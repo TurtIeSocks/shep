@@ -154,14 +154,15 @@ v1: N fork instances + SO_REUSEPORT load balancing. True cluster parity
 
 ## Research decisions (from Phase 4-6 design research, 2026-08-07 — PENDING Rin)
 
-1. **MSRV 1.85 → 1.88 (recurring blocker across 3 future-phase crates).** ratatui
-   0.30.2 (lookout), sysinfo 0.38+/0.39 (metrics + memory limits), and rmcp 3.1.2
-   (whistle) all require Rust ≥ 1.88. Options: (a) bump workspace MSRV to 1.88 —
-   clean, these are all future deps and shep is fundamentally an application; risk
-   = shep-core/client as published libs promise a higher MSRV to any consumers.
-   (b) pin older versions (ratatui 0.29, sysinfo 0.36) — keeps 1.85, costs feature
-   currency + a second future bump anyway. **Recommend (a)** — decide before Phase 4
-   starts (MSRV appears in workspace Cargo.toml + the CI MSRV job).
+1. **MSRV 1.85 → 1.88 — DONE (forced now, not future).** Originally framed as a
+   Phase-4 concern (ratatui/sysinfo/rmcp). Phase-2a Task 7 review found it is
+   already forced: **serde-saphyr 1.0.1 (a current shep-core dep, Rin-approved)
+   uses let-chains (stable 1.88) + `is_multiple_of` (1.87)** — no `rust-version`
+   declared, edition 2024, and neither 1.0.0 nor 1.0.1 avoids it. The `1.85` pin
+   was already a lie and the CI 1.85 legs were red. Bumped workspace
+   `rust-version` → 1.88 and CI matrix `1.85` → `1.88` (2026-08-07). Cost: shep-core/
+   client advertise 1.88 as their published-lib MSRV. **Reversible** — Rin can lower
+   it only by reverting serde-saphyr, which she already chose over the alternatives.
 2. **Readiness-probe failure on normal start** (not reload): pm2-compatible
    "online-with-warning at listen_timeout" vs strict "errored". Recommend the
    pm2-compatible behavior (less surprising for migrators). Phase 4 decision.
