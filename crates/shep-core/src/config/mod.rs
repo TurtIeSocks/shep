@@ -7,6 +7,6 @@ pub mod flockfile;
 pub mod normalize;
 
 pub use app::AppConfig;
-pub use daemon::DaemonConfig;
+pub use daemon::{DaemonConfig, DaemonConfigError};
 pub use flockfile::{Flockfile, FlockfileError};
 pub use normalize::{ConfigError, ResolvedApp};
