@@ -25,12 +25,22 @@ pub struct DaemonSection {
 ///
 /// Dog sections stay untyped here: each dog deserializes its own
 /// `[dog.<name>]` table so dog config schemas live with the dog code.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct DaemonConfig {
     /// The `[daemon]` section
     pub daemon: DaemonSection,
     /// Raw `[dog.<name>]` sections keyed by dog name
     pub dog: BTreeMap<String, toml::Table>,
+}
+
+/// Debug implementation does not leak dog config values (IR-41)
+impl fmt::Debug for DaemonConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DaemonConfig")
+            .field("daemon", &self.daemon)
+            .field("dog", &format_args!("<{} tables>", self.dog.len()))
+            .finish()
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -154,5 +164,17 @@ port = 9615
             DaemonConfig::load(Some("[daemon"), &no_env),
             Err(DaemonConfigError::Toml(_))
         ));
+    }
+
+    #[test]
+    fn debug_redacts_dog_values() {
+        // Dog tables carry things like webhook URLs; a lazy derive(Debug)
+        // would land them in daemon logs. Exact string pinned so that
+        // regression fails here instead of leaking a secret.
+        let cfg = DaemonConfig::load(Some("[dog.metrics]\nport = 9615"), &no_env).unwrap();
+        assert_eq!(
+            format!("{cfg:?}"),
+            "DaemonConfig { daemon: DaemonSection { log_json: false, socket: None, enabled_dogs: [] }, dog: <1 tables> }"
+        );
     }
 }
