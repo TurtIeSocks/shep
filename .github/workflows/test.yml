@@ -1,0 +1,38 @@
+name: test
+on:
+  push: { branches: [main] }
+  pull_request:
+  schedule: [{ cron: "0 0 * * SUN" }]
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.93 --profile minimal --component clippy,rustfmt
+      - run: cargo +1.93 fmt --all -- --check
+      - run: cargo +1.93 clippy --workspace --all-targets -- -D warnings
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo +nightly doc --workspace --all-features --no-deps
+        env: { RUSTDOCFLAGS: "-Dwarnings --cfg docsrs" }
+  typos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@v1
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        toolchain: [stable, "1.85"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
+      - run: cargo +${{ matrix.toolchain }} test --workspace
