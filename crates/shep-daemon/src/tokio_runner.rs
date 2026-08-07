@@ -1,7 +1,8 @@
-//! Real [`ProcessRunner`] over actual OS processes.
+//! Real [`crate::runner::ProcessRunner`] over actual OS processes.
 //!
-//! [`TokioRunner::spawn`] starts a `tokio::process::Command` in its own
-//! process group (so [`RunningProcess::kill_tree`] can `SIGKILL` the whole
+//! `TokioRunner`'s spawn starts a `tokio::process::Command` in its own
+//! process group (so [`crate::runner::RunningProcess::kill_tree`] can
+//! `SIGKILL` the whole
 //! group without touching the daemon's own), optionally wires an fd-3
 //! socketpair as the shepherd channel, and spawns background pump tasks that
 //! drain stdout/stderr into the `logs` channel (and append them to the
@@ -40,7 +41,7 @@ use crate::runner::{
 /// slow to poll, without buffering unboundedly.
 const CHANNEL_CAPACITY: usize = 32;
 
-/// Real [`ProcessRunner`] over actual OS processes.
+/// Real [`crate::runner::ProcessRunner`] over actual OS processes.
 #[derive(Debug, Default)]
 pub struct TokioRunner;
 
@@ -52,7 +53,8 @@ impl TokioRunner {
     }
 }
 
-/// A live real OS child, produced by [`TokioRunner::spawn`].
+/// A live real OS child, produced by [`TokioRunner`]'s
+/// [`crate::runner::ProcessRunner::spawn`].
 #[derive(Debug)]
 pub struct TokioProc {
     /// Captured once at spawn time — `tokio::process::Child::id` reports

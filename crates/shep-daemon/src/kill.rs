@@ -18,7 +18,8 @@ use crate::runner::{ExitOutcome, RunningProcess, StopSignal};
 ///
 /// 1. If `app.shutdown_with_message` is set and `to_child` is present, sends
 ///    [`ShepherdMessage::Shutdown`] over the shepherd channel; otherwise sends
-///    the app's configured [`StopSignal`] (see [`stop_signal`]).
+///    the app's configured [`StopSignal`] (resolved by the private
+///    `stop_signal` parser from `app.kill_signal`).
 /// 2. Waits up to `app.kill_timeout` for the process to exit.
 /// 3. On timeout, SIGKILLs the whole process tree and waits for that to land.
 ///
