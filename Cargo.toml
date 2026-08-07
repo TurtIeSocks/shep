@@ -22,7 +22,7 @@ shep-client = { path = "crates/shep-client" }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
-serde_yml = { version = "0.0.12", default-features = false }
+serde-saphyr = { version = "1", default-features = false, features = ["deserialize"] }
 json5 = { version = "0.4", default-features = false }
 regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
 globset = { version = "0.4", default-features = false }

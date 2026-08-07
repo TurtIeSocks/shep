@@ -71,7 +71,7 @@ impl Flockfile {
                 toml::from_str(source).map_err(|e| FlockfileError::Toml(e.to_string()))?
             }
             FlockFormat::Yaml => {
-                serde_yml::from_str(source).map_err(|e| FlockfileError::Yaml(e.to_string()))?
+                serde_saphyr::from_str(source).map_err(|e| FlockfileError::Yaml(e.to_string()))?
             }
             FlockFormat::Json => {
                 serde_json::from_str(source).map_err(|e| FlockfileError::Json(e.to_string()))?
@@ -322,6 +322,33 @@ args = ["job.py"]
             discover(dir.path()),
             Some(dir.path().join("Flockfile.toml"))
         );
+    }
+
+    #[test]
+    fn yaml_deep_nesting_is_rejected_without_crashing() {
+        // Adversarial probe locked in as a regression test (json5 taught us
+        // to distrust backends here): 5000-deep flow-style nesting must
+        // return Err from serde-saphyr, never overflow the stack.
+        let deep = "[".repeat(5000);
+        let result = Flockfile::parse(&deep, FlockFormat::Yaml);
+        assert!(matches!(result, Err(FlockfileError::Yaml(_))));
+    }
+
+    #[test]
+    fn yaml_alias_bomb_is_bounded() {
+        // Billion-laughs shape: each level aliases the previous twice. The
+        // backend must reject or resolve it bounded — this test completing
+        // quickly (and the doc failing schema-wise) is the assertion.
+        let mut bomb = String::from("a: &a [\"x\",\"x\"]\n");
+        for i in 1..9 {
+            bomb.push_str(&format!(
+                "{c}: &{c} [*{p},*{p}]\n",
+                c = (b'a' + i) as char,
+                p = (b'a' + i - 1) as char
+            ));
+        }
+        let result = Flockfile::parse(&bomb, FlockFormat::Yaml);
+        assert!(result.is_err(), "alias bomb must not produce a valid flock");
     }
 
     #[test]
