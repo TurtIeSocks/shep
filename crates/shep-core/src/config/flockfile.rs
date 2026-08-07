@@ -60,7 +60,10 @@ impl Flockfile {
     /// # Errors
     ///
     /// - Format variants ([`FlockfileError::Toml`] etc.) — backend parse
-    ///   failure, carrying the backend's message.
+    ///   failure, carrying the backend's message. Json5 additionally rejects
+    ///   sources nested past a depth of 64 before ever handing them to the
+    ///   backend parser (json5's recursive-descent parser stack-overflows on
+    ///   deeply nested input rather than returning an error).
     /// - [`FlockfileError::NoApps`] — parsed fine but declared no apps.
     pub fn parse(source: &str, format: FlockFormat) -> Result<Self, FlockfileError> {
         let raw: RawFlockfile = match format {
@@ -74,6 +77,11 @@ impl Flockfile {
                 serde_json::from_str(source).map_err(|e| FlockfileError::Json(e.to_string()))?
             }
             FlockFormat::Json5 => {
+                if json5_nesting_depth(source) > MAX_JSON5_NESTING_DEPTH {
+                    return Err(FlockfileError::Json5(
+                        "nesting depth exceeds 64".to_string(),
+                    ));
+                }
                 json5::from_str(source).map_err(|e| FlockfileError::Json5(e.to_string()))?
             }
         };
@@ -82,6 +90,51 @@ impl Flockfile {
         }
         Ok(Self { apps: raw.apps })
     }
+}
+
+// json5's recursive-descent parser stack-overflows (SIGABRT, not a catchable
+// error) on documents nested a few thousand levels deep — reproduced locally
+// around ~4500 levels. 64 is far beyond anything a real Flockfile needs (the
+// deepest legitimate nesting, a probe object inside an app object inside the
+// app array inside the root object, is 4) and comfortably clear of the crash
+// threshold.
+const MAX_JSON5_NESTING_DEPTH: u32 = 64;
+
+// Scans `source` for the maximum number of concurrently open `[`/`{`
+// brackets. Skips characters inside quoted strings (single or double,
+// backslash-escaped) so bracket-like characters in string values don't
+// inflate the count; deliberately does NOT skip `//`/`/* */` comments —
+// a document with enough commented-out brackets to trip the guard is
+// pathological enough that over-rejecting it is an acceptable tradeoff for
+// staying simple. Saturating: a real document would fail the depth check
+// long before `u32` could overflow.
+fn json5_nesting_depth(source: &str) -> u32 {
+    let mut depth: u32 = 0;
+    let mut max_depth: u32 = 0;
+    let mut in_string: Option<char> = None;
+    let mut chars = source.chars();
+    while let Some(c) = chars.next() {
+        if let Some(quote) = in_string {
+            match c {
+                '\\' => {
+                    chars.next(); // skip the escaped character
+                }
+                q if q == quote => in_string = None,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => in_string = Some(c),
+            '[' | '{' => {
+                depth = depth.saturating_add(1);
+                max_depth = max_depth.max(depth);
+            }
+            ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max_depth
 }
 
 const DISCOVERY_ORDER: [&str; 10] = [
@@ -97,8 +150,7 @@ const DISCOVERY_ORDER: [&str; 10] = [
     "flockfile.json5",
 ];
 
-/// Finds the Flockfile in a directory (spec §5 order, extended with the
-/// `.yml`/`.json5` spellings — spec updated to this ten-name list)
+/// Finds the Flockfile in a directory (spec §5 ten-name order)
 #[must_use]
 pub fn discover(dir: &Path) -> Option<PathBuf> {
     DISCOVERY_ORDER
@@ -223,13 +275,61 @@ args = ["job.py"]
 
     #[test]
     fn discover_prefers_toml_then_capitalized() {
-        let dir = std::env::temp_dir().join(format!("shep-flock-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("flockfile.json"), "{}").unwrap();
-        std::fs::write(dir.join("Flockfile.yaml"), "").unwrap();
-        assert_eq!(discover(&dir), Some(dir.join("Flockfile.yaml")));
-        std::fs::write(dir.join("Flockfile.toml"), "").unwrap();
-        assert_eq!(discover(&dir), Some(dir.join("Flockfile.toml")));
-        std::fs::remove_dir_all(&dir).unwrap();
+        // tempdir gives RAII cleanup instead of a manual remove_dir_all, so
+        // a failing assertion above can't leak the directory.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("flockfile.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("Flockfile.yaml"), "").unwrap();
+        assert_eq!(
+            discover(dir.path()),
+            Some(dir.path().join("Flockfile.yaml"))
+        );
+        std::fs::write(dir.path().join("Flockfile.toml"), "").unwrap();
+        assert_eq!(
+            discover(dir.path()),
+            Some(dir.path().join("Flockfile.toml"))
+        );
+    }
+
+    #[test]
+    fn json5_beyond_max_nesting_depth_is_rejected_without_crashing() {
+        // json5's backend parser stack-overflows (SIGABRT) around ~4500
+        // levels of nesting rather than returning an error — the depth
+        // guard must reject this before ever calling into it. 5000 unclosed
+        // `[` is nonsense JSON5, but the guard runs before any real parsing
+        // is attempted, so that's fine.
+        let src = "[".repeat(5000);
+        assert_eq!(
+            Flockfile::parse(&src, FlockFormat::Json5).unwrap_err(),
+            FlockfileError::Json5("nesting depth exceeds 64".to_string())
+        );
+    }
+
+    #[test]
+    fn json5_nesting_depth_counts_concurrently_open_brackets() {
+        let nested = format!("{}{}", "[".repeat(10), "]".repeat(10));
+        assert_eq!(json5_nesting_depth(&nested), 10);
+    }
+
+    #[test]
+    fn json5_nesting_depth_ignores_brackets_inside_strings() {
+        let src = r#"{ "a": "[[[[[[[[[[", "b": "esc\"aped [ too" }"#;
+        assert_eq!(json5_nesting_depth(src), 1); // only the outer `{`
+    }
+
+    #[test]
+    fn json5_legitimately_nested_doc_still_parses() {
+        // A probe object nested inside an app object inside the app array
+        // inside the root object — depth 4, the deepest a real Flockfile
+        // schema allows, and well under the depth-64 guard.
+        let src = r#"{
+            app: [{
+                name: "web",
+                script: "./srv",
+                readiness_probe: { kind: "http", target: "http://localhost/x" },
+            }],
+        }"#;
+        let flock = Flockfile::parse(src, FlockFormat::Json5).unwrap();
+        assert_eq!(flock.apps.len(), 1);
     }
 }
