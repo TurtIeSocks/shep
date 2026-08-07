@@ -142,6 +142,139 @@ impl fmt::Display for ParseMemSizeError {
 
 impl core::error::Error for ParseMemSizeError {}
 
+/// A duration from the Flockfile grammar `^\d+(h|m|s)?$`
+///
+/// Plain digits are milliseconds; `s`/`m`/`h` are seconds/minutes/hours.
+/// Used for `min_uptime`, `kill_timeout`, and the other lifecycle timers.
+///
+/// # Example
+/// ```
+/// use shep_core::values::UpDuration;
+///
+/// assert_eq!("30s".parse::<UpDuration>()?.as_millis(), 30_000);
+/// assert!("30S".parse::<UpDuration>().is_err()); // lowercase units only
+/// # Ok::<(), shep_core::values::ParseUpDurationError>(())
+/// ```
+// wire format: changing this is a breaking change (string form in AppConfig)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UpDuration(core::time::Duration);
+
+impl UpDuration {
+    /// Wraps a raw millisecond count
+    #[inline]
+    #[must_use]
+    pub const fn from_millis(ms: u64) -> Self {
+        Self(core::time::Duration::from_millis(ms))
+    }
+
+    /// Returns the wrapped [`core::time::Duration`]
+    #[inline]
+    #[must_use]
+    pub const fn as_duration(self) -> core::time::Duration {
+        self.0
+    }
+
+    /// Returns the duration in whole milliseconds
+    #[inline]
+    #[must_use]
+    pub const fn as_millis(self) -> u64 {
+        self.0.as_millis() as u64
+    }
+}
+
+impl FromStr for UpDuration {
+    type Err = ParseUpDurationError;
+
+    /// Parses `^\d+(h|m|s)?$` — plain digits are milliseconds
+    ///
+    /// # Errors
+    ///
+    /// - [`ParseUpDurationError::Empty`] — empty input.
+    /// - [`ParseUpDurationError::MissingDigits`] — unit with no digits.
+    /// - [`ParseUpDurationError::InvalidCharacter`] — anything outside ASCII
+    ///   digits plus one trailing lowercase `h`/`m`/`s`.
+    /// - [`ParseUpDurationError::Overflow`] — milliseconds overflow `u64`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(ParseUpDurationError::Empty);
+        }
+        let (digits, ms_per_unit) = match s.as_bytes()[s.len() - 1] {
+            b'h' => (&s[..s.len() - 1], 3_600_000),
+            b'm' => (&s[..s.len() - 1], 60_000),
+            b's' => (&s[..s.len() - 1], 1_000),
+            _ => (s, 1),
+        };
+        if digits.is_empty() {
+            return Err(ParseUpDurationError::MissingDigits);
+        }
+        if !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ParseUpDurationError::InvalidCharacter);
+        }
+        let value: u64 = digits.parse().map_err(|_| ParseUpDurationError::Overflow)?;
+        value
+            .checked_mul(ms_per_unit)
+            .map(Self::from_millis)
+            .ok_or(ParseUpDurationError::Overflow)
+    }
+}
+
+/// Formats with the largest unit dividing the value exactly (ms as digits)
+impl fmt::Display for UpDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ms = self.as_millis();
+        match ms {
+            0 => f.write_str("0"),
+            v if v % 3_600_000 == 0 => write!(f, "{}h", v / 3_600_000),
+            v if v % 60_000 == 0 => write!(f, "{}m", v / 60_000),
+            v if v % 1_000 == 0 => write!(f, "{}s", v / 1_000),
+            v => write!(f, "{v}"),
+        }
+    }
+}
+
+impl Serialize for UpDuration {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for UpDuration {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // String, not &str: the toml deserializer cannot always borrow
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Failure to parse an [`UpDuration`] from the grammar `^\d+(h|m|s)?$`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseUpDurationError {
+    /// The input string was empty
+    Empty,
+    /// A unit suffix with no digits before it (`"s"`)
+    MissingDigits,
+    /// A character outside ASCII digits plus one optional trailing
+    /// lowercase `h`/`m`/`s`
+    InvalidCharacter,
+    /// The duration in milliseconds does not fit in `u64`
+    Overflow,
+}
+
+impl fmt::Display for ParseUpDurationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "duration is empty",
+            Self::MissingDigits => "duration has a unit suffix but no digits",
+            Self::InvalidCharacter => {
+                "duration must be ASCII digits with an optional trailing h, m, or s"
+            }
+            Self::Overflow => "duration in milliseconds overflows u64",
+        })
+    }
+}
+
+impl core::error::Error for ParseUpDurationError {}
+
 #[cfg(test)]
 mod mem_size_tests {
     use super::*;
@@ -197,5 +330,53 @@ mod mem_size_tests {
         assert_eq!(size.bytes(), 512 << 20);
         assert_eq!(serde_json::to_string(&size).unwrap(), "\"512M\"");
         assert!(serde_json::from_str::<MemSize>("\"512MB\"").is_err());
+    }
+}
+
+#[cfg(test)]
+mod up_duration_tests {
+    use super::*;
+
+    #[test]
+    fn plain_digits_are_milliseconds() {
+        assert_eq!("1600".parse::<UpDuration>().unwrap().as_millis(), 1600);
+    }
+
+    #[test]
+    fn units_seconds_minutes_hours() {
+        assert_eq!("30s".parse::<UpDuration>().unwrap().as_millis(), 30_000);
+        assert_eq!("5m".parse::<UpDuration>().unwrap().as_millis(), 300_000);
+        assert_eq!("2h".parse::<UpDuration>().unwrap().as_millis(), 7_200_000);
+    }
+
+    #[test]
+    fn rejects_spec_violations() {
+        use ParseUpDurationError::*;
+        assert_eq!("".parse::<UpDuration>(), Err(Empty));
+        assert_eq!("s".parse::<UpDuration>(), Err(MissingDigits));
+        assert_eq!("30S".parse::<UpDuration>(), Err(InvalidCharacter)); // uppercase
+        assert_eq!("1.5s".parse::<UpDuration>(), Err(InvalidCharacter));
+        assert_eq!("30 s".parse::<UpDuration>(), Err(InvalidCharacter));
+        assert_eq!("99999999999999999999h".parse::<UpDuration>(), Err(Overflow));
+    }
+
+    #[test]
+    fn display_round_trips() {
+        for ms in [
+            0u64, 1, 999, 1000, 1600, 30_000, 300_000, 7_200_000, 3_601_000,
+        ] {
+            let d = UpDuration::from_millis(ms);
+            assert_eq!(d.to_string().parse::<UpDuration>().unwrap(), d, "{ms}ms");
+        }
+        assert_eq!(UpDuration::from_millis(30_000).to_string(), "30s");
+        assert_eq!(UpDuration::from_millis(1600).to_string(), "1600");
+        assert_eq!(UpDuration::from_millis(7_200_000).to_string(), "2h");
+    }
+
+    #[test]
+    fn serde_uses_string_form() {
+        let d: UpDuration = serde_json::from_str("\"30s\"").unwrap();
+        assert_eq!(d.as_millis(), 30_000);
+        assert_eq!(serde_json::to_string(&d).unwrap(), "\"30s\"");
     }
 }
