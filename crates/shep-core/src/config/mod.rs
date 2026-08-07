@@ -9,4 +9,4 @@ pub mod normalize;
 pub use app::AppConfig;
 pub use daemon::{DaemonConfig, DaemonConfigError};
 pub use flockfile::{Flockfile, FlockfileError};
-pub use normalize::{ConfigError, ResolvedApp};
+pub use normalize::{NormalizeError, ResolvedApp};

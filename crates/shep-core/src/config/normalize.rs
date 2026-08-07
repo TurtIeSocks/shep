@@ -33,25 +33,25 @@ impl ResolvedApp {
 ///
 /// # Errors
 ///
-/// - [`ConfigError::MissingName`] — `name` is empty.
-/// - [`ConfigError::MissingScript`] — `script` is empty.
-/// - [`ConfigError::ZeroInstances`] — `instances == 0`.
-/// - [`ConfigError::InvalidCron`] — `cron_restart` is not a 5-field pattern.
-pub fn normalize(app: AppConfig) -> Result<ResolvedApp, ConfigError> {
+/// - [`NormalizeError::MissingName`] — `name` is empty.
+/// - [`NormalizeError::MissingScript`] — `script` is empty.
+/// - [`NormalizeError::ZeroInstances`] — `instances == 0`.
+/// - [`NormalizeError::InvalidCron`] — `cron_restart` is not a 5-field pattern.
+pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
     if app.name.is_empty() {
-        return Err(ConfigError::MissingName);
+        return Err(NormalizeError::MissingName);
     }
     if app.script.is_empty() {
-        return Err(ConfigError::MissingScript);
+        return Err(NormalizeError::MissingScript);
     }
     if app.instances == 0 {
-        return Err(ConfigError::ZeroInstances);
+        return Err(NormalizeError::ZeroInstances);
     }
     if let Some(pattern) = &app.cron_restart {
         // ponytail: field-count check only; croner dialect validation lands
         // with the daemon phase that actually schedules crons
         if pattern.split_whitespace().count() != 5 {
-            return Err(ConfigError::InvalidCron(pattern.clone()));
+            return Err(NormalizeError::InvalidCron(pattern.clone()));
         }
     }
     Ok(ResolvedApp { config: app })
@@ -62,13 +62,13 @@ pub fn normalize(app: AppConfig) -> Result<ResolvedApp, ConfigError> {
 /// # Errors
 ///
 /// Everything [`normalize`] returns, plus
-/// [`ConfigError::DuplicateName`] — two apps share a `name`.
-pub fn normalize_all(apps: Vec<AppConfig>) -> Result<Vec<ResolvedApp>, ConfigError> {
+/// [`NormalizeError::DuplicateName`] — two apps share a `name`.
+pub fn normalize_all(apps: Vec<AppConfig>) -> Result<Vec<ResolvedApp>, NormalizeError> {
     let mut seen = BTreeSet::new();
     apps.into_iter()
         .map(|app| {
             if !seen.insert(app.name.clone()) {
-                return Err(ConfigError::DuplicateName(app.name));
+                return Err(NormalizeError::DuplicateName(app.name));
             }
             normalize(app)
         })
@@ -77,7 +77,7 @@ pub fn normalize_all(apps: Vec<AppConfig>) -> Result<Vec<ResolvedApp>, ConfigErr
 
 /// Error type returned from [`normalize`] and [`normalize_all`]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConfigError {
+pub enum NormalizeError {
     /// `name` is empty
     MissingName,
     /// `script` is empty
@@ -90,7 +90,7 @@ pub enum ConfigError {
     DuplicateName(String),
 }
 
-impl fmt::Display for ConfigError {
+impl fmt::Display for NormalizeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingName => f.write_str("app config is missing a name"),
@@ -102,7 +102,7 @@ impl fmt::Display for ConfigError {
     }
 }
 
-impl core::error::Error for ConfigError {}
+impl core::error::Error for NormalizeError {}
 
 #[cfg(test)]
 mod tests {
@@ -119,11 +119,11 @@ mod tests {
     fn missing_name_and_script_are_distinct_errors() {
         assert_eq!(
             normalize(AppConfig::minimal("", "./srv")).unwrap_err(),
-            ConfigError::MissingName
+            NormalizeError::MissingName
         );
         assert_eq!(
             normalize(AppConfig::minimal("web", "")).unwrap_err(),
-            ConfigError::MissingScript
+            NormalizeError::MissingScript
         );
     }
 
@@ -131,7 +131,7 @@ mod tests {
     fn zero_instances_rejected() {
         let mut app = AppConfig::minimal("web", "./srv");
         app.instances = 0;
-        assert_eq!(normalize(app).unwrap_err(), ConfigError::ZeroInstances);
+        assert_eq!(normalize(app).unwrap_err(), NormalizeError::ZeroInstances);
     }
 
     #[test]
@@ -139,7 +139,7 @@ mod tests {
         let mut app = AppConfig::minimal("web", "./srv");
         app.cron_restart = Some("not a cron".to_string());
         match normalize(app).unwrap_err() {
-            ConfigError::InvalidCron(p) => assert_eq!(p, "not a cron"),
+            NormalizeError::InvalidCron(p) => assert_eq!(p, "not a cron"),
             other => panic!("expected InvalidCron, got {other:?}"),
         }
     }
@@ -152,7 +152,7 @@ mod tests {
         ];
         assert_eq!(
             normalize_all(apps).unwrap_err(),
-            ConfigError::DuplicateName("web".to_string())
+            NormalizeError::DuplicateName("web".to_string())
         );
     }
 }
