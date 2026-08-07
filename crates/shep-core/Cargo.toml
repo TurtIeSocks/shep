@@ -15,10 +15,12 @@ serde_yml.workspace = true
 json5.workspace = true
 regex.workspace = true
 tokio-util.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
+futures-util.workspace = true
 
 [lints]
 workspace = true

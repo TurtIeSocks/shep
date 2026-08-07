@@ -28,6 +28,8 @@ regex = { version = "1", default-features = false, features = ["std", "unicode-p
 globset = { version = "0.4", default-features = false }
 tokio = { version = "1", default-features = false }
 tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
+bytes = { version = "1", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 insta = { version = "1", default-features = false, features = ["json"] }
 
 [workspace.lints.rust]

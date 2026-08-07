@@ -6,14 +6,15 @@
 
 pub mod events;
 pub mod request;
-// `pub mod wire;` is added by the framing task — declaring it here would
-// break this task's gates (E0583: file not found).
+/// Frame encoding shared by daemon and client
+pub mod wire;
 
 pub use events::{BusEvent, ProcessEventKind};
 pub use request::{
     Envelope, Hello, HelloAck, HelloReply, ProcessInfo, Reply, Request, Response, RpcError,
     RpcErrorCode, SelectorSpec,
 };
+pub use wire::{WireError, codec, decode_frame, encode_frame};
 
 /// Wire protocol version; bump on any breaking change to serialized shapes
 pub const PROTOCOL_VERSION: u32 = 1;
