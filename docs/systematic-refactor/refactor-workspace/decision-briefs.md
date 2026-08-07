@@ -152,6 +152,27 @@ e2e polish.
 v1: N fork instances + SO_REUSEPORT load balancing. True cluster parity
 (fd-passing / LISTEN_FDS protocol) = v1.1/v1.2 per Rin.
 
+## Research decisions (from Phase 4-6 design research, 2026-08-07 — PENDING Rin)
+
+1. **MSRV 1.85 → 1.88 (recurring blocker across 3 future-phase crates).** ratatui
+   0.30.2 (lookout), sysinfo 0.38+/0.39 (metrics + memory limits), and rmcp 3.1.2
+   (whistle) all require Rust ≥ 1.88. Options: (a) bump workspace MSRV to 1.88 —
+   clean, these are all future deps and shep is fundamentally an application; risk
+   = shep-core/client as published libs promise a higher MSRV to any consumers.
+   (b) pin older versions (ratatui 0.29, sysinfo 0.36) — keeps 1.85, costs feature
+   currency + a second future bump anyway. **Recommend (a)** — decide before Phase 4
+   starts (MSRV appears in workspace Cargo.toml + the CI MSRV job).
+2. **Readiness-probe failure on normal start** (not reload): pm2-compatible
+   "online-with-warning at listen_timeout" vs strict "errored". Recommend the
+   pm2-compatible behavior (less surprising for migrators). Phase 4 decision.
+3. **`shep-client` subscription stream shape** → `ClientEvent { Bus(BusEvent),
+   Disconnected, Reconnected }` as a named stream struct (IR-15), so the lookout
+   TUI (and any consumer) gets reconnect UX. Low-risk, clear win — **baking into
+   the Phase 2b/client plan unless Rin objects.**
+4. **Additive `GetMetrics` RPC** (metrics dog + whistle both consume it; keeps
+   protocol v1 per the evolution rule). Lands with the metrics phase; noted so 2b's
+   RPC dispatch leaves room. Non-decision, just tracked.
+
 ## Parking lot (v2 ideas — logged, not scoped)
 
 - **HMR/bacon-style dev loops** (Rin, 2026-08-07): don't bind to any Rust HMR
