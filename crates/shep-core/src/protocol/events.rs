@@ -28,11 +28,17 @@ pub enum ProcessEventKind {
 
 /// One event on the daemon bus
 ///
-/// The serde tag is structural; subscription TOPICS are the dotted
-/// strings from [`BusEvent::topic`] (`process.exit`, `log.out`, `daemon.*` —
-/// spec §6 grammar). Phase 2's server-side filter globs against `topic()`.
+/// Uses adjacently tagged serde format with `event` discriminator and `data` wrapper.
+/// Subscription TOPICS are the dotted strings from [`BusEvent::topic`]
+/// (`process.exit`, `log.out`, `daemon.*` — spec §6 grammar).
+/// Phase 2's server-side filter globs against `topic()`.
 // wire format: changing existing variants is a breaking change
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// Adjacent tagging chosen because internally-tagged form cannot compile:
+// the `Process` variant has its own `event: ProcessEventKind` field, which
+// collides with an internal tag named `event` (serde_derive rejects this).
+// Adjacently tagging (with `content = "data"`) avoids the collision while
+// matching `Response`'s serde convention. Wire shape pinned by snapshot.
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BusEvent {
