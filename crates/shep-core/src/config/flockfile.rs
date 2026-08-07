@@ -102,17 +102,24 @@ const MAX_JSON5_NESTING_DEPTH: u32 = 64;
 
 // Scans `source` for the maximum number of concurrently open `[`/`{`
 // brackets. Skips characters inside quoted strings (single or double,
-// backslash-escaped) so bracket-like characters in string values don't
-// inflate the count; deliberately does NOT skip `//`/`/* */` comments —
-// a document with enough commented-out brackets to trip the guard is
-// pathological enough that over-rejecting it is an acceptable tradeoff for
-// staying simple. Saturating: a real document would fail the depth check
-// long before `u32` could overflow.
+// backslash-escaped) and inside `//`/`/* */` comments, so bracket-like (and
+// quote-like) characters there don't distort the count — a `'` inside a `//
+// don't nest` comment must NOT be able to flip the scanner into string mode
+// and make it ignore real brackets that follow (that was exactly the bug in
+// the first version of this guard: it failed OPEN, letting an over-deep
+// document reach json5 and crash it).
+//
+// Fails CLOSED on anything that isn't clean, well-terminated JSON5 lexing:
+// an unterminated `/* ...` comment or an unterminated string at EOF returns
+// `u32::MAX`, which always exceeds `MAX_JSON5_NESTING_DEPTH` — better to
+// reject a malformed document than to under-count it and let it through.
+// Saturating add/sub: a real document would fail the depth check long
+// before `u32` could overflow.
 fn json5_nesting_depth(source: &str) -> u32 {
     let mut depth: u32 = 0;
     let mut max_depth: u32 = 0;
     let mut in_string: Option<char> = None;
-    let mut chars = source.chars();
+    let mut chars = source.chars().peekable();
     while let Some(c) = chars.next() {
         if let Some(quote) = in_string {
             match c {
@@ -125,6 +132,29 @@ fn json5_nesting_depth(source: &str) -> u32 {
             continue;
         }
         match c {
+            '/' if chars.peek() == Some(&'/') => {
+                chars.next(); // consume the second '/'
+                for c2 in chars.by_ref() {
+                    if c2 == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next(); // consume the '*'
+                let mut prev = '\0';
+                let mut closed = false;
+                for c2 in chars.by_ref() {
+                    if prev == '*' && c2 == '/' {
+                        closed = true;
+                        break;
+                    }
+                    prev = c2;
+                }
+                if !closed {
+                    return u32::MAX; // unterminated block comment
+                }
+            }
             '"' | '\'' => in_string = Some(c),
             '[' | '{' => {
                 depth = depth.saturating_add(1);
@@ -133,6 +163,9 @@ fn json5_nesting_depth(source: &str) -> u32 {
             ']' | '}' => depth = depth.saturating_sub(1),
             _ => {}
         }
+    }
+    if in_string.is_some() {
+        return u32::MAX; // unterminated string
     }
     max_depth
 }
@@ -323,6 +356,45 @@ args = ["job.py"]
         // inside the root object — depth 4, the deepest a real Flockfile
         // schema allows, and well under the depth-64 guard.
         let src = r#"{
+            app: [{
+                name: "web",
+                script: "./srv",
+                readiness_probe: { kind: "http", target: "http://localhost/x" },
+            }],
+        }"#;
+        let flock = Flockfile::parse(src, FlockFormat::Json5).unwrap();
+        assert_eq!(flock.apps.len(), 1);
+    }
+
+    #[test]
+    fn json5_line_comment_apostrophe_does_not_hide_deep_nesting() {
+        // Regression: a `'` inside a `//` comment must not flip the scanner
+        // into string mode and make it ignore every bracket that follows —
+        // that would let an over-deep document slip past the guard straight
+        // into json5's stack overflow.
+        let src = format!("// don't nest\n{}", "[".repeat(5000));
+        assert_eq!(
+            Flockfile::parse(&src, FlockFormat::Json5).unwrap_err(),
+            FlockfileError::Json5("nesting depth exceeds 64".to_string())
+        );
+    }
+
+    #[test]
+    fn json5_block_comment_apostrophe_does_not_hide_deep_nesting() {
+        let src = format!("/* it's fine */\n{}", "[".repeat(5000));
+        assert_eq!(
+            Flockfile::parse(&src, FlockFormat::Json5).unwrap_err(),
+            FlockfileError::Json5("nesting depth exceeds 64".to_string())
+        );
+    }
+
+    #[test]
+    fn json5_benign_comment_does_not_undercount_a_real_document() {
+        // Same depth-4 document as `json5_legitimately_nested_doc_still_parses`,
+        // plus a comment (apostrophe included) that must be skipped cleanly
+        // rather than throwing off the count.
+        let src = r#"{
+            /* it's the app list */
             app: [{
                 name: "web",
                 script: "./srv",
