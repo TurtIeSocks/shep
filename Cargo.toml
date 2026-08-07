@@ -57,8 +57,10 @@ tokio = { version = "1", default-features = false }
 tokio-util = { version = "0.7.1", default-features = false, features = ["codec"] }
 bytes = { version = "1", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-# 1.18.0 has a JSON-serialization regression with newtype/tuple-variant snapshots (our
-# Result<T, E> reply wire format triggers it), fixed in 1.18.1.
+# Our `insta::assert_json_snapshot!` calls in shep-core (protocol::request,
+# protocol::events) snapshot newtype/tuple enum variants (the Result-shaped reply
+# payload); 1.18.0 has a JSON-serialization regression with exactly that shape, fixed
+# in 1.18.1.
 insta = { version = "1.18.1", default-features = false, features = ["json"] }
 tempfile = { version = "3", default-features = false }
 
