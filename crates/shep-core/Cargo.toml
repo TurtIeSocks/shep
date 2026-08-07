@@ -1,0 +1,13 @@
+[package]
+name = "shep-core"
+description = "Shared types, configuration, and wire protocol for the shep process manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

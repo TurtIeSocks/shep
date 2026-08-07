@@ -1,0 +1,14 @@
+[package]
+name = "shep-daemon"
+description = "Supervisor engine for shep: spawn, restart, reload, watch, metrics, alerts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+shep-core.workspace = true
+
+[lints]
+workspace = true

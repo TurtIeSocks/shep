@@ -1,0 +1,14 @@
+[package]
+name = "shep-client"
+description = "Async RPC client and programmatic API for the shep daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+shep-core.workspace = true
+
+[lints]
+workspace = true

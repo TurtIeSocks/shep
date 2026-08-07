@@ -1,0 +1,20 @@
+[package]
+name = "shep-cli"
+description = "The shep command-line interface: one binary embedding CLI, daemon, TUI, and static server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "shep"
+path = "src/main.rs"
+
+[dependencies]
+shep-core.workspace = true
+shep-daemon.workspace = true
+shep-client.workspace = true
+
+[lints]
+workspace = true

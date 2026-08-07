@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/shep-core",
+    "crates/shep-daemon",
+    "crates/shep-client",
+    "crates/shep-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/rin/pm2-rs"
+# Clean-room implementation — pm2 is feature-list inspiration only (Rin, 2026-08-07).
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+shep-core = { path = "crates/shep-core" }
+shep-daemon = { path = "crates/shep-daemon" }
+shep-client = { path = "crates/shep-client" }
+
+[workspace.lints.rust]
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
