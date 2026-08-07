@@ -9,6 +9,7 @@
 #![doc(test(attr(deny(warnings))))]
 #![deny(unsafe_code)]
 
+pub mod assemble;
 pub mod backoff;
 pub mod brain;
 pub mod channel;

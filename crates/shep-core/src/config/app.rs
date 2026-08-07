@@ -122,9 +122,9 @@ pub struct AppConfig {
     pub user: Option<String>,
     /// Run as this group (unix)
     pub group: Option<String>,
-    /// Stdout log file (default: `$SHEP_HOME/logs/<name>-out.log`)
+    /// Stdout log file (default: `$SHEP_HOME/logs/<name>-<instance>-out.log`; `merge_logs` collapses to `<name>-out.log`)
     pub out_file: Option<String>,
-    /// Stderr log file (default: `$SHEP_HOME/logs/<name>-err.log`)
+    /// Stderr log file (default: `$SHEP_HOME/logs/<name>-<instance>-err.log`; `merge_logs` collapses to `<name>-err.log`)
     pub err_file: Option<String>,
     /// Merge instance logs into one file pair
     pub merge_logs: bool,
