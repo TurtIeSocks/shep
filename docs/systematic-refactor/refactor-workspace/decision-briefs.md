@@ -72,9 +72,9 @@ on Linux plumbing to ship v1; the seam makes v1.1 additive.
 
 ## #3b — First-party plugin architecture (must-haves as pluggable helpers)
 
-**DECIDED (Rin, 2026-08-07): ship this model, renamed to LAMB** — `lamb/lambs`
+**DECIDED (Rin, 2026-08-07): ship this model, renamed to DOG** — `dog/dogs`
 for first-party plugin processes; `sheep` stays reserved for managed user
-processes. Section below predates the rename ("sheep model" = lamb model).
+processes. Section below predates the rename ("sheep model" = dog model).
 
 Rin's question: what would the must-haves look like as pluggable sheep instead
 of native daemon code? Her pm2-module pain: archaic install, archaic config.
@@ -151,3 +151,11 @@ e2e polish.
 
 v1: N fork instances + SO_REUSEPORT load balancing. True cluster parity
 (fd-passing / LISTEN_FDS protocol) = v1.1/v1.2 per Rin.
+
+## Parking lot (v2 ideas — logged, not scoped)
+
+- **HMR/bacon-style dev loops** (Rin, 2026-08-07): don't bind to any Rust HMR
+  lib (space immature: hot-lib-reloader, dioxus subsecond, dexterous). Two
+  generic hooks instead: `watch_action = restart | signal | command` (signal
+  lets HMR-equipped apps hot-patch without dying) and `shep dev` build
+  pipeline (`dev.build_command` — watch → build → restart-on-success).

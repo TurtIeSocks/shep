@@ -58,9 +58,10 @@ grammars beyond spec.
 
 [docs/terminology.md](docs/terminology.md) is the lexicon: flock, fold,
 Flockfile, bleats, bark (webhooks), whistle (MCP), muster, lookout (TUI),
-**lambs** (first-party plugin processes — metrics, bark — supervised by the
-daemon itself). `sheep` = ONE managed user process (singular only); the plural
-is always **flock**, never bare "sheep"/"sheeps". Rules: straight verbs
+**dogs** (plugin processes — metrics, bark — supervised by the daemon; the
+daemon itself is only ever "the shepherd"), **lambs** (child processes of a
+sheep — process-tree members). `sheep` = ONE managed user process (singular
+only); the plural is always **flock**, never bare "sheep"/"sheeps". Rules: straight verbs
 (`start`/`stop`/`list`) stay
 first-class aliases; destructive ops and error text stay plain — the theme
 never costs clarity.

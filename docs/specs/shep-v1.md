@@ -14,10 +14,10 @@ shep is a general-purpose process manager: a single Rust binary whose daemon
 (the shepherd) supervises long-running processes (the flock) with restart
 policies, log capture, zero-downtime reload, file watching, native
 observability (Prometheus, webhooks, TUI, MCP), and first-party plugins
-(lambs). Clean-room build inspired by pm2's feature list; MIT OR Apache-2.0.
+(dogs). Clean-room build inspired by pm2's feature list; MIT OR Apache-2.0.
 
 **Non-goals (v1):** container orchestration; multi-host anything; a
-third-party module registry (the lamb contract replaces it); pm2 artifact
+third-party module registry (the dog contract replaces it); pm2 artifact
 compatibility (formats live only in `shep import`); deployment tooling;
 in-process Node instrumentation.
 
@@ -28,8 +28,8 @@ Flockfile config, daemon config (`shep.toml`, file < env < flags layering),
 JSON wire protocol over UDS/named-pipe, fd-pipe readiness + HTTP/TCP/exec
 probes, custom actions (`trigger` over the shepherd channel), log
 capture/tail/flush/reopen, watch-restart, cron-restart, memory-limit polling
-behind `LimitEnforcer`, SO_REUSEPORT reload for all runtimes, lambs
-infrastructure + metrics lamb + bark lamb, lookout TUI, whistle MCP (stdio),
+behind `LimitEnforcer`, SO_REUSEPORT reload for all runtimes, dogs
+infrastructure + metrics dog + bark dog, lookout TUI, whistle MCP (stdio),
 `shep import` + migration guide, startup scripts (systemd Type=notify,
 launchd, openrc, rc.d), Windows functional tier (named pipes + Job Objects;
 start/stop/list/logs work).
@@ -38,7 +38,7 @@ start/stop/list/logs work).
 v2 enforcement (`enforce = "kernel"`); `@shep/io` npm shim (on demand);
 Windows polish (service integration, ctrl-event graceful stop, full e2e);
 vcs metadata (git revision shown in describe — `vcs` feature, off by
-default); `shep web` JSON status endpoint (if demand — metrics lamb covers
+default); `shep web` JSON status endpoint (if demand — metrics dog covers
 observability).
 
 **v1.2 candidate:** fd-passing/LISTEN_FDS true cluster parity (Rin: "v1.1 or
@@ -50,11 +50,11 @@ Four crates, one distributed binary (`shep`); see map.md for module detail.
 
 - `shep-core` — types, config, paths, selectors, errors, wire protocol.
 - `shep-daemon` — supervisor lib: registry actor, spawn/kill/reload state
-  machines, watcher, workers, RPC server, bus, lamb support. No binary.
+  machines, watcher, workers, RPC server, bus, dog support. No binary.
 - `shep-client` — async client: connect-or-spawn, typed RPC, event streams.
   Re-exports shep-core.
 - `shep-cli` — the `shep` binary: clap surface, output/UX, lookout, whistle,
-  serve, lambs, import, runtime/dev modes. Hidden `daemon` subcommand is the
+  serve, dogs, import, runtime/dev modes. Hidden `daemon` subcommand is the
   daemonization target (re-exec self, detached, readiness handshake over a
   pipe: child reports `{pid, version}` once the socket is bound). `[[bin]]`
   aliases `shep-runtime` and `shep-dev` ship for container entrypoints
@@ -69,7 +69,9 @@ config), `flock.json` (state snapshot), `logs/`, `pids/`, `run/` (sockets,
 One spawn path: `tokio::process::Command`, own process group, optional
 uid/gid, piped stdio + one extra pipe fd (the shepherd channel). "Cluster"
 = N instances of the same app, each with `SHEP_INSTANCE` slot id (lowest free
-slot among same-name; `increment_var` supported).
+slot among same-name; `increment_var` supported). Processes a sheep spawns
+are its **lambs** (the process-tree members): shown in `describe`'s tree
+view, killed with the sheep by the process-group/Job-Object tree kill.
 
 **States:** `starting → online → stopping → stopped`, plus `errored`
 (restart budget exhausted or spawn failure) and `waiting-restart` (backoff
@@ -129,14 +131,14 @@ documented). Discovery order in cwd: `Flockfile.toml`, `Flockfile.yaml`,
 set per map.md app_spec; sheep-native names, no pm2 aliases.
 
 **Daemon config** `$SHEP_HOME/shep.toml`: `[daemon]` (log policy, socket
-overrides), `[lamb.<name>]` sections (each lamb's typed config), alert rules
-under `[lamb.bark]`. Layering: file < `SHEP_*` env < CLI flags.
+overrides), `[dog.<name>]` sections (each dog's typed config), alert rules
+under `[dog.bark]`. Layering: file < `SHEP_*` env < CLI flags.
 
 **Folds** (grouping): optional `fold = "<name>"` field in AppConfig assigns a
 sheep to a named group. `shep fold <name>` lists that fold; `fold:<name>`
 selects it in any verb; `flock`/`describe` display fold membership.
 
-**KV store** (`shep set/get/unset`): retained for ad-hoc + lamb runtime
+**KV store** (`shep set/get/unset`): retained for ad-hoc + dog runtime
 tweaks; file-locked JSON; not the primary config path.
 
 ## 6. Wire protocol (v1 = protocol version 1)
@@ -174,31 +176,31 @@ tweaks; file-locked JSON; not the primary config path.
 - `wait_ready = true` selects channel-based readiness; probe config selects
   probe-based; neither → "ready" = spawn success + listen_timeout heuristic.
 
-## 8. Lambs (first-party plugins)
+## 8. Dogs (plugins)
 
-Contract: a lamb is a process speaking the client wire protocol,
-supervised by the daemon, tagged `lamb` (badged in `shep flock`, hidden by
-default in user listings unless `--all`). First-party lambs live in the
-multi-call binary as `shep lamb <name>`. Lifecycle: `shep enable <name>` →
+Contract: a dog is a process speaking the client wire protocol,
+supervised by the daemon, tagged `dog` (badged in `shep flock`, hidden by
+default in user listings unless `--all`). First-party dogs live in the
+multi-call binary as `shep dog <name>`. Lifecycle: `shep enable <name>` →
 daemon config entry → autostart with the daemon; `shep disable <name>`
-removes. Config: `[lamb.<name>]` in shep.toml. Third-party lamb = any binary
+removes. Config: `[dog.<name>]` in shep.toml. Third-party dog = any binary
 speaking the protocol, registered with `shep enable --exec <path> <name>`.
 
-**metrics lamb (v1):** serves Prometheus exposition on 127.0.0.1:9615
+**metrics dog (v1):** serves Prometheus exposition on 127.0.0.1:9615
 (configurable): per-sheep cpu/mem/restart_total/status/uptime, daemon self
 metrics, host metrics. Reference Grafana dashboard JSON in `assets/grafana/`.
 OTLP export = `otel` cargo feature.
 
-**bark lamb (v1):** subscribes `process.*` + polls state as reconciliation
-(bus drops must not lose alerts). Named sinks in `[lamb.bark.sinks]`:
+**bark dog (v1):** subscribes `process.*` + polls state as reconciliation
+(bus drops must not lose alerts). Named sinks in `[dog.bark.sinks]`:
 Discord webhook, Slack webhook, generic JSON POST (templated body). Rules in
-`[lamb.bark.rules]`: event kinds, restart-loop detection, memory threshold;
+`[dog.bark.rules]`: event kinds, restart-loop detection, memory threshold;
 per-rule debounce/cooldown; **each rule routes to one or more named sinks**
 (per-event routing, must-have #7). Fired alerts append to
 `$SHEP_HOME/barks.jsonl` (size-capped ring) — the data source for
 `shep barks` and the whistle's `list_barks`.
 
-Third-party extensions are treated as lambs once enabled: any binary
+Third-party extensions are treated as dogs once enabled: any binary
 speaking the client wire protocol, registered via
 `shep enable --exec <path> <name>`.
 
@@ -211,10 +213,10 @@ rotation; also SIGUSR2 to the daemon), `muster` (save + resurrect pair:
 `shep muster save` / `shep muster` restores; `resurrect` hidden alias),
 `signal`, `sendline`, `trigger <target> <action>` (custom actions via the
 shepherd channel `action`/`action-reply` messages), `enable`/`disable`
-(lambs), `lambs` (list lambs), `barks` (recent alert history), `fold <name>`
+(dogs), `dogs` (list dogs), `barks` (recent alert history), `fold <name>`
 (list a fold), `lookout` (TUI; `dash` alias), `whistle` (MCP stdio), `serve`,
 `startup`/`unstartup`, `set`/`get`/`unset`, `import`, `dev`, `runtime`,
-`daemon` (hidden), `lamb <name>` (hidden), `kill` (daemon shutdown),
+`daemon` (hidden), `dog <name>` (hidden), `kill` (daemon shutdown),
 `thatlldo` (easter-egg alias for graceful `stop`). Selectors everywhere:
 name, id, `all`, `/regex/`, `fold:<name>`. Global `--format json|table`
 (versioned serde output schema), enumerated exit codes, clap_complete
@@ -295,11 +297,11 @@ Trusted Publishing.
    30s → 15s (cheap via sysinfo, halves worst-case breach latency).
 3. Flockfile TOML-first (Rust ecosystem norm); YAML/JSON accepted; `.js`
    needs node present.
-4. Metrics lamb default port 9615 (pm2's old web port — familiar, unclaimed
+4. Metrics dog default port 9615 (pm2's old web port — familiar, unclaimed
    by IANA; trivially configurable).
 5. `muster` = both save and restore (`muster save` / `muster`); `resurrect`
    kept as hidden alias.
-6. Lambs hidden in default `shep flock` output (badged under `--all`).
+6. Dogs hidden in default `shep flock` output (badged under `--all`).
 7. Whistle control tools gated by daemon config, not CLI flag — config is
    auditable, flags are per-invocation.
 8. `SHEP_INSTANCE` replaces `NODE_APP_INSTANCE` (sheep-native env; importer
@@ -311,5 +313,5 @@ Trusted Publishing.
 11. Daemon idle-footprint goal (single-digit MB RSS) tracked via criterion
     benches + a CI-reported RSS number, not gated in the DoD.
 12. vcs metadata deferred to v1.1; `shep web` deferred to v1.1-if-demand
-    (metrics lamb covers observability) — both were map modules without a
+    (metrics dog covers observability) — both were map modules without a
     ruled version.

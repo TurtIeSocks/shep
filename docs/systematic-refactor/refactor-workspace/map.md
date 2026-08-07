@@ -151,11 +151,11 @@ src/
       Action: port
       Notes: tokio interval tasks: max_memory_restart poll, backoff reset, cron_restart registry
              (croner crate), host metrics cadence. domain → catch_unwind per tick.
-  lamb_support.rs    ← new module (decision #3: lamb architecture)
+  dog_support.rs    ← new module (decision #3: dog architecture)
       Action: write fresh
-      Notes: daemon-side lamb plumbing ONLY: enabled-lambs list in daemon_config → autostart
-             as supervised internal-tagged processes; typed [lamb.<name>] config sections
-             passed through. Metrics + bark logic themselves are lambs in shep-cli (below) —
+      Notes: daemon-side dog plumbing ONLY: enabled-dogs list in daemon_config → autostart
+             as supervised internal-tagged processes; typed [dog.<name>] config sections
+             passed through. Metrics + bark logic themselves are dogs in shep-cli (below) —
              the daemon just exposes bus + monitoring RPCs they consume.
   host_metrics.rs    ← was lib/tools/SysMetrics.js
       Action: replace-with-crate (sysinfo)
@@ -252,15 +252,15 @@ src/
              default; start/stop/restart/reload tools only with --allow-control. Thin layer
              over shep-client — zero daemon changes needed. Decision 6: stdio ships v1
              (dev/debug), HTTP/SSE transport is a committed v1.1 feature.
-  lambs/             ← new modules (decision #3: lamb architecture; hidden `shep lamb <name>`)
+  dogs/             ← new modules (decision #3: dog architecture; hidden `shep dog <name>`)
     metrics.rs       [MUST-HAVE #6]
       Action: write fresh
       Notes: shep-client consumer: polls monitoring RPC + host metrics, serves prometheus
-             /metrics on 127.0.0.1 (port from [lamb.metrics]). Reference Grafana dashboard
+             /metrics on 127.0.0.1 (port from [dog.metrics]). Reference Grafana dashboard
              JSON in assets/. OTLP export behind "otel" feature. Enabled: `shep enable metrics`.
     bark.rs          [MUST-HAVE #7]
       Action: write fresh
-      Notes: bus subscriber → rule engine ([lamb.bark] thresholds: crash, restart-loop,
+      Notes: bus subscriber → rule engine ([dog.bark] thresholds: crash, restart-loop,
              high-mem) → reqwest webhooks: Discord/Slack templates + generic JSON POST.
              Debounce/cooldown per rule. MUST handle bounded-bus drop notices + reconcile by
              polling — alerts never silently vanish.
@@ -333,7 +333,7 @@ CI: fmt+clippy+nextest × {ubuntu,macos,windows} × {stable,MSRV}; llvm-cov; doc
 
 1. **DECIDED: JSON frames v1.** rmp-serde stays a possible later feature; not planned.
 2. **DECIDED**: fd-pipe protocol + probe-based readiness in v1; optional `@shep/io` npm shim v1.1; no Node-IPC emulation.
-3. **DECIDED: lamb architecture.** Module system permanently deleted. Metrics + bark ship as first-party **lambs**: shep-client consumers inside the multi-call binary (`shep lamb metrics`), enabled via `shep enable <lamb>` → daemon-config entry → supervised like any process (lamb-tagged). Third-party extension = any binary speaking the client protocol. TUI/MCP stay client subcommands. See [decision-briefs.md](decision-briefs.md) #3b.
+3. **DECIDED: dog architecture.** Module system permanently deleted. Metrics + bark ship as first-party **dogs**: shep-client consumers inside the multi-call binary (`shep dog metrics`), enabled via `shep enable <dog>` → daemon-config entry → supervised like any process (dog-tagged). Third-party extension = any binary speaking the client protocol. TUI/MCP stay client subcommands. See [decision-briefs.md](decision-briefs.md) #3b.
 4. **DECIDED**: v1 polling behind `LimitEnforcer` trait; cgroup v2 (`enforce = "kernel"`) feature in v1.1.
 5. **DECIDED**: name `shep`, license MIT OR Apache-2.0 (clean-room).
 6. **DECIDED: MCP stdio in v1** (dev/debug use while building), **HTTP/SSE lands v1.1** as a real feature.
