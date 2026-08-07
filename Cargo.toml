@@ -23,14 +23,43 @@ serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 serde-saphyr = { version = "1", default-features = false, features = ["deserialize"] }
+# Transitive floor pins (referenced from shep-core, which depends on serde-saphyr and
+# json5) forcing -Z minimal-versions past bugs where a transitive dep under-declares its
+# own true minimum:
+#   - annotate-snippets 0.12.0/0.12.1/0.12.2 lack `Title::element()`, added in 0.12.3.
+#   - annotate-snippets itself under-declares anstyle as "1.0.4"; it actually needs
+#     `impl Display for Style`, added in anstyle 1.0.5.
+#   - encoding_rs_io 0.1.0/0.1.1 lack `DecodeReaderBytesBuilder::bom_override()`, added
+#     in 0.1.2. Both are pulled in by serde-saphyr's `deserialize` feature.
+#   - pest 2.0.0/2.0.1 lack `error::LineColLocation` and `Error::line_col`, which
+#     json5 0.4.0's error.rs uses despite json5 only declaring pest = "2.0"; present
+#     from pest 2.0.2.
+#   - json5's pest_derive 1.0.2 (pulled in by pest_meta as a bootstrap dependency,
+#     unrelated to the pest 2.x line above) under-declares quote as "^0.3" (floor
+#     0.3.0), but its generated code needs `Tokens::append(impl ToString)` and
+#     `Tokens::as_ref()`, added in quote 0.3.15.
+#   - tokio-util's `tracing` dependency chain pulls in tracing-attributes, which
+#     under-declares syn as "1" (floor 1.0.0) but needs `LitInt::base10_parse`,
+#     added in syn 1.0.1.
+annotate-snippets = { version = "0.12.3", default-features = false }
+anstyle = { version = "1.0.5", default-features = false }
+encoding_rs_io = { version = "0.1.2", default-features = false }
+pest = { version = "2.0.2", default-features = false }
+quote = { version = "0.3.15", default-features = false }
+syn = { version = "1.0.1", default-features = false }
 json5 = { version = "0.4", default-features = false }
 regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
 globset = { version = "0.4", default-features = false }
 tokio = { version = "1", default-features = false }
-tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
+# 0.7.0 has a broken minimum floor: it needs a newer tokio (mpsc `reserve_owned`, absent
+# from tokio 1.0.1) and a working log/tracing bridge (`trace!` fails to resolve under
+# minimal deps). Fixed in 0.7.1, which also pulls in a tokio floor high enough to compile.
+tokio-util = { version = "0.7.1", default-features = false, features = ["codec"] }
 bytes = { version = "1", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-insta = { version = "1", default-features = false, features = ["json"] }
+# 1.18.0 has a JSON-serialization regression with newtype/tuple-variant snapshots (our
+# Result<T, E> reply wire format triggers it), fixed in 1.18.1.
+insta = { version = "1.18.1", default-features = false, features = ["json"] }
 tempfile = { version = "3", default-features = false }
 
 [workspace.lints.rust]

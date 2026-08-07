@@ -12,6 +12,15 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 serde-saphyr.workspace = true
+# Unused directly — forces the transitive floor pins above into resolution (see root
+# Cargo.toml comment). Required only for `-Z minimal-versions`; safe to drop once the
+# corresponding upstream crate corrects its own declared floor.
+annotate-snippets.workspace = true
+anstyle.workspace = true
+encoding_rs_io.workspace = true
+pest.workspace = true
+quote.workspace = true
+syn.workspace = true
 json5.workspace = true
 regex.workspace = true
 tokio-util.workspace = true
