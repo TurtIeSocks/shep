@@ -2,7 +2,9 @@
 //! and the daemon's own `shep.toml`
 
 pub mod app;
+pub mod flockfile;
 pub mod normalize;
 
 pub use app::AppConfig;
+pub use flockfile::{Flockfile, FlockfileError};
 pub use normalize::{ConfigError, ResolvedApp};
