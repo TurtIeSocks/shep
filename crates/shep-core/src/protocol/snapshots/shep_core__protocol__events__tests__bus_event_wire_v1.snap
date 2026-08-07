@@ -1,0 +1,37 @@
+---
+source: crates/shep-core/src/protocol/events.rs
+assertion_line: 121
+expression: events
+---
+[
+  {
+    "event": "process",
+    "data": {
+      "event": "exit",
+      "info": {
+        "id": 3,
+        "name": "web",
+        "status": "waiting-restart",
+        "pid": null,
+        "restarts": 2,
+        "uptime_ms": 500,
+        "fold": null
+      },
+      "manually": false,
+      "at_ms": 1700000000000
+    }
+  },
+  {
+    "event": "log_out",
+    "data": {
+      "id": 3,
+      "line": "listening on :8080"
+    }
+  },
+  {
+    "event": "dropped",
+    "data": {
+      "count": 17
+    }
+  }
+]
