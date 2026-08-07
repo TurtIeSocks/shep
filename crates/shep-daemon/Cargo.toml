@@ -13,7 +13,7 @@ test-fakes = []
 
 [dependencies]
 shep-core.workspace = true
-tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "sync", "net", "macros"] }
+tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "sync", "net", "fs", "macros"] }
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
