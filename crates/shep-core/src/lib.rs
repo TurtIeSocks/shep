@@ -7,5 +7,6 @@
 
 pub mod config;
 pub mod paths;
+pub mod selector;
 pub mod status;
 pub mod values;
