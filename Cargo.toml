@@ -57,12 +57,20 @@ tokio = { version = "1", default-features = false }
 tokio-util = { version = "0.7.1", default-features = false, features = ["codec"] }
 bytes = { version = "1", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# Only shep-daemon: process-group signal delivery and process-related syscalls for the
+# real ProcessRunner (kill ladder, SIGKILL tree).
+nix = { version = "0.29", default-features = false, features = ["signal", "process"] }
+# Only shep-daemon: passes the shepherd-channel socketpair as fd 3 into the spawned child.
+command-fds = { version = "0.3", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 # Our `insta::assert_json_snapshot!` calls in shep-core (protocol::request,
 # protocol::events) snapshot newtype/tuple enum variants (the Result-shaped reply
 # payload); 1.18.0 has a JSON-serialization regression with exactly that shape, fixed
 # in 1.18.1.
 insta = { version = "1.18.1", default-features = false, features = ["json"] }
 tempfile = { version = "3", default-features = false }
+# Only shep-daemon (dev): property tests on the kill ladder / supervisor state machine.
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 missing_docs = "deny"

@@ -7,8 +7,23 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+# Option: expose the scripted fake runner to other crates' tests (2b reuses it).
+test-fakes = []
+
 [dependencies]
 shep-core.workspace = true
+tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "sync", "net", "macros"] }
+nix.workspace = true
+command-fds.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
+proptest.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
