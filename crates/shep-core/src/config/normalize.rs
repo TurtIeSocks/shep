@@ -12,8 +12,21 @@ use crate::config::AppConfig;
 /// A validated app config — only obtainable via [`normalize`]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedApp {
-    /// The validated configuration
-    pub config: AppConfig,
+    config: AppConfig,
+}
+
+impl ResolvedApp {
+    /// Borrow the validated configuration
+    #[must_use]
+    pub fn config(&self) -> &AppConfig {
+        &self.config
+    }
+
+    /// Unwrap the validated configuration (consumes the proof token)
+    #[must_use]
+    pub fn into_config(self) -> AppConfig {
+        self.config
+    }
 }
 
 /// Validates one app config
@@ -99,7 +112,7 @@ mod tests {
     #[test]
     fn valid_minimal_config_normalizes() {
         let resolved = normalize(AppConfig::minimal("web", "./srv")).unwrap();
-        assert_eq!(resolved.config.name, "web");
+        assert_eq!(resolved.config().name, "web");
     }
 
     #[test]
