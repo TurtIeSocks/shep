@@ -14,6 +14,7 @@ pub mod backoff;
 pub mod brain;
 pub mod channel;
 pub mod entry;
+pub mod kill;
 pub mod runner;
 
 /// Real [`ProcessRunner`](runner::ProcessRunner) over actual OS processes.
