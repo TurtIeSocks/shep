@@ -34,12 +34,16 @@ impl ResolvedApp {
 /// # Errors
 ///
 /// - [`NormalizeError::MissingName`] — `name` is empty.
+/// - [`NormalizeError::InvalidName`] — `name` contains a path separator or is `.`/`..`.
 /// - [`NormalizeError::MissingScript`] — `script` is empty.
 /// - [`NormalizeError::ZeroInstances`] — `instances == 0`.
 /// - [`NormalizeError::InvalidCron`] — `cron_restart` is not a 5-field pattern.
 pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
     if app.name.is_empty() {
         return Err(NormalizeError::MissingName);
+    }
+    if app.name.contains(['/', '\\']) || app.name == "." || app.name == ".." {
+        return Err(NormalizeError::InvalidName(app.name));
     }
     if app.script.is_empty() {
         return Err(NormalizeError::MissingScript);
@@ -80,6 +84,9 @@ pub fn normalize_all(apps: Vec<AppConfig>) -> Result<Vec<ResolvedApp>, Normalize
 pub enum NormalizeError {
     /// `name` is empty
     MissingName,
+    /// `name` contains `/` or `\` or is `.`/`..` — it becomes a filesystem
+    /// path stem, so these would escape the shep home (carries the name)
+    InvalidName(String),
     /// `script` is empty
     MissingScript,
     /// `instances` is zero
@@ -94,6 +101,12 @@ impl fmt::Display for NormalizeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingName => f.write_str("app config is missing a name"),
+            Self::InvalidName(n) => {
+                write!(
+                    f,
+                    "sheep name `{n}` may not contain a path separator or be `.` or `..`"
+                )
+            }
             Self::MissingScript => f.write_str("app config is missing a script"),
             Self::ZeroInstances => f.write_str("instances must be at least 1"),
             Self::InvalidCron(p) => write!(f, "invalid cron pattern `{p}`"),
@@ -113,6 +126,19 @@ mod tests {
     fn valid_minimal_config_normalizes() {
         let resolved = normalize(AppConfig::minimal("web", "./srv")).unwrap();
         assert_eq!(resolved.config().name, "web");
+    }
+
+    #[test]
+    fn names_that_reach_the_filesystem_are_rejected() {
+        // A name becomes a log/pid file stem via Path::join; a slash-prefixed
+        // or dotdot name would escape $SHEP_HOME. Reject at the config boundary.
+        for bad in ["/etc/passwd", "..", ".", "a/b", "a\\b"] {
+            assert_eq!(
+                normalize(AppConfig::minimal(bad, "./srv")).unwrap_err(),
+                NormalizeError::InvalidName(bad.to_string())
+            );
+        }
+        assert!(normalize(AppConfig::minimal("web-1", "./srv")).is_ok());
     }
 
     #[test]
