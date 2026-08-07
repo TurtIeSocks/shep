@@ -9,7 +9,9 @@
 #![doc(test(attr(deny(warnings))))]
 #![deny(unsafe_code)]
 
+pub mod backoff;
 pub mod channel;
+pub mod entry;
 pub mod runner;
 
 /// Deterministic scripted [`ProcessRunner`](runner::ProcessRunner), reused by
