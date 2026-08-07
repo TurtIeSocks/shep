@@ -14,7 +14,13 @@ pub use request::{
     Envelope, Hello, HelloAck, HelloReply, ProcessInfo, Reply, Request, Response, RpcError,
     RpcErrorCode, SelectorSpec,
 };
-pub use wire::{WireError, codec, decode_frame, encode_frame};
+pub use wire::{MAX_FRAME_BYTES, WireError, codec, decode_frame, encode_frame};
 
-/// Wire protocol version; bump on any breaking change to serialized shapes
+/// Wire protocol version.
+///
+/// Evolution rule: ADDITIVE optional fields (new serde-defaulted `Option<T>`
+/// fields, new variants behind `#[non_exhaustive]`) keep the version.
+/// Removing, renaming, or retyping anything serialized bumps it, recorded in
+/// the CHANGELOG. Byte fixtures in each protocol module pin the deserialize
+/// direction.
 pub const PROTOCOL_VERSION: u32 = 1;

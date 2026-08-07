@@ -304,4 +304,22 @@ mod tests {
         let back: HelloReply = serde_json::from_str(&json).unwrap();
         assert_eq!(back, refusal);
     }
+
+    #[test]
+    fn v1_reply_fixture_still_deserializes() {
+        // Committed byte fixture, protocol v1 (IR-35).
+        let ok = r#"{"id":1,"result":{"Ok":{"kind":"pong"}}}"#;
+        let reply: Reply = serde_json::from_str(ok).unwrap();
+        assert!(matches!(reply.result, Ok(Response::Pong)));
+        let err = r#"{"id":2,"result":{"Err":{"code":"not_found","message":"no sheep"}}}"#;
+        let reply: Reply = serde_json::from_str(err).unwrap();
+        assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::NotFound);
+    }
+
+    #[test]
+    fn v1_hello_ack_fixture_still_deserializes() {
+        let fixture = r#"{"Ok":{"daemon_version":"0.1.0","protocol":1,"pid":4242}}"#;
+        let ack: HelloReply = serde_json::from_str(fixture).unwrap();
+        assert_eq!(ack.unwrap().pid, 4242);
+    }
 }

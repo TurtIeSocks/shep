@@ -20,6 +20,10 @@ pub struct Flockfile {
     pub apps: Vec<AppConfig>,
 }
 
+// Forward-compat decision (Phase 1 final review): the top level is locked to
+// the `app` key on purpose — a typo'd key must fail loudly. A future schema
+// key (e.g. `version`) gets added HERE explicitly; older binaries then
+// reject newer Flockfiles by design instead of silently ignoring config.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawFlockfile {
