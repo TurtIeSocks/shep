@@ -47,10 +47,10 @@ impl ProcessSelector {
                 .map(Self::Regex)
                 .map_err(|e| SelectorError::BadRegex(e.to_string()));
         }
-        if input.bytes().all(|b| b.is_ascii_digit()) {
-            if let Ok(id) = input.parse() {
-                return Ok(Self::Id(id));
-            }
+        if input.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(id) = input.parse()
+        {
+            return Ok(Self::Id(id));
         }
         Ok(Self::Name(input.to_string()))
     }

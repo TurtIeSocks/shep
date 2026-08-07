@@ -45,10 +45,10 @@ pub fn decide_on_exit(
     }
 
     // Rule 2: exit code matched against stop_exit_codes (ONLY if code.is_some())
-    if let Some(code) = exit.code {
-        if app.stop_exit_codes.contains(&code) {
-            return Decision::CleanStop;
-        }
+    if let Some(code) = exit.code
+        && app.stop_exit_codes.contains(&code)
+    {
+        return Decision::CleanStop;
     }
 
     // Rule 3: autorestart is off

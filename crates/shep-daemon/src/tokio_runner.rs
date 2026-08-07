@@ -259,13 +259,12 @@ where
 /// stdout/stderr — leaving that unread risks the child stalling on a full
 /// pipe once its own stdout buffer backs up.
 async fn open_append(path: &Path) -> Option<tokio::fs::File> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(error) = tokio::fs::create_dir_all(parent).await {
-                tracing::error!(?path, %error, "log directory create failed");
-                return None;
-            }
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = tokio::fs::create_dir_all(parent).await
+    {
+        tracing::error!(?path, %error, "log directory create failed");
+        return None;
     }
 
     match tokio::fs::OpenOptions::new()
