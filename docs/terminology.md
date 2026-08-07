@@ -15,7 +15,7 @@ Free on crates.io (verified 2026-08-07): `shep`, `shepd`, plus reserves `bleat`,
 | the daemon | daemon/supervisor | **the shepherd** (affectionately: the dog) | docs, log messages, TUI header |
 | managed processes (plural/list) | process list | **the flock** — ALWAYS the plural term; never bare plural "sheep" in docs/CLI (kills sg/pl ambiguity; ruled 2026-08-07) | `shep flock` (list), `Flock` type, docs |
 | one managed process (singular) | process/app | **a sheep** (singular ONLY) / process (precise) | docs may say sheep; API types stay `Process`-clear. RESERVED for managed processes |
-| first-party plugin process | plugin/module | **lamb** (pl. lambs) | `shep enable metrics`, `shep lambs` (list), hidden `shep lamb <name>` runs one; `lamb`-tagged in flock listing. Decided 2026-08-07 |
+| plugin process (first-party in-binary, or third-party speaking the client protocol) | plugin/module | **lamb** (pl. lambs) | `shep enable metrics`, `shep enable --exec <path> <name>` (third-party), `shep lambs` (list), hidden `shep lamb <name>` runs one; `lamb`-tagged in flock listing. Decided 2026-08-07 |
 | namespace / group | namespace | **fold** (also: paddock) | `shep fold <name>`, `Fold` type |
 | app config file | ecosystem.config.js | **Flockfile** (`Flockfile.toml` / `.yaml` / `.json`) | config discovery, docs |
 | logs | logs | **bleats** | `shep bleats [--follow]`; `shep logs` stays as alias |
