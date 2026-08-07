@@ -85,7 +85,7 @@ src/
              probe-connect → unlink-if-refused) and reconnect backoff (100ms ×1.5 cap 5s).
   error.rs           ← new (rand idiom)
       Action: write fresh
-      Notes: per-operation small enums (SpawnError, ConnectError, ProtocolError, ConfigError),
+      Notes: per-operation small enums (SpawnError, ConnectError, ProtocolError, NormalizeError),
              Clone+Copy+Debug+PartialEq+Eq where fieldless, manual Display, core::error::Error.
 ```
 
