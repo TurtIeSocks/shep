@@ -125,8 +125,8 @@ impl lands v1.1).
 **Flockfile** (per-app config): TOML preferred, YAML + JSON + JSON5 accepted;
 `.js`
 config via `node -p 'JSON.stringify(require(p))'` (requires node on PATH,
-documented). Discovery order in cwd: `Flockfile.toml`, `Flockfile.yaml`,
-`Flockfile.json`, `flockfile.*`. Schema = `AppConfig` in shep-core
+documented). Discovery order in cwd: `Flockfile.{toml,yaml,yml,json,json5}`
+then lowercase `flockfile.*` in the same order. Schema = `AppConfig` in shep-core
 (schemars-exported JSON schema ships in assets for editor completion). Field
 set per map.md app_spec; sheep-native names, no pm2 aliases.
 
