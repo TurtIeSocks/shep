@@ -48,13 +48,15 @@ pest = { version = "2.0.2", default-features = false }
 quote = { version = "0.3.15", default-features = false }
 syn = { version = "1.0.1", default-features = false }
 json5 = { version = "0.4", default-features = false }
-regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
+# regex 1.8.0's compiled-size accounting lets `selector_spec_oversized_regex_is_rejected`'s
+# huge pattern slip under the 1 MiB `size_limit`; 1.9+ rejects it. Floor to 1.9 so the
+# selector-bridge test holds under `-Z minimal-versions`.
+regex = { version = "1.9", default-features = false, features = ["std", "unicode-perl"] }
 globset = { version = "0.4", default-features = false }
 # `tokio::task::JoinHandle::is_finished` (shep-daemon's fake.rs cancel-safety test uses
-# it to assert a `wait()` future is genuinely still pending before dropping it) isn't
-# present on 1.0-1.16; requesting anything in 1.17-1.26 still resolves no lower than
-# 1.27.0 under `-Z minimal-versions` because those point releases are yanked from
-# crates.io. 1.27 is both the true feature floor and the lowest buildable one.
+# it to assert a `wait()` future is genuinely still pending before dropping it) landed in
+# tokio 1.19.0. Floor to 1.27 — the lowest we've empirically confirmed builds and passes
+# the workspace under `-Z minimal-versions`; safely above the 1.19 feature floor.
 tokio = { version = "1.27", default-features = false }
 # 0.7.0 has a broken minimum floor: it needs a newer tokio (mpsc `reserve_owned`, absent
 # from tokio 1.0.1) and a working log/tracing bridge (`trace!` fails to resolve under
