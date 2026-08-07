@@ -10,6 +10,7 @@
 #![deny(unsafe_code)]
 
 pub mod backoff;
+pub mod brain;
 pub mod channel;
 pub mod entry;
 pub mod runner;
