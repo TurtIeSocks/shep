@@ -117,17 +117,40 @@ struct ProcState {
     /// nobody is awaiting yet, so events firing before OR during a `wait()`
     /// both resolve it.
     signal_notify: Notify,
-    /// Raw signal number recorded by the most recent `record_signal`
+    /// Raw signal number recorded by the most recent explicit `signal()`
+    /// call. A `Shutdown` message does NOT set this (see `record_shutdown`),
+    /// so `wait()`'s fallback naturally reports `StopSignal::Term` for it.
     pending_signal: Mutex<Option<i32>>,
+    /// Every raw signal number an explicit `signal()` call has recorded, in
+    /// call order — read back via [`ScriptedRunner::signals`]. A `Shutdown`
+    /// message does NOT append here, so tests can assert "no `signal()` call
+    /// happened" even though the wait still resolved.
+    signals: Mutex<Vec<i32>>,
     /// Notified on `kill_tree()`; same before-or-during buffering as above
     kill_notify: Notify,
     /// `kill_tree()` call count, read back via [`ScriptedRunner::kill_counts`]
     kill_count: AtomicU32,
+    /// Latches the first resolved outcome so a repeated `wait()` re-reports
+    /// it instead of racing the notify/sleep branches again — matches
+    /// `tokio::process::Child::wait`'s documented repeat-call behavior.
+    resolved: Mutex<Option<ExitOutcome>>,
 }
 
 impl ProcState {
+    /// Records an explicit `signal()` call: appends to the `signals` ledger,
+    /// arms `pending_signal` with the raw number `wait()` should report, and
+    /// wakes a pending (or buffers for a future) wait.
     fn record_signal(&self, raw: i32) {
+        self.signals.lock().unwrap().push(raw);
         *self.pending_signal.lock().unwrap() = Some(raw);
+        self.signal_notify.notify_one();
+    }
+
+    /// A `Shutdown` message resolves an obeys_signal wait exactly like
+    /// `signal()` would (falling back to `StopSignal::Term` since
+    /// `pending_signal` is left untouched), but is NOT itself an explicit
+    /// `signal()` call: it never appears in `signals`.
+    fn record_shutdown(&self) {
         self.signal_notify.notify_one();
     }
 
@@ -150,10 +173,12 @@ impl fmt::Debug for ProcState {
 
 /// A single scripted live child produced by [`ScriptedRunner::spawn`]
 ///
-/// `Clone`s share the same underlying state (see [`ProcState`]), which lets
-/// one handle drive `wait()` on a spawned task while another delivers
-/// `signal()`/`kill_tree()` concurrently — the pattern the daemon's kill
-/// ladder uses against the real runner too.
+/// `Clone`s share the same underlying state (private `ProcState`, held in an
+/// `Arc`), which lets one handle drive `wait()` on a spawned task while
+/// another delivers `signal()`/`kill_tree()` concurrently — the pattern the
+/// daemon's kill ladder uses against the real runner too. A control event
+/// (signal, shutdown, kill) resolves exactly ONE waiting `wait()` call, not
+/// every clone independently — `tokio::sync::Notify::notify_one` semantics.
 #[derive(Debug, Clone)]
 pub struct FakeProc {
     pid: u32,
@@ -166,10 +191,14 @@ impl RunningProcess for FakeProc {
     }
 
     async fn wait(&mut self) -> ExitOutcome {
+        if let Some(outcome) = *self.state.resolved.lock().unwrap() {
+            return outcome;
+        }
+
         // Every branch resolves the wait, so this select! never re-loops: a signal
         // this wait doesn't obey simply isn't a candidate branch (the `if` guard),
         // it doesn't fall through to a retry.
-        tokio::select! {
+        let outcome = tokio::select! {
             () = sleep_until(self.state.exit_deadline) => self.state.outcome,
             () = self.state.signal_notify.notified(), if self.state.obeys_signal => {
                 let raw = self.state.pending_signal.lock().unwrap().take();
@@ -181,7 +210,9 @@ impl RunningProcess for FakeProc {
             () = self.state.kill_notify.notified() => {
                 ExitOutcome { code: None, signal: Some(StopSignal::Kill.as_raw()) }
             }
-        }
+        };
+        *self.state.resolved.lock().unwrap() = Some(outcome);
+        outcome
     }
 
     fn signal(&mut self, sig: StopSignal) -> Result<(), RunnerError> {
@@ -195,15 +226,21 @@ impl RunningProcess for FakeProc {
     }
 }
 
+/// One spawn's shared state plus its still-unclaimed [`FakeIo`] test handles
+struct SpawnedProc {
+    state: Arc<ProcState>,
+    io: Option<FakeIo>,
+}
+
 /// Deterministic fake [`ProcessRunner`] driven by a pre-scripted [`ProcScript`] per spawn.
-//
-// WHY: deterministic + instant under the paused tokio clock; real OS process
-// behavior is covered only by `tests/real_runner.rs` (added when the real
-// runner lands).
 pub struct ScriptedRunner {
     scripts: Mutex<VecDeque<ProcScript>>,
-    procs: Mutex<Vec<Arc<ProcState>>>,
-    io: Mutex<Vec<Option<FakeIo>>>,
+    /// State + IO for every spawn, indexed by spawn order, behind ONE lock.
+    /// Two separate `Mutex`es here (one for state, one for IO) would let
+    /// concurrent spawns interleave their critical sections and desync a
+    /// proc's state from its `FakeIo` at the same index; one lock makes
+    /// "assign the next index, push both pieces" atomic.
+    spawned: Mutex<Vec<SpawnedProc>>,
 }
 
 impl fmt::Debug for ScriptedRunner {
@@ -218,8 +255,7 @@ impl ScriptedRunner {
     pub fn new(scripts: Vec<ProcScript>) -> Self {
         Self {
             scripts: Mutex::new(scripts.into_iter().collect()),
-            procs: Mutex::new(Vec::new()),
-            io: Mutex::new(Vec::new()),
+            spawned: Mutex::new(Vec::new()),
         }
     }
 
@@ -227,12 +263,31 @@ impl ScriptedRunner {
     /// kill-assertion accessor.
     #[must_use]
     pub fn kill_counts(&self) -> Vec<u32> {
-        self.procs
+        self.spawned
             .lock()
             .unwrap()
             .iter()
-            .map(|state| state.kill_count.load(Ordering::SeqCst))
+            .map(|p| p.state.kill_count.load(Ordering::SeqCst))
             .collect()
+    }
+
+    /// Every raw signal number an explicit `signal()` call has recorded for
+    /// the proc spawned at `spawn_index`, in call order. A `Shutdown`
+    /// message never appears here — only real `RunningProcess::signal`
+    /// calls do, so this and a resolved `ExitOutcome` together distinguish
+    /// "signalled" from "shut down over the channel".
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[must_use]
+    pub fn signals(&self, spawn_index: usize) -> Vec<i32> {
+        self.spawned.lock().unwrap()[spawn_index]
+            .state
+            .signals
+            .lock()
+            .unwrap()
+            .clone()
     }
 
     /// Takes the [`FakeIo`] test-side handles for the proc spawned at `spawn_index`
@@ -242,11 +297,11 @@ impl ScriptedRunner {
     /// If `spawn_index` is out of range or its `FakeIo` was already taken.
     #[must_use]
     pub fn io_handles(&self, spawn_index: usize) -> FakeIo {
-        self.io
+        self.spawned
             .lock()
             .unwrap()
             .get_mut(spawn_index)
-            .and_then(Option::take)
+            .and_then(|p| p.io.take())
             .expect("io_handles: no unclaimed IO bundle at this spawn index")
     }
 }
@@ -268,8 +323,10 @@ impl ProcessRunner for ScriptedRunner {
             obeys_signal: script.obeys_signal,
             signal_notify: Notify::new(),
             pending_signal: Mutex::new(None),
+            signals: Mutex::new(Vec::new()),
             kill_notify: Notify::new(),
             kill_count: AtomicU32::new(0),
+            resolved: Mutex::new(None),
         });
 
         let (logs_tx, logs_rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -278,15 +335,17 @@ impl ProcessRunner for ScriptedRunner {
         let (relay_tx, relay_rx) = mpsc::channel(CHANNEL_CAPACITY);
 
         // Relay task: the fake watches its own to_child stream so a `Shutdown`
-        // message resolves an obeys_signal wait (Term) exactly like `signal()`
-        // would, while still forwarding every message onward so tests can
-        // independently observe daemon→child traffic via `FakeIo::to_child_rx`.
+        // message resolves an obeys_signal wait (falling back to Term) exactly
+        // like `signal()` would — but via `record_shutdown`, NOT `record_signal`,
+        // so it never shows up in `ScriptedRunner::signals`. Every message is
+        // also forwarded onward so tests can independently observe daemon→child
+        // traffic via `FakeIo::to_child_rx`.
         let relay_state = Arc::clone(&state);
         tokio::spawn(async move {
             let mut raw_rx = raw_to_child_rx;
             while let Some(msg) = raw_rx.recv().await {
                 if msg == ShepherdMessage::Shutdown {
-                    relay_state.record_signal(StopSignal::Term.as_raw());
+                    relay_state.record_shutdown();
                 }
                 if relay_tx.send(msg).await.is_err() {
                     break; // observer dropped FakeIo::to_child_rx; stop relaying
@@ -294,15 +353,17 @@ impl ProcessRunner for ScriptedRunner {
             }
         });
 
-        let mut procs = self.procs.lock().unwrap();
-        let index = procs.len();
-        procs.push(Arc::clone(&state));
-        drop(procs);
-        self.io.lock().unwrap().push(Some(FakeIo {
-            logs_tx,
-            from_child_tx,
-            to_child_rx: relay_rx,
-        }));
+        let mut spawned = self.spawned.lock().unwrap();
+        let index = spawned.len();
+        spawned.push(SpawnedProc {
+            state: Arc::clone(&state),
+            io: Some(FakeIo {
+                logs_tx,
+                from_child_tx,
+                to_child_rx: relay_rx,
+            }),
+        });
+        drop(spawned);
 
         let proc_io = ProcIo {
             logs: logs_rx,
@@ -479,6 +540,9 @@ mod tests {
                 signal: Some(StopSignal::Term.as_raw())
             }
         );
+        // A Shutdown message is not an explicit signal() call (IMPORTANT-3): it
+        // resolves the wait via record_shutdown, which never touches `signals`.
+        assert!(runner.signals(0).is_empty());
 
         let observed = fake_io.to_child_rx.recv().await.unwrap();
         assert_eq!(observed, ShepherdMessage::Shutdown);
@@ -504,5 +568,23 @@ mod tests {
         io.to_child.send(sent.clone()).await.unwrap();
         let observed = fake_io.to_child_rx.recv().await.unwrap();
         assert_eq!(observed, sent);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_wait_returns_the_same_cached_outcome() {
+        // MINOR-8 regression guard: a second wait() must re-report the latched
+        // outcome instead of racing the (already-fired) select! branches again.
+        let runner = ScriptedRunner::new(vec![ProcScript::const_exit(3)]);
+        let (mut proc, _io) = runner.spawn(&spec()).unwrap();
+        let first = proc.wait().await;
+        let second = proc.wait().await;
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            ExitOutcome {
+                code: Some(3),
+                signal: None
+            }
+        );
     }
 }

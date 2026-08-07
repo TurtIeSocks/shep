@@ -84,16 +84,23 @@ pub struct ProcIo {
 }
 
 /// A live child.
-///
-/// # Cancellation safety
-///
-/// [`RunningProcess::wait`]'s future is explicitly `Send` (RPITIT) because
-/// the sheep task that owns the proc is `tokio::spawn`'ed.
 pub trait RunningProcess: Send + 'static {
     /// The OS process id
     fn pid(&self) -> u32;
 
     /// Resolves exactly once with the exit outcome
+    ///
+    /// # Cancellation safety
+    ///
+    /// Dropping the returned future and calling `wait` again is safe: it
+    /// neither restarts the wait nor loses whatever progress was already
+    /// made toward it. [`tokio::process::Child::wait`] documents this
+    /// guarantee for real children; the scripted fake mirrors it by fixing
+    /// its exit deadline once, at spawn time, rather than recomputing it on
+    /// each `wait` call.
+    ///
+    /// The future is also explicitly `Send` (RPITIT) because the sheep task
+    /// that owns the proc is `tokio::spawn`'ed.
     fn wait(&mut self) -> impl core::future::Future<Output = ExitOutcome> + Send;
 
     /// Sends a signal
@@ -117,6 +124,10 @@ pub trait ProcessRunner: Send + Sync + 'static {
     type Proc: RunningProcess;
 
     /// Spawns per the spec, returning the proc + its IO bundle
+    ///
+    /// Must be called from within a Tokio runtime context: both
+    /// implementations (the scripted fake and the real runner) spawn
+    /// background tasks internally to pump IO.
     ///
     /// # Errors
     ///

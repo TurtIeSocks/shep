@@ -14,11 +14,20 @@ test-fakes = []
 [dependencies]
 shep-core.workspace = true
 tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "sync", "net", "macros"] }
-nix.workspace = true
-command-fds.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+# nix is #![cfg(unix)] internally and command-fds does unconditional unix-only fd
+# plumbing, so both would fail to compile on a Windows CI leg. Rin's Windows ruling:
+# the pure tier (this crate's types/traits/fake) compiles everywhere; the OS tier
+# (signal delivery, fd-passing) is unix-only for now. Nothing in this crate calls
+# either yet — Task 7's tokio_runner.rs/kill.rs (the real runner + kill ladder) is
+# what will actually use them, and those modules must themselves be `#[cfg(unix)]`
+# when they land, matching this dependency gate.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+command-fds.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
