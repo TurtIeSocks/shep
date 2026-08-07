@@ -1219,7 +1219,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `AppConfig` (Task 6).
-- Produces: `pub fn normalize(app: AppConfig) -> Result<ResolvedApp, ConfigError>`; `pub struct ResolvedApp { pub config: AppConfig }` (newtype proof-of-validation; fields accessed through `config`); `pub enum ConfigError { MissingName, MissingScript, ZeroInstances, InvalidCron(String), DuplicateName(String) }` + `pub fn normalize_all(apps: Vec<AppConfig>) -> Result<Vec<ResolvedApp>, ConfigError>` (adds duplicate-name detection).
+- Produces: `pub fn normalize(app: AppConfig) -> Result<ResolvedApp, ConfigError>`; `pub struct ResolvedApp` with PRIVATE `config` field + accessors `config(&self) -> &AppConfig` / `into_config(self) -> AppConfig` (a public field would let any crate forge the proof token — caught in execution review); `pub enum ConfigError { MissingName, MissingScript, ZeroInstances, InvalidCron(String), DuplicateName(String) }` + `pub fn normalize_all(apps: Vec<AppConfig>) -> Result<Vec<ResolvedApp>, ConfigError>` (adds duplicate-name detection).
 
 - [ ] **Step 1: Write failing tests** — `config/normalize.rs`:
 
@@ -2447,8 +2447,12 @@ pub enum ProcessEventKind {
 /// strings from [`BusEvent::topic`] (`process.exit`, `log.out`, `daemon.*` —
 /// spec §6 grammar). Phase 2's server-side filter globs against `topic()`.
 // wire format: changing existing variants is a breaking change
+// NOTE (execution correction): internally-tagged `tag = "event"` cannot
+// compile — Process's own `event` field collides with the internal tag
+// (serde_derive error). Shipped shape is ADJACENTLY tagged, matching
+// Response's convention:
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
+#[serde(tag = "event", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BusEvent {
     /// Lifecycle event for one sheep

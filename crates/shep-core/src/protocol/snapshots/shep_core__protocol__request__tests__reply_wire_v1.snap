@@ -1,0 +1,43 @@
+---
+source: crates/shep-core/src/protocol/request.rs
+assertion_line: 248
+expression: replies
+---
+[
+  {
+    "id": 1,
+    "result": {
+      "Ok": {
+        "kind": "pong"
+      }
+    }
+  },
+  {
+    "id": 2,
+    "result": {
+      "Ok": {
+        "kind": "flock",
+        "data": [
+          {
+            "id": 3,
+            "name": "web",
+            "status": "online",
+            "pid": 4242,
+            "restarts": 1,
+            "uptime_ms": 60000,
+            "fold": "backend"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 3,
+    "result": {
+      "Err": {
+        "code": "not_found",
+        "message": "no sheep matches `web`"
+      }
+    }
+  }
+]

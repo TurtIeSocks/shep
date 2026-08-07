@@ -1,0 +1,80 @@
+---
+source: crates/shep-core/src/protocol/request.rs
+assertion_line: 232
+expression: requests
+---
+[
+  {
+    "id": 1,
+    "deadline_ms": 5000,
+    "body": {
+      "kind": "ping"
+    }
+  },
+  {
+    "id": 2,
+    "deadline_ms": null,
+    "body": {
+      "kind": "list_flock"
+    }
+  },
+  {
+    "id": 3,
+    "deadline_ms": null,
+    "body": {
+      "kind": "stop",
+      "selector": {
+        "kind": "name",
+        "value": "web"
+      }
+    }
+  },
+  {
+    "id": 4,
+    "deadline_ms": null,
+    "body": {
+      "kind": "start",
+      "apps": [
+        {
+          "name": "web",
+          "script": "./srv",
+          "args": [],
+          "cwd": null,
+          "interpreter": null,
+          "env": {},
+          "instances": 1,
+          "autorestart": true,
+          "autostart": true,
+          "stop_exit_codes": [],
+          "min_uptime": "1s",
+          "max_restarts": 16,
+          "restart_delay": null,
+          "exp_backoff_restart_delay": null,
+          "kill_signal": null,
+          "kill_timeout": "1600",
+          "shutdown_with_message": false,
+          "listen_timeout": "3s",
+          "graceful_timeout": "8s",
+          "max_memory": null,
+          "watch": false,
+          "ignore_watch": [],
+          "watch_delay": null,
+          "cron_restart": null,
+          "fold": null,
+          "user": null,
+          "group": null,
+          "out_file": null,
+          "err_file": null,
+          "merge_logs": false,
+          "wait_ready": false,
+          "reuse_port": false,
+          "readiness_probe": null,
+          "liveness_probe": null,
+          "watch_options": [],
+          "cron_timezone": null,
+          "increment_var": null
+        }
+      ]
+    }
+  }
+]
