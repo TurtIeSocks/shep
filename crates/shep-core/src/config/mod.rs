@@ -6,7 +6,7 @@ pub mod daemon;
 pub mod flockfile;
 pub mod normalize;
 
-pub use app::AppConfig;
+pub use app::{AppConfig, ProbeConfig, ProbeKind};
 pub use daemon::{DaemonConfig, DaemonConfigError};
-pub use flockfile::{Flockfile, FlockfileError};
-pub use normalize::{NormalizeError, ResolvedApp};
+pub use flockfile::{FlockFormat, Flockfile, FlockfileError, discover};
+pub use normalize::{NormalizeError, ResolvedApp, normalize, normalize_all};

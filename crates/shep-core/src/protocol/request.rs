@@ -62,7 +62,8 @@ pub enum Request {
     },
     /// Register + start apps
     Start {
-        /// Validated app configs (client normalizes before sending)
+        /// App configs — the daemon MUST re-normalize (peer input is
+        /// untrusted); failures return [`RpcErrorCode::InvalidConfig`]
         apps: Vec<AppConfig>,
     },
     /// Stop matching sheep (stay registered)

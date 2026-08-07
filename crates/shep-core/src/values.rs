@@ -178,6 +178,11 @@ impl UpDuration {
     #[inline]
     #[must_use]
     pub const fn as_millis(self) -> u64 {
+        // Sound: every constructor bounds millis to u64 (`from_millis`
+        // stores its u64 argument directly; `FromStr` reaches this type
+        // only through a `checked_mul` that already fits in u64). Revisit
+        // if a constructor from a raw `Duration` is ever added — that could
+        // carry more than u64::MAX milliseconds.
         self.0.as_millis() as u64
     }
 }
@@ -357,7 +362,11 @@ mod up_duration_tests {
         assert_eq!("30S".parse::<UpDuration>(), Err(InvalidCharacter)); // uppercase
         assert_eq!("1.5s".parse::<UpDuration>(), Err(InvalidCharacter));
         assert_eq!("30 s".parse::<UpDuration>(), Err(InvalidCharacter));
+        // Digit string itself overflows u64 before any unit multiplication.
         assert_eq!("99999999999999999999h".parse::<UpDuration>(), Err(Overflow));
+        // Digit string fits u64 on its own, but overflows on the ×3_600_000
+        // (hours-to-ms) multiplication.
+        assert_eq!("9999999999999999h".parse::<UpDuration>(), Err(Overflow));
     }
 
     #[test]

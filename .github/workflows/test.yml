@@ -35,4 +35,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
-      - run: cargo +${{ matrix.toolchain }} test --workspace
+      - run: cargo +${{ matrix.toolchain }} test --workspace --locked
