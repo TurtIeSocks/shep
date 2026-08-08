@@ -46,7 +46,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
@@ -136,16 +135,22 @@ pub fn pidfile(paths: &ShepPaths) -> PathBuf {
 /// crate-private `PidfileLock::record` instead, writing in place into the
 /// SAME open, locked file descriptor it already holds — a rename here
 /// would swap in an unlocked inode and undo that lock's whole point (see
-/// `PidfileLock`'s own doc, next to its definition in this file). This
-/// function stays for callers that
-/// legitimately want a standalone, lock-free pidfile write — this crate's
-/// own tests use it to seed a fixture pidfile without contending for the
-/// boot-time lock at all.
+/// `PidfileLock`'s own doc, next to its definition in this file).
+///
+/// Test-only, and deliberately so. Its only remaining use is seeding a
+/// fixture pidfile without contending for the boot-time lock. Exported, it
+/// would be a footgun: a rename over the locked path by any outside caller
+/// silently disarms `PidfileLock` for the rest of that daemon's life. The
+/// Phase 3 CLI has no need for it either — it learns the daemon's pid from
+/// the handshake's `HelloAck`, not from this file.
 ///
 /// # Errors
 /// - [`BootError::Io`] — the pidfile could not be written.
-pub fn write_pidfile(paths: &ShepPaths, pid: u32) -> Result<(), BootError> {
+#[cfg(test)]
+fn write_pidfile(paths: &ShepPaths, pid: u32) -> Result<(), BootError> {
     use std::io::Write;
+
+    use tempfile::NamedTempFile;
 
     let path = pidfile(paths);
     let mut tmp = NamedTempFile::new_in(&paths.pids).map_err(|source| BootError::Io {
