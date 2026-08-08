@@ -35,7 +35,21 @@ use tempfile::TempDir;
 /// Bound on every `shep` invocation in this file. `assert_cmd`'s
 /// `.output()` blocks unbounded without it; case 7 (`bleats --no-follow`)
 /// is the live hazard, since its regression mode is following forever.
-const CMD_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Must outlive [`shep_client::spawn::SPAWN_DEADLINE`], not merely equal it
+/// (whole-branch review item 5): the autostart path
+/// (`shep_client::spawn::probe_until_ready`, `spawn.rs:298`->`:328`) can run
+/// right up to that whole budget before it ever reports
+/// `DaemonUnreachable`, plus this binary's own write-and-exit overhead on
+/// top — roughly 35s end to end. A `CMD_TIMEOUT` merely equal to
+/// `SPAWN_DEADLINE` races `assert_cmd`'s own kill against that report; on a
+/// loaded machine the kill can win, and this harness would then observe a
+/// killed process instead of the exit-5 failure it meant to exercise. The
+/// extra margin below is headroom for that overhead, not a second deadline
+/// — expressed as an offset from `SPAWN_DEADLINE` rather than a bare number
+/// so the relationship stays visible if either budget ever moves.
+const CMD_TIMEOUT: Duration =
+    Duration::from_secs(shep_client::spawn::SPAWN_DEADLINE.as_secs() + 15);
 
 /// How long [`bleats_no_follow_until_written`] keeps retrying.
 const BLEATS_DEADLINE: Duration = Duration::from_secs(10);
