@@ -20,11 +20,9 @@ use super::Render;
 /// rule forbids implementing our `Render` on it directly. `transparent` so
 /// the JSON is a plain array of `ProcessInfo`, not a wrapper object.
 ///
-/// Not constructed outside this module's own tests yet: `commands/query.rs`
-/// and `commands/lifecycle.rs`, which build one from a real `Response`, are
-/// Tasks 8-9. `#[allow(dead_code)]` says so explicitly rather than
-/// inventing a call site nothing needs yet.
-#[allow(dead_code)]
+/// Constructed by `commands/query.rs`'s `flock`/`describe_selector` and
+/// `commands/lifecycle.rs`'s `start`/`stop`/`restart`, each from a real
+/// `Response`.
 #[derive(Debug, Serialize)]
 #[serde(transparent)]
 pub struct FlockRows(pub Vec<ProcessInfo>);
@@ -107,11 +105,8 @@ impl Render for DeletedIds {
 
 /// `ping`: the daemon identity the handshake already told us.
 ///
-/// Not constructed outside this module's own tests yet: `commands/query.rs`'s
-/// `ping`, which builds one from a real `HelloAck`, is Task 9.
-/// `#[allow(dead_code)]` says so explicitly rather than inventing a call
-/// site nothing needs yet.
-#[allow(dead_code)]
+/// Constructed by `commands/query.rs`'s `ping`, from the real `HelloAck`
+/// `Client::daemon` holds.
 #[derive(Debug, Serialize)]
 pub struct PingRow {
     /// Daemon crate version, read off the handshake `HelloAck`.

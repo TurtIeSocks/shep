@@ -196,10 +196,24 @@ pub async fn ping(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> Ex
 
 #[cfg(test)]
 mod tests {
-    use shep_client::testing::{fake_client_capturing_envelopes, fake_client_with_ack};
+    use std::time::Duration;
+
+    use shep_client::testing::{
+        fake_client_capturing_envelopes, fake_client_with_ack, sample_ack, sample_info,
+    };
     use shep_core::protocol::{HelloAck, PROTOCOL_VERSION};
 
     use super::*;
+
+    /// Every `envelopes.recv()` in this module is bounded by this timeout
+    /// rather than left to run to completion — the same rule
+    /// `commands::lifecycle`'s tests apply
+    /// (`crates/shep-cli/src/commands/lifecycle.rs:613,652`) and this module
+    /// originally skipped: a Task 9 reviewer mutated `ping` to render from
+    /// `client.daemon()` without issuing the request, and the test meant to
+    /// catch that hung past 90 seconds instead of failing. A test that fails
+    /// by hanging gives CI a killed job, not a named assertion.
+    const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// `flock` must send `Request::ListFlock` and nothing else — the same
     /// class of guard Task 8's reviewer found missing for `restart` and
@@ -218,7 +232,10 @@ mod tests {
             err: &mut err,
         };
         let _ = flock(&client, &mut streams, Format::Table).await;
-        let sent = envelopes.recv().await.unwrap();
+        let sent = tokio::time::timeout(RECV_TIMEOUT, envelopes.recv())
+            .await
+            .expect("flock must reach the wire; it hung instead of sending a request")
+            .unwrap();
         assert_eq!(sent.body, Request::ListFlock);
     }
 
@@ -250,7 +267,12 @@ mod tests {
                 selector: input.into(),
             };
             let _ = describe(&client, &mut streams, Format::Table, &args).await;
-            let sent = envelopes.recv().await.unwrap();
+            let sent = tokio::time::timeout(RECV_TIMEOUT, envelopes.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("describe({input}) must reach the wire; it hung instead of sending a request")
+                })
+                .unwrap();
             assert_eq!(
                 sent.body,
                 Request::Describe { selector: expected },
@@ -313,7 +335,10 @@ mod tests {
             &FoldArgs { name: "api".into() },
         )
         .await;
-        let sent = envelopes.recv().await.unwrap();
+        let sent = tokio::time::timeout(RECV_TIMEOUT, envelopes.recv())
+            .await
+            .expect("fold must reach the wire; it hung instead of sending a request")
+            .unwrap();
         assert_eq!(
             sent.body,
             Request::Describe {
@@ -368,6 +393,83 @@ mod tests {
             err: &mut err,
         };
         let _ = ping(&client, &mut streams, Format::Table).await;
-        assert_eq!(envelopes.recv().await.unwrap().body, Request::Ping);
+        let sent = tokio::time::timeout(RECV_TIMEOUT, envelopes.recv())
+            .await
+            .expect("ping must reach the wire; it hung instead of sending a request")
+            .unwrap();
+        assert_eq!(sent.body, Request::Ping);
+    }
+
+    /// Proves the `Response::Flock` arm inside `flock`'s own `extract`
+    /// closure is wired to the right variant, not merely that some payload
+    /// renders as `FlockRows` in isolation (`output/rows.rs`'s own tests
+    /// already cover that) and not merely that the right request went out
+    /// (`flock_asks_the_daemon_to_list_the_whole_flock`, above, covers
+    /// that). `Response::Flock` and `Response::Described` both wrap a bare
+    /// `Vec<ProcessInfo>`, so a match arm swapped between them compiles
+    /// clean and passes every other test in this file — this is the one
+    /// that fails: `FakeDaemon::reply_to_list` scripts a real
+    /// `Response::Flock`, not the `Response::Pong` every other fake in this
+    /// module hands back regardless of what was sent.
+    #[tokio::test]
+    async fn flock_response_round_trips_into_rendered_flock_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_ack(&path, sample_ack()).await;
+        daemon.reply_to_list(vec![sample_info()]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            flock(&client, &mut streams, Format::Json).await
+        };
+
+        assert_eq!(code, ExitCode::Success);
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["command"], "flock");
+        assert_eq!(json["data"][0]["name"], "web");
+    }
+
+    /// Proves the `Response::Described` arm inside `describe_selector`'s
+    /// `extract` closure is wired to the right variant, by the same
+    /// reasoning as the test above — and, since `fold` delegates straight
+    /// to `describe_selector` rather than duplicating it, this covers
+    /// `fold`'s wiring too without a third fake-daemon round trip. Also
+    /// covers Minor 5: `describe` and `fold` share this one code path and
+    /// this one `command` string parameter, so an envelope with `"describe"`
+    /// and `"fold"` swapped would otherwise go unasserted.
+    #[tokio::test]
+    async fn describe_response_round_trips_into_rendered_flock_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_ack(&path, sample_ack()).await;
+        daemon.reply_to_describe(vec![sample_info()]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            describe(
+                &client,
+                &mut streams,
+                Format::Json,
+                &SelectorArgs {
+                    selector: "all".into(),
+                },
+            )
+            .await
+        };
+
+        assert_eq!(code, ExitCode::Success);
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["command"], "describe");
+        assert_eq!(json["data"][0]["name"], "web");
     }
 }

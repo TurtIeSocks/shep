@@ -203,12 +203,15 @@ enum OutOfOrder {
 /// A scripted daemon over one accepted connection.
 ///
 /// [`Self::reply_to_list`] arms the answer to the next `Request::ListFlock`;
+/// [`Self::reply_to_describe`] arms the answer to the next
+/// `Request::Describe { .. }` (the shape both `describe` and `fold` send);
 /// [`Self::list_flock_count`] reports how many `ListFlock` requests this
 /// connection has answered, so a test can prove a client cached rather than
 /// re-asked; [`Self::close`] ends the script and drops the connection.
 /// Every other request this fake receives is answered with
 /// `Response::Pong` — good enough for a test that only cares about
-/// `ListFlock` behavior, or about a request getting *some* prompt reply.
+/// `ListFlock`/`Describe` behavior, or about a request getting *some*
+/// prompt reply.
 /// [`Self::push`], [`Self::overrun_by`] and [`Self::queue_reply_then_event`]
 /// drive this connection's event side: a real `Request::Subscribe` is
 /// always answered with `Response::Subscribed` and switches the connection
@@ -224,6 +227,7 @@ enum OutOfOrder {
 pub struct FakeDaemon {
     script: mpsc::Sender<ScriptCommand>,
     armed_list: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
+    armed_describe: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
     armed_reply_then_event: Arc<Mutex<Option<(Response, BusEvent)>>>,
     list_flock_count: Arc<AtomicU64>,
     task: JoinHandle<()>,
@@ -240,6 +244,17 @@ impl FakeDaemon {
     /// lets this stay a plain fn instead.
     pub fn reply_to_list(&self, flock: Vec<ProcessInfo>) {
         *self.armed_list.lock().unwrap() = Some(flock);
+    }
+
+    /// Arms the answer to the next `Request::Describe { .. }` this
+    /// connection receives, regardless of the selector inside it —
+    /// `describe` and `fold` both send this request shape, and this fake
+    /// scripts the reply the same way for either.
+    ///
+    /// Synchronous for the same reason [`Self::reply_to_list`] is: every
+    /// call site invokes it without `.await`.
+    pub fn reply_to_describe(&self, procs: Vec<ProcessInfo>) {
+        *self.armed_describe.lock().unwrap() = Some(procs);
     }
 
     /// How many `Request::ListFlock` envelopes this connection has
@@ -319,7 +334,8 @@ impl FakeDaemon {
 /// subscribed state, and flushes anything [`ScriptCommand::PushEvent`]
 /// queued before now; else `ListFlock` is answered per
 /// [`FakeDaemon::reply_to_list`] (or `Flock(vec![])` if nothing is armed);
-/// else `Response::Pong`.
+/// else `Describe { .. }` is answered per [`FakeDaemon::reply_to_describe`]
+/// (or `Described(vec![])` if nothing is armed); else `Response::Pong`.
 ///
 /// A [`ScriptCommand::PushEvent`] arriving outside a request turn is
 /// written straight to the wire once subscribed, or buffered until then —
@@ -329,6 +345,7 @@ async fn serve_scripted(
     ack: HelloAck,
     mut script: mpsc::Receiver<ScriptCommand>,
     armed_list: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
+    armed_describe: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
     armed_reply_then_event: Arc<Mutex<Option<(Response, BusEvent)>>>,
     list_flock_count: Arc<AtomicU64>,
 ) {
@@ -407,6 +424,10 @@ async fn serve_scripted(
                             let response = if matches!(envelope.body, Request::ListFlock) {
                                 list_flock_count.fetch_add(1, Ordering::SeqCst);
                                 Response::Flock(armed_list.lock().unwrap().take().unwrap_or_default())
+                            } else if matches!(envelope.body, Request::Describe { .. }) {
+                                Response::Described(
+                                    armed_describe.lock().unwrap().take().unwrap_or_default(),
+                                )
                             } else {
                                 Response::Pong
                             };
@@ -432,6 +453,7 @@ pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDa
     let listener = UnixListener::bind(path).unwrap();
     let (script_tx, script_rx) = mpsc::channel(SCRIPT_CHANNEL_CAPACITY);
     let armed_list = Arc::new(Mutex::new(None));
+    let armed_describe = Arc::new(Mutex::new(None));
     let armed_reply_then_event = Arc::new(Mutex::new(None));
     let list_flock_count = Arc::new(AtomicU64::new(0));
     let task = tokio::spawn(serve_scripted(
@@ -439,6 +461,7 @@ pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDa
         ack,
         script_rx,
         Arc::clone(&armed_list),
+        Arc::clone(&armed_describe),
         Arc::clone(&armed_reply_then_event),
         Arc::clone(&list_flock_count),
     ));
@@ -448,6 +471,7 @@ pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDa
         FakeDaemon {
             script: script_tx,
             armed_list,
+            armed_describe,
             armed_reply_then_event,
             list_flock_count,
             task,
