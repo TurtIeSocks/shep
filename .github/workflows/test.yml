@@ -1,8 +1,16 @@
 name: test
+# Manual-only while the repository is private. Actions minutes on a private
+# repo bill macOS at 10x and Windows at 2x, and one run of this file is 15
+# jobs — six of them on those two platforms. Run it from the Actions tab
+# when you want it.
+#
+# Restore the automatic triggers when the repository goes public, where
+# Actions is free:
+#   push: { branches: [main] }
+#   pull_request:
+#   schedule: [{ cron: "0 0 * * SUN" }]
 on:
-  push: { branches: [main] }
-  pull_request:
-  schedule: [{ cron: "0 0 * * SUN" }]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
