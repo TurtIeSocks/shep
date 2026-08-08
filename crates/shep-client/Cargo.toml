@@ -7,12 +7,6 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
-[features]
-# Exposes `testing` (the hand-rolled fakes) to shep-cli's tests. Mirrors
-# shep-daemon's `test-fakes` (`crates/shep-daemon/Cargo.toml:12`), which does
-# the same job for the scripted runner.
-test-support = []
-
 [dependencies]
 shep-core.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros"] }
@@ -21,6 +15,11 @@ tokio-stream.workspace = true   # wrappers::BroadcastStream, for the event-bus s
 futures-util.workspace = true
 
 [dev-dependencies]
+# The hand-rolled daemon fakes, in their own crate so they never ship inside
+# this one. shep-client-testing depends on shep-client, so this edge closes a
+# cycle — legal, and only legal, because it is a dev-dependency: Cargo builds
+# the lib first, then the test targets against it.
+shep-client-testing.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 tempfile.workspace = true
 

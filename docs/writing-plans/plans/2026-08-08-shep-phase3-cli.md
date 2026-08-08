@@ -77,7 +77,7 @@ cargo test --workspace --all-features -- --test-threads=1
 
 The Windows gate is `--workspace --all-targets`, not `-p shep-cli --all-targets`. Scoping it to one package builds shep-client's *lib* but not its *test* targets, so a `UnixListener` inside a `#[cfg(test)]` module would sail through this gate and detonate on CI instead.
 
-The Windows gate also carries `--all-features`, which the pre-round-2 plan did not. Task 1 adds a `test-support` feature to shep-client that turns a `#[cfg(test)]` module into a `pub` one, and shep-cli's dev-dependencies enable it — so on the `windows-latest` CI leg (`cargo test --workspace --locked`) that module *is* compiled. Without `--all-features` here, the local gate would not build the one module most likely to name a `UnixStream`.
+The Windows gate also carries `--all-features`, which the pre-round-2 plan did not. Keep it: it is cheap, and it keeps the local gate a superset of every CI leg. The fakes need no feature to be built there — `shep-client-testing` is an ordinary workspace member, so `--workspace` compiles it on the `windows-latest` leg (`cargo test --workspace --locked`) unconditionally. Its `#[cfg(unix)]` module gate is the only thing keeping a `UnixListener` out of a Windows build, which makes that gate load-bearing rather than decorative.
 
 **Explicitly out of scope for Phase 3** — do not build these, do not stub them into the clap tree:
 `reload`, `scale` (no `Request` variant exists), `muster` CLI verb (restore is a boot flag; `muster save` would need a new RPC), `--with-env` (`ProcessInfo` carries no `env` field — it needs additive wire work first), dynamic shell completion (clap_complete's engine is `unstable-dynamic` upstream), **named-pipe transport / functional Windows RPC** (`ShepPaths::pipe_name()` already exists for that future work; do not wire it up, and do not build a cfg-aliased transport to make Windows "work" — Windows compiles and refuses, that is the whole deliverable), dogs, `lookout`, `whistle`, `serve`, `import`, `dev`, `runtime`, `signal`, `sendline`, `trigger`, `startup`, `set`/`get`/`unset`.
@@ -89,7 +89,7 @@ The Windows gate also carries `--all-features`, which the pre-round-2 plan did n
 ```
 crates/shep-client/
   Cargo.toml                 deps: shep-core, tokio, tokio-util, tokio-stream, futures-util, bytes
-                             feature: test-support (exposes `testing` to shep-cli's tests)
+                             dev-deps: shep-client-testing (the fakes; closes a dev-dep cycle)
   src/lib.rs                 #![forbid(unsafe_code)], IR-6 doctest attr, # Quick start, re-export
                              shep-core, cfg(unix)-gated mod declarations, and the crate-root
                              re-export surface every shep-cli task imports from
@@ -98,8 +98,14 @@ crates/shep-client/
   src/client.rs       [unix]  Client handle: request / subscribe / close; owns RequestError
   src/events.rs       [unix]  EventStream (named Stream type, IR-15)
   src/spawn.rs        [unix]  connect_or_spawn + the launcher contract; owns SpawnError
-  src/testing.rs      [unix]  the ONE home for every hand-rolled fake, shared across tasks and
-                              crates; `#[cfg(any(test, feature = "test-support"))]`
+  tests/*.rs          [unix]  every test that drives a fake (see the fakes-crate rules below)
+
+crates/shep-client-testing/
+  Cargo.toml                 publish = false; deps: shep-client, shep-core, tokio, tokio-util,
+                             futures-util. No dev-dependencies, ever.
+  src/lib.rs                 crate docs + the cfg(unix)-gated re-export surface
+  src/fakes.rs        [unix]  the ONE home for every hand-rolled fake, shared across tasks
+                              and crates
 
 crates/shep-cli/
   Cargo.toml                 deps: shep-core, shep-client, shep-daemon, clap, clap_complete, tokio,
@@ -128,22 +134,29 @@ There is no `shep-client/src/error.rs`. Each error enum lives in the module that
 **shep-client's crate-root re-export surface.** Every shep-cli task below imports from the crate root, not from module paths, so each shep-client task ends by adding its own public items to this list in `lib.rs` (all of it inside the same `#[cfg(unix)]` region as the modules):
 
 ```rust
+#[cfg(unix)] pub use actor::EVENT_CHANNEL_CAPACITY;
 #[cfg(unix)] pub use client::{Client, RequestError, DEADLINE_GRACE, DEFAULT_DEADLINE, START_DEADLINE};
 #[cfg(unix)] pub use connection::{ConnectError, HANDSHAKE_TIMEOUT};
 #[cfg(unix)] pub use events::{EventStream, Lagged};
 #[cfg(unix)] pub mod spawn;   // SpawnError, SpawnOptions, SpawnOutcome, connect_or_spawn, the consts
-#[cfg(all(unix, any(test, feature = "test-support")))] pub mod testing;
 ```
 
 `spawn` stays a public *module* rather than a flattened re-export because the exit-code contract (`spawn::DAEMON_ALREADY_RUNNING`) reads better qualified — it is a cross-crate agreement, not a convenience import.
 
-**`testing` is one module with one owner, not a fake per task.** A `#[cfg(test)] mod tests` block is not compiled into a dependency at all, so a shep-cli test can never see a fake that lives in shep-client's private test module — and a fake that lives in `connection.rs`'s test module is invisible from `spawn.rs` too. Follow shep-daemon's merged precedent exactly: `test-fakes = []` in `[features]` and `#[cfg(any(test, feature = "test-fakes"))] pub mod fake;` at `crates/shep-daemon/src/lib.rs:347-348`. Ours is `test-support` / `testing`, with `unix` added because every fake here binds a `UnixListener`.
+`EVENT_CHANNEL_CAPACITY` is public because it is the number behind `Lagged`: a subscriber that falls that many events behind starts losing them, so a caller sizing its own drain loop — or a test proving the lag path — needs the figure rather than a guess. It is a plain `usize`, so publishing it pins no dependency's types into the API.
 
-Three consequences the implementer must not discover the hard way:
+**The fakes are one crate with one owner, not a fake per task.** A `#[cfg(test)] mod tests` block is not compiled into a dependency at all, so a shep-cli test can never see a fake that lives in shep-client's private test module — and a fake that lives in `connection.rs`'s test module is invisible from `spawn.rs` too. The answer is a separate crate, `shep-client-testing`, holding every hand-rolled double: it depends on `shep-client`, and `shep-client` dev-depends on it, a cycle Cargo permits precisely because it runs through dev-dependencies.
 
-- Under the `test-support` feature the module is an ordinary `pub` module in an ordinary build, so **`missing_docs` applies to it** — every helper needs a doc comment, and every returned struct a `Debug`.
-- It therefore **may not use dev-dependencies.** Everything in it is built from `tokio` (`net`/`sync`/`rt`/`time`), `tokio-util`, `futures-util`, `shep_core::protocol` and `std` — all normal dependencies. No `tempfile`: every helper takes the socket path as a `&Path` and the caller owns the `TempDir`.
-- The `#[cfg(unix)]` is load-bearing. shep-cli's dev-dependencies enable `test-support`, and Cargo unifies that onto the `windows-latest` CI leg's `cargo test --workspace`, so an ungated `testing` would put a `UnixListener` into a Windows build.
+Not a `test-support` feature on shep-client (Rin, 2026-08-08): test scaffolding has no business in the published library's source, and a feature flag can be switched on by a production consumer. `publish = false` on the fakes crate makes that structural instead of a matter of discipline.
+
+Four consequences the implementer must not discover the hard way:
+
+- **shep-client's own tests that drive a fake must be integration tests**, under `crates/shep-client/tests/`, never a `#[cfg(test)] mod tests` block. A unit-test build compiles the lib a second time (with `--cfg test`) as the test binary's root, so the `Client` a fake returns and the `Client` the module names are two distinct types from two distinct copies of shep-client — it does not compile, and the copy the fakes carry is not the one under test anyway. Linked as an ordinary external crate from `tests/`, there is exactly one shep-client. Tests that need crate internals and no fake (`connection.rs`'s, which use only `fake_daemon`) stay unit tests: `fake_daemon`, `sample_ack` and `sample_info` name no shep-client type, so they cross that boundary fine.
+- The fakes crate is an **ordinary `pub` crate in an ordinary build**, so **`missing_docs` applies** — every helper needs a doc comment, and every returned struct a `Debug`.
+- It **may not use dev-dependencies**; it has none. Everything in it is built from `tokio` (`net`/`rt`/`sync`/`macros`), `tokio-util`, `futures-util`, `shep_core::protocol`, `shep_client` and `std`. No `tempfile`: every helper takes the socket path as a `&Path` and the caller owns the `TempDir`.
+- The `#[cfg(unix)]` on the fakes module is load-bearing. `--workspace` builds this crate on the `windows-latest` CI leg, so an ungated module would put a `UnixListener` into a Windows build.
+
+**Do not make `shep-client`'s `Frames` public** to serve the fakes. It is `Framed<UnixStream, LengthDelimitedCodec>`, so exporting it would pin tokio-util's `Framed` into shep-client's public API and tie the crate to that dependency's major version. The fakes need no such thing: they only ever serve the *daemon* side of the wire, which they build themselves from the public `codec()`, under their own private alias.
 
 ---
 
@@ -153,7 +166,8 @@ Three consequences the implementer must not discover the hard way:
 - Modify: `crates/shep-client/Cargo.toml`
 - Modify: `crates/shep-client/src/lib.rs`
 - Create: `crates/shep-client/src/connection.rs`
-- Create: `crates/shep-client/src/testing.rs`
+- Create: `crates/shep-client-testing/Cargo.toml`, `crates/shep-client-testing/src/lib.rs`, `crates/shep-client-testing/src/fakes.rs`
+- Modify: root `Cargo.toml` (new workspace member + `[workspace.dependencies]` entry)
 
 **Interfaces:**
 - Consumes: `shep_core::protocol::{codec, encode_frame, decode_frame, Hello, HelloAck, HelloReply, PROTOCOL_VERSION, RpcError, RpcErrorCode, WireError}`
@@ -212,12 +226,6 @@ The daemon's `ProtocolMismatch` arrives as `HelloReply::Err(RpcError { code: Pro
 In `crates/shep-client/Cargo.toml`:
 
 ```toml
-[features]
-# Exposes `testing` (the hand-rolled fakes) to shep-cli's tests. Mirrors
-# shep-daemon's `test-fakes` (`crates/shep-daemon/Cargo.toml:12`), which does
-# the same job for the scripted runner.
-test-support = []
-
 [dependencies]
 shep-core.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros"] }
@@ -227,6 +235,10 @@ futures-util.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]
+# The hand-rolled daemon fakes, in their own crate so they never ship inside
+# this one. shep-client-testing depends on shep-client, so this edge closes a
+# cycle — legal, and only legal, because it is a dev-dependency.
+shep-client-testing.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 tempfile.workspace = true
 
@@ -273,7 +285,7 @@ mod connection;
 
 The `# Quick start` doctest must compile on Windows, where none of the gated modules exist. Write it against the portable surface only (`shep_core` re-exports), or mark it ```` ```no_run ```` and `#[cfg(unix)]`-guard nothing — a doctest that names `Client` will fail the Windows gate.
 
-Then create `src/testing.rs` and declare it as shown in the re-export surface above. **This module is the phase's single home for hand-rolled fakes.** Tasks 2, 3 and 4 each add their own helpers to it as their types come into existence — Task 1 cannot define a helper that returns a `Client`, because `Client` does not exist until Task 2 — but nobody creates a second fake anywhere else, in either crate. The full roster, with the task that writes each one:
+Then create the `shep-client-testing` crate — `Cargo.toml` (with `publish = false`), `src/lib.rs` (crate docs plus the `#[cfg(unix)]`-gated re-export surface) and `src/fakes.rs` — and add it to the root `Cargo.toml`'s `members` and `[workspace.dependencies]`. **This crate is the phase's single home for hand-rolled fakes.** Tasks 2, 3 and 4 each add their own helpers to it as their types come into existence — Task 1 cannot define a helper that returns a `Client`, because `Client` does not exist until Task 2 — but nobody creates a second fake anywhere else, in any crate. Every helper is re-exported from the crate root, so call sites read `shep_client_testing::fake_client_on`, never a module path. The full roster, with the task that writes each one:
 
 | Helper | Written by | Signature |
 |---|---|---|
@@ -329,13 +341,13 @@ pub fn sample_info() -> ProcessInfo { /* id 1, name "web", Online, pid Some, fol
 
 - [ ] **Step 3: Write the failing handshake tests**
 
-In `connection.rs`, driving the fakes from `crate::testing`. The fake daemon is a bare `UnixListener` that speaks the wire by hand — do NOT pull in `shep-daemon` to test the client.
+In `connection.rs`, driving the fakes from `shep-client-testing`. The fake daemon is a bare `UnixListener` that speaks the wire by hand — do NOT pull in `shep-daemon` to test the client.
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::fake_daemon;
+    use shep_client_testing::fake_daemon;
     use shep_core::protocol::{HelloAck, HelloReply, PROTOCOL_VERSION, RpcError, RpcErrorCode};
     use tokio::net::UnixListener;
 
@@ -453,12 +465,11 @@ git add crates/shep-client && git commit -m "feat(client): bounded connection ha
 ### Task 2: The connection actor — request/reply with frame demultiplexing
 
 **Files:**
-- Create: `crates/shep-client/src/actor.rs`
-- Create: `crates/shep-client/src/client.rs`
-- Modify: `crates/shep-client/src/lib.rs`, `crates/shep-client/src/testing.rs`
+- Create: `crates/shep-client/src/actor.rs`, `crates/shep-client/src/client.rs`, `crates/shep-client/tests/request_reply.rs`
+- Modify: `crates/shep-client/src/lib.rs`, `crates/shep-client-testing/src/fakes.rs`
 
 **Interfaces:**
-- Consumes: `Connection`, `ConnectError`, `HANDSHAKE_TIMEOUT`, `crate::testing::{fake_daemon, sample_ack, sample_info}` (all Task 1), `shep_core::protocol::{Envelope, Reply, Request, Response, ServerFrame, BusEvent, HelloAck, RpcError, RpcErrorCode}`
+- Consumes: `Connection`, `ConnectError`, `HANDSHAKE_TIMEOUT`, `shep_client_testing::{fake_daemon, sample_ack, sample_info}` (all Task 1), `shep_core::protocol::{Envelope, Reply, Request, Response, ServerFrame, BusEvent, HelloAck, RpcError, RpcErrorCode}`
 - Produces:
 ```rust
 /// Daemon-side budget applied when a caller names none. Mirrors the daemon's
@@ -510,7 +521,7 @@ impl Client {
 
 `connect` uses `HANDSHAKE_TIMEOUT`; `connect_with_timeout` exists for callers that need another value (Task 4's fast tests are the first).
 
-**This task also fills in its share of `crate::testing`** (roster and rules in Task 1): `fake_client_on`, `fake_client_with_ack`, `fake_client_capturing_envelopes`, `fake_client_replying_err`, `fake_client_out_of_order`, `fake_client_event_then_reply`, `fake_client_that_closes_after_handshake`, `fake_client_that_never_replies`. Each binds a `UnixListener` at the caller's `&Path`, completes the handshake with `sample_ack()` unless the helper's name says otherwise, and hands back a connected `Client`. `fake_client_capturing_envelopes` additionally decodes every `Envelope` it receives onto an `mpsc::Receiver<Envelope>` the test drains. None of them may use `tempfile`.
+**This task also fills in its share of `shep-client-testing`** (roster and rules in Task 1): `fake_client_on`, `fake_client_with_ack`, `fake_client_capturing_envelopes`, `fake_client_replying_err`, `fake_client_out_of_order`, `fake_client_event_then_reply`, `fake_client_that_closes_after_handshake`, `fake_client_that_never_replies`. Each binds a `UnixListener` at the caller's `&Path`, completes the handshake with `sample_ack()` unless the helper's name says otherwise, and hands back a connected `Client`. `fake_client_capturing_envelopes` additionally decodes every `Envelope` it receives onto an `mpsc::Receiver<Envelope>` the test drains. None of them may use `tempfile`.
 
 **`FakeDaemon` is born here, because six of those helpers return one.** It is a *script*, not a live socket: nothing it is handed is written at the moment it is handed over — the script is a queue, and the queue drains against what the client asks for. The contract in full, because Tasks 3 and 8-11 depend on every clause:
 
@@ -551,6 +562,8 @@ Task 2 writes clauses 1, 2 and 7; Task 3 adds 3-5; Task 11 adds 6. Each is a met
 **The race this must survive:** the supervisor emits a sheep's bus event *before* it resolves the RPC reply that caused it (`daemon_e2e.rs:161-174` documents this, empirically, from the daemon side). An `Event` frame therefore legitimately arrives ahead of the `Reply` for the very request that produced it. The actor must route it and keep reading, never treat it as an out-of-order protocol violation.
 
 - [ ] **Step 1: Write the failing tests**
+
+These go in `crates/shep-client/tests/request_reply.rs`, an integration test with `#![cfg(unix)]`, **not** a `#[cfg(test)] mod tests` block in `client.rs` — they drive fakes that return a `Client`, and a unit-test build would put two copies of shep-client in one binary (File Structure explains it). Everything they touch is public: `Client`, `RequestError`, `DEADLINE_GRACE`, `DEFAULT_DEADLINE`, `START_DEADLINE`.
 
 Every test here opens with its own socket, and the fixture never invents one:
 
@@ -672,8 +685,8 @@ git commit -m "feat(client): connection actor routing replies by id and events t
 ### Task 3: EventStream — the subscription surface
 
 **Files:**
-- Create: `crates/shep-client/src/events.rs`
-- Modify: `crates/shep-client/src/client.rs`, `crates/shep-client/src/actor.rs`, `crates/shep-client/src/lib.rs`, `crates/shep-client/src/testing.rs`
+- Create: `crates/shep-client/src/events.rs`, `crates/shep-client/tests/event_stream.rs`
+- Modify: `crates/shep-client/src/client.rs`, `crates/shep-client/src/actor.rs`, `crates/shep-client/src/lib.rs`, `crates/shep-client-testing/src/fakes.rs`
 
 **Interfaces:**
 - Consumes: `Client`, `RequestError` (Task 2), `shep_core::protocol::{BusEvent, ProcessEventKind, Request, Response}`
@@ -712,6 +725,8 @@ so it already distinguishes lag from close (`RecvError::Closed` → `Poll::Ready
 **This task adds the event half of `FakeDaemon`'s script** — `push`, `overrun_by`, `queue_reply_then_event`, and clauses 3-5 of the contract Task 2 states. Why the queue exists rather than a straight socket write: a `broadcast::Receiver` never sees a value sent before it existed, and the receiver is created inside `subscribe()`. If `push` wrote through immediately, the actor would read the frame and broadcast it to zero receivers, and every queued line would be gone before the consumer subscribed. Tasks 8-11 depend on being able to queue before the code under test subscribes.
 
 - [ ] **Step 1: Write the failing tests**
+
+These go in `crates/shep-client/tests/event_stream.rs`, an integration test with `#![cfg(unix)]`, for the same reason Task 2's do. `Lagged` and `EVENT_CHANNEL_CAPACITY` are both re-exported from shep-client's crate root, so nothing here needs a module path.
 
 As in Task 2, each test opens with its own `tempfile::tempdir()` and `path`; the bodies elide it.
 
@@ -815,7 +830,7 @@ async fn a_lagging_consumer_reports_the_lag_rather_than_silently_skipping() {
 
 `EventStream` holds a `BroadcastStream<BusEvent>` over the actor's `broadcast::Receiver<BusEvent>`. `poll_next` delegates and maps the one error variant: `Some(Err(BroadcastStreamRecvError::Lagged(n)))` becomes `Some(Err(Lagged { count: n }))`, `Some(Ok(e))` becomes `Some(Ok(e))`, `None` stays `None` (the wrapper already turns `RecvError::Closed` into end-of-stream). Name the channel capacity as a `const EVENT_CHANNEL_CAPACITY: usize` (IR-26) with a comment tying it to the daemon's own `CONN_QUEUE = 64` (`shep-daemon/src/server.rs:39`).
 
-This task also adds `FakeDaemon` and `fake_client_with_push` to `crate::testing`, per the contract above and the roster in Task 1.
+This task also adds `FakeDaemon` and `fake_client_with_push` to `shep-client-testing`, per the contract above and the roster in Task 1.
 
 `subscribe` issues `Request::Subscribe { topics }`, awaits `Response::Subscribed`, and hands back a receiver the actor has already been feeding — the receiver is created *before* the request is sent, which is what makes the reply-then-event ordering test pass rather than deadlock.
 
@@ -828,11 +843,11 @@ This task also adds `FakeDaemon` and `fake_client_with_push` to `crate::testing`
 ### Task 4: connect_or_spawn — autostart without an inherited descriptor
 
 **Files:**
-- Create: `crates/shep-client/src/spawn.rs`
-- Modify: `crates/shep-client/src/lib.rs`, `crates/shep-client/src/testing.rs`
+- Create: `crates/shep-client/src/spawn.rs`, `crates/shep-client/tests/spawn.rs`
+- Modify: `crates/shep-client/src/lib.rs`, `crates/shep-client-testing/src/fakes.rs`
 
 **Interfaces:**
-- Consumes: `Client`, `ConnectError`, `HANDSHAKE_TIMEOUT`, `crate::testing::{fake_daemon, sample_ack}` (Tasks 1-2), `shep_core::protocol::{RpcError, RpcErrorCode}`
+- Consumes: `Client`, `ConnectError`, `HANDSHAKE_TIMEOUT`, `shep_client_testing::{fake_daemon, sample_ack}` (Tasks 1-2), `shep_core::protocol::{RpcError, RpcErrorCode}`
 - Produces:
 ```rust
 /// How long the spawn-and-wait path will keep probing before giving up.
@@ -923,12 +938,14 @@ Only `a_child_that_dies_fails_fast_instead_of_waiting_out_the_deadline` runs on 
 
 - [ ] **Step 1: Write the failing tests**
 
-`fast_opts`, `start_fake_daemon_answering_on` and `child_exiting_with` go into `crate::testing` (Task 1's roster). `Reaper` and `spawn_long_lived` stay in this module's `#[cfg(test)] mod tests`: `Reaper` uses `nix`, which is a dev-dependency and therefore unavailable to a module that also compiles under the `test-support` feature.
+These go in `crates/shep-client/tests/spawn.rs`, an integration test with `#![cfg(unix)]`, for the same reason Tasks 2 and 3's do — `fast_opts` returns a `SpawnOptions`, and `connect_or_spawn_with` returns a `SpawnOutcome` carrying a `Client`, so both types have to be the same copy the fakes carry. Everything under test is public (`connect_or_spawn`, `connect_or_spawn_with`, `SpawnOptions`, `SpawnOutcome`, `SpawnError`, the consts).
+
+`fast_opts`, `start_fake_daemon_answering_on` and `child_exiting_with` go into `shep-client-testing` (Task 1's roster). `Reaper` and `spawn_long_lived` stay local to this test file rather than joining them: `Reaper` uses `nix`, which is a dev-dependency of shep-client — available to an integration test, but not inside `shep-client-testing`, which has no dev-dependencies at all.
 
 ```rust
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use crate::testing::{child_exiting_with, fake_daemon, fast_opts, sample_ack,
+use shep_client_testing::{child_exiting_with, fake_daemon, fast_opts, sample_ack,
                      start_fake_daemon_answering_on};
 
 /// Reaps the `cat` children the launcher closures spawn.
@@ -1328,13 +1345,12 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-# Tasks 8-11 drive their verbs against shep-client's hand-rolled fakes. That
-# module is `#[cfg(all(unix, any(test, feature = "test-support")))]`, and `test`
-# is never true for a crate that is merely LINKED — so without this feature
-# edge `shep_client::testing` does not exist here and four tasks fail to
-# compile. CI's `cargo test --workspace --locked` passes no `--all-features`,
-# so nothing else would turn it on.
-shep-client = { workspace = true, features = ["test-support"] }
+# Tasks 8-11 drive their verbs against the hand-rolled fakes, which live in
+# their own crate rather than behind a feature on shep-client — see the fakes
+# rules under File Structure. A plain dev-dependency is all it takes here;
+# unlike shep-client itself, this crate is not the one the fakes link, so
+# nothing about the edge is delicate.
+shep-client-testing.workspace = true
 tempfile.workspace = true
 insta.workspace = true       # Task 6's envelope snapshots
 assert_cmd.workspace = true  # Task 12's real-binary tier
@@ -2045,7 +2061,7 @@ Do **not** call `.env_clear()`. The child needs `PATH` to exec anything, and cle
 OS tier: `#[cfg(unix)]` at the `mod` declaration.
 
 **Interfaces:**
-- Consumes: `StartArgs`, `SelectorArgs`, `Format` and `ExitCode` from `cli.rs` / `exit.rs` (Task 5 — this task defines no argument struct), `crate::output::{Streams, emit, emit_error, FlockRows, DeletedIds}` (Task 6 — this task defines no payload type and no `Render` impl), `crate::launch::launch_daemon` (Task 7, for the `Start` dispatch arm only), `shep_core::config::{Flockfile, FlockFormat, FlockfileError, AppConfig}`, `shep_core::selector::ProcessSelector`, `shep_core::protocol::{SelectorSpec, Request, Response, RpcErrorCode}`, `shep_client::{Client, START_DEADLINE, spawn::connect_or_spawn}`, `shep_client::testing::{fake_client_capturing_envelopes, fake_client_replying_err}` (dev)
+- Consumes: `StartArgs`, `SelectorArgs`, `Format` and `ExitCode` from `cli.rs` / `exit.rs` (Task 5 — this task defines no argument struct), `crate::output::{Streams, emit, emit_error, FlockRows, DeletedIds}` (Task 6 — this task defines no payload type and no `Render` impl), `crate::launch::launch_daemon` (Task 7, for the `Start` dispatch arm only), `shep_core::config::{Flockfile, FlockFormat, FlockfileError, AppConfig}`, `shep_core::selector::ProcessSelector`, `shep_core::protocol::{SelectorSpec, Request, Response, RpcErrorCode}`, `shep_client::{Client, START_DEADLINE, spawn::connect_or_spawn}`, `shep_client_testing::{fake_client_capturing_envelopes, fake_client_replying_err}` (dev)
 - Produces:
 ```rust
 pub async fn start(client: &Client, streams: &mut Streams<'_>, fmt: Format, args: &StartArgs) -> ExitCode;
@@ -2260,7 +2276,7 @@ Only `start` autostarts, and it does so in `main`, not here — Task 5's dispatc
 OS tier: `#[cfg(unix)]` at the `mod` declaration.
 
 **Interfaces:**
-- Consumes: `SelectorArgs`, `FoldArgs`, `Format` and `ExitCode` from `cli.rs` / `exit.rs` (Task 5), `crate::output::{Streams, emit, emit_error, FlockRows, PingRow}` (Task 6 — this task defines no payload type and no `Render` impl), `shep_core::protocol::{Request, Response, SelectorSpec, ProcessInfo, HelloAck, PROTOCOL_VERSION}`, `shep_client::Client`, `shep_client::testing::{fake_client_capturing_envelopes, fake_client_with_ack}` (dev)
+- Consumes: `SelectorArgs`, `FoldArgs`, `Format` and `ExitCode` from `cli.rs` / `exit.rs` (Task 5), `crate::output::{Streams, emit, emit_error, FlockRows, PingRow}` (Task 6 — this task defines no payload type and no `Render` impl), `shep_core::protocol::{Request, Response, SelectorSpec, ProcessInfo, HelloAck, PROTOCOL_VERSION}`, `shep_client::Client`, `shep_client_testing::{fake_client_capturing_envelopes, fake_client_with_ack}` (dev)
 - Produces:
 ```rust
 pub async fn flock(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> ExitCode;
@@ -2353,7 +2369,7 @@ Each verb is one request, one `emit`, one error mapping. `flock` sends `Request:
 OS tier: `#[cfg(unix)]` at the `mod` declaration.
 
 **Interfaces:**
-- Consumes: `BleatsArgs`, `Format` and `ExitCode` from `cli.rs` / `exit.rs` (Task 5 — this task defines no argument struct), `crate::output::Streams` (Task 6), `shep_client::{Client, EventStream, Lagged}`, `shep_client::testing::fake_client_with_push` (dev), `shep_core::protocol::{BusEvent, Request, Response, ProcessInfo}`
+- Consumes: `BleatsArgs`, `Format` and `ExitCode` from `cli.rs` / `exit.rs` (Task 5 — this task defines no argument struct), `crate::output::Streams` (Task 6), `shep_client::{Client, EventStream, Lagged}`, `shep_client_testing::fake_client_with_push` (dev), `shep_core::protocol::{BusEvent, Request, Response, ProcessInfo}`
 - Produces:
 ```rust
 pub async fn bleats(client: &Client, streams: &mut Streams<'_>, fmt: Format, args: &BleatsArgs)
@@ -2621,12 +2637,12 @@ Flush `streams.out` on every exit path. A follow that ends with lines still buff
 **Files:**
 - Create: `crates/shep-cli/src/commands/admin.rs` (OS tier), `crates/shep-cli/src/completions.rs` (**pure tier**)
 - Modify: `crates/shep-cli/src/main.rs` — replace the `not_wired` arms for `Kill` and `Completions`
-- Modify: `crates/shep-client/src/testing.rs` — add clause 6 of `FakeDaemon`'s contract (the two teardown scripts). Yes, a shep-cli task edits shep-client: the fakes have exactly one home, and a second one built here is the failure Task 1's roster exists to prevent.
+- Modify: `crates/shep-client-testing/src/fakes.rs` — add clause 6 of `FakeDaemon`'s contract (the two teardown scripts). Yes, a shep-cli task edits the fakes crate: the fakes have exactly one home, and a second one built here is the failure Task 1's roster exists to prevent.
 
 `admin.rs` is OS tier: `#[cfg(unix)]` at the `mod` declaration. `completions.rs` is **not** — it names only `cli.rs`, `clap` and `clap_complete`, all of which compile everywhere, and its tests have to run on the Windows leg like the rest of the parse surface. Putting `completions` inside `admin.rs` would drag it behind a `cfg(unix)` for no reason and leave its tests with no portable home.
 
 **Interfaces:**
-- Consumes: `CompletionArgs`, `Cli`, `Format` and `ExitCode` from `cli.rs` / `exit.rs` (Task 5 — this task defines no argument struct), `crate::output::{Streams, emit, KillRow}` (Task 6), `shep_client::Client`, `shep_client::testing::fake_client_on` (dev), `shep_core::protocol::{Request, Response}`, `clap::CommandFactory`, `clap_complete::aot::{generate, Shell}`
+- Consumes: `CompletionArgs`, `Cli`, `Format` and `ExitCode` from `cli.rs` / `exit.rs` (Task 5 — this task defines no argument struct), `crate::output::{Streams, emit, KillRow}` (Task 6), `shep_client::Client`, `shep_client_testing::fake_client_on` (dev), `shep_core::protocol::{Request, Response}`, `clap::CommandFactory`, `clap_complete::aot::{generate, Shell}`
 - Produces:
 ```rust
 // admin.rs — OS tier
@@ -2880,4 +2896,4 @@ Copy that `output()` → `adopt_home` → assert ordering into all eight; it is 
 5. **`DaemonAlreadyRunning = 10` is a new exit code**, not one spec §9 enumerates, and it is a cross-crate contract: shep-client hard-codes the same 10 so it can read a dead child's status. The alternative — treating every non-zero child status as fatal — makes the concurrent-cold-start case (Task 12 case 3) fail. Blessing the number, or picking a different one, is yours.
 6. **`completions` or `completion`?** Spec §9 says "clap_complete completions" in prose without naming a verb; `docs/research/phase3-cli.md:451` writes `shep completion <shell>`, singular. The plan uses `Completions`. Whichever you pick becomes a stable CLI surface, so it is worth one word of your time. (An alias for the other spelling is trivial if you want both.)
 7. **`bleats --format json` emits JSON lines, not an envelope.** A follow has no end, so there is nothing to wrap — the plan has it emit one object per line, `{"schema_version", "id", "name", "stream", "line"}`. Every other verb's JSON is a single `OutputEnvelope`, so this is the one place the output schema changes shape by command, and it is a stability surface with a committed fixture from day one. The alternative is an envelope whose `data` is an array, which only works under `--no-follow` and would make the streaming case a different command in practice. Blessing the line shape, or picking different field names, is yours.
-8. **`shep-client` gains a `test-support` feature** (Task 1) so shep-cli's tests can use one set of fakes instead of four. It follows shep-daemon's merged `test-fakes` precedent exactly, but it does put a `pub mod testing` on the crate's published surface under `--all-features`, which `cargo doc` will render. shep-daemon already made that trade; flagging it because shep-client is the crate an external programmatic user would depend on.
+8. ~~**`shep-client` gains a `test-support` feature**~~ — **settled 2026-08-08 (Rin): the fakes get their own `publish = false` crate, `shep-client-testing`, instead.** The feature would have put a `pub mod testing` on shep-client's published surface, and a consumer could switch it on in production; a separate crate keeps test scaffolding out of the published library's source entirely. shep-daemon's `test-fakes` feature is untouched — it stays as merged, and this is a divergence from that precedent rather than a revision of it. Consequence for later tasks: shep-client's own fake-driven tests are integration tests under `crates/shep-client/tests/`, not `#[cfg(test)]` modules (see File Structure for why).

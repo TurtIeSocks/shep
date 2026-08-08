@@ -32,15 +32,18 @@ mod connection;
 #[cfg(unix)]
 mod events;
 #[cfg(unix)]
+pub use actor::EVENT_CHANNEL_CAPACITY;
+#[cfg(unix)]
 pub use client::{Client, DEADLINE_GRACE, DEFAULT_DEADLINE, RequestError, START_DEADLINE};
 #[cfg(unix)]
 pub use connection::{ConnectError, HANDSHAKE_TIMEOUT};
 #[cfg(unix)]
 pub use events::{EventStream, Lagged};
 
-// Unix-only for the same reason as `connection` above: every fake here
-// binds a `UnixListener`.
-#[cfg(all(unix, any(test, feature = "test-support")))]
-pub mod testing;
+// The hand-rolled daemon fakes live in the `shep-client-testing` crate, not
+// here: test scaffolding does not belong in this crate's published source,
+// and a `test-support` feature could be switched on by a production consumer.
+// That crate depends on this one and this one dev-depends on it — a cycle
+// Cargo permits precisely because it runs through dev-dependencies.
 
 pub use shep_core;

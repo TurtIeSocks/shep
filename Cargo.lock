@@ -582,10 +582,22 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "nix 0.29.0",
+ "shep-client-testing",
  "shep-core",
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-util",
+]
+
+[[package]]
+name = "shep-client-testing"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "shep-client",
+ "shep-core",
+ "tokio",
  "tokio-util",
 ]
 

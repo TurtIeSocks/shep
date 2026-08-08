@@ -196,7 +196,7 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::fake_daemon;
+    use shep_client_testing::fake_daemon;
     use shep_core::protocol::{HelloAck, PROTOCOL_VERSION, RpcError, RpcErrorCode};
     use tokio::net::UnixListener;
 
