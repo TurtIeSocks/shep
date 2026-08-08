@@ -31,6 +31,15 @@ mod client;
 mod connection;
 #[cfg(unix)]
 mod events;
+// `spawn` stays a public module rather than a flattened re-export: the
+// exit-code contract (`spawn::DAEMON_ALREADY_RUNNING`) reads better
+// qualified, a cross-crate agreement rather than a convenience import.
+// Deliberately a plain `//` comment, not `///` — an outer doc comment on a
+// `mod` declaration merges with the module file's own `//!` docs and
+// resolves in crate-root scope, breaking that module's intra-doc links to
+// its own siblings.
+#[cfg(unix)]
+pub mod spawn;
 #[cfg(unix)]
 pub use actor::EVENT_CHANNEL_CAPACITY;
 #[cfg(unix)]

@@ -9,6 +9,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -23,6 +24,7 @@ use shep_core::protocol::{
 };
 use shep_core::status::ProcStatus;
 
+use shep_client::spawn::SpawnOptions;
 use shep_client::{Client, EVENT_CHANNEL_CAPACITY};
 
 /// The framed transport a fake serves its one connection over.
@@ -611,4 +613,73 @@ pub async fn fake_client_that_never_replies(path: &Path) -> (Client, JoinHandle<
     });
     let client = Client::connect(path).await.unwrap();
     (client, task)
+}
+
+/// [`SpawnOptions`] tuned so `spawn.rs`'s tests finish in well under a
+/// second on a real clock, rather than the production 30s/100ms/5s/5s
+/// figures. Every test built against a real socket and (in most cases) a
+/// real child process, so none of them may pause tokio's clock to fake this
+/// speed — shrinking the values themselves is the only option.
+///
+/// The one exception, `a_child_that_dies_fails_fast_instead_of_waiting_out_the_deadline`,
+/// deliberately runs on the production defaults instead: it is an assertion
+/// *about* the 30s deadline, so using this would delete the thing under
+/// test.
+#[must_use]
+pub fn fast_opts() -> SpawnOptions {
+    SpawnOptions {
+        deadline: Duration::from_millis(600),
+        backoff_start: Duration::from_millis(10),
+        backoff_cap: Duration::from_millis(50),
+        handshake_timeout: Duration::from_millis(100),
+    }
+}
+
+/// Binds `path`, accepts one connection, and answers its handshake with
+/// [`sample_ack`], then parks — for a launcher closure that needs to bring a
+/// working daemon into existence synchronously (a real launcher spawns a
+/// child, this stands in for the daemon that child would eventually become).
+///
+/// Synchronous, not `async`: a `connect_or_spawn` launcher is a plain
+/// `FnOnce() -> io::Result<Child>`, so anything it calls to make a daemon
+/// "appear" has to be callable from a synchronous context too. This spawns
+/// its own background task via [`tokio::spawn`], which works even though the
+/// caller isn't `async`: `connect_or_spawn_with` runs the launcher on
+/// `tokio::task::spawn_blocking`'s pool, and that pool's threads carry the
+/// owning runtime's context for exactly this reason.
+///
+/// The returned task is detached deliberately: it outlives this function
+/// call and keeps running for as long as the test's runtime does, which is
+/// long enough for `connect_or_spawn_with`'s later probes to reach it.
+///
+/// Panics if `path` cannot be bound — test scaffolding, see [`fake_daemon`]'s
+/// own doc for why that is the right failure mode here.
+pub fn start_fake_daemon_answering_on(path: &Path) {
+    let listener = UnixListener::bind(path).unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut frames = Framed::new(stream, codec());
+        handshake(&mut frames, sample_ack()).await;
+        core::future::pending::<()>().await;
+    });
+}
+
+/// A launcher-ready child that is already exiting with `code`: spawns
+/// `sh -c "exit <code>"` and hands the `Child` back immediately.
+///
+/// For a launcher whose test cares only about `connect_or_spawn`'s reaction
+/// to a child that is dead (or dying) with a known status, not about a
+/// process that behaves like a daemon in any other way.
+///
+/// # Errors
+///
+/// Whatever `std::process::Command::spawn` itself can return — `sh` failing
+/// to exec, principally. Propagated rather than unwrapped so a caller using
+/// this directly as a launcher (`connect_or_spawn`'s `L` bound is
+/// `FnOnce() -> io::Result<Child>`) gets the same signature every other
+/// launcher does.
+pub fn child_exiting_with(code: i32) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("sh")
+        .args(["-c", &format!("exit {code}")])
+        .spawn()
 }

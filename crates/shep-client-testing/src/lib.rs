@@ -28,8 +28,9 @@ mod fakes;
 
 #[cfg(unix)]
 pub use fakes::{
-    FakeDaemon, fake_client_capturing_envelopes, fake_client_event_then_reply, fake_client_on,
-    fake_client_out_of_order, fake_client_replying_err, fake_client_that_closes_after_handshake,
-    fake_client_that_dies_mid_request, fake_client_that_never_replies, fake_client_with_ack,
-    fake_client_with_push, fake_daemon, sample_ack, sample_info,
+    FakeDaemon, child_exiting_with, fake_client_capturing_envelopes, fake_client_event_then_reply,
+    fake_client_on, fake_client_out_of_order, fake_client_replying_err,
+    fake_client_that_closes_after_handshake, fake_client_that_dies_mid_request,
+    fake_client_that_never_replies, fake_client_with_ack, fake_client_with_push, fake_daemon,
+    fast_opts, sample_ack, sample_info, start_fake_daemon_answering_on,
 };
