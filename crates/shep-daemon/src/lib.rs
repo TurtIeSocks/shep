@@ -16,6 +16,7 @@ pub mod channel;
 pub mod entry;
 pub mod kill;
 pub mod runner;
+pub mod supervisor;
 
 /// Real [`ProcessRunner`](runner::ProcessRunner) over actual OS processes.
 ///
