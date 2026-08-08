@@ -62,7 +62,7 @@ pub enum Commands {
     Flock,
     /// Describe one sheep in detail.
     Describe(SelectorArgs),
-    /// List one fold (spec §5 / §9)
+    /// List one fold.
     Fold(FoldArgs),
     /// Show or follow bleats (log output) for one or more sheep.
     #[command(visible_alias = "logs")]
