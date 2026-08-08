@@ -51,18 +51,33 @@ type Frames = FramedRead<OwnedReadHalf, LengthDelimitedCodec>;
 ///
 /// (IR-29 canonical writeup; everything else links here.)
 ///
-/// Design criteria: `$SHEP_HOME/run` is created `0700` so no other user can
-/// reach the socket path at all; every accepted connection is checked with
-/// `SO_PEERCRED`/`getpeereid` ([`check_peer`]) and refused unless the peer's
-/// uid equals the daemon's; the handshake refuses protocol skew with a typed
-/// error ([`RpcErrorCode::ProtocolMismatch`]) rather than silence; frames are
-/// capped at [`shep_core::protocol::MAX_FRAME_BYTES`]; peer-supplied
-/// selectors and topic globs are size-bounded before compiling
-/// ([`crate::bus::MAX_TOPIC_PATTERNS`]); every call carries a clamped
+/// Design criteria: `$SHEP_HOME/run` is *intended* to be created `0700` so
+/// no other user can reach the socket path at all — that creation (and any
+/// permission check of an already-existing `run` dir) is the daemon's boot
+/// path's responsibility (Task 6), not this module's: nothing in
+/// [`RpcServer`] creates, checks, or enforces that mode, it only accepts on
+/// whatever listener it is handed. Every accepted connection is checked
+/// with `SO_PEERCRED`/`getpeereid` ([`check_peer`]) and refused unless the
+/// peer's uid equals the daemon's; this fails CLOSED — a connection whose
+/// credentials the OS will not report ([`AuthError::NoCredentials`]) is
+/// refused, not admitted, exactly like a confirmed uid mismatch. The
+/// handshake refuses protocol skew with a typed error
+/// ([`RpcErrorCode::ProtocolMismatch`]) rather than silence; frames are
+/// capped at [`shep_core::protocol::MAX_FRAME_BYTES`]; the *number* of
+/// peer-supplied topic patterns on one `Subscribe` is bounded before
+/// compiling ([`crate::bus::MAX_TOPIC_PATTERNS`] — this bounds pattern
+/// *count*, not the byte length of any individual pattern, which is
+/// unbounded short of `MAX_FRAME_BYTES`); every call carries a clamped
 /// deadline ([`crate::rpc::budget`]).
 ///
-/// Explicit non-goals: root can always read daemon memory, and a peer with
-/// the same uid is fully trusted (it could simply run the binary itself).
+/// Explicit non-goals: root can always read daemon memory; a peer with the
+/// same uid is fully trusted (it could simply run the binary itself); there
+/// is no post-handshake idle timeout (a same-uid peer that completes the
+/// handshake and then never sends another frame holds its connection, and
+/// this module's queue/task resources, open indefinitely); and there is no
+/// cap on the number of concurrent connections one uid can hold open
+/// ([`RpcServer::serve`] spawns and detaches unconditionally on every
+/// accepted connection).
 #[derive(Debug)]
 pub struct RpcServer {
     listener: UnixListener,
@@ -84,8 +99,25 @@ impl RpcServer {
     /// state when the other resolves first. A transient accept error (e.g.
     /// `EMFILE`) is logged and the loop continues: one bad `accept()` must
     /// not take the whole daemon down.
+    ///
+    /// Each accepted connection's task is spawned and detached — this loop
+    /// does not track or await it. That is fine for `serve` itself (it never
+    /// blocks a still-running connection), but it means `serve` returning is
+    /// not a guarantee that every in-flight connection has finished; a
+    /// future daemon-shutdown sequence that needs to *drain* live
+    /// connections before exiting will need its own seam here (a
+    /// `tokio::task::JoinSet` in place of the bare `tokio::spawn`), not
+    /// yet built.
     pub async fn serve(self, mut shutdown: watch::Receiver<bool>) {
         let Self { listener, ctx } = self;
+        // A shutdown signal that was ALREADY `true` before this loop's first
+        // `changed()` call would otherwise never be observed: `changed()`
+        // only resolves on a value newer than the one this receiver has
+        // last seen, and a receiver in fresh-from-the-daemon condition
+        // hasn't seen anything past the value it was constructed with.
+        if *shutdown.borrow() {
+            return;
+        }
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -271,6 +303,27 @@ async fn converse(
 ) -> Result<(), ConnError> {
     handshake(frames, out, ctx).await?;
     let mut forwarder: Option<JoinHandle<()>> = None;
+    let outcome = read_loop(frames, out, ctx, &mut forwarder).await;
+    // EVERY path out of read_loop — Ok or any `?`-propagated Err — lands
+    // here: a live forwarder MUST be aborted, not just dropped. Dropping a
+    // JoinHandle detaches the task rather than stopping it, and a detached
+    // forwarder keeps holding its own clone of `out` forever, which keeps
+    // write_loop's `rx.recv()` from ever observing every sender gone —
+    // which hangs `handle_conn`'s `writer.await` forever, which leaks the
+    // task and the connection's fds and never actually closes the socket.
+    // (Regression: see `a_garbage_frame_after_subscribing_still_closes_the_connection`.)
+    if let Some(forwarder) = forwarder {
+        forwarder.abort();
+    }
+    outcome
+}
+
+async fn read_loop(
+    frames: &mut Frames,
+    out: &mpsc::Sender<Bytes>,
+    ctx: &RpcContext,
+    forwarder: &mut Option<JoinHandle<()>>,
+) -> Result<(), ConnError> {
     while let Some(frame) = frames.next().await {
         let frame = frame.map_err(ConnError::Frame)?; // oversize/short frame ends the connection
         let envelope: Envelope = decode_frame(&frame).map_err(ConnError::Decode)?;
@@ -292,9 +345,6 @@ async fn converse(
                 break;
             }
         }
-    }
-    if let Some(forwarder) = forwarder {
-        forwarder.abort();
     }
     Ok(())
 }
@@ -565,6 +615,48 @@ mod tests {
             .await
             .unwrap();
         assert!(client.closed().await);
+    }
+
+    #[tokio::test]
+    async fn a_garbage_frame_after_subscribing_still_closes_the_connection() {
+        // Regression test (Opus security review, post-Task-5): a live
+        // forwarder holds its own clone of `out`. If a connection error
+        // (garbage frame, oversize frame, ...) after Subscribe skipped
+        // aborting that forwarder, `out_tx`'s drop in `handle_conn` would NOT
+        // be the last sender — write_loop's `rx.recv()` would never see
+        // every sender go away, `handle_conn`'s `writer.await` would hang
+        // forever, and the socket would never actually close. Subscribing
+        // first is what makes that path reachable; the plain
+        // `a_garbage_frame_ends_the_connection_without_panicking` test above
+        // never subscribes, so it could not have caught this.
+        let h = harness(vec![]);
+        let mut client = connected(h.ctx.clone());
+        client
+            .send(&Hello {
+                client_version: "0.1.0".to_string(),
+                protocol: PROTOCOL_VERSION,
+            })
+            .await;
+        let _: HelloReply = client.recv().await;
+        client
+            .send(&Envelope {
+                id: 1,
+                deadline_ms: None,
+                body: Request::Subscribe {
+                    topics: vec!["*".to_string()],
+                },
+            })
+            .await;
+        let _: ServerFrame = client.recv().await; // the Subscribed reply
+        client
+            .frames
+            .send(bytes::Bytes::from_static(b"not json"))
+            .await
+            .unwrap();
+        assert!(
+            client.closed().await,
+            "a live forwarder must not keep the connection open past a decode error"
+        );
     }
 
     #[tokio::test]
