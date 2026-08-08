@@ -27,7 +27,8 @@
 //!
 //! - [`boot`]: daemon boot — `0700` layout dirs, pidfile, socket bind with stale-socket
 //!   recovery, the readiness pipe, signal handlers, and the ordered teardown sequence (unix-only)
-//! - [`sys`]: adopting an inherited descriptor — the phase's one `unsafe` block (unix-only)
+//! - [`sys`]: adopting an inherited descriptor — the phase's `unsafe fn`, called from one
+//!   site in [`boot`] (two documented sites total, see `sys`'s own doc) (unix-only)
 //! - [`tokio_runner`]: real [`ProcessRunner`](runner::ProcessRunner) over `tokio::process` (unix-only)
 //! - [`server`]: the unix-socket connection layer — peer-cred auth, handshake, subscriptions (unix-only)
 //!
@@ -231,10 +232,12 @@ pub(crate) mod testing {
 #[cfg(unix)]
 pub mod boot;
 
-// Unix-only: `std::os::unix::io::{FromRawFd, RawFd}` and the one `unsafe` block
-// in this crate (adopting the readiness pipe's inherited descriptor) have no
-// portable equivalent. Doc lives inside sys.rs's own `//!` header (IR-24's
-// rationale essay), not here — same reasoning as `server`'s note below.
+// Unix-only: `std::os::unix::io::{FromRawFd, RawFd}` and this crate's unsafe
+// surface (adopting the readiness pipe's inherited descriptor — two
+// documented sites, this module's definition plus `boot`'s one call site;
+// see sys.rs's own doc) have no portable equivalent. Doc lives inside
+// sys.rs's own `//!` header (IR-24's rationale essay), not here — same
+// reasoning as `server`'s note below.
 #[cfg(unix)]
 pub mod sys;
 

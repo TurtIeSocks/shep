@@ -1,12 +1,23 @@
-//! Adopting an inherited descriptor — the phase's only `unsafe`
+//! Adopting an inherited descriptor — the phase's `unsafe`
 //!
-//! **Why unsafe here, and nowhere else.** The daemonization contract (spec
+//! **Why unsafe here, and (almost) nowhere else.** The daemonization contract (spec
 //! §3) is that the CLI re-execs itself detached and the child reports
 //! `{pid, version}` on an inherited pipe once the socket is bound. Adopting
 //! an inherited descriptor is the one operation std offers no safe path
 //! for: `OwnedFd`/`File` can only be built from a raw number through
 //! `from_raw_fd`, which is unsafe because nothing in the type system proves
 //! the number names a descriptor this process owns.
+//!
+//! **Two documented sites, not one.** [`adopt_fd`] is `unsafe fn`, not a
+//! safe fn hiding an internal unsafe block: the ordering precondition that
+//! makes adoption sound (call this before the process opens anything of
+//! its own — see scenario (c) below) is a CALLER obligation this function
+//! cannot verify from inside itself, so the type system pushes it out to
+//! whoever calls it. That means the crate's unsafe surface is [`adopt_fd`]'s
+//! own definition here, plus its single call site in `crate::boot::boot`
+//! (the literal first statement in that function, with its own `// SAFETY:`
+//! comment) — two sites, each independently justified, not a widening of
+//! the exception.
 //!
 //! **Rejected alternative:** have the parent pass a socket path
 //! (`SHEP_READY_SOCK`) and let the child connect and write. It is entirely
@@ -53,7 +64,7 @@
 //! (d) double adoption — [`adopt_fd`] is called at most once, from
 //!     [`crate::boot::boot`], and consumes the number into an owning
 //!     [`std::fs::File`] that closes it on drop.
-#![allow(unsafe_code)] // IR-24: the one exception in this crate — see the essay above.
+#![allow(unsafe_code)] // IR-24 exception — two sites total, this block and boot.rs's one call site; see the essay above.
 
 use core::fmt;
 

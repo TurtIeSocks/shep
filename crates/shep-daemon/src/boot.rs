@@ -17,13 +17,23 @@
 //! serves connections until a signal or `KillDaemon` arrives, then tears
 //! down in a load-bearing order — see its own doc for why.
 //!
-//! `unsafe`-free itself: bind/probe/unlink/signal-registration are all safe
-//! std and tokio APIs. The one `unsafe` in this phase lives in
-//! [`crate::sys`]; [`boot`] calls into it as the very FIRST thing it does,
-//! before opening any descriptor of its own — see [`sys::adopt_fd`]'s
-//! `# Safety` section for why that ordering is load-bearing, not cosmetic
-//! (an earlier version of this module got it wrong and adopted a recycled
-//! fd in production-reachable conditions).
+//! **Unsafe surface (revised, IR-24):** two documented sites, not one —
+//! [`sys::adopt_fd`]'s own definition, and this module's single call to it
+//! (the very first statement in [`boot`], before anything else opens a
+//! descriptor of its own). `adopt_fd` is `unsafe fn`, not a safe fn wrapping
+//! an internal unsafe block: the ordering precondition that makes adoption
+//! sound ("call this before the process opens anything of its own") is a
+//! CALLER obligation `adopt_fd` cannot verify from inside itself, so the
+//! type system pushes it out to every call site instead. That is correct,
+//! not a widening of the exception — it moves the unprovable half of the
+//! contract to where it can actually be checked (by a reader of `boot`,
+//! against `boot`'s own literal statement order), rather than leaving a
+//! single safe-looking function silently trusted to always be called
+//! correctly. Every other bind/probe/unlink/signal-registration step in
+//! this module is plain safe std/tokio. (An earlier version of this module
+//! got the ordering wrong and adopted a recycled fd in
+//! production-reachable conditions — see [`sys::adopt_fd`]'s own rationale
+//! essay, scenario (c).)
 
 use core::fmt;
 use std::io::ErrorKind;
@@ -514,9 +524,11 @@ impl RunningDaemon {
     /// `boot` succeeding is what commits the daemon to owning the flock,
     /// the roll, the socket, and the pidfile, so nothing short of a panic
     /// may return from here without having attempted every step above.
-    /// (`signal_ready`'s registration, the one thing that used to be able
-    /// to `?`-exit `run` before any of this ran, now happens inside `boot`
-    /// instead, before any of these are created — see `boot`'s own doc.)
+    /// (`install_signals`'s registration used to run here, in `run`, where
+    /// its own failure could `?`-exit before any of this teardown had a
+    /// chance to run at all; it now happens inside `boot` instead, before
+    /// any of the state teardown depends on is even created — see `boot`'s
+    /// own doc.)
     ///
     /// # Errors
     /// - [`BootError::Io`] — a teardown filesystem step failed.
@@ -757,23 +769,38 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
-    /// Serializes every test in this module that calls `daemon.run()`
-    /// against every OTHER such test, because `nix::sys::signal::raise` (and
-    /// the real OS signal delivery it triggers) is NOT scoped to one test's
-    /// own tokio runtime: every `Signal` stream registered anywhere in this
-    /// test BINARY'S process receives it, regardless of which test spawned
-    /// it or which runtime owns it.
+    /// Serializes every test in this module that calls `boot()` and expects
+    /// it to succeed — NOT just the ones that go on to call `daemon.run()`
+    /// — against every OTHER such test, because `nix::sys::signal::raise`
+    /// (and the real OS signal delivery it triggers) is NOT scoped to one
+    /// test's own tokio runtime: every `Signal` stream registered anywhere
+    /// in this test BINARY'S process receives it, regardless of which test
+    /// spawned it or which runtime owns it.
     ///
-    /// Proven load-bearing, not just theoretical (Opus review, 2026-08-08):
-    /// reintroducing the fixed watch-receiver bug on purpose (dropping the
-    /// initial `shutdown_rx` again) still made `boot::tests` PASS under the
-    /// default PARALLEL test runner — `sigterm_triggers_the_same_graceful_shutdown`'s
-    /// `raise(SIGTERM)` accidentally reached `boot_restores_a_saved_flock_and_tears_down_in_order`'s
+    /// The rule is "calls `boot()` successfully", not "calls `run()`",
+    /// because `install_signals` moved INTO `boot` (see `boot`'s own doc):
+    /// a test whose `boot()` call succeeds has live signal listeners
+    /// running from that point on, whether or not it ever calls `run()`.
+    /// Proven concretely, not just reasoned about (Opus review follow-up,
+    /// 2026-08-08): a `boot`-only test with no lock passed 10/10 runs in
+    /// isolation and FAILED 10/10 runs alongside
+    /// `sigterm_triggers_the_same_graceful_shutdown` — the exact same
+    /// process-wide `raise(SIGTERM)` hazard, just reached through `boot`
+    /// alone rather than through `run`. Task 10's e2e `Fixture` is the next
+    /// `boot()` caller this crate will grow, so this is a real, standing
+    /// tripwire, not a one-off.
+    ///
+    /// Proven load-bearing on the shutdown-signal front too (Opus review,
+    /// 2026-08-08): reintroducing the fixed watch-receiver bug on purpose
+    /// (dropping the initial `shutdown_rx` again) still made `boot::tests`
+    /// PASS under the default PARALLEL test runner —
+    /// `sigterm_triggers_the_same_graceful_shutdown`'s `raise(SIGTERM)`
+    /// accidentally reached `boot_restores_a_saved_flock_and_tears_down_in_order`'s
     /// OWN daemon (hung on the reintroduced bug) too, on the SAME signal
     /// delivery, and rescued it — masking the regression. Only
     /// `--test-threads=1` (or, now, this lock) exposed it. Every test below
-    /// that calls `daemon.run()` takes this for its own duration so the two
-    /// can never overlap and one can never rescue (or corrupt) the other.
+    /// that calls `boot()` takes this for its own duration so no two such
+    /// tests can ever overlap and one can never rescue (or corrupt) another.
     ///
     /// `tokio::sync::Mutex`, not `std::sync::Mutex`: the guard is held
     /// across this fn's own `.await` points (`boot`, `run`, ...), and
@@ -918,33 +945,57 @@ mod tests {
         assert!(line.ends_with('\n'), "the parent reads a line: {line:?}");
     }
 
-    // Deliberately NOT tested with a real forced fd collision (tried, then
-    // removed — Opus review follow-up, 2026-08-08): a test that frees a real
-    // fd number and hands that same number to `boot()` a moment later has
-    // the exact "close, then act again on that learned number" shape that
-    // FD_REUSE_LOCK exists for (see its own doc), but locking THIS test
-    // against sys.rs's only protects it from THOSE two tests — it does
-    // nothing against the dozens of OTHER tests across this crate
-    // (server.rs, supervisor.rs, boot.rs's own other socket tests, ...)
-    // that independently open and close real descriptors on their own
-    // threads at the same time. Empirically, adding this one extra
-    // fd-churning test measurably raised the whole suite's collision odds
-    // enough to crash an UNRELATED test
-    // (`server::tests::a_garbage_frame_ends_the_connection_without_panicking`)
-    // with the identical `SIGABRT` (`IO Safety violation: owned file
-    // descriptor already closed`) within single-digit parallel runs — 40/40
-    // clean runs on the commit before this test existed, a crash within the
-    // first handful after. Locking the WHOLE crate's fd-touching tests
-    // against each other to make this one test safe would be a wildly
-    // disproportionate change for what it buys: the adoption-ordering fix
-    // itself is verified by inspection (`sys::adopt_fd` is the literal first
-    // statement in `boot`, see its own doc), by the rationale essay's
-    // scenario (c), and by `adopt_fd` now being `unsafe fn` — a future
-    // reorder needs its own fresh `unsafe` block and SAFETY justification
-    // at the new call site, not a silent move. `sys::tests`' own two
-    // fd-touching tests keep FD_REUSE_LOCK: that's a strict improvement
-    // over the prior state (no lock at all) for a self-contained pair, not
-    // an attempt to close this broader, pre-existing, whole-suite risk.
+    #[tokio::test]
+    async fn boot_refuses_a_stale_ready_fd_before_touching_anything_else() {
+        // Pins the CRITICAL fix (Opus review, 2026-08-08 + follow-up), this
+        // time WITHOUT the fd-collision risk of an earlier attempt (tried,
+        // found to destabilize the whole suite by racing unrelated tests
+        // over real fd reuse, removed — see git history / task-7-report.md
+        // for the numbers). fd 4096 is a number this process will NEVER
+        // own: default fd-table limits sit far below it, and nothing in
+        // this crate's test suite opens anywhere near that many concurrent
+        // descriptors, so `adopt_fd`'s `F_GETFD` probe fails on it
+        // deterministically, every time, regardless of what else is
+        // running concurrently — zero collision risk, unlike freeing and
+        // re-probing a REAL fd number.
+        //
+        // The assertion that actually pins the ordering isn't WHICH error
+        // `boot` returns (`BadFd` either way, since 4096 is never open no
+        // matter when it's probed) — it's that `bind_socket`/`write_pidfile`
+        // never ran at all. Reorder adoption to after `bind_socket` (as an
+        // earlier, broken version of this module did) and `paths.socket`
+        // WOULD exist here, because the wrongly-late adoption step would
+        // still fail on 4096 but only after the socket was already bound.
+        //
+        // Locked per SIGNAL_TEST_LOCK's widened rule (any test calling
+        // `boot()`, not just ones that reach `run()`) even though THIS
+        // specific call fails before `install_signals` ever runs — cheap,
+        // and it keeps the rule simple enough to hold under a future edit
+        // rather than relying on "well, THIS one doesn't get that far".
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+
+        let err = boot(
+            ScriptedRunner::new(vec![]),
+            paths.clone(),
+            BootOptions {
+                ready_fd: Some(4096),
+                ..BootOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, BootError::Ready(SysError::BadFd { .. })),
+            "a fd this process never owns must be refused as BadFd: {err:?}"
+        );
+        assert!(
+            !paths.socket.exists(),
+            "adoption must be refused BEFORE the socket is bound"
+        );
+        assert_eq!(read_pidfile(&paths).unwrap(), None);
+    }
 
     #[tokio::test]
     async fn boot_restores_a_saved_flock_and_tears_down_in_order() {
