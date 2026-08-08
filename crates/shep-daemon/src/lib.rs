@@ -26,11 +26,11 @@
 //! ##### OS tier
 //!
 //! - [`tokio_runner`]: real [`ProcessRunner`](runner::ProcessRunner) over `tokio::process` (unix-only)
-//! - [`kill`]: kill ladder — SIGTERM, SIGKILL escalation with a timeout
 //!
 //! ##### Orchestration
 //!
 //! - [`supervisor`]: the actor — owns registered entries, spawns per-sheep tasks, routes commands
+//! - [`kill`]: kill ladder — SIGTERM, SIGKILL escalation (portable, generic over [`RunningProcess`](runner::RunningProcess))
 //! - [`channel`]: shepherd channel codec (child↔daemon messages, newline-JSON)
 //!
 //! # Quick start
@@ -76,9 +76,7 @@
 //! }
 //!
 //! // Gracefully shut down all processes
-//! let (reply, rx) = tokio::sync::oneshot::channel();
-//! handle.shutdown(reply).await?;
-//! rx.await.ok();
+//! handle.shutdown().await;
 //!
 //! Ok(())
 //! # }

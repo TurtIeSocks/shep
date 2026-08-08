@@ -58,7 +58,6 @@ impl RestartBudget {
     }
 
     /// Get the current consecutive-unstable-exit count
-    #[inline]
     pub fn unstable_count(&self) -> u32 {
         self.unstable_count
     }
