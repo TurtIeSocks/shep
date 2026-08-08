@@ -103,7 +103,7 @@ crates/shep-client/
 
 crates/shep-cli/
   Cargo.toml                 deps: shep-core, shep-client, shep-daemon, clap, clap_complete, tokio,
-                             serde, serde_json
+                             futures-util, serde, serde_json
   src/main.rs                #![forbid(unsafe_code)], #[tokio::main], dispatch, exit-code mapping
   src/cli.rs                 clap derive tree: Cli, Commands, GlobalArgs, and EVERY argument struct
   src/exit.rs                ExitCode enum + code_str + From<RpcErrorCode> (portable)
@@ -1140,7 +1140,7 @@ Paste **both** transcripts into your report. This is the single most important g
 **`cli.rs` owns every argument struct in the tree.** Tasks 7 through 11 consume them and define none. Two reasons: this task's own "run the tests, confirm they pass" step is impossible if the enum names types that do not exist yet, and the whole parse surface has to sit in one portable file for the Windows tier to hold.
 
 **Interfaces:**
-- Consumes: `shep_core::protocol::RpcErrorCode`, `shep_core::paths::ShepPaths`, `clap_complete::aot::Shell`, and — behind `#[cfg(unix)]`, for the three conversions and the dispatch — `shep_client::{ConnectError, RequestError, SpawnError, Client, spawn::{connect_or_spawn, DAEMON_ALREADY_RUNNING}}`
+- Consumes: `shep_core::protocol::RpcErrorCode`, `shep_core::paths::ShepPaths`, `clap_complete::aot::Shell`, and — behind `#[cfg(unix)]`, for the three conversions and the dispatch — `shep_client::{ConnectError, RequestError, Client, spawn::{connect_or_spawn, SpawnError, DAEMON_ALREADY_RUNNING}}`
 - Produces:
 ```rust
 #[derive(Debug, clap::Parser)]
@@ -1289,8 +1289,13 @@ impl From<RpcErrorCode> for ExitCode { /* infallible, total */ }
 // OS tier: these three error types do not exist on a Windows build.
 #[cfg(unix)] impl From<&shep_client::ConnectError> for ExitCode {}
 #[cfg(unix)] impl From<&shep_client::RequestError> for ExitCode {}
-#[cfg(unix)] impl From<&shep_client::SpawnError> for ExitCode {}
+#[cfg(unix)] impl From<&shep_client::spawn::SpawnError> for ExitCode {}
 ```
+
+`SpawnError` is qualified through `spawn` while the other two are not, and that
+asymmetry is the re-export surface's, not a slip: the File Structure section
+flattens `ConnectError` and `RequestError` to the crate root and deliberately
+leaves `spawn` a module. There is no `shep_client::SpawnError` to name.
 
 `ExitCode` and `From<RpcErrorCode>` are pure tier — `RpcErrorCode` lives in shep-core and compiles everywhere. Only the three shep-client conversions are gated.
 
@@ -1311,6 +1316,12 @@ shep-client.workspace = true
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "env", "wrap_help"] }
 clap_complete = { version = "4", default-features = false }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
+# Task 10 is the reason: `EventStream` implements `futures_util::Stream`, and the
+# trait that gives it a `.next()` lives in this crate. Nothing else can supply it
+# — tokio dropped its own `StreamExt` in 1.0, and a transitive futures-util
+# through shep-client is not nameable from here. The Ctrl-C wiring
+# (`tokio::signal::ctrl_c().map(|_| ())`) needs `FutureExt` from the same crate.
+futures-util.workspace = true
 # `Render: Serialize` (Task 6) needs the trait and the derive, not just the
 # serializer — `serde_json` alone does not bring them.
 serde.workspace = true
@@ -1446,18 +1457,24 @@ Parsing happens before either — a Windows build still parses, still prints hel
 pub fn resolve(env: &dyn Fn(&str) -> Option<String>, home_dir: &Path) -> Self
 ```
 
-It reads exactly one variable, `SHEP_HOME`, and otherwise returns `home_dir.join(".shep")` (`:52-55`). `GlobalArgs.home` already carries `env = "SHEP_HOME"`, so clap has folded the flag and the variable into one `Option<PathBuf>` with the flag winning. The bridge is therefore a closure that answers `SHEP_HOME` from that option and passes everything else through:
+It reads exactly one variable, `SHEP_HOME`, and otherwise returns `home_dir.join(".shep")` (`:52-55`). `GlobalArgs.home` already carries `env = "SHEP_HOME"`, so clap has folded the flag and the variable into one `Option<PathBuf>` with the flag winning. The bridge is therefore a closure that answers `SHEP_HOME` from that option and passes everything else through — this is the whole body of the `resolve_paths` this task factors out further down:
 
 ```rust
-let home_dir = std::env::var_os("HOME").map(PathBuf::from);
 let env = |key: &str| match key {
-    "SHEP_HOME" => cli.global.home.as_ref().map(|p| p.to_string_lossy().into_owned()),
+    "SHEP_HOME" => global.home.as_ref().map(|p| p.to_string_lossy().into_owned()),
     other => std::env::var(other).ok(),
 };
-let Some(home_dir) = home_dir else {
-    // Only reachable when neither --home nor $SHEP_HOME was given, since
-    // otherwise `home_dir` is never read. Say which three things to set.
-    return emit_usage("set --home or $SHEP_HOME: $HOME is not set");
+// `$HOME` is only the FALLBACK root: `resolve` returns `home_dir.join(".shep")`
+// when `SHEP_HOME` answers nothing, and ignores the argument entirely when it
+// answers something. So demand `$HOME` only in that first case — reading it
+// unconditionally would fail a `--home` invocation in an environment that has
+// no `$HOME`, which is one of the situations `--home` exists for.
+let home_dir = match (std::env::var_os("HOME"), env("SHEP_HOME")) {
+    (Some(dir), _) => PathBuf::from(dir),
+    (None, Some(_)) => PathBuf::new(),
+    // `run` renders "set --home or $SHEP_HOME: $HOME is not set" through
+    // `emit_error` before exiting on this code.
+    (None, None) => return Err(ExitCode::Usage),
 };
 let paths = ShepPaths::resolve(&env, &home_dir);
 ```
@@ -1505,7 +1522,7 @@ Each later task **replaces its own arms in the same commit that creates its modu
 
 `streams` is `output::Streams { out: &mut io::stdout().lock(), err: &mut io::stderr().lock() }`, built once in `run` (Task 6 defines it — so at Task 5 time `run` writes to the two locks directly and Task 6 swaps in the struct). `fmt` is `cli.global.format`. The `Commands::Daemon` arm is the one that makes `ExitCode::DaemonAlreadyRunning = 10` reach a real process exit status — without it the whole cold-start contract, which Task 4 and Open Question 5 both rest on, is unreachable code.
 
-Factor the path resolution into `fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode>` so it is a unit under test rather than a paragraph inside `run`:
+The path resolution above is `fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode>`, a unit under test rather than a paragraph inside `run`:
 
 ```rust
 /// A `--home` that never reached `ShepPaths` is the failure mode fix D exists
@@ -1859,7 +1876,18 @@ pub fn launch_daemon(paths: &ShepPaths) -> std::io::Result<std::process::Child>;
 BootOptions { socket: config.daemon.socket.clone(), ready_fd: None, restore: !args.no_restore }
 ```
 
-`ready_fd` stays `None`, deliberately and permanently, per this plan's Global Constraints. Then `boot(TokioRunner::new(), paths, options).await.map_err(DaemonRunError::Boot)?.run().await`.
+`ready_fd` stays `None`, deliberately and permanently, per this plan's Global Constraints. Then
+
+```rust
+boot(TokioRunner::new(), paths, options)
+    .await
+    .map_err(DaemonRunError::Boot)?
+    .run()
+    .await
+    .map_err(DaemonRunError::Boot)
+```
+
+Both `map_err`s are load-bearing and neither is a duplicate of the other: `boot` and `RunningDaemon::run` each return `Result<_, BootError>`, so the trailing one is what makes the expression's type `Result<(), DaemonRunError>` rather than `Result<(), BootError>`.
 
 Reading the file is the one failure mode the two `DaemonRunError` variants do not name outright: `std::fs::read_to_string(&paths.daemon_config)` with `ErrorKind::NotFound` → `None` (a missing `shep.toml` is not an error, it is `DaemonConfig::load(None, &env)`), and any *other* io error → `DaemonRunError::Boot(BootError::Io { path: paths.daemon_config.clone(), source })`. It is genuinely an IO failure on a path, `BootError::Io` is exactly that, and it lands on `ExitCode::Failure`, which is right — an unreadable config file is not the same fault as an invalid one.
 
@@ -2476,11 +2504,14 @@ async fn ctrl_c_during_a_follow_exits_success() {
     let mut err = Vec::new();
     let mut streams = Streams { out: &mut out, err: &mut err };
 
+    // Bound, not inlined: a `&follow_args("all")` temporary is freed at the end
+    // of this `let`, and `follow` outlives it into the `join!` below.
+    let args = follow_args("all");
     let follow = bleats_with_signal(
         &client,
         &mut streams,
         Format::Table,
-        &follow_args("all"),
+        &args,
         async { let _ = interrupt_rx.await; },
     );
     let (_, code) = tokio::join!(
@@ -2836,9 +2867,9 @@ Copy that `output()` → `adopt_home` → assert ordering into all eight; it is 
 3. `grep -rn "unsafe" crates/shep-client/src crates/shep-cli/src | grep -v "forbid(unsafe_code)"` returns nothing. (The unfiltered grep can never pass: `#![forbid(unsafe_code)]` contains the string it searches for.)
 4. `grep -rn "SHEP_READY_FD\|adopt_fd" crates/shep-cli/src crates/shep-client/src` returns nothing.
 5. `grep -rn "not_wired" crates/shep-cli/src` returns nothing — every arm in Task 5's dispatch table has been replaced by the task that owns it.
-5. The three revert-proof transcripts (Task 2 routing, Task 4 handshake probe, Task 6 anti-drift) are in the reports, each with BOTH the broken-FAIL and restored-PASS runs.
-6. `shep start`, `shep flock`, `shep bleats`, `shep kill` work against a real daemon on a clean `$SHEP_HOME`.
-7. A report to Rin listing: the now-dead readiness-pipe surface with evidence, and every judgment call made on her behalf.
+6. The three revert-proof transcripts (Task 2 routing, Task 4 handshake probe, Task 6 anti-drift) are in the reports, each with BOTH the broken-FAIL and restored-PASS runs.
+7. `shep start`, `shep flock`, `shep bleats`, `shep kill` work against a real daemon on a clean `$SHEP_HOME`.
+8. A report to Rin listing: the now-dead readiness-pipe surface with evidence, and every judgment call made on her behalf.
 
 ## Open questions for Rin — do not resolve these unilaterally
 
