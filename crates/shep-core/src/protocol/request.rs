@@ -193,6 +193,8 @@ pub enum RpcErrorCode {
     ProtocolMismatch,
     /// Unexpected daemon-side failure
     Internal,
+    /// The request's deadline expired before the daemon finished it
+    DeadlineExceeded,
 }
 
 #[cfg(test)]
@@ -321,5 +323,19 @@ mod tests {
         let fixture = r#"{"Ok":{"daemon_version":"0.1.0","protocol":1,"pid":4242}}"#;
         let ack: HelloReply = serde_json::from_str(fixture).unwrap();
         assert_eq!(ack.unwrap().pid, 4242);
+    }
+
+    #[test]
+    fn deadline_exceeded_code_serializes_snake_case() {
+        // Additive variant (evolution rule): the existing codes keep their
+        // strings, so v1 byte fixtures above still deserialize unchanged.
+        assert_eq!(
+            serde_json::to_string(&RpcErrorCode::DeadlineExceeded).unwrap(),
+            "\"deadline_exceeded\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RpcErrorCode>("\"deadline_exceeded\"").unwrap(),
+            RpcErrorCode::DeadlineExceeded
+        );
     }
 }
