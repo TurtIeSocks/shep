@@ -239,6 +239,10 @@ impl Client {
             .map_err(|_send_error| RequestError::Closed)?;
         let receiver = reply_rx.await.map_err(|_recv_error| RequestError::Closed)?;
 
+        // The reply is expected to be `Response::Subscribed`, but it is
+        // deliberately unexamined here: no unexpected-response error variant
+        // exists yet, and the Global Constraints put `Response` variant
+        // interpretation in shep-cli, not this crate.
         self.request(Request::Subscribe { topics }).await?;
         Ok(EventStream::new(receiver))
     }

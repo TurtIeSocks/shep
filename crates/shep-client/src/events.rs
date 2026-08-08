@@ -75,9 +75,8 @@ impl Stream for EventStream {
 /// [`BusEvent`]. `Lagged` is the opposite failure: the event made it across
 /// the wire and into this connection's local broadcast channel just fine,
 /// but the [`EventStream`] reading from it was not polled quickly enough to
-/// keep up (another slow subscriber on the same channel, or the channel's
-/// own bounded capacity), and the channel discarded its oldest entries to
-/// make room.
+/// keep up against the channel's own bounded capacity, and the channel
+/// discarded its oldest entries to make room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lagged {
     /// How many events were discarded since this stream's last successful
@@ -96,6 +95,11 @@ mod tests {
     use crate::actor::EVENT_CHANNEL_CAPACITY;
     use crate::testing::{fake_client_with_push, sample_info};
 
+    /// Every `stream.next()` in this module is wrapped in this bound so a
+    /// broken implementation fails with a named assertion instead of
+    /// hanging the test run.
+    const EVENT_TIMEOUT: Duration = Duration::from_secs(1);
+
     #[tokio::test]
     async fn subscribe_yields_events_the_daemon_pushes() {
         let dir = tempfile::tempdir().unwrap();
@@ -113,7 +117,11 @@ mod tests {
         }
 
         for i in 0..3u32 {
-            let event = stream.next().await.unwrap().unwrap();
+            let event = tokio::time::timeout(EVENT_TIMEOUT, stream.next())
+                .await
+                .expect("a pushed event must arrive, not hang")
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 event,
                 BusEvent::LogOut {
@@ -125,17 +133,19 @@ mod tests {
         }
     }
 
-    /// `server.rs:357` sends the `Subscribed` reply ahead of any event, by
-    /// queue order. The client must have routed that reply before the first
-    /// event reaches the stream — an implementation that waits for the
-    /// reply *after* installing the subscriber deadlocks against a daemon
-    /// that pushes fast. Catches an implementation that sends
-    /// `Request::Subscribe` and only creates the local receiver once the
-    /// reply comes back: that ordering can never observe the event at all
-    /// (the daemon already wrote it before the receiver existed) and would
-    /// hang on the `stream.next()` below instead of the timeout tripping.
+    /// `Client::subscribe` installs the local receiver on the actor before
+    /// sending the wire `Request::Subscribe` (`client.rs:234-244`). Catches
+    /// an implementation that sends `Request::Subscribe` and only creates
+    /// the local receiver once the reply comes back: against a daemon that
+    /// writes its event immediately after replying (`server.rs:357`'s own
+    /// ordering), that receiver would not exist yet when the event crosses
+    /// the wire, so the event vanishes and this hangs on the `stream.next()`
+    /// below instead of a named assertion failing. Does NOT pin
+    /// reply-before-event ordering on the wire itself — only that the
+    /// receiver is installed in time to catch whatever the daemon sends
+    /// once the request goes out.
     #[tokio::test]
-    async fn the_subscribed_reply_arrives_before_any_event() {
+    async fn subscribing_installs_the_receiver_before_the_request_is_sent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.sock");
         let (client, daemon) = fake_client_with_push(&path).await;
@@ -158,7 +168,11 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            stream.next().await.unwrap().unwrap(),
+            tokio::time::timeout(EVENT_TIMEOUT, stream.next())
+                .await
+                .expect("the pre-installed receiver must observe the queued event")
+                .unwrap()
+                .unwrap(),
             BusEvent::Process {
                 event: ProcessEventKind::Online,
                 ..
@@ -184,11 +198,18 @@ mod tests {
         daemon.close().await;
 
         assert_eq!(
-            stream.next().await.unwrap().unwrap(),
+            tokio::time::timeout(EVENT_TIMEOUT, stream.next())
+                .await
+                .expect("the DaemonShutdown event must arrive, not hang")
+                .unwrap()
+                .unwrap(),
             BusEvent::DaemonShutdown
         );
         assert!(
-            stream.next().await.is_none(),
+            tokio::time::timeout(EVENT_TIMEOUT, stream.next())
+                .await
+                .expect("the stream must end after the notice, not hang")
+                .is_none(),
             "the stream ends after the notice, not before it"
         );
     }
@@ -219,14 +240,19 @@ mod tests {
         }
         daemon.close().await;
 
-        let mut lag = None;
-        while let Some(item) = stream.next().await {
-            if let Err(Lagged { count }) = item {
-                lag = Some(count);
-                break;
+        let count = tokio::time::timeout(EVENT_TIMEOUT, async {
+            let mut lag = None;
+            while let Some(item) = stream.next().await {
+                if let Err(Lagged { count }) = item {
+                    lag = Some(count);
+                    break;
+                }
             }
-        }
-        let count = lag.expect("an overrun must be reported, never silently skipped");
+            lag
+        })
+        .await
+        .expect("must not hang waiting for the lag notice or the stream to end")
+        .expect("an overrun must be reported, never silently skipped");
         assert!(count > 0, "the lag notice must say how many were lost");
     }
 }
