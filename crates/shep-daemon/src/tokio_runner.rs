@@ -155,6 +155,19 @@ impl ProcessRunner for TokioRunner {
         // reaching the daemon's own group.
         command.process_group(0);
 
+        if let Some(creds) = spec.credentials {
+            // std sets the gid before the uid in the child (setgid must
+            // happen while still privileged), which is the order privilege
+            // drop requires.
+            // KNOWN LIMITATION: supplementary groups are inherited from the
+            // daemon — CommandExt::groups is still unstable. Documented,
+            // deferred.
+            if let Some(gid) = creds.gid {
+                command.gid(gid);
+            }
+            command.uid(creds.uid);
+        }
+
         let (from_child_tx, from_child_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (to_child_tx, to_child_rx) = mpsc::channel(CHANNEL_CAPACITY);
 

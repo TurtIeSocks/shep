@@ -22,6 +22,8 @@
 //!
 //! - [`runner`]: [`ProcessRunner`](runner::ProcessRunner) spawn seam with two impls
 //! - [`fake`]: deterministic scripted [`ProcessRunner`](runner::ProcessRunner) (test-only, or test-fakes feature)
+//! - [`privilege`]: `user`/`group` config -> numeric uid/gid, one portable `resolve()`
+//!   signature over a real unix impl and a refuse-outright non-unix stub
 //!
 //! ##### OS tier
 //!
@@ -114,6 +116,7 @@ pub mod bus;
 pub mod channel;
 pub mod entry;
 pub mod kill;
+pub mod privilege;
 pub mod rpc;
 pub mod runner;
 pub mod snapshot;

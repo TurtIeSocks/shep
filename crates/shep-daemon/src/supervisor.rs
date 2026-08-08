@@ -42,6 +42,7 @@ use crate::brain::{Decision, decide_on_exit};
 use crate::channel::ChildMessage;
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
 use crate::kill::kill_process;
+use crate::privilege::{self, Credentials};
 use crate::runner::{ExitOutcome, ProcIo, ProcessRunner, RunningProcess};
 
 /// Capacity of the actor's own mailbox (commands + internal events).
@@ -476,6 +477,13 @@ impl<R: ProcessRunner> Actor<R> {
         let mut results = Vec::new();
         for app in apps {
             let name = app.config().name.clone();
+            // Resolved once per app in this Start batch, not once per
+            // instance: every instance of the same app shares one identity,
+            // and respawn() reuses this same value from ProcessEntry for
+            // every future restart instead of re-touching the passwd
+            // database (crate::privilege's module doc).
+            let credentials = privilege::resolve(app.config())
+                .map_err(|err| SupervisorError::SpawnFailed(err.to_string()))?;
             let mut existing: Vec<u32> = self
                 .sheep
                 .values()
@@ -486,7 +494,7 @@ impl<R: ProcessRunner> Actor<R> {
             let slots = instance_slots(&existing, app.config().instances);
 
             for instance in slots {
-                match self.spawn_fresh(&app, instance) {
+                match self.spawn_fresh(&app, instance, credentials) {
                     Ok(info) => results.push(info),
                     Err(message) => return Err(SupervisorError::SpawnFailed(message)),
                 }
@@ -500,8 +508,13 @@ impl<R: ProcessRunner> Actor<R> {
     /// Always inserts a [`SheepSlot`] — `Online` with a live sheep task on
     /// success, `Errored` with no task on failure — before returning, so the
     /// entry persists regardless of the outcome.
-    fn spawn_fresh(&mut self, app: &ResolvedApp, instance: u32) -> Result<ProcessInfo, String> {
-        let spec = assemble(app, instance, &self.paths);
+    fn spawn_fresh(
+        &mut self,
+        app: &ResolvedApp,
+        instance: u32,
+        credentials: Option<Credentials>,
+    ) -> Result<ProcessInfo, String> {
+        let spec = assemble(app, instance, &self.paths, credentials);
         let id = self.next_id;
         self.next_id += 1;
 
@@ -518,6 +531,7 @@ impl<R: ProcessRunner> Actor<R> {
                     started_at: Some(tokio::time::Instant::now()),
                     budget: RestartBudget::default(),
                     reload: ReloadState::None,
+                    credentials,
                 };
                 let info = to_info(&entry);
                 let ctl = spawn_sheep_task::<R::Proc>(
@@ -551,6 +565,7 @@ impl<R: ProcessRunner> Actor<R> {
                     started_at: None,
                     budget: RestartBudget::default(),
                     reload: ReloadState::None,
+                    credentials,
                 };
                 let info = to_info(&entry);
                 self.sheep.insert(
@@ -576,7 +591,11 @@ impl<R: ProcessRunner> Actor<R> {
         let slot = self.sheep.get(&id).expect("respawn: unknown id");
         let app = slot.entry.spec.clone();
         let instance = slot.entry.instance;
-        let spec = assemble(&app, instance, &self.paths);
+        // Reused as-is from the initial Start (never re-resolved): a
+        // restart must never re-touch the passwd database, and must never
+        // silently change identity out from under an already-running app.
+        let credentials = slot.entry.credentials;
+        let spec = assemble(&app, instance, &self.paths, credentials);
 
         match self.runner.spawn(&spec) {
             Ok((proc, io)) => {
@@ -1295,6 +1314,24 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, SupervisorError::SpawnFailed(_)));
         assert_eq!(handle.list().await[0].status, ProcStatus::Errored);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unresolvable_user_fails_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let handle = spawn_supervisor(
+            ScriptedRunner::new(vec![ProcScript::never_exits()]),
+            test_paths(&dir),
+            events,
+        );
+        let mut app = AppConfig::minimal("svc", "./svc");
+        app.user = Some("definitely-not-a-real-shep-user".to_string());
+        let err = handle
+            .start(vec![normalize(app).unwrap()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SupervisorError::SpawnFailed(_)));
     }
 
     #[tokio::test(start_paused = true)]

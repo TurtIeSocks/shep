@@ -5,11 +5,13 @@
 //! No I/O here — all defaults, env vars, and paths are pre-resolved by the
 //! daemon before assembler is called (environment comes in via `ResolvedApp`).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use shep_core::config::ResolvedApp;
 use shep_core::paths::ShepPaths;
 
+use crate::privilege::Credentials;
 use crate::runner::SpawnSpec;
 
 /// Finds the `count` lowest-free instance slot numbers from an existing set.
@@ -42,11 +44,37 @@ pub fn instance_slots(existing: &[u32], count: u32) -> Vec<u32> {
     result
 }
 
+/// The env every spawned child starts from, before the app's own `env` map
+/// is folded on top (app config always wins on conflict).
+///
+/// `tokio_runner.rs` calls `env_clear()` then `envs(&spec.env)` — the child
+/// sees exactly this map and nothing else. Without a `PATH` in it, a bare
+/// program/interpreter name (anything with no `/`: `node`, `python3`, `sh`,
+/// a PATH-relative script) can never be found by exec; this is reading the
+/// DAEMON'S OWN env once (not a file, not the child's), so it stays a pure
+/// function of process state, not a filesystem/network IO the module doc's
+/// "no I/O" note is warning about.
+fn base_env() -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
+    env.insert("PATH".to_string(), path);
+    for key in ["HOME", "USER", "LANG", "TZ"] {
+        if let Ok(value) = std::env::var(key) {
+            env.insert(key.to_string(), value);
+        }
+    }
+    env
+}
+
 /// Assembles a [`SpawnSpec`] from a validated app config and instance slot.
 ///
 /// Resolves the program/args from the interpreter config, merges env with the
 /// instance slot var, computes log file paths respecting `merge_logs`, and sets
 /// the shepherd-channel flag from `wait_ready || shutdown_with_message`.
+///
+/// `credentials` is resolved by the caller (passwd/group lookups are real
+/// I/O, so they stay out of this otherwise-pure function — see
+/// [`crate::privilege::resolve`]) and threaded straight onto the spec.
 ///
 /// # Interpreter logic
 ///
@@ -61,7 +89,12 @@ pub fn instance_slots(existing: &[u32], count: u32) -> Vec<u32> {
 /// (shared across all instances). Explicit `out_file`/`err_file` config
 /// always win over defaults.
 #[must_use]
-pub fn assemble(app: &ResolvedApp, instance: u32, paths: &ShepPaths) -> SpawnSpec {
+pub fn assemble(
+    app: &ResolvedApp,
+    instance: u32,
+    paths: &ShepPaths,
+    credentials: Option<Credentials>,
+) -> SpawnSpec {
     let config = app.config();
     let name = config.name.clone();
 
@@ -83,8 +116,13 @@ pub fn assemble(app: &ResolvedApp, instance: u32, paths: &ShepPaths) -> SpawnSpe
         }
     };
 
-    // Environment: merge app env with instance slot var
-    let mut env = config.env.clone();
+    // Environment: base env FIRST (PATH + a small inherited allowlist), then
+    // the app's own env on top: env_clear() + envs(&spec.env) in
+    // tokio_runner.rs means anything not seeded here is invisible to the
+    // child (adversarial finding #1 — a bare interpreter/program spawned
+    // with no PATH is ENOENT, not a slow failure).
+    let mut env = base_env();
+    env.extend(config.env.clone());
     let slot_var = config.increment_var.as_deref().unwrap_or("SHEP_INSTANCE");
     env.insert(slot_var.to_string(), instance.to_string());
 
@@ -122,6 +160,7 @@ pub fn assemble(app: &ResolvedApp, instance: u32, paths: &ShepPaths) -> SpawnSpe
         out_file,
         err_file,
         channel,
+        credentials,
     }
 }
 
@@ -167,7 +206,7 @@ mod tests {
         let app = normalize(app_config).unwrap();
         let paths = test_paths();
 
-        let spec = assemble(&app, 1, &paths);
+        let spec = assemble(&app, 1, &paths, None);
 
         assert!(spec.env.contains_key("SHEP_INSTANCE"));
         assert_eq!(spec.env.get("SHEP_INSTANCE").map(|s| s.as_str()), Some("1"));
@@ -186,7 +225,7 @@ mod tests {
         let app = normalize(app_config).unwrap();
         let paths = test_paths();
 
-        let spec = assemble(&app, 5, &paths);
+        let spec = assemble(&app, 5, &paths, None);
 
         assert!(!spec.env.contains_key("SHEP_INSTANCE"));
         assert_eq!(spec.env.get("WORKER_ID").map(|s| s.as_str()), Some("5"));
@@ -204,7 +243,7 @@ mod tests {
         let app = normalize(app_config).unwrap();
         let paths = test_paths();
 
-        let spec = assemble(&app, 0, &paths);
+        let spec = assemble(&app, 0, &paths, None);
 
         assert_eq!(spec.program, "/opt/bin/server");
         assert_eq!(spec.args, vec!["--port", "8080"]);
@@ -222,7 +261,7 @@ mod tests {
         let app = normalize(app_config).unwrap();
         let paths = test_paths();
 
-        let spec = assemble(&app, 0, &paths);
+        let spec = assemble(&app, 0, &paths, None);
 
         assert_eq!(spec.program, "server.py");
         assert_eq!(spec.args, vec!["--verbose"]);
@@ -240,7 +279,7 @@ mod tests {
         let app = normalize(app_config).unwrap();
         let paths = test_paths();
 
-        let spec = assemble(&app, 0, &paths);
+        let spec = assemble(&app, 0, &paths, None);
 
         assert_eq!(spec.program, "node");
         assert_eq!(spec.args, vec!["app.js", "--debug", "true"]);
@@ -258,7 +297,7 @@ mod tests {
         let app = normalize(app_config).unwrap();
         let paths = test_paths();
 
-        let spec = assemble(&app, 2, &paths);
+        let spec = assemble(&app, 2, &paths, None);
 
         assert_eq!(
             spec.out_file,
@@ -282,7 +321,7 @@ mod tests {
         let app = normalize(app_config).unwrap();
         let paths = test_paths();
 
-        let spec = assemble(&app, 1, &paths);
+        let spec = assemble(&app, 1, &paths, None);
 
         assert_eq!(
             spec.out_file,
@@ -307,7 +346,7 @@ mod tests {
         let app = normalize(app_config).unwrap();
         let paths = test_paths();
 
-        let spec = assemble(&app, 0, &paths);
+        let spec = assemble(&app, 0, &paths, None);
 
         assert_eq!(spec.out_file, PathBuf::from("/var/log/myapp.log"));
         // err_file still uses default
@@ -330,7 +369,7 @@ mod tests {
         let app = normalize(app_config).unwrap();
         let paths = test_paths();
 
-        let spec = assemble(&app, 0, &paths);
+        let spec = assemble(&app, 0, &paths, None);
 
         assert!(spec.channel);
     }
@@ -348,8 +387,52 @@ mod tests {
         let app = normalize(app_config).unwrap();
         let paths = test_paths();
 
-        let spec = assemble(&app, 0, &paths);
+        let spec = assemble(&app, 0, &paths, None);
 
         assert!(spec.channel);
+    }
+
+    #[test]
+    fn assembled_env_always_carries_a_path() {
+        // tokio_runner.rs's env_clear() + envs(&spec.env) means this map IS
+        // the child's whole env: no PATH here, and a bare interpreter name
+        // (node, python3, sh, ...) can never be found by exec.
+        let app_config = AppConfig {
+            name: "web".to_string(),
+            script: "app.js".to_string(),
+            args: vec![],
+            interpreter: Some("node".to_string()),
+            ..Default::default()
+        };
+        let app = normalize(app_config).unwrap();
+        let spec = assemble(&app, 0, &test_paths(), None);
+        let path = spec
+            .env
+            .get("PATH")
+            .expect("PATH must survive env_clear()+envs(&spec.env)");
+        assert!(
+            !path.is_empty(),
+            "an empty PATH is exactly the ENOENT failure mode"
+        );
+    }
+
+    #[test]
+    fn an_explicit_app_path_overrides_the_seeded_default() {
+        let mut app_config = AppConfig {
+            name: "web".to_string(),
+            script: "app.js".to_string(),
+            args: vec![],
+            interpreter: Some("node".to_string()),
+            ..Default::default()
+        };
+        app_config
+            .env
+            .insert("PATH".to_string(), "/opt/custom/bin".to_string());
+        let app = normalize(app_config).unwrap();
+        let spec = assemble(&app, 0, &test_paths(), None);
+        assert_eq!(
+            spec.env.get("PATH").map(String::as_str),
+            Some("/opt/custom/bin")
+        );
     }
 }

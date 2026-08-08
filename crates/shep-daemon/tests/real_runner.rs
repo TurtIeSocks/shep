@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use shep_daemon::channel::ChildMessage;
+use shep_daemon::privilege::Credentials;
 use shep_daemon::runner::{ProcessRunner, RunningProcess, SpawnSpec, StopSignal};
 use shep_daemon::tokio_runner::TokioRunner;
 
@@ -31,6 +32,27 @@ fn sh_spec(script: &str, channel: bool, out_file: PathBuf, err_file: PathBuf) ->
         out_file,
         err_file,
         channel,
+        credentials: None,
+    }
+}
+
+/// Builds a `program args...` spec writing logs under `dir` — the general
+/// form `sh_spec` doesn't cover (an arbitrary program, not always `/bin/sh
+/// -c <one script string>`). Used by the uid/gid drop proof below, which
+/// needs to run `/bin/sh -c "id -u"` and separately by nothing else today,
+/// but is named/shaped for reuse (Task 8 brief: "this file's existing
+/// helper" — added here since it didn't exist before this task).
+fn spec_for(dir: &tempfile::TempDir, program: &str, args: &[&str]) -> SpawnSpec {
+    SpawnSpec {
+        name: "real-runner-test".to_string(),
+        program: program.to_string(),
+        args: args.iter().map(|s| (*s).to_string()).collect(),
+        cwd: None,
+        env: BTreeMap::new(),
+        out_file: dir.path().join("out.log"),
+        err_file: dir.path().join("err.log"),
+        channel: false,
+        credentials: None,
     }
 }
 
@@ -143,4 +165,86 @@ async fn shepherd_channel_delivers_ready() {
         .await
         .expect("kill_tree should reap promptly");
     assert_eq!(outcome.signal, Some(9));
+}
+
+#[tokio::test]
+#[ignore = "needs root: run with `sudo -E cargo test -p shep-daemon --test real_runner -- --ignored`"]
+async fn a_dropped_child_runs_as_the_requested_user() {
+    // Real time: this file's whole tier is real OS behavior.
+    assert!(
+        nix::unistd::geteuid().is_root(),
+        "this test only means anything as root"
+    );
+    let target = nix::unistd::User::from_name("nobody")
+        .unwrap()
+        .expect("every unix box has `nobody`");
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = spec_for(&dir, "/bin/sh", &["-c", "id -u"]);
+    spec.credentials = Some(Credentials {
+        uid: target.uid.as_raw(),
+        gid: Some(target.gid.as_raw()),
+    });
+
+    let runner = TokioRunner::new();
+    let (mut proc, mut io) = runner.spawn(&spec).unwrap();
+    let printed = tokio::time::timeout(Duration::from_secs(5), io.logs.recv())
+        .await
+        .expect("the child must print its uid")
+        .expect("the log pump must deliver the line");
+    assert_eq!(printed.line.trim(), target.uid.as_raw().to_string());
+    assert!(!printed.err);
+    assert_eq!(proc.wait().await.code, Some(0));
+}
+
+#[tokio::test]
+async fn a_bare_interpreter_resolves_via_the_seeded_path() {
+    // Standing in for Task 10's not-yet-created e2e tier (this crate has no
+    // `tests/e2e_*.rs` yet — see task-8-report.md): proves the FULL chain
+    // (config -> assemble()'s base_env() PATH seed -> TokioRunner spawn ->
+    // OS exec) actually resolves a BARE program name, not just an absolute
+    // one. Every other test in this file spawns `/bin/sh` by absolute path,
+    // which never exercises PATH lookup at all — exactly what masked
+    // adversarial finding #1 (assemble() built `spec.env` with no PATH, so
+    // `env_clear()` + `envs(&spec.env)` handed a bare interpreter an empty
+    // env and every such spawn ENOENT'd).
+    use shep_core::config::{AppConfig, normalize};
+    use shep_core::paths::ShepPaths;
+    use shep_daemon::assemble::assemble;
+
+    let dir = tempfile::tempdir().unwrap();
+    let paths = ShepPaths {
+        home: dir.path().to_path_buf(),
+        daemon_config: dir.path().join("shep.toml"),
+        snapshot: dir.path().join("flock.json"),
+        logs: dir.path().join("logs"),
+        pids: dir.path().join("pids"),
+        run: dir.path().join("run"),
+        socket: dir.path().join("run/shep.sock"),
+        barks: dir.path().join("barks.jsonl"),
+    };
+    let app_config = AppConfig {
+        name: "bare".to_string(),
+        script: "-c".to_string(),
+        args: vec!["echo bare-exec-ok".to_string()],
+        interpreter: Some("sh".to_string()), // bare: resolved via PATH, never /bin/sh directly
+        ..Default::default()
+    };
+    let app = normalize(app_config).unwrap();
+    let spec = assemble(&app, 0, &paths, None);
+    assert_eq!(
+        spec.program, "sh",
+        "sanity: genuinely bare, not accidentally absolute"
+    );
+
+    let runner = TokioRunner::new();
+    let (mut proc, mut io) = runner.spawn(&spec).unwrap();
+    let line = tokio::time::timeout(Duration::from_secs(5), io.logs.recv())
+        .await
+        .expect("a bare `sh` must resolve via the seeded PATH and produce output")
+        .expect("logs channel closed before the line arrived");
+    assert_eq!(line.line, "bare-exec-ok");
+    assert!(!line.err);
+    let outcome = proc.wait().await;
+    assert_eq!(outcome.code, Some(0));
 }
