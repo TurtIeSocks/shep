@@ -32,7 +32,7 @@ use crate::exit::ExitCode;
 /// separate variants rather than one, because they are not the same fault:
 /// a `BootError` from `run()` means the supervisor came up and served
 /// (possibly for a long time) and only failed during its run loop or
-/// teardown, which "the shepherd failed to boot" would misreport.
+/// teardown, which "the daemon failed to boot" would misreport.
 #[derive(Debug)]
 pub enum DaemonRunError {
     /// `shep.toml` was unreadable as config.
@@ -48,8 +48,8 @@ impl core::fmt::Display for DaemonRunError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Config(err) => write!(f, "invalid daemon configuration: {err}"),
-            Self::Boot(err) => write!(f, "the shepherd failed to boot: {err}"),
-            Self::Run(err) => write!(f, "the shepherd failed while running: {err}"),
+            Self::Boot(err) => write!(f, "the daemon failed to boot: {err}"),
+            Self::Run(err) => write!(f, "the daemon failed while running: {err}"),
         }
     }
 }
@@ -254,11 +254,11 @@ mod tests {
         // What must differ is `DaemonRunError`'s own outer wording: only
         // `Boot` may claim the daemon "failed to boot".
         assert_ne!(boot_msg, run_msg);
-        assert!(boot_msg.starts_with("the shepherd failed to boot"));
+        assert!(boot_msg.starts_with("the daemon failed to boot"));
         assert!(
-            !run_msg.starts_with("the shepherd failed to boot"),
+            !run_msg.starts_with("the daemon failed to boot"),
             "a run-phase failure must not still claim to be a boot failure: {run_msg:?}"
         );
-        assert!(run_msg.starts_with("the shepherd failed while running"));
+        assert!(run_msg.starts_with("the daemon failed while running"));
     }
 }

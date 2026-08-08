@@ -92,8 +92,7 @@ pub async fn kill_with_wait(
                     },
                 ))
             } else {
-                let message =
-                    "the shepherd acknowledged shutdown, but teardown is still in progress";
+                let message = "the daemon acknowledged shutdown, but teardown is still in progress";
                 let _ = emit_error(
                     &mut *streams.err,
                     fmt,
