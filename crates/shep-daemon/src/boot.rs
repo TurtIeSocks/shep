@@ -20,7 +20,7 @@
 //! **No unsafe in this module.** [`BootOptions::ready_fd`] is
 //! `Option<`[`std::fs::File`]`>`, not a raw descriptor: the CALLER adopts
 //! the inherited readiness pipe (`unsafe fn` [`crate::sys::adopt_fd`],
-//! IR-24's sole unsafe surface) before ever constructing a [`BootOptions`],
+//! IR-22's sole unsafe surface) before ever constructing a [`BootOptions`],
 //! so [`boot`] only ever receives an already-owned handle and never
 //! constructs one from a bare number itself. Every bind/probe/unlink/
 //! signal-registration step in this module is plain safe std/tokio.

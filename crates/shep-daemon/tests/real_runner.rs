@@ -308,7 +308,7 @@ async fn a_dropped_child_runs_as_the_requested_user() {
 /// `getenv` at the same instant. `tests/real_runner.rs` is compiled as its
 /// own crate root (a `[[test]]` binary), not part of the `shep-daemon`
 /// library crate `lib.rs` gates with `#![deny(unsafe_code)]` — so this does
-/// NOT add a third unsafe site to that crate's documented two. Within this
+/// NOT add a second unsafe site to that crate's documented one. Within this
 /// binary specifically: no other test here reads or writes `PATH`, and
 /// `std::process::Command::spawn` (used throughout this file) reads env
 /// through std's OWN `env_read_lock`/fork synchronization (see
