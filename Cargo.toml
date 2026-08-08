@@ -91,6 +91,15 @@ insta = { version = "1.18.1", default-features = false, features = ["json"] }
 tempfile = { version = "3", default-features = false }
 # Only shep-daemon (dev): property tests on the kill ladder / supervisor state machine.
 proptest = { version = "1", default-features = false, features = ["std"] }
+# Task 3's EventStream. `broadcast::Receiver` has no poll API, so a hand-rolled
+# `Stream::poll_next` over it either does not compile or busy-spins on
+# `try_recv` (which registers no waker). `wrappers::BroadcastStream` is the
+# upstream answer and is gated behind the `sync` feature, which does not exist
+# before 0.1.3 — verified against the crates.io index, where 0.1.0-0.1.2 declare
+# only `default`/`fs`/`io-util`/`net`/`time`. Start the minimal-versions
+# rehearsal at 0.1.3 and raise the floor to whatever version actually provides
+# `BroadcastStreamRecvError`, naming that type in the comment.
+tokio-stream = { version = "0.1.3", default-features = false, features = ["sync"] }
 
 [workspace.lints.rust]
 missing_docs = "deny"
