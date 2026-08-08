@@ -43,12 +43,9 @@ use shep_core::paths::ShepPaths;
 /// - Either log file could not be opened for writing.
 /// - [`std::env::current_exe`] failed to resolve this binary's own path.
 ///
-/// Not called outside this module's own tests yet: wiring this launcher
-/// into `shep_client::spawn::connect_or_spawn`'s autostart path is the
-/// `start` command's own job, and `commands::lifecycle` (which will own
-/// `start`) has not landed. `#[allow(dead_code)]` says so explicitly
-/// rather than inventing a call site nothing needs yet.
-#[allow(dead_code)]
+/// Reached in production through [`launch_daemon`], which `main` hands to
+/// `shep_client::spawn::connect_or_spawn` as its launcher — the binary's
+/// only autostart.
 pub fn launch_command(paths: &ShepPaths) -> io::Result<Command> {
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -88,10 +85,9 @@ pub fn launch_command(paths: &ShepPaths) -> io::Result<Command> {
 /// # Errors
 /// Whatever [`launch_command`] can fail with, plus the spawn itself.
 ///
-/// Not called outside this module's own tests yet, for the same reason as
-/// [`launch_command`]. `#[allow(dead_code)]` says so explicitly rather than
-/// inventing a call site nothing needs yet.
-#[allow(dead_code)]
+/// This is the launcher `main` passes to
+/// `shep_client::spawn::connect_or_spawn`, so a cold `$SHEP_HOME` gets a
+/// daemon on the first command that needs one.
 pub fn launch_daemon(paths: &ShepPaths) -> io::Result<Child> {
     launch_command(paths)?.spawn()
 }
