@@ -118,7 +118,7 @@ pub struct BleatsArgs {
     /// Which sheep (default: all)
     #[arg(default_value = "all")]
     pub selector: String,
-    /// Drain what is buffered and exit instead of streaming
+    /// Print the tail of each sheep's log file and exit, instead of following
     #[arg(long)]
     pub no_follow: bool,
     /// Only stderr
