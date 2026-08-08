@@ -1,4 +1,0 @@
-#!/bin/sh
-# Existence-only fixture. commands/lifecycle.rs test suite resolves this
-# relative path through resolve_target(), which checks Path::exists() before
-# treating a target as a script; content is never read or executed.

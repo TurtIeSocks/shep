@@ -350,6 +350,7 @@ pub async fn delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shep_client::DEFAULT_DEADLINE;
     use shep_client::testing::{fake_client_capturing_envelopes, fake_client_replying_err};
     use shep_core::protocol::RpcErrorCode;
 
@@ -361,6 +362,16 @@ mod tests {
         }
     }
 
+    /// Covers `resolve_target`'s pure `-` arm only — `stdin` here is bytes
+    /// already read, handed straight in. The real `std::io::stdin()` read
+    /// inside `start` (this file's `if args.target == "-"` block) has no
+    /// injection seam and is a documented gap, not tested: swapping the
+    /// process's real fd 0 to feed it would race whatever other test
+    /// `cargo test`'s multi-threaded runner happens to run concurrently,
+    /// and reading the harness's own actual stdin blocks or EOFs depending
+    /// on how the suite was invoked — neither is a real assertion, and
+    /// inventing one that passes either way is worse than admitting the
+    /// gap.
     #[test]
     fn a_dash_target_reads_a_flockfile_from_stdin_as_json() {
         // `app`, not `apps` — the wire key is renamed and unknown keys are a
@@ -433,40 +444,74 @@ mod tests {
         assert!(String::from_utf8(err).unwrap().contains("./does-not-exist"));
     }
 
-    /// The client-side parse is the point: `stop` must send a compiled
-    /// `SelectorSpec`, not the raw string and not `All`. Nothing else here
-    /// reads the envelope, so without this a `stop` that always sent
-    /// `SelectorSpec::All` would pass every other test in this module — and
-    /// would stop the entire flock.
+    /// The client-side parse is the point: every selector-taking verb must
+    /// send a compiled `SelectorSpec` inside its OWN `Request` variant — not
+    /// the raw string, not `SelectorSpec::All`, and not another verb's
+    /// variant. Asserting the whole `sent.body` (not just the selector
+    /// inside it) is what catches a verb sending the wrong request kind:
+    /// the reviewer proved this reachable by mutating both `restart` and
+    /// `delete` to send `Request::Stop { selector }` and getting 9 passed,
+    /// 0 failed — because the previous version of this test only ever
+    /// drove `stop`. Also pins that all three call `request_and_render`
+    /// with `deadline: None` — visible on the wire as `DEFAULT_DEADLINE`,
+    /// since `Client::request_with_deadline` never leaves `deadline_ms`
+    /// unstated — and a verb that stopped doing so passed unnoticed before
+    /// this.
     #[tokio::test]
     async fn a_selector_reaches_the_wire_in_its_compiled_form() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.sock");
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
-        for (input, expected) in [
-            ("all", SelectorSpec::All),
-            ("7", SelectorSpec::Id(7)),
-            ("web", SelectorSpec::Name("web".into())),
-            ("/^web-/", SelectorSpec::Regex("^web-".into())),
-            ("fold:api", SelectorSpec::Fold("api".into())),
-        ] {
-            let mut out = Vec::new();
-            let mut err = Vec::new();
-            let mut streams = Streams {
-                out: &mut out,
-                err: &mut err,
-            };
-            let _ = stop(
-                &client,
-                &mut streams,
-                Format::Table,
-                &SelectorArgs {
+
+        #[derive(Clone, Copy, Debug)]
+        enum Verb {
+            Stop,
+            Restart,
+            Delete,
+        }
+
+        for verb in [Verb::Stop, Verb::Restart, Verb::Delete] {
+            for (input, expected) in [
+                ("all", SelectorSpec::All),
+                ("7", SelectorSpec::Id(7)),
+                ("web", SelectorSpec::Name("web".into())),
+                ("/^web-/", SelectorSpec::Regex("^web-".into())),
+                ("fold:api", SelectorSpec::Fold("api".into())),
+            ] {
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                let mut streams = Streams {
+                    out: &mut out,
+                    err: &mut err,
+                };
+                let args = SelectorArgs {
                     selector: input.into(),
-                },
-            )
-            .await;
-            let sent = envelopes.recv().await.unwrap();
-            assert_eq!(sent.body, Request::Stop { selector: expected }, "{input}");
+                };
+                let expected_body = match verb {
+                    Verb::Stop => Request::Stop { selector: expected },
+                    Verb::Restart => Request::Restart { selector: expected },
+                    Verb::Delete => Request::Delete { selector: expected },
+                };
+                let _ = match verb {
+                    Verb::Stop => stop(&client, &mut streams, Format::Table, &args).await,
+                    Verb::Restart => restart(&client, &mut streams, Format::Table, &args).await,
+                    Verb::Delete => delete(&client, &mut streams, Format::Table, &args).await,
+                };
+                let sent = envelopes.recv().await.unwrap();
+                assert_eq!(sent.body, expected_body, "verb={verb:?} input={input}");
+                // `request_and_render` is called with `deadline: None` for
+                // all three verbs — `Client::request_with_deadline` never
+                // leaves that unstated on the wire, it fills in
+                // `DEFAULT_DEADLINE` (client.rs:194), so the wire-level
+                // signal that the call site truly passed `None` (rather
+                // than some other explicit `Some(_)`) is the envelope
+                // carrying exactly that default.
+                assert_eq!(
+                    sent.deadline_ms,
+                    Some(u64::try_from(DEFAULT_DEADLINE.as_millis()).unwrap()),
+                    "verb={verb:?} input={input} must defer to the client's default deadline"
+                );
+            }
         }
     }
 
@@ -526,22 +571,94 @@ mod tests {
         assert_eq!(code, ExitCode::NotFound);
     }
 
+    /// Bounded by `timeout` rather than left to run to completion: `start`
+    /// returns early with `ExitCode::Usage` whenever `resolve_target` fails
+    /// — before any request is built — so a regression that reintroduced
+    /// an early return here would otherwise hang this test forever on
+    /// `envelopes.recv()`. The reviewer measured exactly that with the
+    /// fixture missing: the test ran past 60 seconds before SIGALRM killed
+    /// it at 75s (exit 142), reporting a killed CI job rather than a named
+    /// assertion. Also asserts `sent.body`, not only `sent.deadline_ms` —
+    /// previously only the deadline was pinned, so a `start` that sent the
+    /// wrong request with the right deadline would still have passed.
+    ///
+    /// The fixture itself lives in this test's own tempdir rather than a
+    /// tracked file at the crate root: a tracked fixture's absence is what
+    /// caused the hang above, it depended on Cargo running test binaries
+    /// with CWD == package root, and a `.toml`-named fixture would not
+    /// substitute — that extension routes `resolve_target` into
+    /// `Flockfile::parse`, a different branch entirely.
     #[tokio::test]
     async fn start_asks_for_the_longer_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.sock");
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
+        let srv = dir.path().join("srv");
+        std::fs::write(&srv, "").unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
         };
-        let _ = start(&client, &mut streams, Format::Table, &start_args("./srv")).await;
-        let sent = envelopes.recv().await.unwrap();
+
+        let _ = start(
+            &client,
+            &mut streams,
+            Format::Table,
+            &start_args(srv.to_str().unwrap()),
+        )
+        .await;
+
+        let sent = tokio::time::timeout(Duration::from_secs(5), envelopes.recv())
+            .await
+            .expect("start must reach the wire; it hung instead of sending a request")
+            .unwrap();
         assert_eq!(
             sent.deadline_ms,
             Some(u64::try_from(START_DEADLINE.as_millis()).unwrap())
         );
+        assert_eq!(
+            sent.body,
+            Request::Start {
+                apps: vec![AppConfig::minimal("srv", srv.to_str().unwrap())]
+            }
+        );
+    }
+
+    /// `--fold` (the `if let Some(fold) = &args.fold` loop, this file's
+    /// `start`) is spec'd behaviour with, until now, no guard: deleting
+    /// that loop left every other test in this module green (9 passed).
+    /// Assert the fold actually lands on the `AppConfig` that reaches the
+    /// wire, not merely that `start` still exits `Success`.
+    #[tokio::test]
+    async fn a_fold_flag_lands_on_the_resolved_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
+        let srv = dir.path().join("srv");
+        std::fs::write(&srv, "").unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+        };
+        let mut args = start_args(srv.to_str().unwrap());
+        args.fold = Some("backend".to_string());
+
+        let _ = start(&client, &mut streams, Format::Table, &args).await;
+
+        let sent = tokio::time::timeout(Duration::from_secs(5), envelopes.recv())
+            .await
+            .expect("start must reach the wire with a --fold target")
+            .unwrap();
+        match sent.body {
+            Request::Start { apps } => {
+                assert_eq!(apps.len(), 1);
+                assert_eq!(apps[0].fold.as_deref(), Some("backend"));
+            }
+            other => panic!("expected Request::Start, got {other:?}"),
+        }
     }
 }
