@@ -34,6 +34,7 @@
 //! - [`channel`]: shepherd channel codec (child↔daemon messages, newline-JSON)
 //! - [`bus`]: the daemon-wide event bus — topic-glob filtering, per-subscriber forwarder tasks
 //! - [`snapshot`]: the muster roll — debounced atomic `flock.json` writes, restart-survival restore
+//! - [`rpc`]: request dispatch — verb routing onto [`SupervisorHandle`](supervisor::SupervisorHandle), typed errors, per-call deadlines
 //!
 //! # Quick start
 //!
@@ -108,6 +109,7 @@ pub mod bus;
 pub mod channel;
 pub mod entry;
 pub mod kill;
+pub mod rpc;
 pub mod runner;
 pub mod snapshot;
 pub mod supervisor;
@@ -131,7 +133,15 @@ pub(crate) fn now_ms() -> u64 {
 // of hand-rolling its own.
 #[cfg(test)]
 pub(crate) mod testing {
+    use std::sync::Arc;
+
     use shep_core::paths::ShepPaths;
+    use tokio::sync::{broadcast, watch};
+
+    use crate::fake::{ProcScript, ScriptedRunner};
+    use crate::rpc::RpcContext;
+    use crate::snapshot::FlockRegistry;
+    use crate::supervisor::spawn_supervisor;
 
     // WHY a shallow home: later tasks bind a UDS under `run/`, and sun_path
     // caps a socket path near 104 bytes. Using the tempdir root as
@@ -143,6 +153,44 @@ pub(crate) mod testing {
             &|key| (key == "SHEP_HOME").then(|| home.display().to_string()),
             std::path::Path::new("/nonexistent"),
         )
+    }
+
+    // IR-33: `rpc.rs`'s dispatch tests (Task 4) and the connection-server's
+    // tests (Task 5) need the exact same fixture — one factory, not two.
+    pub(crate) struct Harness {
+        pub(crate) ctx: RpcContext,
+        // Kept alive only: dropping the tempdir would remove the paths `ctx`
+        // still points at.
+        _dir: tempfile::TempDir,
+        // Kept alive only: dropping the sender's last receiver would turn
+        // every future `events.send()` into a silent no-op.
+        _events_rx: broadcast::Receiver<shep_core::protocol::BusEvent>,
+        pub(crate) shutdown_rx: watch::Receiver<bool>,
+    }
+
+    /// Builds one supervisor engine (a [`ScriptedRunner`] replaying `scripts`)
+    /// plus a fresh [`RpcContext`] wired to it.
+    pub(crate) fn harness(scripts: Vec<ProcScript>) -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (events, events_rx) = broadcast::channel(256);
+        let supervisor =
+            spawn_supervisor(ScriptedRunner::new(scripts), paths.clone(), events.clone());
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        Harness {
+            ctx: RpcContext {
+                supervisor,
+                events,
+                registry: FlockRegistry::new(),
+                snapshot_path: paths.snapshot.clone(),
+                daemon_version: "0.1.0".to_string(),
+                pid: 4242,
+                shutdown: Arc::new(shutdown),
+            },
+            _dir: dir,
+            _events_rx: events_rx,
+            shutdown_rx,
+        }
     }
 }
 

@@ -102,6 +102,24 @@ pub enum BusError {
     TooManyPatterns(usize),
 }
 
+impl core::fmt::Display for BusError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BadPattern { pattern, message } => {
+                write!(f, "invalid topic pattern `{pattern}`: {message}")
+            }
+            Self::TooManyPatterns(count) => {
+                write!(
+                    f,
+                    "{count} topic patterns exceeds the limit of {MAX_TOPIC_PATTERNS}"
+                )
+            }
+        }
+    }
+}
+
+impl core::error::Error for BusError {}
+
 /// What the forwarder should do with one receive result
 enum Forwarded {
     Frame(Bytes),
