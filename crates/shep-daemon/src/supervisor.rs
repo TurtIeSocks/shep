@@ -884,6 +884,24 @@ impl<R: ProcessRunner> Actor<R> {
                 id,
                 "Msg::Exited for an entry with no started_at (duplicate?)"
             );
+            // Deregistration is NOT reachable here today: `pending_delete`
+            // is only ever set for a sheep whose `ctl.is_some()` (see the
+            // `is_running` gate in `apply_manual`), which implies a live
+            // task and therefore `started_at.is_some()`; and the ONE exit
+            // that consumes the flag removes the slot outright, so a second
+            // `Msg::Exited` for that id lands in the unregistered-id branch
+            // above rather than here. Honoured anyway, because the cost is
+            // four lines and the alternative failure is silent: the
+            // `std::mem::take` above has already consumed both markers, so
+            // a future change to WHEN `pending_delete` is set would drop a
+            // Delete on the floor while telling its caller it succeeded.
+            if manual == Some(ManualKind::Delete) || pending_delete {
+                let mut removed = self.sheep.remove(&id).expect("checked above");
+                removed.entry.status = ProcStatus::Stopped;
+                let info = to_info(&removed.entry);
+                self.emit(ProcessEventKind::Delete, info.clone(), true);
+                return self.resolve_pending(id, info);
+            }
             let info = to_info(&self.sheep.get(&id).expect("checked above").entry);
             return self.resolve_pending(id, info);
         };
