@@ -223,7 +223,7 @@ nothing before `init()` that could panic while raw mode is half-entered.
 
 ## 5. Eventual plan — task list (titles only)
 
-- Decide + land workspace MSRV 1.85 → 1.88 (unblocks dep set; own commit)
+- ~~Decide + land workspace MSRV 1.85 → 1.88~~ — DONE 2026-08-07, dep set unblocked
 - Add lookout deps to workspace + shep-cli (ratatui/crossterm/sysinfo/tui-input, IR-2 features)
 - lookout scaffold: module tree, terminal lifecycle, panic/error restore
 - Msg/Effect vocabulary + App skeleton + crate-root test fixture module (fake DaemonHandle)
@@ -244,7 +244,10 @@ nothing before `init()` that could panic while raw mode is half-entered.
 
 ## 6. Open questions for Rin
 
-1. MSRV bump 1.85 → 1.88 — yes/no (fallback island documented in §1).
+1. ~~MSRV bump 1.85 → 1.88 — yes/no (fallback island documented in §1).~~
+   **RESOLVED 2026-08-07: bumped.** serde-saphyr forced it before this phase
+   was reached, so the fallback island in §1 is moot — take ratatui 0.30.2 +
+   sysinfo 0.38.4.
 2. Should filter accept the CLI selector grammar (`/regex/`, `fold:x`) in v1,
    or is substring enough until someone asks?
 3. Host strip: cpu+mem+load only, or also per-sheep cpu/mem sparklines in the

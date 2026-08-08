@@ -25,7 +25,7 @@ cargo fmt --all --check
 cargo test --workspace
 ```
 
-All four must be green before any task is called done. MSRV 1.85, edition 2024.
+All four must be green before any task is called done. MSRV 1.88, edition 2024.
 
 ## Architecture
 

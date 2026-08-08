@@ -20,7 +20,7 @@ All `default-features = false` + enumerated features per IR-2. New deps land in
 | tower-http | 0.7.0 | `fs` | `ServeDir`/`ServeFile` (range, ETag/conditional GET, MIME via mime_guess, traversal rejection — all free) |
 | tower | 0.5.3 | `util` | `ServiceExt` (also dev-dep for `oneshot` router tests) |
 | subtle | 2.6.1 | — | `ConstantTimeEq` for auth compare |
-| sha2 | 0.11.0 | `std` | fixed-width digest before ct-compare (kills length leak); verify MSRV ≤ 1.85 at add time — 0.11 is the new RustCrypto line, fall back to 0.10.9 if it bites |
+| sha2 | 0.11.0 | `std` | fixed-width digest before ct-compare (kills length leak); verify MSRV ≤ 1.88 at add time — 0.11 is the new RustCrypto line, fall back to 0.10.9 if it bites |
 | base64 | 0.23.1 | `std` | `Authorization: Basic` decode |
 | html-escape | 0.2.15 | — | dir-listing escaping |
 | percent-encoding | 2.3.2 | `std` | dir-listing hrefs |
