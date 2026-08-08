@@ -21,6 +21,8 @@ use std::io;
 
 use serde::Serialize;
 
+use crate::exit::ExitCode;
+
 // Re-exported for `commands/`, which names every one of these at its own
 // crate-root import (`crate::output::{Streams, emit, FlockRows, ...}`) once
 // Tasks 7-11 land. None of the four is named by this literal source file
@@ -61,14 +63,8 @@ pub struct OutputEnvelope<'a, T> {
 /// Production wires the process's own; tests wire a pair of `Vec<u8>`, which
 /// is what makes every renderer assertion hermetic and safe under the
 /// parallel `cargo test` gate. `&mut dyn Write` has no `Debug`, so this needs
-/// a manual one — print `Streams { .. }` and nothing else.
-///
-/// Not constructed from non-test code on Windows: `main.rs` only builds one
-/// in its `#[cfg(unix)]` `run` arm — the Windows arm refuses before
-/// reaching any dispatch that would need one, until spec §11's Windows
-/// functional tier lands. `#[cfg_attr]` says so explicitly rather than
-/// leaving an unexplained Windows-only warning.
-#[cfg_attr(windows, allow(dead_code))]
+/// a manual one — print `Streams { .. }` and nothing else (pinned by this
+/// module's own `streams_debug_is_the_redacted_placeholder` test).
 pub struct Streams<'a> {
     /// Rendered command output — what `emit` writes to.
     ///
@@ -120,6 +116,14 @@ pub trait Render: Serialize {
     fn json_key_for(header: &str) -> &'static str;
     /// Serialized fields that legitimately have no column, each with a
     /// comment giving the reason. Usually empty.
+    ///
+    /// This constant is the only thing standing between an unmapped
+    /// `Serialize` field and a silently-widened, unreviewed pass of
+    /// `assert_no_drift` (rows.rs) — an entry proves the *count* of covered
+    /// keys matches, never *why* a field belongs here. Every entry an impl
+    /// adds MUST carry its own inline `//` comment stating that reason
+    /// (`"note", // internal only, never shown to a user`); an entry with no
+    /// comment is a review gap, not a pass.
     const JSON_ONLY: &'static [&'static str];
 }
 
@@ -170,17 +174,13 @@ struct ErrorBody<'a> {
 
 /// Renders a failure to `err` in `fmt`. `code` is `ExitCode::code_str()`.
 ///
-/// Not called from non-test code on Windows: its only production call sites
-/// (`not_wired`, `run`'s `resolve_paths` error branch) are in `main.rs`'s
-/// `#[cfg(unix)]` arm, until spec §11's Windows functional tier lands.
-/// `#[cfg_attr]` says so explicitly rather than leaving an unexplained
-/// Windows-only warning — and that in turn is why [`ErrorEnvelope`] and
-/// [`ErrorBody`], only ever built inside this function's `Format::Json` arm,
-/// need no annotation of their own.
+/// `code` is a string this function only prints — the exit code stays the
+/// caller's — but it prints on both surfaces: JSON already carried it in
+/// `error.code`, and table mode used to drop it silently, which left a
+/// human at a terminal with no name for the failure a script could see.
 ///
 /// # Errors
 /// The underlying write failed.
-#[cfg_attr(windows, allow(dead_code))]
 pub fn emit_error(
     err: &mut dyn io::Write,
     fmt: Format,
@@ -196,14 +196,36 @@ pub fn emit_error(
             serde_json::to_writer(&mut *err, &envelope)?;
             writeln!(err)
         }
-        Format::Table => writeln!(err, "error: {message}"),
+        Format::Table => writeln!(err, "error[{code}]: {message}"),
+    }
+}
+
+/// Turns the result of an `emit`/`emit_error` write into the exit code that
+/// write earned.
+///
+/// The one rule, stated once so Tasks 7-11 do not each reinvent it at their
+/// own `emit` call site: a write failure is [`ExitCode::Failure`], except
+/// [`io::ErrorKind::BrokenPipe`], which is [`ExitCode::Success`] —
+/// `shep flock | head` closes the pipe on purpose, and that is not a failed
+/// command.
+///
+/// Not called outside this module's own tests yet: `commands/` — the code
+/// that will call `emit`/`emit_error` and hand this function their `Result`
+/// — is Tasks 7-11. `#[allow(dead_code)]` says so explicitly rather than
+/// inventing a call site nothing needs yet.
+#[allow(dead_code)]
+#[must_use]
+pub fn write_outcome(result: io::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::Success,
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::Success,
+        Err(_) => ExitCode::Failure,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exit::ExitCode;
     use crate::output::rows::tests::sample_flock;
 
     /// Pins the JSON envelope's exact shape (`--format json` is a stability
@@ -255,6 +277,11 @@ mod tests {
         let text = String::from_utf8(err).unwrap();
         assert!(text.contains("no sheep matched"));
         assert!(
+            text.contains("not_found"),
+            "table mode used to drop `code` silently; a human at a terminal needs the same \
+             failure name a script would get from JSON: {text}"
+        );
+        assert!(
             serde_json::from_str::<serde_json::Value>(&text).is_err(),
             "table mode is not JSON"
         );
@@ -280,5 +307,41 @@ mod tests {
             !text.contains("schema_version"),
             "the envelope is a JSON-only concept"
         );
+    }
+
+    /// `Streams` carries `&mut dyn io::Write`, which has no `Debug` of its
+    /// own, so the manual impl is the only thing standing between a future
+    /// refactor and either a compile error or (worse, if someone works
+    /// around it) a `Debug` that leaks whatever the streams happen to hold.
+    /// Precedent: `shep-core/src/config/app.rs`'s `debug_redacts_env_values`
+    /// (IR-41 — exact-string pin so a lazy derive can't slip back in).
+    #[test]
+    fn streams_debug_is_the_redacted_placeholder() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let streams = Streams {
+            out: &mut out,
+            err: &mut err,
+        };
+        assert_eq!(format!("{streams:?}"), "Streams { .. }");
+    }
+
+    #[test]
+    fn write_outcome_treats_a_broken_pipe_as_success() {
+        // `shep flock | head` closes the pipe on purpose; that is not a
+        // failed command.
+        let broken = io::Error::from(io::ErrorKind::BrokenPipe);
+        assert_eq!(write_outcome(Err(broken)), ExitCode::Success);
+    }
+
+    #[test]
+    fn write_outcome_treats_every_other_write_error_as_failure() {
+        let other = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(write_outcome(Err(other)), ExitCode::Failure);
+    }
+
+    #[test]
+    fn write_outcome_treats_ok_as_success() {
+        assert_eq!(write_outcome(Ok(())), ExitCode::Success);
     }
 }

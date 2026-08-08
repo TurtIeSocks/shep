@@ -220,18 +220,39 @@ pub(crate) mod tests {
         sample_info(1, "web", uptime_ms)
     }
 
-    /// The anti-drift gate, written once and instantiated four times — once
-    /// per payload type, per this task's own rule. Serializes a
-    /// fully-populated value, collects its JSON object keys, and asserts
-    /// they match `headers()` after `json_key_for`, so a field added to
-    /// `Serialize` and forgotten in `rows()` fails here rather than silently
-    /// vanishing from the table.
+    /// The anti-drift gate, written once and instantiated three times — once
+    /// per payload type with JSON object keys (`DeletedIds` has none — see
+    /// its own test below), per this task's own rule.
+    ///
+    /// Three checks, each catching a mutation the other two miss:
+    /// 1. Serializes a fully-populated value, collects its JSON object keys,
+    ///    and asserts they match `headers()` after `json_key_for`, so a
+    ///    field added to `Serialize` and forgotten in `rows()` fails here
+    ///    rather than silently vanishing from the table.
+    /// 2. Every row's cell count must equal `headers().len()` — a dropped or
+    ///    added cell shifts every later column without changing the row
+    ///    *count*, which `table_and_json_report_the_same_record_count`
+    ///    checks but this doesn't.
+    /// 3. The first row's cell for each non-`formatted` header is pinned
+    ///    against that same field's own JSON value — a cell-count check
+    ///    alone cannot see two same-arity cells swapped (e.g. NAME and
+    ///    STATUS trading places).
+    ///
+    /// `formatted` lists headers whose table cell is a human-only rendering
+    /// of the field rather than the field's raw value (`FlockRows`'s
+    /// `UPTIME`, formatted by `human_duration` — see `table.rs`'s own tests
+    /// for that formatting's coverage instead). Comparing those cells
+    /// against the raw JSON value would either duplicate that formatting
+    /// here or spuriously fail; every other header IS compared cell-for-cell,
+    /// which is what actually catches a swap.
     fn assert_no_drift<T: Render>(
         value: &T,
         first_record: fn(&serde_json::Value) -> &serde_json::Value,
+        formatted: &[&str],
     ) {
         let json = serde_json::to_value(value).unwrap();
-        let keys: BTreeSet<&str> = first_record(&json)
+        let record = first_record(&json);
+        let keys: BTreeSet<&str> = record
             .as_object()
             .unwrap()
             .keys()
@@ -248,11 +269,55 @@ pub(crate) mod tests {
             keys, covered,
             "a serialized field is a column, or it is in JSON_ONLY with a reason — never neither"
         );
+
+        let rows = value.rows();
+        for row in &rows {
+            assert_eq!(
+                row.len(),
+                T::headers().len(),
+                "a row has {} cells but headers() has {} — a dropped or added cell changes no \
+                 row *count*, so table_and_json_report_the_same_record_count would miss it",
+                row.len(),
+                T::headers().len(),
+            );
+        }
+
+        let Some(row) = rows.first() else {
+            return;
+        };
+        for (i, header) in T::headers().iter().enumerate() {
+            if formatted.contains(header) {
+                continue;
+            }
+            let key = T::json_key_for(header);
+            let expected = match &record[key] {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                // Not exercised by today's fully-populated fixtures (see
+                // `sample_info`'s own comment on why every `Option` is
+                // `Some`); skipped rather than panicking so a future
+                // `None`-carrying fixture doesn't fail here for an unrelated
+                // reason.
+                serde_json::Value::Null => continue,
+                other => panic!(
+                    "{header} ({key}) serialized to {other:?}; teach this match how to \
+                     stringify it, or add {header} to `formatted`"
+                ),
+            };
+            assert_eq!(
+                row[i], expected,
+                "{header} cell does not match its own JSON field {key:?} — swapped or \
+                 substituted with a neighbouring column?"
+            );
+        }
     }
 
     #[test]
     fn flock_rows_do_not_drift() {
-        assert_no_drift(&sample_flock(), |j| &j[0]);
+        // UPTIME is formatted (`human_duration`), not a raw echo of
+        // `uptime_ms` — see the doc comment on `assert_no_drift` above.
+        assert_no_drift(&sample_flock(), |j| &j[0], &["UPTIME"]);
     }
 
     #[test]
@@ -263,6 +328,7 @@ pub(crate) mod tests {
                 pid: 4242,
             },
             |j| j,
+            &[],
         );
     }
 
@@ -274,11 +340,31 @@ pub(crate) mod tests {
                 socket_removed: true,
             },
             |j| j,
+            &[],
         );
     }
 
-    // `DeletedIds` serializes as an array of bare numbers, so it has no
-    // object keys to drift; its test is the record-count one below.
+    /// `DeletedIds` is `#[serde(transparent)]` over `Vec<u32>`, so it
+    /// serializes as a bare JSON array of numbers with no object keys —
+    /// `assert_no_drift`'s key-set comparison has nothing to compare
+    /// against, and `json_key_for("ID") -> "id"` names a key that never
+    /// exists in this type's JSON at all. This test is `DeletedIds`'s drift
+    /// coverage instead: it pins each row's one cell against the array
+    /// element at the same position, so a `rows()` that dropped, reordered,
+    /// or mis-rendered an id still fails.
+    #[test]
+    fn deleted_ids_rows_match_their_own_json_values() {
+        let ids = DeletedIds(vec![10, 20, 30]);
+        let json = serde_json::to_value(&ids).unwrap();
+        let array = json.as_array().unwrap();
+        let rows = ids.rows();
+
+        assert_eq!(rows.len(), array.len());
+        for (row, value) in rows.iter().zip(array) {
+            assert_eq!(row.len(), 1, "DeletedIds::headers() has exactly one column");
+            assert_eq!(row[0], value.to_string());
+        }
+    }
 
     #[test]
     fn table_and_json_report_the_same_record_count() {

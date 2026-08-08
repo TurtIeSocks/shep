@@ -18,7 +18,6 @@ use cli::{Cli, GlobalArgs};
 #[cfg(unix)]
 use cli::{Commands, Format};
 use exit::ExitCode;
-#[cfg(unix)]
 use output::Streams;
 use shep_core::paths::ShepPaths;
 
@@ -158,12 +157,31 @@ async fn run(cli: Cli) -> ExitCode {
 /// (spec §11's functional tier — named-pipe RPC is future work, tracked by
 /// `ShepPaths::pipe_name`, not built here).
 ///
+/// Routed through [`output::emit_error`], same as the unix arm's own
+/// placeholders, rather than a bare `eprintln!` — so this refusal already
+/// honours `--format json` rather than only ever printing prose.
+///
 /// `async fn` purely so the call site in `main` needs no `cfg` of its own —
 /// it awaits nothing, and the resulting `clippy::unused_async` is
 /// pedantic-only, so it does not trip the gate.
 #[cfg(windows)]
-async fn run(_cli: Cli) -> ExitCode {
-    eprintln!("shep does not yet support Windows");
+async fn run(cli: Cli) -> ExitCode {
+    let mut out = std::io::stdout().lock();
+    let mut err = std::io::stderr().lock();
+    // No `mut` on `streams` here (unlike the unix arm): this arm only ever
+    // reborrows through the already-`&mut` `err` field, and never takes
+    // `&mut streams` on the struct itself, so the binding needs no
+    // mutability of its own.
+    let streams = Streams {
+        out: &mut out,
+        err: &mut err,
+    };
+    let _ = output::emit_error(
+        &mut *streams.err,
+        cli.global.format,
+        ExitCode::Failure.code_str(),
+        "shep does not yet support Windows",
+    );
     ExitCode::Failure
 }
 
