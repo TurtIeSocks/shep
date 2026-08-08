@@ -34,3 +34,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `restart`). They are `JSON_ONLY`, not columns: absolute log paths are
   routinely longer than the rest of the row put together and would wreck the
   table those verbs exist to print.
+- Add the end-to-end test tier (`tests/cli_e2e.rs`): the real `shep` binary
+  against a real daemon, a real socket, and real spawned sheep, each on a
+  fresh `$SHEP_HOME`. Covers autostart from cold, daemon reuse across
+  commands, the concurrent cold-start race, exit codes and stdout/stderr
+  stream discipline under `--format json`, `kill`'s socket teardown,
+  `bleats --no-follow` against real log files (both default and `--out`),
+  and that an autostarted daemon binds under the `--home` it was given
+  rather than an ambient `$SHEP_HOME`. Unix-only (`#![cfg(unix)]`): an
+  integration test file is its own compilation unit, so without the gate
+  `--all-targets` would build it — with its unix-only `nix` dev-dependency —
+  on the Windows CI leg too.
+- Commit `--format json` fixtures for `flock`, `describe`, `start`, `ping`
+  and `bleats --no-follow` under `tests/fixtures/*.json` (IR-35's byte-fixture
+  discipline, same as the wire protocol). The four envelopes are compared
+  structurally, with the fields a real spawned process cannot pin across
+  runs (`pid`, `uptime_ms`, `out_file`, `err_file`) asserted against their
+  own real shape and then normalized before the comparison; `bleats
+  --no-follow`'s one JSON-line-per-record output carries no envelope (see
+  its own entry below) and is compared byte-for-byte.
+- `DaemonAlreadyRunning = 10` is a cross-crate contract, not an internal
+  implementation detail: `shep-client`'s `spawn::DAEMON_ALREADY_RUNNING`
+  hard-codes the same number so `connect_or_spawn` can tell "a losing
+  cold-start racer's daemon exited on purpose" apart from every other exit,
+  which is what lets both sides of a concurrent `shep start` race exit 0
+  (Task 12's end-to-end tier proves this against two real, genuinely
+  concurrent invocations). Changing either side without the other
+  reintroduces the race — `exit.rs`'s own test pins the two constants equal.

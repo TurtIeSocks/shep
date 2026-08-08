@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "command": "flock",
+  "data": [
+    {
+      "id": 0,
+      "name": "fixture",
+      "status": "online",
+      "pid": null,
+      "restarts": 0,
+      "uptime_ms": null,
+      "fold": null,
+      "out_file": null,
+      "err_file": null
+    }
+  ]
+}
