@@ -367,8 +367,8 @@ mod tests {
     /// `$HOME` cleared — the latter is exactly the e2e tier described
     /// below, not this unit test.
     ///
-    /// `daemon` used to share this test (both were routed through
-    /// `not_wired`), but it no longer belongs here: it now genuinely
+    /// `daemon` used to share this test (both were routed through the same
+    /// placeholder dispatch arm), but it no longer belongs here: it now genuinely
     /// resolves its own paths in [`run_daemon_command`] and, on success,
     /// runs the real supervisor to completion — calling `run(cli).await`
     /// on `["shep", "daemon"]` from a unit test would bind a real socket

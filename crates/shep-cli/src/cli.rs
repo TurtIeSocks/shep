@@ -72,6 +72,9 @@ pub enum Commands {
     /// Shut the shepherd down.
     Kill,
     /// Print a shell completion script.
+    ///
+    /// Static only: sheep names, fold names and other daemon-side
+    /// identifiers are never completed.
     Completions(CompletionArgs),
     /// Graceful stop. Easter-egg alias for `stop`.
     #[command(hide = true)]

@@ -41,6 +41,7 @@ mod tests {
     /// be testing clap_complete, which is upstream's job.
     #[test]
     fn completions_generate_a_named_script_for_every_supported_shell() {
+        let mut scripts = Vec::new();
         for shell in [Shell::Bash, Shell::Zsh, Shell::Fish] {
             let mut buf = Vec::new();
             let code = completions(&mut buf, &CompletionArgs { shell });
@@ -51,6 +52,23 @@ mod tests {
                 script.contains("shep"),
                 "{shell} script must name the binary"
             );
+            scripts.push((shell, script));
+        }
+
+        // Every check above passes for a `completions` that ignores
+        // `args.shell` and always emits (say) bash: the output would still
+        // be non-empty and name the binary. Only comparing the scripts
+        // pairwise catches that — each shell's grammar is different enough
+        // that two real scripts never collide.
+        for i in 0..scripts.len() {
+            for j in (i + 1)..scripts.len() {
+                let (shell_i, script_i) = &scripts[i];
+                let (shell_j, script_j) = &scripts[j];
+                assert_ne!(
+                    script_i, script_j,
+                    "{shell_i} and {shell_j} produced identical scripts — args.shell is being ignored"
+                );
+            }
         }
     }
 

@@ -24,13 +24,13 @@ use serde::Serialize;
 use crate::exit::ExitCode;
 
 // Re-exported for `commands/`, which names every one of these at its own
-// crate-root import (`crate::output::{Streams, emit, FlockRows, ...}`) once
-// Tasks 7-11 land. None of the four is named by this literal source file
-// today — only by other modules and tests reaching through this re-export
-// — so `unused_imports` (a name-resolution lint, unlike `dead_code`'s
-// reachability one) sees no reference and flags it. `#[allow]` says so
-// explicitly rather than inventing a call site nothing needs yet.
-#[allow(unused_imports)]
+// crate-root import (`crate::output::{Streams, emit, FlockRows, ...}`).
+// Tasks 7-11 have landed and every one of the four is genuinely used there
+// on unix. `commands/` itself is `#[cfg(unix)]`-gated (main.rs), so on
+// Windows none of the four is named anywhere and `unused_imports` (a
+// name-resolution lint, unlike `dead_code`'s reachability one) still flags
+// it there — narrowed to that target rather than dropped.
+#[cfg_attr(windows, allow(unused_imports))]
 pub use rows::{DeletedIds, FlockRows, KillRow, PingRow};
 pub use table::{human_duration, render_table};
 
@@ -68,12 +68,12 @@ pub struct OutputEnvelope<'a, T> {
 pub struct Streams<'a> {
     /// Rendered command output — what `emit` writes to.
     ///
-    /// Not read anywhere yet: `main.rs`'s only caller today is the
-    /// placeholder dispatch (`not_wired`), which only ever writes a
-    /// diagnostic to `err`. Tasks 7-11 pass `&mut streams.out` to `emit` for
-    /// a real command's rendered output. `#[allow(dead_code)]` says so
-    /// explicitly rather than inventing a call site nothing needs yet.
-    #[allow(dead_code)]
+    /// Read on unix: every real command in `commands/` (Tasks 7-11) passes
+    /// `&mut streams.out` to `emit` for its rendered output. `commands/`
+    /// itself is `#[cfg(unix)]`-gated (main.rs), so on Windows nothing
+    /// reads this field yet and `dead_code` still flags it there —
+    /// narrowed to that target rather than dropped.
+    #[cfg_attr(windows, allow(dead_code))]
     pub out: &'a mut dyn io::Write,
     /// Diagnostics and errors — what `emit_error` writes to.
     pub err: &'a mut dyn io::Write,

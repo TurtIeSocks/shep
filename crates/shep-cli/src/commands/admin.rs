@@ -197,7 +197,7 @@ mod tests {
             )
             .await
         };
-        assert_ne!(code, ExitCode::Success);
+        assert_eq!(code, ExitCode::DeadlineExceeded);
         assert!(
             path.exists(),
             "precondition: the fake really did leave the socket behind"
