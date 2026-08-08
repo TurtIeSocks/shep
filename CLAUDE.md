@@ -2,7 +2,8 @@
 
 Clean-room Rust process manager (daemon + CLI + client lib), inspired by pm2's
 *feature list only*. License: MIT OR Apache-2.0. Sheep/sheepdog branding
-throughout. Repo dir is still `pm2-rs` pending GitHub rename.
+throughout. Published at `github.com/TurtIeSocks/shep`; the local checkout
+directory is still named `pm2-rs`, which is expected and not a rename to make.
 
 ## ⚠️ Clean-room rule (non-negotiable)
 

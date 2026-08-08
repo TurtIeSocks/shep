@@ -13,7 +13,7 @@ edition = "2024"
 # 1.88 forced by serde-saphyr (let-chains, stabilized 1.88) — a current dep,
 # not a future one. Also the floor for ratatui/sysinfo/rmcp in later phases.
 rust-version = "1.88"
-repository = "https://github.com/rin/pm2-rs"
+repository = "https://github.com/TurtIeSocks/shep"
 # Clean-room implementation — pm2 is feature-list inspiration only (Rin, 2026-08-07).
 license = "MIT OR Apache-2.0"
 

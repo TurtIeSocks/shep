@@ -102,7 +102,7 @@ no long-term-support branch yet.
 ## Reporting a vulnerability
 
 Report security issues privately through
-[GitHub Security Advisories](https://github.com/rin/pm2-rs/security/advisories/new)
+[GitHub Security Advisories](https://github.com/TurtIeSocks/shep/security/advisories/new)
 for this repository. Do not open a public issue for a suspected
 vulnerability.
 
