@@ -17,6 +17,7 @@ use shep_core::protocol::{HelloAck, Request, Response, RpcError, WireError};
 
 use crate::actor::{self, Command};
 use crate::connection::{ConnectError, Connection, HANDSHAKE_TIMEOUT};
+use crate::events::EventStream;
 
 /// Daemon-side budget applied when a caller names none. Mirrors the daemon's
 /// own `DEFAULT_DEADLINE_MS = 5_000` (`shep-daemon/src/rpc.rs:36`), which is
@@ -132,11 +133,7 @@ impl Client {
     ) -> Result<Self, ConnectError> {
         let connection = Connection::open(socket, timeout).await?;
         let (frames, ack) = connection.into_parts();
-        // The event `broadcast::Sender` `spawn` also returns has no
-        // subscriber yet — nothing in this crate consumes `BusEvent`s
-        // before the event-stream task lands, so it's dropped here rather
-        // than stored on a field this struct doesn't have yet.
-        let (commands, _events) = actor::spawn(frames);
+        let commands = actor::spawn(frames);
         Ok(Self {
             commands,
             ack,
@@ -211,6 +208,39 @@ impl Client {
             Ok(Err(_recv_error)) => Err(RequestError::Closed),
             Err(_elapsed) => Err(RequestError::Timeout { after: budget }),
         }
+    }
+
+    /// Subscribes this connection to `topics` — dotted glob patterns matched
+    /// against [`shep_core::protocol::BusEvent::topic`] (`process.*`,
+    /// `log.*`, `daemon.*`, ...).
+    ///
+    /// A second call on the same `Client` **replaces** the daemon-side
+    /// filter rather than adding to it (`shep-daemon/src/server.rs:360-364`
+    /// — the daemon keeps one subscriber filter per connection, not a
+    /// growing union). A caller that wants two independent topic sets needs
+    /// two `Client`s, each with its own connection.
+    ///
+    /// The returned [`EventStream`]'s receiver is installed on the actor
+    /// *before* the `Subscribe` request is sent, so no event the daemon
+    /// pushes between it answering `Subscribed` and this call returning can
+    /// be missed — a daemon that answers and immediately starts pushing
+    /// (the real one does exactly that) cannot race ahead of a subscriber
+    /// that isn't listening yet.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::request`]: a daemon-side [`RpcError`], a client-side
+    /// timeout, a closed connection, or a wire encode failure.
+    pub async fn subscribe(&self, topics: Vec<String>) -> Result<EventStream, RequestError> {
+        let (reply_to, reply_rx) = oneshot::channel();
+        self.commands
+            .send(Command::Subscribe { reply_to })
+            .await
+            .map_err(|_send_error| RequestError::Closed)?;
+        let receiver = reply_rx.await.map_err(|_recv_error| RequestError::Closed)?;
+
+        self.request(Request::Subscribe { topics }).await?;
+        Ok(EventStream::new(receiver))
     }
 
     /// Closes the connection.

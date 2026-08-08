@@ -30,9 +30,13 @@ mod client;
 #[cfg(unix)]
 mod connection;
 #[cfg(unix)]
+mod events;
+#[cfg(unix)]
 pub use client::{Client, DEADLINE_GRACE, DEFAULT_DEADLINE, RequestError, START_DEADLINE};
 #[cfg(unix)]
 pub use connection::{ConnectError, HANDSHAKE_TIMEOUT};
+#[cfg(unix)]
+pub use events::{EventStream, Lagged};
 
 // Unix-only for the same reason as `connection` above: every fake here
 // binds a `UnixListener`.

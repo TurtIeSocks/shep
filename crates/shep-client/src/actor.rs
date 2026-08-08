@@ -54,22 +54,36 @@ pub(crate) enum Command {
         /// Resolved exactly once, by the actor.
         reply_to: oneshot::Sender<Result<Response, RequestError>>,
     },
+    /// Hand back a fresh [`broadcast::Receiver`] over the actor's own
+    /// [`broadcast::Sender`].
+    ///
+    /// Routed through the actor rather than handing
+    /// [`Client`](crate::client::Client) its own clone of the sender to
+    /// call `.subscribe()` on directly: `broadcast` closes a channel by
+    /// sender count reaching zero, never by receiver activity. A
+    /// `Client`-held clone would sit alive for as long as the `Client`
+    /// itself does, so the channel could never close — and every
+    /// [`crate::EventStream`] with it — even after this task's own loop
+    /// ends and drops the one clone it holds, which is exactly the moment a
+    /// `Client` that outlives its connection needs it to. Routing through
+    /// here keeps that clone the only one that ever exists outside `run`.
+    Subscribe {
+        /// Resolved exactly once, by the actor.
+        reply_to: oneshot::Sender<broadcast::Receiver<BusEvent>>,
+    },
 }
 
 /// Spawns the actor task that owns `frames`, returning the command channel
-/// a [`Client`](crate::client::Client) sends [`Command`]s through, together
-/// with the [`broadcast::Sender`] the actor publishes [`BusEvent`]s on.
+/// a [`Client`](crate::client::Client) sends [`Command`]s through.
 ///
-/// Nobody calls [`broadcast::Sender::subscribe`] on the returned sender
-/// here — this task's own caller doesn't consume events yet, it just needs
-/// a stable handle to hand off. Until something does subscribe, every
-/// event is sent to zero receivers and dropped, silently, which is exactly
-/// what [`broadcast::Sender::send`] with no live receivers already does.
-pub(crate) fn spawn(frames: Frames) -> (mpsc::Sender<Command>, broadcast::Sender<BusEvent>) {
+/// The spawned task keeps the only [`broadcast::Sender`] this connection
+/// will ever have; see [`Command::Subscribe`] for why nothing outside this
+/// module ever holds a clone of it.
+pub(crate) fn spawn(frames: Frames) -> mpsc::Sender<Command> {
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (events_tx, _events_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-    tokio::spawn(run(frames, commands_rx, events_tx.clone()));
-    (commands_tx, events_tx)
+    tokio::spawn(run(frames, commands_rx, events_tx));
+    commands_tx
 }
 
 /// The actor's own loop: `select!` between new commands and incoming
@@ -99,6 +113,12 @@ async fn run(
                         if !alive {
                             break; // the write failed; the connection is dead
                         }
+                    }
+                    Some(Command::Subscribe { reply_to }) => {
+                        // No wire traffic, no failure mode: the caller may
+                        // already have stopped waiting, in which case this
+                        // receiver is simply dropped unused.
+                        let _ = reply_to.send(events.subscribe());
                     }
                     None => break, // every `Client` handle (and its command sender) is gone
                 }

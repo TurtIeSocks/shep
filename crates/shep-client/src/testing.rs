@@ -130,28 +130,38 @@ async fn write_err(frames: &mut Frames, id: u64, code: RpcErrorCode, message: St
     frames.send(encode_frame(&reply).unwrap()).await.unwrap();
 }
 
+/// Encodes and sends one [`BusEvent`] frame directly — not wrapped in a
+/// [`Reply`], the shape a real subscriber actually receives. Panics on
+/// failure — test scaffolding, see [`fake_daemon`]'s own doc.
+async fn write_event(frames: &mut Frames, event: BusEvent) {
+    frames.send(encode_frame(&event).unwrap()).await.unwrap();
+}
+
 /// Sends a `BusEvent::Process` built from [`sample_info`] — the daemon's
 /// own documented ordering (`shep-daemon/tests/daemon_e2e.rs:161-174`): a
 /// sheep's bus event can legitimately arrive ahead of the reply for the
 /// request that caused it. Panics on failure — test scaffolding, see
 /// [`fake_daemon`]'s own doc.
 async fn send_sample_event(frames: &mut Frames) {
-    let event = BusEvent::Process {
-        event: ProcessEventKind::Online,
-        info: sample_info(),
-        manually: false,
-        at_ms: 0,
-    };
-    frames.send(encode_frame(&event).unwrap()).await.unwrap();
+    write_event(
+        frames,
+        BusEvent::Process {
+            event: ProcessEventKind::Online,
+            info: sample_info(),
+            manually: false,
+            at_ms: 0,
+        },
+    )
+    .await;
 }
 
 /// One scripted step sent to a [`FakeDaemon`]'s background task.
 ///
-/// [`FakeDaemon::reply_to_list`] does NOT go through this channel — it is
-/// synchronous (a `Mutex`-backed flag), because every plan call site
-/// invokes it without `.await`. This enum carries the remaining scripted
-/// behaviors, each armed at most once, by the `fake_client_*` constructor
-/// that needs it.
+/// [`FakeDaemon::reply_to_list`] and [`FakeDaemon::queue_reply_then_event`]
+/// do NOT go through this channel — both are synchronous (a `Mutex`-backed
+/// flag), because every plan call site invokes them without `.await`. This
+/// enum carries the remaining scripted behaviors, each armed at most once,
+/// by the `fake_client_*` constructor or `FakeDaemon` method that needs it.
 enum ScriptCommand {
     /// Arms the next request (of any kind) to receive
     /// `RpcError { code, message }` instead of a normal response.
@@ -164,6 +174,11 @@ enum ScriptCommand {
     /// (`Response::Pong`) — regardless of which one arrived first, proof
     /// that a `Client` routes replies by id rather than by send order.
     ArmOutOfOrder,
+    /// Queues one [`BusEvent`] for this connection's subscriber. Buffered
+    /// until the connection has observed and answered a `Request::Subscribe`
+    /// — see [`FakeDaemon::push`] for why — then written straight to the
+    /// wire for as long as the subscription stays live.
+    PushEvent(BusEvent),
     /// Ends the script: stop serving and let the task return.
     Close,
 }
@@ -189,6 +204,10 @@ enum OutOfOrder {
 /// Every other request this fake receives is answered with
 /// `Response::Pong` — good enough for a test that only cares about
 /// `ListFlock` behavior, or about a request getting *some* prompt reply.
+/// [`Self::push`], [`Self::overrun_by`] and [`Self::queue_reply_then_event`]
+/// drive this connection's event side: a real `Request::Subscribe` is
+/// always answered with `Response::Subscribed` and switches the connection
+/// into forwarding pushed events straight to the wire.
 ///
 /// A handful of `fake_client_*` constructors below
 /// ([`fake_client_replying_err`], [`fake_client_out_of_order`],
@@ -200,6 +219,7 @@ enum OutOfOrder {
 pub struct FakeDaemon {
     script: mpsc::Sender<ScriptCommand>,
     armed_list: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
+    armed_reply_then_event: Arc<Mutex<Option<(Response, BusEvent)>>>,
     list_flock_count: Arc<AtomicU64>,
     task: JoinHandle<()>,
 }
@@ -224,6 +244,52 @@ impl FakeDaemon {
         self.list_flock_count.load(Ordering::SeqCst)
     }
 
+    /// Arms the reply this connection sends for the very next request it
+    /// receives (of any kind) as `reply`, then immediately follows it with
+    /// `event` written directly to the wire — the ordering
+    /// `shep-daemon/src/server.rs:357` actually produces: the `Subscribed`
+    /// reply ahead of any event, by queue order, once a subscriber is
+    /// installed.
+    ///
+    /// Synchronous for the same reason [`Self::reply_to_list`] is: every
+    /// call site invokes it without `.await`.
+    pub fn queue_reply_then_event(&self, reply: Response, event: BusEvent) {
+        *self.armed_reply_then_event.lock().unwrap() = Some((reply, event));
+    }
+
+    /// Queues `event` for this connection's subscriber.
+    ///
+    /// Before this connection has observed a `Request::Subscribe` and
+    /// answered it, `event` is buffered in arrival order rather than
+    /// written straight through — nothing is listening for it yet, since
+    /// the `broadcast::Receiver` a real `Client::subscribe` call installs
+    /// does not exist until that call returns, and a `broadcast::Receiver`
+    /// never sees a value sent before it existed. Once the subscription is
+    /// live, `push` writes straight to the wire.
+    ///
+    /// Silently does nothing if the background task has already ended —
+    /// the same tolerance [`Self::close`] applies to its own script send —
+    /// so a `push` racing the connection closing simply vanishes rather
+    /// than panicking.
+    pub async fn push(&self, event: BusEvent) {
+        let _ = self.script.send(ScriptCommand::PushEvent(event)).await;
+    }
+
+    /// Pushes `EVENT_CHANNEL_CAPACITY + n` [`BusEvent::LogOut`] events in
+    /// one go — enough, once a subscriber falls that far behind, to force a
+    /// local lag notice rather than an ordinary delivery. `EVENT_CHANNEL_CAPACITY`
+    /// is the actor's own broadcast channel capacity
+    /// (`crate::actor::EVENT_CHANNEL_CAPACITY`).
+    pub async fn overrun_by(&self, n: usize) {
+        for i in 0..(crate::actor::EVENT_CHANNEL_CAPACITY + n) {
+            self.push(BusEvent::LogOut {
+                id: 1,
+                line: i.to_string(),
+            })
+            .await;
+        }
+    }
+
     /// Ends the script and drops the connection: drains anything still
     /// queued, then lets the background task finish.
     ///
@@ -241,15 +307,24 @@ impl FakeDaemon {
 ///
 /// Per request, in priority order: a request buffered by
 /// [`OutOfOrder::Buffered`] is answered together with the one that just
-/// arrived; else an armed [`ScriptCommand::ReplyErr`] or
-/// [`ScriptCommand::EventThenReply`] is consumed and answers this one
-/// request; else `ListFlock` is answered per [`FakeDaemon::reply_to_list`]
-/// (or `Flock(vec![])` if nothing is armed); else `Response::Pong`.
+/// arrived; else an armed `armed_reply_then_event` or
+/// [`ScriptCommand::ReplyErr`] or [`ScriptCommand::EventThenReply`] is
+/// consumed and answers this one request; else a `Request::Subscribe`
+/// is answered with `Response::Subscribed`, flips this connection into the
+/// subscribed state, and flushes anything [`ScriptCommand::PushEvent`]
+/// queued before now; else `ListFlock` is answered per
+/// [`FakeDaemon::reply_to_list`] (or `Flock(vec![])` if nothing is armed);
+/// else `Response::Pong`.
+///
+/// A [`ScriptCommand::PushEvent`] arriving outside a request turn is
+/// written straight to the wire once subscribed, or buffered until then —
+/// see [`FakeDaemon::push`].
 async fn serve_scripted(
     listener: UnixListener,
     ack: HelloAck,
     mut script: mpsc::Receiver<ScriptCommand>,
     armed_list: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
+    armed_reply_then_event: Arc<Mutex<Option<(Response, BusEvent)>>>,
     list_flock_count: Arc<AtomicU64>,
 ) {
     let (stream, _) = listener.accept().await.unwrap();
@@ -259,6 +334,12 @@ async fn serve_scripted(
     let mut armed_err: Option<(RpcErrorCode, String)> = None;
     let mut armed_event_then_reply = false;
     let mut out_of_order = OutOfOrder::Idle;
+    // Once a `Request::Subscribe` has been answered, a pushed event is
+    // written the moment it arrives. Before that, nothing is listening on
+    // the client side yet (its `broadcast::Receiver` is created inside
+    // `Client::subscribe`, which has not returned), so events queue here.
+    let mut subscribed = false;
+    let mut pending_events: Vec<BusEvent> = Vec::new();
 
     loop {
         tokio::select! {
@@ -267,6 +348,13 @@ async fn serve_scripted(
                     Some(ScriptCommand::ReplyErr(code, message)) => armed_err = Some((code, message)),
                     Some(ScriptCommand::EventThenReply) => armed_event_then_reply = true,
                     Some(ScriptCommand::ArmOutOfOrder) => out_of_order = OutOfOrder::Armed,
+                    Some(ScriptCommand::PushEvent(event)) => {
+                        if subscribed {
+                            write_event(&mut frames, event).await;
+                        } else {
+                            pending_events.push(event);
+                        }
+                    }
                     Some(ScriptCommand::Close) | None => break,
                 }
             }
@@ -288,12 +376,28 @@ async fn serve_scripted(
                         write_reply(&mut frames, other_env.id, Response::Pong).await;
                     }
                     OutOfOrder::Idle => {
-                        if let Some((code, message)) = armed_err.take() {
+                        // Taken into an owned local before any `.await` below:
+                        // the `MutexGuard` `.lock()` produces is not `Send`,
+                        // and holding it across an await point would make
+                        // this whole future not `Send` (tokio::spawn requires
+                        // `Send`).
+                        let reply_then_event = armed_reply_then_event.lock().unwrap().take();
+                        if let Some((reply, event)) = reply_then_event {
+                            write_reply(&mut frames, envelope.id, reply).await;
+                            write_event(&mut frames, event).await;
+                            subscribed = true;
+                        } else if let Some((code, message)) = armed_err.take() {
                             write_err(&mut frames, envelope.id, code, message).await;
                         } else if armed_event_then_reply {
                             armed_event_then_reply = false;
                             send_sample_event(&mut frames).await;
                             write_reply(&mut frames, envelope.id, Response::Pong).await;
+                        } else if matches!(envelope.body, Request::Subscribe { .. }) {
+                            write_reply(&mut frames, envelope.id, Response::Subscribed).await;
+                            subscribed = true;
+                            for event in pending_events.drain(..) {
+                                write_event(&mut frames, event).await;
+                            }
                         } else {
                             let response = if matches!(envelope.body, Request::ListFlock) {
                                 list_flock_count.fetch_add(1, Ordering::SeqCst);
@@ -323,12 +427,14 @@ pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDa
     let listener = UnixListener::bind(path).unwrap();
     let (script_tx, script_rx) = mpsc::channel(SCRIPT_CHANNEL_CAPACITY);
     let armed_list = Arc::new(Mutex::new(None));
+    let armed_reply_then_event = Arc::new(Mutex::new(None));
     let list_flock_count = Arc::new(AtomicU64::new(0));
     let task = tokio::spawn(serve_scripted(
         listener,
         ack,
         script_rx,
         Arc::clone(&armed_list),
+        Arc::clone(&armed_reply_then_event),
         Arc::clone(&list_flock_count),
     ));
     let client = Client::connect(path).await.unwrap();
@@ -337,10 +443,22 @@ pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDa
         FakeDaemon {
             script: script_tx,
             armed_list,
+            armed_reply_then_event,
             list_flock_count,
             task,
         },
     )
+}
+
+/// Binds `path`, handshakes with [`sample_ack`], and hands back a connected
+/// [`Client`] alongside the still-live [`FakeDaemon`] script — identical to
+/// [`fake_client_on`], named separately for tests whose whole point is
+/// [`FakeDaemon::push`], [`FakeDaemon::overrun_by`] or
+/// [`FakeDaemon::queue_reply_then_event`], so the call site reads as "a
+/// daemon I'm about to push events through" rather than "a daemon with
+/// nothing daemon-specific armed".
+pub async fn fake_client_with_push(path: &Path) -> (Client, FakeDaemon) {
+    fake_client_on(path).await
 }
 
 /// Binds `path`, handshakes with [`sample_ack`], and answers every request
