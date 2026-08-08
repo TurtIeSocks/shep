@@ -17,10 +17,15 @@
 //! serves connections until a signal or `KillDaemon` arrives, then tears
 //! down in a load-bearing order — see its own doc for why.
 //!
-//! **Unsafe surface (revised, IR-24):** two documented sites, not one —
-//! [`sys::adopt_fd`]'s own definition, and this module's single call to it
-//! (the very first statement in [`boot`], before anything else opens a
-//! descriptor of its own). `adopt_fd` is `unsafe fn`, not a safe fn wrapping
+//! **Unsafe surface (revised, IR-24):** more than two documented sites —
+//! [`sys::adopt_fd`]'s own definition, this module's ONE production call to
+//! it (the very first statement in [`boot`], before anything else in that
+//! function opens a descriptor of its own), and this module's own test
+//! suite adds a second, test-only call site further down in this file
+//! (`sys.rs`'s own test suite adds five more of its own — see that
+//! module's doc for the full accounting, not "two total").
+//!
+//! `adopt_fd` is `unsafe fn`, not a safe fn wrapping
 //! an internal unsafe block: the ordering precondition that makes adoption
 //! sound ("call this before the process opens anything of its own") is a
 //! CALLER obligation `adopt_fd` cannot verify from inside itself, so the
@@ -340,17 +345,46 @@ pub async fn boot<R: ProcessRunner>(
     paths: ShepPaths,
     options: BootOptions,
 ) -> Result<RunningDaemon, BootError> {
-    // 1. Adopt FIRST — before this process opens or closes anything of its
-    //    own. See this fn's own doc and sys.rs's rationale essay.
+    // 1. Adopt FIRST — before anything LATER IN THIS FUNCTION opens or
+    //    closes a descriptor of its own. See this fn's own doc and sys.rs's
+    //    rationale essay.
     #[allow(unsafe_code)] // IR-24 escape hatch, exercised here — see sys.rs's essay.
     let ready_pipe = options
         .ready_fd
         .map(|fd| {
-            // SAFETY: this is the first fd-touching statement in `boot` —
-            // nothing in this process has opened or closed a descriptor of
-            // its own yet, so `fd` cannot alias one. `adopt_fd`'s own
-            // checks (>= 3, `F_GETFD`) rule out the remaining hazards (see
-            // its `# Safety` section).
+            // SAFETY: revised — the previous wording here was false. This
+            // is the first fd-touching statement in `boot`'s OWN body, so
+            // `boot` itself cannot have created or closed anything `fd`
+            // might alias — that half is structurally true from statement
+            // order alone. It is NOT true that nothing in the process has
+            // touched a descriptor by this point: `boot` is `async`, so a
+            // tokio runtime with its own epoll/kqueue-backed poller fds is
+            // already live before this line ever runs. (Confirmed the hard
+            // way, not just reasoned about: the ledger records a caller
+            // that opened fd 9 before calling `boot`, making a stale
+            // `SHEP_READY_FD` alias it and abort on a real IO-safety
+            // violation.) What this closure actually leans on is a CALLER
+            // obligation this line cannot verify or enforce by itself: that
+            // whatever process exec'd us has not opened descriptors of its
+            // own that could alias `fd`, and that `fd` genuinely is the
+            // pipe our own parent set up over `SHEP_READY_FD` (spec §3)
+            // rather than some other number recycled into it. That is
+            // exactly why `sys::adopt_fd` is `unsafe fn` rather than a safe
+            // wrapper — the unprovable half of the contract is pushed out
+            // to here, where a reader can at least check it against the
+            // real boot sequence, instead of being silently trusted inside
+            // a safe-looking function. `adopt_fd`'s own checks (>= 3,
+            // `F_GETFD`) rule out a reserved or already-closed number, never
+            // who opened the one that's left (see its `# Safety` section).
+            //
+            // Known gap, not closed by this comment: `BootOptions::ready_fd`
+            // is a safe `pub Option<RawFd>` field, so safe code elsewhere
+            // can still build a `BootOptions` that violates the caller
+            // obligation above and drive this unsafe block into UB without
+            // writing a single `unsafe` keyword itself. The structural fix
+            // (`Option<OwnedFd>`, which would make an already-invalid fd a
+            // type error before `boot` ever ran) is deferred to the
+            // CLI-wiring task in Phase 3, not attempted here.
             unsafe { sys::adopt_fd(fd) }
         })
         .transpose()

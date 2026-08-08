@@ -8,16 +8,25 @@
 //! `from_raw_fd`, which is unsafe because nothing in the type system proves
 //! the number names a descriptor this process owns.
 //!
-//! **Two documented sites, not one.** [`adopt_fd`] is `unsafe fn`, not a
-//! safe fn hiding an internal unsafe block: the ordering precondition that
-//! makes adoption sound (call this before the process opens anything of
-//! its own — see scenario (c) below) is a CALLER obligation this function
-//! cannot verify from inside itself, so the type system pushes it out to
-//! whoever calls it. That means the crate's unsafe surface is [`adopt_fd`]'s
-//! own definition here, plus its single call site in `crate::boot::boot`
-//! (the literal first statement in that function, with its own `// SAFETY:`
-//! comment) — two sites, each independently justified, not a widening of
-//! the exception.
+//! **More than two sites, and that's fine.** [`adopt_fd`] is `unsafe fn`,
+//! not a safe fn hiding an internal unsafe block: the ordering precondition
+//! that makes adoption sound (call this before the process opens anything
+//! of its own — see scenario (c) below) is a CALLER obligation this
+//! function cannot verify from inside itself, so the type system pushes it
+//! out to whoever calls it. The crate's actual unsafe surface, counted
+//! honestly (an earlier revision of this doc undercounted, by only
+//! tallying the non-test sites — corrected here rather than repeated):
+//! [`adopt_fd`]'s own definition here, its one PRODUCTION call site in
+//! `crate::boot::boot` (the literal first statement in that function, with
+//! its own `// SAFETY:` comment), plus six TEST-only call sites that
+//! exercise it directly against synthetic fds — one in `boot.rs`'s own
+//! tests, five in this file's own (below) — eight sites total, each with
+//! its own justification. What actually matters for soundness is
+//! unchanged by the recount: only the ONE production call site's ordering
+//! claim has to hold against a real inherited descriptor; every test site
+//! adopts a fd it created itself moments earlier in the same test, which is
+//! a narrower, locally-checkable obligation, not a widening of the
+//! exception.
 //!
 //! **Rejected alternative:** have the parent pass a socket path
 //! (`SHEP_READY_SOCK`) and let the child connect and write. It is entirely
@@ -61,10 +70,17 @@
 //!     justification: it adopts as the literal first fd-touching statement,
 //!     before `init_dirs`/`bind_socket`/`write_pidfile`/signal installation
 //!     run;
-//! (d) double adoption — [`adopt_fd`] is called at most once, from
-//!     [`crate::boot::boot`], and consumes the number into an owning
-//!     [`std::fs::File`] that closes it on drop.
-#![allow(unsafe_code)] // IR-24 exception — two sites total, this block and boot.rs's one call site; see the essay above.
+//! (d) double adoption — in production, [`adopt_fd`] is called at most
+//!     once, from [`crate::boot::boot`]'s single production call site, and
+//!     consumes the number into an owning [`std::fs::File`] that closes it
+//!     on drop, so a second production adoption of the same fd cannot even
+//!     occur there; if it somehow did, scenario (b)'s `BadFd` refusal
+//!     catches it, since the first adoption already closed the number.
+//!     (This crate's *tests* call `adopt_fd` directly, and more than once
+//!     across the suite, each time against a fd the test itself just
+//!     created — a different, lower-stakes situation than production
+//!     double-adoption, and not what this scenario is about.)
+#![allow(unsafe_code)] // IR-24 exception — eight sites total across the crate (this file's definition plus its 5 test call sites, boot.rs's 1 production call site plus its own 1 test call site); see the essay above.
 
 use core::fmt;
 

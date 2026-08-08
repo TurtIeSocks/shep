@@ -167,6 +167,87 @@ async fn shepherd_channel_delivers_ready() {
     assert_eq!(outcome.signal, Some(9));
 }
 
+/// Proves `TokioRunner::spawn`'s `command.uid(creds.uid)` /
+/// `command.gid(gid)` lines (the ones a whole-branch review found a
+/// reviewer could delete with the full suite staying green — the only
+/// other coverage was the root-only, `#[ignore]`d test just below, plus
+/// `fake.rs:401` which hardcodes `credentials: None` and so never reaches
+/// this code at all) are ACTUALLY CALLED, without requiring root.
+///
+/// The obvious version of this test — spawn with your OWN uid/gid and
+/// assert the child reports them back — does NOT work as a regression
+/// gate: verified empirically against this toolchain's own
+/// `library/std/src/sys/process/unix/unix.rs::do_exec` (stable
+/// aarch64-apple-darwin, and confirmed with a standalone probe binary)
+/// that `setuid`/`setgid` to your OWN id is a permitted no-op with zero
+/// observable effect, AND std's own `setgroups(0, NULL)` privilege-drop
+/// call (triggered whenever `.uid()` is set without `.groups()`) silently
+/// swallows `EPERM` for a non-root caller — so a child spawned with the
+/// daemon's own uid/gid looks byte-for-byte identical to one spawned with
+/// `spec.credentials: None`, whether or not `command.uid`/`command.gid`
+/// were ever called. That version would pass unchanged even with both
+/// lines deleted.
+///
+/// This version instead targets a uid/gid the test process does NOT own.
+/// A non-root `setuid`/`setgid` to any id other than your own real/
+/// effective/saved id fails `EPERM` (POSIX) — deterministically, on every
+/// unix — so if `command.uid`/`command.gid` are actually invoked inside
+/// `TokioRunner::spawn`'s child setup, `spawn()` itself returns `Err`
+/// (std pipes a pre-exec failure back to the parent before ever calling
+/// `execve`). If the two lines are deleted, `spec.credentials` is simply
+/// never applied to the `Command` and `spawn()` succeeds instead. That
+/// difference is exactly what each assertion below checks.
+#[tokio::test]
+async fn credentials_are_actually_applied_a_foreign_id_is_refused_by_the_os() {
+    if nix::unistd::geteuid().is_root() {
+        // As root, setuid/setgid to an arbitrary id typically succeeds
+        // instead of failing — this test's whole premise (a guaranteed
+        // EPERM) doesn't hold, and the root-only test below already
+        // covers the apply path under privilege. Nothing to assert here.
+        return;
+    }
+    let own_uid = nix::unistd::geteuid().as_raw();
+    let own_gid = nix::unistd::getegid().as_raw();
+    // Neither number needs to name a real passwd/group entry — a raw
+    // setuid(2)/setgid(2) EPERMs on an unowned id regardless of whether
+    // anything in /etc/passwd or /etc/group claims it.
+    let foreign_uid = if own_uid == 1 { 2 } else { 1 };
+    let foreign_gid = if own_gid == 1 { 2 } else { 1 };
+    let runner = TokioRunner::new();
+
+    // Isolates `command.uid(creds.uid)`: `gid: None` means the
+    // `if let Some(gid) = creds.gid` line is never even reached, so a
+    // failure here can only come from the unconditional `.uid()` call.
+    let dir = tempfile::tempdir().unwrap();
+    let mut uid_spec = spec_for(&dir, "id", &["-u"]);
+    uid_spec.credentials = Some(Credentials {
+        uid: foreign_uid,
+        gid: None,
+    });
+    let uid_result = runner.spawn(&uid_spec);
+    assert!(
+        uid_result.is_err(),
+        "spawning with a foreign uid must be refused by the OS if `command.uid` is really \
+         called; an `Ok` here means the credentials were silently dropped on the floor"
+    );
+
+    // Isolates `command.gid(gid)`: `uid: own_uid` is a permitted no-op
+    // (see this fn's own doc), so a failure here can only come from the
+    // `if let Some(gid) = creds.gid { command.gid(gid); }` line.
+    let dir = tempfile::tempdir().unwrap();
+    let mut gid_spec = spec_for(&dir, "id", &["-g"]);
+    gid_spec.credentials = Some(Credentials {
+        uid: own_uid,
+        gid: Some(foreign_gid),
+    });
+    let gid_result = runner.spawn(&gid_spec);
+    assert!(
+        gid_result.is_err(),
+        "spawning with a foreign gid must be refused by the OS if `command.gid` is really \
+         called; an `Ok` here means the credentials were silently dropped on the floor"
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs root: run with `sudo -E cargo test -p shep-daemon --test real_runner -- --ignored`"]
 async fn a_dropped_child_runs_as_the_requested_user() {

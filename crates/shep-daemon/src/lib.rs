@@ -48,7 +48,8 @@
 //! from a portable (non-unix) build except [`privilege`]'s refuse-outright stub.
 //!
 //! - [`sys`]: adopting an inherited descriptor — the phase's `unsafe fn`, called from one
-//!   site in [`boot`] (two documented sites total, see `sys`'s own doc) (unix-only)
+//!   PRODUCTION site in [`boot`] plus several test-only call sites (`sys`'s own doc has
+//!   the full accounting — not "two total") (unix-only)
 //! - [`privilege`]: `user`/`group` config -> numeric uid/gid, one portable `resolve()`
 //!   signature over a real unix impl and a refuse-outright non-unix stub
 //! - [`tokio_runner`]: real [`ProcessRunner`](runner::ProcessRunner) over `tokio::process` (unix-only)
@@ -310,9 +311,10 @@ pub(crate) mod testing {
 pub mod boot;
 
 // Unix-only: `std::os::unix::io::{FromRawFd, RawFd}` and this crate's unsafe
-// surface (adopting the readiness pipe's inherited descriptor — two
-// documented sites, this module's definition plus `boot`'s one call site;
-// see sys.rs's own doc) have no portable equivalent. Doc lives inside
+// surface (adopting the readiness pipe's inherited descriptor — this
+// module's definition, `boot`'s one production call site, plus test-only
+// call sites in both files; see sys.rs's own doc for the full accounting,
+// not "two total") have no portable equivalent. Doc lives inside
 // sys.rs's own `//!` header (IR-24's rationale essay), not here — same
 // reasoning as `server`'s note below.
 #[cfg(unix)]

@@ -60,6 +60,18 @@ lifecycle events, RPC errors) follow the redaction rule above and do not
 include env values or tokens. Log files inherit the permissions of
 `$SHEP_HOME`; they are not independently access-controlled.
 
+### Muster roll (`flock.json`)
+
+The daemon persists its muster roll at `$SHEP_HOME/flock.json` so a restart
+can restore the flock (`shep muster`, spec §9/§13.4). The roll stores each
+registered app's config, including its `env` map, verbatim — the redaction
+rule above covers output the daemon sends back over the RPC socket or writes
+to its own logs, not this file. `flock.json` is created owner-only (`0600`)
+and kept there across its atomic rename (see `server.rs`'s canonical
+security writeup for the daemon-wide rundown of what this crate writes to
+disk). Anyone who can read `$SHEP_HOME` — the daemon's own user, or root —
+can read every secret held in any managed app's `env` table.
+
 ### Metrics and serve binds
 
 The metrics dog's Prometheus exposition endpoint and the `shep serve` static

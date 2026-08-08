@@ -82,9 +82,11 @@ type Frames = FramedRead<OwnedReadHalf, LengthDelimitedCodec>;
 ///
 /// A separate, install-time trust boundary: the CLI that daemonizes this
 /// process hands it a readiness-pipe descriptor over `SHEP_READY_FD` (spec
-/// §3), adopted through this crate's one unsafe *operation* (Task 7) — two
-/// documented sites, [`crate::sys::adopt_fd`]'s own definition and its one
-/// call site in `crate::boot::boot`, each independently justified. That
+/// §3), adopted through this crate's one unsafe *operation* (Task 7) —
+/// [`crate::sys::adopt_fd`]'s own definition, its one PRODUCTION call site
+/// in `crate::boot::boot`, plus test-only call sites exercising it directly
+/// against synthetic fds (`sys.rs`'s own doc has the full accounting, not
+/// "two total"), each independently justified. That
 /// boundary sits between this process and its own parent, not between this
 /// process and an RPC peer — nothing arriving over the control socket can
 /// reach it — and a hostile or stale descriptor is refused (below fd 3, or

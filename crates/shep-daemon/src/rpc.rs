@@ -513,6 +513,70 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn envelope_deadline_ms_actually_bounds_the_reply() {
+        // `budgets_default_and_clamp` proves `budget()` in isolation, and
+        // `work_past_its_deadline_answers_deadline_exceeded` proves
+        // `with_deadline` in isolation — neither one exercises the wire from
+        // `Envelope::deadline_ms` into `budget()` inside `dispatch` itself
+        // (rpc.rs line ~139: `budget(envelope.deadline_ms)`). A reviewer
+        // changing that call to `budget(None)` left the full suite green,
+        // which is exactly the gap this test closes: it drives a REAL
+        // envelope with a client-supplied deadline through `dispatch`
+        // against a supervisor command that provably takes longer than that
+        // deadline, and checks the reply is `DeadlineExceeded`.
+        //
+        // "Provably longer": `Stop` on an `ignores_signals()` sheep goes
+        // through the real kill ladder (`kill.rs::kill_process`), which
+        // SIGTERMs (ignored — that's the whole point of this script), then
+        // waits up to `app.kill_timeout` (1600ms, `AppConfig::minimal`'s
+        // spec default) before escalating to SIGKILL — and the supervisor's
+        // reply to `stop()` doesn't land until that whole ladder resolves
+        // (`begin_manual`/`PendingReply`, supervisor.rs). `never_exits()`
+        // does NOT work for this: despite the name, it still `obeys_signal`
+        // and resolves its `wait()` the instant `signal()` is called, with
+        // no virtual time elapsed at all — `ignores_signals()` is the one
+        // script that actually forces the full `kill_timeout` wait. A 1ms
+        // client deadline is far below that 1600ms floor, so under the
+        // paused clock `dispatch`'s own `tokio::time::timeout` is
+        // guaranteed to fire first — provided `envelope.deadline_ms`
+        // genuinely reached `budget`. If it didn't (e.g. `budget(None)`
+        // uses the 5s default), 1600ms < 5000ms and this would NOT time
+        // out — see the revert experiment in merge-blockers-report.md,
+        // which changes exactly that line and confirms this test fails.
+        let h = harness(vec![ProcScript::ignores_signals()]);
+        dispatch(
+            envelope(
+                1,
+                Request::Start {
+                    apps: vec![AppConfig::minimal("web", "./srv")],
+                },
+            ),
+            &h.ctx,
+        )
+        .await;
+
+        let reply = reply_of(
+            dispatch(
+                Envelope {
+                    id: 2,
+                    deadline_ms: Some(1),
+                    body: Request::Stop {
+                        selector: SelectorSpec::Name("web".to_string()),
+                    },
+                },
+                &h.ctx,
+            )
+            .await,
+        );
+        let err = reply.result.unwrap_err();
+        assert_eq!(
+            err.code,
+            RpcErrorCode::DeadlineExceeded,
+            "a 1ms client deadline against a 1600ms kill ladder must expire, not {err:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn work_past_its_deadline_answers_deadline_exceeded() {
         // Driven at the deadline seam with a future that never finishes: the
         // paused clock auto-advances the moment the test parks, so this is
