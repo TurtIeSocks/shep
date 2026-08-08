@@ -65,10 +65,13 @@ impl ExitCode {
     /// written, so call sites read `emit_error(err, fmt, code.code_str(), &msg)`
     /// and no verb invents its own spelling.
     ///
-    /// Not called anywhere yet: `emit_error` and the rest of `output/` are
-    /// still unwritten. `#[allow(dead_code)]` says so explicitly rather
-    /// than inventing a call site nothing needs yet.
-    #[allow(dead_code)]
+    /// Not called from non-test code on Windows: its only production call
+    /// sites (`not_wired`, `run`'s `resolve_paths` error branch) are in
+    /// `main.rs`'s `#[cfg(unix)]` arm — there is no diagnostic path on
+    /// Windows to call it from until spec §11's Windows functional tier
+    /// lands. `#[cfg_attr]` says so explicitly rather than leaving an
+    /// unexplained Windows-only warning.
+    #[cfg_attr(windows, allow(dead_code))]
     #[must_use]
     pub const fn code_str(self) -> &'static str {
         match self {

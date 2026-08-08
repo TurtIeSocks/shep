@@ -8,15 +8,18 @@
 
 mod cli;
 mod exit;
+mod output;
 
 use std::path::PathBuf;
 
 use clap::Parser;
 
-#[cfg(unix)]
-use cli::Commands;
 use cli::{Cli, GlobalArgs};
+#[cfg(unix)]
+use cli::{Commands, Format};
 use exit::ExitCode;
+#[cfg(unix)]
+use output::Streams;
 use shep_core::paths::ShepPaths;
 
 #[tokio::main]
@@ -69,12 +72,25 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
 /// It returns `Internal` rather than `Usage` because reaching it is a fault
 /// in this binary, not in what the user typed.
 ///
+/// Renders through [`output::emit_error`] rather than a bare `eprintln!` so
+/// this placeholder path already honours `--format json` — the same
+/// `Streams` real verbs will thread through in later tasks. The write's own
+/// `Result` is intentionally discarded: unlike a real command's output, a
+/// failure to print "not wired yet" doesn't change which failure this run
+/// experienced, and it stays `Internal` either way.
+///
 /// `#[cfg(unix)]`: the only dispatch table that calls it is `run`'s unix
 /// arm — the Windows arm refuses before reaching any per-verb dispatch at
 /// all.
 #[cfg(unix)]
-fn not_wired(verb: &str) -> ExitCode {
-    eprintln!("shep: {verb} is not wired yet");
+fn not_wired(streams: &mut Streams<'_>, fmt: Format, verb: &str) -> ExitCode {
+    let message = format!("{verb} is not wired yet");
+    let _ = output::emit_error(
+        &mut *streams.err,
+        fmt,
+        ExitCode::Internal.code_str(),
+        &message,
+    );
     ExitCode::Internal
 }
 
@@ -96,28 +112,41 @@ fn not_wired(verb: &str) -> ExitCode {
 /// deliberate restriction.
 #[cfg(unix)]
 async fn run(cli: Cli) -> ExitCode {
+    let mut out = std::io::stdout().lock();
+    let mut err = std::io::stderr().lock();
+    let mut streams = Streams {
+        out: &mut out,
+        err: &mut err,
+    };
+    let fmt = cli.global.format;
+
     match cli.command {
-        Commands::Completions(_) => return not_wired("completions"),
-        Commands::Daemon(_) => return not_wired("daemon"),
+        Commands::Completions(_) => return not_wired(&mut streams, fmt, "completions"),
+        Commands::Daemon(_) => return not_wired(&mut streams, fmt, "daemon"),
         _ => {}
     }
 
     if let Err(code) = resolve_paths(&cli.global) {
-        eprintln!("shep: none of --home, $SHEP_HOME, or $HOME resolves a root directory");
+        let _ = output::emit_error(
+            &mut *streams.err,
+            fmt,
+            code.code_str(),
+            "none of --home, $SHEP_HOME, or $HOME resolves a root directory",
+        );
         return code;
     }
 
     match cli.command {
-        Commands::Start(_) => not_wired("start"),
-        Commands::Stop(_) | Commands::Thatlldo(_) => not_wired("stop"),
-        Commands::Restart(_) => not_wired("restart"),
-        Commands::Delete(_) => not_wired("delete"),
-        Commands::Flock => not_wired("flock"),
-        Commands::Describe(_) => not_wired("describe"),
-        Commands::Fold(_) => not_wired("fold"),
-        Commands::Bleats(_) => not_wired("bleats"),
-        Commands::Ping => not_wired("ping"),
-        Commands::Kill => not_wired("kill"),
+        Commands::Start(_) => not_wired(&mut streams, fmt, "start"),
+        Commands::Stop(_) | Commands::Thatlldo(_) => not_wired(&mut streams, fmt, "stop"),
+        Commands::Restart(_) => not_wired(&mut streams, fmt, "restart"),
+        Commands::Delete(_) => not_wired(&mut streams, fmt, "delete"),
+        Commands::Flock => not_wired(&mut streams, fmt, "flock"),
+        Commands::Describe(_) => not_wired(&mut streams, fmt, "describe"),
+        Commands::Fold(_) => not_wired(&mut streams, fmt, "fold"),
+        Commands::Bleats(_) => not_wired(&mut streams, fmt, "bleats"),
+        Commands::Ping => not_wired(&mut streams, fmt, "ping"),
+        Commands::Kill => not_wired(&mut streams, fmt, "kill"),
         Commands::Completions(_) | Commands::Daemon(_) => {
             unreachable!("handled above, before resolve_paths runs")
         }
