@@ -1,47 +1,57 @@
-//! Supervisor engine for process lifecycle management
+//! The daemon: a process-supervision engine plus the control plane that
+//! exposes it over a unix socket
 //!
 //! Owned by the daemon: spawns processes via [`ProcessRunner`](runner::ProcessRunner),
 //! orchestrates restart policy, tracks logs and shepherd-channel traffic, and
 //! gates lifecycle commands (start, stop, restart, delete, shutdown) through a
 //! single [`SupervisorHandle`](supervisor::SupervisorHandle). Pure decision logic
 //! (brain, backoff, entry assembly) is IO-free for deterministic testing under a
-//! paused tokio clock. The OS tier (real spawning, signal delivery, the kill
-//! ladder) is unix-only. Production daemon embeds this crate; the CLI
-//! re-executes itself with a hidden `daemon` subcommand to daemonize.
+//! paused tokio clock. [`RpcServer`](server::RpcServer) exposes that engine to a
+//! CLI client over `$SHEP_HOME/run/shep.sock`, and [`boot`] assembles both into
+//! one running daemon. The OS tier (real spawning, signal delivery, the kill
+//! ladder, the socket itself) is unix-only. Production daemon embeds this
+//! crate; the CLI re-executes itself with a hidden `daemon` subcommand to
+//! daemonize.
 //!
-//! ## Engine taxonomy
+//! ## Module taxonomy
 //!
-//! ##### Pure logic
+//! ##### Engine
+//!
+//! Process-lifecycle decision logic and the actor that runs it (2a).
 //!
 //! - [`brain`]: restart decision tree given exit outcome, uptime, and budget
 //! - [`backoff`]: restart delay computation per the spec's exponential backoff rule
 //! - [`assemble`]: process env, log paths, and spawn spec assembly
 //! - [`entry`]: process lifecycle state, restart budget, reload state machine
-//!
-//! ##### Abstractions
-//!
 //! - [`runner`]: [`ProcessRunner`](runner::ProcessRunner) spawn seam with two impls
 //! - [`fake`]: deterministic scripted [`ProcessRunner`](runner::ProcessRunner) (test-only, or test-fakes feature)
-//! - [`privilege`]: `user`/`group` config -> numeric uid/gid, one portable `resolve()`
-//!   signature over a real unix impl and a refuse-outright non-unix stub
+//! - [`kill`]: kill ladder — SIGTERM, SIGKILL escalation (portable, generic over [`RunningProcess`](runner::RunningProcess))
+//! - [`supervisor`]: the actor — owns registered entries, spawns per-sheep tasks, routes commands
+//! - [`channel`]: shepherd channel codec (child↔daemon messages, newline-JSON)
 //!
-//! ##### OS tier
+//! ##### Plane
 //!
+//! The control plane a CLI client talks to (2b): event bus, request dispatch,
+//! the socket itself, the persisted muster roll, and the boot sequence that
+//! wires all of the above (plus the engine above) into one daemon.
+//!
+//! - [`bus`]: the daemon-wide event bus — topic-glob filtering, per-subscriber forwarder tasks
+//! - [`rpc`]: request dispatch — verb routing onto [`SupervisorHandle`](supervisor::SupervisorHandle), typed errors, per-call deadlines
+//! - [`server`]: the unix-socket connection layer — peer-cred auth, handshake, subscriptions (unix-only)
+//! - [`snapshot`]: the muster roll — debounced atomic `flock.json` writes, restart-survival restore
 //! - [`boot`]: daemon boot — `0700` layout dirs, pidfile, socket bind with stale-socket
 //!   recovery, the readiness pipe, signal handlers, and the ordered teardown sequence (unix-only)
+//!
+//! ##### Platform
+//!
+//! Unix-specific glue underneath both tiers above; nothing here is reachable
+//! from a portable (non-unix) build except [`privilege`]'s refuse-outright stub.
+//!
 //! - [`sys`]: adopting an inherited descriptor — the phase's `unsafe fn`, called from one
 //!   site in [`boot`] (two documented sites total, see `sys`'s own doc) (unix-only)
+//! - [`privilege`]: `user`/`group` config -> numeric uid/gid, one portable `resolve()`
+//!   signature over a real unix impl and a refuse-outright non-unix stub
 //! - [`tokio_runner`]: real [`ProcessRunner`](runner::ProcessRunner) over `tokio::process` (unix-only)
-//! - [`server`]: the unix-socket connection layer — peer-cred auth, handshake, subscriptions (unix-only)
-//!
-//! ##### Orchestration
-//!
-//! - [`supervisor`]: the actor — owns registered entries, spawns per-sheep tasks, routes commands
-//! - [`kill`]: kill ladder — SIGTERM, SIGKILL escalation (portable, generic over [`RunningProcess`](runner::RunningProcess))
-//! - [`channel`]: shepherd channel codec (child↔daemon messages, newline-JSON)
-//! - [`bus`]: the daemon-wide event bus — topic-glob filtering, per-subscriber forwarder tasks
-//! - [`snapshot`]: the muster roll — debounced atomic `flock.json` writes, restart-survival restore
-//! - [`rpc`]: request dispatch — verb routing onto [`SupervisorHandle`](supervisor::SupervisorHandle), typed errors, per-call deadlines
 //!
 //! # Quick start
 //!
@@ -105,6 +115,70 @@
 //! ([`ScriptedRunner`](fake::ScriptedRunner)) drives deterministic tests;
 //! [`spawn_supervisor`](supervisor::spawn_supervisor) wires these together into
 //! the core actor loop.
+//!
+//! # Quick start
+//!
+//! This second example boots a full daemon — layout, socket, and RPC server,
+//! via [`boot`] — on a temporary `$SHEP_HOME`, using the same scripted fake
+//! runner as the example above so it stays hermetic (no real child
+//! processes), then connects a raw client to the control socket and
+//! round-trips one `Ping` over the same wire codec [`server`] itself speaks.
+//! Compile with `--all-features` on a unix target (`test-fakes` for the fake
+//! runner, plus the unix-only [`boot`]/[`server`] modules this example needs).
+//!
+//! ```no_run
+//! # #[cfg(all(unix, feature = "test-fakes"))]
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! use shep_daemon::boot::{BootOptions, boot};
+//! use shep_daemon::fake::ScriptedRunner;
+//! use shep_core::paths::ShepPaths;
+//! use shep_core::protocol::{
+//!     Envelope, Hello, HelloReply, PROTOCOL_VERSION, Request, ServerFrame, codec, decode_frame,
+//!     encode_frame,
+//! };
+//! use tokio::net::UnixStream;
+//! use tokio_util::codec::Framed;
+//! use futures_util::{SinkExt, StreamExt};
+//!
+//! // A throwaway $SHEP_HOME: `boot` creates its 0700 layout inside it.
+//! let paths = ShepPaths::resolve(&|_| None, std::path::Path::new("/tmp/shep-daemon-example"));
+//!
+//! // Boot with the scripted fake runner — no real children, just the plane.
+//! let daemon = boot(ScriptedRunner::new(vec![]), paths, BootOptions::default()).await?;
+//! let socket = daemon.socket().to_path_buf();
+//! tokio::spawn(daemon.run());
+//!
+//! // Connect and speak the wire protocol directly: Hello, then Ping.
+//! let stream = UnixStream::connect(&socket).await?;
+//! let mut frames = Framed::new(stream, codec());
+//! frames
+//!     .send(encode_frame(&Hello {
+//!         client_version: "0.1.0".to_string(),
+//!         protocol: PROTOCOL_VERSION,
+//!     })?)
+//!     .await?;
+//! let ack: HelloReply = decode_frame(&frames.next().await.unwrap()?)?;
+//! let ack = ack.expect("the daemon must ack our protocol");
+//! println!("daemon pid: {}", ack.pid);
+//!
+//! frames
+//!     .send(encode_frame(&Envelope {
+//!         id: 1,
+//!         deadline_ms: Some(1_000),
+//!         body: Request::Ping,
+//!     })?)
+//!     .await?;
+//! let frame: ServerFrame = decode_frame(&frames.next().await.unwrap()?)?;
+//! println!("reply: {frame:?}");
+//!
+//! Ok(())
+//! # }
+//! # #[tokio::main]
+//! # async fn main() {
+//! #     #[cfg(all(unix, feature = "test-fakes"))]
+//! #     example().await.ok();
+//! # }
+//! ```
 
 #![doc(test(attr(deny(warnings))))]
 #![deny(unsafe_code)]

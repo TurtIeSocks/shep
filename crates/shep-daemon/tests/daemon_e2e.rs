@@ -33,11 +33,23 @@ use shep_daemon::tokio_runner::TokioRunner;
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A booted daemon on its own `$SHEP_HOME`, with its run loop spawned.
+///
+/// `run`/`dir` are `Option`-wrapped, not moved out directly, so this type
+/// can carry a [`Drop`] impl (see below) without every existing partial
+/// move (`fixture.run`, `fixture.dir`) turning into a compile error —
+/// Rust forbids moving a single field out of a value whose type implements
+/// `Drop`; going through `Option::take` on a `&mut self` method sidesteps
+/// that without touching every call site's shape.
 struct Fixture {
-    dir: tempfile::TempDir,
+    dir: Option<tempfile::TempDir>,
     paths: ShepPaths,
     ctx: RpcContext,
-    run: tokio::task::JoinHandle<Result<(), BootError>>,
+    run: Option<tokio::task::JoinHandle<Result<(), BootError>>>,
+    // Real OS pids this fixture is responsible for on the panic path — every
+    // `Client::request` sharing this `Arc` records one here whenever a reply
+    // carries live `ProcessInfo`s (`Started`/`Flock`/`Described`/`Restarted`/
+    // `Stopped`). See `Drop` below for why this exists at all.
+    spawned: std::sync::Arc<std::sync::Mutex<Vec<i32>>>,
 }
 
 impl Fixture {
@@ -62,10 +74,11 @@ impl Fixture {
         let ctx = daemon.context();
         let run = tokio::spawn(daemon.run());
         Self {
-            dir,
+            dir: Some(dir),
             paths,
             ctx,
-            run,
+            run: Some(run),
+            spawned: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -76,6 +89,7 @@ impl Fixture {
             next_id: 1,
             hello_ack: None,
             pending: std::collections::VecDeque::new(),
+            spawned: self.spawned.clone(),
         };
         client
             .send(&Hello {
@@ -89,14 +103,51 @@ impl Fixture {
     }
 
     /// Shuts the daemon down and waits for its ordered teardown.
-    async fn shutdown(self) -> tempfile::TempDir {
+    async fn shutdown(mut self) -> tempfile::TempDir {
         self.ctx.shutdown();
-        tokio::time::timeout(RECV_TIMEOUT, self.run)
+        let run = self.run.take().expect("shutdown is only ever called once");
+        tokio::time::timeout(RECV_TIMEOUT, run)
             .await
             .expect("teardown must not hang")
             .unwrap()
             .unwrap();
-        self.dir
+        self.dir.take().expect("dir is only ever taken once")
+    }
+}
+
+/// Last-resort net for a test that PANICS before reaching its own
+/// `Fixture::shutdown()` (or, in the crash-simulation test, before
+/// deliberately skipping it).
+///
+/// On every success path this is a no-op: `shutdown()`'s kill ladder (or,
+/// in `kill_daemon_shuts_the_flock_down_and_unlinks_the_socket`, the
+/// test's own explicit ESRCH poll) already reaped every tracked pid before
+/// `Fixture` drops, so `kill()` below just hits ESRCH and is ignored. It
+/// only does real work on the panic path — proven, not assumed, by
+/// deliberately failing a test mid-run and checking for orphans (see
+/// task-11-report.md's "Drop-prevents-leak experiment"): a `current_thread`
+/// `#[tokio::test]` runtime that unwinds out from under a panic does NOT
+/// keep polling the background `run` task to let its own async teardown
+/// (the kill ladder in `RunningDaemon::run`) finish, so `ctx.shutdown()`
+/// alone is not sufficient — this sends `SIGKILL` directly, synchronously,
+/// with no dependency on the runtime still being alive to schedule anything.
+///
+/// SIGKILLs the whole process GROUP (`-pid`, not `pid`): `TokioRunner`
+/// spawns every child leader in its own group (see `tokio_runner.rs`'s own
+/// doc) specifically so a group signal also reaches a `sleep 1`
+/// grandchild a leader-only signal would miss.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let pids = self
+            .spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &pid in pids.iter() {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(-pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
     }
 }
 
@@ -122,6 +173,9 @@ struct Client {
     // first version discarded them and hung waiting for `process.stop` after
     // a `Stop` reply that had already raced past it.
     pending: std::collections::VecDeque<ServerFrame>,
+    // Shared with the owning `Fixture` — see its own doc and `Drop` impl.
+    // `request` below is the one place this gets written to.
+    spawned: std::sync::Arc<std::sync::Mutex<Vec<i32>>>,
 }
 
 impl Client {
@@ -184,6 +238,7 @@ impl Client {
             }
         };
         requeue(&mut self.pending, skipped);
+        track_spawned(&self.spawned, &reply);
         reply
     }
 
@@ -203,6 +258,67 @@ impl Client {
         };
         requeue(&mut self.pending, skipped);
         info
+    }
+
+    /// Reads frames until a `LogOut` event for `id` arrives, re-queueing
+    /// (never discarding) everything else — see `pending`'s doc — bounded by
+    /// one overall [`RECV_TIMEOUT`], not merely `recv_as`'s own per-frame
+    /// one, so a daemon that keeps emitting OTHER frames forever without
+    /// ever emitting a `log.*` event for `id` cannot spin this loop past its
+    /// budget. (Task 11 fix: the original version of this loop lived inline
+    /// in the one test that needs it, called `next_frame` directly, and so
+    /// silently discarded every non-matching frame with no deadline of its
+    /// own — contradicting this exact discipline. Nothing after this call
+    /// in that test reads the connection again, so discarding was harmless
+    /// in practice, but the requeue treatment costs nothing and keeps every
+    /// `Client` method in this file honest about the same rule.)
+    async fn await_log_line(&mut self, id: u32) -> String {
+        tokio::time::timeout(RECV_TIMEOUT, async {
+            let mut skipped = Vec::new();
+            let line = loop {
+                let frame = self.next_frame().await;
+                if let ServerFrame::Event(BusEvent::LogOut { id: event_id, line }) = &frame
+                    && *event_id == id
+                {
+                    break line.clone();
+                }
+                skipped.push(frame);
+            };
+            requeue(&mut self.pending, skipped);
+            line
+        })
+        .await
+        .expect("timed out waiting for a log.* event")
+    }
+}
+
+/// Records every live pid a reply's `ProcessInfo`s carry — see `Fixture`'s
+/// `spawned` field and `Drop` impl for why. Every `Response` variant that
+/// can carry a real spawned/listed pid is covered, not just `Started`: a
+/// muster restore's fresh pids, for one, are only ever observed here via a
+/// post-reboot `ListFlock` (`Response::Flock`), never a `Started` reply on
+/// the rebooted client.
+fn track_spawned(spawned: &std::sync::Arc<std::sync::Mutex<Vec<i32>>>, reply: &Reply) {
+    let Ok(response) = &reply.result else {
+        return;
+    };
+    let infos: &[ProcessInfo] = match response {
+        Response::Flock(infos)
+        | Response::Described(infos)
+        | Response::Started(infos)
+        | Response::Stopped(infos)
+        | Response::Restarted(infos) => infos,
+        _ => return,
+    };
+    let mut spawned = spawned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for info in infos {
+        if let Some(pid) = info.pid
+            && let Ok(pid) = i32::try_from(pid)
+        {
+            spawned.push(pid);
+        }
     }
 }
 
@@ -291,14 +407,7 @@ async fn log_lines_reach_a_log_subscriber() {
     };
     let id = infos[0].id;
 
-    let line = loop {
-        if let ServerFrame::Event(BusEvent::LogOut { id: event_id, line }) =
-            client.next_frame().await
-            && event_id == id
-        {
-            break line;
-        }
-    };
+    let line = client.await_log_line(id).await;
     assert_eq!(line, "hello-flock");
 
     fixture.shutdown().await;
@@ -346,7 +455,7 @@ async fn protocol_skew_is_refused_over_the_real_socket() {
 
 #[tokio::test]
 async fn kill_daemon_shuts_the_flock_down_and_unlinks_the_socket() {
-    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
     let mut client = fixture.connect().await;
 
     let sleeper = |name: &str| {
@@ -374,7 +483,8 @@ async fn kill_daemon_shuts_the_flock_down_and_unlinks_the_socket() {
 
     let socket = fixture.paths.socket.clone();
     let pidfile_path = shep_daemon::boot::pidfile(&fixture.paths);
-    tokio::time::timeout(RECV_TIMEOUT, fixture.run)
+    let run = fixture.run.take().expect("run is only ever taken once");
+    tokio::time::timeout(RECV_TIMEOUT, run)
         .await
         .expect("teardown must not hang")
         .unwrap()
@@ -389,22 +499,23 @@ async fn kill_daemon_shuts_the_flock_down_and_unlinks_the_socket() {
         "the pidfile must be removed on teardown"
     );
 
-    // Neither child may survive teardown: poll kill(pid, None) for ESRCH
-    // (no such process) instead of sleeping a fixed guess.
+    // What this proves: the daemon's kill ladder REAPED both DIRECT
+    // children -- the two `/bin/sh` leaders `pids` holds -- not merely
+    // signaled them. `kill(pid, None)` still returns `Ok` for a zombie
+    // (exited but not yet `wait()`ed by its parent — the pid stays in the
+    // process table until reaped), so only a transition all the way to
+    // ESRCH proves the daemon's own `wait()` actually ran, which is what
+    // `assert_reaped` polls for instead of sleeping a fixed guess.
+    //
+    // What this does NOT prove: that their `sleep 1` GRANDCHILDREN are
+    // also gone. Neither `pids` nor anything else in this test ever learns
+    // those pids (spec §7's shepherd channel never reports grandchild
+    // pids either), so this loop cannot poll them directly — the kill
+    // ladder reaches them, if at all, only via the process-GROUP `SIGKILL`
+    // `kill_tree` sends (`tokio_runner.rs`'s own doc), which this test does
+    // not independently verify.
     for pid in pids {
-        let reaped = tokio::time::timeout(RECV_TIMEOUT, async {
-            loop {
-                match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
-                    Err(nix::errno::Errno::ESRCH) => break,
-                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
-                }
-            }
-        })
-        .await;
-        assert!(
-            reaped.is_ok(),
-            "pid {pid} must be reaped by teardown's kill ladder"
-        );
+        assert_reaped(pid).await;
     }
 
     // Engine unreachable: a fresh connect on the now-unlinked socket path
@@ -415,9 +526,29 @@ async fn kill_daemon_shuts_the_flock_down_and_unlinks_the_socket() {
     );
 }
 
+/// Polls `kill(pid, None)` for ESRCH (no such process) instead of sleeping a
+/// fixed guess — see the comment at this fn's one multi-line call site
+/// (`kill_daemon_shuts_the_flock_down_and_unlinks_the_socket`) for exactly
+/// what a transition to ESRCH does and does not prove.
+async fn assert_reaped(pid: i32) {
+    let reaped = tokio::time::timeout(RECV_TIMEOUT, async {
+        loop {
+            match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+                Err(nix::errno::Errno::ESRCH) => break,
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await;
+    assert!(
+        reaped.is_ok(),
+        "pid {pid} must be reaped by teardown's kill ladder"
+    );
+}
+
 #[tokio::test]
 async fn a_socket_left_behind_by_a_crash_does_not_block_the_next_boot() {
-    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
     let socket = fixture.paths.socket.clone();
 
     // Simulate a crash: abort the run loop instead of asking for its
@@ -427,8 +558,9 @@ async fn a_socket_left_behind_by_a_crash_does_not_block_the_next_boot() {
     // and the `UnixListener` it owned — has actually finished dropping, so
     // the reboot below's stale-socket probe can never race a listener that
     // hasn't finished closing yet.
-    fixture.run.abort();
-    let outcome = fixture.run.await;
+    let run = fixture.run.take().expect("run is only ever taken once");
+    run.abort();
+    let outcome = run.await;
     assert!(
         outcome.is_err_and(|err| err.is_cancelled()),
         "the run task must have been cancelled, not completed on its own"
@@ -438,10 +570,13 @@ async fn a_socket_left_behind_by_a_crash_does_not_block_the_next_boot() {
         "sanity: a crash leaves the socket file behind"
     );
 
-    // Same `$SHEP_HOME`: `dir` is moved out of `fixture` here rather than
+    // Same `$SHEP_HOME`: `dir` is taken out of `fixture` here rather than
     // dropped alongside it, so the directory (and the leftover socket file
-    // inside it) survives into the reboot.
-    let rebooted = Fixture::boot(fixture.dir, false).await;
+    // inside it) survives into the reboot. No processes were ever started
+    // on this fixture, so its `Drop` (see `Fixture`'s own doc) has nothing
+    // to reap when it goes out of scope at the end of this fn.
+    let dir = fixture.dir.take().expect("dir is only ever taken once");
+    let rebooted = Fixture::boot(dir, false).await;
     let mut client = rebooted.connect().await;
     let pong = client.request(Request::Ping).await;
     assert_eq!(pong.result.unwrap(), Response::Pong);
@@ -484,6 +619,18 @@ async fn muster_restores_the_flock_across_a_daemon_lifetime() {
     assert_eq!(running_by_name.get("beta"), Some(&2));
 
     let dir = fixture.shutdown().await; // same $SHEP_HOME survives the reboot
+
+    // shutdown()'s kill ladder must have actually reaped the pre-reboot
+    // flock, not merely recorded it in the roll as it was — test 4
+    // (kill_daemon_shuts_the_flock_down_and_unlinks_the_socket) already
+    // proves teardown's kill ladder in general; this confirms it held for
+    // THIS fixture's own three sheep too, before trusting the "a restored
+    // sheep gets a fresh pid" assertion below to mean anything (a stale
+    // pid the OS happened not to reuse yet would make that assertion pass
+    // for the wrong reason).
+    for &pid in &old_pids {
+        assert_reaped(i32::try_from(pid).unwrap()).await;
+    }
 
     let rebooted = Fixture::boot(dir, true).await;
     let listed = rebooted.connect().await.request(Request::ListFlock).await;

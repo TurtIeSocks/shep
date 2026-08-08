@@ -22,6 +22,12 @@ use core::fmt;
 use shep_core::config::AppConfig;
 
 /// Resolved unix credentials for a spawned sheep
+// IR-25 audit (Task 11): `uid`/`gid` are plain `pub` fields, not accessor
+// methods — reading them is already a zero-cost, un-inlinable field access,
+// so there is nothing here for `#[inline]` to annotate. Noted rather than
+// silently skipped, since the brief named this type alongside two real
+// accessors (`TopicFilter::patterns`, `SnapshotWriter::writes`) that DID get
+// `#[inline]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Credentials {
     /// Numeric user id to run the child as

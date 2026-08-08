@@ -49,26 +49,46 @@ type Frames = FramedRead<OwnedReadHalf, LengthDelimitedCodec>;
 ///
 /// # Security
 ///
-/// (IR-29 canonical writeup; everything else links here.)
+/// This is the canonical security writeup for the whole daemon (IR-29):
+/// every other module that touches something security-relevant links back
+/// here instead of re-arguing it.
 ///
 /// Design criteria: `$SHEP_HOME/run` is *intended* to be created `0700` so
 /// no other user can reach the socket path at all — that creation (and any
 /// permission check of an already-existing `run` dir) is the daemon's boot
-/// path's responsibility (Task 6), not this module's: nothing in
-/// [`RpcServer`] creates, checks, or enforces that mode, it only accepts on
-/// whatever listener it is handed. Every accepted connection is checked
-/// with `SO_PEERCRED`/`getpeereid` ([`check_peer`]) and refused unless the
-/// peer's uid equals the daemon's; this fails CLOSED — a connection whose
-/// credentials the OS will not report ([`AuthError::NoCredentials`]) is
-/// refused, not admitted, exactly like a confirmed uid mismatch. The
-/// handshake refuses protocol skew with a typed error
-/// ([`RpcErrorCode::ProtocolMismatch`]) rather than silence; frames are
-/// capped at [`shep_core::protocol::MAX_FRAME_BYTES`]; the *number* of
-/// peer-supplied topic patterns on one `Subscribe` is bounded before
-/// compiling ([`crate::bus::MAX_TOPIC_PATTERNS`] — this bounds pattern
-/// *count*, not the byte length of any individual pattern, which is
-/// unbounded short of `MAX_FRAME_BYTES`); every call carries a clamped
-/// deadline ([`crate::rpc::budget`]).
+/// path's responsibility ([`crate::boot::init_dirs`], Task 6), not this
+/// module's: nothing in [`RpcServer`] creates, checks, or enforces that
+/// mode, it only accepts on whatever listener it is handed. Every accepted
+/// connection is checked with `SO_PEERCRED`/`getpeereid` ([`check_peer`])
+/// and refused unless the peer's uid equals the daemon's; this fails
+/// CLOSED — a connection whose credentials the OS will not report
+/// ([`AuthError::NoCredentials`]) is refused, not admitted, exactly like a
+/// confirmed uid mismatch. The handshake refuses protocol skew with a typed
+/// error ([`RpcErrorCode::ProtocolMismatch`]) rather than silence; frames
+/// are capped at [`shep_core::protocol::MAX_FRAME_BYTES`]. Every
+/// peer-supplied *pattern* is bounded before it can cost the daemon
+/// unbounded work compiling it: a `Subscribe`'s topic-glob *count* (not the
+/// byte length of any individual pattern, which is unbounded short of
+/// `MAX_FRAME_BYTES`) is capped at [`crate::bus::MAX_TOPIC_PATTERNS`], and a
+/// `/regex/` [`shep_core::protocol::SelectorSpec`] on `Start`/`Stop`/
+/// `Restart`/`Delete` is capped at a 1 MiB compiled size by
+/// [`shep_core::selector::ProcessSelector`]'s `TryFrom<SelectorSpec>` impl.
+/// Every call carries
+/// a clamped deadline ([`crate::rpc::budget`]). The one place this daemon
+/// writes secrets to disk — an app's `env`, verbatim, so a muster restore
+/// can reproduce it (spec §10 redacts them everywhere else) — is
+/// [`crate::snapshot::write_atomic`]'s `flock.json`, created owner-only
+/// (`0600`, Task 3) and kept there across its atomic rename.
+///
+/// A separate, install-time trust boundary: the CLI that daemonizes this
+/// process hands it a readiness-pipe descriptor over `SHEP_READY_FD` (spec
+/// §3), adopted through this crate's one `unsafe` operation
+/// ([`crate::sys::adopt_fd`], Task 7). That boundary sits between this
+/// process and its own parent, not between this process and an RPC peer —
+/// nothing arriving over the control socket can reach it — and a hostile or
+/// stale descriptor is refused (below fd 3, or not currently open) rather
+/// than adopted; see [`crate::sys`]'s own rationale essay for the full
+/// threat model.
 ///
 /// Explicit non-goals: root can always read daemon memory; a peer with the
 /// same uid is fully trusted (it could simply run the binary itself); there

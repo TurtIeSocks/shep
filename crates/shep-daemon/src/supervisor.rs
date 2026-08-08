@@ -567,7 +567,8 @@ impl<R: ProcessRunner> Actor<R> {
                 self.emit(ProcessEventKind::Start, info.clone(), true);
                 // No readiness-probe gate exists yet (Phase 2b: `readiness_probe`
                 // is parsed into `AppConfig` but not wired to anything here —
-                // see `lib.rs`'s taxonomy doc), so `entry.status` above already
+                // see this file's own `Msg::Ready` handler, line 432, the
+                // Phase-4 wait_ready TODO), so `entry.status` above already
                 // went straight to `Online` with no intervening `Starting`
                 // phase ever observed by a caller. The bus must say so too:
                 // a `process.*` subscriber that only ever hears `process.start`

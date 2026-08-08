@@ -278,6 +278,9 @@ pub struct SnapshotWriter {
 
 impl SnapshotWriter {
     /// Completed roll writes since boot — the number the metrics dog reports
+    // IR-25: trivial atomic load, no branch — inline across the crate
+    // boundary. Not per-frame hot, so `#[inline]`, never `#[inline(always)]`.
+    #[inline]
     #[must_use]
     pub fn writes(&self) -> u64 {
         self.writes.load(Ordering::SeqCst)

@@ -82,6 +82,10 @@ impl TopicFilter {
     }
 
     /// The source patterns this filter was compiled from.
+    // IR-25: trivial field return, no branch — inline across the crate
+    // boundary. Not per-frame hot like `matches` above (a `GlobSet` call,
+    // not a forwarding one), so `#[inline]`, never `#[inline(always)]`.
+    #[inline]
     #[must_use]
     pub fn patterns(&self) -> &[String] {
         &self.patterns
