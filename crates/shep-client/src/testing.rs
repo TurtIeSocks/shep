@@ -1,16 +1,16 @@
 //! Hand-rolled test doubles shared across this phase's tasks (and, via the
-//! `test-support` feature, shep-cli's own tests).
+//! `test-support` feature, shep-cli's own tests) — the ONE home for every
+//! scripted daemon/client double: no other module grows a second
+//! `fake_daemon`, and no other crate defines its own.
 //!
-//! This is the ONE home for every fake used to test shep-client: no other
-//! module grows a second `fake_daemon`, and no other crate defines its own.
 //! Every helper takes the socket path as `&Path` — this module carries no
 //! dev-dependencies (it compiles into an ordinary build under
 //! `test-support`, so `missing_docs` and `missing_debug_implementations`
 //! apply to it exactly like any other public module), so the caller owns
 //! the `TempDir`.
 //!
-//! Roster grows task by task: this task (1) writes `fake_daemon`,
-//! `sample_ack`, and `sample_info`; later tasks in this phase add
+//! Roster grows task by task: this task (1) writes [`fake_daemon`],
+//! [`sample_ack`], and [`sample_info`]; later tasks in this phase add
 //! `FakeDaemon` and its many flavors as their own types come into
 //! existence.
 
@@ -33,8 +33,6 @@ use shep_core::status::ProcStatus;
 ///
 /// Binds before returning, so a caller that awaits it can `connect`
 /// immediately without a sleep.
-///
-/// # Panics
 ///
 /// Panics if `path` cannot be bound, or if the served connection fails to
 /// accept, read the `Hello` frame, decode it, or send `reply` back — this

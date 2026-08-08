@@ -24,8 +24,8 @@ use shep_core::protocol::{
 ///
 /// Deliberately mirrors the daemon's own `HANDSHAKE_TIMEOUT_MS = 5_000`
 /// (`shep-daemon/src/server.rs:41`) so neither side out-waits the other.
-/// Re-exported from `spawn` (Task 4), which is where the whole spawn budget
-/// reads from one place.
+/// The single constant the `spawn` module's own connect-and-wait budget
+/// reads from, so the two never drift apart.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why `Connection::open` failed.
@@ -144,6 +144,11 @@ impl Connection {
     /// - [`ConnectError::ProtocolMismatch`] — the daemon refused the
     ///   handshake on protocol-version skew.
     pub(crate) async fn open(socket: &Path, timeout: Duration) -> Result<Self, ConnectError> {
+        // `timeout` bounds `connect(2)` and the handshake together, not just
+        // the handshake — intentional, but barely testable over AF_UNIX (a
+        // mutant moving `connect` outside this timeout still passes all
+        // five tests below). Not directly covered; don't contort a test to
+        // chase it.
         tokio::time::timeout(timeout, Self::open_inner(socket))
             .await
             .map_err(|_elapsed| ConnectError::HandshakeTimeout { after: timeout })?
@@ -171,6 +176,9 @@ impl Connection {
             .ok_or(ConnectError::HandshakeClosed)?
             .map_err(ConnectError::Io)?;
         let reply: HelloReply = decode_frame(&frame).map_err(ConnectError::Wire)?;
+        // Flattens every `RpcError` into `ProtocolMismatch` regardless of
+        // `code` — sound only because `server.rs` is the sole producer today
+        // and always sends `ProtocolMismatch` (shep-daemon/src/server.rs:387-397).
         let ack = reply.map_err(|err| ConnectError::ProtocolMismatch {
             client: PROTOCOL_VERSION,
             message: err.message,
@@ -211,8 +219,9 @@ mod tests {
             hello.protocol, PROTOCOL_VERSION,
             "the client must announce the version it speaks"
         );
-        assert!(
-            !hello.client_version.is_empty(),
+        assert_eq!(
+            hello.client_version,
+            env!("CARGO_PKG_VERSION"),
             "the client must identify its own version"
         );
     }

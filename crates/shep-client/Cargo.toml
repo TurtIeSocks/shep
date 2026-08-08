@@ -17,14 +17,14 @@ test-support = []
 shep-core.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros"] }
 tokio-util.workspace = true
-tokio-stream.workspace = true   # Task 3: wrappers::BroadcastStream
+tokio-stream.workspace = true   # wrappers::BroadcastStream, for the event-bus subscription stream
 futures-util.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 tempfile.workspace = true
 
-# Task 4's zombie reaper needs `waitpid`; dev-only and unix-only, same shape
+# The zombie reaper needs `waitpid`; dev-only and unix-only, same shape
 # shep-daemon uses. The workspace default features already cover it.
 [target.'cfg(unix)'.dev-dependencies]
 nix.workspace = true

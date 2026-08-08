@@ -28,10 +28,8 @@ mod connection;
 #[cfg(unix)]
 pub use connection::{ConnectError, HANDSHAKE_TIMEOUT};
 
-/// Hand-rolled fakes shared by this phase's tests — the ONE home for every
-/// scripted daemon/client double, across every task and (via the
-/// `test-support` feature) across shep-cli's tests too. Unix-only for the
-/// same reason as `connection`: every fake here binds a `UnixListener`.
+// Unix-only for the same reason as `connection` above: every fake here
+// binds a `UnixListener`.
 #[cfg(all(unix, any(test, feature = "test-support")))]
 pub mod testing;
 
