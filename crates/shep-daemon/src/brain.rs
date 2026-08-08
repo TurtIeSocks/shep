@@ -127,7 +127,8 @@ mod tests {
     fn budget_exhausted_returns_errored() {
         let mut app = AppConfig::minimal("test", "./test");
         app.min_uptime = "1000".parse().unwrap(); // 1000 ms
-        app.max_restarts = 15; // Set explicitly so 16 exits triggers exhausted
+        // max_restarts uses the real shipped default (16, spec §4) — no
+        // override needed now that `exhausted` uses `>=`.
         let mut budget = RestartBudget::default();
 
         // Make 16 consecutive unstable exits to exhaust the budget
@@ -138,7 +139,7 @@ mod tests {
             };
             let d = decide_on_exit(&app, &mut budget, Duration::from_millis(100), exit, false);
             // After the 16th decision, it should be Errored
-            if budget.unstable_count() > 15 {
+            if budget.unstable_count() >= 16 {
                 assert!(matches!(d, Decision::Errored));
                 return;
             }
@@ -166,9 +167,10 @@ mod tests {
             exits in proptest::collection::vec(0u64..500, 16..64)
         ) {
             // Every uptime < min_uptime(1000ms): the 16th decision must be
-            // Errored, none before it.
-            let mut app = AppConfig::minimal("p", "./p");
-            app.max_restarts = 15; // Set explicitly for deterministic test
+            // Errored, none before it. max_restarts uses the real shipped
+            // default (16, spec §4) — no override needed now that
+            // `exhausted` uses `>=`.
+            let app = AppConfig::minimal("p", "./p");
             let mut budget = RestartBudget::default();
             for (i, ms) in exits.iter().enumerate() {
                 let d = decide_on_exit(&app, &mut budget,

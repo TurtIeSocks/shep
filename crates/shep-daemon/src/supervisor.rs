@@ -1205,11 +1205,40 @@ mod tests {
         app.exp_backoff_restart_delay = Some("100".parse().unwrap());
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Park on the event stream; auto-advance drives through all pending
-        // backoff delays (pinned Task 4 sequence) until the script runs out.
+        // backoff delays (pinned Task 4 sequence). The budget check itself
+        // (spec §4: reaching max_restarts=16 unstable exits errors) fires on
+        // the 16th exit, using the script's 16th and final entry — the
+        // script is exactly, not incidentally, exhausted at that point.
         await_event(&mut rx, 0, ProcessEventKind::Errored).await;
         let list = handle.list().await;
         assert_eq!(list[0].status, ProcStatus::Errored);
         assert_eq!(list[0].restarts, 15); // respawns performed, not exits
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn crash_loop_budget_check_fires_before_script_exhaustion_at_real_default() {
+        // Coverage gap flagged by the whole-branch review: the pinned-delay
+        // crash_loop test above supplies EXACTLY 16 scripted spawns, so a
+        // still-buggy `unstable_count > max_restarts` check (which needs a
+        // 17th unstable exit to fire) would coincidentally also land on
+        // Errored via script exhaustion (spawn failure), masking the bug.
+        // Here the script has 20 entries — comfortably more than either
+        // check needs — so only the BUDGET path can produce restarts==15;
+        // a still-buggy `>` check would consume a 17th spawn and report
+        // restarts==16 instead. Real shipped default max_restarts (16, no
+        // override) throughout.
+        let (events, mut rx) = tokio::sync::broadcast::channel(1024);
+        let runner = ScriptedRunner::new((0..20).map(|_| ProcScript::const_exit(1)).collect());
+        let handle = spawn_supervisor(runner, test_paths(), events);
+        let app = AppConfig::minimal("crash-default", "./boom"); // no max_restarts override
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        await_event(&mut rx, 0, ProcessEventKind::Errored).await;
+        let list = handle.list().await;
+        assert_eq!(list[0].status, ProcStatus::Errored);
+        // Budget-exhaustion path, not script exhaustion: errors at the 16th
+        // unstable exit (15 respawns performed), with 4 scripted spawns left
+        // unused.
+        assert_eq!(list[0].restarts, 15);
     }
 
     #[tokio::test(start_paused = true)]

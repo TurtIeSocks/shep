@@ -62,9 +62,13 @@ impl RestartBudget {
         self.unstable_count
     }
 
-    /// Check if the restart budget is exhausted
+    /// Check if the restart budget is exhausted.
+    ///
+    /// Spec §4: the counter *reaching* `max_restarts` consecutive unstable
+    /// exits is what errors the process — i.e. exhausted on the Nth
+    /// unstable exit where N = `max_restarts` (N-1 restarts performed).
     pub fn exhausted(&self, max_restarts: u32) -> bool {
-        self.unstable_count > max_restarts
+        self.unstable_count >= max_restarts
     }
 
     /// Reset the unstable counter (e.g., after a reload)
@@ -121,11 +125,13 @@ mod tests {
         let mut budget = RestartBudget::default();
         let max = 5;
 
-        for _ in 0..max {
+        // max-1 unstable exits: not yet exhausted.
+        for _ in 0..max - 1 {
             budget.note_exit(Duration::from_millis(100), Duration::from_secs(10));
         }
         assert!(!budget.exhausted(max));
 
+        // The max-th unstable exit reaches the budget: exhausted.
         budget.note_exit(Duration::from_millis(100), Duration::from_secs(10));
         assert!(budget.exhausted(max));
     }
