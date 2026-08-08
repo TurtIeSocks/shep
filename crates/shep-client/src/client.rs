@@ -132,7 +132,11 @@ impl Client {
     ) -> Result<Self, ConnectError> {
         let connection = Connection::open(socket, timeout).await?;
         let (frames, ack) = connection.into_parts();
-        let commands = actor::spawn(frames);
+        // The event `broadcast::Sender` `spawn` also returns has no
+        // subscriber yet — nothing in this crate consumes `BusEvent`s
+        // before the event-stream task lands, so it's dropped here rather
+        // than stored on a field this struct doesn't have yet.
+        let (commands, _events) = actor::spawn(frames);
         Ok(Self {
             commands,
             ack,
@@ -240,7 +244,8 @@ mod tests {
     use crate::testing::{
         fake_client_capturing_envelopes, fake_client_event_then_reply, fake_client_on,
         fake_client_out_of_order, fake_client_replying_err,
-        fake_client_that_closes_after_handshake, fake_client_that_never_replies,
+        fake_client_that_closes_after_handshake, fake_client_that_dies_mid_request,
+        fake_client_that_never_replies,
     };
     use shep_core::protocol::{Response, RpcErrorCode};
 
@@ -290,6 +295,22 @@ mod tests {
         let path = dir.path().join("s.sock");
         let (client, served) = fake_client_that_closes_after_handshake(&path).await;
         served.await.unwrap();
+        assert!(matches!(
+            client.request(Request::Ping).await,
+            Err(RequestError::Closed)
+        ));
+    }
+
+    /// Unlike the test above, the request here is genuinely in the
+    /// actor's `pending` map when the connection dies — the fake daemon
+    /// reads it (proving the write already succeeded) before dropping the
+    /// connection, rather than dropping before any request is ever sent.
+    /// This is the path `actor.rs`'s drain-on-close loop exists for.
+    #[tokio::test]
+    async fn a_connection_dying_mid_request_fails_the_pending_request_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, _served) = fake_client_that_dies_mid_request(&path).await;
         assert!(matches!(
             client.request(Request::Ping).await,
             Err(RequestError::Closed)

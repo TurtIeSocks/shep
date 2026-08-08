@@ -57,17 +57,19 @@ pub(crate) enum Command {
 }
 
 /// Spawns the actor task that owns `frames`, returning the command channel
-/// a [`Client`](crate::client::Client) sends [`Command`]s through.
+/// a [`Client`](crate::client::Client) sends [`Command`]s through, together
+/// with the [`broadcast::Sender`] the actor publishes [`BusEvent`]s on.
 ///
-/// The actor also opens a [`broadcast`] channel for [`BusEvent`]s. Nothing
-/// subscribes to it here — every event is sent to zero receivers and
-/// dropped, silently, which is exactly what a [`broadcast::Sender::send`]
-/// with no live receivers already does.
-pub(crate) fn spawn(frames: Frames) -> mpsc::Sender<Command> {
+/// Nobody calls [`broadcast::Sender::subscribe`] on the returned sender
+/// here — this task's own caller doesn't consume events yet, it just needs
+/// a stable handle to hand off. Until something does subscribe, every
+/// event is sent to zero receivers and dropped, silently, which is exactly
+/// what [`broadcast::Sender::send`] with no live receivers already does.
+pub(crate) fn spawn(frames: Frames) -> (mpsc::Sender<Command>, broadcast::Sender<BusEvent>) {
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (events_tx, _events_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-    tokio::spawn(run(frames, commands_rx, events_tx));
-    commands_tx
+    tokio::spawn(run(frames, commands_rx, events_tx.clone()));
+    (commands_tx, events_tx)
 }
 
 /// The actor's own loop: `select!` between new commands and incoming
@@ -88,6 +90,12 @@ async fn run(
                 match command {
                     Some(Command::Request { body, deadline_ms, reply_to }) => {
                         let alive = send_request(&mut frames, &mut next_id, &mut pending, body, deadline_ms, reply_to).await;
+                        // A request whose caller already stopped waiting (timed
+                        // out, or dropped the future) leaves a closed
+                        // `oneshot::Sender` behind; swept here so an abandoned
+                        // request doesn't linger in `pending` until the whole
+                        // connection closes.
+                        pending.retain(|_, tx| !tx.is_closed());
                         if !alive {
                             break; // the write failed; the connection is dead
                         }

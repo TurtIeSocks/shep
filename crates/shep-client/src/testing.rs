@@ -15,8 +15,8 @@
 //! for testing the connection actor's request/reply routing and beyond.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::UnixListener;
@@ -120,12 +120,64 @@ async fn write_reply(frames: &mut Frames, id: u64, response: Response) {
     frames.send(encode_frame(&reply).unwrap()).await.unwrap();
 }
 
+/// Encodes and sends one error [`Reply`] for `id`. Panics on failure —
+/// test scaffolding, see [`fake_daemon`]'s own doc.
+async fn write_err(frames: &mut Frames, id: u64, code: RpcErrorCode, message: String) {
+    let reply = Reply {
+        id,
+        result: Err(RpcError { code, message }),
+    };
+    frames.send(encode_frame(&reply).unwrap()).await.unwrap();
+}
+
+/// Sends a `BusEvent::Process` built from [`sample_info`] — the daemon's
+/// own documented ordering (`shep-daemon/tests/daemon_e2e.rs:161-174`): a
+/// sheep's bus event can legitimately arrive ahead of the reply for the
+/// request that caused it. Panics on failure — test scaffolding, see
+/// [`fake_daemon`]'s own doc.
+async fn send_sample_event(frames: &mut Frames) {
+    let event = BusEvent::Process {
+        event: ProcessEventKind::Online,
+        info: sample_info(),
+        manually: false,
+        at_ms: 0,
+    };
+    frames.send(encode_frame(&event).unwrap()).await.unwrap();
+}
+
 /// One scripted step sent to a [`FakeDaemon`]'s background task.
+///
+/// [`FakeDaemon::reply_to_list`] does NOT go through this channel — it is
+/// synchronous (a `Mutex`-backed flag), because every plan call site
+/// invokes it without `.await`. This enum carries the remaining scripted
+/// behaviors, each armed at most once, by the `fake_client_*` constructor
+/// that needs it.
 enum ScriptCommand {
-    /// Arms the answer to the next `Request::ListFlock`.
-    ReplyToList(Vec<ProcessInfo>),
+    /// Arms the next request (of any kind) to receive
+    /// `RpcError { code, message }` instead of a normal response.
+    ReplyErr(RpcErrorCode, String),
+    /// Arms the next request to receive a [`sample_info`]-based
+    /// `BusEvent::Process` BEFORE its `Pong` reply.
+    EventThenReply,
+    /// Buffers the next two requests, then answers the `ListFlock` one
+    /// first (`Response::Flock(vec![])`) and the other second
+    /// (`Response::Pong`) — regardless of which one arrived first, proof
+    /// that a `Client` routes replies by id rather than by send order.
+    ArmOutOfOrder,
     /// Ends the script: stop serving and let the task return.
     Close,
+}
+
+/// [`ScriptCommand::ArmOutOfOrder`]'s progress: idle, armed (waiting for
+/// the first of the two requests), or holding the first request while it
+/// waits for the second.
+enum OutOfOrder {
+    /// Not armed; requests are answered by the normal script.
+    Idle,
+    /// Armed; the next request received is buffered rather than answered.
+    Armed,
+    /// The first of the two requests, buffered until the second arrives.
+    Buffered(Envelope),
 }
 
 /// A scripted daemon over one accepted connection.
@@ -137,9 +189,17 @@ enum ScriptCommand {
 /// Every other request this fake receives is answered with
 /// `Response::Pong` — good enough for a test that only cares about
 /// `ListFlock` behavior, or about a request getting *some* prompt reply.
+///
+/// A handful of `fake_client_*` constructors below
+/// ([`fake_client_replying_err`], [`fake_client_out_of_order`],
+/// [`fake_client_event_then_reply`]) also arm a one-shot error reply, an
+/// out-of-order two-request response, or an event-before-reply, via a
+/// private `ScriptCommand` — internal to this module, since nothing
+/// outside it needs to arm those behaviors directly.
 #[derive(Debug)]
 pub struct FakeDaemon {
     script: mpsc::Sender<ScriptCommand>,
+    armed_list: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
     list_flock_count: Arc<AtomicU64>,
     task: JoinHandle<()>,
 }
@@ -148,13 +208,13 @@ impl FakeDaemon {
     /// Arms the answer to the next `Request::ListFlock` this connection
     /// receives.
     ///
-    /// Panics if the background task is gone — test scaffolding, see
-    /// [`fake_daemon`]'s own doc.
-    pub async fn reply_to_list(&self, flock: Vec<ProcessInfo>) {
-        self.script
-            .send(ScriptCommand::ReplyToList(flock))
-            .await
-            .unwrap();
+    /// Synchronous, not `async`: every plan call site invokes this without
+    /// `.await` (`docs/writing-plans/plans/2026-08-08-shep-phase3-cli.md`,
+    /// e.g. lines 2425, 2452, 2475), which would trip `unused_must_use`
+    /// under `-D warnings` against an `async fn`. A `Mutex`-backed flag
+    /// lets this stay a plain fn instead.
+    pub fn reply_to_list(&self, flock: Vec<ProcessInfo>) {
+        *self.armed_list.lock().unwrap() = Some(flock);
     }
 
     /// How many `Request::ListFlock` envelopes this connection has
@@ -176,38 +236,75 @@ impl FakeDaemon {
 }
 
 /// The [`FakeDaemon`] background task: accepts one connection, handshakes
-/// with `ack`, then answers requests (`ListFlock` per the armed script,
-/// everything else with `Response::Pong`) until [`ScriptCommand::Close`]
-/// arrives or the connection ends.
+/// with `ack`, then answers requests until [`ScriptCommand::Close`] arrives
+/// or the connection ends.
+///
+/// Per request, in priority order: a request buffered by
+/// [`OutOfOrder::Buffered`] is answered together with the one that just
+/// arrived; else an armed [`ScriptCommand::ReplyErr`] or
+/// [`ScriptCommand::EventThenReply`] is consumed and answers this one
+/// request; else `ListFlock` is answered per [`FakeDaemon::reply_to_list`]
+/// (or `Flock(vec![])` if nothing is armed); else `Response::Pong`.
 async fn serve_scripted(
     listener: UnixListener,
     ack: HelloAck,
     mut script: mpsc::Receiver<ScriptCommand>,
+    armed_list: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
     list_flock_count: Arc<AtomicU64>,
 ) {
     let (stream, _) = listener.accept().await.unwrap();
     let mut frames = Framed::new(stream, codec());
     handshake(&mut frames, ack).await;
 
-    let mut armed_list: Option<Vec<ProcessInfo>> = None;
+    let mut armed_err: Option<(RpcErrorCode, String)> = None;
+    let mut armed_event_then_reply = false;
+    let mut out_of_order = OutOfOrder::Idle;
+
     loop {
         tokio::select! {
             command = script.recv() => {
                 match command {
-                    Some(ScriptCommand::ReplyToList(flock)) => armed_list = Some(flock),
+                    Some(ScriptCommand::ReplyErr(code, message)) => armed_err = Some((code, message)),
+                    Some(ScriptCommand::EventThenReply) => armed_event_then_reply = true,
+                    Some(ScriptCommand::ArmOutOfOrder) => out_of_order = OutOfOrder::Armed,
                     Some(ScriptCommand::Close) | None => break,
                 }
             }
             frame = frames.next() => {
                 let Some(Ok(frame)) = frame else { break };
                 let envelope: Envelope = decode_frame(&frame).unwrap();
-                let response = if matches!(envelope.body, Request::ListFlock) {
-                    list_flock_count.fetch_add(1, Ordering::SeqCst);
-                    Response::Flock(armed_list.take().unwrap_or_default())
-                } else {
-                    Response::Pong
-                };
-                write_reply(&mut frames, envelope.id, response).await;
+
+                match std::mem::replace(&mut out_of_order, OutOfOrder::Idle) {
+                    OutOfOrder::Armed => {
+                        out_of_order = OutOfOrder::Buffered(envelope);
+                    }
+                    OutOfOrder::Buffered(first) => {
+                        let (list_env, other_env) = if matches!(first.body, Request::ListFlock) {
+                            (first, envelope)
+                        } else {
+                            (envelope, first)
+                        };
+                        write_reply(&mut frames, list_env.id, Response::Flock(Vec::new())).await;
+                        write_reply(&mut frames, other_env.id, Response::Pong).await;
+                    }
+                    OutOfOrder::Idle => {
+                        if let Some((code, message)) = armed_err.take() {
+                            write_err(&mut frames, envelope.id, code, message).await;
+                        } else if armed_event_then_reply {
+                            armed_event_then_reply = false;
+                            send_sample_event(&mut frames).await;
+                            write_reply(&mut frames, envelope.id, Response::Pong).await;
+                        } else {
+                            let response = if matches!(envelope.body, Request::ListFlock) {
+                                list_flock_count.fetch_add(1, Ordering::SeqCst);
+                                Response::Flock(armed_list.lock().unwrap().take().unwrap_or_default())
+                            } else {
+                                Response::Pong
+                            };
+                            write_reply(&mut frames, envelope.id, response).await;
+                        }
+                    }
+                }
             }
         }
     }
@@ -225,11 +322,13 @@ pub async fn fake_client_on(path: &Path) -> (Client, FakeDaemon) {
 pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDaemon) {
     let listener = UnixListener::bind(path).unwrap();
     let (script_tx, script_rx) = mpsc::channel(SCRIPT_CHANNEL_CAPACITY);
+    let armed_list = Arc::new(Mutex::new(None));
     let list_flock_count = Arc::new(AtomicU64::new(0));
     let task = tokio::spawn(serve_scripted(
         listener,
         ack,
         script_rx,
+        Arc::clone(&armed_list),
         Arc::clone(&list_flock_count),
     ));
     let client = Client::connect(path).await.unwrap();
@@ -237,6 +336,7 @@ pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDa
         client,
         FakeDaemon {
             script: script_tx,
+            armed_list,
             list_flock_count,
             task,
         },
@@ -275,26 +375,24 @@ pub async fn fake_client_capturing_envelopes(path: &Path) -> (Client, mpsc::Rece
 /// request that arrives with `RpcError { code, message }` instead of a
 /// normal response — for testing that a daemon-side error reply surfaces
 /// through `Client::request` as `RequestError::Rpc`.
+///
+/// Backed by a [`FakeDaemon`] (armed with a private `ScriptCommand::ReplyErr`)
+/// so the connection keeps serving afterward, like any other `fake_client_*`
+/// helper that hands one back — a bespoke one-shot task here would die
+/// after the one scripted reply, which is wrong for a later test that
+/// issues a second request against the same connection.
 pub async fn fake_client_replying_err(
     path: &Path,
     code: RpcErrorCode,
     message: &str,
-) -> (Client, JoinHandle<()>) {
-    let listener = UnixListener::bind(path).unwrap();
-    let message = message.to_string();
-    let task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
-        let envelope = read_envelope(&mut frames).await;
-        let reply = Reply {
-            id: envelope.id,
-            result: Err(RpcError { code, message }),
-        };
-        frames.send(encode_frame(&reply).unwrap()).await.unwrap();
-    });
-    let client = Client::connect(path).await.unwrap();
-    (client, task)
+) -> (Client, FakeDaemon) {
+    let (client, daemon) = fake_client_on(path).await;
+    daemon
+        .script
+        .send(ScriptCommand::ReplyErr(code, message.to_string()))
+        .await
+        .unwrap();
+    (client, daemon)
 }
 
 /// Binds `path`, handshakes with [`sample_ack`], reads exactly two
@@ -302,24 +400,17 @@ pub async fn fake_client_replying_err(
 /// one first, with `Response::Flock(vec![])`, then the `Ping` one, with
 /// `Response::Pong` — proof that a `Client` routes replies by id rather
 /// than by the order it sent the requests in.
-pub async fn fake_client_out_of_order(path: &Path) -> (Client, JoinHandle<()>) {
-    let listener = UnixListener::bind(path).unwrap();
-    let task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
-        let first = read_envelope(&mut frames).await;
-        let second = read_envelope(&mut frames).await;
-        let (list_env, ping_env) = if matches!(first.body, Request::ListFlock) {
-            (first, second)
-        } else {
-            (second, first)
-        };
-        write_reply(&mut frames, list_env.id, Response::Flock(Vec::new())).await;
-        write_reply(&mut frames, ping_env.id, Response::Pong).await;
-    });
-    let client = Client::connect(path).await.unwrap();
-    (client, task)
+///
+/// Backed by a [`FakeDaemon`] (armed with a private `ScriptCommand::ArmOutOfOrder`);
+/// see [`fake_client_replying_err`]'s own doc for why that matters.
+pub async fn fake_client_out_of_order(path: &Path) -> (Client, FakeDaemon) {
+    let (client, daemon) = fake_client_on(path).await;
+    daemon
+        .script
+        .send(ScriptCommand::ArmOutOfOrder)
+        .await
+        .unwrap();
+    (client, daemon)
 }
 
 /// Binds `path`, handshakes with [`sample_ack`], reads one envelope, and
@@ -327,24 +418,17 @@ pub async fn fake_client_out_of_order(path: &Path) -> (Client, JoinHandle<()>) {
 /// documented ordering (`shep-daemon/tests/daemon_e2e.rs:161-174`): a
 /// sheep's bus event can legitimately arrive ahead of the reply for the
 /// very request that caused it.
-pub async fn fake_client_event_then_reply(path: &Path) -> (Client, JoinHandle<()>) {
-    let listener = UnixListener::bind(path).unwrap();
-    let task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
-        let envelope = read_envelope(&mut frames).await;
-        let event = BusEvent::Process {
-            event: ProcessEventKind::Online,
-            info: sample_info(),
-            manually: false,
-            at_ms: 0,
-        };
-        frames.send(encode_frame(&event).unwrap()).await.unwrap();
-        write_reply(&mut frames, envelope.id, Response::Pong).await;
-    });
-    let client = Client::connect(path).await.unwrap();
-    (client, task)
+///
+/// Backed by a [`FakeDaemon`] (armed with a private `ScriptCommand::EventThenReply`);
+/// see [`fake_client_replying_err`]'s own doc for why that matters.
+pub async fn fake_client_event_then_reply(path: &Path) -> (Client, FakeDaemon) {
+    let (client, daemon) = fake_client_on(path).await;
+    daemon
+        .script
+        .send(ScriptCommand::EventThenReply)
+        .await
+        .unwrap();
+    (client, daemon)
 }
 
 /// Binds `path`, handshakes with [`sample_ack`], then immediately drops the
@@ -363,10 +447,41 @@ pub async fn fake_client_that_closes_after_handshake(path: &Path) -> (Client, Jo
     (client, task)
 }
 
+/// Binds `path`, handshakes with [`sample_ack`], reads exactly one
+/// envelope, then drops the connection WITHOUT replying — for testing that
+/// a request already accepted by the connection actor (and thus already
+/// sitting in its `pending` map) fails with `RequestError::Closed` when the
+/// connection dies mid-flight, rather than only covering the case where the
+/// connection was already gone before the request was ever sent (that's
+/// [`fake_client_that_closes_after_handshake`]).
+pub async fn fake_client_that_dies_mid_request(path: &Path) -> (Client, JoinHandle<()>) {
+    let listener = UnixListener::bind(path).unwrap();
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut frames = Framed::new(stream, codec());
+        handshake(&mut frames, sample_ack()).await;
+        let _envelope = read_envelope(&mut frames).await;
+        // Dropping `frames` here — after reading, not before — closes the
+        // connection only once the actor has already written the request
+        // and recorded it as pending.
+    });
+    let client = Client::connect(path).await.unwrap();
+    (client, task)
+}
+
 /// Binds `path`, handshakes with [`sample_ack`], then reads nothing and
 /// replies to nothing, ever — for testing a `Client`'s own client-side
 /// deadline against a daemon that accepted the connection but stopped
 /// answering.
+///
+/// Returns `(Client, JoinHandle<()>)`, not `(Client, FakeDaemon)`, even
+/// though the phase 3 roster pins the latter
+/// (`docs/writing-plans/plans/2026-08-08-shep-phase3-cli.md:291`).
+/// `FakeDaemon`'s `serve_scripted` loop always answers SOME request
+/// promptly (`ListFlock` per the armed script, everything else with
+/// `Pong`) — there is no script command that means "never answer," so a
+/// `FakeDaemon`-backed version of this helper could not do what its name
+/// promises. Deliberate divergence from the roster, not an oversight.
 pub async fn fake_client_that_never_replies(path: &Path) -> (Client, JoinHandle<()>) {
     let listener = UnixListener::bind(path).unwrap();
     let task = tokio::spawn(async move {
