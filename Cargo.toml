@@ -105,6 +105,17 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 # defined at tokio-stream-0.1.3/src/wrappers/broadcast.rs:22, so 0.1.3 is
 # the correct floor.
 tokio-stream = { version = "0.1.3", default-features = false, features = ["sync"] }
+# `shep-cli`'s dev-dependencies, for Task 12's real-binary e2e tier
+# (`crates/shep-cli/tests/cli_e2e.rs`). Neither crate has any call site yet —
+# this phase's other tasks land the assertions that actually exercise them —
+# so no feature beyond the bare crate is named; the task that writes the
+# first assertion adds whatever feature it needs (`regex`, `diff`, ...) with
+# its own comment. `default-features = false` already matches assert_cmd's
+# real default (neither of its two features, `color`/`color-auto`, is on by
+# default); for predicates it drops the upstream default set (`color`,
+# `diff`, `float-cmp`, `normalize-line-endings`, `regex`) down to nothing.
+assert_cmd = { version = "2", default-features = false }
+predicates = { version = "3", default-features = false }
 
 # Most debuginfo in `target/` is not ours: the default `debug = true` emits
 # full DWARF for every dependency and links a copy into each of the

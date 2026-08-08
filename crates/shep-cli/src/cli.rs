@@ -1,0 +1,183 @@
+//! The clap command tree: [`Cli`], [`Commands`], and every argument struct.
+//!
+//! This is the whole parse surface of the `shep` binary in one place, pure
+//! tier (spec §11): it compiles and its tests run on every target, Windows
+//! included, so `Cli::command().debug_assert()` and the alias tests below
+//! cover a platform that cannot build the rest of this crate.
+//!
+//! This module owns every argument struct in the tree, even the ones whose
+//! command is not wired up yet — the whole parse surface lives in one
+//! portable file rather than accreting piecemeal as each verb lands.
+
+use std::path::PathBuf;
+
+/// The `shep` command line.
+#[derive(Debug, clap::Parser)]
+#[command(name = "shep", version, about = "A process manager for your flock")]
+pub struct Cli {
+    /// Flags valid on every subcommand.
+    #[command(flatten)]
+    pub global: GlobalArgs,
+    /// The verb being invoked.
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+/// Flags valid on every subcommand, folded into [`Cli`] via `#[command(flatten)]`.
+#[derive(Debug, clap::Args)]
+pub struct GlobalArgs {
+    /// Override $SHEP_HOME for this invocation
+    #[arg(long, global = true, env = "SHEP_HOME")]
+    pub home: Option<PathBuf>,
+    /// Output format
+    #[arg(long, global = true, value_enum, default_value_t = Format::Table)]
+    pub format: Format,
+    /// Suppress non-essential output
+    #[arg(short, long, global = true)]
+    pub quiet: bool,
+}
+
+/// `--format`'s two shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Format {
+    /// Human-readable columns (the default).
+    Table,
+    /// A versioned JSON envelope, one object per invocation.
+    Json,
+}
+
+/// Every verb the binary understands.
+#[derive(Debug, clap::Subcommand)]
+pub enum Commands {
+    /// Start a sheep from a script, a Flockfile, or stdin.
+    Start(StartArgs),
+    /// Stop one or more sheep.
+    Stop(SelectorArgs),
+    /// Restart one or more sheep.
+    Restart(SelectorArgs),
+    /// Delete one or more sheep from the flock.
+    Delete(SelectorArgs),
+    /// List the flock.
+    #[command(visible_aliases = ["list", "ls"])]
+    Flock,
+    /// Describe one sheep in detail.
+    Describe(SelectorArgs),
+    /// List one fold (spec §5 / §9)
+    Fold(FoldArgs),
+    /// Show or follow bleats (log output) for one or more sheep.
+    #[command(visible_alias = "logs")]
+    Bleats(BleatsArgs),
+    /// Check whether the shepherd answers.
+    Ping,
+    /// Shut the shepherd down.
+    Kill,
+    /// Print a shell completion script.
+    Completions(CompletionArgs),
+    /// Graceful stop. Easter-egg alias for `stop`.
+    #[command(hide = true)]
+    Thatlldo(SelectorArgs),
+    /// Run the supervisor in the foreground. Spawned by the CLI; not for direct use.
+    #[command(hide = true)]
+    Daemon(DaemonArgs),
+}
+
+/// Arguments to `shep start`.
+#[derive(Debug, clap::Args)]
+pub struct StartArgs {
+    /// A script path, a Flockfile, or `-` to read Flockfile JSON from stdin
+    pub target: String,
+    /// Name for this sheep (script form only)
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Fold to place this sheep in
+    #[arg(long)]
+    pub fold: Option<String>,
+}
+
+/// Arguments shared by every verb that targets an existing selection of the
+/// flock (`stop`, `restart`, `delete`, `describe`, `thatlldo`).
+#[derive(Debug, clap::Args)]
+pub struct SelectorArgs {
+    /// name, id, `all`, `/regex/`, or `fold:<name>`
+    pub selector: String,
+}
+
+/// Arguments to `shep fold`.
+#[derive(Debug, clap::Args)]
+pub struct FoldArgs {
+    /// The fold to list
+    pub name: String,
+}
+
+/// Arguments to `shep bleats` (alias `logs`).
+#[derive(Debug, clap::Args)]
+pub struct BleatsArgs {
+    /// Which sheep (default: all)
+    #[arg(default_value = "all")]
+    pub selector: String,
+    /// Drain what is buffered and exit instead of streaming
+    #[arg(long)]
+    pub no_follow: bool,
+    /// Only stderr
+    #[arg(long, conflicts_with = "out")]
+    pub err: bool,
+    /// Only stdout
+    #[arg(long, conflicts_with = "err")]
+    pub out: bool,
+}
+
+/// Arguments to `shep completions`.
+#[derive(Debug, clap::Args)]
+pub struct CompletionArgs {
+    /// Shell to generate a completion script for
+    #[arg(value_enum)]
+    pub shell: clap_complete::aot::Shell,
+}
+
+/// Arguments to the hidden `shep daemon` subcommand.
+#[derive(Debug, clap::Args)]
+pub struct DaemonArgs {
+    /// Boot without restoring the saved muster roll
+    #[arg(long)]
+    pub no_restore: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_command_tree_parses_and_is_internally_consistent() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert(); // clap's own structural self-check
+    }
+
+    #[test]
+    fn list_and_ls_both_reach_flock() {
+        use clap::Parser;
+        for argv in [["shep", "flock"], ["shep", "list"], ["shep", "ls"]] {
+            assert!(matches!(
+                Cli::try_parse_from(argv).unwrap().command,
+                Commands::Flock
+            ));
+        }
+    }
+
+    #[test]
+    fn logs_reaches_bleats() {
+        use clap::Parser;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "logs"]).unwrap().command,
+            Commands::Bleats(_)
+        ));
+    }
+
+    #[test]
+    fn format_defaults_to_table_and_accepts_json() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["shep", "flock"]).unwrap();
+        assert_eq!(cli.global.format, Format::Table);
+        let cli = Cli::try_parse_from(["shep", "--format", "json", "flock"]).unwrap();
+        assert_eq!(cli.global.format, Format::Json);
+    }
+}
