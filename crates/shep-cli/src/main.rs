@@ -25,6 +25,8 @@ use cli::{Commands, DaemonArgs, Format};
 use commands::daemon::{daemon_exit_code, run_daemon};
 #[cfg(unix)]
 use commands::lifecycle;
+#[cfg(unix)]
+use commands::query;
 use exit::ExitCode;
 #[cfg(unix)]
 use launch::launch_daemon;
@@ -179,11 +181,23 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => lifecycle::delete(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
-        Commands::Flock => not_wired(&mut streams, fmt, "flock"),
-        Commands::Describe(_) => not_wired(&mut streams, fmt, "describe"),
-        Commands::Fold(_) => not_wired(&mut streams, fmt, "fold"),
+        Commands::Flock => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => query::flock(&client, &mut streams, fmt).await,
+            Err(code) => code,
+        },
+        Commands::Describe(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => query::describe(&client, &mut streams, fmt, args).await,
+            Err(code) => code,
+        },
+        Commands::Fold(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => query::fold(&client, &mut streams, fmt, args).await,
+            Err(code) => code,
+        },
         Commands::Bleats(_) => not_wired(&mut streams, fmt, "bleats"),
-        Commands::Ping => not_wired(&mut streams, fmt, "ping"),
+        Commands::Ping => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => query::ping(&client, &mut streams, fmt).await,
+            Err(code) => code,
+        },
         Commands::Kill => not_wired(&mut streams, fmt, "kill"),
         Commands::Completions(_) | Commands::Daemon(_) => {
             unreachable!("handled above, before resolve_paths runs")
