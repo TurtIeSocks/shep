@@ -1255,7 +1255,7 @@ pub struct BleatsArgs {
     /// Which sheep (default: all)
     #[arg(default_value = "all")]
     pub selector: String,
-    /// Drain what is buffered and exit instead of streaming
+    /// Print the tail of each sheep's log file and exit, instead of following
     #[arg(long)]
     pub no_follow: bool,
     /// Only stderr
@@ -1284,6 +1284,8 @@ pub struct DaemonArgs {
 **`--no-restore`, not `--restore`, and for the same reason as `--no-follow`.** The tempting `#[arg(long, default_value_t = true)] pub restore: bool` is unfalsifiable: a bare `bool` field infers `ArgAction::SetTrue`, so `--restore` sets `true` and *absence* now also defaults to `true`. There is no argv that produces `false`, which means there is no way to boot without restore and Task 7's `assert!(opts.restore)` can never see the other value. Declare the negative flag and compute `let restore = !args.no_restore;` at the call site, exactly as `bleats` does with `follow`.
 
 **On `no_follow`, and why the obvious spelling is wrong.** The tempting declaration is a `follow: bool` field with `#[arg(long, default_value_t = true, action = clap::ArgAction::Set)]`. That does **not** produce `--no-follow`. `ArgAction::Set` stores a *value*, so it yields a flag that requires one — `--follow true` — and clap offers no derive attribute that synthesises a negated long from a positive one. Verified against clap 4.6.6's own `ArgAction::Set` doctest, which parses `["mycmd", "--flag", "value"]`. Declare the negative flag directly, as above (a bare `bool` field infers `ArgAction::SetTrue`), and compute `let follow = !args.no_follow;` at the call site.
+
+The help text above is Task 10a's wording, not Task 10's: `--no-follow` prints the tail of each sheep's log file rather than draining a bus buffer that does not exist. Task 5 shipped the earlier string; Task 10a replaces it in the same edit that changes the behaviour, so the two never disagree in a released `--help`.
 
 `clap_complete::aot::Shell` already implements `clap::ValueEnum`, so `#[arg(value_enum)]` is all the derive needs. It is `#[non_exhaustive]` upstream; do not match on it exhaustively anywhere.
 
@@ -2379,6 +2381,8 @@ Each verb is one request, one `emit`, one error mapping. `flock` sends `Request:
 
 ### Task 10: bleats — following the log stream
 
+> **Shipped as written (`988aacb`), then amended by Task 10a.** `--no-follow` reads the log files rather than draining the bus. What changed: the two paragraphs marked *superseded* below, and the `drain_args` tests in Step 1, which Task 10a converts to follow mode because drain mode stops being a way to end a bus test. Everything else here is what the code does today, and Task 10a assumes it.
+
 **Files:**
 - Create: `crates/shep-cli/src/commands/bleats.rs`
 - Modify: `crates/shep-cli/src/main.rs` — replace the `not_wired` arm for `Bleats`
@@ -2405,7 +2409,7 @@ pub async fn bleats_with_signal(
 ) -> ExitCode;
 ```
 
-`args.no_follow` is the declared flag; the code computes `let follow = !args.no_follow;` once, at the top, and reads `follow` from there. See Task 5 for why the flag is spelled negatively.
+`args.no_follow` is the declared flag; the code computes `let follow = !args.no_follow;` once, at the top, and reads `follow` from there. See Task 5 for why the flag is spelled negatively. **Superseded in part by Task 10a:** the flag no longer selects a mode of the same loop, it selects a different path that never subscribes. The negative spelling and the computation stand.
 
 **`BusEvent::LogOut`/`LogErr` carry only `{ id, line }` — no name.** Resolve ids to names with one `ListFlock` before subscribing, and cache it. An id that appears later and is not in the cache renders as the bare id rather than blocking on a refresh; do not issue a `ListFlock` per unknown line.
 
@@ -2639,6 +2643,8 @@ Order matters: `ListFlock` for the id→name cache **first**, then `subscribe`. 
 
 The main loop is one `tokio::select!` over three arms — the event stream, the `interrupt` future, and (under `--no-follow`) an immediate break once the buffered drain is exhausted. Each arm returns a distinct `ExitCode`, so the exit code *is* the record of how the follow ended. `bleats` is `bleats_with_signal(.., tokio::signal::ctrl_c().map(|_| ()))`; nothing else differs between the two.
 
+**Superseded in part by Task 10a: the third arm is deleted.** There is nothing buffered for it to drain — the bus is live-only fan-out — so `--no-follow` takes a separate path that reads the log files instead. The other two arms, and everything else in this step, are unchanged.
+
 `BusEvent` is `#[non_exhaustive]`: the match carries a `_` arm that ignores the event silently, per Global Constraints. A follow must not die on a bus event a newer daemon added.
 
 Flush `streams.out` on every exit path. A follow that ends with lines still buffered loses them, and the user has no way to know.
@@ -2646,6 +2652,107 @@ Flush `streams.out` on every exit path. A follow that ends with lines still buff
 - [ ] **Step 4: Run tests, confirm pass**
 
 - [ ] **Step 5: Commit** — `feat(cli): bleats log following with client-side identity resolution`
+
+---
+
+### Task 10a: `bleats --no-follow` reads the log files — an amendment to Task 10
+
+**This is a follow-up amendment, not a new verb, and Task 10 is already shipped and merged (`988aacb`).** `bleats` exists, follows, resolves ids client-side, and renders both formats. What does not work is the one thing `--no-follow` was specified to do: the drain arm Task 10 built breaks out of the `select!` once the bus has nothing ready *right now*, and the bus never has anything ready, because it is live-only fan-out — `Request` carries no log-history variant (`crates/shep-core/src/protocol/request.rs` — nine variants, none of them a history ask) and a fresh `Subscribe` carries no backlog. So the arm resolves immediately and prints nothing, reliably.
+
+**Rin's ruling (2026-08-08): `--no-follow` reads the log files the daemon already writes; `--follow` keeps subscribing to the bus.** `tail` against `tail -f` — the split every user of a log already has in their hands. It is also strictly more than a replay buffer would have given, because a log file holds what the sheep wrote *before* this CLI ever connected.
+
+**The wire change it rests on has already landed (`f62e504`).** `shep_core::protocol::ProcessInfo` carries `out_file: Option<String>` and `err_file: Option<String>` — the daemon's *resolved* paths, populated in `supervisor.rs`'s `to_info` from the assembled spec, which means the app's explicit `out_file` when it configured one and the derived default otherwise. The CLI cannot work these out for itself: an explicit `out_file` may point anywhere on the filesystem, so a convention-based guess shows nothing for exactly the sheep whose owner cared enough to configure a path. `PROTOCOL_VERSION` deliberately did **not** bump, since the fields are additive — so **`None` means "this peer predates the field", never "this sheep has no log file"**, and this task's rendering of `None` has to say that and nothing stronger.
+
+**Files:**
+- Modify: `crates/shep-cli/src/commands/bleats.rs` — the `--no-follow` path, its own tests, and the seven follow-path tests that today reach for `--no-follow` only as a way to terminate
+- Modify: `crates/shep-cli/src/cli.rs` — one help string
+
+OS tier already; nothing here moves the platform split. No CHANGELOG entry of its own — Task 12 Step 4 still writes shep-cli's first, and it should describe the shipped behaviour rather than the intermediate one.
+
+**Interfaces:** `bleats` and `bleats_with_signal` keep the signatures Task 10 published, including the injected `interrupt`. The follow path — `parse_selector`, `resolve_names`, `subscribe`, `handle_event`, the two-arm `select!` — is untouched. New, all private to the module:
+
+```rust
+/// How many lines of each log file `--no-follow` prints.
+const TAIL_LINES: usize = 50;
+
+/// The most of one log file `--no-follow` will read to find those lines.
+const TAIL_WINDOW_BYTES: u64 = 256 * 1024;
+
+/// The last [`TAIL_LINES`] lines of one log file, bounded twice over.
+fn read_tail(path: &Path) -> io::Result<Vec<String>>;
+
+/// Renders the selected files of every sheep the selector admits, in id
+/// order, and returns the exit code that reports how that went.
+fn tail_log_files(
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    cache: &HashMap<u32, ProcessInfo>,
+    selector: &ProcessSelector,
+    args: &BleatsArgs,
+) -> ExitCode;
+```
+
+**The `--no-follow` path never subscribes.** One `Request::ListFlock` — the one `resolve_names` already sends, which is also where the paths come from, so there is **no extra round trip** — then the files, then exit. Delete the third `select!` arm rather than teaching it to read files: with no subscription there is no stream, no `Lagged`, no `DaemonShutdown`, and nothing for `interrupt` to race, since a bounded file read terminates on its own. `resolve_names` returns `HashMap<u32, ProcessInfo>` and already carries the paths; it needs no change at all.
+
+**The tail is bounded twice, and both bounds are load-bearing.** A log file is arbitrarily large and a line count alone does not bound memory — one 4 GiB line without a newline defeats it. So: seek to `len.saturating_sub(TAIL_WINDOW_BYTES)`, read to end, and if that seek landed anywhere but zero, discard everything up to and including the first `\n` — a window boundary lands mid-line, and half a line rendered as a whole one is a lie. Decode the window with `String::from_utf8_lossy`: a log file is whatever the child wrote and is under no obligation to be UTF-8, and refusing to show a log over one bad byte is the wrong failure — the same trade the wire already makes for these paths. Split on `\n`, drop the trailing empty piece a file ending in a newline produces, take the last `TAIL_LINES`. Read one file at a time, so peak memory is one window whatever the flock size.
+
+`TAIL_LINES = 50` is a default, not a limit the user can lift — `--lines` is not in this phase's CLI surface (Global Constraints' out-of-scope list). Fifty keeps `shep bleats --no-follow` against a whole flock readable at a terminal while still carrying the tail of a crash, which is what people run this for. `TAIL_WINDOW_BYTES = 256 * 1024` binds only when lines average over 5 KiB, so in ordinary use the line bound is the one that decides. A future `--lines` flag replaces the first constant; it does not change the mechanism.
+
+Use `std::fs`, not `tokio::fs`: shep-cli's tokio does not carry the `fs` feature (`crates/shep-cli/Cargo.toml`), adding one for this would owe Global Constraints a minimal-versions rehearsal, and the read is a bounded 256 KiB on a one-shot command with nothing else on the runtime.
+
+**`--out` / `--err` select which file is read.** Their meaning does not change, only what they act on: `--out` reads `out_file` alone, `--err` reads `err_file` alone, neither reads both. They still do not choose a *destination* — every line either flag admits lands on `streams.out`, exactly as in follow mode, and `streams.err` still carries only shep's own diagnostics. The `stream` field of a JSON line is `"out"` for a line from `out_file` and `"err"` for one from `err_file`.
+
+**Ordering, and the limitation it admits rather than hides.** Within a file, lines come out in file order, which is append order, which is chronological. Beyond that there is no merge: a sheep's `out_file` is printed in full, then its `err_file`, and sheep are printed in ascending id order. Nothing in a log file carries a timestamp — the daemon's pump appends the child's line and a newline, nothing else — so there is no key to interleave two files on, and inventing one from arrival guesswork would produce a plausible order that is wrong precisely when a sheep writes to both streams at once. Say so in the module docs: a reader seeing all of `out` before any of `err` must not read that as "everything on stdout happened first". `--out`/`--err` reduce each sheep to one file, which is the only way to get output from this path with no seam in it. The follow path is unaffected — the bus delivers in arrival order, and that *is* chronological across both streams.
+
+Ascending id is also mechanical, not cosmetic: the cache is a `HashMap`, whose iteration order varies run to run, and Task 12 case 4 compares this command's stdout byte-for-byte against a committed fixture. Sort the matched ids before reading anything.
+
+**Three ways a file yields no lines. None of them abandons the command.**
+
+- **`None` — the daemon predates the field.** One notice per sheep to `streams.err` through the existing `write_notice`, code `"log_path_unknown"`, naming the sheep and saying the shepherd did not report a log path. The exit code is unaffected: this is version skew, not a fault in this run, and rendering it as a failure would make an ordinary old-daemon case read as broken. Warn only about a path the flags actually asked for — under `--out`, a daemon that reported neither path draws one notice, not two.
+- **The file is not there (`ErrorKind::NotFound`) — silent.** The daemon creates both files when it spawns the child (`crates/shep-daemon/src/tokio_runner.rs`'s `open_append`, called before the pump reads a first line), so a missing file means this sheep has not run in this `$SHEP_HOME` at all: registered but never started, or a log deleted underneath. A notice for each such sheep would put a line of shep's own text on stderr for every quiet sheep in a fresh flock. The user sees nothing for that sheep, which is exactly true. The flip side is worth stating in the module docs, because it is the capability follow mode does not have: a **stopped** sheep still has its file, so `--no-follow` shows what it said before it stopped.
+- **The file is there and will not read — one notice, and a non-zero exit at the end.** Code `"log_unreadable"`, naming the path and the OS error, then on to the next file. The command still prints everything it could, and *then* returns `ExitCode::Failure`. Spec §9's rule is that no error exits 0, and `tail`'s own convention is exactly this shape: print what is readable, warn per file, exit non-zero. What must not happen is bailing out mid-flock — one sheep's permission problem hiding every other sheep's lines is the opposite of what was asked for. `None` and `NotFound` do not set this code; only a read that failed for a reason the user can act on.
+
+Both notices go through `write_notice`, so stderr keeps the single grammar Task 10's fix round established — structured under `--format json`, prose under `--format table` — rather than growing a third.
+
+**Exit codes on this path**, in the order they can occur: a malformed selector is still `Usage`, decided before any request; a failed `ListFlock` is still whatever `ExitCode::from(&RequestError)` yields; a write failure still goes through `write_outcome`, so `shep bleats --no-follow | head` still exits `Success` on `BrokenPipe`; an unreadable file is `Failure`; everything else is `Success`. `DaemonUnreachable` cannot come out of this path — there is no stream to end. **A selector matching nothing is not `NotFound` here**: follow mode never reported it either, and an amendment is not the place to open a divergence between the two modes. `NotFound` stays the lifecycle and query verbs' code.
+
+**The JSON line shape does not change, and that is the whole point.** File-sourced lines go through the same `write_line`, so they are byte-for-byte the shape Rin settled — `{"schema_version", "id", "name", "stream", "line"}`, one object per line, no envelope — and a consumer cannot tell a file-sourced line from a bus-sourced one. Under `Format::Table` it stays `name | line`. `name` comes from the same `resolved_name` against the same cache; on this path it is always resolvable, since the paths and the name came from the same listing entry.
+
+**The help string in `cli.rs` becomes**, verbatim:
+
+```rust
+    /// Print the tail of each sheep's log file and exit, instead of following
+```
+
+- [ ] **Step 1: Convert the seven tests that use `--no-follow` only to terminate**
+
+`ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare`, `err_and_out_filter_the_two_streams`, `a_selector_filters_client_side_on_the_resolved_id_set`, `a_lag_notice_reaches_stderr_and_the_follow_continues`, `a_dropped_notice_reaches_stderr_worded_for_the_daemon_side_cause`, `json_format_renders_the_pinned_five_key_line_shape` and `a_broken_pipe_while_writing_a_line_exits_success` are all tests *about the bus*, which reached for drain mode only because it was the one way to make the call return. After this task it is the one way to make sure the bus is never consulted, so every one of them moves to follow mode plus `daemon.close_after_subscribe().await`.
+
+That conversion also **retires the known limitation** documented at the top of `ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare` — that these tests are green only under the current-thread scheduler because nothing synchronizes on "the pushed events reached the client". `close_after_subscribe` flushes everything already queued *before* it ends the script, and a follow that runs to end-of-stream therefore observes all of it in order, on any scheduler. Delete that doc paragraph rather than leaving it asserting something that has stopped being true.
+
+Re-check each converted test's expected exit code rather than assuming it survives: a follow ending on end-of-stream returns `DaemonUnreachable`, while `a_broken_pipe_while_writing_a_line_exits_success` returns from the write path before the stream ends and stays `Success`. Rename the helpers with them — `drain_args`/`drain_args_err`/`drain_args_out` become `no_follow_args`/`no_follow_args_err`/`no_follow_args_out` and serve Step 2's tests, and follow mode gains `follow_args_err`/`follow_args_out`.
+
+- [ ] **Step 2: Write the failing tests for the file path**
+
+Each writes real files into its own `tempfile::tempdir()` and points a scripted `ProcessInfo`'s `out_file`/`err_file` at them. **This task needs no new fake surface** — contrast Task 11, which had to add two `FakeDaemon` methods: `reply_to_list` already carries whatever `ProcessInfo` a test builds, and `info()` is this module's own local helper. Every `bleats(...)` call stays wrapped in the module's `RUN_TIMEOUT`, per Global Constraints' bounded-receive rule: the file path terminates on its own, so a regression that goes back to subscribing would otherwise fail by hanging.
+
+1. `no_follow_reads_the_files_and_never_the_bus` — the file holds `from-the-file`; the fake is also handed `daemon.push(BusEvent::LogOut { id, line: "from-the-bus" })`. Assert stdout has the first and **not** the second. A `--no-follow` still wired to the bus fails the second assertion; one wired to neither fails the first.
+2. `the_tail_is_bounded_by_lines` — write `TAIL_LINES + 20` numbered lines; assert the last is present, the first is absent, and exactly `TAIL_LINES` lines reach stdout. A `read_to_string` implementation prints line 1 and fails.
+3. `the_tail_is_bounded_by_bytes_and_never_shows_half_a_line` — one line of `TAIL_WINDOW_BYTES + 1024` bytes, then a short final line; assert the short line is printed and no fragment of the long one is. Guards the window and the discard-the-partial-first-line rule together; an implementation that keeps the partial head emits a quarter-megabyte fragment and fails.
+4. `out_and_err_select_which_file_is_read` — three ways: `--out` (out lines only), `--err` (err lines only), neither (out lines, then err lines). The third assertion is also this module's pin on within-sheep ordering.
+5. `files_are_printed_in_ascending_id_order` — script the listing in **descending** id order, so the `HashMap`'s iteration order cannot be what makes it pass.
+6. `a_missing_file_is_silent_and_the_rest_still_print` — one sheep's path names a file that was never created, another's is real. Assert the real sheep's line, an empty stderr, and `Success`.
+7. `an_unreadable_file_is_noticed_and_exits_failure_with_the_rest_still_printed` — point `out_file` at **a directory**, not at a `chmod 000` file: opening a directory succeeds on unix and the read fails `EISDIR` deterministically, including as root, and some CI runners are root, where a `000` file is still readable. Assert the notice names the path, the other sheep's line still reached stdout, and the code is `Failure`.
+8. `a_daemon_that_reported_no_path_is_noticed_not_silently_empty` — `out_file: None`, `err_file: None`. Assert the `"log_path_unknown"` notice and `Success`. An implementation that skips a `None` in silence passes every other test here and fails this one.
+9. `a_file_sourced_json_line_is_the_same_five_key_shape_as_a_bus_sourced_one` — under `Format::Json`, parse the emitted line and assert the exact five-key set and each value. It sits beside the existing bus-path shape test, and renaming a field of `BleatLine` must now fail both.
+
+- [ ] **Step 3: Run, confirm failure.** Expected: `TAIL_LINES`, `read_tail` and `tail_log_files` do not exist, so Step 2's tests do not compile. Step 1's conversions are the opposite case — they drive the untouched follow path and must be **green before Step 2 is written at all**. A red one there is a fault in the conversion, not evidence for the amendment.
+
+- [ ] **Step 4: Implement**
+
+- [ ] **Step 5: Run tests, confirm pass**, then the full gate list from Global Constraints, each from its own exit code.
+
+- [ ] **Step 6: Commit** — `feat(cli): bleats --no-follow tails the log files instead of the bus`
 
 ---
 
@@ -2897,17 +3004,55 @@ impl Drop for DaemonGuard {
 
 **Every case's command chain carries `.timeout(Duration::from_secs(30))`**, before `.output()`. `assert_cmd`'s `timeout` (`assert_cmd/src/cmd.rs:108`) kills the child when it expires (`cmd.rs:484-490`) so the `Output` still comes back and the assertion still runs. Without it every case ends in an unbounded block, and case 7 is the live hazard: `shep bleats --no-follow` is the one command under test whose regression mode is *following forever*. A `.output()` on a regressed `--no-follow` never returns, and CI reports a killed job instead of the failed assertion that would name the bug. This is Global Constraints' bounded-receive rule (line 60) one tier up — the same failure, with a process where the earlier tiers had a channel.
 
-**`write_test_script` is this tier's one fixture helper, and it is load-bearing in a non-obvious way:**
+**`write_test_script` is this tier's first fixture helper, and it is load-bearing in a non-obvious way:**
 
 ```rust
 /// Writes a trivial long-running script into `dir` and returns its path.
 /// The executable bit is the point: without `set_mode(0o755)` every
-/// `shep start` fails EACCES and all eight cases fail together, for a
-/// reason that has nothing to do with the CLI.
+/// `shep start` fails EACCES and every case that starts a sheep fails
+/// together, for a reason that has nothing to do with the CLI.
 fn write_test_script(dir: &TempDir) -> PathBuf;
 ```
 
 Set the mode with `std::os::unix::fs::PermissionsExt::set_mode` — the same `PermissionsExt` import `launch.rs`'s own test module already uses. `#![cfg(unix)]` at the top of the file makes that unconditional here.
+
+**Cases 4 and 7 need two more helpers, and both exist to keep those cases honest rather than merely green:**
+
+```rust
+/// Writes a script that emits one marker line on stdout, optionally one on
+/// stderr, and then sleeps. Same `0o755` requirement as `write_test_script`.
+///
+/// `None` writes to stderr not at all — not an empty line. An empty line is
+/// still a line: it reaches the err file, `--no-follow` renders it, and
+/// case 4's byte-exact fixture gains a second object it did not predict.
+///
+/// The sleep is what makes the output countable: a script that exits is
+/// restarted, and each restart appends another copy of every marker, so a
+/// byte-exact fixture would stop being byte-exact after the first respawn.
+fn write_logging_script(dir: &TempDir, out_marker: &str, err_marker: Option<&str>) -> PathBuf;
+
+/// Runs `shep --home <home> bleats --no-follow` with `args` appended,
+/// until its stdout is non-empty or `BLEATS_DEADLINE` expires, and returns
+/// the last attempt's `Output` either way. The selector and any global flag
+/// ride in `args` — `--format` is declared `global = true`
+/// (`crates/shep-cli/src/cli.rs`), so clap takes it after the subcommand.
+///
+/// The retry covers a real gap: `shep start` returns once the sheep is
+/// registered and spawned, while the daemon's log pump is a separate task
+/// that has not necessarily written the child's first line yet. Polling the
+/// log file at its conventional path instead would tie this tier to a
+/// path-derivation rule the daemon is free to change (and which an app's
+/// own `out_file` overrides anyway); polling the command does not.
+///
+/// It returns on expiry rather than panicking, so the failure that reaches
+/// CI is the caller's own assertion naming its own marker. Each attempt
+/// still carries the `.timeout(Duration::from_secs(30))` every other case
+/// does, so nothing here can block unbounded.
+fn bleats_no_follow_until_written(home: &Path, args: &[&str]) -> Output;
+
+/// How long `bleats_no_follow_until_written` keeps retrying.
+const BLEATS_DEADLINE: Duration = Duration::from_secs(10);
+```
 
 Keep `$SHEP_HOME` shallow — the tempdir root itself, not a nested path. macOS caps `sun_path` around 104 bytes and a nested fixture path silently overruns it. The reasoning and the fixture shape to copy are at `shep-daemon/src/lib.rs:256-259` (the `test_paths` helper's own comment) and `shep-daemon/tests/daemon_e2e.rs:57-58`.
 
@@ -2915,10 +3060,16 @@ Required cases:
 1. `shep start <script>` with no daemon running autostarts one, and the sheep reaches Online. **Also assert the daemon is its own process-group leader** — read `pids/shepd.pid` and check `getpgid(pid) == pid`. That is the `Command::process_group(0)` contract, and `std::process::Command` exposes no getter for it, so a real spawn is the only honest test; this tier already spawns one and already reads that pidfile.
 2. A second command reuses the daemon rather than spawning a second (assert one pid across both).
 3. Two concurrent `shep start` invocations against a cold `$SHEP_HOME` produce exactly one daemon and no spurious error. This is the race Phase 2b's `flock(2)` makes safe; prove the client half is safe too — the loser exits 10, `connect_or_spawn` keeps probing, and both invocations exit 0.
-4. **⚠️ BLOCKED — see the note below the template.** `--format json` output validates against the committed fixture for `flock`, `describe`, `start`, `ping` and `bleats --no-follow` (the last is one JSON object per line, not an envelope — see Task 10). The `bleats` fixture is the blocked part; the other four are not, and can ship without it.
+4. `--format json` output validates against the committed fixture for `flock`, `describe`, `start`, `ping` and `bleats --no-follow`. The first four are envelopes. The `bleats` fixture is one JSON object per line and no envelope (Task 10), and it is compared **byte-for-byte, not by containment** — which is what stops an empty stdout from passing, the exact defect this case carried while it was blocked. Every field of that line is pinned, so byte-exact is achievable: `schema_version` is 1, `name` is the `--name fixture` this case passed, `stream` is `"out"`, `line` is the marker, and `id` is **0** because `$SHEP_HOME` is fresh per test and the supervisor allocates ids from zero (`crates/shep-daemon/src/supervisor.rs:299` and `:530`). Give this case a sheep of its own, from `write_logging_script` with `None` for the stderr marker — one stdout line, nothing at all on stderr, then sleep — so the whole of stdout is one line:
+
+```
+{"schema_version":1,"id":0,"name":"fixture","stream":"out","line":"<marker>"}
+```
+
+Key order is serde's field order, which is `BleatLine`'s declaration order and does not vary between runs. Do not share case 7's `$SHEP_HOME` or its sheep: two sheep in one home means one of them is id 1. Fetch the output through `bleats_no_follow_until_written`, or the comparison races the daemon's log pump and fails against an empty stdout for a reason that has nothing to do with the schema.
 5. Exit codes **and stream discipline**: a selector matching nothing exits `NotFound`; the malformed selector **`/[/`** exits `Usage` (`/unclosed` would not — it parses as a sheep named `/unclosed` and would exit `NotFound`, making the case look green while testing nothing; see Task 8's note on the three inputs the grammar rejects); **`shep --home <nonexistent> flock`** exits `DaemonUnreachable`. Pin that verb — the case does not hold for `start`, and picking the wrong one makes it fail for a reason the case text does not predict. `Start` is the only verb routed through the autostart path (`main.rs:166-171`); everything else takes the plain `connect_client` and fails on a socket that is not there. `start` instead reaches `launch_daemon` → `launch_command`, which creates `$SHEP_HOME/logs` recursively (`crates/shep-cli/src/launch.rs:52-56`) — so "nonexistent directory" stops being true mid-command, the daemon boots, and the invocation exits `Success`. Any non-autostarting verb works here; `flock` or `ping` are the obvious two. For each of the three, under `--format json`, assert **stdout is empty and stderr parses as a JSON object with `error.code`**. That claim is structurally unreachable from a unit test — `emit_error` is handed one writer — and this is the only tier that sees the two real streams separately.
 6. `shep kill` stops the daemon and removes the socket.
-7. **⚠️ BLOCKED — see the note below the template.** `shep bleats --no-follow` drains buffered lines and exits `Success`.
+7. `shep bleats --no-follow` prints what a sheep actually wrote to its log files. Start one named `bleater` from `write_logging_script` with a marker on each stream, then take its output from `bleats_no_follow_until_written` and assert: exit `Success`, **stdout contains both markers**, and stderr contains neither — both of a sheep's streams are the data the user asked for, and `streams.err` carries only shep's own diagnostics (Task 10). Then invoke it once more with `--out`, and assert the stdout marker is present and the stderr marker is not. The second half is the assertion that can only pass if the flag really selects a file rather than being accepted and ignored; the first half fails on any implementation that prints nothing, which is precisely what this case could not do while it was written against the bus.
 8. `shep --home <tmp> start <script>` autostarts a daemon whose socket is **under `<tmp>`** — assert on the location of the socket file, not on the command exiting 0. A child that re-resolved `$SHEP_HOME` from ambient environment binds elsewhere, and only this assertion catches it:
 
 ```rust
@@ -2947,13 +3098,9 @@ fn home_reaches_the_spawned_daemon() {
 
 Copy that `timeout()` → `output()` → `adopt_home` → assert ordering into every case; it is the template. All four parts, in that order — the timeout is what turns a regression into a failed assertion instead of a killed job, and `adopt_home` before the assertion is what keeps a failed case from leaking a real daemon.
 
-> **⚠️ Cases 4 and 7 are blocked on a decision that is Rin's, not this task's. Do not start them.**
->
-> Both rest on `shep bleats --no-follow` producing output against a real daemon, and review has established it cannot: the daemon's bus is live-only fan-out, and `Request` has no log-history variant to ask for the backlog with (`crates/shep-core/src/protocol/request.rs:53-90` — `Ping`, `ListFlock`, `Describe`, `Start`, `Stop`, `Restart`, `Delete`, `KillDaemon`, `Subscribe`, and nothing else). So a `--no-follow` run subscribes, receives whatever the daemon happens to emit in that instant, and exits — which is to say, reliably nothing. Case 7's "drains buffered lines" describes a buffer that does not exist, and case 4's `bleats --no-follow` fixture would pin an empty stream as the committed schema.
->
-> The fix is a wire change (a history request, or a `--no-follow` that reads the log files directly), and that is a design call with Rin. **Stop and raise it — do not invent a workaround**, do not weaken case 7 to "exits `Success`" (a `bleats` that emits nothing at all passes that), and do not commit a fixture for a stream this tier cannot produce. Cases 1-3, 5, 6 and 8 are unaffected and can proceed; the remaining two land once she has ruled.
+> **Cases 4 and 7 were blocked on a decision; it has been made.** Both used to rest on `shep bleats --no-follow` producing output from the daemon's bus, which it cannot: the bus is live-only fan-out and `Request` has no log-history variant to ask for a backlog with. Rin ruled on 2026-08-08 that `--no-follow` reads the log files instead, and Task 10a carries that change. **Both cases therefore depend on Task 10a being merged** — written against Task 10's shipped `--no-follow` they assert on output that command cannot produce. The two traps the old note named still apply to whoever writes them: do not weaken case 7 to "exits `Success`" (a `bleats` that emits nothing at all passes that), and do not commit a fixture that an empty stdout could match.
 
-- [ ] **Step 1: Write the six unblocked cases (1-3, 5, 6, 8), run, confirm they fail**
+- [ ] **Step 1: Write all eight cases, run, confirm they fail** — cases 1-3, 5, 6 and 8 depend on nothing beyond Task 11; cases 4 and 7 need Task 10a merged first.
 - [ ] **Step 2: Confirm the dispatch is complete**
 
 `grep -rn "not_wired" crates/shep-cli/src` must return **nothing**. Task 5's dispatch table names the task that replaces each placeholder arm; this is the check that none was missed. Anything else these tests expose as missing is a defect in the task that owned it — fix it there, and say so in the report.
@@ -2971,7 +3118,7 @@ Copy that `timeout()` → `output()` → `adopt_home` → assert ordering into e
 4. `grep -rn "SHEP_READY_FD\|adopt_fd" crates/shep-cli/src crates/shep-client/src` returns nothing.
 5. `grep -rn "not_wired" crates/shep-cli/src` returns nothing — every arm in Task 5's dispatch table has been replaced by the task that owns it.
 6. The three revert-proof transcripts (Task 2 routing, Task 4 handshake probe, Task 6 anti-drift) are in the reports, each with BOTH the broken-FAIL and restored-PASS runs.
-7. `shep start`, `shep flock`, `shep bleats`, `shep kill` work against a real daemon on a clean `$SHEP_HOME`.
+7. `shep start`, `shep flock`, `shep kill` and `shep bleats --no-follow` work against a real daemon on a clean `$SHEP_HOME`, with `bleats --no-follow`'s stdout compared byte-for-byte against its committed fixture (Task 12 cases 4 and 7). **`bleats` in follow mode is not demonstrated end-to-end** — no case subscribes to a real daemon's bus — and is covered only by Task 10's unit tier against `FakeDaemon`. Report it in those terms; "works against a real daemon" must not be left standing for both modes.
 8. A report to Rin listing: the now-dead readiness-pipe surface with evidence, and every judgment call made on her behalf.
 
 ## Open questions for Rin — do not resolve these unilaterally
@@ -2984,3 +3131,5 @@ Copy that `timeout()` → `output()` → `adopt_home` → assert ordering into e
 6. **`completions` or `completion`?** Spec §9 says "clap_complete completions" in prose without naming a verb; `docs/research/phase3-cli.md:451` writes `shep completion <shell>`, singular. The plan uses `Completions`. Whichever you pick becomes a stable CLI surface, so it is worth one word of your time. (An alias for the other spelling is trivial if you want both.)
 7. ~~**`bleats --format json` emits JSON lines, not an envelope.**~~ **SETTLED (Rin, 2026-08-08): JSON lines, no envelope.** A follow has no end, so there is nothing to wrap: `bleats` emits one object per line, `{"schema_version", "id", "name", "stream", "line"}`, `stream` being `"out"` or `"err"`. This is the one place the output schema changes shape by command, and it is a stability surface with a committed fixture from day one. The rejected alternative was an envelope whose `data` is an array, which only terminates under `--no-follow` and so would have made the streaming case a different command in practice.
 8. ~~**`shep-client` gains a `test-support` feature**~~ — **settled 2026-08-08 (Rin): yes, exactly as shep-daemon's `test-fakes` does.** A `publish = false` fakes crate was tried and reverted the same day: it keeps the scaffolding out of the published source, but only by making `shep-client-testing` depend on shep-client while shep-client dev-depends on it, and a dependency cycle — legal through dev-dependencies or not — is not a shape worth leaving in the tree for that. Consequence for later tasks: shep-client's own fake-driven test targets carry `required-features = ["test-support"]`, and shep-cli reaches the fakes through `shep-client = { workspace = true, features = ["test-support"] }` in its dev-dependencies (see File Structure).
+
+9. ~~**`shep bleats --no-follow` cannot print anything.**~~ **SETTLED (Rin, 2026-08-08): `--no-follow` reads the log files; `--follow` keeps the bus.** The bus is live-only fan-out and `Request` has no history variant, so the drain arm Task 10 shipped exits on empty output by construction — which would have let Task 12's case 7 and its committed fixture both pass on nothing. The alternatives were bounded replay-on-subscribe, which redefines `Subscribe` for every future consumer including the lookout and the whistle, and dropping `--no-follow` from the phase. Reading the files needed one additive wire change to be honest about apps that configure an explicit `out_file` — `ProcessInfo`'s `out_file`/`err_file`, landed at `f62e504` — and gives more than replay would have, since a log file also holds what a sheep wrote before this CLI ever connected. Task 10a carries it.
