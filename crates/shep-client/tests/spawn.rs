@@ -167,9 +167,19 @@ async fn a_child_exiting_with_the_already_running_code_keeps_probing() {
             // binds AND accepts; the handle is detached deliberately — the
             // fake outlives the launcher closure and dies with the runtime.
             start_fake_daemon_answering_on(&answer_on);
-            std::process::Command::new("sh")
+            let child = std::process::Command::new("sh")
                 .args(["-c", "exit 10"])
-                .spawn()
+                .spawn()?;
+            // Without this, the loop's first probe can win the race against
+            // `try_wait()` ever observing this child's exit at all — the
+            // fake daemon started above is already answering, so a probe
+            // that lands before the next `try_wait()` succeeds and the test
+            // passes without the exit-10 special case ever running. Verified
+            // by mutation: replacing the `DAEMON_ALREADY_RUNNING` check below
+            // with `if true` (treat any exit as fatal) still left this test
+            // green without the sleep.
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(child)
         },
         fast_opts(),
     )
@@ -205,6 +215,57 @@ async fn a_protocol_mismatch_propagates_instead_of_spawning_a_second_daemon() {
         err,
         SpawnError::Connect(ConnectError::ProtocolMismatch { .. })
     ));
+}
+
+/// The same propagate-immediately rule as the test above, but for a mismatch
+/// that only a *loop* probe observes — reachable via the no-launch
+/// `HandshakeTimeout` branch hitting a daemon that is still mid-boot on the
+/// first probe and only answers (with a refusal) on a later one. Folding
+/// this into `last` and looping to the deadline would misdiagnose a
+/// definitively-answered condition as "daemon unreachable".
+#[tokio::test]
+async fn a_protocol_mismatch_on_a_loop_probe_propagates_instead_of_looping_to_the_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.sock");
+    let reaper = Reaper::default();
+    let answer_on = path.clone();
+
+    let started = Instant::now();
+    let err = {
+        let long_lived = reaper.spawn_long_lived();
+        connect_or_spawn_with(
+            &path,
+            move || {
+                // Nothing is bound yet when this launcher runs — the first
+                // probe already saw `ConnectError::Connect`. Bind the
+                // refusing fake here so it's a *loop* probe, not the first
+                // one, that observes the mismatch.
+                tokio::runtime::Handle::current().block_on(fake_daemon(
+                    &answer_on,
+                    Err(RpcError {
+                        code: RpcErrorCode::ProtocolMismatch,
+                        message: "daemon speaks protocol 2, client speaks 1".into(),
+                    }),
+                ));
+                long_lived()
+            },
+            fast_opts(),
+        )
+        .await
+        .unwrap_err()
+    };
+
+    assert!(
+        matches!(
+            err,
+            SpawnError::Connect(ConnectError::ProtocolMismatch { .. })
+        ),
+        "a mismatch on a loop probe must propagate immediately, got {err:?}"
+    );
+    assert!(
+        started.elapsed() < fast_opts().deadline,
+        "must not burn the rest of the deadline after a definitive answer"
+    );
 }
 
 /// A daemon in the bind->serve gap must not provoke a second daemon.

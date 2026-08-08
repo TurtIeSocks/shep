@@ -1,12 +1,11 @@
 //! Autostart: [`connect_or_spawn`], [`connect_or_spawn_with`], [`SpawnError`]
 //!
 //! A bound-but-not-accepting unix socket still completes `connect(2)` into
-//! the kernel backlog (see `connection`'s own doc), so a bare connect can
-//! never tell "nothing is listening" apart from "something is listening and
-//! not yet answering". [`connect_or_spawn_with`] therefore never treats a
-//! plain `connect` success as readiness — every probe it makes, including
-//! the very first one, is a full `Connection::open` handshake (private to
-//! this crate — see the `connection` module's own doc). Only
+//! the kernel backlog, so a bare connect can never tell "nothing is
+//! listening" apart from "something is listening and not yet answering".
+//! [`connect_or_spawn_with`] therefore never treats a plain `connect`
+//! success as readiness — every probe it makes, including the very first
+//! one, is a full handshake via [`Client::connect_with_timeout`]. Only
 //! [`ConnectError::Connect`] (the OS refusing the connect
 //! outright — nothing bound at all) is read as "nothing to disturb, launch a
 //! daemon"; [`ConnectError::HandshakeTimeout`] on that first probe means a
@@ -199,8 +198,11 @@ where
 /// 5. Loop until `opts.deadline`: check the launched child (if any), sleep
 ///    the current backoff, then attempt a full handshake with
 ///    `opts.handshake_timeout`. Success hands back [`SpawnOutcome::Spawned`].
-///    The most recent [`ConnectError`] is kept for
-///    [`SpawnError::DeadlineExpired`].
+///    A [`ConnectError::ProtocolMismatch`] on one of these loop probes
+///    propagates immediately as [`SpawnError::Connect`], same as step 4 — a
+///    daemon that answers but refuses on version skew is still a daemon, and
+///    there is nothing a longer wait would change. Every other
+///    [`ConnectError`] is instead kept for [`SpawnError::DeadlineExpired`].
 /// 6. Between attempts, the launched child (if any) is checked with
 ///    `try_wait()`. An exit carrying [`DAEMON_ALREADY_RUNNING`] is not a
 ///    failure — another process won the cold-start race, so probing
@@ -215,16 +217,6 @@ where
 /// those on the executor would stall every other task in the process for as
 /// long as the filesystem takes.
 ///
-/// # Errors
-///
-/// - [`SpawnError::Connect`] — the first probe failed for a reason other
-///   than "nothing listening" or "listening but not yet answering".
-/// - [`SpawnError::Launch`] — `launch` itself returned an `io::Error`.
-/// - [`SpawnError::DaemonExited`] — the launched child exited with a status
-///   other than [`DAEMON_ALREADY_RUNNING`] before any probe succeeded.
-/// - [`SpawnError::DeadlineExpired`] — no probe succeeded before
-///   `opts.deadline`.
-///
 /// Not a `# Panics` section, deliberately: this function contains no
 /// panicking call of its own. But note that if `launch` itself panics, that
 /// panic is resumed rather than converted into a `SpawnError` — a caller
@@ -232,6 +224,17 @@ where
 /// this crate do, to assert that a code path must never call it) needs that
 /// panic to still fail the test, not be swallowed by the `JoinHandle`
 /// `spawn_blocking` returns it through.
+///
+/// # Errors
+///
+/// - [`SpawnError::Connect`] — the first probe failed for a reason other
+///   than "nothing listening" or "listening but not yet answering", or a
+///   later loop probe hit [`ConnectError::ProtocolMismatch`].
+/// - [`SpawnError::Launch`] — `launch` itself returned an `io::Error`.
+/// - [`SpawnError::DaemonExited`] — the launched child exited with a status
+///   other than [`DAEMON_ALREADY_RUNNING`] before any probe succeeded.
+/// - [`SpawnError::DeadlineExpired`] — no probe succeeded before
+///   `opts.deadline`.
 pub async fn connect_or_spawn_with<L>(
     socket: &Path,
     launch: L,
@@ -304,6 +307,14 @@ async fn probe_until_ready(
             && let Ok(Some(status)) = proc.try_wait()
         {
             child_reaped = true;
+            // A clean exit (status 0) is fatal too, not just a non-zero one:
+            // `child` here *is* the daemon process, so any exit at all means
+            // it is not serving — there is no "successful" way for it to
+            // have stopped running while this loop still needs it. This
+            // would need revisiting if `launch_daemon` ever grows a
+            // double-fork, at which point this handle would stop being the
+            // daemon itself and a clean exit would just mean the parent
+            // shim finished its job.
             if status.code() != Some(DAEMON_ALREADY_RUNNING) {
                 return Err(SpawnError::DaemonExited { status });
             }
@@ -316,6 +327,14 @@ async fn probe_until_ready(
 
         match Client::connect_with_timeout(socket, opts.handshake_timeout).await {
             Ok(client) => return Ok(SpawnOutcome::Spawned(client)),
+            // A daemon that answers but refuses on protocol skew is still a
+            // daemon: propagate immediately, same as the pre-launch probe
+            // (step 4 above), rather than folding it into `last` and burning
+            // the rest of the deadline on a condition that has already been
+            // definitively answered.
+            Err(err @ ConnectError::ProtocolMismatch { .. }) => {
+                return Err(SpawnError::Connect(err));
+            }
             Err(err) => last = Some(err),
         }
     }
