@@ -565,6 +565,17 @@ impl<R: ProcessRunner> Actor<R> {
                     },
                 );
                 self.emit(ProcessEventKind::Start, info.clone(), true);
+                // No readiness-probe gate exists yet (Phase 2b: `readiness_probe`
+                // is parsed into `AppConfig` but not wired to anything here —
+                // see `lib.rs`'s taxonomy doc), so `entry.status` above already
+                // went straight to `Online` with no intervening `Starting`
+                // phase ever observed by a caller. The bus must say so too:
+                // a `process.*` subscriber that only ever hears `process.start`
+                // for a sheep whose STATUS already reads `Online` (via
+                // `ListFlock`) is being told less than a status poll would
+                // show it. Once a real readiness gate lands, this is the spot
+                // that defers to it instead of firing unconditionally.
+                self.emit(ProcessEventKind::Online, info.clone(), true);
                 Ok(info)
             }
             Err(error) => {
@@ -637,6 +648,10 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.epoch += 1;
                 let info = to_info(&slot.entry);
                 self.emit(ProcessEventKind::Restart, info.clone(), manually);
+                // Same gap as `spawn_fresh`'s Ok arm (see its own comment):
+                // `slot.entry.status` above already went straight to `Online`,
+                // so the bus must announce that too, not just the restart.
+                self.emit(ProcessEventKind::Online, info.clone(), manually);
                 info
             }
             Err(_error) => {

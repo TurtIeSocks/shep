@@ -260,11 +260,16 @@ impl Drop for PathGuard {
 
 #[tokio::test]
 async fn a_bare_interpreter_resolves_via_the_seeded_path() {
-    // Standing in for Task 10's not-yet-created e2e tier (this crate has no
-    // `tests/e2e_*.rs` yet — see task-8-report.md): proves the FULL chain
-    // (config -> assemble()'s base_env() PATH seed -> TokioRunner spawn ->
-    // OS exec) actually resolves a BARE program name, not just an absolute
-    // one.
+    // Originally written to stand in for Task 10's not-yet-created e2e tier
+    // (see task-8-report.md); that tier now exists (`tests/daemon_e2e.rs`,
+    // `a_bare_interpreter_resolves_via_the_inherited_path`) and re-proves
+    // this same regression through the full daemon RPC stack — Start over
+    // the real socket -> supervisor -> assemble() -> TokioRunner -> OS exec.
+    // Kept here too rather than deleted: this test isolates the
+    // assemble()+TokioRunner tier specifically (config -> assemble()'s
+    // base_env() PATH seed -> TokioRunner spawn -> OS exec), so a failure
+    // here versus one only in the e2e tier still tells you which layer
+    // regressed.
     //
     // WHY a hand-rolled shim instead of `sh`/`node`: `/bin/sh` is reachable
     // even with a completely EMPTY child env, because glibc/libSystem's
