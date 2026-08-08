@@ -1157,10 +1157,11 @@ mod tests {
         // actual shape of the bug this test pins.
         //
         // Looped: a race this timing-dependent isn't guaranteed to land on
-        // the exact bad interleaving every single attempt (this crate's own
-        // `FD_REUSE_LOCK` doc records a comparable real bug that only
-        // reproduced "roughly 1-in-a-few-dozen parallel runs" before it was
-        // fixed) — running many trials inside one test call, and failing on
+        // the exact bad interleaving every single attempt (the fd-reuse
+        // double-close that `sys.rs`'s
+        // `a_closed_descriptor_is_refused_instead_of_adopted` now pins
+        // structurally took 25 saturated workspace runs to show itself even
+        // once) — running many trials inside one test call, and failing on
         // the first bad one, is what makes the revert-and-confirm-it-fails
         // check below actually reliable rather than a coin flip.
         //
