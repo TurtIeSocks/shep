@@ -219,15 +219,24 @@ fn write_line(
 }
 
 /// Writes one of this module's own notices — not a sheep's line, and not
-/// `parse_selector`'s kind of usage error either — to `streams.err`, in the
-/// same grammar [`output::emit_error`] gives usage errors.
+/// `parse_selector`'s kind of usage error either — to `streams.err`, through
+/// [`output::emit_notice`] rather than [`output::emit_error`]: a notice's
+/// code (`log_path_unknown`, `dropped`, `daemon_shutdown`, ...) is not part
+/// of [`crate::exit::ExitCode`]'s taxonomy, and a clean run can still emit
+/// one on its way to exit 0 — reusing the error envelope would leave a
+/// `--format json` consumer unable to tell a diagnostic from a failure
+/// (whole-branch review item 4; `cli_e2e.rs`'s `assert_json_error` pins the
+/// opposite rule for real errors: JSON on stderr means the command failed).
 ///
-/// Without this, a script capturing stderr under `--format json` would see
-/// valid JSON from `parse_selector`'s errors alongside plain-text prose from
-/// everything else this module writes: two grammars for one command's
-/// stderr, item 7's fix.
-fn write_notice(streams: &mut Streams<'_>, fmt: Format, code: &str, message: &str) {
-    let _ = output::emit_error(&mut *streams.err, fmt, code, message);
+/// A no-op when `quiet` is set: `--quiet`'s own doc
+/// (`cli::GlobalArgs::quiet`, "suppress non-essential output") is exactly
+/// what a notice is — a sheep's own line and a real error both still print
+/// regardless (whole-branch review item 2).
+fn write_notice(streams: &mut Streams<'_>, fmt: Format, quiet: bool, code: &str, message: &str) {
+    if quiet {
+        return;
+    }
+    let _ = output::emit_notice(&mut *streams.err, fmt, code, message);
 }
 
 /// How many lines of each log file `--no-follow` prints.
@@ -319,6 +328,7 @@ fn read_tail(path: &Path) -> io::Result<Vec<String>> {
 fn tail_log_files(
     streams: &mut Streams<'_>,
     fmt: Format,
+    quiet: bool,
     cache: &HashMap<u32, ProcessInfo>,
     selector: &ProcessSelector,
     args: &BleatsArgs,
@@ -345,8 +355,9 @@ fn tail_log_files(
                 None => write_notice(
                     streams,
                     fmt,
+                    quiet,
                     "log_path_unknown",
-                    &format!("{name}: the shepherd did not report a {stream_name} log path"),
+                    &format!("{name}: the daemon did not report a {stream_name} log path"),
                 ),
                 Some(path) => match read_tail(Path::new(path)) {
                     Ok(lines) => {
@@ -371,6 +382,7 @@ fn tail_log_files(
                         write_notice(
                             streams,
                             fmt,
+                            quiet,
                             "log_unreadable",
                             &format!("failed to read {path}: {err}"),
                         );
@@ -399,6 +411,7 @@ fn tail_log_files(
 fn handle_event(
     streams: &mut Streams<'_>,
     fmt: Format,
+    quiet: bool,
     cache: &HashMap<u32, ProcessInfo>,
     selector: &ProcessSelector,
     args: &BleatsArgs,
@@ -430,8 +443,9 @@ fn handle_event(
             write_notice(
                 streams,
                 fmt,
+                quiet,
                 "dropped",
-                &format!("the shepherd dropped {count} events (its own queue overflowed)"),
+                &format!("the daemon dropped {count} events (its own queue overflowed)"),
             );
             Ok(())
         }
@@ -440,8 +454,9 @@ fn handle_event(
             write_notice(
                 streams,
                 fmt,
+                quiet,
                 "daemon_shutdown",
-                "the shepherd is shutting down",
+                "the daemon is shutting down",
             );
             Ok(())
         }
@@ -451,6 +466,10 @@ fn handle_event(
 
 /// Follows the bleats (log output) of the sheep matching `args.selector`.
 ///
+/// `quiet` is `cli::GlobalArgs::quiet` — it silences this module's own
+/// notices (whole-branch review item 2) and nothing else: a sheep's own
+/// line and a real error both still print regardless.
+///
 /// Delegates to [`bleats_with_signal`] with a real `SIGINT` as the
 /// interrupt source — see that function's own doc for the shape both
 /// share.
@@ -458,12 +477,14 @@ pub async fn bleats(
     client: &Client,
     streams: &mut Streams<'_>,
     fmt: Format,
+    quiet: bool,
     args: &BleatsArgs,
 ) -> ExitCode {
     bleats_with_signal(
         client,
         streams,
         fmt,
+        quiet,
         args,
         tokio::signal::ctrl_c().map(|_| ()),
     )
@@ -498,6 +519,7 @@ pub async fn bleats_with_signal(
     client: &Client,
     streams: &mut Streams<'_>,
     fmt: Format,
+    quiet: bool,
     args: &BleatsArgs,
     interrupt: impl std::future::Future<Output = ()> + Send,
 ) -> ExitCode {
@@ -515,7 +537,7 @@ pub async fn bleats_with_signal(
     };
 
     if args.no_follow {
-        return tail_log_files(streams, fmt, &cache, &selector, args);
+        return tail_log_files(streams, fmt, quiet, &cache, &selector, args);
     }
 
     let mut stream = match subscribe(client, streams, fmt).await {
@@ -531,7 +553,9 @@ pub async fn bleats_with_signal(
             item = stream.next() => {
                 match item {
                     Some(Ok(event)) => {
-                        if let Err(write_err) = handle_event(streams, fmt, &cache, &selector, args, event) {
+                        if let Err(write_err) =
+                            handle_event(streams, fmt, quiet, &cache, &selector, args, event)
+                        {
                             let code = write_outcome(Err(write_err));
                             let _ = streams.out.flush();
                             return code;
@@ -541,6 +565,7 @@ pub async fn bleats_with_signal(
                         write_notice(
                             streams,
                             fmt,
+                            quiet,
                             "lagged",
                             &format!("{count} events dropped locally (lagged)"),
                         );
@@ -705,7 +730,13 @@ mod tests {
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(&client, &mut streams, Format::Table, &follow_args("all")),
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args("all"),
+                ),
             )
             .await
             .expect("close_after_subscribe ends the follow deterministically, not by hanging");
@@ -758,7 +789,7 @@ mod tests {
                 };
                 tokio::time::timeout(
                     RUN_TIMEOUT,
-                    bleats(&client, &mut streams, Format::Table, &args),
+                    bleats(&client, &mut streams, Format::Table, false, &args),
                 )
                 .await
                 .expect("close_after_subscribe ends the follow deterministically, not by hanging");
@@ -809,7 +840,13 @@ mod tests {
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(&client, &mut streams, Format::Table, &follow_args("web")),
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args("web"),
+                ),
             )
             .await
             .expect("close_after_subscribe ends the follow deterministically, not by hanging");
@@ -849,9 +886,10 @@ mod tests {
         };
 
         let args = follow_args("all");
-        let follow = bleats_with_signal(&client, &mut streams, Format::Table, &args, async {
-            let _ = interrupt_rx.await;
-        });
+        let follow =
+            bleats_with_signal(&client, &mut streams, Format::Table, false, &args, async {
+                let _ = interrupt_rx.await;
+            });
         let (_, code) = tokio::join!(
             async {
                 tokio::task::yield_now().await;
@@ -896,7 +934,13 @@ mod tests {
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(&client, &mut streams, Format::Table, &follow_args("all")),
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args("all"),
+                ),
             )
             .await
             .expect("a shutdown mid-follow must end the follow, not hang")
@@ -928,7 +972,13 @@ mod tests {
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(&client, &mut streams, Format::Table, &follow_args("all")),
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args("all"),
+                ),
             )
             .await
             .expect("the connection ending must end the follow, not hang")
@@ -938,6 +988,100 @@ mod tests {
         assert!(
             !String::from_utf8(err).unwrap().contains("shutting down"),
             "a notice the daemon never sent must not be invented"
+        );
+    }
+
+    /// Whole-branch review item 2: `--quiet` (`GlobalArgs::quiet`, threaded
+    /// in here as `bleats`' own `quiet` parameter) must actually do
+    /// something, and this module's notices are what it was given meaning
+    /// against. Same shutdown scenario as
+    /// `a_daemon_shutdown_mid_follow_is_announced_before_the_stream_ends`,
+    /// with `quiet: true` instead of `false` — the exit code must not move
+    /// (the daemon really did go away either way), only the notice text.
+    #[tokio::test]
+    async fn quiet_suppresses_the_daemon_shutdown_notice_but_not_the_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon.push(BusEvent::DaemonShutdown).await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    true,
+                    &follow_args("all"),
+                ),
+            )
+            .await
+            .expect("a shutdown mid-follow must end the follow, not hang")
+        };
+
+        assert_eq!(
+            code,
+            ExitCode::DaemonUnreachable,
+            "quiet must not change the exit code, only whether the notice prints"
+        );
+        assert!(
+            String::from_utf8(err).unwrap().is_empty(),
+            "quiet must suppress the shutdown notice entirely"
+        );
+    }
+
+    /// The other half of `--quiet`'s contract: it narrows notices only.
+    /// `resolved_name`/`write_line` never see `quiet` at all (their call
+    /// sites are unconditional in `handle_event`), so this is a
+    /// belt-and-braces end-to-end check that a sheep's own line still
+    /// reaches `streams.out` under `quiet: true`.
+    #[tokio::test]
+    async fn quiet_does_not_suppress_a_sheeps_own_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "hello".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    true,
+                    &follow_args("all"),
+                ),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("web") && out.contains("hello"),
+            "quiet must never touch a sheep's own line: {out}"
         );
     }
 
@@ -987,7 +1131,13 @@ mod tests {
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(&client, &mut streams, Format::Table, &follow_args("all")),
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args("all"),
+                ),
             )
             .await
             .expect("close_after_subscribe ends the follow deterministically, not by hanging");
@@ -1036,7 +1186,13 @@ mod tests {
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(&client, &mut streams, Format::Table, &follow_args("all")),
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args("all"),
+                ),
             )
             .await
             .expect("close_after_subscribe ends the follow deterministically, not by hanging");
@@ -1044,7 +1200,7 @@ mod tests {
 
         let stderr = String::from_utf8(err).unwrap();
         assert!(
-            stderr.contains("shepherd") && stderr.contains('5'),
+            stderr.contains("daemon") && stderr.contains('5'),
             "a daemon-side Dropped must not be silently swallowed: {stderr}"
         );
         assert!(
@@ -1088,7 +1244,13 @@ mod tests {
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(&client, &mut streams, Format::Json, &follow_args("all")),
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Json,
+                    false,
+                    &follow_args("all"),
+                ),
             )
             .await
             .expect("close_after_subscribe ends the follow deterministically, not by hanging");
@@ -1155,7 +1317,13 @@ mod tests {
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(&client, &mut streams, Format::Table, &follow_args("all")),
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args("all"),
+                ),
             )
             .await
             .expect("close_after_subscribe ends the follow deterministically, not by hanging")
@@ -1210,6 +1378,7 @@ mod tests {
                     &client,
                     &mut streams,
                     Format::Table,
+                    false,
                     &no_follow_args_out("all"),
                 ),
             )
@@ -1255,6 +1424,7 @@ mod tests {
                     &client,
                     &mut streams,
                     Format::Table,
+                    false,
                     &no_follow_args_out("all"),
                 ),
             )
@@ -1311,6 +1481,7 @@ mod tests {
                     &client,
                     &mut streams,
                     Format::Table,
+                    false,
                     &no_follow_args_out("all"),
                 ),
             )
@@ -1355,7 +1526,7 @@ mod tests {
                 };
                 tokio::time::timeout(
                     RUN_TIMEOUT,
-                    bleats(&client, &mut streams, Format::Table, &args),
+                    bleats(&client, &mut streams, Format::Table, false, &args),
                 )
                 .await
                 .expect("--no-follow never subscribes, so it must terminate on its own");
@@ -1415,6 +1586,7 @@ mod tests {
                     &client,
                     &mut streams,
                     Format::Table,
+                    false,
                     &no_follow_args_out("all"),
                 ),
             )
@@ -1474,6 +1646,7 @@ mod tests {
                     &client,
                     &mut streams,
                     Format::Table,
+                    false,
                     &no_follow_args_out("all"),
                 ),
             )
@@ -1527,6 +1700,7 @@ mod tests {
                     &client,
                     &mut streams,
                     Format::Table,
+                    false,
                     &no_follow_args_out("all"),
                 ),
             )
@@ -1573,6 +1747,7 @@ mod tests {
                     &client,
                     &mut streams,
                     Format::Table,
+                    false,
                     &no_follow_args_out("all"),
                 ),
             )
@@ -1620,6 +1795,7 @@ mod tests {
                     &client,
                     &mut streams,
                     Format::Json,
+                    false,
                     &no_follow_args_out("all"),
                 ),
             )

@@ -200,6 +200,76 @@ pub fn emit_error(
     }
 }
 
+/// The `--format json` shape of a non-failure diagnostic: `{"schema_version",
+/// "notice": {"code", "message"}}`.
+///
+/// A deliberate sibling of [`ErrorEnvelope`], not a reuse of it: `bleats`'
+/// own notices (`log_path_unknown`, `log_unreadable`, `dropped`,
+/// `daemon_shutdown`, `lagged`) used to go out through [`emit_error`], whose
+/// codes are otherwise exactly [`crate::exit::ExitCode::code_str`]'s
+/// taxonomy — a `--format json` consumer parsing stderr had no way to tell
+/// "the daemon is shutting down, informationally" from "this command
+/// failed", even on a clean run that exits 0. `cli_e2e.rs`'s
+/// `assert_json_error` pins the opposite rule for real errors: JSON on
+/// stderr means the command failed. A notice must not read that way, so it
+/// gets its own envelope key instead of a borrowed one.
+///
+/// Only ever constructed by [`emit_notice`], whose own doc explains the
+/// `#[cfg_attr(windows, allow(dead_code))]` this struct also carries: its
+/// one caller, `bleats.rs`, lives in `commands/`, which is
+/// `#[cfg(unix)]`-gated in `main.rs`.
+#[derive(Debug, Serialize)]
+#[cfg_attr(windows, allow(dead_code))]
+struct NoticeEnvelope<'a> {
+    schema_version: u32,
+    notice: NoticeBody<'a>,
+}
+
+/// The `notice` object inside [`NoticeEnvelope`].
+#[derive(Debug, Serialize)]
+#[cfg_attr(windows, allow(dead_code))]
+struct NoticeBody<'a> {
+    code: &'a str,
+    message: &'a str,
+}
+
+/// Renders a non-failure diagnostic to `err` in `fmt`. Same stream as
+/// [`emit_error`] (stderr — a notice is not a sheep's line, and not a
+/// command's own rendered output either) but a different envelope key, so a
+/// `--format json` consumer can tell a diagnostic from a failure without
+/// also cross-referencing the process exit code.
+///
+/// `code` is caller-defined, unlike `emit_error`'s `ExitCode::code_str()`:
+/// a notice's code is never part of the exit-code taxonomy — that gap is
+/// the whole reason this function exists rather than every notice call site
+/// continuing to borrow [`emit_error`].
+///
+/// Not called outside this module's own tests on Windows: its one caller,
+/// `bleats.rs`, lives in `commands/`, which is `#[cfg(unix)]`-gated in
+/// `main.rs` — same reason [`Streams::out`] carries the same attribute.
+///
+/// # Errors
+/// The underlying write failed.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn emit_notice(
+    err: &mut dyn io::Write,
+    fmt: Format,
+    code: &str,
+    message: &str,
+) -> io::Result<()> {
+    match fmt {
+        Format::Json => {
+            let envelope = NoticeEnvelope {
+                schema_version: SCHEMA_VERSION,
+                notice: NoticeBody { code, message },
+            };
+            serde_json::to_writer(&mut *err, &envelope)?;
+            writeln!(err)
+        }
+        Format::Table => writeln!(err, "notice[{code}]: {message}"),
+    }
+}
+
 /// Turns the result of an `emit`/`emit_error` write into the exit code that
 /// write earned.
 ///
@@ -343,5 +413,50 @@ mod tests {
     #[test]
     fn write_outcome_treats_ok_as_success() {
         assert_eq!(write_outcome(Ok(())), ExitCode::Success);
+    }
+
+    /// Item 4 (whole-branch review): a notice's JSON envelope must key on
+    /// `notice`, not `error` — a consumer parsing `--format json` stderr
+    /// needs to tell a diagnostic from a failure without also having to
+    /// know the process exit code.
+    #[test]
+    fn a_notice_under_format_json_uses_the_notice_key_not_the_error_key() {
+        let mut err = Vec::new();
+        emit_notice(
+            &mut err,
+            Format::Json,
+            "daemon_shutdown",
+            "the daemon is shutting down",
+        )
+        .unwrap();
+
+        let json: serde_json::Value = serde_json::from_slice(&err)
+            .expect("under --format json a notice must be parseable, not prose");
+        assert_eq!(json["schema_version"], SCHEMA_VERSION);
+        assert_eq!(json["notice"]["code"], "daemon_shutdown");
+        assert_eq!(json["notice"]["message"], "the daemon is shutting down");
+        assert!(
+            json.get("error").is_none(),
+            "a notice must not also carry an `error` key: {json}"
+        );
+    }
+
+    /// The table-mode sibling of the JSON test above: `notice[code]:
+    /// message`, not `error[code]: message` — the same visual grammar
+    /// `emit_error` uses, but a different word, so a human at a terminal can
+    /// tell the two apart at a glance too.
+    #[test]
+    fn a_notice_under_format_table_is_plain_text_prefixed_notice() {
+        let mut err = Vec::new();
+        emit_notice(
+            &mut err,
+            Format::Table,
+            "dropped",
+            "the daemon dropped 3 events",
+        )
+        .unwrap();
+        let text = String::from_utf8(err).unwrap();
+        assert!(text.starts_with("notice[dropped]:"), "{text}");
+        assert!(text.contains("the daemon dropped 3 events"));
     }
 }

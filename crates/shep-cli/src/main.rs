@@ -171,7 +171,7 @@ async fn run(cli: Cli) -> ExitCode {
             Err(code) => code,
         },
         Commands::Bleats(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => bleats::bleats(&client, &mut streams, fmt, args).await,
+            Ok(client) => bleats::bleats(&client, &mut streams, fmt, cli.global.quiet, args).await,
             Err(code) => code,
         },
         Commands::Ping => match connect_client(&mut streams, fmt, &paths).await {
