@@ -78,17 +78,32 @@ fn not_wired(verb: &str) -> ExitCode {
     ExitCode::Internal
 }
 
-/// Parses, resolves `$SHEP_HOME`, and dispatches to the verb's own module.
+/// Parses, resolves `$SHEP_HOME` for the verbs that need it, and dispatches
+/// to the verb's own module.
 ///
 /// Every command receives an already-connected client; no verb here
 /// connects or autostarts for itself. Every arm below is a stand-in
 /// ([`not_wired`]) until the task that owns that verb replaces it with a
 /// real connect (or, for `start` alone, `connect_or_spawn`) and a call into
 /// its own command module.
+///
+/// `resolve_paths` runs only for the arms that actually touch the socket.
+/// `Completions` and `Daemon` never do — shell completion generation is
+/// exactly what runs in the minimal environments (package build scripts,
+/// container images, shell rc files) that have no `$HOME` at all, and the
+/// re-exec'd `daemon` subcommand resolves its own paths independently once
+/// it lands. Requiring a resolvable home for either was a bug, not a
+/// deliberate restriction.
 #[cfg(unix)]
 async fn run(cli: Cli) -> ExitCode {
+    match cli.command {
+        Commands::Completions(_) => return not_wired("completions"),
+        Commands::Daemon(_) => return not_wired("daemon"),
+        _ => {}
+    }
+
     if let Err(code) = resolve_paths(&cli.global) {
-        eprintln!("shep: set --home or $SHEP_HOME: $HOME is not set");
+        eprintln!("shep: none of --home, $SHEP_HOME, or $HOME resolves a root directory");
         return code;
     }
 
@@ -103,8 +118,9 @@ async fn run(cli: Cli) -> ExitCode {
         Commands::Bleats(_) => not_wired("bleats"),
         Commands::Ping => not_wired("ping"),
         Commands::Kill => not_wired("kill"),
-        Commands::Completions(_) => not_wired("completions"),
-        Commands::Daemon(_) => not_wired("daemon"),
+        Commands::Completions(_) | Commands::Daemon(_) => {
+            unreachable!("handled above, before resolve_paths runs")
+        }
     }
 }
 
@@ -128,8 +144,16 @@ mod tests {
 
     /// A `--home` that never reached `ShepPaths` is invisible from the
     /// outside until a daemon binds the wrong socket well after the fact.
+    ///
+    /// This pins `resolve_paths`'s own folding of an already-populated
+    /// `GlobalArgs::home` into `ShepPaths` — it says nothing about
+    /// `$SHEP_HOME` itself, which clap folds into `GlobalArgs::home` before
+    /// this function ever runs (pinned separately in `cli.rs`'s
+    /// `home_flag_is_wired_to_the_shep_home_env_var`, since this crate's
+    /// `#![forbid(unsafe_code)]` rules out mutating the environment here to
+    /// exercise that fold directly).
     #[test]
-    fn home_wins_over_the_ambient_environment() {
+    fn explicit_home_field_resolves_to_the_expected_shep_paths() {
         let global = cli::GlobalArgs {
             home: Some("/tmp/explicit".into()),
             format: cli::Format::Table,
@@ -141,5 +165,29 @@ mod tests {
             paths.socket,
             std::path::Path::new("/tmp/explicit/run/shep.sock")
         );
+    }
+
+    /// Regression test: `resolve_paths` used to run unconditionally before
+    /// dispatch, so `shep completions bash` exited `Usage` ("$HOME is not
+    /// set") in exactly the minimal environments — build scripts, container
+    /// images, shell rc files — that completion generation is meant for,
+    /// even though neither `Completions` nor `Daemon` ever touches
+    /// `ShepPaths` or the socket. This can't reproduce the original bug by
+    /// unsetting `$HOME` (mutating the environment is `unsafe` in edition
+    /// 2024, and this crate is `#![forbid(unsafe_code)]`), so instead it
+    /// pins the structural fix directly: these two commands never reach
+    /// `resolve_paths` at all, so whatever `$HOME` happens to be in any
+    /// environment can't matter to them. If `resolve_paths` were moved back
+    /// onto their path, this fails the moment CI's `$HOME` is unset — but
+    /// even on a machine with `$HOME` set, `not_wired`'s `Internal` return
+    /// vs. `resolve_paths`'s would-be `Usage` return still tells them apart.
+    #[tokio::test]
+    async fn completions_and_daemon_never_resolve_paths() {
+        use clap::Parser;
+        for argv in [vec!["shep", "completions", "bash"], vec!["shep", "daemon"]] {
+            let cli = Cli::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("{argv:?} failed to parse: {e}"));
+            assert_eq!(run(cli).await, ExitCode::Internal, "argv: {argv:?}");
+        }
     }
 }

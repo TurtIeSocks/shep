@@ -193,20 +193,15 @@ mod tests {
 
     #[test]
     fn every_rpc_error_code_maps_to_a_distinct_nonzero_exit_code() {
-        use shep_core::protocol::RpcErrorCode::*;
-        // `RpcErrorCode` is `#[non_exhaustive]`, so `From` needs a `_` arm and the
-        // compiler cannot force this list to stay complete. Keeping it here means a
-        // shep-core addition shows up as a review question, not silently as Failure.
-        // The final assertion pins the fallback so a new variant is at least
-        // classified as an internal fault rather than a generic failure.
-        let codes = [
-            NotFound,
-            InvalidConfig,
-            SpawnFailed,
-            ProtocolMismatch,
-            Internal,
-            DeadlineExceeded,
-        ];
+        // `RpcErrorCode` is `#[non_exhaustive]`, so the `From` impl above needs a
+        // `_` arm and the compiler cannot force *this* list to stay complete on
+        // its own. Iterating `RpcErrorCode::ALL` instead of a hand-written array
+        // closes that gap: `ALL` is exhaustive-checked inside shep-core (its
+        // defining crate, where `#[non_exhaustive]` does not apply), so a new
+        // variant there is compiled into `ALL` — and then lands here, where an
+        // unmapped variant collides with `Internal` under the `From` impl's `_`
+        // arm and this test's distinctness assertion below catches it.
+        let codes = shep_core::protocol::RpcErrorCode::ALL;
         let mapped: Vec<u8> = codes.iter().map(|c| ExitCode::from(*c) as u8).collect();
         assert!(
             mapped.iter().all(|&c| c != 0),

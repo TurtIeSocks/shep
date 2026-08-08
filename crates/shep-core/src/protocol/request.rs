@@ -197,6 +197,52 @@ pub enum RpcErrorCode {
     DeadlineExceeded,
 }
 
+impl RpcErrorCode {
+    /// Every variant, for code that needs to iterate them all.
+    ///
+    /// `#[non_exhaustive]` forces a `_` arm on any match written outside
+    /// this crate, which would silently swallow a variant added here and
+    /// never updated there (shep-cli's exit-code mapping test is the
+    /// motivating case — see `crates/shep-cli/src/exit.rs`). Downstream
+    /// crates should iterate `ALL` instead of hand-writing their own list
+    /// that the compiler can't check.
+    ///
+    /// Kept honest by a private `assert_all_lists_every_variant` fn right
+    /// below: read that doc for how a forgotten variant is caught here,
+    /// where `#[non_exhaustive]` has no effect.
+    pub const ALL: [Self; 6] = [
+        Self::NotFound,
+        Self::InvalidConfig,
+        Self::SpawnFailed,
+        Self::ProtocolMismatch,
+        Self::Internal,
+        Self::DeadlineExceeded,
+    ];
+
+    /// Never called; exists purely so this crate fails to build if a
+    /// variant is added to [`RpcErrorCode`] without also adding it to
+    /// [`Self::ALL`].
+    ///
+    /// `#[non_exhaustive]` only forces a wildcard arm on matches written
+    /// *outside* this crate — inside the crate that defines the enum, a
+    /// match with no `_` arm is still checked for exhaustiveness (E0004),
+    /// so a new variant breaks this build until it gets an arm here. Each
+    /// arm indexes a fixed literal position into [`Self::ALL`], so growing
+    /// the enum without growing the array is caught too: rustc denies an
+    /// out-of-bounds constant array index by default.
+    #[allow(dead_code)]
+    const fn assert_all_lists_every_variant(code: Self) -> Self {
+        match code {
+            Self::NotFound => Self::ALL[0],
+            Self::InvalidConfig => Self::ALL[1],
+            Self::SpawnFailed => Self::ALL[2],
+            Self::ProtocolMismatch => Self::ALL[3],
+            Self::Internal => Self::ALL[4],
+            Self::DeadlineExceeded => Self::ALL[5],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

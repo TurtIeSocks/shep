@@ -180,4 +180,54 @@ mod tests {
         let cli = Cli::try_parse_from(["shep", "--format", "json", "flock"]).unwrap();
         assert_eq!(cli.global.format, Format::Json);
     }
+
+    /// `std::env::set_var` is `unsafe` in edition 2024 and this crate is
+    /// `#![forbid(unsafe_code)]`, so nothing here can establish an ambient
+    /// `$SHEP_HOME` and observe clap actually reading it. The next best
+    /// thing, and the thing that actually matters for `$SHEP_HOME` to keep
+    /// working, is pinning that clap was *told* to read it: if `env =
+    /// "SHEP_HOME"` (`cli.rs:30`) is ever deleted, this fails.
+    #[test]
+    fn home_flag_is_wired_to_the_shep_home_env_var() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let home_arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id().as_str() == "home")
+            .expect("GlobalArgs::home must still be a flattened argument named `home`");
+        assert_eq!(home_arg.get_env(), Some(std::ffi::OsStr::new("SHEP_HOME")));
+    }
+
+    /// Pins `Flock`'s and `Bleats`'s visible aliases, and that the hidden
+    /// verbs (`thatlldo`, the internal `daemon` re-exec target) stay hidden
+    /// from `--help`. A `visible_aliases`/`aliases` swap, or a dropped
+    /// `hide = true`, passes every other test in this module but changes
+    /// user-facing behavior silently.
+    #[test]
+    fn alias_visibility_and_hiding_are_pinned() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+
+        let flock = cmd.find_subcommand("flock").unwrap();
+        assert_eq!(
+            flock.get_visible_aliases().collect::<Vec<_>>(),
+            ["list", "ls"]
+        );
+
+        let bleats = cmd.find_subcommand("bleats").unwrap();
+        assert_eq!(bleats.get_visible_aliases().collect::<Vec<_>>(), ["logs"]);
+
+        for hidden in ["thatlldo", "daemon"] {
+            assert!(
+                cmd.find_subcommand(hidden).unwrap().is_hide_set(),
+                "{hidden} must stay hidden from --help"
+            );
+        }
+        for visible in ["start", "flock", "bleats", "ping", "kill", "completions"] {
+            assert!(
+                !cmd.find_subcommand(visible).unwrap().is_hide_set(),
+                "{visible} must stay visible in --help"
+            );
+        }
+    }
 }
