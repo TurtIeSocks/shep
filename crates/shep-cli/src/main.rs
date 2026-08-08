@@ -275,11 +275,23 @@ mod tests {
     /// crate is `#![forbid(unsafe_code)]`), so instead it pins the
     /// structural fix directly: `completions` never reaches
     /// `resolve_paths` at all, so whatever `$HOME` happens to be in any
-    /// environment can't matter to it. If `resolve_paths` were moved back
-    /// onto its path, this fails the moment CI's `$HOME` is unset — but
-    /// even on a machine with `$HOME` set, `not_wired`'s `Internal` return
-    /// vs. `resolve_paths`'s would-be `Usage` return still tells them
-    /// apart.
+    /// environment can't matter to it.
+    ///
+    /// What this actually guards, precisely: if `resolve_paths` were moved
+    /// back onto `completions`'s path, this fails the moment `$HOME` is
+    /// unset — the exit code would become `Usage` instead of `Internal`.
+    /// It does **not** catch that regression in an environment where
+    /// `$HOME` is set (true of ordinary dev machines and most CI): there,
+    /// the reinstated `resolve_paths` call would simply succeed and fall
+    /// through to the same `not_wired("completions")` arm, so `run(cli)`
+    /// still returns `Internal` either way and this assertion cannot tell
+    /// the two code shapes apart. `resolve_paths` has no seam for a test to
+    /// inject a controlled failure without touching the real process
+    /// environment (it reads `std::env::var_os("HOME")` directly), so
+    /// there is no honest way to close that gap short of unsafe env
+    /// mutation or spawning the real binary as a subprocess with `$HOME`
+    /// cleared — the latter is exactly the e2e tier described below, not
+    /// this unit test.
     ///
     /// `daemon` used to share this test (both were routed through
     /// `not_wired`), but it no longer belongs here: it now genuinely

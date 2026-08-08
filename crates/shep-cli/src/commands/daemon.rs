@@ -26,19 +26,30 @@ use crate::exit::ExitCode;
 /// [`ExitCode::InvalidConfig`] is not satisfiable, and widening
 /// `BootError` would mean editing merged daemon code that is off-limits
 /// for this phase.
+///
+/// [`Self::Boot`] and [`Self::Run`] both wrap a [`BootError`] — `boot()`
+/// and `RunningDaemon::run()` share that error type — but they are kept as
+/// separate variants rather than one, because they are not the same fault:
+/// a `BootError` from `run()` means the supervisor came up and served
+/// (possibly for a long time) and only failed during its run loop or
+/// teardown, which "the shepherd failed to boot" would misreport.
 #[derive(Debug)]
 pub enum DaemonRunError {
     /// `shep.toml` was unreadable as config.
     Config(DaemonConfigError),
-    /// The supervisor failed to come up.
+    /// The supervisor failed to come up, before it ever served a request.
     Boot(BootError),
+    /// The supervisor came up and served, then failed during its run loop
+    /// or teardown.
+    Run(BootError),
 }
 
-impl std::fmt::Display for DaemonRunError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for DaemonRunError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Config(err) => write!(f, "invalid daemon configuration: {err}"),
             Self::Boot(err) => write!(f, "the shepherd failed to boot: {err}"),
+            Self::Run(err) => write!(f, "the shepherd failed while running: {err}"),
         }
     }
 }
@@ -47,7 +58,7 @@ impl core::error::Error for DaemonRunError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Config(err) => Some(err),
-            Self::Boot(err) => Some(err),
+            Self::Boot(err) | Self::Run(err) => Some(err),
         }
     }
 }
@@ -87,7 +98,9 @@ fn read_daemon_config_source(paths: &ShepPaths) -> Result<Option<String>, Daemon
 ///   `SHEP_*` override held an unparseable value.
 /// - [`DaemonRunError::Boot`] — the config file itself could not be read
 ///   (any IO error other than "does not exist"), or the supervisor failed
-///   to boot or to run cleanly to completion.
+///   to boot.
+/// - [`DaemonRunError::Run`] — the supervisor came up and served, then
+///   failed during its run loop or teardown.
 pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), DaemonRunError> {
     let env = |key: &str| std::env::var(key).ok();
     let file_source = read_daemon_config_source(&paths)?;
@@ -99,7 +112,7 @@ pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), Daemo
         .map_err(DaemonRunError::Boot)?
         .run()
         .await
-        .map_err(DaemonRunError::Boot)
+        .map_err(DaemonRunError::Run)
 }
 
 /// Builds [`BootOptions`] from `config` and the `daemon` subcommand's own
@@ -117,11 +130,19 @@ pub fn boot_options(config: &DaemonConfig, args: &DaemonArgs) -> BootOptions {
     }
 }
 
-/// Maps a boot failure to the process exit status the parent will read.
+/// Maps a boot or run failure to the process exit status the parent will
+/// read.
 ///
 /// [`BootError`] is not `#[non_exhaustive]` and has exactly four variants,
-/// so this matches it exhaustively rather than carrying a `_` arm that
-/// would silently absorb a fifth variant added later.
+/// so the [`DaemonRunError::Boot`] arm matches it exhaustively rather than
+/// carrying a `_` arm that would silently absorb a fifth variant added
+/// later. [`DaemonRunError::Run`] maps unconditionally to
+/// [`ExitCode::Failure`] rather than re-inspecting the inner `BootError`:
+/// `RunningDaemon::run()`'s own `# Errors` section names only
+/// `BootError::Io`, so `AlreadyRunning` — the one variant with its own
+/// dedicated code — can only ever come from the [`DaemonRunError::Boot`]
+/// arm, where a daemon has not yet claimed the flock; a daemon that already
+/// served has no "already running" outcome left to report.
 #[must_use]
 pub fn daemon_exit_code(err: &DaemonRunError) -> ExitCode {
     match err {
@@ -132,6 +153,7 @@ pub fn daemon_exit_code(err: &DaemonRunError) -> ExitCode {
                 ExitCode::Failure
             }
         },
+        DaemonRunError::Run(_) => ExitCode::Failure,
     }
 }
 
@@ -169,7 +191,7 @@ mod tests {
 
     #[test]
     fn already_running_gets_its_own_exit_code_and_everything_else_is_failure() {
-        use DaemonRunError::{Boot, Config};
+        use DaemonRunError::{Boot, Config, Run};
         assert_eq!(
             daemon_exit_code(&Boot(BootError::AlreadyRunning { pid: Some(7) })),
             ExitCode::DaemonAlreadyRunning
@@ -180,6 +202,18 @@ mod tests {
         );
         assert_eq!(
             daemon_exit_code(&Boot(BootError::Io {
+                path: "/x".into(),
+                source: std::io::Error::other("x"),
+            })),
+            ExitCode::Failure
+        );
+        // A teardown failure reported through `Run` stays `Failure` even
+        // when it wraps the same `BootError::Io` variant that, through
+        // `Boot`, can share the value with other `Failure`-mapped
+        // variants — `Run` never earns `DaemonAlreadyRunning`, because a
+        // daemon that already served has no such outcome left to report.
+        assert_eq!(
+            daemon_exit_code(&Run(BootError::Io {
                 path: "/x".into(),
                 source: std::io::Error::other("x"),
             })),
@@ -198,5 +232,33 @@ mod tests {
             ))),
             ExitCode::InvalidConfig
         );
+    }
+
+    /// `Boot` and `Run` must not say the same thing about *when* the
+    /// failure happened — that distinction is the whole reason `Run`
+    /// exists (see the enum's own doc): a daemon that served for a week and
+    /// then failed during teardown must not be reported as having "failed
+    /// to boot".
+    #[test]
+    fn boot_and_run_report_different_phases_for_the_same_underlying_error() {
+        use DaemonRunError::{Boot, Run};
+        let io_err = || BootError::Io {
+            path: "/x".into(),
+            source: std::io::Error::other("x"),
+        };
+        let boot_msg = Boot(io_err()).to_string();
+        let run_msg = Run(io_err()).to_string();
+        // Both wrap the same `BootError`, whose own `Display` still says
+        // "boot step failed" regardless of phase — that wording lives in
+        // shep-daemon, off-limits for this fix (see this enum's own doc).
+        // What must differ is `DaemonRunError`'s own outer wording: only
+        // `Boot` may claim the daemon "failed to boot".
+        assert_ne!(boot_msg, run_msg);
+        assert!(boot_msg.starts_with("the shepherd failed to boot"));
+        assert!(
+            !run_msg.starts_with("the shepherd failed to boot"),
+            "a run-phase failure must not still claim to be a boot failure: {run_msg:?}"
+        );
+        assert!(run_msg.starts_with("the shepherd failed while running"));
     }
 }

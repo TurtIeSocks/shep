@@ -28,6 +28,16 @@ use shep_core::paths::ShepPaths;
 /// `ENOENT` and the daemon never starts. Do not remove it as
 /// "redundant" — that is the exact failure this exists to prevent.
 ///
+/// The `.mode(shep_daemon::boot::DIR_MODE)` below sets the directory's mode
+/// at creation, via `DirBuilderExt`, rather than `create_dir_all` followed
+/// by a separate `set_permissions` — matching
+/// `shep_daemon::boot::create_dir_at_dir_mode`'s own TOCTOU discipline. A
+/// create-then-chmod sequence leaves a window in which the directory exists
+/// at whatever the ambient umask allows before the chmod narrows it; on a
+/// shared machine that window is enough for another user to open a handle
+/// that survives the later chmod. Requesting the mode at `mkdir` time
+/// leaves no such window. Do not "simplify" this to `create_dir_all`.
+///
 /// # Errors
 /// - The log directory could not be created.
 /// - Either log file could not be opened for writing.
