@@ -118,6 +118,10 @@ pub(crate) enum Msg {
     RestartDue {
         /// The sheep's id.
         id: u32,
+        /// The sheep's `SheepSlot::epoch` at scheduling time. Ignored if it
+        /// no longer matches the slot's current epoch — a stale timer left
+        /// behind by a respawn that happened in the meantime (IMPORTANT-3).
+        epoch: u64,
     },
     /// The sheep's shepherd channel reported readiness.
     ///
@@ -294,6 +298,7 @@ pub fn spawn_supervisor<R: ProcessRunner>(
         sheep: HashMap::new(),
         next_id: 0,
         pending: Vec::new(),
+        shutting_down: false,
     };
     tokio::spawn(actor.run(rx));
     SupervisorHandle { tx }
@@ -336,6 +341,11 @@ struct SheepSlot {
     ctl: Option<mpsc::Sender<SheepCtl>>,
     /// Which manual command (if any) is waiting on this sheep's next exit.
     manual: Option<ManualKind>,
+    /// Bumped on every successful respawn (IMPORTANT-3). A `RestartDue`
+    /// timer carries the epoch it was scheduled under; `handle_restart_due`
+    /// drops one whose epoch no longer matches — a stale timer left behind
+    /// by a respawn (manual or automatic) that happened in the meantime.
+    epoch: u64,
 }
 
 /// Where a deferred `Stop`/`Restart`/`Delete`/`Shutdown` reply eventually
@@ -382,6 +392,11 @@ struct Actor<R: ProcessRunner> {
     next_id: u32,
     /// Deferred command replies still waiting on matched sheep.
     pending: Vec<PendingReply>,
+    /// Set once a `Shutdown` command starts (CRITICAL-1). While `true`:
+    /// `Start`/`Restart` are rejected outright and `RestartDue` respawns
+    /// nothing — nothing is allowed to spawn a child the shutdown
+    /// aggregation (fixed at the moment it ran) doesn't know to kill.
+    shutting_down: bool,
 }
 
 impl<R: ProcessRunner> Actor<R> {
@@ -392,10 +407,13 @@ impl<R: ProcessRunner> Actor<R> {
     async fn run(mut self, mut rx: mpsc::Receiver<Msg>) {
         while let Some(msg) = rx.recv().await {
             let should_break = match msg {
-                Msg::Command(cmd) => self.handle_command(cmd).await,
+                // Sync now (CRITICAL-2): nothing left in the command path
+                // ever awaits — `try_send` replaced the one blocking
+                // `.await` that could park the actor on a busy sheep task.
+                Msg::Command(cmd) => self.handle_command(cmd),
                 Msg::Exited { id, outcome } => self.handle_exited(id, outcome),
-                Msg::RestartDue { id } => {
-                    self.handle_restart_due(id);
+                Msg::RestartDue { id, epoch } => {
+                    self.handle_restart_due(id, epoch);
                     false
                 }
                 Msg::Ready { id } => {
@@ -409,10 +427,18 @@ impl<R: ProcessRunner> Actor<R> {
         }
     }
 
-    async fn handle_command(&mut self, cmd: Command) -> bool {
+    fn handle_command(&mut self, cmd: Command) -> bool {
         match cmd {
+            // CRITICAL-1: Start is rejected outright once shutdown has
+            // begun — it would register + spawn a child the shutdown
+            // aggregation (computed from `online` ids at the moment it ran)
+            // can never know to kill, orphaning it after the actor exits.
             Command::Start { apps, reply } => {
-                let result = self.do_start(apps);
+                let result = if self.shutting_down {
+                    Err(SupervisorError::EngineStopped)
+                } else {
+                    self.do_start(apps)
+                };
                 let _ = reply.send(result);
                 false
             }
@@ -421,21 +447,26 @@ impl<R: ProcessRunner> Actor<R> {
                 false
             }
             Command::Stop { selector, reply } => {
-                self.begin_manual(selector, ManualKind::Stop, ReplyKind::Info(reply))
-                    .await;
+                self.begin_manual(selector, ManualKind::Stop, ReplyKind::Info(reply));
                 false
             }
+            // CRITICAL-1: Restart is rejected outright once shutdown has
+            // begun, for the same reason as Start — its forced respawn
+            // (handle_exited's manual-Restart branch, or apply_immediate's)
+            // would spawn a child outside the shutdown aggregation.
             Command::Restart { selector, reply } => {
-                self.begin_manual(selector, ManualKind::Restart, ReplyKind::Info(reply))
-                    .await;
+                if self.shutting_down {
+                    send_reply(ReplyKind::Info(reply), Err(SupervisorError::EngineStopped));
+                } else {
+                    self.begin_manual(selector, ManualKind::Restart, ReplyKind::Info(reply));
+                }
                 false
             }
             Command::Delete { selector, reply } => {
-                self.begin_manual(selector, ManualKind::Delete, ReplyKind::Ids(reply))
-                    .await;
+                self.begin_manual(selector, ManualKind::Delete, ReplyKind::Ids(reply));
                 false
             }
-            Command::Shutdown { reply } => self.begin_shutdown(reply).await,
+            Command::Shutdown { reply } => self.begin_shutdown(reply),
         }
     }
 
@@ -504,6 +535,7 @@ impl<R: ProcessRunner> Actor<R> {
                         entry,
                         ctl: Some(ctl),
                         manual: None,
+                        epoch: 0,
                     },
                 );
                 self.emit(ProcessEventKind::Start, info.clone(), true);
@@ -528,6 +560,7 @@ impl<R: ProcessRunner> Actor<R> {
                         entry,
                         ctl: None,
                         manual: None,
+                        epoch: 0,
                     },
                 );
                 self.emit(ProcessEventKind::Errored, info, true);
@@ -566,6 +599,10 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.entry.started_at = Some(tokio::time::Instant::now());
                 slot.entry.restarts += 1;
                 slot.ctl = Some(ctl);
+                // IMPORTANT-3: a new process now exists for this id — any
+                // RestartDue timer scheduled before this point (targeting
+                // the process this replaced) is stale the moment it fires.
+                slot.epoch += 1;
                 let info = to_info(&slot.entry);
                 self.emit(ProcessEventKind::Restart, info.clone(), manually);
                 info
@@ -591,12 +628,15 @@ impl<R: ProcessRunner> Actor<R> {
 
     /// Resolves `selector`, then either defers to each matched sheep's next
     /// exit (if running) or applies the command immediately (if not).
-    async fn begin_manual(
-        &mut self,
-        selector: ProcessSelector,
-        kind: ManualKind,
-        reply: ReplyKind,
-    ) {
+    ///
+    /// Mixed selectors (some matched ids already terminal, some still
+    /// running) are handled uniformly: immediate results are collected into
+    /// `results` up front and folded into the SAME `PendingReply` as the
+    /// deferred ids, so the reply carries every match and only fires once
+    /// the last running one goes terminal too (confirmed by probe C's
+    /// equivalent scenario — no code change needed there, this comment is
+    /// the "why it already works").
+    fn begin_manual(&mut self, selector: ProcessSelector, kind: ManualKind, reply: ReplyKind) {
         let matched: Vec<u32> = self
             .sheep
             .iter()
@@ -619,13 +659,40 @@ impl<R: ProcessRunner> Actor<R> {
         for id in matched {
             let is_running = self.sheep.get(&id).is_some_and(|slot| slot.ctl.is_some());
             if is_running {
-                let ctl = {
+                // IMPORTANT-4: chosen semantics — the FIRST manual command
+                // to reach a running sheep owns its `manual` marker and its
+                // one live Kill; a later command racing in against the SAME
+                // in-flight kill (this sheep already has `manual.is_some()`)
+                // does not overwrite that marker or send a second Kill — it
+                // just joins `remaining` and rides the same eventual
+                // Msg::Exited to whatever terminal state the FIRST command's
+                // intent produces. A `stop()` that lands first still wins
+                // over a racing `restart()`, and vice versa; both callers
+                // get the SAME honest terminal snapshot instead of one of
+                // them being lied to (the old last-writer-wins bug handed a
+                // `stop()` caller back an `Online` `ProcessInfo`).
+                let already_in_flight = self
+                    .sheep
+                    .get(&id)
+                    .is_some_and(|slot| slot.manual.is_some());
+                if !already_in_flight {
                     let slot = self.sheep.get_mut(&id).expect("checked is_running above");
                     slot.manual = Some(kind);
-                    slot.ctl.clone()
-                };
-                if let Some(ctl) = ctl {
-                    let _ = ctl.send(SheepCtl::Kill).await;
+                    // CRITICAL-2: try_send, never `.await`. The sheep task
+                    // stops draining its ctl mailbox the moment it starts
+                    // the kill ladder, so a blocking send here could park
+                    // the actor for up to `kill_timeout` — or, with the
+                    // mailbox-full tail (a flood of commands after this
+                    // one), deadlock forever (actor parked in `ctl.send()`,
+                    // sheep parked in `actor_tx.send()`, neither drains the
+                    // other). `Full`/`Closed` are both fine to ignore: a
+                    // Kill already queued means the ladder is already
+                    // running (a second would be redundant); `Closed` means
+                    // the sheep already exited and its own `Msg::Exited` is
+                    // already in flight (or about to be).
+                    if let Some(ctl) = &slot.ctl {
+                        let _ = ctl.try_send(SheepCtl::Kill);
+                    }
                 }
                 remaining.insert(id);
             } else if let Some(info) = self.apply_immediate(id, kind) {
@@ -652,15 +719,24 @@ impl<R: ProcessRunner> Actor<R> {
         match kind {
             ManualKind::Stop => {
                 let slot = self.sheep.get_mut(&id)?;
-                if slot.entry.status == ProcStatus::WaitingRestart {
-                    // Cancels the pending restart: `handle_restart_due` only
-                    // respawns an id still in `WaitingRestart`.
-                    slot.entry.status = ProcStatus::Stopped;
-                    let info = to_info(&slot.entry);
-                    self.emit(ProcessEventKind::Stop, info.clone(), true);
-                    Some(info)
-                } else {
-                    Some(to_info(&slot.entry))
+                match slot.entry.status {
+                    // WaitingRestart: cancels the pending restart —
+                    // `handle_restart_due` only respawns an id still in
+                    // WaitingRestart (and, since IMPORTANT-3, only a
+                    // still-current epoch).
+                    //
+                    // Errored (MINOR-5, pm2 parity): `stop` on an
+                    // already-errored sheep still lands it in `Stopped`
+                    // rather than being a silent no-op — matches pm2's
+                    // `stop` clearing the errored flag instead of leaving
+                    // the sheep in limbo.
+                    ProcStatus::WaitingRestart | ProcStatus::Errored => {
+                        slot.entry.status = ProcStatus::Stopped;
+                        let info = to_info(&slot.entry);
+                        self.emit(ProcessEventKind::Stop, info.clone(), true);
+                        Some(info)
+                    }
+                    _ => Some(to_info(&slot.entry)),
                 }
             }
             ManualKind::Delete => {
@@ -680,7 +756,16 @@ impl<R: ProcessRunner> Actor<R> {
     /// `Stop` does; returns `true` (break the actor loop) once there was
     /// nothing to wait on, or once the deferred reply's own resolution says
     /// so (propagated back from [`Self::handle_exited`]).
-    async fn begin_shutdown(&mut self, reply: oneshot::Sender<()>) -> bool {
+    ///
+    /// CRITICAL-1: sets `shutting_down` FIRST, before computing `online` —
+    /// every check against it downstream (`Start`/`Restart` rejection,
+    /// `handle_restart_due`'s guard) is only meaningful if no new sheep can
+    /// register and no `WaitingRestart` sheep can respawn from this point
+    /// on, so nothing outside this snapshot of `online` can ever need
+    /// killing later.
+    fn begin_shutdown(&mut self, reply: oneshot::Sender<()>) -> bool {
+        self.shutting_down = true;
+
         let online: HashSet<u32> = self
             .sheep
             .iter()
@@ -694,13 +779,22 @@ impl<R: ProcessRunner> Actor<R> {
         }
 
         for &id in &online {
-            let ctl = {
+            // Same first-command-wins dedupe as `begin_manual` (IMPORTANT-4):
+            // an id already mid-kill from an earlier Stop/Restart/Delete
+            // keeps that command's `manual` marker and doesn't get a
+            // redundant Kill — it still joins `remaining` below either way.
+            let already_in_flight = self
+                .sheep
+                .get(&id)
+                .is_some_and(|slot| slot.manual.is_some());
+            if !already_in_flight {
                 let slot = self.sheep.get_mut(&id).expect("checked online above");
                 slot.manual = Some(ManualKind::Stop);
-                slot.ctl.clone()
-            };
-            if let Some(ctl) = ctl {
-                let _ = ctl.send(SheepCtl::Kill).await;
+                // CRITICAL-2: try_send — see `begin_manual` for why this
+                // must never be a blocking `.await`.
+                if let Some(ctl) = &slot.ctl {
+                    let _ = ctl.try_send(SheepCtl::Kill);
+                }
             }
         }
 
@@ -725,18 +819,33 @@ impl<R: ProcessRunner> Actor<R> {
         slot.entry.pid = None;
         let manual = slot.manual.take();
         let Some(started_at) = slot.entry.started_at.take() else {
+            // MINOR-7: shouldn't happen (a duplicate Msg::Exited would
+            // violate the one-exit-path invariant) — but resolve any
+            // pending reply waiting on this id with a best-effort snapshot
+            // instead of leaving its caller parked on `.await` forever.
             tracing::warn!(
                 id,
                 "Msg::Exited for an entry with no started_at (duplicate?)"
             );
-            return false;
+            let info = to_info(&self.sheep.get(&id).expect("checked above").entry);
+            return self.resolve_pending(id, info);
         };
         let uptime = tokio::time::Instant::now().saturating_duration_since(started_at);
 
-        // A manual Restart always forces a respawn (spec §4: manual action
-        // resets budget), regardless of what `decide_on_exit` would say —
-        // `manual_stop = true` would otherwise make it choose CleanStop.
-        if manual == Some(ManualKind::Restart) {
+        // A manual Restart normally forces a respawn (spec §4: manual
+        // action resets budget), regardless of what `decide_on_exit` would
+        // say — `manual_stop = true` would otherwise make it choose
+        // CleanStop. CRITICAL-1: NOT while shutting down, though — this
+        // branch can still be reached then (a Restart that landed and sent
+        // its Kill just before Shutdown began; Shutdown's own dedupe skips
+        // sending a second Kill for an id whose `manual` is already set),
+        // and respawning here would spawn a child outside the shutdown
+        // aggregation's `online` snapshot, orphaning it exactly like the
+        // rejected-at-the-command-level cases. Falling through instead: with
+        // `manual.is_some()` true, `decide_on_exit` always resolves to
+        // CleanStop, landing the sheep in `Stopped` — an honest answer for
+        // a restart request that lost the race to a shutdown.
+        if manual == Some(ManualKind::Restart) && !self.shutting_down {
             slot.entry.budget.reset();
             let info = self.respawn(id, true);
             return self.resolve_pending(id, info);
@@ -757,7 +866,11 @@ impl<R: ProcessRunner> Actor<R> {
             Decision::Restart { delay } => {
                 let info = self.set_status(id, ProcStatus::WaitingRestart);
                 self.emit(ProcessEventKind::Exit, info.clone(), false);
-                self.schedule_restart(id, delay);
+                // IMPORTANT-3: capture the CURRENT epoch so the timer this
+                // schedules can tell, when it fires, whether it's still the
+                // authoritative one for this id (see `respawn`/`SheepSlot`).
+                let epoch = self.sheep.get(&id).expect("checked above").epoch;
+                self.schedule_restart(id, epoch, delay);
                 info
             }
             Decision::Errored => {
@@ -786,14 +899,30 @@ impl<R: ProcessRunner> Actor<R> {
         self.resolve_pending(id, info)
     }
 
-    /// A scheduled restart's backoff elapsed. Guarded on the entry still
-    /// being `WaitingRestart`: a manual command may have intercepted it
-    /// (see `apply_immediate`'s `Stop` case), making this a stale timer.
-    fn handle_restart_due(&mut self, id: u32) {
+    /// A scheduled restart's backoff elapsed. Guarded on:
+    ///
+    /// 1. NOT shutting down (CRITICAL-1) — a graceful shutdown in progress
+    ///    forbids any new spawn, full stop; nothing here would be part of
+    ///    the shutdown aggregation's `online` snapshot, so it would leak.
+    /// 2. The entry still being `WaitingRestart` — a manual command may
+    ///    have intercepted it (see `apply_immediate`'s `Stop` case),
+    ///    making this a stale timer.
+    /// 3. Its epoch still matching the slot's current one (IMPORTANT-3) — a
+    ///    respawn that happened after this timer was scheduled (a manual
+    ///    restart during the wait, most commonly) makes it stale too, even
+    ///    though the status check above wouldn't catch it (the sheep is
+    ///    legitimately `WaitingRestart` again, just under a NEWER backoff).
+    fn handle_restart_due(&mut self, id: u32, epoch: u64) {
+        if self.shutting_down {
+            return;
+        }
         let Some(slot) = self.sheep.get(&id) else {
             return;
         };
         if slot.entry.status != ProcStatus::WaitingRestart {
+            return;
+        }
+        if slot.epoch != epoch {
             return;
         }
         self.respawn(id, false);
@@ -802,13 +931,13 @@ impl<R: ProcessRunner> Actor<R> {
     /// Spawns the backoff timer for a scheduled restart; `None` still hops
     /// through a task + mailbox send rather than respawning inline, so
     /// "immediate" restarts remain observable as a distinct scheduling step.
-    fn schedule_restart(&self, id: u32, delay: Option<Duration>) {
+    fn schedule_restart(&self, id: u32, epoch: u64, delay: Option<Duration>) {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
-            let _ = tx.send(Msg::RestartDue { id }).await;
+            let _ = tx.send(Msg::RestartDue { id, epoch }).await;
         });
     }
 
@@ -929,6 +1058,14 @@ fn spawn_sheep_task<P: RunningProcess>(
 /// lifetime and drains every `ProcIo` channel. Exactly one of the first two
 /// `select!` branches ever fires per proc — that's the one-exit-path
 /// invariant — after which the task reports `Msg::Exited` and returns.
+///
+/// A natural exit racing an in-flight `Kill` (both `proc.wait()` and
+/// `ctl_rx.recv()` ready in the same poll) can't produce two `Msg::Exited`s
+/// or hang a caller: `tokio::select!` picks exactly one ready branch per
+/// iteration, that branch alone runs `kill_process`-or-not and `break`s, and
+/// the loop never revisits the other. Whichever branch wins, the caller's
+/// deferred reply resolves off that ONE `Msg::Exited` the same way either
+/// way (verified under stress — 300 same-tick spawn/stop races, no hang).
 ///
 /// The `logs`/`from_child`/`ctl` branches each carry an `if <channel>_open`
 /// guard, flipped to `false` the moment that channel closes: without it, a
@@ -1223,5 +1360,265 @@ mod tests {
         handle.shutdown().await; // kill ladder on every online sheep, then stop
         // After shutdown the handle's channel is closed; further commands error.
         assert!(handle.list_checked().await.is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // Concurrency regression guards (opus review, fix round 2026-08-07).
+    // Promoted from the reviewer's probe suite (probes A, B, H, I, K, L) —
+    // the 9 tests above are structurally incapable of reaching any of these:
+    // every one needs either a second in-flight command racing the first,
+    // or a timer/channel left pending across a state transition, neither of
+    // which the locked 9-test suite's single-command-at-a-time shape
+    // produces.
+    // ---------------------------------------------------------------
+
+    async fn drain_kinds(
+        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+    ) -> Vec<(u32, ProcessEventKind)> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let BusEvent::Process { event, info, .. } = ev {
+                out.push((info.id, event));
+            }
+        }
+        out
+    }
+
+    // CRITICAL-1 (probe A): a pending RestartDue timer for a waiting-restart
+    // sheep must not respawn a child once shutdown has begun — that child
+    // would never be part of the shutdown's `online` snapshot and so would
+    // never be killed.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_ignores_a_pending_restart_timer() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(1024);
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::const_exit(1),     // crash: instant exit -> waiting-restart
+            ProcScript::ignores_signals(), // web: full 1600ms kill ladder
+            ProcScript::never_exits(),     // the ghost respawn, if CRITICAL-1 regresses
+        ]);
+        let handle = spawn_supervisor(runner, test_paths(), events);
+        let mut crash = AppConfig::minimal("crash", "./boom");
+        crash.exp_backoff_restart_delay = Some("500".parse().unwrap());
+        let web = AppConfig::minimal("web", "./srv");
+        handle
+            .start(vec![normalize(crash).unwrap(), normalize(web).unwrap()])
+            .await
+            .unwrap();
+        // id 0 is now waiting-restart with a 500ms timer pending.
+        await_event(&mut rx, 0, ProcessEventKind::Exit).await;
+
+        handle.shutdown().await; // web's ladder burns 1600ms of virtual time
+
+        let seen = drain_kinds(&mut rx).await;
+        let ghost = seen
+            .iter()
+            .any(|(id, k)| *id == 0 && *k == ProcessEventKind::Restart);
+        assert!(
+            !ghost,
+            "GHOST RESPAWN during shutdown: events after shutdown = {seen:?}"
+        );
+    }
+
+    // CRITICAL-1 (probe H): a Start racing a concurrent Shutdown must never
+    // leave an un-killed child — either the actor processes Shutdown first
+    // (Start is then rejected outright) or Start lands first (Shutdown's
+    // `online` snapshot, computed afterward, catches it).
+    #[tokio::test(start_paused = true)]
+    async fn late_start_racing_shutdown_never_orphans() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(1024);
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::ignores_signals(), // web: 1600ms ladder
+            ProcScript::never_exits(),     // the late Start, if it lands before Shutdown
+        ]);
+        let handle = spawn_supervisor(runner, test_paths(), events);
+        let web = AppConfig::minimal("web", "./srv");
+        handle.start(vec![normalize(web).unwrap()]).await.unwrap();
+
+        let h2 = handle.clone();
+        let late = tokio::spawn(async move {
+            let app = AppConfig::minimal("late", "./l");
+            h2.start(vec![normalize(app).unwrap()]).await
+        });
+        handle.shutdown().await;
+        let outcome = late.await.unwrap();
+
+        let seen = drain_kinds(&mut rx).await;
+        match outcome {
+            Err(SupervisorError::EngineStopped) => {} // rejected: no orphan possible
+            Ok(infos) => {
+                let late_id = infos[0].id;
+                assert!(
+                    seen.iter().any(|(id, k)| *id == late_id
+                        && matches!(k, ProcessEventKind::Stop | ProcessEventKind::Exit)),
+                    "late Start raced ahead of shutdown but was never killed: events = {seen:?}"
+                );
+            }
+            Err(other) => panic!("unexpected error from a late Start during shutdown: {other:?}"),
+        }
+    }
+
+    // IMPORTANT-3 (probe B): a manual restart during a backoff wait leaves
+    // the ORIGINAL RestartDue timer scheduled; it must not fire later and
+    // short-circuit the NEW backoff the manual respawn's own eventual exit
+    // schedules.
+    #[tokio::test(start_paused = true)]
+    async fn stale_restart_timer_never_short_circuits_a_newer_backoff() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(1024);
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::const_exit(1),             // t=0 exit -> T1 @ 2000
+            ProcScript::stable_then_exit(1500, 1), // manual respawn, dies @1500 -> T2 @ 3500
+            ProcScript::never_exits(),             // whoever respawns first takes this
+            ProcScript::never_exits(),
+        ]);
+        let handle = spawn_supervisor(runner, test_paths(), events);
+        let mut app = AppConfig::minimal("crash", "./boom");
+        app.exp_backoff_restart_delay = Some("2000".parse().unwrap());
+        app.min_uptime = "5000".parse().unwrap(); // 1500ms uptime counts as unstable
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        await_event(&mut rx, 0, ProcessEventKind::Exit).await; // waiting-restart, T1 @ 2000
+
+        let out = handle.restart(ProcessSelector::All).await.unwrap();
+        assert_eq!(
+            out[0].status,
+            ProcStatus::Online,
+            "manual restart respawned"
+        );
+
+        // t=1500 the respawn dies -> waiting-restart with a NEW timer @ 3500.
+        // The correct next respawn is at 3500. Look at the world at t=2500.
+        tokio::time::advance(Duration::from_millis(2500)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let info = handle.list().await.remove(0);
+        assert_eq!(
+            (info.status, info.restarts),
+            (ProcStatus::WaitingRestart, 1),
+            "at t=2500 the sheep should still be waiting on its 3500ms backoff; \
+             got {info:?} -- the stale 2000ms timer fired early"
+        );
+    }
+
+    // IMPORTANT-4 (probe I): Stop and Restart racing on the same running
+    // sheep. Chosen semantics (see `begin_manual`'s doc comment): the first
+    // command to reach a running sheep owns its `manual` marker and its one
+    // live Kill; both callers get back the SAME honest terminal snapshot
+    // once it lands, instead of the old last-writer-wins bug handing the
+    // `stop()` caller an `Online` `ProcessInfo`.
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_stop_and_restart_agree_on_one_outcome() {
+        let (events, _rx) = tokio::sync::broadcast::channel(1024);
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::ignores_signals(), // 1600ms ladder: a wide race window
+            ProcScript::never_exits(),
+        ]);
+        let handle = spawn_supervisor(runner, test_paths(), events);
+        let app = AppConfig::minimal("svc", "./svc");
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+        let h2 = handle.clone();
+        let stopper = tokio::spawn(async move { h2.stop(ProcessSelector::All).await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let restarted = handle.restart(ProcessSelector::All).await.unwrap();
+        let stopped = stopper.await.unwrap().unwrap();
+
+        assert_eq!(
+            stopped[0].status,
+            ProcStatus::Stopped,
+            "stop() reported a non-stopped sheep"
+        );
+        assert_eq!(
+            restarted[0].status,
+            ProcStatus::Stopped,
+            "restart() lost the race to the earlier stop() but got a different \
+             answer than the stop() caller -- the two callers disagree about \
+             what happened to the same sheep"
+        );
+    }
+
+    // CRITICAL-2 (probe K): the actor must never block on a busy sheep's
+    // kill ladder. A flood of Stop commands against one sheep mid-kill must
+    // not delay processing an unrelated sheep's own, unrelated exit.
+    #[tokio::test(start_paused = true)]
+    async fn actor_never_blocks_behind_a_busy_kill_ladder() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(1024);
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::ignores_signals(),        // sheep a: 1600ms ladder
+            ProcScript::stable_then_exit(800, 0), // sheep b: exits at t=800
+        ]);
+        let handle = spawn_supervisor(runner, test_paths(), events);
+        let a = AppConfig::minimal("a", "./a");
+        let mut b = AppConfig::minimal("b", "./b");
+        b.autorestart = false;
+        handle
+            .start(vec![normalize(a).unwrap(), normalize(b).unwrap()])
+            .await
+            .unwrap();
+
+        let t0 = tokio::time::Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let h = handle.clone();
+            tasks.push(tokio::spawn(async move {
+                h.stop(ProcessSelector::Name("a".to_string())).await
+            }));
+        }
+        // Sheep b exits on its own at t=800 and is nobody's kill target.
+        await_event(&mut rx, 1, ProcessEventKind::Stop).await;
+        let seen_at = t0.elapsed();
+        for t in tasks {
+            let _ = t.await;
+        }
+        assert!(
+            seen_at < Duration::from_millis(1000),
+            "sheep b's own exit was only processed at {seen_at:?} -- the actor \
+             was parked inside ctl.send() for sheep a's kill ladder"
+        );
+    }
+
+    // CRITICAL-2 (probe L): the deadlock tail of the above. Actor parked in
+    // ctl.send() (ctl full) while the sheep task parks in actor_tx.send()
+    // (mailbox full) used to mean neither could ever make progress again.
+    #[tokio::test(start_paused = true)]
+    async fn mailbox_flood_during_a_kill_never_deadlocks() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(4096);
+        let runner = ScriptedRunner::new(vec![ProcScript::ignores_signals()]);
+        let handle = spawn_supervisor(runner, test_paths(), events);
+        let a = AppConfig::minimal("a", "./a");
+        handle.start(vec![normalize(a).unwrap()]).await.unwrap();
+
+        for _ in 0..8 {
+            let h = handle.clone();
+            tokio::spawn(async move {
+                let _ = h.stop(ProcessSelector::All).await;
+            });
+        }
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+        }
+        // Stuff the 256-slot mailbox while the actor is (formerly) parked on
+        // ctl.send().
+        for _ in 0..400 {
+            let h = handle.clone();
+            tokio::spawn(async move {
+                let _ = h.list_checked().await;
+            });
+        }
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+
+        let r = tokio::time::timeout(
+            Duration::from_secs(600),
+            await_event(&mut rx, 0, ProcessEventKind::Stop),
+        )
+        .await;
+        assert!(
+            r.is_ok(),
+            "DEADLOCK: actor parked in ctl.send() while the sheep task is \
+             parked in actor_tx.send() -- the daemon never recovers"
+        );
     }
 }
