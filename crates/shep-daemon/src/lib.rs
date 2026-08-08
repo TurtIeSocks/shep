@@ -26,6 +26,7 @@
 //! ##### OS tier
 //!
 //! - [`tokio_runner`]: real [`ProcessRunner`](runner::ProcessRunner) over `tokio::process` (unix-only)
+//! - [`server`]: the unix-socket connection layer — peer-cred auth, handshake, subscriptions (unix-only)
 //!
 //! ##### Orchestration
 //!
@@ -202,6 +203,16 @@ pub(crate) mod testing {
 /// platform; only this OS tier is gated out on Windows.
 #[cfg(unix)]
 pub mod tokio_runner;
+
+/// The unix-domain-socket connection layer: peer-cred auth, handshake,
+/// subscriptions — shep's privilege boundary.
+///
+/// Unix-only for the same reason as [`tokio_runner`]: it is built on
+/// `tokio::net`'s unix-socket types. Task 4's [`rpc`] dispatcher (and
+/// everything it calls) stays portable; this module is the thing that
+/// actually opens a socket.
+#[cfg(unix)]
+pub mod server;
 
 /// Deterministic scripted [`ProcessRunner`](runner::ProcessRunner), reused by
 /// this crate's own tests and (behind `test-fakes`) by Phase 2b's tests.
