@@ -47,6 +47,7 @@ pub enum StopSignal {
 
 impl StopSignal {
     /// The raw unix signal number
+    #[inline]
     #[must_use]
     pub fn as_raw(self) -> i32 {
         match self {
