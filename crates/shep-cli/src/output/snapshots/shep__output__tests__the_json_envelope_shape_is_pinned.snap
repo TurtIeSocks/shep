@@ -1,0 +1,43 @@
+---
+source: crates/shep-cli/src/output/mod.rs
+expression: out
+---
+{
+  "schema_version": 1,
+  "command": "flock",
+  "data": [
+    {
+      "id": 1,
+      "name": "web",
+      "status": "online",
+      "pid": 1001,
+      "restarts": 1,
+      "uptime_ms": 60000,
+      "fold": "backend",
+      "out_file": "/logs/web-0-out.log",
+      "err_file": "/logs/web-0-err.log"
+    },
+    {
+      "id": 2,
+      "name": "worker",
+      "status": "online",
+      "pid": 1002,
+      "restarts": 2,
+      "uptime_ms": 120000,
+      "fold": "backend",
+      "out_file": "/logs/worker-0-out.log",
+      "err_file": "/logs/worker-0-err.log"
+    },
+    {
+      "id": 3,
+      "name": "cron",
+      "status": "online",
+      "pid": 1003,
+      "restarts": 3,
+      "uptime_ms": 30000,
+      "fold": "backend",
+      "out_file": "/logs/cron-0-out.log",
+      "err_file": "/logs/cron-0-err.log"
+    }
+  ]
+}

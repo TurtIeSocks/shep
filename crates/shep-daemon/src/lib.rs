@@ -227,31 +227,24 @@ pub(crate) mod testing {
     use crate::snapshot::FlockRegistry;
     use crate::supervisor::spawn_supervisor;
 
-    /// Serializes any test, anywhere in this crate, that closes a real OS
-    /// descriptor and then acts again on that SAME learned number (adopting
-    /// it a second time).
-    ///
-    /// fd numbers are process-wide and Rust's default test harness runs
-    /// `#[test]`/`#[tokio::test]` functions on separate threads
-    /// concurrently, so two such tests can race the kernel's own
-    /// lowest-available-fd allocation: one test's "now closed, expect
-    /// refusal" window can get a DIFFERENT, concurrently running test's own
-    /// live fd handed back to it instead, and touching that number closes
-    /// the other test's resource out from under it. Found empirically
-    /// (Opus review follow-up, 2026-08-08) as a genuine, non-deterministic
-    /// `SIGABRT` (`fatal runtime error: IO Safety violation: owned file
-    /// descriptor already closed`) between `sys.rs`'s own two fd-adoption
-    /// tests, roughly 1-in-a-few-dozen parallel runs — not a flaky
-    /// assertion, a real double-close.
-    ///
-    /// `#[cfg(unix)]`: its only users, `sys.rs`, are unix-only themselves.
-    /// (Not itself proof against every fd-collision risk in this crate — a
-    /// similarly-shaped `boot.rs` test was tried, found to measurably raise
-    /// the WHOLE suite's collision odds against unrelated tests elsewhere
-    /// in the crate that also churn real fds, and removed rather than kept
-    /// under this lock; see `boot.rs`'s own comment at that call site.)
-    #[cfg(unix)]
-    pub(crate) static FD_REUSE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // `FD_REUSE_LOCK` lived here until 2026-08-08. It serialized the tests
+    // that close a real descriptor and then re-probe that same number, to
+    // stop them racing the kernel's lowest-available-fd allocation.
+    //
+    // It was removed because it could not work. A mutex only excludes the
+    // tests that TAKE it; every other test in the binary stayed free to open
+    // a file and be handed the just-closed number, after which `adopt_fd`'s
+    // `F_GETFD` probe legitimately succeeds and the adoption double-closes
+    // somebody else's descriptor. That is not hypothetical: it was
+    // reproduced WITH the lock in place, as `fatal runtime error: IO Safety
+    // violation: owned file descriptor already closed`, once in 25 saturated
+    // `--workspace --all-features` runs, taking the whole lib test binary
+    // down with SIGABRT.
+    //
+    // The fix is structural, not exclusive: `sys.rs`'s probe now parks on a
+    // high fd number (`F_DUPFD`), which the lowest-free allocation policy
+    // will not hand back while lower numbers remain free. See
+    // `a_closed_descriptor_is_refused_instead_of_adopted`.
 
     // WHY a shallow home: later tasks bind a UDS under `run/`, and sun_path
     // caps a socket path near 104 bytes. Using the tempdir root as

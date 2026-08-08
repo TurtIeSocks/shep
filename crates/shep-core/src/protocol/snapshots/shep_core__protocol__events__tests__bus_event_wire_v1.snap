@@ -1,6 +1,5 @@
 ---
 source: crates/shep-core/src/protocol/events.rs
-assertion_line: 121
 expression: events
 ---
 [
@@ -15,7 +14,9 @@ expression: events
         "pid": null,
         "restarts": 2,
         "uptime_ms": 500,
-        "fold": null
+        "fold": null,
+        "out_file": "/home/rin/.shep/logs/web-0-out.log",
+        "err_file": "/home/rin/.shep/logs/web-0-err.log"
       },
       "manually": false,
       "at_ms": 1700000000000

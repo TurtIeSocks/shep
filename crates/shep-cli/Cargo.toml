@@ -13,8 +13,56 @@ path = "src/main.rs"
 
 [dependencies]
 shep-core.workspace = true
+# Unconditional even though only its `#[cfg(unix)]` modules (`boot`, `sys`,
+# `tokio_runner`, `server`) are reachable here: the pure tier compiles on
+# every target, so the platform gate belongs on our `use` sites, not on this
+# dependency edge.
 shep-daemon.workspace = true
 shep-client.workspace = true
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "env", "wrap_help"] }
+# `default-features = false` is a no-op here — clap_complete's own default
+# feature set is empty — kept for consistency with the workspace rule.
+# `unstable-dynamic` is deliberately not enabled: dynamic completion is out
+# of scope for this phase.
+# Floor 4.6.0, not the crate's actual minimum: `CompletionArgs::shell` names
+# `clap_complete::aot::Shell`, and the `aot` module does not exist before
+# 4.6.0 (verified against the crates.io index by extracting each 4.x.0
+# release's `src/lib.rs` — 4.0.0 through 4.5.0 have no `aot` module at all;
+# `Shell` and `generate` sat at the crate root). `-Z minimal-versions` picks
+# 4.0.0 without this pin and fails with "cannot find `aot` in `clap_complete`".
+clap_complete = { version = "4.6.0", default-features = false }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
+# `EventStream` implements `futures_util::Stream`; the `.next()` method comes
+# from `futures_util::StreamExt`, which nothing else in this crate's
+# dependency graph re-exports (tokio dropped its own `StreamExt` at 1.0, and
+# shep-client's transitive futures-util is not nameable from here). The
+# Ctrl-C wiring (`tokio::signal::ctrl_c().map(|_| ())`) needs `FutureExt`
+# from the same crate.
+futures-util.workspace = true
+# `Render: Serialize` needs the trait and its derive, not just the
+# serializer — `serde_json` alone does not bring either.
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# The same shep-client the `[dependencies]` entry above pulls in, asking for
+# the hand-rolled daemon fakes this crate's command tests drive. A
+# dev-dependency, so the feature is on for the test targets and off for the
+# shipped binary.
+shep-client = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+# Snapshot coverage for `--format json` payloads.
+insta.workspace = true
+# The real-binary e2e tier (`tests/cli_e2e.rs`).
+assert_cmd.workspace = true
+predicates.workspace = true
+
+# A process-group assertion and a teardown Drop guard both need to signal a
+# real pid; same cfg(unix) dev-only shape shep-daemon uses. The workspace
+# default nix features (signal, process, user) already cover `getpgid` and
+# `kill`.
+[target.'cfg(unix)'.dev-dependencies]
+nix.workspace = true
 
 [lints]
 workspace = true

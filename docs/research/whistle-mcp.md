@@ -110,7 +110,11 @@ stay precise.
 
 ## 5. Hardest design decisions
 
-**D1 — MSRV: rmcp needs 1.88, workspace says 1.85 (IR-4).**
+**D1 — MSRV: rmcp needs 1.88, workspace said 1.85 (IR-4). RESOLVED
+2026-08-07 — option (a) taken, and forced earlier than this doc expected:
+serde-saphyr's let-chains made 1.88 a present-tense requirement, not a
+future one. Workspace `rust-version` and the CI matrix are both 1.88. See
+`refactor-workspace/decision-briefs.md`. Kept below for the reasoning.**
 Options: (a) bump workspace MSRV to 1.88; (b) bump only shep-cli's
 `rust-version`. **Recommend (a).** The shipped artifact is the shep-cli
 binary, so the effective MSRV is 1.88 either way; a split MSRV is a fiction

@@ -19,7 +19,7 @@ Priority when rules collide: **Readability > KISS > DRY** (Rin's global order).
   carries a `# Option:` / `# Option (enabled by default):` comment stating its
   consequence. Never a feature that removes behavior. Gate convenience layers,
   never core trait/type definitions.
-- **IR-4** Each publishable crate: `rust-version` (MSRV 1.85), `include = [...]`
+- **IR-4** Each publishable crate: `rust-version` (MSRV 1.88), `include = [...]`
   slim list, `[package.metadata.docs.rs]` with `all-features = true` +
   `--generate-link-to-definition` + the local repro command as a comment.
 - **IR-5** Benches: separate unpublished crate (`publish = false`, own

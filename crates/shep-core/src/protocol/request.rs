@@ -92,6 +92,30 @@ pub enum Request {
 
 /// Snapshot of one sheep for listings and events
 // wire format: changing this is a breaking change
+//
+// `out_file`/`err_file` are `Option<String>`, and both halves of that are
+// deliberate:
+//
+// String, not PathBuf. Every path already on this wire travels as a string
+// (`AppConfig::script`, `cwd`, `out_file`, `err_file`, all of which ride in
+// `Request::Start`), so this matches the established representation. It is
+// also the safer failure mode: serde's `PathBuf` impl REFUSES a non-UTF-8
+// path, and that refusal is not local — it aborts the whole `Reply`, so one
+// sheep with an odd log path would blank the entire `ListFlock` for every
+// other sheep. Lossy conversion daemon-side degrades exactly one field of
+// one sheep instead.
+//
+// Option, not a bare String. Semantically the daemon always resolves both
+// paths, so a required field is tempting. But the handshake only compares
+// `PROTOCOL_VERSION` (see shep-daemon's `server.rs`), and adding these
+// fields deliberately does NOT bump it — the evolution rule in this
+// module's parent says additive fields keep the version. A daemon built
+// before this field and a client built after it therefore both announce
+// protocol 1 and connect happily, and that daemon's replies carry no
+// `out_file` key at all. A required `String` would fail to deserialize
+// there, so a new client could not list against an old daemon. `None`
+// means precisely "this peer predates the field" — which readers must
+// render as unknown, NOT as "this sheep has no log file".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessInfo {
     /// Stable numeric id
@@ -108,6 +132,12 @@ pub struct ProcessInfo {
     pub uptime_ms: u64,
     /// Fold membership
     pub fold: Option<String>,
+    /// Resolved stdout log path: the app's explicit
+    /// [`AppConfig::out_file`] when it set one, else the daemon-derived
+    /// default. `None` only when the peer daemon predates this field.
+    pub out_file: Option<String>,
+    /// Resolved stderr log path, resolved exactly as [`Self::out_file`]
+    pub err_file: Option<String>,
 }
 
 /// One RPC response (pairs with [`Request`] variants)
@@ -197,6 +227,52 @@ pub enum RpcErrorCode {
     DeadlineExceeded,
 }
 
+impl RpcErrorCode {
+    /// Every variant, for code that needs to iterate them all.
+    ///
+    /// `#[non_exhaustive]` forces a `_` arm on any match written outside
+    /// this crate, which would silently swallow a variant added here and
+    /// never updated there (shep-cli's exit-code mapping test is the
+    /// motivating case — see `crates/shep-cli/src/exit.rs`). Downstream
+    /// crates should iterate `ALL` instead of hand-writing their own list
+    /// that the compiler can't check.
+    ///
+    /// Kept honest by a private `assert_all_lists_every_variant` fn right
+    /// below: read that doc for how a forgotten variant is caught here,
+    /// where `#[non_exhaustive]` has no effect.
+    pub const ALL: [Self; 6] = [
+        Self::NotFound,
+        Self::InvalidConfig,
+        Self::SpawnFailed,
+        Self::ProtocolMismatch,
+        Self::Internal,
+        Self::DeadlineExceeded,
+    ];
+
+    /// Never called; exists purely so this crate fails to build if a
+    /// variant is added to [`RpcErrorCode`] without also adding it to
+    /// [`Self::ALL`].
+    ///
+    /// `#[non_exhaustive]` only forces a wildcard arm on matches written
+    /// *outside* this crate — inside the crate that defines the enum, a
+    /// match with no `_` arm is still checked for exhaustiveness (E0004),
+    /// so a new variant breaks this build until it gets an arm here. Each
+    /// arm indexes a fixed literal position into [`Self::ALL`], so growing
+    /// the enum without growing the array is caught too: rustc denies an
+    /// out-of-bounds constant array index by default.
+    #[allow(dead_code)]
+    const fn assert_all_lists_every_variant(code: Self) -> Self {
+        match code {
+            Self::NotFound => Self::ALL[0],
+            Self::InvalidConfig => Self::ALL[1],
+            Self::SpawnFailed => Self::ALL[2],
+            Self::ProtocolMismatch => Self::ALL[3],
+            Self::Internal => Self::ALL[4],
+            Self::DeadlineExceeded => Self::ALL[5],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +289,8 @@ mod tests {
             restarts: 1,
             uptime_ms: 60_000,
             fold: Some("backend".to_string()),
+            out_file: Some("/home/rin/.shep/logs/web-0-out.log".to_string()),
+            err_file: Some("/home/rin/.shep/logs/web-0-err.log".to_string()),
         }
     }
 
@@ -323,6 +401,39 @@ mod tests {
         let fixture = r#"{"Ok":{"daemon_version":"0.1.0","protocol":1,"pid":4242}}"#;
         let ack: HelloReply = serde_json::from_str(fixture).unwrap();
         assert_eq!(ack.unwrap().pid, 4242);
+    }
+
+    #[test]
+    fn v1_process_info_without_log_paths_still_deserializes() {
+        // Committed byte fixture from before `out_file`/`err_file` existed
+        // (IR-35). The handshake only compares PROTOCOL_VERSION, which this
+        // addition deliberately did not bump, so a daemon built at this
+        // vintage still connects to a current client and sends exactly these
+        // bytes. Absent keys must land as `None`, not as a decode error.
+        let fixture = r#"{"id":3,"name":"web","status":"online","pid":4242,"restarts":1,"uptime_ms":60000,"fold":"backend"}"#;
+        let info: ProcessInfo = serde_json::from_str(fixture).unwrap();
+        assert_eq!(info.id, 3);
+        assert_eq!(info.out_file, None);
+        assert_eq!(info.err_file, None);
+    }
+
+    #[test]
+    fn an_old_client_still_decodes_a_new_process_info() {
+        // The other skew direction: a client built before the fields reads a
+        // current daemon's reply. `ProcessInfo` carries no
+        // `deny_unknown_fields` (unlike the config types in
+        // `crate::config`), so the two extra keys are ignored rather than
+        // refused — which is what makes this addition version-preserving.
+        #[derive(Deserialize)]
+        struct V1ProcessInfo {
+            id: u32,
+            fold: Option<String>,
+        }
+
+        let current = serde_json::to_string(&sample_info()).unwrap();
+        let old: V1ProcessInfo = serde_json::from_str(&current).unwrap();
+        assert_eq!(old.id, 3);
+        assert_eq!(old.fold.as_deref(), Some("backend"));
     }
 
     #[test]

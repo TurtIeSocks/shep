@@ -530,6 +530,14 @@ impl<R: ProcessRunner> Actor<R> {
         let id = self.next_id;
         self.next_id += 1;
 
+        // Kept off the assembled spec rather than recomputed: the assembler
+        // is the only place that knows whether the app set an explicit
+        // out_file/err_file or takes the merge_logs-dependent default, and
+        // these are the exact paths the child is about to write to. Both
+        // arms below register an entry, so both need them.
+        let out_file = spec.out_file.clone();
+        let err_file = spec.err_file.clone();
+
         match self.runner.spawn(&spec) {
             Ok((proc, io)) => {
                 let pid = proc.pid();
@@ -544,6 +552,8 @@ impl<R: ProcessRunner> Actor<R> {
                     budget: RestartBudget::default(),
                     reload: ReloadState::None,
                     credentials,
+                    out_file,
+                    err_file,
                 };
                 let info = to_info(&entry);
                 let ctl = spawn_sheep_task::<R::Proc>(
@@ -591,6 +601,8 @@ impl<R: ProcessRunner> Actor<R> {
                     budget: RestartBudget::default(),
                     reload: ReloadState::None,
                     credentials,
+                    out_file,
+                    err_file,
                 };
                 let info = to_info(&entry);
                 self.sheep.insert(
@@ -884,6 +896,24 @@ impl<R: ProcessRunner> Actor<R> {
                 id,
                 "Msg::Exited for an entry with no started_at (duplicate?)"
             );
+            // Deregistration is NOT reachable here today: `pending_delete`
+            // is only ever set for a sheep whose `ctl.is_some()` (see the
+            // `is_running` gate in `apply_manual`), which implies a live
+            // task and therefore `started_at.is_some()`; and the ONE exit
+            // that consumes the flag removes the slot outright, so a second
+            // `Msg::Exited` for that id lands in the unregistered-id branch
+            // above rather than here. Honoured anyway, because the cost is
+            // four lines and the alternative failure is silent: the
+            // `std::mem::take` above has already consumed both markers, so
+            // a future change to WHEN `pending_delete` is set would drop a
+            // Delete on the floor while telling its caller it succeeded.
+            if manual == Some(ManualKind::Delete) || pending_delete {
+                let mut removed = self.sheep.remove(&id).expect("checked above");
+                removed.entry.status = ProcStatus::Stopped;
+                let info = to_info(&removed.entry);
+                self.emit(ProcessEventKind::Delete, info.clone(), true);
+                return self.resolve_pending(id, info);
+            }
             let info = to_info(&self.sheep.get(&id).expect("checked above").entry);
             return self.resolve_pending(id, info);
         };
@@ -1096,6 +1126,11 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
         restarts: entry.restarts,
         uptime_ms,
         fold: entry.spec.config().fold.clone(),
+        // Lossy on purpose: `ProcessInfo` carries paths as strings, and a
+        // non-UTF-8 log path must not be allowed to fail serialization of
+        // the whole reply and blank the listing for every other sheep.
+        out_file: Some(entry.out_file.to_string_lossy().into_owned()),
+        err_file: Some(entry.err_file.to_string_lossy().into_owned()),
     }
 }
 
@@ -1239,6 +1274,58 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert!(list.iter().all(|i| i.status == ProcStatus::Online));
         assert_eq!(list.iter().map(|i| i.id).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listed_log_paths_are_the_derived_defaults() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let logs = paths.logs.clone();
+        let handle = spawn_supervisor(runner, paths, events);
+        handle
+            .start(vec![normalize(AppConfig::minimal("web", "./srv")).unwrap()])
+            .await
+            .unwrap();
+
+        let list = handle.list().await;
+        assert_eq!(
+            list[0].out_file.as_deref(),
+            logs.join("web-0-out.log").to_str()
+        );
+        assert_eq!(
+            list[0].err_file.as_deref(),
+            logs.join("web-0-err.log").to_str()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listed_log_paths_honour_an_explicit_out_file() {
+        // The entire reason `ProcessInfo` carries these: an explicit
+        // `out_file` may point anywhere on the filesystem, so a reader that
+        // guessed `logs/<name>-<instance>-out.log` from the convention would
+        // silently show nothing for this sheep. `err_file` is left unset in
+        // the same app on purpose — the two resolve independently, and
+        // pinning both here proves reporting one explicitly does not drag
+        // the other off its default.
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let logs = paths.logs.clone();
+        let handle = spawn_supervisor(runner, paths, events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.out_file = Some("/var/log/myapp.log".to_string());
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+        let list = handle.list().await;
+        assert_eq!(list[0].out_file.as_deref(), Some("/var/log/myapp.log"));
+        assert_eq!(
+            list[0].err_file.as_deref(),
+            logs.join("web-0-err.log").to_str(),
+            "err_file was not configured, so it must still be the default"
+        );
     }
 
     #[tokio::test(start_paused = true)]

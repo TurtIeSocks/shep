@@ -58,6 +58,8 @@ mod tests {
                 restarts: 0,
                 uptime_ms: 0,
                 fold: None,
+                out_file: Some("/home/rin/.shep/logs/web-0-out.log".to_string()),
+                err_file: Some("/home/rin/.shep/logs/web-0-err.log".to_string()),
             },
             manually: false,
             at_ms: 1_700_000_000_000,

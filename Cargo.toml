@@ -91,6 +91,48 @@ insta = { version = "1.18.1", default-features = false, features = ["json"] }
 tempfile = { version = "3", default-features = false }
 # Only shep-daemon (dev): property tests on the kill ladder / supervisor state machine.
 proptest = { version = "1", default-features = false, features = ["std"] }
+# For the event-bus subscription stream: `broadcast::Receiver` has no poll
+# API, so a hand-rolled `Stream::poll_next` over it either does not compile
+# or busy-spins on `try_recv` (which registers no waker).
+# `wrappers::BroadcastStream` is the upstream answer, gated behind the `sync`
+# feature, which does not exist before 0.1.3 — verified against the
+# crates.io index, where 0.1.0-0.1.2 declare only
+# `default`/`fs`/`io-util`/`net`/`time`. `BroadcastStreamRecvError` is
+# defined at tokio-stream-0.1.3/src/wrappers/broadcast.rs:22, so 0.1.3 is
+# the correct floor.
+tokio-stream = { version = "0.1.3", default-features = false, features = ["sync"] }
+# `shep-cli`'s dev-dependencies, for Task 12's real-binary e2e tier
+# (`crates/shep-cli/tests/cli_e2e.rs`). Neither crate has any call site yet —
+# this phase's other tasks land the assertions that actually exercise them —
+# so no feature beyond the bare crate is named; the task that writes the
+# first assertion adds whatever feature it needs (`regex`, `diff`, ...) with
+# its own comment. `default-features = false` already matches assert_cmd's
+# real default (neither of its two features, `color`/`color-auto`, is on by
+# default); for predicates it drops the upstream default set (`color`,
+# `diff`, `float-cmp`, `normalize-line-endings`, `regex`) down to nothing.
+assert_cmd = { version = "2", default-features = false }
+predicates = { version = "3", default-features = false }
+
+# Most debuginfo in `target/` is not ours: the default `debug = true` emits
+# full DWARF for every dependency and links a copy into each of the
+# workspace's test binaries. Line tables carry the backtraces a panicking
+# test prints; dependencies need none at all, since we do not step through
+# them.
+#
+# Measured on a clean build of this workspace (2026-08-08, 91 crates):
+# `target/debug` 899M -> 596M, a third smaller. Wall clock was 13s -> 12s,
+# i.e. noise at this size — the win here is disk, not time. Expect the gap
+# to widen as phases 4-6 add ratatui, sysinfo, rmcp and axum.
+#
+# Separately: a `target/` that has grown to tens of GB is accumulation
+# across feature combos and extra target dirs (`llvm-cov-target`,
+# `x86_64-pc-windows-gnu`), not one build. These settings do not shrink
+# that; `cargo clean` does.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [workspace.lints.rust]
 missing_docs = "deny"

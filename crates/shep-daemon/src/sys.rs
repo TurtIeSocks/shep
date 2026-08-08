@@ -198,18 +198,16 @@ impl core::error::Error for SysError {}
 mod tests {
     use super::*;
     use std::io::Read;
-    use std::os::unix::io::IntoRawFd;
-
-    // FD_REUSE_LOCK (crate::testing, IR-33's one shared fixture module):
-    // closing a real fd and then acting again on that SAME learned number
-    // races other concurrently-running tests over fd reuse — see that
-    // static's own doc for the real SIGABRT this crashed with before both
-    // tests below took the lock.
-    use crate::testing::FD_REUSE_LOCK;
+    use std::os::unix::io::{AsRawFd, IntoRawFd};
 
     #[test]
     fn a_real_inherited_descriptor_is_adopted_and_owned() {
-        let _guard = FD_REUSE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // No fd-reuse hazard here, and so no lock: this adopts a descriptor
+        // it just created and still holds open. Nothing is closed and then
+        // re-probed by number, which is the only shape that can race another
+        // test over fd reuse (see
+        // `a_closed_descriptor_is_refused_instead_of_adopted`).
+        //
         // into_raw_fd gives up std's ownership, which is exactly the state
         // an exec-inherited descriptor is in: live, and owned by nobody yet.
         let (parent, child) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -252,16 +250,41 @@ mod tests {
 
     #[test]
     fn a_closed_descriptor_is_refused_instead_of_adopted() {
-        let _guard = FD_REUSE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Park the probe on a HIGH descriptor number instead of whatever the
+        // kernel handed the pair. Unix allocates the LOWEST free fd, so once
+        // this one is closed below, no other concurrently-running test in
+        // this binary can be handed the number back ahead of the ~2048 lower
+        // free ones — which is what makes the second adoption a genuine
+        // BadFd probe rather than a race.
+        //
+        // This test used to re-probe the pair's own low fd under
+        // `FD_REUSE_LOCK`. That lock could not work: it serialized this test
+        // against the one other test that took it, while every OTHER test in
+        // the binary remained free to open a file and be handed the
+        // just-closed number. `adopt_fd`'s `F_GETFD` probe then succeeds
+        // (the number IS open — it belongs to someone else now), the
+        // adoption goes through, and dropping the returned `File`
+        // double-closes another test's descriptor. Reproduced 2026-08-08 as
+        // `fatal runtime error: IO Safety violation: owned file descriptor
+        // already closed` — a SIGABRT that took the whole lib test binary
+        // down, once in 25 saturated `--workspace --all-features` runs. The
+        // high number removes the race structurally, so no lock is needed.
+        const PROBE_FD: RawFd = 2048;
         let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
-        let fd = a.into_raw_fd();
-        // SAFETY: this test process has opened nothing else of its own
-        // between creating the pair and this first adoption.
-        drop(unsafe { adopt_fd(fd) }.unwrap()); // adopt once, closing it
-        // SAFETY: fd is now closed; a second adoption attempt is exactly
-        // what this test means to probe, and BadFd is expected to refuse
-        // it before from_raw_fd ever runs.
-        let second = unsafe { adopt_fd(fd) };
+        let parked = nix::fcntl::fcntl(a.as_raw_fd(), nix::fcntl::FcntlArg::F_DUPFD(PROBE_FD))
+            .expect("duplicating onto a high fd number must succeed");
+        assert!(
+            parked >= PROBE_FD,
+            "F_DUPFD must return a number at or above its floor, got {parked}"
+        );
+        // SAFETY: `parked` is a descriptor this test just created and owns
+        // outright — `a` keeps its own separate descriptor and its own Drop.
+        drop(unsafe { adopt_fd(parked) }.unwrap()); // adopt once, closing it
+        // SAFETY: `parked` is closed now, and being >= PROBE_FD it cannot be
+        // reallocated while lower numbers remain free, so this second
+        // attempt probes a genuinely closed descriptor. BadFd is expected to
+        // refuse it before `from_raw_fd` ever runs.
+        let second = unsafe { adopt_fd(parked) };
         assert!(matches!(second, Err(SysError::BadFd { .. })));
     }
 
@@ -280,10 +303,11 @@ mod tests {
         // fd-table limits sit far below it, and nothing in this crate's
         // test suite opens anywhere near that many concurrent descriptors,
         // so `F_GETFD` fails on it deterministically, every time, regardless
-        // of what else is running concurrently — zero collision risk,
-        // unlike `a_closed_descriptor_is_refused_instead_of_adopted` above,
-        // which frees and re-probes a REAL fd number and so needs
-        // `FD_REUSE_LOCK`. This test needs no lock for exactly that reason.
+        // of what else is running concurrently — zero collision risk. Same
+        // reasoning as the high `PROBE_FD` in
+        // `a_closed_descriptor_is_refused_instead_of_adopted` above: staying
+        // clear of the numbers the kernel actually hands out is what makes
+        // an fd-refusal test deterministic under a parallel harness.
         // SAFETY: fd 4096 is never open in this process; adopt_fd's
         // F_GETFD probe rejects it before from_raw_fd ever runs, so there
         // is no ordering precondition to uphold for a call that never

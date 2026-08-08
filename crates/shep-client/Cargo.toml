@@ -7,8 +7,47 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+# Option: expose `testing` (the hand-rolled daemon fakes) to other crates'
+# tests. Off by default — it is test scaffolding, not public API. Mirrors
+# shep-daemon's `test-fakes` (`crates/shep-daemon/Cargo.toml:12`), which does
+# the same job for the scripted runner.
+test-support = []
+
+# This crate's own fake-driven tests are integration tests, so they link the
+# ordinary (not `--cfg test`) library and need the feature switched on —
+# `cfg(test)` alone does not reach them. Declared per target rather than left
+# to fail: a bare `cargo test -p shep-client` skips these three instead of
+# failing to compile. `cargo test --workspace` runs them, because shep-cli's
+# dev-dependency turns the feature on for the whole workspace build; so does
+# any `--all-features` leg.
+[[test]]
+name = "request_reply"
+required-features = ["test-support"]
+
+[[test]]
+name = "event_stream"
+required-features = ["test-support"]
+
+[[test]]
+name = "spawn"
+required-features = ["test-support"]
+
 [dependencies]
 shep-core.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros"] }
+tokio-util.workspace = true
+tokio-stream.workspace = true   # wrappers::BroadcastStream, for the event-bus subscription stream
+futures-util.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+tempfile.workspace = true
+
+# The zombie reaper needs `waitpid`; dev-only and unix-only, same shape
+# shep-daemon uses. The workspace default features already cover it.
+[target.'cfg(unix)'.dev-dependencies]
+nix.workspace = true
 
 [lints]
 workspace = true

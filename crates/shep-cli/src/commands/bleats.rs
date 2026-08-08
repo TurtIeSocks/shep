@@ -1,0 +1,1823 @@
+//! `bleats` (alias `logs`): following a sheep's log stream — the only
+//! streaming verb, and the only one whose output does not go through
+//! [`crate::output`]'s envelope (see that module's own doc: a follow has
+//! no end, so there is nothing to wrap).
+//!
+//! Order matters here in a way it does not for the other verbs: one
+//! `Request::ListFlock` resolves an id -> [`ProcessInfo`] cache *before*
+//! `Request::Subscribe` goes out, never the other way around — subscribing
+//! first would lose every line the daemon pushes while the listing is
+//! still in flight. An id that later shows up on the bus but was not in
+//! that one listing renders as its bare id rather than blocking on a
+//! second `ListFlock` per unknown line.
+//!
+//! Selector filtering happens **client-side**, against the id set that one
+//! listing resolved: the daemon's own topic filter globs on the topic
+//! string (`log.out`, `log.err`), which carries no sheep identity at all,
+//! so the daemon has nothing to narrow by selector with — only this
+//! module can.
+//!
+//! `--out`/`--err` choose which of a sheep's two output streams is shown,
+//! not where shep's own text goes: both a followed sheep's stdout and its
+//! stderr are the data the user asked for, so both land on
+//! [`Streams::out`]. [`Streams::err`] carries only shep's own
+//! diagnostics — the lag notice, the shutdown notice — never a line a
+//! sheep itself wrote; interleaving sheep stderr into it would make
+//! `shep bleats > file` silently lose half the output, and `--err` would
+//! produce an empty file.
+//!
+//! `--no-follow` does not touch the bus at all: it takes the same one
+//! `Request::ListFlock` [`resolve_names`] already sends, then prints the
+//! tail of each matched sheep's log file and exits — `tail` to `--follow`'s
+//! `tail -f`. It never subscribes, so there is no stream, no `Lagged`, no
+//! shutdown notice, and no extra round trip. A file's tail is bounded
+//! twice ([`TAIL_LINES`] lines, found within the last [`TAIL_WINDOW_BYTES`]
+//! of the file), and files are read one at a time, so peak memory for this
+//! path is one window regardless of flock size.
+//!
+//! **The ordering limitation is real and is stated, not hidden.** Within one
+//! file, lines print in file order (append order, chronological). Across a
+//! sheep's two files there is no merge: `out_file` prints in full, then
+//! `err_file` starts. A log line carries no timestamp, so there is no key to
+//! interleave the two files on, and guessing one from arrival order would be
+//! wrong exactly when a sheep writes to both streams at once — seeing all of
+//! `out` before any of `err` must not be read as "everything on stdout
+//! happened first". `--out`/`--err` sidestep the seam by reducing a sheep to
+//! the one file that matters. `--follow` has no such limitation: the bus
+//! delivers in arrival order, which is chronological across both streams.
+//!
+//! No-follow can also show a **stopped** sheep's last output, which
+//! `--follow` cannot: the daemon creates both files at spawn and keeps
+//! appending to them for the life of the sheep, so a sheep that has since
+//! stopped still has a file to read, while it has nothing left to publish
+//! to the bus.
+
+use std::collections::HashMap;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::Path;
+
+use futures_util::{FutureExt, StreamExt};
+use serde::Serialize;
+
+use shep_client::{Client, EventStream, Lagged};
+use shep_core::protocol::{BusEvent, ProcessInfo, Request, Response};
+use shep_core::selector::ProcessSelector;
+
+use crate::cli::{BleatsArgs, Format};
+use crate::exit::ExitCode;
+use crate::output::{self, Streams, write_outcome};
+
+/// One line of `bleats` output under `--format json` — a stability surface
+/// of its own (Task 12's fixture), deliberately not wrapped in
+/// [`output::OutputEnvelope`]: see this module's own doc for why.
+#[derive(Debug, Serialize)]
+struct BleatLine<'a> {
+    /// [`output::SCHEMA_VERSION`] at the time this line was produced.
+    schema_version: u32,
+    /// The sheep's id.
+    id: u32,
+    /// The sheep's name if the initial listing resolved it, else the bare
+    /// id rendered as a string.
+    name: &'a str,
+    /// Which of a sheep's two output streams this line came from.
+    stream: &'static str,
+    /// The line itself, no trailing newline.
+    line: &'a str,
+}
+
+/// Parses `raw` client-side, so a malformed selector is a fast local usage
+/// error rather than a round trip to the daemon.
+///
+/// Returns a [`ProcessSelector`] rather than a `SelectorSpec`: unlike every
+/// other selector-taking verb, `bleats` never puts the selector on the
+/// wire at all (the daemon's topic filter has no sheep identity to match
+/// one against) — it only ever matches locally, against the id/name cache
+/// [`resolve_names`] builds.
+fn parse_selector(
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    raw: &str,
+) -> Result<ProcessSelector, ExitCode> {
+    match ProcessSelector::parse(raw) {
+        Ok(selector) => Ok(selector),
+        Err(err) => {
+            let _ = output::emit_error(
+                &mut *streams.err,
+                fmt,
+                ExitCode::Usage.code_str(),
+                &err.to_string(),
+            );
+            Err(ExitCode::Usage)
+        }
+    }
+}
+
+/// Issues the one `Request::ListFlock` `bleats` sends, before it ever
+/// subscribes, and turns the answer into an id -> [`ProcessInfo`] cache.
+///
+/// # Errors
+/// Renders and returns the exit code for a request that failed to reach
+/// the daemon, or a response this client does not recognise (`Response` is
+/// `#[non_exhaustive]`, Global Constraints).
+async fn resolve_names(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    fmt: Format,
+) -> Result<HashMap<u32, ProcessInfo>, ExitCode> {
+    match client.request(Request::ListFlock).await {
+        Ok(Response::Flock(procs)) => Ok(procs.into_iter().map(|p| (p.id, p)).collect()),
+        Ok(_unrecognised) => {
+            let message = "the daemon answered with a response this client does not understand";
+            let _ = output::emit_error(
+                &mut *streams.err,
+                fmt,
+                ExitCode::Internal.code_str(),
+                message,
+            );
+            Err(ExitCode::Internal)
+        }
+        Err(err) => {
+            let code = ExitCode::from(&err);
+            let _ = output::emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
+            Err(code)
+        }
+    }
+}
+
+/// Subscribes to every topic `bleats` needs: `log.*` for the lines
+/// themselves, `daemon.*` so a `BusEvent::DaemonShutdown` is observed
+/// rather than the connection simply vanishing unexplained.
+///
+/// # Errors
+/// Renders and returns the exit code for a subscribe request that failed.
+async fn subscribe(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    fmt: Format,
+) -> Result<EventStream, ExitCode> {
+    let topics = vec!["log.*".to_string(), "daemon.*".to_string()];
+    match client.subscribe(topics).await {
+        Ok(stream) => Ok(stream),
+        Err(err) => {
+            let code = ExitCode::from(&err);
+            let _ = output::emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
+            Err(code)
+        }
+    }
+}
+
+/// Resolves `id` to a name from `cache`, or the bare id if `id` was not in
+/// the one listing `resolve_names` took — an id that shows up on the bus
+/// later than that snapshot is not a reason to block on a second listing.
+fn resolved_name(cache: &HashMap<u32, ProcessInfo>, id: u32) -> String {
+    cache
+        .get(&id)
+        .map_or_else(|| id.to_string(), |info| info.name.clone())
+}
+
+/// Whether `selector` (parsed client-side) admits `id`, matched against
+/// `cache`'s snapshot of that sheep if it has one.
+///
+/// An id the initial listing never saw has no name or fold to match
+/// against; it is matched with an empty name and no fold, which is enough
+/// for `all` and for `ProcessSelector::Id` (both work without identity)
+/// while a name/regex/fold selector correctly excludes it — there is
+/// nothing to prove it belongs.
+fn selector_allows(selector: &ProcessSelector, cache: &HashMap<u32, ProcessInfo>, id: u32) -> bool {
+    match cache.get(&id) {
+        Some(info) => selector.matches(&info.name, info.id, info.fold.as_deref()),
+        None => selector.matches("", id, None),
+    }
+}
+
+/// Writes one rendered line to `out`. `stream` is `"out"` or `"err"` — the
+/// sheep stream the line came from, not `out`'s own identity: every line
+/// this function is called with lands on [`Streams::out`], per this
+/// module's own doc.
+fn write_line(
+    out: &mut dyn io::Write,
+    fmt: Format,
+    id: u32,
+    name: &str,
+    stream: &'static str,
+    line: &str,
+) -> io::Result<()> {
+    match fmt {
+        Format::Json => {
+            let payload = BleatLine {
+                schema_version: output::SCHEMA_VERSION,
+                id,
+                name,
+                stream,
+                line,
+            };
+            serde_json::to_writer(&mut *out, &payload)?;
+            writeln!(out)
+        }
+        Format::Table => writeln!(out, "{name} | {line}"),
+    }
+}
+
+/// Writes one of this module's own notices — not a sheep's line, and not
+/// `parse_selector`'s kind of usage error either — to `streams.err`, through
+/// [`output::emit_notice`] rather than [`output::emit_error`]: a notice's
+/// code (`log_path_unknown`, `dropped`, `daemon_shutdown`, ...) is not part
+/// of [`crate::exit::ExitCode`]'s taxonomy, and a clean run can still emit
+/// one on its way to exit 0 — reusing the error envelope would leave a
+/// `--format json` consumer unable to tell a diagnostic from a failure
+/// (whole-branch review item 4; `cli_e2e.rs`'s `assert_json_error` pins the
+/// opposite rule for real errors: JSON on stderr means the command failed).
+///
+/// A no-op when `quiet` is set: `--quiet`'s own doc
+/// (`cli::GlobalArgs::quiet`, "suppress non-essential output") is exactly
+/// what a notice is — a sheep's own line and a real error both still print
+/// regardless (whole-branch review item 2).
+fn write_notice(streams: &mut Streams<'_>, fmt: Format, quiet: bool, code: &str, message: &str) {
+    if quiet {
+        return;
+    }
+    let _ = output::emit_notice(&mut *streams.err, fmt, code, message);
+}
+
+/// How many lines of each log file `--no-follow` prints.
+///
+/// A default, not a limit the user can lift — `--lines` is not in this
+/// phase's CLI surface. Fifty keeps `shep bleats --no-follow` against a
+/// whole flock readable at a terminal while still carrying the tail of a
+/// crash, which is what people run this for.
+const TAIL_LINES: usize = 50;
+
+/// The most of one log file `--no-follow` will read to find those
+/// [`TAIL_LINES`] lines.
+///
+/// Binds only when lines average over 5 KiB, so in ordinary use
+/// [`TAIL_LINES`] is the bound that decides. A line count alone cannot
+/// bound memory on its own — one arbitrarily long line with no newline
+/// would defeat it — hence both bounds.
+const TAIL_WINDOW_BYTES: u64 = 256 * 1024;
+
+/// The last [`TAIL_LINES`] lines of one log file, bounded twice over: a
+/// [`TAIL_WINDOW_BYTES`] window from the end of the file, then a
+/// [`TAIL_LINES`] cap once that window is split into lines.
+///
+/// `std::fs`, not `tokio::fs`: shep-cli's tokio does not carry the `fs`
+/// feature, and this is a bounded read on a one-shot command with nothing
+/// else on the runtime.
+///
+/// A window boundary can land mid-line. When the seek away from the start
+/// of the file was non-zero, the bytes up to and including the first `\n`
+/// in the window are discarded rather than rendered as a fragment — half a
+/// line shown as a whole one is a lie. The remaining bytes are decoded with
+/// [`String::from_utf8_lossy`]: a log file is whatever the child wrote and
+/// is under no obligation to be UTF-8, and refusing to show a log over one
+/// bad byte is the wrong failure.
+///
+/// # Errors
+/// The file could not be opened, `stat`ed, seeked, or read. Notably
+/// includes [`io::ErrorKind::NotFound`] (the sheep has never run in this
+/// `$SHEP_HOME`) and `EISDIR` (`out_file`/`err_file` named a directory) —
+/// [`tail_log_files`] gives the two different treatment.
+fn read_tail(path: &Path) -> io::Result<Vec<String>> {
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(TAIL_WINDOW_BYTES);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))?;
+    }
+
+    let mut window = Vec::new();
+    file.read_to_end(&mut window)?;
+
+    let window: &[u8] = if start > 0 {
+        match window.iter().position(|&b| b == b'\n') {
+            Some(newline) => &window[newline + 1..],
+            None => &[],
+        }
+    } else {
+        &window
+    };
+
+    let text = String::from_utf8_lossy(window);
+    let mut lines: Vec<String> = text.split('\n').map(String::from).collect();
+    if lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    let keep_from = lines.len().saturating_sub(TAIL_LINES);
+    lines.drain(..keep_from);
+    Ok(lines)
+}
+
+/// Renders the selected files of every sheep the selector admits, in id
+/// order, and returns the exit code that reports how that went.
+///
+/// Within one sheep, `out_file` (unless `--err`) prints before `err_file`
+/// (unless `--out`) — this module's own doc states the ordering limitation
+/// that follows from it. Ids are sorted before anything is read: `cache` is
+/// a `HashMap`, whose iteration order is not the id order this command's
+/// `--format json` output is pinned against.
+///
+/// A `None` path means the shepherd predates the field (module doc,
+/// [`shep_core::protocol::ProcessInfo::out_file`]) — one `log_path_unknown`
+/// notice per path the flags actually asked for, exit code unaffected. A
+/// missing file ([`io::ErrorKind::NotFound`]) is silent: the daemon creates
+/// both files at spawn, so a missing one means this sheep has never run in
+/// this `$SHEP_HOME`, and a notice per quiet sheep would spam stderr on a
+/// fresh flock. Any other read failure is one `log_unreadable` notice naming
+/// the path and the OS error, and the rest of the flock still prints — only
+/// this last case sets the final [`ExitCode::Failure`].
+fn tail_log_files(
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    quiet: bool,
+    cache: &HashMap<u32, ProcessInfo>,
+    selector: &ProcessSelector,
+    args: &BleatsArgs,
+) -> ExitCode {
+    let mut matched: Vec<&ProcessInfo> = cache
+        .values()
+        .filter(|info| selector.matches(&info.name, info.id, info.fold.as_deref()))
+        .collect();
+    matched.sort_unstable_by_key(|info| info.id);
+
+    let mut failure = false;
+
+    for info in matched {
+        let name = &info.name;
+        let wanted: [(&'static str, Option<&str>, bool); 2] = [
+            ("out", info.out_file.as_deref(), !args.err),
+            ("err", info.err_file.as_deref(), !args.out),
+        ];
+        for (stream_name, path, show) in wanted {
+            if !show {
+                continue;
+            }
+            match path {
+                None => write_notice(
+                    streams,
+                    fmt,
+                    quiet,
+                    "log_path_unknown",
+                    &format!("{name}: the daemon did not report a {stream_name} log path"),
+                ),
+                Some(path) => match read_tail(Path::new(path)) {
+                    Ok(lines) => {
+                        for line in lines {
+                            if let Err(write_err) =
+                                write_line(streams.out, fmt, info.id, name, stream_name, &line)
+                            {
+                                let code = write_outcome(Err(write_err));
+                                let _ = streams.out.flush();
+                                return code;
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        // Silent: the daemon creates both files at spawn, so
+                        // a missing file means this sheep has never run in
+                        // this $SHEP_HOME. A notice per quiet sheep would
+                        // spam stderr on a fresh flock.
+                    }
+                    Err(err) => {
+                        failure = true;
+                        write_notice(
+                            streams,
+                            fmt,
+                            quiet,
+                            "log_unreadable",
+                            &format!("failed to read {path}: {err}"),
+                        );
+                    }
+                },
+            }
+        }
+    }
+
+    let _ = streams.out.flush();
+    if failure {
+        ExitCode::Failure
+    } else {
+        ExitCode::Success
+    }
+}
+
+/// Handles one [`BusEvent`] already known to be `Ok` (a `Lagged` item is
+/// handled by the caller, not here).
+///
+/// `BusEvent` is `#[non_exhaustive]`: the `_` arm ignores anything this
+/// client does not recognise, silently — a follow must not die on a bus
+/// event a newer daemon added (Global Constraints). `Dropped` is NOT one of
+/// those unrecognised events — it is a real, named variant this client
+/// understands — so it gets its own arm rather than falling into that `_`.
+fn handle_event(
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    quiet: bool,
+    cache: &HashMap<u32, ProcessInfo>,
+    selector: &ProcessSelector,
+    args: &BleatsArgs,
+    event: BusEvent,
+) -> io::Result<()> {
+    match event {
+        BusEvent::LogOut { id, line } => {
+            if !args.err && selector_allows(selector, cache, id) {
+                let name = resolved_name(cache, id);
+                write_line(streams.out, fmt, id, &name, "out", &line)?;
+            }
+            Ok(())
+        }
+        BusEvent::LogErr { id, line } => {
+            if !args.out && selector_allows(selector, cache, id) {
+                let name = resolved_name(cache, id);
+                write_line(streams.out, fmt, id, &name, "err", &line)?;
+            }
+            Ok(())
+        }
+        BusEvent::Dropped { count } => {
+            // Daemon-side cause, deliberately NOT the `Lagged` arm's
+            // wording below: `Dropped` is the daemon's own outbound queue
+            // overflowing for this subscriber, while `Lagged` is this
+            // client's receiver falling behind reading its socket. The two
+            // failures live on opposite sides of the connection and must
+            // read differently, or a user cannot tell which end to
+            // investigate.
+            write_notice(
+                streams,
+                fmt,
+                quiet,
+                "dropped",
+                &format!("the daemon dropped {count} events (its own queue overflowed)"),
+            );
+            Ok(())
+        }
+        BusEvent::DaemonShutdown => {
+            // Shep's own diagnostic, not a sheep's line: `streams.err`.
+            write_notice(
+                streams,
+                fmt,
+                quiet,
+                "daemon_shutdown",
+                "the daemon is shutting down",
+            );
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Follows the bleats (log output) of the sheep matching `args.selector`.
+///
+/// `quiet` is `cli::GlobalArgs::quiet` — it silences this module's own
+/// notices (whole-branch review item 2) and nothing else: a sheep's own
+/// line and a real error both still print regardless.
+///
+/// Delegates to [`bleats_with_signal`] with a real `SIGINT` as the
+/// interrupt source — see that function's own doc for the shape both
+/// share.
+pub async fn bleats(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    quiet: bool,
+    args: &BleatsArgs,
+) -> ExitCode {
+    bleats_with_signal(
+        client,
+        streams,
+        fmt,
+        quiet,
+        args,
+        tokio::signal::ctrl_c().map(|_| ()),
+    )
+    .await
+}
+
+/// [`bleats`] with the interrupt injected, so the Ctrl-C branch has a test
+/// that does not need a real `SIGINT` — one would kill the test runner.
+///
+/// One `Request::ListFlock` always goes out first, building the id -> name
+/// cache both paths share.
+///
+/// **`--no-follow`** (`args.no_follow`) stops there and hands off to
+/// [`tail_log_files`]: it never issues `Request::Subscribe`, so there is no
+/// stream, no `Lagged`, no `DaemonShutdown`, and nothing for `interrupt` to
+/// race — a bounded file read terminates on its own.
+///
+/// **`--follow`** (the default) subscribes (`log.*`/`daemon.*`) and loops
+/// over one `tokio::select!` with two arms, checked in this priority order
+/// every iteration:
+///
+/// 1. The event stream — a normal line is rendered, a `Lagged` item is
+///    noted to `streams.err` and the follow continues, and the stream
+///    ending (`None`) means the daemon is gone: flush and exit
+///    [`ExitCode::DaemonUnreachable`].
+/// 2. `interrupt` — a user ending a follow deliberately has not failed:
+///    flush and exit [`ExitCode::Success`].
+///
+/// `streams.out` is flushed on every exit path — a follow that ends with
+/// lines still buffered would otherwise lose them silently.
+pub async fn bleats_with_signal(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    quiet: bool,
+    args: &BleatsArgs,
+    interrupt: impl std::future::Future<Output = ()> + Send,
+) -> ExitCode {
+    let selector = match parse_selector(streams, fmt, &args.selector) {
+        Ok(selector) => selector,
+        Err(code) => return code,
+    };
+
+    // Order matters: the id/name cache is built from ONE listing taken
+    // before subscribing. Subscribing first would lose every line pushed
+    // while the listing is still in flight.
+    let cache = match resolve_names(client, streams, fmt).await {
+        Ok(cache) => cache,
+        Err(code) => return code,
+    };
+
+    if args.no_follow {
+        return tail_log_files(streams, fmt, quiet, &cache, &selector, args);
+    }
+
+    let mut stream = match subscribe(client, streams, fmt).await {
+        Ok(stream) => stream,
+        Err(code) => return code,
+    };
+
+    tokio::pin!(interrupt);
+
+    loop {
+        tokio::select! {
+            biased;
+            item = stream.next() => {
+                match item {
+                    Some(Ok(event)) => {
+                        if let Err(write_err) =
+                            handle_event(streams, fmt, quiet, &cache, &selector, args, event)
+                        {
+                            let code = write_outcome(Err(write_err));
+                            let _ = streams.out.flush();
+                            return code;
+                        }
+                    }
+                    Some(Err(Lagged { count })) => {
+                        write_notice(
+                            streams,
+                            fmt,
+                            quiet,
+                            "lagged",
+                            &format!("{count} events dropped locally (lagged)"),
+                        );
+                    }
+                    None => {
+                        let _ = streams.out.flush();
+                        return ExitCode::DaemonUnreachable;
+                    }
+                }
+            }
+            () = &mut interrupt => {
+                let _ = streams.out.flush();
+                return ExitCode::Success;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use shep_client::testing::fake_client_with_push;
+    use shep_core::protocol::ProcessInfo;
+    use shep_core::status::ProcStatus;
+
+    use super::*;
+    use crate::cli::{Cli, Commands};
+
+    fn info(id: u32, name: &str) -> ProcessInfo {
+        ProcessInfo {
+            id,
+            name: name.to_string(),
+            status: ProcStatus::Online,
+            pid: Some(1000 + id),
+            restarts: 0,
+            uptime_ms: 0,
+            fold: None,
+            out_file: Some(format!("/logs/{name}-0-out.log")),
+            err_file: Some(format!("/logs/{name}-0-err.log")),
+        }
+    }
+
+    fn bleats_args(selector: &str, no_follow: bool, err: bool, out: bool) -> BleatsArgs {
+        BleatsArgs {
+            selector: selector.to_string(),
+            no_follow,
+            err,
+            out,
+        }
+    }
+
+    fn follow_args(selector: &str) -> BleatsArgs {
+        bleats_args(selector, false, false, false)
+    }
+
+    fn follow_args_err(selector: &str) -> BleatsArgs {
+        bleats_args(selector, false, true, false)
+    }
+
+    fn follow_args_out(selector: &str) -> BleatsArgs {
+        bleats_args(selector, false, false, true)
+    }
+
+    fn no_follow_args(selector: &str) -> BleatsArgs {
+        bleats_args(selector, true, false, false)
+    }
+
+    fn no_follow_args_err(selector: &str) -> BleatsArgs {
+        bleats_args(selector, true, true, false)
+    }
+
+    fn no_follow_args_out(selector: &str) -> BleatsArgs {
+        bleats_args(selector, true, false, true)
+    }
+
+    /// Writes `content` to `dir/name` and returns the path as a `String` —
+    /// what a scripted [`ProcessInfo`]'s `out_file`/`err_file` needs.
+    fn write_log(dir: &Path, name: &str, content: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn no_follow_parses_and_plain_bleats_still_follows() {
+        use clap::Parser;
+
+        let Commands::Bleats(args) = Cli::try_parse_from(["shep", "bleats"]).unwrap().command
+        else {
+            panic!()
+        };
+        assert!(!args.no_follow, "the default is to follow");
+
+        let Commands::Bleats(args) = Cli::try_parse_from(["shep", "bleats", "--no-follow"])
+            .unwrap()
+            .command
+        else {
+            panic!()
+        };
+        assert!(args.no_follow);
+
+        // The flag stores NO value: `--no-follow` is `ArgAction::SetTrue`, so a
+        // following token is not consumed by it and lands on the positional
+        // instead.
+        let Commands::Bleats(args) = Cli::try_parse_from(["shep", "bleats", "--no-follow", "true"])
+            .unwrap()
+            .command
+        else {
+            panic!()
+        };
+        assert!(args.no_follow);
+        assert_eq!(
+            args.selector, "true",
+            "--no-follow takes no value; the token is the selector"
+        );
+    }
+
+    /// Every `bleats(...)`/`bleats_with_signal(...)` call in this module is
+    /// bounded by this timeout — a broken implementation that hangs (e.g. a
+    /// drain that never terminates, or a follow that never observes an
+    /// interrupt) fails with a named assertion instead of a killed CI job
+    /// (Global Constraints: nine tests have already shipped that fail only
+    /// by hanging).
+    const RUN_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// `daemon.close_after_subscribe()` — not `daemon.close()` — ends the
+    /// connection right after the real `Subscribe` this test's `bleats`
+    /// call issues has been served and anything queued via `push` has been
+    /// flushed. That is what makes this test scheduler-independent: unlike
+    /// the old `--no-follow` drain arm (retired by the amendment that reads
+    /// log files instead), a follow that runs to end-of-stream observes
+    /// everything pushed before the close, in order, on any executor —
+    /// there is no longer a race between "the events arrived" and "the loop
+    /// decided nothing was buffered".
+    #[tokio::test]
+    async fn ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "hello".into(),
+            })
+            .await;
+        daemon
+            .push(BusEvent::LogOut {
+                id: 9,
+                line: "orphan".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args("all"),
+                ),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(out.contains("web") && out.contains("hello"));
+        assert!(
+            out.contains('9') && out.contains("orphan"),
+            "an unknown id renders bare, not blocked on: {out}"
+        );
+        assert_eq!(
+            daemon.list_flock_count(),
+            1,
+            "one listing, not one per unknown line"
+        );
+    }
+
+    /// Same `close_after_subscribe` reasoning as the test above.
+    #[tokio::test]
+    async fn err_and_out_filter_the_two_streams() {
+        for (args, kept, gone) in [
+            (follow_args_err("all"), "to-stderr", "to-stdout"),
+            (follow_args_out("all"), "to-stdout", "to-stderr"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("s.sock");
+            let (client, daemon) = fake_client_with_push(&path).await;
+            daemon.reply_to_list(vec![info(1, "web")]);
+            daemon
+                .push(BusEvent::LogOut {
+                    id: 1,
+                    line: "to-stdout".into(),
+                })
+                .await;
+            daemon
+                .push(BusEvent::LogErr {
+                    id: 1,
+                    line: "to-stderr".into(),
+                })
+                .await;
+            daemon.close_after_subscribe().await;
+
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            {
+                let mut streams = Streams {
+                    out: &mut out,
+                    err: &mut err,
+                };
+                tokio::time::timeout(
+                    RUN_TIMEOUT,
+                    bleats(&client, &mut streams, Format::Table, false, &args),
+                )
+                .await
+                .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+            }
+            let rendered = String::from_utf8(out).unwrap();
+            assert!(
+                rendered.contains(kept),
+                "{kept} should have survived: {rendered}"
+            );
+            assert!(
+                !rendered.contains(gone),
+                "{gone} should have been filtered: {rendered}"
+            );
+        }
+    }
+
+    /// The daemon's topic filter globs on `log.out` / `log.err`, which carry
+    /// no identity — so this filtering CANNOT have happened server-side,
+    /// and a test that let the fake daemon pre-filter would prove nothing.
+    /// Same `close_after_subscribe` reasoning as the test above.
+    #[tokio::test]
+    async fn a_selector_filters_client_side_on_the_resolved_id_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web"), info(2, "worker")]);
+        // The fake queues BOTH; only the selector may narrow them.
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "from-web".into(),
+            })
+            .await;
+        daemon
+            .push(BusEvent::LogOut {
+                id: 2,
+                line: "from-worker".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args("web"),
+                ),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(out.contains("from-web"));
+        assert!(
+            !out.contains("from-worker"),
+            "the selector must narrow the resolved id set: {out}"
+        );
+    }
+
+    /// The stream stays open for the whole test — the fake is never closed
+    /// — so the ONLY thing that can end this follow is the injected
+    /// interrupt. A `bleats` that ignored the interrupt arm hangs and the
+    /// timeout fails it.
+    #[tokio::test]
+    async fn ctrl_c_during_a_follow_exits_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "still running".into(),
+            })
+            .await;
+
+        let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+        };
+
+        let args = follow_args("all");
+        let follow =
+            bleats_with_signal(&client, &mut streams, Format::Table, false, &args, async {
+                let _ = interrupt_rx.await;
+            });
+        let (_, code) = tokio::join!(
+            async {
+                tokio::task::yield_now().await;
+                let _ = interrupt_tx.send(()); // a oneshot stays ready once sent
+            },
+            tokio::time::timeout(RUN_TIMEOUT, follow),
+        );
+        assert_eq!(
+            code.expect("the interrupt arm must end the follow"),
+            ExitCode::Success,
+            "a user ending a follow deliberately has not failed"
+        );
+    }
+
+    /// The pair that makes the shutdown branch bite. Both end in
+    /// `DaemonUnreachable` — the daemon went away either way — so the exit
+    /// code alone discriminates nothing. The NOTICE is the behaviour under
+    /// test: a `bleats` that never matches `BusEvent::DaemonShutdown` and
+    /// just maps any end-of-stream to `DaemonUnreachable` passes the first
+    /// assertion of each and fails the stderr assertion of the first.
+    ///
+    /// `close_after_subscribe`, not `close()`: this test genuinely needs
+    /// the connection to end mid-follow (there is no interrupt here, and
+    /// `follow_args` never terminates on its own), and `close_after_subscribe`
+    /// ends it deterministically, right after the real `Subscribe` this
+    /// test's `bleats` call issues has been served.
+    #[tokio::test]
+    async fn a_daemon_shutdown_mid_follow_is_announced_before_the_stream_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon.push(BusEvent::DaemonShutdown).await; // scripted: emitted after Subscribe
+        daemon.close_after_subscribe().await; // scripted: after Subscribe is served
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args("all"),
+                ),
+            )
+            .await
+            .expect("a shutdown mid-follow must end the follow, not hang")
+        };
+
+        assert_eq!(code, ExitCode::DaemonUnreachable);
+        assert!(
+            String::from_utf8(err).unwrap().contains("shutting down"),
+            "the shutdown notice is what distinguishes this from the connection simply ending"
+        );
+    }
+
+    /// Same `close_after_subscribe` usage as the test above, and for the
+    /// same reason.
+    #[tokio::test]
+    async fn a_stream_that_just_ends_reports_no_shutdown_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon.close_after_subscribe().await; // no DaemonShutdown event at all
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args("all"),
+                ),
+            )
+            .await
+            .expect("the connection ending must end the follow, not hang")
+        };
+
+        assert_eq!(code, ExitCode::DaemonUnreachable);
+        assert!(
+            !String::from_utf8(err).unwrap().contains("shutting down"),
+            "a notice the daemon never sent must not be invented"
+        );
+    }
+
+    /// Whole-branch review item 2: `--quiet` (`GlobalArgs::quiet`, threaded
+    /// in here as `bleats`' own `quiet` parameter) must actually do
+    /// something, and this module's notices are what it was given meaning
+    /// against. Same shutdown scenario as
+    /// `a_daemon_shutdown_mid_follow_is_announced_before_the_stream_ends`,
+    /// with `quiet: true` instead of `false` — the exit code must not move
+    /// (the daemon really did go away either way), only the notice text.
+    #[tokio::test]
+    async fn quiet_suppresses_the_daemon_shutdown_notice_but_not_the_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon.push(BusEvent::DaemonShutdown).await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    true,
+                    &follow_args("all"),
+                ),
+            )
+            .await
+            .expect("a shutdown mid-follow must end the follow, not hang")
+        };
+
+        assert_eq!(
+            code,
+            ExitCode::DaemonUnreachable,
+            "quiet must not change the exit code, only whether the notice prints"
+        );
+        assert!(
+            String::from_utf8(err).unwrap().is_empty(),
+            "quiet must suppress the shutdown notice entirely"
+        );
+    }
+
+    /// The other half of `--quiet`'s contract: it narrows notices only.
+    /// `resolved_name`/`write_line` never see `quiet` at all (their call
+    /// sites are unconditional in `handle_event`), so this is a
+    /// belt-and-braces end-to-end check that a sheep's own line still
+    /// reaches `streams.out` under `quiet: true`.
+    #[tokio::test]
+    async fn quiet_does_not_suppress_a_sheeps_own_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "hello".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    true,
+                    &follow_args("all"),
+                ),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("web") && out.contains("hello"),
+            "quiet must never touch a sheep's own line: {out}"
+        );
+    }
+
+    /// Same `close_after_subscribe` reasoning as
+    /// `ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare` —
+    /// but unlike that test, this one is **not** scheduler-independent, for
+    /// a different reason than the drain arm the amendment retired.
+    ///
+    /// **Verified, current known limitation**: run 10/10 in isolation under
+    /// `#[tokio::test(flavor = "multi_thread")]`, this test fails 10/10 —
+    /// `stderr` comes back empty, meaning `overrun_by`'s forced lag never
+    /// happens. `overrun_by` pushes `EVENT_CHANNEL_CAPACITY + n` events that
+    /// the fake flushes onto the wire in one burst right after `Subscribe`;
+    /// a `Lagged` only appears if this test's own `EventStream` falls behind
+    /// that burst by more than `EVENT_CHANNEL_CAPACITY` before it drains any
+    /// of it. Under the default current-thread runtime that reliably
+    /// happens: the connection actor decodes the whole burst in one
+    /// uninterrupted turn before this test's task gets scheduled again.
+    /// Under `multi_thread`, real parallelism lets this test's receiver keep
+    /// pace with the actor as events arrive, so the backlog never crosses
+    /// `EVENT_CHANNEL_CAPACITY` and no lag is ever produced. The other six
+    /// tests converted alongside this one all pass 10/10 in the same
+    /// isolated check — this is `overrun_by`'s own timing dependency, not a
+    /// symptom of the retired drain arm, and forcing a deterministic lag
+    /// would need a synchronization point `FakeDaemon` does not have today.
+    #[tokio::test]
+    async fn a_lag_notice_reaches_stderr_and_the_follow_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon.overrun_by(8).await; // forces a Lagged item
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "after".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args("all"),
+                ),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            stderr.contains("dropped") || stderr.contains("lagged"),
+            "a lag must be told, not swallowed: {stderr}"
+        );
+        assert!(
+            String::from_utf8(out).unwrap().contains("after"),
+            "a lag ends the gap, not the follow"
+        );
+    }
+
+    /// Critical fix (item 1): `BusEvent::Dropped` used to fall into
+    /// `handle_event`'s `_ => Ok(())` catch-all and vanish — the daemon's
+    /// own outbound queue overflowing is exactly the "a sheep went quiet"
+    /// failure mode this module's doc warns against swallowing silently.
+    ///
+    /// `Dropped` (the daemon's queue) and `Lagged` (this client's own
+    /// receiver falling behind) are different causes and must read
+    /// differently, so this asserts the daemon-side wording specifically —
+    /// `stderr.contains("dropped")` alone would also pass if the `Lagged`
+    /// arm's wording were reused by mistake, which is exactly the bug this
+    /// test exists to catch.
+    ///
+    /// Same `close_after_subscribe` reasoning as
+    /// `ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare`.
+    #[tokio::test]
+    async fn a_dropped_notice_reaches_stderr_worded_for_the_daemon_side_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon.push(BusEvent::Dropped { count: 5 }).await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args("all"),
+                ),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            stderr.contains("daemon") && stderr.contains('5'),
+            "a daemon-side Dropped must not be silently swallowed: {stderr}"
+        );
+        assert!(
+            !stderr.contains("locally"),
+            "Dropped is the daemon's queue overflowing, not this client \
+             falling behind reading its own socket — reusing the `Lagged` \
+             arm's wording would blame the wrong side: {stderr}"
+        );
+    }
+
+    /// Important fix (item 3): every other test in this module uses
+    /// `Format::Table`, so mutating the JSON line shape (renaming a field,
+    /// or rendering table rows under `--format json`) left every test green.
+    /// Global Constraints pins every command's JSON shape; this is that pin
+    /// for `bleats`' own line shape (deferred by the brief to a Task 12
+    /// fixture, pinned independently here since item 2 puts that fixture's
+    /// shape in doubt).
+    ///
+    /// Same `close_after_subscribe` reasoning as
+    /// `ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare`.
+    #[tokio::test]
+    async fn json_format_renders_the_pinned_five_key_line_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon
+            .push(BusEvent::LogErr {
+                id: 1,
+                line: "boom".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Json,
+                    false,
+                    &follow_args("all"),
+                ),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+        let out = String::from_utf8(out).unwrap();
+        let line = out.lines().next().expect("one JSON line was rendered");
+        let json: serde_json::Value = serde_json::from_str(line).unwrap();
+        let obj = json.as_object().expect("a bleats JSON line is an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["id", "line", "name", "schema_version", "stream"],
+            "the bleats JSON line shape is a stability surface: {out}"
+        );
+        assert_eq!(json["stream"], "err", "the stream this line came from");
+    }
+
+    /// A writer that always fails with `BrokenPipe` — `shep bleats | head`
+    /// closing the reading end is the normal way this streaming verb ends,
+    /// not an error.
+    struct BrokenPipeWriter;
+
+    impl io::Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Important fix (item 5): `shep bleats | head` is this verb's normal
+    /// case, not an error — `write_outcome` already treats a `BrokenPipe`
+    /// write failure as [`ExitCode::Success`], but nothing in this module
+    /// exercised that path through an actual write failure.
+    ///
+    /// `close_after_subscribe` is scripted here too, for consistency with
+    /// the rest of this module's follow-mode tests, but the exit code stays
+    /// `Success` regardless: the write fails on the very first event, which
+    /// returns from `handle_event`'s write-error branch long before the
+    /// stream could ever reach end-of-stream.
+    #[tokio::test]
+    async fn a_broken_pipe_while_writing_a_line_exits_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "hello".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = BrokenPipeWriter;
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args("all"),
+                ),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging")
+        };
+
+        assert_eq!(
+            code,
+            ExitCode::Success,
+            "a reader closing the pipe is not a failed command"
+        );
+    }
+
+    // --- Task 10a: `--no-follow` reads the log files ----------------------
+    //
+    // None of these subscribe: `--no-follow` never issues `Request::Subscribe`
+    // at all, so there is no `daemon.close()`/`close_after_subscribe()` to
+    // script and no scheduler dependence to worry about — a bounded file read
+    // terminates on its own, which is exactly what `RUN_TIMEOUT` guards.
+
+    /// A `--no-follow` still wired to the bus fails the second assertion; one
+    /// wired to neither fails the first. This is the test that tells the two
+    /// apart from a `--no-follow` that reads the right files.
+    #[tokio::test]
+    async fn no_follow_reads_the_files_and_never_the_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let out_path = write_log(dir.path(), "web-out.log", "from-the-file\n");
+
+        let (client, daemon) = fake_client_with_push(&sock).await;
+        let sheep = ProcessInfo {
+            out_file: Some(out_path),
+            ..info(1, "web")
+        };
+        daemon.reply_to_list(vec![sheep]);
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "from-the-bus".into(),
+            })
+            .await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &no_follow_args_out("all"),
+                ),
+            )
+            .await
+            .expect("--no-follow never subscribes, so it must terminate on its own")
+        };
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert_eq!(code, ExitCode::Success);
+        assert!(rendered.contains("from-the-file"));
+        assert!(
+            !rendered.contains("from-the-bus"),
+            "the file path must never consult the bus: {rendered}"
+        );
+    }
+
+    /// A `read_to_string`-style implementation prints line 1 and fails this.
+    #[tokio::test]
+    async fn the_tail_is_bounded_by_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let total = TAIL_LINES + 20;
+        let content: String = (1..=total).map(|n| format!("line-{n}\n")).collect();
+        let out_path = write_log(dir.path(), "web-out.log", &content);
+
+        let (client, daemon) = fake_client_with_push(&sock).await;
+        let sheep = ProcessInfo {
+            out_file: Some(out_path),
+            ..info(1, "web")
+        };
+        daemon.reply_to_list(vec![sheep]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &no_follow_args_out("all"),
+                ),
+            )
+            .await
+            .expect("--no-follow never subscribes, so it must terminate on its own");
+        }
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(
+            !rendered.lines().any(|line| line == "web | line-1"),
+            "the first line must fall outside the tail: {rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == format!("web | line-{total}")),
+            "the last line must be present: {rendered}"
+        );
+        assert_eq!(
+            rendered.lines().count(),
+            TAIL_LINES,
+            "exactly TAIL_LINES lines must reach stdout: {rendered}"
+        );
+    }
+
+    /// Guards the window and the discard-the-partial-first-line rule
+    /// together: an implementation that keeps the partial head emits a
+    /// quarter-megabyte fragment and fails this.
+    #[tokio::test]
+    async fn the_tail_is_bounded_by_bytes_and_never_shows_half_a_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let long_line = "x".repeat(usize::try_from(TAIL_WINDOW_BYTES).unwrap() + 1024);
+        let content = format!("{long_line}\nshort\n");
+        let out_path = write_log(dir.path(), "web-out.log", &content);
+
+        let (client, daemon) = fake_client_with_push(&sock).await;
+        let sheep = ProcessInfo {
+            out_file: Some(out_path),
+            ..info(1, "web")
+        };
+        daemon.reply_to_list(vec![sheep]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &no_follow_args_out("all"),
+                ),
+            )
+            .await
+            .expect("--no-follow never subscribes, so it must terminate on its own");
+        }
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert_eq!(
+            rendered,
+            "web | short\n",
+            "no fragment of the long line may reach stdout ({} bytes rendered)",
+            rendered.len()
+        );
+    }
+
+    /// Three ways: `--out` (out lines only), `--err` (err lines only),
+    /// neither (out lines, then err lines — this module's own pin on
+    /// within-sheep ordering).
+    #[tokio::test]
+    async fn out_and_err_select_which_file_is_read() {
+        async fn run(args: BleatsArgs) -> String {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("s.sock");
+            let out_path = write_log(dir.path(), "web-out.log", "stdout-line\n");
+            let err_path = write_log(dir.path(), "web-err.log", "stderr-line\n");
+
+            let (client, daemon) = fake_client_with_push(&sock).await;
+            let sheep = ProcessInfo {
+                out_file: Some(out_path),
+                err_file: Some(err_path),
+                ..info(1, "web")
+            };
+            daemon.reply_to_list(vec![sheep]);
+
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            {
+                let mut streams = Streams {
+                    out: &mut out,
+                    err: &mut err,
+                };
+                tokio::time::timeout(
+                    RUN_TIMEOUT,
+                    bleats(&client, &mut streams, Format::Table, false, &args),
+                )
+                .await
+                .expect("--no-follow never subscribes, so it must terminate on its own");
+            }
+            String::from_utf8(out).unwrap()
+        }
+
+        let out_only = run(no_follow_args_out("all")).await;
+        assert!(out_only.contains("stdout-line") && !out_only.contains("stderr-line"));
+
+        let err_only = run(no_follow_args_err("all")).await;
+        assert!(err_only.contains("stderr-line") && !err_only.contains("stdout-line"));
+
+        let both = run(no_follow_args("all")).await;
+        let out_pos = both
+            .find("stdout-line")
+            .expect("the stdout line is present");
+        let err_pos = both
+            .find("stderr-line")
+            .expect("the stderr line is present");
+        assert!(
+            out_pos < err_pos,
+            "out_file must render before err_file within one sheep: {both}"
+        );
+    }
+
+    /// Scripts the listing in DESCENDING id order, so the cache's `HashMap`
+    /// iteration order cannot be what makes ascending output pass.
+    #[tokio::test]
+    async fn files_are_printed_in_ascending_id_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let a_path = write_log(dir.path(), "a-out.log", "line-from-a\n");
+        let b_path = write_log(dir.path(), "b-out.log", "line-from-b\n");
+
+        let (client, daemon) = fake_client_with_push(&sock).await;
+        let sheep_a = ProcessInfo {
+            out_file: Some(a_path),
+            ..info(1, "a")
+        };
+        let sheep_b = ProcessInfo {
+            out_file: Some(b_path),
+            ..info(2, "b")
+        };
+        daemon.reply_to_list(vec![sheep_b, sheep_a]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &no_follow_args_out("all"),
+                ),
+            )
+            .await
+            .expect("--no-follow never subscribes, so it must terminate on its own");
+        }
+        let rendered = String::from_utf8(out).unwrap();
+
+        let a_pos = rendered
+            .find("line-from-a")
+            .expect("id 1's line is present");
+        let b_pos = rendered
+            .find("line-from-b")
+            .expect("id 2's line is present");
+        assert!(
+            a_pos < b_pos,
+            "ascending id order means id 1 before id 2: {rendered}"
+        );
+    }
+
+    /// The daemon creates both files at spawn, so a missing one means this
+    /// sheep has never run in this `$SHEP_HOME` — not a fault worth a
+    /// notice.
+    #[tokio::test]
+    async fn a_missing_file_is_silent_and_the_rest_still_print() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let real_path = write_log(dir.path(), "web-out.log", "still-here\n");
+        let missing_path = dir
+            .path()
+            .join("never-written.log")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let (client, daemon) = fake_client_with_push(&sock).await;
+        let ghost = ProcessInfo {
+            out_file: Some(missing_path),
+            ..info(1, "ghost")
+        };
+        let real = ProcessInfo {
+            out_file: Some(real_path),
+            ..info(2, "web")
+        };
+        daemon.reply_to_list(vec![ghost, real]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &no_follow_args_out("all"),
+                ),
+            )
+            .await
+            .expect("--no-follow never subscribes, so it must terminate on its own")
+        };
+
+        assert_eq!(code, ExitCode::Success);
+        assert!(String::from_utf8(out).unwrap().contains("still-here"));
+        assert!(
+            err.is_empty(),
+            "a missing file is silent, not a notice: {}",
+            String::from_utf8_lossy(&err)
+        );
+    }
+
+    /// Points `out_file` at a directory, not a `chmod 000` file: opening a
+    /// directory succeeds on unix and the read fails `EISDIR`
+    /// deterministically, including as root, where a `000` file would still
+    /// be readable.
+    #[tokio::test]
+    async fn an_unreadable_file_is_noticed_and_exits_failure_with_the_rest_still_printed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let bad_dir = dir.path().join("a-directory");
+        std::fs::create_dir(&bad_dir).unwrap();
+        let bad_dir = bad_dir.to_str().unwrap().to_string();
+        let real_path = write_log(dir.path(), "web-out.log", "still-here\n");
+
+        let (client, daemon) = fake_client_with_push(&sock).await;
+        let bad = ProcessInfo {
+            out_file: Some(bad_dir.clone()),
+            ..info(1, "bad")
+        };
+        let real = ProcessInfo {
+            out_file: Some(real_path),
+            ..info(2, "web")
+        };
+        daemon.reply_to_list(vec![bad, real]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &no_follow_args_out("all"),
+                ),
+            )
+            .await
+            .expect("--no-follow never subscribes, so it must terminate on its own")
+        };
+
+        assert_eq!(code, ExitCode::Failure);
+        assert!(
+            String::from_utf8(out).unwrap().contains("still-here"),
+            "one sheep's unreadable file must not hide the rest of the flock's lines"
+        );
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            stderr.contains(&bad_dir),
+            "the notice must name the unreadable path: {stderr}"
+        );
+    }
+
+    /// An implementation that skips a `None` path in silence passes every
+    /// other test here and fails this one.
+    #[tokio::test]
+    async fn a_daemon_that_reported_no_path_is_noticed_not_silently_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&sock).await;
+        let sheep = ProcessInfo {
+            out_file: None,
+            err_file: None,
+            ..info(1, "web")
+        };
+        daemon.reply_to_list(vec![sheep]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &no_follow_args_out("all"),
+                ),
+            )
+            .await
+            .expect("--no-follow never subscribes, so it must terminate on its own")
+        };
+
+        assert_eq!(
+            code,
+            ExitCode::Success,
+            "version skew is not a fault in this run"
+        );
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            stderr.contains("log_path_unknown"),
+            "a None path must be noticed, not silently empty: {stderr}"
+        );
+    }
+
+    /// Sits beside `json_format_renders_the_pinned_five_key_line_shape`:
+    /// renaming a field of `BleatLine` must now fail both.
+    #[tokio::test]
+    async fn a_file_sourced_json_line_is_the_same_five_key_shape_as_a_bus_sourced_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let out_path = write_log(dir.path(), "web-out.log", "hello-from-disk\n");
+
+        let (client, daemon) = fake_client_with_push(&sock).await;
+        let sheep = ProcessInfo {
+            out_file: Some(out_path),
+            ..info(1, "web")
+        };
+        daemon.reply_to_list(vec![sheep]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Json,
+                    false,
+                    &no_follow_args_out("all"),
+                ),
+            )
+            .await
+            .expect("--no-follow never subscribes, so it must terminate on its own");
+        }
+        let out = String::from_utf8(out).unwrap();
+        let line = out.lines().next().expect("one JSON line was rendered");
+        let json: serde_json::Value = serde_json::from_str(line).unwrap();
+        let obj = json.as_object().expect("a bleats JSON line is an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+
+        assert_eq!(
+            keys,
+            ["id", "line", "name", "schema_version", "stream"],
+            "a file-sourced line must be the same shape as a bus-sourced one: {out}"
+        );
+        assert_eq!(json["id"], 1);
+        assert_eq!(json["name"], "web");
+        assert_eq!(json["stream"], "out");
+        assert_eq!(json["line"], "hello-from-disk");
+        assert_eq!(json["schema_version"], output::SCHEMA_VERSION);
+    }
+}

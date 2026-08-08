@@ -25,5 +25,7 @@ pub use wire::{MAX_FRAME_BYTES, WireError, codec, decode_frame, encode_frame};
 /// Removing, renaming, or retyping anything serialized bumps it, recorded in
 /// the CHANGELOG. Byte fixtures in each protocol module pin the deserialize
 /// direction. Phase 2b additions: [`ServerFrame`] (untagged decode helper) and
-/// [`RpcErrorCode::DeadlineExceeded`] are both additive.
+/// [`RpcErrorCode::DeadlineExceeded`] are both additive. Phase 3 addition:
+/// [`ProcessInfo`]'s `out_file`/`err_file`, also additive — they decode to
+/// `None` from pre-Phase-3 bytes, and a pre-Phase-3 peer ignores them.
 pub const PROTOCOL_VERSION: u32 = 1;

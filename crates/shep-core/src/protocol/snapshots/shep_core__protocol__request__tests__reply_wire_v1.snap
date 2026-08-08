@@ -1,6 +1,5 @@
 ---
 source: crates/shep-core/src/protocol/request.rs
-assertion_line: 248
 expression: replies
 ---
 [
@@ -25,7 +24,9 @@ expression: replies
             "pid": 4242,
             "restarts": 1,
             "uptime_ms": 60000,
-            "fold": "backend"
+            "fold": "backend",
+            "out_file": "/home/rin/.shep/logs/web-0-out.log",
+            "err_file": "/home/rin/.shep/logs/web-0-err.log"
           }
         ]
       }

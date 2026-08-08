@@ -1,6 +1,7 @@
 //! Process entry: metadata + lifecycle state for one managed sheep instance
 
 use core::time::Duration;
+use std::path::PathBuf;
 
 use shep_core::{config::ResolvedApp, status::ProcStatus};
 
@@ -31,6 +32,20 @@ pub struct ProcessEntry {
     /// respawn — never re-resolved, so a restart never re-touches the
     /// passwd database (see [`crate::privilege::resolve`]).
     pub credentials: Option<Credentials>,
+    /// Where this instance's stdout is appended, copied from the
+    /// [`SpawnSpec`](crate::runner::SpawnSpec) that
+    /// [`assemble`](crate::assemble::assemble) built.
+    ///
+    /// Carried here so the wire-facing `ProcessInfo` can report it without
+    /// re-deriving it: only the assembler knows whether the app set an
+    /// explicit `out_file` or takes the `merge_logs`-dependent default, and
+    /// a second copy of that rule would be free to drift out of agreement
+    /// with the path the child is actually writing to. `spec` and
+    /// `instance` never change after registration, so neither does this.
+    pub out_file: PathBuf,
+    /// Where this instance's stderr is appended, resolved exactly as
+    /// [`Self::out_file`].
+    pub err_file: PathBuf,
 }
 
 /// Restart budget and consecutive-unstable-exit tracking

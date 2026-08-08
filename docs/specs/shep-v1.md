@@ -219,9 +219,34 @@ shepherd channel `action`/`action-reply` messages), `enable`/`disable`
 `daemon` (hidden), `dog <name>` (hidden), `kill` (daemon shutdown),
 `thatlldo` (easter-egg alias for graceful `stop`). Selectors everywhere:
 name, id, `all`, `/regex/`, `fold:<name>`. Global `--format json|table`
-(versioned serde output schema), enumerated exit codes, clap_complete
-completions incl. dynamic sheep-name completion (short-timeout daemon query,
-silent degrade).
+(versioned serde output schema), clap_complete completions incl. dynamic
+sheep-name completion (short-timeout daemon query, silent degrade).
+
+**Exit codes.** Distinct causes get distinct codes; no error ever exits 0.
+
+| Code | Name | Meaning |
+|---|---|---|
+| 0 | success | The command did what it was asked. |
+| 1 | failure | An error with no more specific code. |
+| 2 | usage | Bad arguments. clap's own convention. |
+| 3 | not found | A selector matched no registered sheep. |
+| 4 | invalid config | A Flockfile or daemon config failed validation. |
+| 5 | daemon unreachable | No daemon answered, and none could be started. |
+| 6 | protocol mismatch | Client and daemon speak different wire versions. |
+| 7 | spawn failed | The daemon could not spawn a sheep. |
+| 8 | deadline exceeded | The request outlived its deadline. |
+| 9 | internal | An unexpected daemon-side failure. |
+| 10 | daemon already running | Another daemon already holds this `$SHEP_HOME`. |
+
+Code 10 is a contract across a process boundary, not merely a CLI detail: a
+CLI that loses the race to start a daemon learns it only from the exit
+status of the child it spawned, so `shep daemon` must exit 10 on that path
+and the client must read 10 as "another daemon won — keep probing", never
+as a failure.
+
+Code 2 is claimed by clap for usage errors, which collides with the
+fail-fast code `runtime` is specified to use below. `runtime` resolves that
+when it is built.
 
 **lookout (TUI):** ratatui; panes = flock table, bleats feed, sheep detail,
 host usage; event-driven redraw; search/filter.
