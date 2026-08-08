@@ -46,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The pure decision tiers (brain, backoff, assemble, entry, the `runner`
   trait and its fake) compile and test on every platform; the OS tier
   (real spawning, signals, the kill ladder, the socket itself) is unix-only.
+- Report each sheep's resolved log paths on `ProcessInfo`. `ProcessEntry`
+  now carries the `out_file`/`err_file` that `assemble` resolved for it,
+  copied off the assembled `SpawnSpec` at registration rather than derived a
+  second time, so the reported paths are by construction the ones the child
+  is writing to — including when the app configured an explicit `out_file`
+  pointing outside the log directory entirely.
 
 ### Fixes
 

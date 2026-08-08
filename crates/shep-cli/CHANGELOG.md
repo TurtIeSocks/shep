@@ -29,3 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subcommand's own use. `runtime` is out of scope for this phase; whichever
   task builds it resolves the collision deliberately, rather than
   discovering it.
+- Carry `ProcessInfo`'s new `out_file`/`err_file` in every `--json` payload
+  built from `FlockRows` (`flock`, `describe`, `fold`, `start`, `stop`,
+  `restart`). They are `JSON_ONLY`, not columns: absolute log paths are
+  routinely longer than the rest of the row put together and would wreck the
+  table those verbs exist to print.

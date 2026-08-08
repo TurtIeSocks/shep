@@ -206,6 +206,8 @@ mod tests {
                 restarts: 0,
                 uptime_ms: 0,
                 fold: None,
+                out_file: Some(format!("/logs/sheep-{id}-0-out.log")),
+                err_file: Some(format!("/logs/sheep-{id}-0-err.log")),
             },
             manually: false,
             at_ms: 0,

@@ -67,7 +67,13 @@ impl Render for FlockRows {
         }
     }
 
-    const JSON_ONLY: &'static [&'static str] = &[];
+    const JSON_ONLY: &'static [&'static str] = &[
+        // Absolute log paths, often longer than every other column put
+        // together — a column here would wreck the table `flock` exists to
+        // print. They ride the JSON so a programmatic consumer can find a
+        // sheep's logs without re-deriving paths the daemon alone resolves.
+        "out_file", "err_file",
+    ];
 }
 
 /// `Response::Deleted(Vec<u32>)` — the ids that were removed.
@@ -189,7 +195,7 @@ pub(crate) mod tests {
             id,
             name: name.to_string(),
             status: ProcStatus::Online,
-            // Both `Option` fields `Some`: `flock_rows_do_not_drift` below
+            // Every `Option` field `Some`: `flock_rows_do_not_drift` below
             // serializes this value and diffs its keys against `headers()`,
             // and a `None` field vanishes from the JSON entirely (no key at
             // all) rather than merely rendering empty — the drift test would
@@ -198,6 +204,8 @@ pub(crate) mod tests {
             restarts: id,
             uptime_ms,
             fold: Some("backend".to_string()),
+            out_file: Some(format!("/logs/{name}-0-out.log")),
+            err_file: Some(format!("/logs/{name}-0-err.log")),
         }
     }
 

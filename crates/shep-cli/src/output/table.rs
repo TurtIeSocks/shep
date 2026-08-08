@@ -208,6 +208,8 @@ mod tests {
             restarts: 0,
             uptime_ms: 0,
             fold: None,
+            out_file: None,
+            err_file: None,
         }
     }
 

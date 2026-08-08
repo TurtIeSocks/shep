@@ -86,6 +86,8 @@ pub fn sample_info() -> ProcessInfo {
         restarts: 3,
         uptime_ms: 60_000,
         fold: Some("backend".to_string()),
+        out_file: Some("/home/rin/.shep/logs/web-0-out.log".to_string()),
+        err_file: Some("/home/rin/.shep/logs/web-0-err.log".to_string()),
     }
 }
 

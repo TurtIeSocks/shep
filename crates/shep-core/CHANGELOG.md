@@ -30,6 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `decode_frame`) with a 16 MiB frame cap (`MAX_FRAME_BYTES`).
 - Add `SelectorSpec` <-> `ProcessSelector` wire bridges (`TryFrom`/`From`) so
   selectors travel over RPC.
+- Add `ProcessInfo::out_file` and `ProcessInfo::err_file`, the daemon's
+  resolved log paths for a sheep. Readers can no longer derive these: an
+  explicit `out_file`/`err_file` in an app's config may point anywhere, so
+  guessing the `logs/<name>-<instance>-out.log` convention silently finds
+  nothing for such a sheep. Both are `Option<String>` — a string because
+  every other path on this wire is one and because serde refuses a non-UTF-8
+  `PathBuf` outright, failing the whole reply rather than one field; optional
+  because this addition does not bump `PROTOCOL_VERSION`, so a daemon
+  predating the fields still connects and sends replies without them, where
+  `None` means "peer too old to say", never "this sheep has no log file".
+  `PROTOCOL_VERSION` stays 1: the fields are additive, they decode to `None`
+  from pre-existing bytes (pinned by a committed byte fixture), and a peer
+  that predates them ignores them.
 
 ### Fixes
 
