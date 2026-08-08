@@ -413,7 +413,20 @@ async fn serve_scripted(
                             pending_events.push(event);
                         }
                     }
-                    Some(ScriptCommand::CloseAfterSubscribe) => close_after_subscribe = true,
+                    Some(ScriptCommand::CloseAfterSubscribe) => {
+                        close_after_subscribe = true;
+                        // If the `Subscribe` frame was already handled by
+                        // this same `select!` before this script command
+                        // was dequeued (both arms are unbiased here), the
+                        // flag above arms too late and the connection stays
+                        // open — a latent race that surfaces as a 5s test
+                        // timeout rather than a clean close. Re-check the
+                        // milestone this command is arming against and act
+                        // on it immediately if it already happened.
+                        if subscribed {
+                            break;
+                        }
+                    }
                     Some(ScriptCommand::Close) | None => break,
                 }
             }

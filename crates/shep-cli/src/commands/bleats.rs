@@ -191,12 +191,26 @@ fn write_line(
     }
 }
 
+/// Writes one of this module's own notices — not a sheep's line, and not
+/// `parse_selector`'s kind of usage error either — to `streams.err`, in the
+/// same grammar [`output::emit_error`] gives usage errors.
+///
+/// Without this, a script capturing stderr under `--format json` would see
+/// valid JSON from `parse_selector`'s errors alongside plain-text prose from
+/// everything else this module writes: two grammars for one command's
+/// stderr, item 7's fix.
+fn write_notice(streams: &mut Streams<'_>, fmt: Format, code: &str, message: &str) {
+    let _ = output::emit_error(&mut *streams.err, fmt, code, message);
+}
+
 /// Handles one [`BusEvent`] already known to be `Ok` (a `Lagged` item is
 /// handled by the caller, not here).
 ///
 /// `BusEvent` is `#[non_exhaustive]`: the `_` arm ignores anything this
 /// client does not recognise, silently — a follow must not die on a bus
-/// event a newer daemon added (Global Constraints).
+/// event a newer daemon added (Global Constraints). `Dropped` is NOT one of
+/// those unrecognised events — it is a real, named variant this client
+/// understands — so it gets its own arm rather than falling into that `_`.
 fn handle_event(
     streams: &mut Streams<'_>,
     fmt: Format,
@@ -220,9 +234,30 @@ fn handle_event(
             }
             Ok(())
         }
+        BusEvent::Dropped { count } => {
+            // Daemon-side cause, deliberately NOT the `Lagged` arm's
+            // wording below: `Dropped` is the daemon's own outbound queue
+            // overflowing for this subscriber, while `Lagged` is this
+            // client's receiver falling behind reading its socket. The two
+            // failures live on opposite sides of the connection and must
+            // read differently, or a user cannot tell which end to
+            // investigate.
+            write_notice(
+                streams,
+                fmt,
+                "dropped",
+                &format!("the shepherd dropped {count} events (its own queue overflowed)"),
+            );
+            Ok(())
+        }
         BusEvent::DaemonShutdown => {
             // Shep's own diagnostic, not a sheep's line: `streams.err`.
-            let _ = writeln!(streams.err, "bleats: the shepherd is shutting down");
+            write_notice(
+                streams,
+                fmt,
+                "daemon_shutdown",
+                "the shepherd is shutting down",
+            );
             Ok(())
         }
         _ => Ok(()),
@@ -314,9 +349,11 @@ pub async fn bleats_with_signal(
                         }
                     }
                     Some(Err(Lagged { count })) => {
-                        let _ = writeln!(
-                            streams.err,
-                            "bleats: {count} events dropped locally (lagged)"
+                        write_notice(
+                            streams,
+                            fmt,
+                            "lagged",
+                            &format!("{count} events dropped locally (lagged)"),
                         );
                     }
                     None => {
@@ -439,6 +476,23 @@ mod tests {
     /// below unreachable. `--no-follow` drain mode does not need the
     /// connection to end anyway — it terminates on its own once nothing
     /// more is immediately available — so the fix is simply not calling it.
+    ///
+    /// **Known limitation, not a solved problem**: this test — and every
+    /// other `--no-follow` drain-mode test in this module — is green only
+    /// under the default current-thread test runtime. None of them
+    /// synchronize on "the pushed events actually reached the client"
+    /// before the drain arm (`std::future::ready(())`, gated `if !follow`)
+    /// resolves; they rely on the current-thread scheduler having already
+    /// driven the actor's socket read into the broadcast channel by the
+    /// time the test task resumes. Switching to
+    /// `#[tokio::test(flavor = "multi_thread")]` fails every one of these
+    /// tests nondeterministically (verified 15/15 runs). Adding
+    /// `close_after_subscribe()` does NOT fix it: the drain arm can still
+    /// win the `select!` race before the actor has forwarded anything, since
+    /// closing the connection is not the same event as delivering a queued
+    /// item. The fake this module relies on has no sync point a real fix
+    /// would need — a future flavor switch here is not a mystery, but it is
+    /// also not free.
     #[tokio::test]
     async fn ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare() {
         let dir = tempfile::tempdir().unwrap();
@@ -487,7 +541,9 @@ mod tests {
     }
 
     /// Same deviation as above, and for the same reason: drain mode does
-    /// not need `daemon.close()` to terminate.
+    /// not need `daemon.close()` to terminate. Same current-thread-scheduler
+    /// dependence as `ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare`'s
+    /// doc describes — known limitation, not fixed here.
     #[tokio::test]
     async fn err_and_out_filter_the_two_streams() {
         for (args, kept, gone) in [
@@ -540,7 +596,9 @@ mod tests {
     /// The daemon's topic filter globs on `log.out` / `log.err`, which carry
     /// no identity — so this filtering CANNOT have happened server-side,
     /// and a test that let the fake daemon pre-filter would prove nothing.
-    /// Same `daemon.close()` deviation as the tests above.
+    /// Same `daemon.close()` deviation as the tests above, and the same
+    /// current-thread-scheduler dependence documented on
+    /// `ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare`.
     #[tokio::test]
     async fn a_selector_filters_client_side_on_the_resolved_id_set() {
         let dir = tempfile::tempdir().unwrap();
@@ -708,6 +766,8 @@ mod tests {
 
     /// Same `daemon.close()` deviation as the drain tests above, and for
     /// the same reason: drain mode does not need the connection to end.
+    /// Same current-thread-scheduler dependence documented on
+    /// `ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare`.
     #[tokio::test]
     async fn a_lag_notice_reaches_stderr_and_the_follow_continues() {
         let dir = tempfile::tempdir().unwrap();
@@ -745,6 +805,163 @@ mod tests {
         assert!(
             String::from_utf8(out).unwrap().contains("after"),
             "a lag ends the gap, not the follow"
+        );
+    }
+
+    /// Critical fix (item 1): `BusEvent::Dropped` used to fall into
+    /// `handle_event`'s `_ => Ok(())` catch-all and vanish — the daemon's
+    /// own outbound queue overflowing is exactly the "a sheep went quiet"
+    /// failure mode this module's doc warns against swallowing silently.
+    ///
+    /// `Dropped` (the daemon's queue) and `Lagged` (this client's own
+    /// receiver falling behind) are different causes and must read
+    /// differently, so this asserts the daemon-side wording specifically —
+    /// `stderr.contains("dropped")` alone would also pass if the `Lagged`
+    /// arm's wording were reused by mistake, which is exactly the bug this
+    /// test exists to catch.
+    ///
+    /// Same current-thread-scheduler dependence documented on
+    /// `ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare`.
+    #[tokio::test]
+    async fn a_dropped_notice_reaches_stderr_worded_for_the_daemon_side_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon.push(BusEvent::Dropped { count: 5 }).await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(&client, &mut streams, Format::Table, &drain_args("all")),
+            )
+            .await
+            .expect("drain mode must terminate on its own, not hang");
+        }
+
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            stderr.contains("shepherd") && stderr.contains('5'),
+            "a daemon-side Dropped must not be silently swallowed: {stderr}"
+        );
+        assert!(
+            !stderr.contains("locally"),
+            "Dropped is the daemon's queue overflowing, not this client \
+             falling behind reading its own socket — reusing the `Lagged` \
+             arm's wording would blame the wrong side: {stderr}"
+        );
+    }
+
+    /// Important fix (item 3): every other test in this module uses
+    /// `Format::Table`, so mutating the JSON line shape (renaming a field,
+    /// or rendering table rows under `--format json`) left every test green.
+    /// Global Constraints pins every command's JSON shape; this is that pin
+    /// for `bleats`' own line shape (deferred by the brief to a Task 12
+    /// fixture, pinned independently here since item 2 puts that fixture's
+    /// shape in doubt).
+    ///
+    /// Same current-thread-scheduler dependence documented on
+    /// `ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare`.
+    #[tokio::test]
+    async fn json_format_renders_the_pinned_five_key_line_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon
+            .push(BusEvent::LogErr {
+                id: 1,
+                line: "boom".into(),
+            })
+            .await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(&client, &mut streams, Format::Json, &drain_args("all")),
+            )
+            .await
+            .expect("drain mode must terminate on its own, not hang");
+        }
+        let out = String::from_utf8(out).unwrap();
+        let line = out.lines().next().expect("one JSON line was rendered");
+        let json: serde_json::Value = serde_json::from_str(line).unwrap();
+        let obj = json.as_object().expect("a bleats JSON line is an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["id", "line", "name", "schema_version", "stream"],
+            "the bleats JSON line shape is a stability surface: {out}"
+        );
+        assert_eq!(json["stream"], "err", "the stream this line came from");
+    }
+
+    /// A writer that always fails with `BrokenPipe` — `shep bleats | head`
+    /// closing the reading end is the normal way this streaming verb ends,
+    /// not an error.
+    struct BrokenPipeWriter;
+
+    impl io::Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Important fix (item 5): `shep bleats | head` is this verb's normal
+    /// case, not an error — `write_outcome` already treats a `BrokenPipe`
+    /// write failure as [`ExitCode::Success`], but nothing in this module
+    /// exercised that path through an actual write failure. Same current-
+    /// thread-scheduler dependence documented on
+    /// `ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare`.
+    #[tokio::test]
+    async fn a_broken_pipe_while_writing_a_line_exits_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info(1, "web")]);
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "hello".into(),
+            })
+            .await;
+
+        let mut out = BrokenPipeWriter;
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(&client, &mut streams, Format::Table, &drain_args("all")),
+            )
+            .await
+            .expect("drain mode must terminate on its own, not hang")
+        };
+
+        assert_eq!(
+            code,
+            ExitCode::Success,
+            "a reader closing the pipe is not a failed command"
         );
     }
 }
