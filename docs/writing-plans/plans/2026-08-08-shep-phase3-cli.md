@@ -2653,8 +2653,8 @@ Flush `streams.out` on every exit path. A follow that ends with lines still buff
 
 **Files:**
 - Create: `crates/shep-cli/src/commands/admin.rs` (OS tier), `crates/shep-cli/src/completions.rs` (**pure tier**)
-- Modify: `crates/shep-cli/src/main.rs` — replace the `not_wired` arms for `Kill` and `Completions`
-- Modify: `crates/shep-client/src/testing.rs` — add clause 6 of `FakeDaemon`'s contract (the two teardown scripts). Yes, a shep-cli task edits a shep-client module: the fakes have exactly one home, and a second one built here is the failure Task 1's roster exists to prevent.
+- Modify: `crates/shep-cli/src/main.rs` — replace the `not_wired` arms for `Kill` and `Completions`, **and fix the one shipped test wiring `Completions` turns false** (Step 4 below spells it out)
+- Modify: `crates/shep-client/src/testing.rs` — add clause 6 of `FakeDaemon`'s contract (the two teardown scripts), with the exact signatures in Produces below. Yes, a shep-cli task edits a shep-client module: the fakes have exactly one home, and a second one built here is the failure Task 1's roster exists to prevent.
 
 `admin.rs` is OS tier: `#[cfg(unix)]` at the `mod` declaration. `completions.rs` is **not** — it names only `cli.rs`, `clap` and `clap_complete`, all of which compile everywhere, and its tests have to run on the Windows leg like the rest of the parse surface. Putting `completions` inside `admin.rs` would drag it behind a `cfg(unix)` for no reason and leave its tests with no portable home.
 
@@ -2672,6 +2672,14 @@ const KILL_TEARDOWN_WAIT: Duration = Duration::from_secs(10);
 /// Gap between socket-existence checks while waiting out teardown. Fixed, not
 /// a backoff: the wait is already bounded and short, and a backoff would only
 /// delay the common case where teardown finishes in milliseconds.
+///
+/// Slept with `tokio::time::sleep(..).await`, never `std::thread::sleep`.
+/// `#[tokio::test]` is a current-thread runtime and the fake's delayed unlink
+/// is a task on that same runtime, so a blocking sleep here parks the one
+/// thread that would ever run it: the socket never disappears, the poll never
+/// observes what it is waiting for, and the first test hangs to the deadline
+/// with no assertion — a killed CI job instead of a failure. Same rule as
+/// Global Constraints' bounded-receive line, one tier down.
 const KILL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 pub async fn kill(client: Client, streams: &mut Streams<'_>, fmt: Format) -> ExitCode;
@@ -2681,7 +2689,27 @@ pub async fn kill_with_wait(client: Client, streams: &mut Streams<'_>, fmt: Form
 // completions.rs — pure tier
 /// Writes the completion script for `args.shell` to `out`.
 pub fn completions(out: &mut dyn std::io::Write, args: &CompletionArgs) -> ExitCode;
+
+// crates/shep-client/src/testing.rs — clause 6 of FakeDaemon's contract.
+// Both are new; `FakeDaemon`'s whole surface today is `reply_to_list`,
+// `reply_to_describe`, `list_flock_count`, `queue_reply_then_event`, `push`,
+// `overrun_by`, `close`, `close_after_subscribe` (`testing.rs:244-357`).
+impl FakeDaemon {
+    /// Arms the next request to be answered `Response::ShuttingDown`, after
+    /// which this connection waits `after` and then unlinks its socket file
+    /// — the real teardown sequence, compressed.
+    pub fn reply_shutting_down_then_unlink_after(&self, after: Duration);
+    /// Arms the next request to be answered `Response::ShuttingDown` and then
+    /// nothing: the socket file stays. The branch `kill`'s timeout exists for.
+    pub fn reply_shutting_down_and_never_unlink(&self);
+}
 ```
+
+**Three things about those two that an implementer will otherwise get wrong.** They are the reason this block declares them at all — Task 10 shipped a test body that did not compile because a check covered declared surface and not the bodies calling it.
+
+1. **`pub fn (&self)`, not `async`.** Both call sites in Step 1 take a borrowed `daemon` and do not `.await`. The nearest precedent is the wrong one to copy: `close_after_subscribe` (`testing.rs:354`) is `pub async fn` because it arms behaviour on the background task and has to go through the script channel. Copying that shape here makes both call sites discarded futures — `unused_must_use` under `-D warnings`, and the arming silently never happens. `reply_to_list` (`:253`) documents this exact trap at `:248-252`; use its `Arc<Mutex<..>>`-flag shape, as `reply_to_describe` (`:270`) and `queue_reply_then_event` (`:284`) also do. Two more `Arc<Mutex<Option<..>>>` slots threaded through `fake_client_with_ack` and `serve_scripted`, same as the three already there.
+2. **The fake has no socket path to unlink — thread one down.** `serve_scripted` (`testing.rs:378-386`) receives a `UnixListener`, a `HelloAck`, a script receiver and four `Arc` slots; nothing stores a path, and `fake_client_with_ack` binds `path` and drops it. `listener.local_addr()?.as_pathname()` would work but is fallible twice over for no gain. **Thread a `PathBuf` down instead**: `fake_client_with_ack` already has `path: &Path` in hand — pass `path.to_path_buf()` as a new `serve_scripted` parameter. One owned field, no `Option`, no unwrap chain.
+3. **The delayed unlink runs inline in the request arm, not deferred to the select loop.** Step 3 has `kill` drop the `Client` immediately after the reply. That closes the connection, so `frames.next()` yields `None` and `serve_scripted` breaks out of its loop (its `let Some(Ok(frame)) = frame else { break }` guard) — anything scheduled for a later turn never runs, and the test fails on `assert!(!path.exists())` having never unlinked. So: in the `OutOfOrder::Idle` branch, write the `ShuttingDown` reply, then `tokio::time::sleep(after).await`, then `std::fs::remove_file` the threaded path, all before yielding back to the `select!`.
 
 `kill` sends `Request::KillDaemon`, expects `Response::ShuttingDown`, and then — per the wire sequence — that connection closes while the daemon finishes teardown. Do not report success on the reply alone: poll for the socket file to disappear, bounded by `KILL_TEARDOWN_WAIT`, so `shep kill && shep start` cannot race the old daemon's unlink. If the poll times out, report that teardown is still in progress rather than claiming a clean stop.
 
@@ -2798,9 +2826,20 @@ Three shells, not five: bash, zsh and fish are the ones the aliases and the scri
 
 On success `kill` emits a `KillRow { pid, socket_removed }` (Task 6's payload) so `--format json` gets a real object rather than an empty envelope; `pid` comes from `client.daemon().pid`, read before the drop.
 
-- [ ] **Step 4: Run tests, confirm pass**
+- [ ] **Step 4: Fix the shipped `main.rs` test this task turns false**
 
-- [ ] **Step 5: Commit** — `feat(cli): daemon shutdown and static shell completions`
+Wiring `Completions` breaks a currently-green test, and the break is silent until the suite runs. `completions_never_resolves_paths` (`crates/shep-cli/src/main.rs:402`) asserts `run(cli).await == ExitCode::Internal` — which is `not_wired`'s code (`main.rs:103-112`), not an outcome anyone chose. The moment `main.rs:145`'s `Commands::Completions(_) => return not_wired(..)` becomes a real call to `completions`, the same invocation returns `ExitCode::Success` and the assertion fails.
+
+Two edits, both required:
+
+- Flip the assertion to `ExitCode::Success`. The test's actual subject is unchanged and still worth keeping: `completions` returns *before* `resolve_paths` runs, so it works with no resolvable `$HOME`.
+- Rewrite the doc paragraph at `main.rs:381-385`. It reasons about a code shape that will no longer exist — "the reinstated `resolve_paths` call would simply succeed and fall through to the same `not_wired("completions")` arm, so `run(cli)` still returns `Internal` either way". After this task there is no `not_wired("completions")` arm, and the two codes being confused are `Success` and `Usage`. The paragraph's *conclusion* survives (with `$HOME` set, the assertion cannot distinguish a `resolve_paths` that runs from one that does not, and closing that gap belongs to the e2e tier), so keep the conclusion and re-derive it from the new codes. Leave the surrounding paragraphs — the unsafe-env-mutation note and the `daemon` note — alone; both are still accurate.
+
+This is the whole of the "Modify `main.rs`" line in Files beyond the two arms themselves.
+
+- [ ] **Step 5: Run tests, confirm pass**
+
+- [ ] **Step 6: Commit** — `feat(cli): daemon shutdown and static shell completions`
 
 ---
 
@@ -2824,9 +2863,10 @@ struct DaemonGuard(Vec<PathBuf>);
 impl DaemonGuard {
     /// Register a `$SHEP_HOME` whose daemon this test is responsible for.
     /// Call it on the `Output` — that is, immediately after `.output()` and
-    /// BEFORE `.assert()`, which panics on failure. Registering after the
-    /// assertion leaks exactly the daemon the guard exists to reap, in exactly
-    /// the case (a failed autostart) where a leaked daemon is most likely.
+    /// BEFORE the assertion on `output.status`, which panics on failure.
+    /// Registering after the assertion leaks exactly the daemon the guard
+    /// exists to reap, in exactly the case (a failed autostart) where a
+    /// leaked daemon is most likely.
     fn adopt_home(&mut self, home: &Path) { self.0.push(home.to_path_buf()); }
 }
 
@@ -2835,16 +2875,39 @@ impl Drop for DaemonGuard {
         for home in &self.0 {
             let Ok(text) = std::fs::read_to_string(home.join("pids/shepd.pid")) else { continue };
             let Ok(pid) = text.trim().parse::<i32>() else { continue };
+            let pid = nix::unistd::Pid::from_raw(pid);
             // Group, not leader: the daemon's own children are in its group.
+            // But only while the daemon really IS its own group leader —
+            // signalling `-pid` when it is not reaches somebody else's group,
+            // and in a test runner that group contains the harness. Case 1
+            // asserts the leader property holds; this checks it rather than
+            // assuming it, because Drop also runs on the path where case 1
+            // failed. ESRCH here means already reaped: fall back to the
+            // leader-only signal, which is a no-op in that case.
+            let target = match nix::unistd::getpgid(Some(pid)) {
+                Ok(pgid) if pgid == pid => nix::unistd::Pid::from_raw(-pid.as_raw()),
+                _ => pid,
+            };
             // ESRCH on an already-reaped daemon is the expected happy path.
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(-pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+            let _ = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGKILL);
         }
     }
 }
 ```
+
+**Every case's command chain carries `.timeout(Duration::from_secs(30))`**, before `.output()`. `assert_cmd`'s `timeout` (`assert_cmd/src/cmd.rs:108`) kills the child when it expires (`cmd.rs:484-490`) so the `Output` still comes back and the assertion still runs. Without it every case ends in an unbounded block, and case 7 is the live hazard: `shep bleats --no-follow` is the one command under test whose regression mode is *following forever*. A `.output()` on a regressed `--no-follow` never returns, and CI reports a killed job instead of the failed assertion that would name the bug. This is Global Constraints' bounded-receive rule (line 60) one tier up — the same failure, with a process where the earlier tiers had a channel.
+
+**`write_test_script` is this tier's one fixture helper, and it is load-bearing in a non-obvious way:**
+
+```rust
+/// Writes a trivial long-running script into `dir` and returns its path.
+/// The executable bit is the point: without `set_mode(0o755)` every
+/// `shep start` fails EACCES and all eight cases fail together, for a
+/// reason that has nothing to do with the CLI.
+fn write_test_script(dir: &TempDir) -> PathBuf;
+```
+
+Set the mode with `std::os::unix::fs::PermissionsExt::set_mode` — the same `PermissionsExt` import `launch.rs`'s own test module already uses. `#![cfg(unix)]` at the top of the file makes that unconditional here.
 
 Keep `$SHEP_HOME` shallow — the tempdir root itself, not a nested path. macOS caps `sun_path` around 104 bytes and a nested fixture path silently overruns it. The reasoning and the fixture shape to copy are at `shep-daemon/src/lib.rs:256-259` (the `test_paths` helper's own comment) and `shep-daemon/tests/daemon_e2e.rs:57-58`.
 
@@ -2852,10 +2915,10 @@ Required cases:
 1. `shep start <script>` with no daemon running autostarts one, and the sheep reaches Online. **Also assert the daemon is its own process-group leader** — read `pids/shepd.pid` and check `getpgid(pid) == pid`. That is the `Command::process_group(0)` contract, and `std::process::Command` exposes no getter for it, so a real spawn is the only honest test; this tier already spawns one and already reads that pidfile.
 2. A second command reuses the daemon rather than spawning a second (assert one pid across both).
 3. Two concurrent `shep start` invocations against a cold `$SHEP_HOME` produce exactly one daemon and no spurious error. This is the race Phase 2b's `flock(2)` makes safe; prove the client half is safe too — the loser exits 10, `connect_or_spawn` keeps probing, and both invocations exit 0.
-4. `--format json` output validates against the committed fixture for `flock`, `describe`, `start`, `ping` and `bleats --no-follow` (the last is one JSON object per line, not an envelope — see Task 10).
-5. Exit codes **and stream discipline**: a selector matching nothing exits `NotFound`; the malformed selector **`/[/`** exits `Usage` (`/unclosed` would not — it parses as a sheep named `/unclosed` and would exit `NotFound`, making the case look green while testing nothing; see Task 8's note on the three inputs the grammar rejects); a command against a socket path in a nonexistent directory exits `DaemonUnreachable`. For each, under `--format json`, assert **stdout is empty and stderr parses as a JSON object with `error.code`**. That claim is structurally unreachable from a unit test — `emit_error` is handed one writer — and this is the only tier that sees the two real streams separately.
+4. **⚠️ BLOCKED — see the note below the template.** `--format json` output validates against the committed fixture for `flock`, `describe`, `start`, `ping` and `bleats --no-follow` (the last is one JSON object per line, not an envelope — see Task 10). The `bleats` fixture is the blocked part; the other four are not, and can ship without it.
+5. Exit codes **and stream discipline**: a selector matching nothing exits `NotFound`; the malformed selector **`/[/`** exits `Usage` (`/unclosed` would not — it parses as a sheep named `/unclosed` and would exit `NotFound`, making the case look green while testing nothing; see Task 8's note on the three inputs the grammar rejects); **`shep --home <nonexistent> flock`** exits `DaemonUnreachable`. Pin that verb — the case does not hold for `start`, and picking the wrong one makes it fail for a reason the case text does not predict. `Start` is the only verb routed through the autostart path (`main.rs:166-171`); everything else takes the plain `connect_client` and fails on a socket that is not there. `start` instead reaches `launch_daemon` → `launch_command`, which creates `$SHEP_HOME/logs` recursively (`crates/shep-cli/src/launch.rs:52-56`) — so "nonexistent directory" stops being true mid-command, the daemon boots, and the invocation exits `Success`. Any non-autostarting verb works here; `flock` or `ping` are the obvious two. For each of the three, under `--format json`, assert **stdout is empty and stderr parses as a JSON object with `error.code`**. That claim is structurally unreachable from a unit test — `emit_error` is handed one writer — and this is the only tier that sees the two real streams separately.
 6. `shep kill` stops the daemon and removes the socket.
-7. `shep bleats --no-follow` drains buffered lines and exits `Success`.
+7. **⚠️ BLOCKED — see the note below the template.** `shep bleats --no-follow` drains buffered lines and exits `Success`.
 8. `shep --home <tmp> start <script>` autostarts a daemon whose socket is **under `<tmp>`** — assert on the location of the socket file, not on the command exiting 0. A child that re-resolved `$SHEP_HOME` from ambient environment binds elsewhere, and only this assertion catches it:
 
 ```rust
@@ -2868,6 +2931,7 @@ fn home_reaches_the_spawned_daemon() {
     let output = Command::cargo_bin("shep").unwrap()
         .args(["--home", dir.path().to_str().unwrap(), "start", script.to_str().unwrap()])
         .env_remove("SHEP_HOME")   // the ambient value must not be what makes this pass
+        .timeout(Duration::from_secs(30))   // never block unbounded; see above
         .output()
         .unwrap();
 
@@ -2881,9 +2945,15 @@ fn home_reaches_the_spawned_daemon() {
 }
 ```
 
-Copy that `output()` → `adopt_home` → assert ordering into all eight; it is the template.
+Copy that `timeout()` → `output()` → `adopt_home` → assert ordering into every case; it is the template. All four parts, in that order — the timeout is what turns a regression into a failed assertion instead of a killed job, and `adopt_home` before the assertion is what keeps a failed case from leaking a real daemon.
 
-- [ ] **Step 1: Write all eight, run, confirm they fail**
+> **⚠️ Cases 4 and 7 are blocked on a decision that is Rin's, not this task's. Do not start them.**
+>
+> Both rest on `shep bleats --no-follow` producing output against a real daemon, and review has established it cannot: the daemon's bus is live-only fan-out, and `Request` has no log-history variant to ask for the backlog with (`crates/shep-core/src/protocol/request.rs:53-90` — `Ping`, `ListFlock`, `Describe`, `Start`, `Stop`, `Restart`, `Delete`, `KillDaemon`, `Subscribe`, and nothing else). So a `--no-follow` run subscribes, receives whatever the daemon happens to emit in that instant, and exits — which is to say, reliably nothing. Case 7's "drains buffered lines" describes a buffer that does not exist, and case 4's `bleats --no-follow` fixture would pin an empty stream as the committed schema.
+>
+> The fix is a wire change (a history request, or a `--no-follow` that reads the log files directly), and that is a design call with Rin. **Stop and raise it — do not invent a workaround**, do not weaken case 7 to "exits `Success`" (a `bleats` that emits nothing at all passes that), and do not commit a fixture for a stream this tier cannot produce. Cases 1-3, 5, 6 and 8 are unaffected and can proceed; the remaining two land once she has ruled.
+
+- [ ] **Step 1: Write the six unblocked cases (1-3, 5, 6, 8), run, confirm they fail**
 - [ ] **Step 2: Confirm the dispatch is complete**
 
 `grep -rn "not_wired" crates/shep-cli/src` must return **nothing**. Task 5's dispatch table names the task that replaces each placeholder arm; this is the check that none was missed. Anything else these tests expose as missing is a defect in the task that owned it — fix it there, and say so in the report.
