@@ -104,14 +104,38 @@ pub trait RunningProcess: Send + 'static {
     /// that owns the proc is `tokio::spawn`'ed.
     fn wait(&mut self) -> impl core::future::Future<Output = ExitOutcome> + Send;
 
-    /// Sends a signal
+    /// Sends a signal to the sheep's whole process group
+    ///
+    /// Group-wide, not leader-only. A sheep that forks a child without
+    /// `exec`ing it — the shape every `thing & wait` wrapper script produces —
+    /// keeps that child in its own process group, so a leader-only signal
+    /// stops the wrapper and leaves the child running, orphaned and untracked.
+    /// Signalling the group instead delivers the graceful stop to the lambs
+    /// too, and gives them the same chance to shut down cleanly that the
+    /// sheep gets, rather than only ever meeting [`Self::kill_tree`]'s
+    /// `SIGKILL`.
     ///
     /// # Errors
     ///
     /// - [`RunnerError::SignalFailed`] — delivery failed (already reaped, `EPERM`).
+    ///
+    /// # Process-group assumption
+    ///
+    /// Implementors must spawn each child as the leader of a fresh process
+    /// group of its own; this method and [`Self::kill_tree`] both address
+    /// that group by the pid [`Self::pid`] reports. A child that escapes its
+    /// group after the fact (the `setsid`-in-a-fork daemonize dance) is
+    /// beyond the reach of either. The real runner's own `signal_group`
+    /// (`tokio_runner.rs`, unix-only, so deliberately not linked from this
+    /// portable tier) documents how it establishes the property and what an
+    /// implementation that dropped it would do instead.
     fn signal(&mut self, sig: StopSignal) -> Result<(), RunnerError>;
 
     /// SIGKILLs the whole process group/tree
+    ///
+    /// The escalation rung above [`Self::signal`]: same group, same
+    /// process-group assumption (documented there), but a signal nothing can
+    /// catch or ignore.
     ///
     /// # Errors
     ///

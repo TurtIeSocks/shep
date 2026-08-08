@@ -215,6 +215,13 @@ impl RunningProcess for FakeProc {
         outcome
     }
 
+    // A scripted proc models exactly ONE process with no descendants, so
+    // `signal`'s group-wide delivery contract and a leader-only delivery are
+    // indistinguishable here: there is nobody else in the group to reach.
+    // Both methods therefore record the call and resolve the wait, and
+    // neither is evidence that a real sheep's forked lambs are signalled —
+    // `tests/real_runner.rs` proves that against a real forking wrapper,
+    // which is the only tier that can.
     fn signal(&mut self, sig: StopSignal) -> Result<(), RunnerError> {
         self.state.record_signal(sig.as_raw());
         Ok(())

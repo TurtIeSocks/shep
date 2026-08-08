@@ -19,13 +19,31 @@ use crate::runner::{ExitOutcome, RunningProcess, StopSignal};
 /// 1. If `app.shutdown_with_message` is set and `to_child` is present, sends
 ///    [`ShepherdMessage::Shutdown`] over the shepherd channel; otherwise sends
 ///    the app's configured [`StopSignal`] (resolved by the private
-///    `stop_signal` parser from `app.kill_signal`).
+///    `stop_signal` parser from `app.kill_signal`) to the sheep's whole
+///    process group — lambs included, see [`RunningProcess::signal`].
 /// 2. Waits up to `app.kill_timeout` for the process to exit.
 /// 3. On timeout, SIGKILLs the whole process tree and waits for that to land.
 ///
 /// Delivery failures (message send, signal, `kill_tree`) are logged and never
 /// panic: the caller always gets a terminal [`ExitOutcome`], even if every
 /// delivery step failed and the timeout simply ran out the clock.
+// Step 3 is not made redundant by step 1 reaching the same process group:
+//
+// - Every signal step 1 can send is catchable. `SIGTERM`/`INT`/`QUIT`/`USR2`
+//   can all be trapped or ignored (`tests/real_runner.rs` runs a `trap ""
+//   TERM` sheep that does exactly that); `SIGKILL` cannot. Escalating from
+//   the polite signal to the unblockable one IS the ladder.
+// - Under `shutdown_with_message`, step 1 sends no signal at all — a child
+//   that never acts on the message has only this rung left.
+// - Group membership is a snapshot taken at delivery: anything forked after
+//   step 1's signal landed never saw it, and only step 3 re-sweeps the group.
+//
+// The rung it still cannot cover: `proc.wait()` resolves on the LEADER's
+// exit, so a lamb that survives its own graceful signal and outlives the
+// sheep ends the ladder at step 2 without ever reaching step 3. Waiting for
+// the whole group to empty has no portable syscall, and the daemon never
+// learns lamb pids (spec §7's shepherd channel does not report them), so
+// nothing here can detect that case today.
 pub async fn kill_process<P: RunningProcess>(
     proc: &mut P,
     app: &AppConfig,

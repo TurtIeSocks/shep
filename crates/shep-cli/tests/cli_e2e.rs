@@ -92,29 +92,28 @@ fn load_fixture(name: &str) -> serde_json::Value {
 /// `shep start` fails EACCES and every case that starts a sheep fails
 /// together, for a reason that has nothing to do with the CLI.
 ///
-/// `exec sleep`, not a bare `sleep`: verified empirically (`ps` before/after
-/// a real `shep kill`) that a bare trailing `sleep` is a *forked* child of
-/// the `/bin/sh` process the daemon actually tracks, in the shell's own
-/// process group. The daemon's graceful stop signals only the one recorded
-/// pid (`shep-daemon/src/tokio_runner.rs`'s `signal`, not its group-wide
-/// `kill_tree`), which kills the shell and orphans that untracked `sleep`
-/// grandchild — reparented, still running, invisible to both `shep kill`
-/// and to [`DaemonGuard`]. `exec` replaces the shell's own process image
-/// with `sleep`, in place (same pid, same group), so there is only ever one
-/// process to track and signal.
+/// A bare `sleep`, deliberately not `exec sleep`: verified empirically (`ps`
+/// before/after a real `shep kill`) that a bare trailing `sleep` is a
+/// *forked* child of the `/bin/sh` process the daemon actually tracks, in the
+/// shell's own process group — the wrapper-script shape real users write.
+/// This file used to `exec` into it to work around a daemon bug where the
+/// graceful stop signalled only the one recorded pid, killing the shell and
+/// orphaning that untracked `sleep` grandchild. The stop now goes to the
+/// whole process group (`shep-daemon/src/tokio_runner.rs`'s `signal_group`),
+/// so the fork is safe to keep — and keeping it means every case in this file
+/// exercises the shape that regressed, over the real CLI, rather than the one
+/// shape the bug could not reach.
 fn write_test_script(dir: &TempDir) -> PathBuf {
     write_script(
         dir,
         "sheep.sh",
-        &format!("#!/bin/sh\nexec sleep {SCRIPT_SLEEP_SECS}\n"),
+        &format!("#!/bin/sh\nsleep {SCRIPT_SLEEP_SECS}\n"),
     )
 }
 
 /// Writes a script that emits one marker line on stdout, optionally one on
-/// stderr, and then sleeps. Same `0o755` requirement, and the same `exec`
-/// requirement, as [`write_test_script`] — the `echo` lines still run as
-/// ordinary steps of the shell process; only the final long-running command
-/// replaces it.
+/// stderr, and then sleeps. Same `0o755` requirement as [`write_test_script`],
+/// and the same forked trailing `sleep` for the same reason.
 ///
 /// `None` writes to stderr not at all — not an empty line. An empty line is
 /// still a line: it reaches the err file, `--no-follow` renders it, and
@@ -128,7 +127,7 @@ fn write_logging_script(dir: &TempDir, out_marker: &str, err_marker: Option<&str
     if let Some(err_marker) = err_marker {
         script.push_str(&format!("echo '{err_marker}' 1>&2\n"));
     }
-    script.push_str(&format!("exec sleep {SCRIPT_SLEEP_SECS}\n"));
+    script.push_str(&format!("sleep {SCRIPT_SLEEP_SECS}\n"));
     write_script(dir, "logging.sh", &script)
 }
 
@@ -176,9 +175,10 @@ fn assert_success(output: &Output) {
 /// `ps`/`kill` against a real daemon: three back-to-back runs of this suite
 /// before this helper existed left eight orphaned `sleep` processes behind,
 /// one per sheep started; after adding this call at the end of every case
-/// that does not already `kill` as its own subject (plus making every
-/// script `exec` into its final `sleep` — see [`write_test_script`]'s own
-/// doc for why that half matters too), repeated runs left none.
+/// that does not already `kill` as its own subject, repeated runs left none.
+/// The other half of that original fix — making every script `exec` into its
+/// final `sleep` — was a workaround for a daemon bug since fixed at the
+/// source, and has been reverted (see [`write_test_script`]).
 fn graceful_kill(home: &Path) {
     let _ = shep(home).arg("kill").output();
 }

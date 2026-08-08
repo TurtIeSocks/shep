@@ -55,6 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixes
 
+- Send the kill ladder's graceful stop to the sheep's whole process group
+  instead of its leader alone, so a wrapper script that forks a child without
+  `exec`ing it (`thing & wait`) no longer leaves that child running, orphaned
+  and untracked, once the wrapper exits on the signal. The escalated `SIGKILL`
+  was already group-wide but only ran on timeout, which such a wrapper never
+  reaches — it exits promptly. Lambs now also get a chance to shut down
+  cleanly rather than only ever meeting `SIGKILL`.
 - Create every runtime directory at `0700` directly via `DirBuilder::mode`
   instead of creating then `chmod`-ing, closing a TOCTOU window where a
   freshly created directory briefly sat at its umask-derived (potentially

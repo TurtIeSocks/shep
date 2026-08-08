@@ -511,9 +511,11 @@ async fn kill_daemon_shuts_the_flock_down_and_unlinks_the_socket() {
     // also gone. Neither `pids` nor anything else in this test ever learns
     // those pids (spec §7's shepherd channel never reports grandchild
     // pids either), so this loop cannot poll them directly — the kill
-    // ladder reaches them, if at all, only via the process-GROUP `SIGKILL`
-    // `kill_tree` sends (`tokio_runner.rs`'s own doc), which this test does
-    // not independently verify.
+    // ladder reaches them via the process-GROUP signals both its rungs send
+    // (`tokio_runner.rs`'s `signal_group`), which this test does not
+    // independently verify. `real_runner.rs`'s
+    // `a_graceful_stop_reaches_a_forked_grandchild` is where that is proven,
+    // against a pid it learns from the wrapper itself.
     for pid in pids {
         assert_reaped(pid).await;
     }

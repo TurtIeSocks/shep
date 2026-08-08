@@ -135,6 +135,126 @@ async fn signal_ignored_then_kill_tree_reaps() {
     assert_eq!(outcome.signal, Some(9));
 }
 
+/// How long the forked grandchild in
+/// [`a_graceful_stop_reaches_a_forked_grandchild`] sleeps: comfortably longer
+/// than [`REAP_DEADLINE`], so a passing run proves the stop signal reached it
+/// rather than that it finished on its own; short enough that a run panicking
+/// before [`Reaper`] fires leaves nothing lingering for a whole CI job.
+const ORPHAN_SLEEP_SECS: u32 = 30;
+
+/// How long [`assert_reaped`] waits for a pid to leave the process table. A
+/// signal that lands takes milliseconds; this is slack for a loaded runner,
+/// not an expected duration.
+const REAP_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Last-resort net for a test that PANICS with real processes still alive, so
+/// a failing assertion never leaks a 30-second `sleep` into the rest of the
+/// run.
+///
+/// Fires ONLY while panicking: on the success path the test has already
+/// proven these pids are gone, and signalling a pid the OS may since have
+/// recycled is a hazard rather than a safety net.
+struct Reaper(Vec<i32>);
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        for &pid in &self.0 {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+}
+
+/// Polls `kill(pid, None)` for `ESRCH` instead of sleeping a fixed guess —
+/// the same technique, for the same reason, as `daemon_e2e.rs`'s own
+/// `assert_reaped` (integration binaries are separate crates, so the helper
+/// is duplicated rather than shared). `kill(pid, None)` still returns `Ok`
+/// for a zombie, so only a transition all the way to `ESRCH` proves the
+/// process is really gone rather than exited-but-unreaped.
+async fn assert_reaped(pid: i32, what: &str) {
+    let reaped = tokio::time::timeout(REAP_DEADLINE, async {
+        loop {
+            match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+                Err(nix::errno::Errno::ESRCH) => break,
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await;
+    assert!(reaped.is_ok(), "{what} (pid {pid}) is still alive");
+}
+
+/// The orphan regression: a graceful stop must reach a sheep's forked lambs,
+/// not just the sheep.
+///
+/// The wrapper is the shape that used to leak — it forks a long-lived child
+/// and does NOT `exec` it, so the child is a separate process sitting in the
+/// sheep's own process group. `signal` targeted the leader alone, the wrapper
+/// died promptly out of its `wait`, `proc.wait()` returned `Ok` so the ladder
+/// never escalated to `kill_tree`, and the `sleep` ran on — reparented,
+/// untracked, invisible to `shep list` and to the next `shep kill` alike.
+///
+/// Only the grandchild tells the two behaviors apart: the wrapper exits on
+/// `SIGTERM` either way. Nothing here sleeps for a fixed guess — the fork is
+/// awaited via the pid the wrapper prints AFTER forking, and the grandchild's
+/// death via [`assert_reaped`]'s `ESRCH` poll.
+#[tokio::test]
+async fn a_graceful_stop_reaches_a_forked_grandchild() {
+    let dir = tempfile::tempdir().unwrap();
+    let runner = TokioRunner::new();
+    let spec = sh_spec(
+        &format!("sleep {ORPHAN_SLEEP_SECS} & echo $!; wait"),
+        false,
+        dir.path().join("out.log"),
+        dir.path().join("err.log"),
+    );
+
+    let (mut proc, mut io) = runner.spawn(&spec).unwrap();
+    let leader = i32::try_from(proc.pid()).unwrap();
+    let mut reaper = Reaper(vec![leader]);
+
+    // Pins the property both stop rungs' negative-pid signal depends on
+    // (`tokio_runner.rs`'s `signal_group`): a runner that dropped
+    // `process_group(0)` would leave `-pid` naming no group at all, and every
+    // assertion below would fail for a reason this makes explicit.
+    assert_eq!(
+        nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(leader)))
+            .unwrap()
+            .as_raw(),
+        leader,
+        "a spawned sheep must lead its own process group"
+    );
+
+    // The wrapper prints `$!` only after the fork has happened, so receiving
+    // this line is proof the grandchild exists — no grace-period sleep needed
+    // to close the race the other tests in this file have to.
+    let line = tokio::time::timeout(Duration::from_secs(5), io.logs.recv())
+        .await
+        .expect("the wrapper must report its forked child's pid")
+        .expect("logs channel closed before the pid arrived");
+    let grandchild: i32 = line.line.trim().parse().expect("`echo $!` prints a pid");
+    reaper.0.push(grandchild);
+    assert_ne!(grandchild, leader, "sanity: `&` really forked");
+
+    proc.signal(StopSignal::Term).unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), proc.wait())
+        .await
+        .expect("the wrapper must exit on SIGTERM");
+    assert_eq!(
+        outcome.signal,
+        Some(StopSignal::Term.as_raw()),
+        "the wrapper itself dies of the same signal either way"
+    );
+
+    // The assertion the whole test exists for.
+    assert_reaped(grandchild, "the wrapper's forked child").await;
+}
+
 #[tokio::test]
 async fn shepherd_channel_delivers_ready() {
     let dir = tempfile::tempdir().unwrap();

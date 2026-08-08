@@ -1,9 +1,10 @@
 //! Real [`crate::runner::ProcessRunner`] over actual OS processes.
 //!
 //! `TokioRunner`'s spawn starts a `tokio::process::Command` in its own
-//! process group (so [`crate::runner::RunningProcess::kill_tree`] can
-//! `SIGKILL` the whole
-//! group without touching the daemon's own), optionally wires an fd-3
+//! process group (so both stop rungs —
+//! [`crate::runner::RunningProcess::signal`] and
+//! [`crate::runner::RunningProcess::kill_tree`] — can reach the whole group
+//! without touching the daemon's own), optionally wires an fd-3
 //! socketpair as the shepherd channel, and spawns background pump tasks that
 //! drain stdout/stderr into the `logs` channel (and append them to the
 //! spec's log files) and shuttle shepherd-channel JSON both ways.
@@ -96,26 +97,58 @@ impl RunningProcess for TokioProc {
     }
 
     fn signal(&mut self, sig: StopSignal) -> Result<(), RunnerError> {
-        let pid = pid_as_i32(self.pid)?;
-        signal::kill(Pid::from_raw(pid), to_nix_signal(sig))
-            .map_err(|error| RunnerError::SignalFailed(error.to_string()))
+        signal_group(self.pid, to_nix_signal(sig))
     }
 
     fn kill_tree(&mut self) -> Result<(), RunnerError> {
-        let pid = pid_as_i32(self.pid)?;
-        // Negative pid targets the whole process group; `process_group(0)`
-        // at spawn made this pid its own group leader, so this reaches the
-        // child and everything it spawned without touching the daemon's own
-        // group.
-        signal::kill(Pid::from_raw(-pid), Signal::SIGKILL)
-            .map_err(|error| RunnerError::SignalFailed(error.to_string()))
+        signal_group(self.pid, Signal::SIGKILL)
     }
 }
 
-/// Converts a captured `u32` pid into the `i32` nix's signal API expects.
-fn pid_as_i32(pid: u32) -> Result<i32, RunnerError> {
-    i32::try_from(pid)
-        .map_err(|_| RunnerError::SignalFailed(format!("pid {pid} exceeds i32 range")))
+// Both stop rungs go through one function because they differ only in which
+// signal they send, never in who they reach: the graceful stop is group-wide
+// for exactly the reason the escalated SIGKILL always was — a wrapper script
+// that forks without exec'ing (`thing & wait`) leaves its child in the
+// sheep's group, and a leader-only signal kills the wrapper while that child
+// runs on, orphaned and no longer tracked by anything.
+//
+// # What `-pid` assumes, and what breaks if it stops holding
+//
+// `command.process_group(0)` in `spawn` below makes each child the leader of
+// a fresh group whose pgid equals its pid, which is what makes `-pid` name
+// that group and nothing else. `tests/real_runner.rs` asserts the property
+// against a real spawn rather than trusting the flag.
+//
+// The sheep's own leader cannot leave that group by accident: `setsid` fails
+// `EPERM` for a process that is already a group leader, and `setpgid(0, 0)`
+// is a no-op for one. A descendant can — the classic daemonize dance is
+// fork-then-`setsid`, and a grandchild that does it lands in a session of its
+// own that neither rung reaches. That is a limit of process groups, not of
+// this choice: it was equally true of `kill_tree` before the graceful stop
+// joined it here, and escaping supervision is what that dance is for.
+//
+// If a future runner spawns WITHOUT `process_group(0)`, the failure is a
+// no-op rather than a misfire. `-pid` names the group led by `pid`; a live
+// child that is not a group leader has no such group, since a pgid is only
+// ever a live leader's own pid and pids are unique — so the call returns
+// `ESRCH` and `kill_process`'s ladder logs it and falls through to the
+// timeout. It can never reach the daemon's own group, whose pgid is the
+// daemon's pid and therefore not this child's.
+/// Sends `sig` to the whole process group led by `pid`.
+fn signal_group(pid: u32, sig: Signal) -> Result<(), RunnerError> {
+    // Rejecting 0 is not a range formality: `kill(0, ...)` means "every
+    // process in the CALLER's group" — the daemon itself — and `-0` is `0`,
+    // so a zero pid must never reach the syscall. `spawn` only ever records a
+    // pid the OS reported for a live child, which is never 0, so this guards
+    // a future refactor rather than a reachable state today.
+    let pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            RunnerError::SignalFailed(format!("pid {pid} is not a signallable process id"))
+        })?;
+    signal::kill(Pid::from_raw(-pid), sig)
+        .map_err(|error| RunnerError::SignalFailed(error.to_string()))
 }
 
 /// Maps [`StopSignal`] to the nix [`Signal`] it names.
@@ -356,4 +389,24 @@ fn spawn_channel_pumps(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Signal, signal_group};
+
+    // Everything else in this module needs a real OS child and lives in
+    // `tests/real_runner.rs`; this one case is reachable with no process at
+    // all, so it belongs here (IR-38).
+    #[test]
+    fn a_zero_pid_is_refused_before_it_can_reach_the_daemons_own_group() {
+        // `SIGCONT`, not a lethal signal, deliberately: if `signal_group`'s
+        // zero guard is ever deleted, this assertion must go RED rather than
+        // take the test harness's own process group down with it.
+        let err = signal_group(0, Signal::SIGCONT).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "signal delivery failed: pid 0 is not a signallable process id"
+        );
+    }
 }
