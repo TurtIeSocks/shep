@@ -9,6 +9,7 @@
 //! `BroadcastStream` is upstream's answer, built on tokio-util's
 //! `ReusableBoxFuture`, which owns the receiver between polls.
 
+use core::fmt;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -82,4 +83,34 @@ pub struct Lagged {
     /// How many events were discarded since this stream's last successful
     /// read.
     pub count: u64,
+}
+
+impl fmt::Display for Lagged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} events dropped locally (lagged)", self.count)
+    }
+}
+
+impl core::error::Error for Lagged {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whole-branch review item 6: `Lagged` is the error half of
+    /// `EventStream`'s `Item` — public API — but implemented neither
+    /// `Display` nor `core::error::Error`, the sole exception among this
+    /// crate's error types (`ConnectError`, `RequestError`, `SpawnError` all
+    /// have both). A consumer could neither print it nor `?` it into
+    /// `anyhow`.
+    #[test]
+    fn lagged_is_printable_and_a_real_error() {
+        let lagged = Lagged { count: 7 };
+        assert_eq!(lagged.to_string(), "7 events dropped locally (lagged)");
+
+        // Compiles only if `Lagged: core::error::Error` — the regression
+        // this test actually guards against; `to_string()` alone only needs
+        // `Display`.
+        let _: &dyn core::error::Error = &lagged;
+    }
 }
