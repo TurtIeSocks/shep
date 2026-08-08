@@ -346,7 +346,12 @@ struct SheepSlot {
     /// Delete-racing-Shutdown). `manual` records who owns the next Kill;
     /// `pending_delete` records intent that must survive regardless of who
     /// won that race, so a Delete can never be silently downgraded to a
-    /// Stop just because a Shutdown's Stop got there first.
+    /// Stop (or, worse, a Restart — a Delete racing a Restart the same way
+    /// used to respawn a brand-new live process and still tell the Delete
+    /// caller it succeeded) just because another command's marker got there
+    /// first. `handle_exited` checks this flag on every path that would
+    /// otherwise skip `decide_on_exit` (today, just the manual-Restart
+    /// early return) as well as on the `CleanStop` branch itself.
     pending_delete: bool,
     /// Bumped on every successful respawn (IMPORTANT-3). A `RestartDue`
     /// timer carries the epoch it was scheduled under; `handle_restart_due`
@@ -881,7 +886,19 @@ impl<R: ProcessRunner> Actor<R> {
         // `manual.is_some()` true, `decide_on_exit` always resolves to
         // CleanStop, landing the sheep in `Stopped` — an honest answer for
         // a restart request that lost the race to a shutdown.
-        if manual == Some(ManualKind::Restart) && !self.shutting_down {
+        //
+        // Adversarial finding #2 follow-up: also NOT when `pending_delete`
+        // is set — this is the ONLY place in `handle_exited` that can
+        // resolve an exit without ever consulting `decide_on_exit` (every
+        // other path reaches the `Decision::CleanStop if ... || pending_delete`
+        // guard below), so it's the one branch a Delete racing a Restart
+        // could slip past. Respawning here would hand back a brand-new LIVE
+        // process while telling the Delete caller it succeeded — worse than
+        // the original bug (a merely-stale `Stopped` entry), since it also
+        // shows up in `list()` as `Online`. Falling through instead lets
+        // `decide_on_exit` resolve to CleanStop (manual.is_some() is still
+        // true) and the `pending_delete` guard below correctly deregister.
+        if manual == Some(ManualKind::Restart) && !self.shutting_down && !pending_delete {
             slot.entry.budget.reset();
             let info = self.respawn(id, true);
             return self.resolve_pending(id, info);
@@ -1762,6 +1779,66 @@ mod tests {
         drop(shutter);
     }
 
+    // Fix-round regression (reviewer finding, Task 9): a Delete racing a
+    // RESTART, not a Shutdown. `handle_exited`'s manual-Restart branch is
+    // the ONE path that resolves an exit without ever consulting
+    // `decide_on_exit` -- every other path reaches the
+    // `Decision::CleanStop if manual == Some(Delete) || pending_delete`
+    // guard, but this one used to `return` straight to `self.respawn(...)`
+    // whenever `manual == Some(Restart)`, ignoring `pending_delete`
+    // entirely. Reachable exactly like the Shutdown race: `Restart(id)`
+    // claims `slot.manual = Some(Restart)` on a running sheep; a racing
+    // `Delete(id)` hits `already_in_flight`, correctly sets
+    // `pending_delete = true`, but never touches `manual`. Worse than the
+    // original bug: instead of leaving a stale `Stopped` entry behind, this
+    // one respawned a BRAND-NEW LIVE PROCESS while still telling the
+    // `Delete` caller it succeeded.
+    #[tokio::test(start_paused = true)]
+    async fn delete_racing_restart_still_deregisters_the_sheep() {
+        let (events, _rx) = tokio::sync::broadcast::channel(1024);
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::ignores_signals(), // wide kill-ladder window
+            // A second script so the pre-fix bug's illegitimate respawn
+            // actually SUCCEEDS into a live, Online process (worse than the
+            // original bug: without this, an exhausted script pool would
+            // land the buggy respawn attempt in Errored instead, still
+            // failing this test but masking exactly how bad the bug is).
+            ProcScript::never_exits(),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let app = AppConfig::minimal("svc", "./svc");
+        let started = handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        let id = started[0].id;
+
+        let h2 = handle.clone();
+        let restarter = tokio::spawn(async move { h2.restart(ProcessSelector::All).await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await; // let Restart claim the manual marker first
+        }
+        let deleted = handle.delete(ProcessSelector::Id(id)).await.unwrap();
+        let restarted = restarter.await.unwrap().unwrap();
+
+        assert_eq!(deleted, vec![id], "the caller was told this id was deleted");
+        // Both callers get the SAME honest outcome (IMPORTANT-4 semantics):
+        // the restart() caller must NOT see a respawned Online process --
+        // if it does, a brand-new live child was spawned behind the
+        // Delete's back.
+        assert_eq!(restarted[0].id, id);
+        assert_eq!(
+            restarted[0].status,
+            ProcStatus::Stopped,
+            "restart() must not report a respawned process once a racing \
+             Delete has claimed this id -- got {restarted:?}"
+        );
+        assert!(
+            handle.list().await.iter().all(|info| info.id != id),
+            "a Delete that raced a Restart must still deregister the sheep, \
+             not respawn a brand-new live process while telling its caller \
+             the sheep was deleted"
+        );
+    }
+
     // ---------------------------------------------------------------
     // IR-37: supervisor proptest (Task 9, Step 2). A command script (what
     // the operator does) and a process script (how each spawned child
@@ -1777,6 +1854,20 @@ mod tests {
     // racing Shutdown, fixed above) is exactly the kind of bug this proptest
     // structurally cannot reach -- that's why it has its own targeted
     // regression test instead of being folded in here.
+    //
+    // More generally: this proptest's driver below is strictly sequential --
+    // each step's command is fully `.await`ed (its deferred reply resolved)
+    // before the next step runs -- so it can NEVER put two manual commands
+    // in flight against the SAME sheep at once. Every manual-vs-manual race
+    // this file guards against (`overlapping_stop_and_restart_agree_on_one_outcome`,
+    // `delete_racing_shutdown_still_deregisters_the_sheep`,
+    // `delete_racing_restart_still_deregisters_the_sheep`) needs a second
+    // command issued via `tokio::spawn` while the first is still mid-flight,
+    // which is exactly what this driver's "one command, fully awaited, then
+    // the next" shape rules out. Don't read this proptest's invariants
+    // holding as evidence that manual-vs-manual races are covered here --
+    // they aren't, by construction; that coverage lives entirely in the
+    // file's dedicated race tests.
     // ---------------------------------------------------------------
 
     #[derive(Debug, Clone, Copy)]
