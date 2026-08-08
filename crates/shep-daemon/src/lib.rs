@@ -147,6 +147,32 @@ pub(crate) mod testing {
     use crate::snapshot::FlockRegistry;
     use crate::supervisor::spawn_supervisor;
 
+    /// Serializes any test, anywhere in this crate, that closes a real OS
+    /// descriptor and then acts again on that SAME learned number (adopting
+    /// it a second time).
+    ///
+    /// fd numbers are process-wide and Rust's default test harness runs
+    /// `#[test]`/`#[tokio::test]` functions on separate threads
+    /// concurrently, so two such tests can race the kernel's own
+    /// lowest-available-fd allocation: one test's "now closed, expect
+    /// refusal" window can get a DIFFERENT, concurrently running test's own
+    /// live fd handed back to it instead, and touching that number closes
+    /// the other test's resource out from under it. Found empirically
+    /// (Opus review follow-up, 2026-08-08) as a genuine, non-deterministic
+    /// `SIGABRT` (`fatal runtime error: IO Safety violation: owned file
+    /// descriptor already closed`) between `sys.rs`'s own two fd-adoption
+    /// tests, roughly 1-in-a-few-dozen parallel runs — not a flaky
+    /// assertion, a real double-close.
+    ///
+    /// `#[cfg(unix)]`: its only users, `sys.rs`, are unix-only themselves.
+    /// (Not itself proof against every fd-collision risk in this crate — a
+    /// similarly-shaped `boot.rs` test was tried, found to measurably raise
+    /// the WHOLE suite's collision odds against unrelated tests elsewhere
+    /// in the crate that also churn real fds, and removed rather than kept
+    /// under this lock; see `boot.rs`'s own comment at that call site.)
+    #[cfg(unix)]
+    pub(crate) static FD_REUSE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // WHY a shallow home: later tasks bind a UDS under `run/`, and sun_path
     // caps a socket path near 104 bytes. Using the tempdir root as
     // $SHEP_HOME (no extra nesting) keeps every test in this crate under the
