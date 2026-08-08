@@ -186,6 +186,10 @@ enum ScriptCommand {
     PushEvent(BusEvent),
     /// Ends the script: stop serving and let the task return.
     Close,
+    /// Ends the script the moment this connection has answered its next
+    /// `Request::Subscribe` and flushed anything already queued via
+    /// [`FakeDaemon::push`] — see [`FakeDaemon::close_after_subscribe`].
+    CloseAfterSubscribe,
 }
 
 /// [`ScriptCommand::ArmOutOfOrder`]'s progress: idle, armed (waiting for
@@ -207,7 +211,11 @@ enum OutOfOrder {
 /// `Request::Describe { .. }` (the shape both `describe` and `fold` send);
 /// [`Self::list_flock_count`] reports how many `ListFlock` requests this
 /// connection has answered, so a test can prove a client cached rather than
-/// re-asked; [`Self::close`] ends the script and drops the connection.
+/// re-asked; [`Self::close`] ends the script and drops the connection;
+/// [`Self::close_after_subscribe`] does the same but only once this
+/// connection's next `Request::Subscribe` has actually been answered,
+/// which is what a test needs when the script has to queue `close`
+/// *before* the client under test has connected at all.
 /// Every other request this fake receives is answered with
 /// `Response::Pong` — good enough for a test that only cares about
 /// `ListFlock`/`Describe` behavior, or about a request getting *some*
@@ -319,6 +327,33 @@ impl FakeDaemon {
         let _ = self.script.send(ScriptCommand::Close).await;
         self.task.await.unwrap();
     }
+
+    /// Arms this connection to close itself the moment it has answered its
+    /// next `Request::Subscribe` and flushed anything [`Self::push`] queued
+    /// beforehand — deterministically, unlike calling [`Self::close`]
+    /// *before* a test's client has even issued its first real request.
+    ///
+    /// [`Self::close`] ends the script as soon as the background task
+    /// observes it, with no regard for whether a real protocol exchange
+    /// (`ListFlock`, `Subscribe`, ...) is still ahead of it — calling it
+    /// before the client under test has connected races the whole
+    /// arrange/act split instead of the one thing a test means to exercise.
+    /// This method instead waits for the *real* milestone a "the daemon
+    /// goes away mid-follow" test actually needs: the subscription this
+    /// connection's caller asked for has been served, in full, before the
+    /// connection ends.
+    ///
+    /// Synchronous is not an option here (unlike [`Self::reply_to_list`]):
+    /// this arms behavior on the same background task that also drains
+    /// [`Self::push`]'s queue, so it has to go through the same script
+    /// channel those do.
+    ///
+    /// Does not consume `self`, unlike [`Self::close`]: a caller that also
+    /// wants [`Self::list_flock_count`] after the connection ends needs to
+    /// keep this handle alive to ask for it.
+    pub async fn close_after_subscribe(&self) {
+        let _ = self.script.send(ScriptCommand::CloseAfterSubscribe).await;
+    }
 }
 
 /// The [`FakeDaemon`] background task: accepts one connection, handshakes
@@ -362,6 +397,7 @@ async fn serve_scripted(
     // `Client::subscribe`, which has not returned), so events queue here.
     let mut subscribed = false;
     let mut pending_events: Vec<BusEvent> = Vec::new();
+    let mut close_after_subscribe = false;
 
     loop {
         tokio::select! {
@@ -377,6 +413,7 @@ async fn serve_scripted(
                             pending_events.push(event);
                         }
                     }
+                    Some(ScriptCommand::CloseAfterSubscribe) => close_after_subscribe = true,
                     Some(ScriptCommand::Close) | None => break,
                 }
             }
@@ -419,6 +456,9 @@ async fn serve_scripted(
                             subscribed = true;
                             for event in pending_events.drain(..) {
                                 write_event(&mut frames, event).await;
+                            }
+                            if close_after_subscribe {
+                                break;
                             }
                         } else {
                             let response = if matches!(envelope.body, Request::ListFlock) {

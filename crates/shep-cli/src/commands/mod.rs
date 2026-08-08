@@ -2,6 +2,7 @@
 //! `#[cfg(unix)]` at this module's own declaration in `main.rs`, so nothing
 //! declared beneath it needs a `cfg` of its own.
 
+pub mod bleats;
 pub mod daemon;
 pub mod lifecycle;
 pub mod query;

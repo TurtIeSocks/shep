@@ -22,6 +22,8 @@ use cli::{Cli, GlobalArgs};
 #[cfg(unix)]
 use cli::{Commands, DaemonArgs, Format};
 #[cfg(unix)]
+use commands::bleats;
+#[cfg(unix)]
 use commands::daemon::{daemon_exit_code, run_daemon};
 #[cfg(unix)]
 use commands::lifecycle;
@@ -193,7 +195,10 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => query::fold(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
-        Commands::Bleats(_) => not_wired(&mut streams, fmt, "bleats"),
+        Commands::Bleats(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => bleats::bleats(&client, &mut streams, fmt, args).await,
+            Err(code) => code,
+        },
         Commands::Ping => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => query::ping(&client, &mut streams, fmt).await,
             Err(code) => code,
