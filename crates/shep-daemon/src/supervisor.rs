@@ -28,7 +28,6 @@
 use core::fmt;
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
-use std::time::SystemTime;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -990,7 +989,7 @@ impl<R: ProcessRunner> Actor<R> {
             event,
             info,
             manually,
-            at_ms: now_ms(),
+            at_ms: crate::now_ms(),
         });
     }
 }
@@ -1028,16 +1027,6 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
         uptime_ms,
         fold: entry.spec.config().fold.clone(),
     }
-}
-
-/// The one real-time read in the supervisor: wall-clock milliseconds since
-/// the Unix epoch, for [`BusEvent::Process::at_ms`]. Everything else in the
-/// actor uses the paused-clock-aware `tokio::time::Instant`.
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Spawns the per-sheep task and returns its control sender.
@@ -1145,21 +1134,7 @@ mod tests {
 
     use super::*;
     use crate::fake::{ProcScript, ScriptedRunner};
-
-    // WHY: an isolated $SHEP_HOME per test, resolved over a real tempdir so
-    // `assemble`'s log-path computation has somewhere plausible to point —
-    // nothing in these tests actually touches the filesystem (the scripted
-    // runner never opens the log files), so leaking the tempdir (no cleanup
-    // guard kept alive) is fine for test-process-lifetime isolation.
-    fn test_paths() -> ShepPaths {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // `into_path()` (not `keep()`) deliberately: `keep()` isn't available
-        // on the workspace's tempfile floor ("3", i.e. 3.0.2 under
-        // -Z minimal-versions), only added in a later 3.x release.
-        #[allow(deprecated, reason = "keep() postdates the workspace's tempfile floor")]
-        let path = dir.into_path();
-        ShepPaths::resolve(&|_| None, &path)
-    }
+    use crate::testing::test_paths; // the one crate-root fixture (IR-33)
 
     // Drives virtual time by parking on recv(); returns when the id reaches `kind`.
     async fn await_event(
@@ -1184,7 +1159,8 @@ mod tests {
         let (events, _rx) = tokio::sync::broadcast::channel(64);
         let runner =
             ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let mut app = AppConfig::minimal("web", "./srv");
         app.instances = 2;
         let infos = handle.start(vec![normalize(app).unwrap()]).await.unwrap();
@@ -1200,7 +1176,8 @@ mod tests {
         let (events, mut rx) = tokio::sync::broadcast::channel(1024);
         // 16 spawns: initial + 15 restarts; every exit instant (unstable).
         let runner = ScriptedRunner::new((0..16).map(|_| ProcScript::const_exit(1)).collect());
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let mut app = AppConfig::minimal("crash", "./boom");
         app.exp_backoff_restart_delay = Some("100".parse().unwrap());
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
@@ -1229,7 +1206,8 @@ mod tests {
         // override) throughout.
         let (events, mut rx) = tokio::sync::broadcast::channel(1024);
         let runner = ScriptedRunner::new((0..20).map(|_| ProcScript::const_exit(1)).collect());
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let app = AppConfig::minimal("crash-default", "./boom"); // no max_restarts override
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         await_event(&mut rx, 0, ProcessEventKind::Errored).await;
@@ -1252,7 +1230,8 @@ mod tests {
         script.push(ProcScript::stable_then_exit(2000, 1)); // > min_uptime 1000ms => stable
         script.extend((0..16).map(|_| ProcScript::const_exit(1)));
         let runner = ScriptedRunner::new(script);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let app = AppConfig::minimal("flappy", "./f");
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // 3 unstable (no backoff => immediate), 1 stable run resets the budget,
@@ -1275,7 +1254,8 @@ mod tests {
             },
             obeys_signal: true,
         }]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let app = AppConfig::minimal("svc", "./svc");
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         let stopped = handle
@@ -1293,7 +1273,8 @@ mod tests {
     async fn stop_exit_codes_mean_clean_stop() {
         let (events, mut rx) = tokio::sync::broadcast::channel(64);
         let runner = ScriptedRunner::new(vec![ProcScript::const_exit(0)]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let mut app = AppConfig::minimal("oneshot", "./job");
         app.stop_exit_codes = vec![0];
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
@@ -1305,7 +1286,8 @@ mod tests {
     async fn spawn_failure_surfaces_and_erroreds() {
         let (events, _rx) = tokio::sync::broadcast::channel(64);
         let runner = ScriptedRunner::new(vec![]); // exhausted immediately
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let app = AppConfig::minimal("ghost", "./missing");
         let err = handle
             .start(vec![normalize(app).unwrap()])
@@ -1320,7 +1302,8 @@ mod tests {
         let (events, _rx) = tokio::sync::broadcast::channel(64);
         let runner =
             ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let mut a = AppConfig::minimal("api", "./a");
         a.fold = Some("backend".to_string());
         let b = AppConfig::minimal("web", "./w");
@@ -1355,7 +1338,8 @@ mod tests {
             ProcScript::never_exits(),
             ProcScript::never_exits(),
         ]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let app = AppConfig::minimal("svc", "./svc");
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
@@ -1382,7 +1366,8 @@ mod tests {
         let (events, _rx) = tokio::sync::broadcast::channel(64);
         let runner =
             ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let mut app = AppConfig::minimal("web", "./srv");
         app.instances = 2;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
@@ -1425,7 +1410,8 @@ mod tests {
             ProcScript::ignores_signals(), // web: full 1600ms kill ladder
             ProcScript::never_exits(),     // the ghost respawn, if CRITICAL-1 regresses
         ]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let mut crash = AppConfig::minimal("crash", "./boom");
         crash.exp_backoff_restart_delay = Some("500".parse().unwrap());
         let web = AppConfig::minimal("web", "./srv");
@@ -1459,7 +1445,8 @@ mod tests {
             ProcScript::ignores_signals(), // web: 1600ms ladder
             ProcScript::never_exits(),     // the late Start, if it lands before Shutdown
         ]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let web = AppConfig::minimal("web", "./srv");
         handle.start(vec![normalize(web).unwrap()]).await.unwrap();
 
@@ -1499,7 +1486,8 @@ mod tests {
             ProcScript::never_exits(),             // whoever respawns first takes this
             ProcScript::never_exits(),
         ]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let mut app = AppConfig::minimal("crash", "./boom");
         app.exp_backoff_restart_delay = Some("2000".parse().unwrap());
         app.min_uptime = "5000".parse().unwrap(); // 1500ms uptime counts as unstable
@@ -1541,7 +1529,8 @@ mod tests {
             ProcScript::ignores_signals(), // 1600ms ladder: a wide race window
             ProcScript::never_exits(),
         ]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let app = AppConfig::minimal("svc", "./svc");
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
 
@@ -1577,7 +1566,8 @@ mod tests {
             ProcScript::ignores_signals(),        // sheep a: 1600ms ladder
             ProcScript::stable_then_exit(800, 0), // sheep b: exits at t=800
         ]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let a = AppConfig::minimal("a", "./a");
         let mut b = AppConfig::minimal("b", "./b");
         b.autorestart = false;
@@ -1614,7 +1604,8 @@ mod tests {
     async fn mailbox_flood_during_a_kill_never_deadlocks() {
         let (events, mut rx) = tokio::sync::broadcast::channel(4096);
         let runner = ScriptedRunner::new(vec![ProcScript::ignores_signals()]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let a = AppConfig::minimal("a", "./a");
         handle.start(vec![normalize(a).unwrap()]).await.unwrap();
 

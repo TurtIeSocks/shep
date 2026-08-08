@@ -33,6 +33,7 @@
 //! - [`kill`]: kill ladder — SIGTERM, SIGKILL escalation (portable, generic over [`RunningProcess`](runner::RunningProcess))
 //! - [`channel`]: shepherd channel codec (child↔daemon messages, newline-JSON)
 //! - [`bus`]: the daemon-wide event bus — topic-glob filtering, per-subscriber forwarder tasks
+//! - [`snapshot`]: the muster roll — debounced atomic `flock.json` writes, restart-survival restore
 //!
 //! # Quick start
 //!
@@ -108,7 +109,42 @@ pub mod channel;
 pub mod entry;
 pub mod kill;
 pub mod runner;
+pub mod snapshot;
 pub mod supervisor;
+
+use std::time::SystemTime;
+
+/// The one real-time read shared across this crate: wall-clock milliseconds
+/// since the Unix epoch, for [`BusEvent::Process::at_ms`](shep_core::protocol::BusEvent::Process)
+/// and [`FlockSnapshot::saved_at_ms`](snapshot::FlockSnapshot::saved_at_ms).
+/// Everything else in the engine uses the paused-clock-aware
+/// `tokio::time::Instant`.
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// IR-33: one crate-root fixture module. Every test mod from Task 3 onward
+// (and the harness in Tasks 4-5) shares this one `test_paths` helper instead
+// of hand-rolling its own.
+#[cfg(test)]
+pub(crate) mod testing {
+    use shep_core::paths::ShepPaths;
+
+    // WHY a shallow home: later tasks bind a UDS under `run/`, and sun_path
+    // caps a socket path near 104 bytes. Using the tempdir root as
+    // $SHEP_HOME (no extra nesting) keeps every test in this crate under the
+    // limit on macOS, whose temp paths are already long.
+    pub(crate) fn test_paths(dir: &tempfile::TempDir) -> ShepPaths {
+        let home = dir.path().to_path_buf();
+        ShepPaths::resolve(
+            &|key| (key == "SHEP_HOME").then(|| home.display().to_string()),
+            std::path::Path::new("/nonexistent"),
+        )
+    }
+}
 
 /// Real [`ProcessRunner`](runner::ProcessRunner) over actual OS processes.
 ///
