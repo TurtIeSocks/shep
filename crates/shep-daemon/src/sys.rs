@@ -1,6 +1,6 @@
-//! Adopting an inherited descriptor — the phase's `unsafe`
+//! Adopting an inherited descriptor — this crate's only `unsafe`
 //!
-//! **Why unsafe here, and (almost) nowhere else.** The daemonization contract (spec
+//! **Why unsafe here, and nowhere else.** The daemonization contract (spec
 //! §3) is that the CLI re-execs itself detached and the child reports
 //! `{pid, version}` on an inherited pipe once the socket is bound. Adopting
 //! an inherited descriptor is the one operation std offers no safe path
@@ -8,24 +8,26 @@
 //! `from_raw_fd`, which is unsafe because nothing in the type system proves
 //! the number names a descriptor this process owns.
 //!
-//! **More than two sites, and that's fine.** [`adopt_fd`] is `unsafe fn`,
-//! not a safe fn hiding an internal unsafe block: the ordering precondition
-//! that makes adoption sound (call this before the process opens anything
-//! of its own — see scenario (c) below) is a CALLER obligation this
-//! function cannot verify from inside itself, so the type system pushes it
-//! out to whoever calls it. The crate's actual unsafe surface, counted
-//! honestly (an earlier revision of this doc undercounted, by only
-//! tallying the non-test sites — corrected here rather than repeated):
-//! [`adopt_fd`]'s own definition here, its one PRODUCTION call site in
-//! `crate::boot::boot` (the literal first statement in that function, with
-//! its own `// SAFETY:` comment), plus six TEST-only call sites that
-//! exercise it directly against synthetic fds — one in `boot.rs`'s own
-//! tests, five in this file's own (below) — eight sites total, each with
-//! its own justification. What actually matters for soundness is
-//! unchanged by the recount: only the ONE production call site's ordering
-//! claim has to hold against a real inherited descriptor; every test site
-//! adopts a fd it created itself moments earlier in the same test, which is
-//! a narrower, locally-checkable obligation, not a widening of the
+//! **All of it, confined to this file (IR-22).** [`adopt_fd`] is `unsafe
+//! fn`, not a safe fn hiding an internal unsafe block: the ordering
+//! precondition that makes adoption sound (call this before the process
+//! opens anything of its own — see scenario (c) below) is a CALLER
+//! obligation this function cannot verify from inside itself, so the type
+//! system pushes it out to whoever calls it. [`crate::boot::BootOptions::ready_fd`]
+//! is `Option<`[`std::fs::File`]`>`, an already-owned handle — `boot`
+//! itself never calls this function and contains no unsafe of its own (see
+//! that field's own doc). The crate's actual unsafe surface today, counted
+//! honestly: [`adopt_fd`]'s own definition here, plus this file's own
+//! test-only call sites exercising it directly against synthetic fds (see
+//! below) — every syntactic site lives in this one file. The intended
+//! PRODUCTION caller is the CLI's `main` (Phase 3), a different crate, as
+//! its literal first fd-touching statement, before a tokio runtime even
+//! exists — not written yet, so it adds no site here today. What actually
+//! matters for soundness is unaffected by exactly how many test sites this
+//! file accumulates: only a real production call's ordering claim has to
+//! hold against a genuinely inherited descriptor; every test site adopts a
+//! fd it created itself moments earlier in the same test, which is a
+//! narrower, locally-checkable obligation, not a widening of the
 //! exception.
 //!
 //! **Rejected alternative:** have the parent pass a socket path
@@ -66,21 +68,31 @@
 //!     of internal checking can verify from inside `adopt_fd` itself, so
 //!     the type system now forces every call site to write down its own
 //!     justification instead of letting the invariant erode silently on a
-//!     future reorder. [`crate::boot::boot`]'s own call site is that
-//!     justification: it adopts as the literal first fd-touching statement,
-//!     before `init_dirs`/`bind_socket`/`write_pidfile`/signal installation
-//!     run;
-//! (d) double adoption — in production, [`adopt_fd`] is called at most
-//!     once, from [`crate::boot::boot`]'s single production call site, and
-//!     consumes the number into an owning [`std::fs::File`] that closes it
-//!     on drop, so a second production adoption of the same fd cannot even
-//!     occur there; if it somehow did, scenario (b)'s `BadFd` refusal
-//!     catches it, since the first adoption already closed the number.
-//!     (This crate's *tests* call `adopt_fd` directly, and more than once
-//!     across the suite, each time against a fd the test itself just
-//!     created — a different, lower-stakes situation than production
-//!     double-adoption, and not what this scenario is about.)
-#![allow(unsafe_code)] // IR-24 exception — eight sites total across the crate (this file's definition plus its 5 test call sites, boot.rs's 1 production call site plus its own 1 test call site); see the essay above.
+//!     future reorder. **Decision 1 (2026-08-08) removed the whole class
+//!     of risk this scenario describes from this crate structurally**,
+//!     rather than merely re-ordering around it again: `boot` no longer
+//!     calls [`adopt_fd`] at all, so it is no longer possible for anything
+//!     `boot` itself does — bind a socket, open a tempfile, install signal
+//!     handlers — to land between adoption and use. The intended
+//!     PRODUCTION caller is the CLI's `main` (Phase 3), which discharges
+//!     the ordering precondition by being the literal first fd-touching
+//!     statement of the whole process, before a tokio runtime — the thing
+//!     that made `boot`'s own attempt at this structurally impossible to
+//!     guarantee, since `boot` is `async` and a runtime with its own live
+//!     poller fds necessarily exists before `boot` is ever called — even
+//!     exists. See [`crate::boot::BootOptions::ready_fd`]'s own doc;
+//!
+//! (d) double adoption — a future production caller (the CLI's `main`,
+//!     Phase 3) is expected to call [`adopt_fd`] at most once, consuming
+//!     the number into an owning [`std::fs::File`] that closes it on drop,
+//!     so a second production adoption of the same fd should not occur; if
+//!     it somehow did, scenario (b)'s `BadFd` refusal catches it, since the
+//!     first adoption already closed the number. (This crate's *tests*
+//!     call `adopt_fd` directly, and more than once across the suite, each
+//!     time against a fd the test itself just created — a different,
+//!     lower-stakes situation than production double-adoption, and not
+//!     what this scenario is about.)
+#![allow(unsafe_code)] // IR-24 exception — seven sites total, all in this file (its own definition plus 6 test call sites; `boot.rs` has none — see the essay above and `crate::boot::BootOptions::ready_fd`'s doc).
 
 use core::fmt;
 
@@ -110,8 +122,15 @@ const RESERVED_FD_FLOOR: RawFd = 3;
 /// process already owns; dropping the returned [`File`] would then close
 /// that resource out from under its real owner instead of the intended
 /// inherited pipe. See this module's rationale essay, scenario (c), for a
-/// worked example of exactly this happening. [`crate::boot::boot`] upholds
-/// this by adopting as its first fd-touching statement.
+/// worked example of exactly this happening.
+///
+/// The intended caller is the CLI's `main` (Phase 3, a different crate —
+/// not written yet): its literal first fd-touching statement, before a
+/// tokio runtime (or anything else) exists. Nothing in `shep-daemon` calls
+/// this function in production today; [`crate::boot::boot`] receives an
+/// already-adopted [`std::fs::File`] via
+/// [`crate::boot::BootOptions::ready_fd`] and never touches a raw fd
+/// itself — see that field's own doc for why adoption moved out of `boot`.
 pub unsafe fn adopt_fd(fd: RawFd) -> Result<File, SysError> {
     if fd < RESERVED_FD_FLOOR {
         return Err(SysError::ReservedFd(fd));
@@ -244,5 +263,35 @@ mod tests {
         // it before from_raw_fd ever runs.
         let second = unsafe { adopt_fd(fd) };
         assert!(matches!(second, Err(SysError::BadFd { .. })));
+    }
+
+    #[test]
+    fn a_fd_this_process_never_owned_is_refused() {
+        // Moved here from `boot.rs` by Decision 1 (2026-08-08):
+        // `BootOptions::ready_fd` is `Option<std::fs::File>` now, so there
+        // is no longer any way to drive a bad fd NUMBER through `boot`'s
+        // public API at all — the type itself proves the handle was valid
+        // at construction. The BadFd-refusal behavior this test pins used
+        // to be exercised indirectly through `boot`; it belongs here now,
+        // testing `adopt_fd` directly, which is where the refusal actually
+        // happens.
+        //
+        // fd 4096 is a number this process will NEVER own: default
+        // fd-table limits sit far below it, and nothing in this crate's
+        // test suite opens anywhere near that many concurrent descriptors,
+        // so `F_GETFD` fails on it deterministically, every time, regardless
+        // of what else is running concurrently — zero collision risk,
+        // unlike `a_closed_descriptor_is_refused_instead_of_adopted` above,
+        // which frees and re-probes a REAL fd number and so needs
+        // `FD_REUSE_LOCK`. This test needs no lock for exactly that reason.
+        // SAFETY: fd 4096 is never open in this process; adopt_fd's
+        // F_GETFD probe rejects it before from_raw_fd ever runs, so there
+        // is no ordering precondition to uphold for a call that never
+        // actually adopts.
+        let err = unsafe { adopt_fd(4096) }.unwrap_err();
+        assert!(
+            matches!(err, SysError::BadFd { fd: 4096, .. }),
+            "a fd this process never owned must be refused as BadFd: {err:?}"
+        );
     }
 }

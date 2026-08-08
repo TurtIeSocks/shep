@@ -18,7 +18,7 @@ These are the rules agents violate when writing "good" Rust from instinct. Check
 | Every `Result`-returning pub fn has an `# Errors` doc section | IR-28 |
 | `# Panics` doc and `#[track_caller]` travel together — never one without the other | IR-21 |
 | Error enums: per-module, variant docs state the precise *condition* | IR-18, IR-19 |
-| unsafe confined to `shep-daemon/src/sys.rs`'s own definitions + their call sites, `// SAFETY:` per block | IR-22, IR-23 |
+| unsafe only in `shep-daemon/src/sys.rs`, `// SAFETY:` per block | IR-22, IR-23 |
 | Secret/env-carrying types: manual redacted `Debug` + exact-string test | IR-41 |
 | Tests: paused tokio clock default, no sleeps, hand-rolled fakes, unique fixtures per test | IR-33, IR-34 |
 | Wire-facing type changed → stability fixtures + CHANGELOG | IR-35, IR-45 |

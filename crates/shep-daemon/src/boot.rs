@@ -17,33 +17,30 @@
 //! serves connections until a signal or `KillDaemon` arrives, then tears
 //! down in a load-bearing order — see its own doc for why.
 //!
-//! **Unsafe surface (revised, IR-24):** more than two documented sites —
-//! [`sys::adopt_fd`]'s own definition, this module's ONE production call to
-//! it (the very first statement in [`boot`], before anything else in that
-//! function opens a descriptor of its own), and this module's own test
-//! suite adds a second, test-only call site further down in this file
-//! (`sys.rs`'s own test suite adds five more of its own — see that
-//! module's doc for the full accounting, not "two total").
+//! **No unsafe in this module.** [`BootOptions::ready_fd`] is
+//! `Option<`[`std::fs::File`]`>`, not a raw descriptor: the CALLER adopts
+//! the inherited readiness pipe (`unsafe fn` [`crate::sys::adopt_fd`],
+//! IR-24's sole unsafe surface) before ever constructing a [`BootOptions`],
+//! so [`boot`] only ever receives an already-owned handle and never
+//! constructs one from a bare number itself. Every bind/probe/unlink/
+//! signal-registration step in this module is plain safe std/tokio.
 //!
-//! `adopt_fd` is `unsafe fn`, not a safe fn wrapping
-//! an internal unsafe block: the ordering precondition that makes adoption
-//! sound ("call this before the process opens anything of its own") is a
-//! CALLER obligation `adopt_fd` cannot verify from inside itself, so the
-//! type system pushes it out to every call site instead. That is correct,
-//! not a widening of the exception — it moves the unprovable half of the
-//! contract to where it can actually be checked (by a reader of `boot`,
-//! against `boot`'s own literal statement order), rather than leaving a
-//! single safe-looking function silently trusted to always be called
-//! correctly. Every other bind/probe/unlink/signal-registration step in
-//! this module is plain safe std/tokio. (An earlier version of this module
-//! got the ordering wrong and adopted a recycled fd in
-//! production-reachable conditions — see [`sys::adopt_fd`]'s own rationale
-//! essay, scenario (c).)
+//! (An earlier revision had `boot` perform that adoption inline, behind an
+//! `unsafe` block at its own call site — see git history around commits
+//! db02d9f/5c4f29b for that design, and f688ac2/9455d80 for the doc fallout
+//! it caused. It moved here because `adopt_fd`'s ordering precondition is
+//! process-wide — "call before THIS PROCESS opens any descriptor" — and
+//! `boot` cannot discharge that on its own caller's behalf: `boot` is
+//! `async`, so a tokio runtime with its own live poller fds already exists
+//! by the time `boot` is ever called. The fix pushes adoption out to
+//! somewhere that CAN discharge the precondition: the CLI's `main`, as its
+//! literal first fd-touching statement, before a tokio runtime — or
+//! anything else — exists (Phase 3). See [`crate::sys::adopt_fd`]'s own
+//! `# Safety` section and rationale essay for the full contract.)
 
 use core::fmt;
 use std::io::ErrorKind;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::os::unix::io::RawFd;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,7 +61,6 @@ use crate::runner::ProcessRunner;
 use crate::server::RpcServer;
 use crate::snapshot::{self, FlockRegistry, SnapshotError, SnapshotWriter, spawn_snapshot_writer};
 use crate::supervisor::{SupervisorHandle, spawn_supervisor};
-use crate::sys::{self, SysError};
 
 /// Mode for every directory shep creates (spec §10: no other user, at all)
 pub const DIR_MODE: u32 = 0o700;
@@ -136,6 +132,16 @@ pub fn pidfile(paths: &ShepPaths) -> PathBuf {
 /// final path with `std::fs::write` and risking a reader observing a
 /// truncated file mid-write.
 ///
+/// [`boot`] itself does NOT call this: it records its own pid through the
+/// crate-private `PidfileLock::record` instead, writing in place into the
+/// SAME open, locked file descriptor it already holds — a rename here
+/// would swap in an unlocked inode and undo that lock's whole point (see
+/// `PidfileLock`'s own doc, next to its definition in this file). This
+/// function stays for callers that
+/// legitimately want a standalone, lock-free pidfile write — this crate's
+/// own tests use it to seed a fixture pidfile without contending for the
+/// boot-time lock at all.
+///
 /// # Errors
 /// - [`BootError::Io`] — the pidfile could not be written.
 pub fn write_pidfile(paths: &ShepPaths, pid: u32) -> Result<(), BootError> {
@@ -178,6 +184,115 @@ pub fn read_pidfile(paths: &ShepPaths) -> Result<Option<u32>, BootError> {
         Ok(contents) => Ok(contents.trim().parse::<u32>().ok()),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
         Err(source) => Err(BootError::Io { path, source }),
+    }
+}
+
+/// This daemon's exclusive claim on `$SHEP_HOME`: an `flock(2)` held on the
+/// pidfile for as long as this process is alive.
+///
+/// Exists to close a real race in [`bind_socket`]'s stale-socket recovery
+/// (spec §6): two daemons racing to boot the same `$SHEP_HOME` can both hit
+/// `EADDRINUSE` on a crashed predecessor's leftover socket file, both probe
+/// it, both observe `ConnectionRefused` (correctly — the file IS stale),
+/// and both proceed into the `remove_file` + rebind arm — B's `remove_file`
+/// can then delete A's freshly-bound listener out from under it, and BOTH
+/// end up with a live [`UnixListener`] on the same path, each unaware of
+/// the other. That is two live daemons on one `$SHEP_HOME`, exactly the
+/// case [`BootError::AlreadyRunning`] exists to prevent, defeated exactly
+/// when the recovery path is what makes it matter.
+///
+/// `flock` closes it because the kernel serializes concurrent lockers
+/// itself: [`Self::acquire`] uses `LOCK_EX | LOCK_NB`, so of any number of
+/// processes racing to boot the same `$SHEP_HOME`, at most one ever holds
+/// this lock at a time, and every other one fails IMMEDIATELY with
+/// [`BootError::AlreadyRunning`] rather than proceeding into
+/// [`bind_socket`]'s probe/recover logic at all — there is no window left
+/// for two processes to be inside that logic concurrently, because only
+/// the lock's single holder can be in there. [`boot`] acquires this BEFORE
+/// calling [`bind_socket`] and keeps it for [`RunningDaemon`]'s whole
+/// lifetime (dropped only at the end of [`RunningDaemon::run`]) — see this
+/// type's own `acquire`/`record` docs for exactly what that does and does
+/// not still leave [`bind_socket`]'s own probe responsible for.
+///
+/// A crashed daemon's lock needs no separate cleanup: `flock`'s locks are
+/// owned by the OPEN FILE DESCRIPTION, which the kernel releases the
+/// instant every fd referencing it closes — including on process death by
+/// any signal, `SIGKILL` included, with no unlock call required. That is
+/// exactly the property a pidfile-based "am I the only one" check needs
+/// and a filesystem-existence check (`pidfile` alone) cannot give: a stale
+/// pidfile from a crash still exists, but a stale LOCK on it does not.
+#[derive(Debug)]
+struct PidfileLock(nix::fcntl::Flock<std::fs::File>);
+
+impl PidfileLock {
+    /// Opens (creating if necessary) and takes an exclusive, non-blocking
+    /// `flock` on `paths`'s pidfile.
+    ///
+    /// Deliberately does NOT truncate on open: a losing caller's
+    /// [`BootError::AlreadyRunning`] still wants to read whatever pid a
+    /// previous winner recorded (via [`Self::record`]) for its error's
+    /// hint, and this call cannot yet know which one it will be.
+    ///
+    /// # Errors
+    /// - [`BootError::AlreadyRunning`] — another process already holds this
+    ///   lock (carries the pid recorded in the file, if any — the file
+    ///   itself is left untouched either way).
+    /// - [`BootError::Io`] — the pidfile could not be opened.
+    fn acquire(paths: &ShepPaths) -> Result<Self, BootError> {
+        let path = pidfile(paths);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false) // preserve any pid a previous winner recorded — see this fn's own doc
+            .mode(0o600)
+            .open(&path)
+            .map_err(|source| BootError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => Ok(Self(lock)),
+            Err((_file, nix::errno::Errno::EWOULDBLOCK)) => Err(BootError::AlreadyRunning {
+                pid: read_pidfile(paths)?,
+            }),
+            Err((_file, errno)) => Err(BootError::Io {
+                path,
+                source: errno.into(),
+            }),
+        }
+    }
+
+    /// Overwrites the locked pidfile's content with `pid`, in place —
+    /// truncate then write at offset 0, never a temp-file-plus-`rename`
+    /// (contrast [`write_pidfile`]): renaming a fresh inode over this path
+    /// would swap in a file nothing has locked, silently ending this
+    /// type's whole reason to exist for as long as the daemon keeps
+    /// running afterward. A `flock` lock lives on the OPEN FILE
+    /// DESCRIPTION, not the path, so it does not follow a rename.
+    ///
+    /// # Errors
+    /// - [`BootError::Io`] — the write failed.
+    fn record(&mut self, paths: &ShepPaths, pid: u32) -> Result<(), BootError> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let path = pidfile(paths);
+        let file = &mut *self.0;
+        file.set_len(0).map_err(|source| BootError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|source| BootError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.write_all(pid.to_string().as_bytes())
+            .map_err(|source| BootError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.sync_all()
+            .map_err(|source| BootError::Io { path, source })
     }
 }
 
@@ -260,9 +375,11 @@ pub fn bind_socket(paths: &ShepPaths, socket: &Path) -> Result<UnixListener, Boo
 
 /// Environment variable naming the inherited readiness descriptor.
 ///
-/// Set by the CLI on the child it re-execs detached (spec §3); read back
-/// into [`BootOptions::ready_fd`] by that same CLI, not by anything in this
-/// crate — shep-daemon only ever sees the already-parsed `RawFd`.
+/// Set by the CLI on the child it re-execs detached (spec §3); read back and
+/// adopted (`unsafe fn` [`crate::sys::adopt_fd`]) by that same CLI, not by
+/// anything in this crate — shep-daemon never parses this variable or sees
+/// a raw fd number itself, only the already-adopted [`std::fs::File`] that
+/// lands in [`BootOptions::ready_fd`].
 pub const READY_FD_ENV: &str = "SHEP_READY_FD";
 
 /// What the daemonizing parent reads off the readiness pipe.
@@ -279,12 +396,11 @@ pub struct DaemonReady {
 /// it — dropping `pipe` at the end of this call is the parent's own EOF
 /// signal that there is nothing more to read.
 ///
-/// Takes an already-[`sys::adopt_fd`]-ed [`std::fs::File`], never a raw
-/// [`RawFd`]: adoption is a fd-inheritance concern (`sys.rs`'s rationale
-/// essay) and must run before `boot` opens anything of its own; the write
-/// itself is plain safe IO with no such ordering constraint, and keeping it
-/// a separate step is what lets `boot` adopt first and write later without
-/// this function re-deciding when adoption is safe.
+/// Takes an already-adopted [`std::fs::File`], never a raw fd: adoption
+/// (`unsafe fn` [`crate::sys::adopt_fd`]) is a fd-inheritance concern
+/// (`sys.rs`'s rationale essay) with a process-wide ordering precondition
+/// that only the CLI's `main` can discharge — this function never touches a
+/// bare descriptor, only the safe `File` handed to it.
 ///
 /// # Errors
 /// - [`BootError::ReadyWrite`] — the write failed (carries the OS error).
@@ -305,39 +421,58 @@ fn write_ready(mut pipe: std::fs::File, ready: &DaemonReady) -> Result<(), BootE
 pub struct BootOptions {
     /// Overrides the layout's default control-socket path.
     pub socket: Option<PathBuf>,
-    /// The inherited readiness-pipe descriptor, if the CLI daemonized us
-    /// (see [`READY_FD_ENV`]).
-    pub ready_fd: Option<RawFd>,
+    /// The inherited readiness pipe, if the CLI daemonized us (see
+    /// [`READY_FD_ENV`]) — already adopted into an owned
+    /// [`std::fs::File`] by the CALLER before this struct is ever
+    /// constructed.
+    ///
+    /// Adoption (`unsafe fn` [`crate::sys::adopt_fd`]) is deliberately not
+    /// this crate's job: its ordering precondition ("call this before the
+    /// process opens any descriptor of its own") is process-wide, and
+    /// [`boot`] — already running inside a tokio runtime with its own live
+    /// poller fds by the time it is called — cannot discharge that on its
+    /// own caller's behalf. The intended caller is the CLI's `main`, as its
+    /// literal first fd-touching statement, before a tokio runtime even
+    /// exists (Phase 3). Because this field already carries a safe owned
+    /// handle, [`boot`] never constructs a `File` from a raw number and
+    /// this crate's unsafe stays confined to `sys.rs` (IR-22).
+    pub ready_fd: Option<std::fs::File>,
     /// Restore the muster roll if one exists (spec §9's `shep muster`).
     pub restore: bool,
 }
 
-/// Brings the daemon up: readiness pipe, signal handlers, layout, roll
-/// restore, bus, supervisor, socket.
+/// Brings the daemon up: signal handlers, layout, roll restore, bus,
+/// supervisor, socket, readiness report.
 ///
 /// Step order here is deliberate and load-bearing, not incidental:
-/// 1. adopt the readiness descriptor (if any) — see [`sys::adopt_fd`]'s
-///    `# Safety` section for why this must be the very first fd-touching
-///    step, before anything below opens (or closes) a descriptor of its
-///    own;
-/// 2. install signal handlers — before the socket exists, so there is no
+/// 1. install signal handlers — before the socket exists, so there is no
 ///    window where the socket is already live but an ordinary `kill -USR2`
 ///    (SIGUSR2's default disposition is to terminate) would still kill the
 ///    daemon instead of rotating logs;
-/// 3. layout, socket bind, pidfile;
-/// 4. report readiness, now that the socket is actually bound (spec §3) —
+/// 2. layout, then the crate-private `PidfileLock::acquire` — this is the
+///    FIRST thing that can fail with [`BootError::AlreadyRunning`], before
+///    [`bind_socket`] ever runs, and it is what makes that call race-free
+///    against another process booting the same `$SHEP_HOME` concurrently
+///    (see `PidfileLock`'s own doc, next to its definition in this file) —
+///    then socket bind (with stale-socket recovery, spec §6), then
+///    `PidfileLock::record` into the now-held-for-this-process's-whole-life
+///    lock;
+/// 3. report readiness, now that the socket is actually bound (spec §3) —
 ///    not once the whole flock is restored, so a slow muster can't make the
-///    parent think boot failed;
-/// 5. bus, supervisor, muster restore, snapshot writer, `RpcContext`.
+///    parent think boot failed. `options.ready_fd`, if set, already names
+///    an owned [`std::fs::File`] the CALLER adopted before ever
+///    constructing [`BootOptions`] (see that field's own doc) — this step
+///    is a plain write, no fd adoption happens inside `boot` itself;
+/// 4. bus, supervisor, muster restore, snapshot writer, `RpcContext`.
 ///
 /// # Errors
-/// - [`BootError::Ready`] — `options.ready_fd` was set but the descriptor
-///   could not be adopted.
 /// - [`BootError::Io`] — a boot filesystem step failed, or the OS refused
 ///   to register a signal handler.
-/// - [`BootError::AlreadyRunning`] — another daemon owns this `$SHEP_HOME`.
-/// - [`BootError::ReadyWrite`] — the descriptor was adopted but the
-///   readiness line could not be written.
+/// - [`BootError::AlreadyRunning`] — another daemon already holds the
+///   pidfile lock, or (belt-and-suspenders, for a peer not participating in
+///   that lock) answered on the socket.
+/// - [`BootError::ReadyWrite`] — the readiness line could not be written to
+///   `options.ready_fd`.
 /// - [`BootError::Snapshot`] — `options.restore` was set, a roll exists, but
 ///   it could not be read or parsed.
 pub async fn boot<R: ProcessRunner>(
@@ -345,66 +480,30 @@ pub async fn boot<R: ProcessRunner>(
     paths: ShepPaths,
     options: BootOptions,
 ) -> Result<RunningDaemon, BootError> {
-    // 1. Adopt FIRST — before anything LATER IN THIS FUNCTION opens or
-    //    closes a descriptor of its own. See this fn's own doc and sys.rs's
-    //    rationale essay.
-    #[allow(unsafe_code)] // IR-24 escape hatch, exercised here — see sys.rs's essay.
-    let ready_pipe = options
-        .ready_fd
-        .map(|fd| {
-            // SAFETY: revised — the previous wording here was false. This
-            // is the first fd-touching statement in `boot`'s OWN body, so
-            // `boot` itself cannot have created or closed anything `fd`
-            // might alias — that half is structurally true from statement
-            // order alone. It is NOT true that nothing in the process has
-            // touched a descriptor by this point: `boot` is `async`, so a
-            // tokio runtime with its own epoll/kqueue-backed poller fds is
-            // already live before this line ever runs. (Confirmed the hard
-            // way, not just reasoned about: the ledger records a caller
-            // that opened fd 9 before calling `boot`, making a stale
-            // `SHEP_READY_FD` alias it and abort on a real IO-safety
-            // violation.) What this closure actually leans on is a CALLER
-            // obligation this line cannot verify or enforce by itself: that
-            // whatever process exec'd us has not opened descriptors of its
-            // own that could alias `fd`, and that `fd` genuinely is the
-            // pipe our own parent set up over `SHEP_READY_FD` (spec §3)
-            // rather than some other number recycled into it. That is
-            // exactly why `sys::adopt_fd` is `unsafe fn` rather than a safe
-            // wrapper — the unprovable half of the contract is pushed out
-            // to here, where a reader can at least check it against the
-            // real boot sequence, instead of being silently trusted inside
-            // a safe-looking function. `adopt_fd`'s own checks (>= 3,
-            // `F_GETFD`) rule out a reserved or already-closed number, never
-            // who opened the one that's left (see its `# Safety` section).
-            //
-            // Known gap, not closed by this comment: `BootOptions::ready_fd`
-            // is a safe `pub Option<RawFd>` field, so safe code elsewhere
-            // can still build a `BootOptions` that violates the caller
-            // obligation above and drive this unsafe block into UB without
-            // writing a single `unsafe` keyword itself. The structural fix
-            // (`Option<OwnedFd>`, which would make an already-invalid fd a
-            // type error before `boot` ever ran) is deferred to the
-            // CLI-wiring task in Phase 3, not attempted here.
-            unsafe { sys::adopt_fd(fd) }
-        })
-        .transpose()
-        .map_err(BootError::Ready)?;
-
-    // 2. Signal handlers next, before the socket (or anything else
+    // 1. Install signal handlers before the socket (or anything else
     //    observable) exists — see this fn's own doc.
     let (shutdown, shutdown_rx) = watch::channel(false);
     let shutdown = Arc::new(shutdown);
     let signals = install_signals(Arc::clone(&shutdown), paths.clone())?;
 
-    // 3. Layout, socket, pidfile.
+    // 2. Layout, then claim exclusive ownership of $SHEP_HOME BEFORE
+    //    touching the socket at all — see `PidfileLock`'s own doc for why
+    //    this is what actually closes the concurrent-boot race a bare
+    //    probe-then-recover sequence can't. Held across the whole
+    //    bind-and-recover sequence, and for the rest of this daemon's life
+    //    (kept in `RunningDaemon`, dropped only at the end of `run`).
     init_dirs(&paths)?;
+    let mut pidfile_lock = PidfileLock::acquire(&paths)?;
     let socket = socket_path(&paths, options.socket.as_deref());
     let listener = bind_socket(&paths, &socket)?;
     let pid = std::process::id();
-    write_pidfile(&paths, pid)?;
+    pidfile_lock.record(&paths, pid)?;
 
-    // 4. Report readiness now that the socket is bound.
-    if let Some(pipe) = ready_pipe {
+    // 3. Report readiness now that the socket is bound. `options.ready_fd`
+    //    is already an owned File adopted by the caller — see this fn's
+    //    own doc and `BootOptions::ready_fd`'s doc — so this is nothing
+    //    more than a write.
+    if let Some(pipe) = options.ready_fd {
         let ready = DaemonReady {
             pid,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -412,7 +511,7 @@ pub async fn boot<R: ProcessRunner>(
         write_ready(pipe, &ready)?;
     }
 
-    // 5. Bus, supervisor, muster restore, snapshot writer, context.
+    // 4. Bus, supervisor, muster restore, snapshot writer, context.
     let events = new_bus();
     let supervisor = spawn_supervisor(runner, paths.clone(), events.clone());
     let registry = FlockRegistry::new();
@@ -455,6 +554,13 @@ pub async fn boot<R: ProcessRunner>(
         // exit from this point on, including an early `?` return from a
         // later step in THIS function. See `SignalTasks`'s own doc.
         signals,
+        // Held from here into `RunningDaemon` and through the whole of
+        // `run`: this is what keeps `$SHEP_HOME` exclusively claimed for
+        // this daemon's entire life, not just its boot — dropping it (at
+        // the end of `run`, or on an early `?`-return from a LATER step in
+        // THIS function) is the only thing that releases the `flock`. See
+        // `PidfileLock`'s own doc.
+        pidfile_lock,
     })
 }
 
@@ -521,6 +627,11 @@ pub struct RunningDaemon {
     // whole serving lifetime, and dropped only once teardown finishes —
     // `SignalTasks`'s own `Drop` is what actually stops these tasks.
     signals: SignalTasks,
+    // Acquired by `boot` before the socket was ever bound, kept alive
+    // through `run`'s whole serving lifetime, and dropped only once
+    // teardown finishes — releasing this `flock` is what lets a NEXT
+    // daemon's own `PidfileLock::acquire` succeed. See that type's own doc.
+    pidfile_lock: PidfileLock,
 }
 
 impl RunningDaemon {
@@ -580,6 +691,11 @@ impl RunningDaemon {
             // prefix suppresses the "unused" warning for a binding that
             // exists purely for its drop side effect.
             signals: _signals,
+            // Same reasoning as `signals` above: this `flock` must stay
+            // held for the whole serving lifetime below, released only by
+            // its `Drop` at the end of this scope — that release is what
+            // lets a future daemon's own boot succeed.
+            pidfile_lock: _pidfile_lock,
         } = self;
 
         // `shutdown_rx` is the receiver `boot` has kept alive since the
@@ -744,19 +860,15 @@ pub enum BootError {
     },
     /// The muster roll exists but could not be read or parsed on restore
     Snapshot(SnapshotError),
-    /// The readiness descriptor could not be adopted (carries the reason —
-    /// see [`SysError`]); the descriptor is untouched, nothing was written
+    /// Writing the readiness line to the caller-adopted readiness pipe
+    /// failed (carries the OS error)
     ///
-    /// Kept distinct from [`Self::ReadyWrite`] on purpose: this is a
-    /// `sys.rs`-layer failure (fd-adoption, `sys::adopt_fd`'s own concern),
-    /// while `ReadyWrite` is a plain IO failure writing to an already-valid
-    /// `File` — conflating the two into one `SysError::ReadyWrite` variant
-    /// (an earlier version of this enum did) made `sys.rs` responsible for
-    /// an error it never produces, since only `boot.rs`'s own `write_ready`
-    /// ever constructs it.
-    Ready(SysError),
-    /// The readiness descriptor was adopted but writing the readiness line
-    /// to it failed (carries the OS error)
+    /// Adoption itself (`unsafe fn` [`crate::sys::adopt_fd`]) is the
+    /// caller's job, not `boot`'s — see [`BootOptions::ready_fd`]'s own
+    /// doc — so `boot` has no error variant for a failed adoption; by the
+    /// time `options.ready_fd` reaches here it is already a valid, owned
+    /// [`std::fs::File`], and this variant covers only the plain IO write
+    /// to it.
     ReadyWrite(std::io::Error),
 }
 
@@ -771,7 +883,6 @@ impl fmt::Display for BootError {
             }
             Self::AlreadyRunning { pid: None } => write!(f, "a shep daemon is already running"),
             Self::Snapshot(err) => write!(f, "muster roll restore failed: {err}"),
-            Self::Ready(err) => write!(f, "readiness descriptor could not be adopted: {err}"),
             Self::ReadyWrite(err) => write!(f, "writing the readiness line failed: {err}"),
         }
     }
@@ -783,7 +894,6 @@ impl core::error::Error for BootError {
             Self::Io { source, .. } => Some(source),
             Self::AlreadyRunning { .. } => None,
             Self::Snapshot(err) => Some(err),
-            Self::Ready(err) => Some(err),
             Self::ReadyWrite(err) => Some(err),
         }
     }
@@ -956,79 +1066,226 @@ mod tests {
         drop(live);
     }
 
+    /// What one racer thread observed in
+    /// [`two_concurrent_boots_on_a_stale_socket_exactly_one_wins`] — kept
+    /// deliberately small and `'static` so it can cross the thread boundary
+    /// without carrying a `RunningDaemon` (and the tokio resources inside
+    /// it) out of the runtime that created it. See that test's own doc for
+    /// why.
+    #[derive(Debug)]
+    enum RaceOutcome {
+        Won { socket_still_accepts: bool },
+        AlreadyRunning,
+        Other(String),
+    }
+
+    #[test]
+    fn two_concurrent_boots_on_a_stale_socket_exactly_one_wins() {
+        // Pins Decision 2 (2026-08-08), closing double-bind race #3: two
+        // daemons racing to boot the same $SHEP_HOME could both hit
+        // `bind_socket`'s EADDRINUSE -> probe -> remove_file -> rebind arm
+        // over a CRASHED predecessor's leftover socket file, both observe
+        // `ConnectionRefused` (correctly — nobody's listening), and both
+        // proceed into the recovery arm — loser's `remove_file` can delete
+        // winner's freshly-bound listener out from under it, leaving BOTH
+        // convinced they hold the sole live daemon. See `PidfileLock`'s own
+        // doc for the full mechanism and why `flock` closes it.
+        //
+        // NOT `#[tokio::test]`, and each racer gets its OWN
+        // `new_current_thread` runtime on its OWN `std::thread`: `boot`'s
+        // own synchronous prefix (signals, dirs, the pidfile lock, socket
+        // bind) never actually awaits a not-yet-ready future, so two
+        // `boot()` calls driven as plain tokio TASKS on one runtime would
+        // never really interleave — the executor would run the first one's
+        // entire synchronous body to completion in a single poll before the
+        // second ever got scheduled, proving nothing about real contention.
+        // Real OS threads, synchronized to start together via a `Barrier`,
+        // give the two racers genuine kernel-level concurrency over the
+        // same `open`/`flock`/`bind`/`connect`/`remove_file` calls — the
+        // actual shape of the bug this test pins.
+        //
+        // Looped: a race this timing-dependent isn't guaranteed to land on
+        // the exact bad interleaving every single attempt (this crate's own
+        // `FD_REUSE_LOCK` doc records a comparable real bug that only
+        // reproduced "roughly 1-in-a-few-dozen parallel runs" before it was
+        // fixed) — running many trials inside one test call, and failing on
+        // the first bad one, is what makes the revert-and-confirm-it-fails
+        // check below actually reliable rather than a coin flip.
+        //
+        // Locked per SIGNAL_TEST_LOCK's rule for every trial that has a
+        // winner: `blocking_lock` because this outer fn is plain sync, not
+        // `#[tokio::test]`, so there is no surrounding runtime to `.await`
+        // on when acquiring it.
+        for _ in 0..25 {
+            let _guard = SIGNAL_TEST_LOCK.blocking_lock();
+            let dir = tempfile::tempdir().unwrap();
+            let paths = test_paths(&dir);
+            init_dirs(&paths).unwrap();
+            // The crashed predecessor's leftover: neither std nor tokio
+            // unlinks a UnixListener's path on drop (see
+            // `a_socket_left_by_a_crash_is_unlinked_and_rebound`). Plain
+            // `std::os::unix::net::UnixListener`, not tokio's: this outer
+            // fn has no runtime of its own (each racer below builds its
+            // own), and std's needs none to bind.
+            drop(std::os::unix::net::UnixListener::bind(&paths.socket).unwrap());
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let paths = paths.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait(); // both racers cross together
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
+                        rt.block_on(async {
+                            match boot(ScriptedRunner::new(vec![]), paths, BootOptions::default())
+                                .await
+                            {
+                                Ok(daemon) => {
+                                    // Checked (and `daemon` dropped) INSIDE
+                                    // this racer's own runtime — see
+                                    // `RaceOutcome`'s own doc for why
+                                    // nothing tokio-shaped crosses the
+                                    // thread boundary.
+                                    let reachable =
+                                        std::os::unix::net::UnixStream::connect(daemon.socket())
+                                            .is_ok();
+                                    RaceOutcome::Won {
+                                        socket_still_accepts: reachable,
+                                    }
+                                }
+                                Err(BootError::AlreadyRunning { .. }) => {
+                                    RaceOutcome::AlreadyRunning
+                                }
+                                Err(other) => RaceOutcome::Other(other.to_string()),
+                            }
+                        })
+                    })
+                })
+                .collect();
+            let outcomes: Vec<RaceOutcome> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+            for outcome in &outcomes {
+                if let RaceOutcome::Other(msg) = outcome {
+                    panic!("a racer hit neither Ok nor AlreadyRunning: {msg}");
+                }
+            }
+
+            let wins = outcomes
+                .iter()
+                .filter(|o| matches!(o, RaceOutcome::Won { .. }))
+                .count();
+            let already_running = outcomes
+                .iter()
+                .filter(|o| matches!(o, RaceOutcome::AlreadyRunning))
+                .count();
+            assert_eq!(
+                wins, 1,
+                "exactly one racer must win a boot on the same $SHEP_HOME: {outcomes:?}"
+            );
+            assert_eq!(
+                already_running, 1,
+                "the loser must be refused as AlreadyRunning, not silently succeed or hit some other error: {outcomes:?}"
+            );
+            assert!(
+                matches!(
+                    outcomes
+                        .iter()
+                        .find(|o| matches!(o, RaceOutcome::Won { .. }))
+                        .unwrap(),
+                    RaceOutcome::Won {
+                        socket_still_accepts: true
+                    }
+                ),
+                "the winner's own socket must still accept a connection, proving its bind \
+                 wasn't the one the loser's remove_file clobbered: {outcomes:?}"
+            );
+        }
+    }
+
     #[test]
     fn readiness_reports_pid_and_version_then_closes_the_pipe() {
         use std::io::Read;
-        use std::os::unix::io::IntoRawFd;
-        let (parent, child) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Safe end-to-end, unlike the pre-Decision-1 version of this test:
+        // `std::io::pipe` (stable 1.87, below this workspace's 1.88 floor)
+        // hands back an owned `PipeWriter`, which converts into `File`
+        // through the standard `OwnedFd` bridge — no `unsafe`, because this
+        // test created the pipe itself and knows exactly what it is. There
+        // is nothing left in this module for `sys::adopt_fd` to be called
+        // on; see this file's own module doc.
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let pipe = std::fs::File::from(std::os::fd::OwnedFd::from(writer));
         let ready = DaemonReady {
             pid: 4242,
             version: "0.1.0".to_string(),
         };
-        #[allow(unsafe_code)] // IR-24 escape hatch, exercised here — see sys.rs's essay.
-        // SAFETY: test-only socketpair fd, nothing else in this process has
-        // opened or closed anything since it was created — the exact
-        // invariant `boot()`'s own call site upholds structurally by being
-        // its first fd-touching statement (see sys.rs's essay).
-        let pipe = unsafe { sys::adopt_fd(child.into_raw_fd()) }.unwrap();
         write_ready(pipe, &ready).unwrap();
         let mut line = String::new();
-        let mut parent = parent;
-        parent.read_to_string(&mut line).unwrap();
+        reader.read_to_string(&mut line).unwrap();
         assert_eq!(line.trim_end(), serde_json::to_string(&ready).unwrap());
         assert!(line.ends_with('\n'), "the parent reads a line: {line:?}");
     }
 
     #[tokio::test]
-    async fn boot_refuses_a_stale_ready_fd_before_touching_anything_else() {
-        // Pins the CRITICAL fix (Opus review, 2026-08-08 + follow-up), this
-        // time WITHOUT the fd-collision risk of an earlier attempt (tried,
-        // found to destabilize the whole suite by racing unrelated tests
-        // over real fd reuse, removed — see git history / task-7-report.md
-        // for the numbers). fd 4096 is a number this process will NEVER
-        // own: default fd-table limits sit far below it, and nothing in
-        // this crate's test suite opens anywhere near that many concurrent
-        // descriptors, so `adopt_fd`'s `F_GETFD` probe fails on it
-        // deterministically, every time, regardless of what else is
-        // running concurrently — zero collision risk, unlike freeing and
-        // re-probing a REAL fd number.
+    async fn boot_writes_readiness_to_the_callers_pipe_after_the_socket_is_bound() {
+        // Real time: binds a real socket. Locked per SIGNAL_TEST_LOCK's rule
+        // — any test whose `boot()` call succeeds has live signal listeners
+        // from that point on.
         //
-        // The assertion that actually pins the ordering isn't WHICH error
-        // `boot` returns (`BadFd` either way, since 4096 is never open no
-        // matter when it's probed) — it's that `bind_socket`/`write_pidfile`
-        // never ran at all. Reorder adoption to after `bind_socket` (as an
-        // earlier, broken version of this module did) and `paths.socket`
-        // WOULD exist here, because the wrongly-late adoption step would
-        // still fail on 4096 but only after the socket was already bound.
-        //
-        // Locked per SIGNAL_TEST_LOCK's widened rule (any test calling
-        // `boot()`, not just ones that reach `run()`) even though THIS
-        // specific call fails before `install_signals` ever runs — cheap,
-        // and it keeps the rule simple enough to hold under a future edit
-        // rather than relying on "well, THIS one doesn't get that far".
+        // Decision 1 (2026-08-08) replaced `boot_refuses_a_stale_ready_fd_
+        // before_touching_anything_else`, which lived here and drove a bad
+        // fd number straight through `BootOptions` to pin that adoption was
+        // refused before `bind_socket` ran. That guard is no longer
+        // expressible through `boot`'s public API at all: `BootOptions::
+        // ready_fd` is `Option<std::fs::File>` now, and there is no safe
+        // way to hand this test a `File` that names a bad descriptor — the
+        // type itself is the proof the fd was valid at construction time.
+        // The BadFd-refusal behavior itself still exists and is still
+        // tested, just one layer down: see `sys::tests::
+        // a_fd_this_process_never_owned_is_refused`, which calls
+        // `sys::adopt_fd` directly (that module's own job now). What THIS
+        // test covers instead — real coverage that would otherwise be lost
+        // entirely, since no other test drives a `Some` `ready_fd` through
+        // `boot` at all — is the happy path: a caller-adopted pipe really
+        // does receive the readiness line, and only after the socket is
+        // genuinely bound (spec §3), exactly as `boot`'s own doc claims.
+        use std::io::Read;
         let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
 
-        let err = boot(
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let pipe = std::fs::File::from(std::os::fd::OwnedFd::from(writer));
+
+        let daemon = boot(
             ScriptedRunner::new(vec![]),
             paths.clone(),
             BootOptions {
-                ready_fd: Some(4096),
+                ready_fd: Some(pipe),
                 ..BootOptions::default()
             },
         )
         .await
-        .unwrap_err();
+        .unwrap();
         assert!(
-            matches!(err, BootError::Ready(SysError::BadFd { .. })),
-            "a fd this process never owns must be refused as BadFd: {err:?}"
+            paths.socket.exists(),
+            "boot must bind the socket before it returns"
         );
-        assert!(
-            !paths.socket.exists(),
-            "adoption must be refused BEFORE the socket is bound"
-        );
-        assert_eq!(read_pidfile(&paths).unwrap(), None);
+
+        // `write_ready` closes its `File` at the end of `boot`'s own call
+        // to it, so this read observes EOF (the readiness line, then
+        // nothing) without blocking on a live writer.
+        let mut line = String::new();
+        reader.read_to_string(&mut line).unwrap();
+        let ready: DaemonReady = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(ready.pid, std::process::id());
+        assert!(line.ends_with('\n'), "the parent reads a line: {line:?}");
+
+        drop(daemon); // no run() needed; SignalTasks::drop stops the listeners
     }
 
     #[tokio::test]

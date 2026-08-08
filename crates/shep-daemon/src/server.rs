@@ -82,17 +82,17 @@ type Frames = FramedRead<OwnedReadHalf, LengthDelimitedCodec>;
 ///
 /// A separate, install-time trust boundary: the CLI that daemonizes this
 /// process hands it a readiness-pipe descriptor over `SHEP_READY_FD` (spec
-/// §3), adopted through this crate's one unsafe *operation* (Task 7) —
-/// [`crate::sys::adopt_fd`]'s own definition, its one PRODUCTION call site
-/// in `crate::boot::boot`, plus test-only call sites exercising it directly
-/// against synthetic fds (`sys.rs`'s own doc has the full accounting, not
-/// "two total"), each independently justified. That
-/// boundary sits between this process and its own parent, not between this
-/// process and an RPC peer — nothing arriving over the control socket can
-/// reach it — and a hostile or stale descriptor is refused (below fd 3, or
-/// not currently open) rather
-/// than adopted; see [`crate::sys`]'s own rationale essay for the full
-/// threat model.
+/// §3), adopted through [`crate::sys::adopt_fd`] — this crate's only
+/// `unsafe fn`, and (as of Decision 1, 2026-08-08) its ONLY unsafe surface,
+/// full stop: [`crate::boot::boot`] receives the already-adopted
+/// [`std::fs::File`] via [`crate::boot::BootOptions::ready_fd`] and never
+/// touches a raw descriptor itself (`sys.rs`'s own doc has the full
+/// test-call-site accounting). That boundary sits between this process and
+/// its own parent, not between this process and an RPC peer — nothing
+/// arriving over the control socket can reach it — and a hostile or stale
+/// descriptor is refused (below fd 3, or not currently open) rather than
+/// adopted; see [`crate::sys`]'s own rationale essay for the full threat
+/// model.
 ///
 /// Explicit non-goals: root can always read daemon memory; a peer with the
 /// same uid is fully trusted (it could simply run the binary itself); there
