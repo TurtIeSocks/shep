@@ -1458,9 +1458,30 @@ async fn handle_conn(stream: UnixStream, ctx: RpcContext) -> Result<(), ConnErro
     outcome
 }
 
+// CORRECTED (execution review, 2026-08-07): the read loop MUST be split out so
+// the forwarder is aborted on EVERY exit path. In the original single-function
+// shape, each `?` inside the loop returned past the trailing `abort()`; dropping
+// a JoinHandle detaches rather than aborts, so the forwarder kept holding its
+// `out.clone()` sender, `write_loop`'s `rx.recv()` never returned None, and
+// `handle_conn`'s `writer.await` hung forever — leaking the connection and its
+// fds on any post-Subscribe error. Proven by a regression test that timed out
+// pre-fix and resolves instantly post-fix.
 async fn converse(frames: &mut Frames, out: &mpsc::Sender<Bytes>, ctx: &RpcContext) -> Result<(), ConnError> {
     handshake(frames, out, ctx).await?;
     let mut forwarder: Option<JoinHandle<()>> = None;
+    let outcome = read_loop(frames, out, ctx, &mut forwarder).await;
+    if let Some(forwarder) = forwarder {
+        forwarder.abort(); // runs on the error path too, not just clean EOF
+    }
+    outcome
+}
+
+async fn read_loop(
+    frames: &mut Frames,
+    out: &mpsc::Sender<Bytes>,
+    ctx: &RpcContext,
+    forwarder: &mut Option<JoinHandle<()>>,
+) -> Result<(), ConnError> {
     while let Some(frame) = frames.next().await {
         let frame = frame.map_err(ConnError::Frame)?;   // oversize/short frame ends the connection
         let envelope: Envelope = decode_frame(&frame).map_err(ConnError::Decode)?;
@@ -1480,9 +1501,6 @@ async fn converse(frames: &mut Frames, out: &mpsc::Sender<Bytes>, ctx: &RpcConte
                 break;
             }
         }
-    }
-    if let Some(forwarder) = forwarder {
-        forwarder.abort();
     }
     Ok(())
 }
