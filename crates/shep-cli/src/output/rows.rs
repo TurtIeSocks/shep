@@ -78,11 +78,8 @@ impl Render for FlockRows {
 
 /// `Response::Deleted(Vec<u32>)` — the ids that were removed.
 ///
-/// Not constructed outside this module's own tests yet: `commands/
-/// lifecycle.rs`'s `delete`, which builds one from a real `Response`, is
-/// Task 8. `#[allow(dead_code)]` says so explicitly rather than inventing a
-/// call site nothing needs yet.
-#[allow(dead_code)]
+/// Constructed by `commands/lifecycle.rs`'s `delete`, from a real
+/// `Response`.
 #[derive(Debug, Serialize)]
 #[serde(transparent)]
 pub struct DeletedIds(pub Vec<u32>);
@@ -146,11 +143,8 @@ impl Render for PingRow {
 
 /// `kill`: what teardown actually achieved.
 ///
-/// Not constructed outside this module's own tests yet: `commands/admin.rs`'s
-/// `kill`, which builds one after tearing the daemon down, is Task 11.
-/// `#[allow(dead_code)]` says so explicitly rather than inventing a call
-/// site nothing needs yet.
-#[allow(dead_code)]
+/// Constructed by `commands/admin.rs`'s `kill`, after tearing the daemon
+/// down.
 #[derive(Debug, Serialize)]
 pub struct KillRow {
     /// Daemon pid at the moment of kill, read before the connection dropped.

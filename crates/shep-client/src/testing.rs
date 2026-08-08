@@ -17,7 +17,7 @@
 //! [`child_exiting_with`] serve the autostart tests, where the peer has to
 //! be brought into existence from a synchronous launcher closure.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -218,6 +218,12 @@ enum OutOfOrder {
 /// connection's next `Request::Subscribe` has actually been answered,
 /// which is what a test needs when the script has to queue `close`
 /// *before* the client under test has connected at all.
+/// [`Self::reply_shutting_down_then_unlink_after`] arms the next request to
+/// be answered `Response::ShuttingDown` and, after a delay, unlinks this
+/// connection's socket file — the real teardown sequence, compressed;
+/// [`Self::reply_shutting_down_and_never_unlink`] answers the same way but
+/// leaves the socket file in place, the branch a kill-teardown timeout
+/// exists to observe.
 /// Every other request this fake receives is answered with
 /// `Response::Pong` — good enough for a test that only cares about
 /// `ListFlock`/`Describe` behavior, or about a request getting *some*
@@ -239,6 +245,8 @@ pub struct FakeDaemon {
     armed_list: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
     armed_describe: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
     armed_reply_then_event: Arc<Mutex<Option<(Response, BusEvent)>>>,
+    armed_shutdown_then_unlink: Arc<Mutex<Option<Duration>>>,
+    armed_shutdown_never_unlink: Arc<Mutex<Option<()>>>,
     list_flock_count: Arc<AtomicU64>,
     task: JoinHandle<()>,
 }
@@ -285,6 +293,26 @@ impl FakeDaemon {
     /// call site invokes it without `.await`.
     pub fn queue_reply_then_event(&self, reply: Response, event: BusEvent) {
         *self.armed_reply_then_event.lock().unwrap() = Some((reply, event));
+    }
+
+    /// Arms the next request to be answered `Response::ShuttingDown`, after
+    /// which this connection waits `after` and then unlinks its socket file
+    /// — the real teardown sequence, compressed.
+    ///
+    /// Synchronous for the same reason [`Self::reply_to_list`] is: every
+    /// call site invokes it without `.await`.
+    pub fn reply_shutting_down_then_unlink_after(&self, after: Duration) {
+        *self.armed_shutdown_then_unlink.lock().unwrap() = Some(after);
+    }
+
+    /// Arms the next request to be answered `Response::ShuttingDown` and then
+    /// nothing: the socket file stays. The branch `kill`'s timeout exists
+    /// for.
+    ///
+    /// Synchronous for the same reason [`Self::reply_to_list`] is: every
+    /// call site invokes it without `.await`.
+    pub fn reply_shutting_down_and_never_unlink(&self) {
+        *self.armed_shutdown_never_unlink.lock().unwrap() = Some(());
     }
 
     /// Queues `event` for this connection's subscriber.
@@ -366,7 +394,11 @@ impl FakeDaemon {
 /// [`OutOfOrder::Buffered`] is answered together with the one that just
 /// arrived; else an armed `armed_reply_then_event` or
 /// [`ScriptCommand::ReplyErr`] or [`ScriptCommand::EventThenReply`] is
-/// consumed and answers this one request; else a `Request::Subscribe`
+/// consumed and answers this one request; else
+/// [`FakeDaemon::reply_shutting_down_then_unlink_after`] or
+/// [`FakeDaemon::reply_shutting_down_and_never_unlink`], if armed, answers
+/// `Response::ShuttingDown` and then unlinks `socket_path` (after a delay)
+/// or leaves it in place, respectively; else a `Request::Subscribe`
 /// is answered with `Response::Subscribed`, flips this connection into the
 /// subscribed state, and flushes anything [`ScriptCommand::PushEvent`]
 /// queued before now; else `ListFlock` is answered per
@@ -377,13 +409,24 @@ impl FakeDaemon {
 /// A [`ScriptCommand::PushEvent`] arriving outside a request turn is
 /// written straight to the wire once subscribed, or buffered until then —
 /// see [`FakeDaemon::push`].
+///
+/// Ten parameters: `listener`, `socket_path` and `ack` set up the one served
+/// connection, `script` carries every command a `FakeDaemon` handle can send
+/// after that, and the rest are one `Arc<Mutex<..>>` slot per independently
+/// armable behavior, cloned straight from [`FakeDaemon`]'s own fields —
+/// bundling them into a struct would move the coupling around, not reduce
+/// it, for this private, one-caller function.
+#[allow(clippy::too_many_arguments)]
 async fn serve_scripted(
     listener: UnixListener,
+    socket_path: PathBuf,
     ack: HelloAck,
     mut script: mpsc::Receiver<ScriptCommand>,
     armed_list: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
     armed_describe: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
     armed_reply_then_event: Arc<Mutex<Option<(Response, BusEvent)>>>,
+    armed_shutdown_then_unlink: Arc<Mutex<Option<Duration>>>,
+    armed_shutdown_never_unlink: Arc<Mutex<Option<()>>>,
     list_flock_count: Arc<AtomicU64>,
 ) {
     let (stream, _) = listener.accept().await.unwrap();
@@ -450,12 +493,16 @@ async fn serve_scripted(
                         write_reply(&mut frames, other_env.id, Response::Pong).await;
                     }
                     OutOfOrder::Idle => {
-                        // Taken into an owned local before any `.await` below:
-                        // the `MutexGuard` `.lock()` produces is not `Send`,
-                        // and holding it across an await point would make
-                        // this whole future not `Send` (tokio::spawn requires
-                        // `Send`).
+                        // Taken into owned locals before any `.await` below:
+                        // the `MutexGuard`s `.lock()` produces are not
+                        // `Send`, and holding one across an await point would
+                        // make this whole future not `Send` (tokio::spawn
+                        // requires `Send`).
                         let reply_then_event = armed_reply_then_event.lock().unwrap().take();
+                        let shutdown_then_unlink =
+                            armed_shutdown_then_unlink.lock().unwrap().take();
+                        let shutdown_never_unlink =
+                            armed_shutdown_never_unlink.lock().unwrap().take();
                         if let Some((reply, event)) = reply_then_event {
                             write_reply(&mut frames, envelope.id, reply).await;
                             write_event(&mut frames, event).await;
@@ -466,6 +513,21 @@ async fn serve_scripted(
                             armed_event_then_reply = false;
                             send_sample_event(&mut frames).await;
                             write_reply(&mut frames, envelope.id, Response::Pong).await;
+                        } else if let Some(after) = shutdown_then_unlink {
+                            write_reply(&mut frames, envelope.id, Response::ShuttingDown).await;
+                            // Run inline, in this same request arm, rather
+                            // than deferred to a later `select!` turn: `kill`
+                            // drops the `Client` right after reading this
+                            // reply, which closes the connection — the next
+                            // `frames.next()` yields `None` and the loop
+                            // breaks before a deferred unlink would ever get
+                            // a turn to run.
+                            tokio::time::sleep(after).await;
+                            let _ = std::fs::remove_file(&socket_path);
+                        } else if shutdown_never_unlink.is_some() {
+                            write_reply(&mut frames, envelope.id, Response::ShuttingDown).await;
+                            // Deliberately never unlinks — the branch a
+                            // kill-teardown timeout exists to observe.
                         } else if matches!(envelope.body, Request::Subscribe { .. }) {
                             write_reply(&mut frames, envelope.id, Response::Subscribed).await;
                             subscribed = true;
@@ -510,14 +572,19 @@ pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDa
     let armed_list = Arc::new(Mutex::new(None));
     let armed_describe = Arc::new(Mutex::new(None));
     let armed_reply_then_event = Arc::new(Mutex::new(None));
+    let armed_shutdown_then_unlink = Arc::new(Mutex::new(None));
+    let armed_shutdown_never_unlink = Arc::new(Mutex::new(None));
     let list_flock_count = Arc::new(AtomicU64::new(0));
     let task = tokio::spawn(serve_scripted(
         listener,
+        path.to_path_buf(),
         ack,
         script_rx,
         Arc::clone(&armed_list),
         Arc::clone(&armed_describe),
         Arc::clone(&armed_reply_then_event),
+        Arc::clone(&armed_shutdown_then_unlink),
+        Arc::clone(&armed_shutdown_never_unlink),
         Arc::clone(&list_flock_count),
     ));
     let client = Client::connect(path).await.unwrap();
@@ -528,6 +595,8 @@ pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDa
             armed_list,
             armed_describe,
             armed_reply_then_event,
+            armed_shutdown_then_unlink,
+            armed_shutdown_never_unlink,
             list_flock_count,
             task,
         },

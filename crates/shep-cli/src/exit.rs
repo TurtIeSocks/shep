@@ -14,12 +14,11 @@ use shep_core::protocol::RpcErrorCode;
 pub enum ExitCode {
     /// The command did what it was asked.
     ///
-    /// Its first real call site is unix-only: `run_daemon` returning
-    /// `Ok(())` on a clean shutdown (signal or `KillDaemon`) maps here.
-    /// Every other verb still routes through `not_wired`'s `Internal`
-    /// until its own dispatch arm replaces that placeholder — which is why
-    /// this stays dead on the Windows target, where the whole `daemon`
-    /// dispatch arm does not exist.
+    /// Reached from unix `run`'s own dispatch arms — `run_daemon` returning
+    /// `Ok(())` on a clean shutdown (signal or `KillDaemon`), or any verb's
+    /// module completing its request without error. It stays dead on the
+    /// Windows target, where `run`'s own arm refuses before dispatching to
+    /// any verb module at all.
     #[cfg_attr(windows, allow(dead_code))]
     Success = 0,
     /// An error with no more specific code.

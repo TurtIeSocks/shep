@@ -9,6 +9,7 @@
 mod cli;
 #[cfg(unix)]
 mod commands;
+mod completions;
 mod exit;
 #[cfg(unix)]
 mod launch;
@@ -21,6 +22,8 @@ use clap::Parser;
 use cli::{Cli, GlobalArgs};
 #[cfg(unix)]
 use cli::{Commands, DaemonArgs, Format};
+#[cfg(unix)]
+use commands::admin;
 #[cfg(unix)]
 use commands::bleats;
 #[cfg(unix)]
@@ -83,34 +86,6 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
     Ok(ShepPaths::resolve(&env, &home_dir))
 }
 
-/// Placeholder for a dispatch arm whose command module has not landed yet.
-/// Every one of these is deleted as its verb's module gets wired in; a grep
-/// for this function's name proves none are left once the CLI is complete.
-/// It returns `Internal` rather than `Usage` because reaching it is a fault
-/// in this binary, not in what the user typed.
-///
-/// Renders through [`output::emit_error`] rather than a bare `eprintln!` so
-/// this placeholder path already honours `--format json` — the same
-/// `Streams` real verbs will thread through in later tasks. The write's own
-/// `Result` is intentionally discarded: unlike a real command's output, a
-/// failure to print "not wired yet" doesn't change which failure this run
-/// experienced, and it stays `Internal` either way.
-///
-/// `#[cfg(unix)]`: the only dispatch table that calls it is `run`'s unix
-/// arm — the Windows arm refuses before reaching any per-verb dispatch at
-/// all.
-#[cfg(unix)]
-fn not_wired(streams: &mut Streams<'_>, fmt: Format, verb: &str) -> ExitCode {
-    let message = format!("{verb} is not wired yet");
-    let _ = output::emit_error(
-        &mut *streams.err,
-        fmt,
-        ExitCode::Internal.code_str(),
-        &message,
-    );
-    ExitCode::Internal
-}
-
 /// Parses, resolves `$SHEP_HOME` for the verbs that need it, and dispatches
 /// to the verb's own module.
 ///
@@ -120,9 +95,7 @@ fn not_wired(streams: &mut Streams<'_>, fmt: Format, verb: &str) -> ExitCode {
 /// answers, and is the *only* autostart path in the binary. Every other
 /// client-taking arm goes through [`connect_client`], which never spawns —
 /// `shep stop` against a dead daemon must not launch a supervisor in order
-/// to tell it to stop nothing. Every arm below still not wired to a real
-/// verb module is a stand-in ([`not_wired`]) until the task that owns it
-/// lands.
+/// to tell it to stop nothing.
 ///
 /// `resolve_paths` runs only for the arms that actually touch the socket.
 /// `Completions` and `Daemon` never do — shell completion generation is
@@ -142,7 +115,9 @@ async fn run(cli: Cli) -> ExitCode {
     let fmt = cli.global.format;
 
     match cli.command {
-        Commands::Completions(_) => return not_wired(&mut streams, fmt, "completions"),
+        Commands::Completions(ref args) => {
+            return completions::completions(&mut *streams.out, args);
+        }
         Commands::Daemon(ref args) => {
             return run_daemon_command(&mut streams, fmt, &cli.global, args).await;
         }
@@ -203,7 +178,10 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => query::ping(&client, &mut streams, fmt).await,
             Err(code) => code,
         },
-        Commands::Kill => not_wired(&mut streams, fmt, "kill"),
+        Commands::Kill => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => admin::kill(client, &mut streams, fmt).await,
+            Err(code) => code,
+        },
         Commands::Completions(_) | Commands::Daemon(_) => {
             unreachable!("handled above, before resolve_paths runs")
         }
@@ -375,19 +353,19 @@ mod tests {
     ///
     /// What this actually guards, precisely: if `resolve_paths` were moved
     /// back onto `completions`'s path, this fails the moment `$HOME` is
-    /// unset — the exit code would become `Usage` instead of `Internal`.
+    /// unset — the exit code would become `Usage` instead of `Success`.
     /// It does **not** catch that regression in an environment where
     /// `$HOME` is set (true of ordinary dev machines and most CI): there,
     /// the reinstated `resolve_paths` call would simply succeed and fall
-    /// through to the same `not_wired("completions")` arm, so `run(cli)`
-    /// still returns `Internal` either way and this assertion cannot tell
-    /// the two code shapes apart. `resolve_paths` has no seam for a test to
-    /// inject a controlled failure without touching the real process
-    /// environment (it reads `std::env::var_os("HOME")` directly), so
-    /// there is no honest way to close that gap short of unsafe env
-    /// mutation or spawning the real binary as a subprocess with `$HOME`
-    /// cleared — the latter is exactly the e2e tier described below, not
-    /// this unit test.
+    /// through to the same real `completions` call this test already
+    /// exercises, so `run(cli)` still returns `Success` either way and this
+    /// assertion cannot tell the two code shapes apart. `resolve_paths` has
+    /// no seam for a test to inject a controlled failure without touching
+    /// the real process environment (it reads `std::env::var_os("HOME")`
+    /// directly), so there is no honest way to close that gap short of
+    /// unsafe env mutation or spawning the real binary as a subprocess with
+    /// `$HOME` cleared — the latter is exactly the e2e tier described
+    /// below, not this unit test.
     ///
     /// `daemon` used to share this test (both were routed through
     /// `not_wired`), but it no longer belongs here: it now genuinely
@@ -403,6 +381,6 @@ mod tests {
         use clap::Parser;
         let argv = ["shep", "completions", "bash"];
         let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} failed: {e}"));
-        assert_eq!(run(cli).await, ExitCode::Internal);
+        assert_eq!(run(cli).await, ExitCode::Success);
     }
 }
