@@ -5,7 +5,7 @@
 
 use core::fmt;
 
-use bytes::BytesMut;
+use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio_util::codec::LengthDelimitedCodec;
@@ -28,12 +28,12 @@ pub fn codec() -> LengthDelimitedCodec {
 ///
 /// - [`WireError::Json`] — serialization failed (carries serde's message).
 /// - [`WireError::FrameTooLarge`] — payload exceeds [`MAX_FRAME_BYTES`].
-pub fn encode_frame<T: Serialize>(value: &T) -> Result<BytesMut, WireError> {
+pub fn encode_frame<T: Serialize>(value: &T) -> Result<Bytes, WireError> {
     let vec = serde_json::to_vec(value).map_err(|e| WireError::Json(e.to_string()))?;
     if vec.len() > MAX_FRAME_BYTES {
         return Err(WireError::FrameTooLarge(vec.len()));
     }
-    Ok(BytesMut::from(vec.as_slice()))
+    Ok(Bytes::from(vec)) // zero-copy: Bytes takes the Vec's buffer
 }
 
 /// Deserializes one frame payload
@@ -117,10 +117,7 @@ mod tests {
             deadline_ms: None,
             body: Request::ListFlock,
         };
-        writer
-            .send(encode_frame(&env).unwrap().freeze())
-            .await
-            .unwrap();
+        writer.send(encode_frame(&env).unwrap()).await.unwrap();
 
         let frame = reader.next().await.unwrap().unwrap();
         let back: Envelope = decode_frame(&frame).unwrap();

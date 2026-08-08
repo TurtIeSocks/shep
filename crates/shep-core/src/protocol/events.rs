@@ -140,4 +140,12 @@ mod tests {
         assert_eq!(e.topic(), "log.out");
         assert_eq!(BusEvent::DaemonShutdown.topic(), "daemon.shutdown");
     }
+
+    #[test]
+    fn v1_bus_event_fixture_still_deserializes() {
+        // Adjacent-tagged shape pinned as a byte fixture (IR-35).
+        let fixture = r#"{"event":"log_out","data":{"id":3,"line":"ready"}}"#;
+        let ev: BusEvent = serde_json::from_str(fixture).unwrap();
+        assert!(matches!(ev, BusEvent::LogOut { id: 3, .. }));
+    }
 }

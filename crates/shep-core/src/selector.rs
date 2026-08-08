@@ -47,10 +47,10 @@ impl ProcessSelector {
                 .map(Self::Regex)
                 .map_err(|e| SelectorError::BadRegex(e.to_string()));
         }
-        if input.bytes().all(|b| b.is_ascii_digit()) {
-            if let Ok(id) = input.parse() {
-                return Ok(Self::Id(id));
-            }
+        if input.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(id) = input.parse()
+        {
+            return Ok(Self::Id(id));
         }
         Ok(Self::Name(input.to_string()))
     }
@@ -90,6 +90,46 @@ impl fmt::Display for SelectorError {
 }
 
 impl core::error::Error for SelectorError {}
+
+impl std::convert::TryFrom<crate::protocol::SelectorSpec> for ProcessSelector {
+    type Error = SelectorError;
+
+    /// Compiles a wire selector into a matchable one
+    ///
+    /// # Errors
+    ///
+    /// - [`SelectorError::BadRegex`] — the peer-supplied pattern fails to
+    ///   compile or exceeds the 1 MiB compiled-size bound.
+    fn try_from(spec: crate::protocol::SelectorSpec) -> Result<Self, Self::Error> {
+        use crate::protocol::SelectorSpec;
+        Ok(match spec {
+            SelectorSpec::All => Self::All,
+            SelectorSpec::Id(id) => Self::Id(id),
+            SelectorSpec::Name(name) => Self::Name(name),
+            SelectorSpec::Fold(fold) => Self::Fold(fold),
+            SelectorSpec::Regex(src) => Self::Regex(
+                // Peer-supplied pattern: bound compiled-program memory.
+                regex::RegexBuilder::new(&src)
+                    .size_limit(1 << 20)
+                    .build()
+                    .map_err(|e| SelectorError::BadRegex(e.to_string()))?,
+            ),
+        })
+    }
+}
+
+impl From<&ProcessSelector> for crate::protocol::SelectorSpec {
+    fn from(sel: &ProcessSelector) -> Self {
+        use crate::protocol::SelectorSpec;
+        match sel {
+            ProcessSelector::All => SelectorSpec::All,
+            ProcessSelector::Id(id) => SelectorSpec::Id(*id),
+            ProcessSelector::Name(name) => SelectorSpec::Name(name.clone()),
+            ProcessSelector::Regex(re) => SelectorSpec::Regex(re.as_str().to_string()),
+            ProcessSelector::Fold(fold) => SelectorSpec::Fold(fold.clone()),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -165,5 +205,45 @@ mod tests {
             ProcessSelector::parse("42").unwrap(),
             ProcessSelector::Id(42)
         ));
+    }
+
+    #[test]
+    fn selector_spec_bridges() {
+        use crate::protocol::SelectorSpec;
+        let sel: ProcessSelector = SelectorSpec::Regex("^w".to_string()).try_into().unwrap();
+        assert!(sel.matches("web", 1, None));
+        assert_eq!(
+            SelectorSpec::from(&sel),
+            SelectorSpec::Regex("^w".to_string())
+        );
+        for spec in [
+            SelectorSpec::All,
+            SelectorSpec::Id(3),
+            SelectorSpec::Name("web".to_string()),
+            SelectorSpec::Fold("backend".to_string()),
+        ] {
+            let sel: ProcessSelector = spec.clone().try_into().unwrap();
+            assert_eq!(SelectorSpec::from(&sel), spec);
+        }
+    }
+
+    #[test]
+    fn selector_spec_bad_regex_is_typed_error() {
+        use crate::protocol::SelectorSpec;
+        assert!(matches!(
+            ProcessSelector::try_from(SelectorSpec::Regex("((".to_string())).unwrap_err(),
+            SelectorError::BadRegex(_)
+        ));
+    }
+
+    #[test]
+    fn selector_spec_oversized_regex_is_rejected() {
+        // Peer-supplied pattern: size_limit bounds compiled-program memory.
+        // The pattern (a|b|...)^N where N is the number of alternations
+        // repeated many times generates a huge compiled regex that exceeds
+        // the 1 MiB limit: many alternations * repetition factor.
+        use crate::protocol::SelectorSpec;
+        let huge = format!("(a{}){{10000}}", "|b".repeat(100_000));
+        assert!(ProcessSelector::try_from(SelectorSpec::Regex(huge)).is_err());
     }
 }

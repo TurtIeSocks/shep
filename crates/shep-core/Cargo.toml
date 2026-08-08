@@ -23,5 +23,19 @@ tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
 futures-util.workspace = true
 tempfile.workspace = true
 
+# `cfg(any())` never matches any target, so nothing here is ever compiled into any real
+# build — but Cargo's resolver still walks these entries when computing the dependency
+# graph, including under `-Z minimal-versions`. Used to force floor pins for transitive
+# deps whose own Cargo.toml under-declares their true minimum (see root Cargo.toml
+# comment for the per-crate reasoning). Safe to drop a line once the corresponding
+# upstream crate corrects its own declared floor.
+[target.'cfg(any())'.dependencies]
+annotate-snippets.workspace = true
+anstyle.workspace = true
+encoding_rs_io.workspace = true
+pest.workspace = true
+quote.workspace = true
+syn.workspace = true
+
 [lints]
 workspace = true

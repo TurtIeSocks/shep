@@ -152,6 +152,28 @@ e2e polish.
 v1: N fork instances + SO_REUSEPORT load balancing. True cluster parity
 (fd-passing / LISTEN_FDS protocol) = v1.1/v1.2 per Rin.
 
+## Research decisions (from Phase 4-6 design research, 2026-08-07 — PENDING Rin)
+
+1. **MSRV 1.85 → 1.88 — DONE (forced now, not future).** Originally framed as a
+   Phase-4 concern (ratatui/sysinfo/rmcp). Phase-2a Task 7 review found it is
+   already forced: **serde-saphyr 1.0.1 (a current shep-core dep, Rin-approved)
+   uses let-chains (stable 1.88) + `is_multiple_of` (1.87)** — no `rust-version`
+   declared, edition 2024, and neither 1.0.0 nor 1.0.1 avoids it. The `1.85` pin
+   was already a lie and the CI 1.85 legs were red. Bumped workspace
+   `rust-version` → 1.88 and CI matrix `1.85` → `1.88` (2026-08-07). Cost: shep-core/
+   client advertise 1.88 as their published-lib MSRV. **Reversible** — Rin can lower
+   it only by reverting serde-saphyr, which she already chose over the alternatives.
+2. **Readiness-probe failure on normal start** (not reload): pm2-compatible
+   "online-with-warning at listen_timeout" vs strict "errored". Recommend the
+   pm2-compatible behavior (less surprising for migrators). Phase 4 decision.
+3. **`shep-client` subscription stream shape** → `ClientEvent { Bus(BusEvent),
+   Disconnected, Reconnected }` as a named stream struct (IR-15), so the lookout
+   TUI (and any consumer) gets reconnect UX. Low-risk, clear win — **baking into
+   the Phase 2b/client plan unless Rin objects.**
+4. **Additive `GetMetrics` RPC** (metrics dog + whistle both consume it; keeps
+   protocol v1 per the evolution rule). Lands with the metrics phase; noted so 2b's
+   RPC dispatch leaves room. Non-decision, just tracked.
+
 ## Parking lot (v2 ideas — logged, not scoped)
 
 - **HMR/bacon-style dev loops** (Rin, 2026-08-07): don't bind to any Rust HMR
