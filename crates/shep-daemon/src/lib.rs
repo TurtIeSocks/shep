@@ -204,13 +204,15 @@ pub(crate) mod testing {
 #[cfg(unix)]
 pub mod tokio_runner;
 
-/// The unix-domain-socket connection layer: peer-cred auth, handshake,
-/// subscriptions — shep's privilege boundary.
-///
-/// Unix-only for the same reason as [`tokio_runner`]: it is built on
-/// `tokio::net`'s unix-socket types. Task 4's [`rpc`] dispatcher (and
-/// everything it calls) stays portable; this module is the thing that
-/// actually opens a socket.
+// Unix-only for the same reason as `tokio_runner` above: it is built on
+// `tokio::net`'s unix-socket types. Task 4's `rpc` dispatcher (and
+// everything it calls) stays portable; this module is the thing that
+// actually opens a socket. Doc lives inside server.rs's own `//!` header
+// (not here) — an outer `///` doc on this declaration would merge with
+// that inner doc and rustdoc would resolve the WHOLE merged block's
+// intra-doc links against this file's scope, breaking every bare
+// same-module link inside server.rs's own header (confirmed by a minimal
+// repro during Task 5's docs gate).
 #[cfg(unix)]
 pub mod server;
 

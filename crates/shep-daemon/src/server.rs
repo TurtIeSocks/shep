@@ -1,9 +1,10 @@
 //! The unix-tier connection layer: peer-cred auth, handshake, subscriptions
 //!
 //! [`RpcServer`] owns the bound [`UnixListener`] and accepts connections
-//! until told to stop. Every accepted connection runs [`handle_conn`] in its
-//! own task: a same-uid check ([`check_peer`]), a version handshake, then a
-//! read loop that decodes envelopes and hands them to
+//! until told to stop. Every accepted connection runs `handle_conn` (private
+//! — the connection state machine is an implementation detail, not public
+//! API) in its own task: a same-uid check ([`check_peer`]), a version
+//! handshake, then a read loop that decodes envelopes and hands them to
 //! [`rpc::dispatch`](crate::rpc::dispatch) — the portable dispatcher Task 4
 //! built, which never sees a socket or a byte. This module is the only place
 //! that does: everything here is `#[cfg(unix)]`, built on `tokio::net`'s
