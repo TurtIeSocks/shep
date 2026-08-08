@@ -1,14 +1,9 @@
 //! `connect_or_spawn`/`connect_or_spawn_with`: the autostart path, driven
-//! against the hand-rolled daemon fakes in `shep-client-testing` plus a
+//! against the hand-rolled daemon fakes in [`shep_client::testing`] plus a
 //! handful of real child processes.
 //!
 //! An integration test rather than a `#[cfg(test)] mod tests` block inside
-//! `spawn.rs`, for the reason spelled out at the top of `request_reply.rs`:
-//! the fakes link `shep-client`, so a unit-test build would put two copies of
-//! the library in one binary and these tests would drive the wrong one.
-//! `fast_opts` returns a `SpawnOptions` and `connect_or_spawn_with` returns a
-//! `SpawnOutcome` carrying a `Client`, so both types have to be the same copy
-//! the fakes carry.
+//! `spawn.rs`, for the reason spelled out at the top of `request_reply.rs`.
 
 #![cfg(unix)]
 
@@ -17,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use shep_client::ConnectError;
 use shep_client::spawn::{SpawnError, SpawnOutcome, connect_or_spawn, connect_or_spawn_with};
-use shep_client_testing::{
+use shep_client::testing::{
     child_exiting_with, fake_daemon, fast_opts, sample_ack, start_fake_daemon_answering_on,
 };
 use shep_core::protocol::{RpcError, RpcErrorCode};

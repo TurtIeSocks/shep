@@ -1,11 +1,9 @@
 //! `Client::subscribe` and the [`EventStream`](shep_client::EventStream) it
 //! hands back, driven against the hand-rolled daemon fakes in
-//! `shep-client-testing`.
+//! [`shep_client::testing`].
 //!
 //! An integration test rather than a `#[cfg(test)] mod tests` block inside
-//! `events.rs`, for the reason spelled out at the top of `request_reply.rs`:
-//! the fakes link `shep-client`, so a unit-test build would put two copies of
-//! the library in one binary and these tests would drive the wrong one.
+//! `events.rs`, for the reason spelled out at the top of `request_reply.rs`.
 
 #![cfg(unix)]
 
@@ -13,8 +11,8 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 
-use shep_client::{EVENT_CHANNEL_CAPACITY, Lagged};
-use shep_client_testing::{fake_client_with_push, sample_info};
+use shep_client::Lagged;
+use shep_client::testing::{fake_client_with_push, sample_info};
 use shep_core::protocol::{BusEvent, ProcessEventKind, Response};
 
 /// Every `stream.next()` in this file is wrapped in this bound so a broken
@@ -149,15 +147,11 @@ async fn a_lagging_consumer_reports_the_lag_rather_than_silently_skipping() {
     let (client, daemon) = fake_client_with_push(&path).await;
     let mut stream = client.subscribe(vec!["log.*".into()]).await.unwrap();
 
-    let overrun = EVENT_CHANNEL_CAPACITY + 8;
-    for i in 0..overrun {
-        daemon
-            .push(BusEvent::LogOut {
-                id: 1,
-                line: i.to_string(),
-            })
-            .await;
-    }
+    // `overrun_by` pushes the actor's whole broadcast capacity plus this
+    // many. The capacity itself is `pub(crate)`, deliberately: a consumer of
+    // the published API has no business sizing a buffer against it, and the
+    // one caller that does need the figure is the fake, from inside the crate.
+    daemon.overrun_by(8).await;
     daemon.close().await;
 
     let count = tokio::time::timeout(EVENT_TIMEOUT, async {

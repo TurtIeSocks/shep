@@ -1,10 +1,21 @@
-//! The fakes themselves; the crate root documents the set and re-exports it.
+//! Hand-rolled test doubles shared across this phase's tasks (and, via the
+//! `test-support` feature, shep-cli's own tests) — the ONE home for every
+//! scripted daemon/client double: no other module grows a second
+//! `fake_daemon`, and no other crate defines its own.
 //!
-//! Everything here is built from ordinary dependencies — `tokio`,
-//! `tokio-util`, `futures-util`, `shep_core::protocol` and `std`. This crate
-//! has no dev-dependencies at all, so nothing in it may reach for one; in
-//! particular there is no `tempfile`, which is why every helper takes the
-//! socket path as a `&Path` and the caller owns the `TempDir`.
+//! Every helper takes the socket path as `&Path` — this module carries no
+//! dev-dependencies (it compiles into an ordinary build under
+//! `test-support`, so `missing_docs` and `missing_debug_implementations`
+//! apply to it exactly like any other public module), so the caller owns
+//! the `TempDir`.
+//!
+//! [`fake_daemon`], [`sample_ack`], and [`sample_info`] are the
+//! handshake-only primitives. [`FakeDaemon`] and the `fake_client_*`
+//! helpers below it connect a real [`Client`] against a scripted peer,
+//! for testing the connection actor's request/reply routing and beyond.
+//! [`fast_opts`], [`start_fake_daemon_answering_on`] and
+//! [`child_exiting_with`] serve the autostart tests, where the peer has to
+//! be brought into existence from a synchronous launcher closure.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,10 +23,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::codec::Framed;
 
 use shep_core::protocol::{
     BusEvent, Envelope, Hello, HelloAck, HelloReply, PROTOCOL_VERSION, ProcessEventKind,
@@ -24,18 +35,9 @@ use shep_core::protocol::{
 };
 use shep_core::status::ProcStatus;
 
-use shep_client::spawn::SpawnOptions;
-use shep_client::{Client, EVENT_CHANNEL_CAPACITY};
-
-/// The framed transport a fake serves its one connection over.
-///
-/// Deliberately our own alias rather than shep-client's `Frames`: that one is
-/// `pub(crate)` and must stay that way, since exporting it would pin
-/// tokio-util's `Framed` into shep-client's public API and tie the crate to
-/// that dependency's major version. A fake only ever needs the *daemon* side
-/// of the wire, which it builds itself from the public `codec()` — so nothing
-/// here needs shep-client to widen anything.
-type Frames = Framed<UnixStream, LengthDelimitedCodec>;
+use crate::Client;
+use crate::connection::Frames;
+use crate::spawn::SpawnOptions;
 
 /// Serves exactly one connection, replying to the `Hello` with `reply`,
 /// then closing. The returned handle yields the `Hello` the client
@@ -278,13 +280,13 @@ impl FakeDaemon {
         let _ = self.script.send(ScriptCommand::PushEvent(event)).await;
     }
 
-    /// Pushes [`EVENT_CHANNEL_CAPACITY`] `+ n` [`BusEvent::LogOut`] events in
+    /// Pushes `EVENT_CHANNEL_CAPACITY + n` [`BusEvent::LogOut`] events in
     /// one go — enough, once a subscriber falls that far behind, to force a
-    /// local lag notice rather than an ordinary delivery.
-    /// [`EVENT_CHANNEL_CAPACITY`] is the client actor's own broadcast channel
-    /// capacity, which shep-client publishes for exactly this reason.
+    /// local lag notice rather than an ordinary delivery. `EVENT_CHANNEL_CAPACITY`
+    /// is the actor's own broadcast channel capacity
+    /// (`crate::actor::EVENT_CHANNEL_CAPACITY`).
     pub async fn overrun_by(&self, n: usize) {
-        for i in 0..(EVENT_CHANNEL_CAPACITY + n) {
+        for i in 0..(crate::actor::EVENT_CHANNEL_CAPACITY + n) {
             self.push(BusEvent::LogOut {
                 id: 1,
                 line: i.to_string(),

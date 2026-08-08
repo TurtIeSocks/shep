@@ -31,12 +31,7 @@ use crate::connection::Frames;
 /// 64`, `shep-daemon/src/server.rs:39`): a client-side buffer smaller than
 /// what the daemon itself is willing to queue before it starts dropping
 /// would lag behind the daemon's own backpressure for no reason (IR-26).
-///
-/// Public because it is the number behind
-/// [`Lagged`](crate::events::Lagged): a subscriber that falls this many
-/// events behind starts losing them, so a caller sizing its own drain loop —
-/// or a test proving the lag path — needs the figure rather than a guess.
-pub const EVENT_CHANNEL_CAPACITY: usize = 64;
+pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// Depth of the actor's own command queue.
 ///

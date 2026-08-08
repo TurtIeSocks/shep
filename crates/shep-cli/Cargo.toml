@@ -45,9 +45,11 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-# The hand-rolled daemon fakes this crate's command tests drive, in their
-# own crate so they never ship inside this one.
-shep-client-testing.workspace = true
+# The same shep-client the `[dependencies]` entry above pulls in, asking for
+# the hand-rolled daemon fakes this crate's command tests drive. A
+# dev-dependency, so the feature is on for the test targets and off for the
+# shipped binary.
+shep-client = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 # Snapshot coverage for `--format json` payloads.
 insta.workspace = true

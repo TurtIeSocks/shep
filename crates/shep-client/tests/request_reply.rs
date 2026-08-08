@@ -1,26 +1,28 @@
 //! `Client` request/reply routing, error surfacing and deadlines, driven
-//! against the hand-rolled daemon fakes in `shep-client-testing`.
+//! against the hand-rolled daemon fakes in [`shep_client::testing`].
 //!
 //! An integration test rather than a `#[cfg(test)] mod tests` block inside
-//! `client.rs`, because the fakes live in a crate that itself links
-//! `shep-client`. A unit-test build compiles this lib a *second* time (with
-//! `--cfg test`) as the test binary's root, so the `Client` a fake hands back
-//! and the `Client` the module names would be two distinct types from two
-//! distinct copies of the library — the compiler rejects it, and the copy the
-//! fakes returned is not even the one under test. Linked as an ordinary
-//! external crate here, there is exactly one `shep-client` and these tests
-//! exercise the real one.
+//! `client.rs`, by preference rather than necessity: every assertion here
+//! reaches only for the published surface, and linking `shep-client` the way
+//! a real embedder does is the honest way to prove that. Nothing stops these
+//! from being unit tests — the fakes are a module of this very crate — so
+//! anything that genuinely needs a crate internal belongs back in `client.rs`
+//! rather than pushing a `pub(crate)` item public to reach it from here.
+//!
+//! Needs `--features test-support`; `Cargo.toml`'s `[[test]]` entry says so,
+//! and a bare `cargo test -p shep-client` skips this target rather than
+//! failing to build it.
 
 #![cfg(unix)]
 
 use std::time::Duration;
 
-use shep_client::{DEADLINE_GRACE, DEFAULT_DEADLINE, RequestError, START_DEADLINE};
-use shep_client_testing::{
+use shep_client::testing::{
     fake_client_capturing_envelopes, fake_client_event_then_reply, fake_client_on,
     fake_client_out_of_order, fake_client_replying_err, fake_client_that_closes_after_handshake,
     fake_client_that_dies_mid_request, fake_client_that_never_replies,
 };
+use shep_client::{DEADLINE_GRACE, DEFAULT_DEADLINE, RequestError, START_DEADLINE};
 use shep_core::protocol::{Request, Response, RpcErrorCode};
 
 #[tokio::test]
