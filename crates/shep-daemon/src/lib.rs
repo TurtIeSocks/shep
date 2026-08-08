@@ -25,6 +25,7 @@
 //!
 //! ##### OS tier
 //!
+//! - [`boot`]: daemon boot — `0700` layout dirs, pidfile, socket bind with stale-socket recovery (unix-only)
 //! - [`tokio_runner`]: real [`ProcessRunner`](runner::ProcessRunner) over `tokio::process` (unix-only)
 //! - [`server`]: the unix-socket connection layer — peer-cred auth, handshake, subscriptions (unix-only)
 //!
@@ -194,6 +195,13 @@ pub(crate) mod testing {
         }
     }
 }
+
+// Unix-only: built on `std::os::unix::fs::PermissionsExt` (directory mode
+// bits) and `tokio::net::UnixListener`. Doc lives inside boot.rs's own
+// `//!` header (not here) — see the comment on `server` below for why an
+// outer `///` here would be the wrong place for it.
+#[cfg(unix)]
+pub mod boot;
 
 /// Real [`ProcessRunner`](runner::ProcessRunner) over actual OS processes.
 ///
