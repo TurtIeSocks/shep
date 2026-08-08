@@ -3,3 +3,4 @@
 //! declared beneath it needs a `cfg` of its own.
 
 pub mod daemon;
+pub mod lifecycle;

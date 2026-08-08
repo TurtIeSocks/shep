@@ -23,8 +23,16 @@ use cli::{Cli, GlobalArgs};
 use cli::{Commands, DaemonArgs, Format};
 #[cfg(unix)]
 use commands::daemon::{daemon_exit_code, run_daemon};
+#[cfg(unix)]
+use commands::lifecycle;
 use exit::ExitCode;
+#[cfg(unix)]
+use launch::launch_daemon;
 use output::Streams;
+#[cfg(unix)]
+use shep_client::Client;
+#[cfg(unix)]
+use shep_client::spawn::{SpawnOutcome, connect_or_spawn};
 use shep_core::paths::ShepPaths;
 
 #[tokio::main]
@@ -102,11 +110,15 @@ fn not_wired(streams: &mut Streams<'_>, fmt: Format, verb: &str) -> ExitCode {
 /// Parses, resolves `$SHEP_HOME` for the verbs that need it, and dispatches
 /// to the verb's own module.
 ///
-/// Every command receives an already-connected client; no verb here
-/// connects or autostarts for itself. Every arm below is a stand-in
-/// ([`not_wired`]) until the task that owns that verb replaces it with a
-/// real connect (or, for `start` alone, `connect_or_spawn`) and a call into
-/// its own command module.
+/// Every command receives an already-connected client; no verb module
+/// itself connects or autostarts. `Start` is the one exception at this
+/// layer: [`connect_or_spawn_client`] autostarts a daemon if nothing
+/// answers, and is the *only* autostart path in the binary. Every other
+/// client-taking arm goes through [`connect_client`], which never spawns —
+/// `shep stop` against a dead daemon must not launch a supervisor in order
+/// to tell it to stop nothing. Every arm below still not wired to a real
+/// verb module is a stand-in ([`not_wired`]) until the task that owns it
+/// lands.
 ///
 /// `resolve_paths` runs only for the arms that actually touch the socket.
 /// `Completions` and `Daemon` never do — shell completion generation is
@@ -133,21 +145,40 @@ async fn run(cli: Cli) -> ExitCode {
         _ => {}
     }
 
-    if let Err(code) = resolve_paths(&cli.global) {
-        let _ = output::emit_error(
-            &mut *streams.err,
-            fmt,
-            code.code_str(),
-            "none of --home, $SHEP_HOME, or $HOME resolves a root directory",
-        );
-        return code;
-    }
+    let paths = match resolve_paths(&cli.global) {
+        Ok(paths) => paths,
+        Err(code) => {
+            let _ = output::emit_error(
+                &mut *streams.err,
+                fmt,
+                code.code_str(),
+                "none of --home, $SHEP_HOME, or $HOME resolves a root directory",
+            );
+            return code;
+        }
+    };
 
     match cli.command {
-        Commands::Start(_) => not_wired(&mut streams, fmt, "start"),
-        Commands::Stop(_) | Commands::Thatlldo(_) => not_wired(&mut streams, fmt, "stop"),
-        Commands::Restart(_) => not_wired(&mut streams, fmt, "restart"),
-        Commands::Delete(_) => not_wired(&mut streams, fmt, "delete"),
+        Commands::Start(ref args) => {
+            match connect_or_spawn_client(&mut streams, fmt, &paths).await {
+                Ok(client) => lifecycle::start(&client, &mut streams, fmt, args).await,
+                Err(code) => code,
+            }
+        }
+        Commands::Stop(ref args) | Commands::Thatlldo(ref args) => {
+            match connect_client(&mut streams, fmt, &paths).await {
+                Ok(client) => lifecycle::stop(&client, &mut streams, fmt, args).await,
+                Err(code) => code,
+            }
+        }
+        Commands::Restart(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => lifecycle::restart(&client, &mut streams, fmt, args).await,
+            Err(code) => code,
+        },
+        Commands::Delete(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => lifecycle::delete(&client, &mut streams, fmt, args).await,
+            Err(code) => code,
+        },
         Commands::Flock => not_wired(&mut streams, fmt, "flock"),
         Commands::Describe(_) => not_wired(&mut streams, fmt, "describe"),
         Commands::Fold(_) => not_wired(&mut streams, fmt, "fold"),
@@ -156,6 +187,52 @@ async fn run(cli: Cli) -> ExitCode {
         Commands::Kill => not_wired(&mut streams, fmt, "kill"),
         Commands::Completions(_) | Commands::Daemon(_) => {
             unreachable!("handled above, before resolve_paths runs")
+        }
+    }
+}
+
+/// Connects to the daemon at `paths.socket`, autostarting one via
+/// [`launch_daemon`] if nothing answers. The only autostart in the binary —
+/// see [`run`]'s own doc.
+///
+/// Not unit-tested here: its coverage is `shep_client::spawn::connect_or_spawn`'s
+/// own suite plus the real-binary end-to-end tier. What would need testing
+/// (a real socket, a real spawned process) is exactly what those two tiers
+/// already cover, and duplicating it as an in-process unit test would mean
+/// either faking `connect_or_spawn` itself (testing nothing new) or spawning
+/// a real child from this test binary (the hang/flake risk this project
+/// avoids in unit tests).
+#[cfg(unix)]
+async fn connect_or_spawn_client(
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    paths: &ShepPaths,
+) -> Result<Client, ExitCode> {
+    let launch_paths = paths.clone();
+    match connect_or_spawn(&paths.socket, move || launch_daemon(&launch_paths)).await {
+        Ok(SpawnOutcome::Connected(client) | SpawnOutcome::Spawned(client)) => Ok(client),
+        Err(err) => {
+            let code = ExitCode::from(&err);
+            let _ = output::emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
+            Err(code)
+        }
+    }
+}
+
+/// Connects to the daemon at `paths.socket`. Never autostarts — see
+/// [`run`]'s own doc for why that matters.
+#[cfg(unix)]
+async fn connect_client(
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    paths: &ShepPaths,
+) -> Result<Client, ExitCode> {
+    match Client::connect(&paths.socket).await {
+        Ok(client) => Ok(client),
+        Err(err) => {
+            let code = ExitCode::from(&err);
+            let _ = output::emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
+            Err(code)
         }
     }
 }
