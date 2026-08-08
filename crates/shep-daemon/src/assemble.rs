@@ -56,7 +56,16 @@ pub fn instance_slots(existing: &[u32], count: u32) -> Vec<u32> {
 /// "no I/O" note is warning about.
 fn base_env() -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
+    // A PRESENT-but-EMPTY PATH ("PATH=" in the daemon's own env — a
+    // misconfigured launcher, `env -i PATH= shep-daemon`, ...) is treated
+    // the same as an ABSENT one: `Ok("")` would otherwise slip through
+    // `unwrap_or_else` untouched (that only catches the `Err` case) and
+    // reproduce this exact task's ENOENT bug, since an empty PATH resolves
+    // a bare program against the current directory, not a real search.
+    let path = std::env::var("PATH")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string());
     env.insert("PATH".to_string(), path);
     for key in ["HOME", "USER", "LANG", "TZ"] {
         if let Ok(value) = std::env::var(key) {

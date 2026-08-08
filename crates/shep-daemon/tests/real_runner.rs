@@ -180,7 +180,12 @@ async fn a_dropped_child_runs_as_the_requested_user() {
         .expect("every unix box has `nobody`");
 
     let dir = tempfile::tempdir().unwrap();
-    let mut spec = spec_for(&dir, "/bin/sh", &["-c", "id -u"]);
+    // `id -G` after `id -u`: proves not just the uid drop but that std's
+    // do_exec cleared root's supplementary groups (setgroups(0, NULL),
+    // called automatically whenever `.uid()` is set without `.groups()` —
+    // see tokio_runner.rs's comment) instead of leaking them into the
+    // dropped-privilege child.
+    let mut spec = spec_for(&dir, "/bin/sh", &["-c", "id -u; id -G"]);
     spec.credentials = Some(Credentials {
         uid: target.uid.as_raw(),
         gid: Some(target.gid.as_raw()),
@@ -188,13 +193,69 @@ async fn a_dropped_child_runs_as_the_requested_user() {
 
     let runner = TokioRunner::new();
     let (mut proc, mut io) = runner.spawn(&spec).unwrap();
-    let printed = tokio::time::timeout(Duration::from_secs(5), io.logs.recv())
+    let uid_line = tokio::time::timeout(Duration::from_secs(5), io.logs.recv())
         .await
         .expect("the child must print its uid")
         .expect("the log pump must deliver the line");
-    assert_eq!(printed.line.trim(), target.uid.as_raw().to_string());
-    assert!(!printed.err);
+    assert_eq!(uid_line.line.trim(), target.uid.as_raw().to_string());
+    assert!(!uid_line.err);
+
+    let groups_line = tokio::time::timeout(Duration::from_secs(5), io.logs.recv())
+        .await
+        .expect("the child must print its group list")
+        .expect("the log pump must deliver the line");
+    let groups: Vec<&str> = groups_line.line.split_whitespace().collect();
+    assert_eq!(
+        groups,
+        vec![target.gid.as_raw().to_string().as_str()],
+        "supplementary groups must be cleared, leaving only the target gid"
+    );
+    assert!(!groups_line.err);
+
     assert_eq!(proc.wait().await.code, Some(0));
+}
+
+/// RAII guard: sets `PATH` for the duration of a test and restores the
+/// original value on drop (including on panic, so a failing assertion never
+/// leaks a mutated `PATH` into whichever OTHER test the harness's default
+/// multi-threaded runner happens to run concurrently).
+///
+/// # Why `unsafe` is contained to this file, not the `shep-daemon` crate
+///
+/// `std::env::set_var`/`remove_var` are `unsafe fn` (edition 2024): the
+/// hazard they document is an OS thread doing a raw, std-unsynchronized
+/// `getenv` at the same instant. `tests/real_runner.rs` is compiled as its
+/// own crate root (a `[[test]]` binary), not part of the `shep-daemon`
+/// library crate `lib.rs` gates with `#![deny(unsafe_code)]` — so this does
+/// NOT add a third unsafe site to that crate's documented two. Within this
+/// binary specifically: no other test here reads or writes `PATH`, and
+/// `std::process::Command::spawn` (used throughout this file) reads env
+/// through std's OWN `env_read_lock`/fork synchronization (see
+/// `library/std/src/sys/process/unix/unix.rs`), not a raw unsynchronized
+/// `getenv` — so the actual soundness hazard the `unsafe` marker exists for
+/// doesn't apply to anything this binary does.
+struct PathGuard {
+    original: Option<String>,
+}
+
+impl PathGuard {
+    fn set(new_path: &std::path::Path) -> Self {
+        let original = std::env::var("PATH").ok();
+        // SAFETY: see struct doc.
+        unsafe { std::env::set_var("PATH", new_path) };
+        Self { original }
+    }
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        match &self.original {
+            // SAFETY: see PathGuard's doc.
+            Some(value) => unsafe { std::env::set_var("PATH", value) },
+            // SAFETY: see PathGuard's doc.
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+    }
 }
 
 #[tokio::test]
@@ -203,16 +264,39 @@ async fn a_bare_interpreter_resolves_via_the_seeded_path() {
     // `tests/e2e_*.rs` yet — see task-8-report.md): proves the FULL chain
     // (config -> assemble()'s base_env() PATH seed -> TokioRunner spawn ->
     // OS exec) actually resolves a BARE program name, not just an absolute
-    // one. Every other test in this file spawns `/bin/sh` by absolute path,
-    // which never exercises PATH lookup at all — exactly what masked
-    // adversarial finding #1 (assemble() built `spec.env` with no PATH, so
-    // `env_clear()` + `envs(&spec.env)` handed a bare interpreter an empty
-    // env and every such spawn ENOENT'd).
+    // one.
+    //
+    // WHY a hand-rolled shim instead of `sh`/`node`: `/bin/sh` is reachable
+    // even with a completely EMPTY child env, because glibc/libSystem's
+    // `execvp` falls back to the OS's compiled-in default search path
+    // (`_PATH_DEFPATH`, `/usr/bin:/bin` on macOS/BSD) whenever `PATH` is
+    // ABSENT from the env it's given — independent of anything assemble()
+    // does. Verified empirically: `subprocess.run(["sh", ...], env={})`
+    // (a fully empty env, no PATH key at all) still succeeds. An earlier
+    // version of this test used a bare "sh" and did NOT actually gate the
+    // fix (reverting `base_env()` left it passing). A shim living in a
+    // throwaway tempdir can NEVER be found by that OS-level fallback, so it
+    // can only resolve if assemble()'s seeded PATH genuinely reaches it.
     use shep_core::config::{AppConfig, normalize};
     use shep_core::paths::ShepPaths;
     use shep_daemon::assemble::assemble;
+    use std::os::unix::fs::PermissionsExt as _;
 
     let dir = tempfile::tempdir().unwrap();
+    let shim_dir = dir.path().join("bin");
+    fs::create_dir_all(&shim_dir).unwrap();
+    let shim_path = shim_dir.join("shep-test-interp");
+    fs::write(&shim_path, "#!/bin/sh\necho shim-exec-ok\n").unwrap();
+    let mut perms = fs::metadata(&shim_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&shim_path, perms).unwrap();
+
+    // Points the DAEMON's (this test process's) own PATH at ONLY the shim's
+    // directory — no `/usr/bin:/bin`, nothing else — so base_env() has
+    // exactly one place to find "shep-test-interp" and no coincidental
+    // fallback can paper over a regression.
+    let _path_guard = PathGuard::set(&shim_dir);
+
     let paths = ShepPaths {
         home: dir.path().to_path_buf(),
         daemon_config: dir.path().join("shep.toml"),
@@ -225,15 +309,15 @@ async fn a_bare_interpreter_resolves_via_the_seeded_path() {
     };
     let app_config = AppConfig {
         name: "bare".to_string(),
-        script: "-c".to_string(),
-        args: vec!["echo bare-exec-ok".to_string()],
-        interpreter: Some("sh".to_string()), // bare: resolved via PATH, never /bin/sh directly
+        script: "unused".to_string(),
+        args: vec![],
+        interpreter: Some("shep-test-interp".to_string()), // bare: only found via seeded PATH
         ..Default::default()
     };
     let app = normalize(app_config).unwrap();
     let spec = assemble(&app, 0, &paths, None);
     assert_eq!(
-        spec.program, "sh",
+        spec.program, "shep-test-interp",
         "sanity: genuinely bare, not accidentally absolute"
     );
 
@@ -241,9 +325,9 @@ async fn a_bare_interpreter_resolves_via_the_seeded_path() {
     let (mut proc, mut io) = runner.spawn(&spec).unwrap();
     let line = tokio::time::timeout(Duration::from_secs(5), io.logs.recv())
         .await
-        .expect("a bare `sh` must resolve via the seeded PATH and produce output")
+        .expect("the shim must resolve via the seeded PATH and produce output")
         .expect("logs channel closed before the line arrived");
-    assert_eq!(line.line, "bare-exec-ok");
+    assert_eq!(line.line, "shim-exec-ok");
     assert!(!line.err);
     let outcome = proc.wait().await;
     assert_eq!(outcome.code, Some(0));
