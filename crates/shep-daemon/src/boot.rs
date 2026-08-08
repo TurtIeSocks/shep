@@ -776,8 +776,9 @@ impl Drop for SignalTasks {
     }
 }
 
-/// Installs SIGTERM/SIGINT/SIGQUIT (graceful shutdown, first signal wins)
-/// and SIGUSR2 (`shep reopen`'s out-of-band form, spec §9).
+/// Installs SIGTERM/SIGINT/SIGQUIT (graceful shutdown, first signal starts
+/// it — see below for what a repeat does) and SIGUSR2 (`shep reopen`'s
+/// out-of-band form, spec §9).
 ///
 /// SIGUSR2's DEFAULT disposition is to terminate the process, so installing
 /// this handler is load-bearing on its own: without it, an operator's
@@ -785,6 +786,27 @@ impl Drop for SignalTasks {
 /// logs. Full per-sheep handle reopening lands with `flush`/`reopen` (Phase
 /// 4); today this only re-creates a missing log dir, counts the request,
 /// and logs it.
+///
+/// **Each listener stays armed for the rest of the process's life
+/// (Decision 3, 2026-08-08).** A signal handler, once installed, is
+/// installed for good — `tokio` never uninstalls the underlying libc
+/// disposition just because the [`tokio::signal::unix::Signal`] stream
+/// polling it happens to stop. An earlier version of this function's
+/// SIGTERM/SIGINT/SIGQUIT loop awaited exactly one signal and returned,
+/// which left a real gap: a SECOND SIGTERM arriving during a slow
+/// [`RunningDaemon::run`] teardown (the kill ladder waiting out
+/// `kill_timeout` on a stuck sheep, say) had nowhere left to go — not
+/// re-delivered to the now-finished task, and not killing the process
+/// either, since installing ANY handler for a signal already replaced its
+/// default terminate disposition. The daemon would sit there, unresponsive
+/// to a second graceful request, with `SIGKILL` as the only remaining way
+/// out. Looping keeps every listener polling for as long as the process
+/// runs, so no delivery is ever silently dropped; a repeat is logged (see
+/// the loop below) but does not otherwise change teardown, which is
+/// already unconditional and already running (see
+/// [`RunningDaemon::run`]'s own doc) — this crate does not invent an
+/// escalation policy beyond "stay armed and observable" that nothing in
+/// the spec or plan asks for.
 ///
 /// # Errors
 /// - [`BootError::Io`] — the OS refused to register a signal handler.
@@ -811,8 +833,33 @@ fn install_signals(
         })?;
         let shutdown = Arc::clone(&shutdown);
         signals.tasks.push(tokio::spawn(async move {
-            stream.recv().await; // first signal only — the daemon is exiting either way
-            let _ = shutdown.send(true);
+            // Looped, not `stream.recv().await` once — see this fn's own
+            // doc for why a single await left a real gap. `recv` returning
+            // `None` would mean the stream itself closed (never observed
+            // in practice — the same reasoning the SIGUSR2 loop below
+            // already relies on), at which point this task has nothing
+            // left to listen for and ending it is correct.
+            let mut already_shutting_down = false;
+            while stream.recv().await.is_some() {
+                if already_shutting_down {
+                    // Not escalated further on purpose: the brief asks
+                    // only that a repeat signal during teardown be
+                    // observable, not that it change teardown's own
+                    // behavior (already unconditional, see
+                    // `RunningDaemon::run`'s doc) — an operator who needs
+                    // the daemon gone RIGHT NOW still has `SIGKILL`, which
+                    // no handler installed here can intercept.
+                    tracing::warn!(
+                        ?kind,
+                        "received a repeat shutdown signal while teardown is already \
+                         underway; teardown continues unchanged (SIGKILL forces an \
+                         immediate exit)"
+                    );
+                } else {
+                    already_shutting_down = true;
+                }
+                let _ = shutdown.send(true);
+            }
         }));
     }
 
@@ -1385,5 +1432,71 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!paths.socket.exists());
+    }
+
+    #[tokio::test]
+    async fn a_repeat_sigterm_is_observed_not_swallowed() {
+        // Pins Decision 3 (2026-08-08): each shutdown-signal listener
+        // `install_signals` spawns stays armed for the rest of the
+        // process's life instead of returning after one `recv()`. Tests
+        // `install_signals` directly rather than the whole `boot()`/`run()`
+        // teardown — the bug and its fix live entirely in this one loop,
+        // and driving a genuinely slow teardown here would only add
+        // unrelated timing noise to what is otherwise a fully
+        // deterministic check.
+        //
+        // Real time + real signals — see SIGNAL_TEST_LOCK's own doc: this
+        // raise() is process-wide.
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (shutdown, mut shutdown_rx) = watch::channel(false);
+        let shutdown = Arc::new(shutdown);
+        let signals = install_signals(shutdown, paths).unwrap();
+
+        // First SIGTERM: starts shutdown, exactly as before this decision.
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), shutdown_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*shutdown_rx.borrow());
+
+        // The regression this test pins: on the pre-fix code, the SIGTERM
+        // listener task RETURNED after that one signal (see
+        // `install_signals`'s own doc for the full history) — `is_finished`
+        // would already read `true` here. Looped, it never finishes on its
+        // own; only `SignalTasks::drop`'s `abort()` stops it.
+        assert!(
+            !signals.tasks[0].is_finished(),
+            "the SIGTERM listener must still be polling after its first signal, not have exited"
+        );
+
+        // A second SIGTERM, into the same "already shutting down" state a
+        // real slow teardown would still be in when a repeat arrives (the
+        // watch channel is already `true`, exactly as `run()` would leave
+        // it while its own teardown steps run). The pre-fix version would
+        // have dropped this on the floor: no live task left to receive it,
+        // and no process kill either, since installing this handler already
+        // replaced SIGTERM's default terminate disposition.
+        // `watch::Sender::send` marks its channel changed on every call
+        // regardless of whether the value differs (confirmed against
+        // tokio's own source, matching the precedent `RunningDaemon::
+        // shutdown_rx`'s own doc already relies on for a different
+        // scenario) — so a SECOND `changed()` resolving here, for a value
+        // that was already `true`, is airtight proof the loop delivered
+        // this signal all the way through to another `shutdown.send()`
+        // call, not a timing coincidence.
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), shutdown_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !signals.tasks[0].is_finished(),
+            "the SIGTERM listener must still be armed after a SECOND signal too"
+        );
+
+        drop(signals); // aborts the listener tasks (SignalTasks::drop)
     }
 }
