@@ -4,6 +4,8 @@ use core::time::Duration;
 
 use shep_core::{config::ResolvedApp, status::ProcStatus};
 
+use crate::privilege::Credentials;
+
 /// Lifecycle state of one managed process instance
 #[derive(Debug, Clone)]
 pub struct ProcessEntry {
@@ -25,6 +27,10 @@ pub struct ProcessEntry {
     pub budget: RestartBudget,
     /// Reload state machine (None, SpawningReplacement, or Draining)
     pub reload: ReloadState,
+    /// Resolved once at the initial `Start` and reused for every later
+    /// respawn — never re-resolved, so a restart never re-touches the
+    /// passwd database (see [`crate::privilege::resolve`]).
+    pub credentials: Option<Credentials>,
 }
 
 /// Restart budget and consecutive-unstable-exit tracking

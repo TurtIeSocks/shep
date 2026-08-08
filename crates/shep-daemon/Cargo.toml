@@ -13,7 +13,20 @@ test-fakes = []
 
 [dependencies]
 shep-core.workspace = true
-tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "sync", "net", "fs", "macros"] }
+# `fs` (tokio_runner.rs log-file append) and `signal` (Task 2b daemon shutdown
+# handling) both stay alongside the bus/wire-framing features this task adds.
+tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "sync", "net", "fs", "macros", "signal"] }
+# The client<->daemon framing: the SAME codec shep-core exposes, so the daemon can
+# never drift from the shared frame parameters.
+tokio-util.workspace = true
+# SinkExt/StreamExt on the framed halves of a connection.
+futures-util.workspace = true
+# encode_frame hands back Bytes; the per-connection write queue carries them as-is.
+bytes.workspace = true
+# Server-side topic filtering for Subscribe (spec §6 glob topics).
+globset.workspace = true
+# Atomic muster-roll writes: NamedTempFile in the same dir + persist = rename(2).
+tempfile.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -21,18 +34,26 @@ serde_json.workspace = true
 # nix is #![cfg(unix)] internally and command-fds does unconditional unix-only fd
 # plumbing, so both would fail to compile on a Windows CI leg. Rin's Windows ruling:
 # the pure tier (this crate's types/traits/fake) compiles everywhere; the OS tier
-# (signal delivery, fd-passing) is unix-only for now. Nothing in this crate calls
-# either yet — Task 7's tokio_runner.rs/kill.rs (the real runner + kill ladder) is
-# what will actually use them, and those modules must themselves be `#[cfg(unix)]`
-# when they land, matching this dependency gate.
+# (signal delivery, fd-passing) is unix-only for now. tokio_runner.rs/kill.rs use
+# the workspace-default nix features (signal, process, user); sys.rs's readiness-pipe
+# adoption additionally needs "fs" for `nix::fcntl::fcntl`/`FcntlArg::F_GETFD`, the
+# safe probe that lets `adopt_fd` refuse a closed descriptor instead of adopting it.
 [target.'cfg(unix)'.dependencies]
-nix.workspace = true
+nix = { workspace = true, features = ["fs"] }
 command-fds.workspace = true
+
+# `cfg(any())` never matches any target, so nothing here is ever compiled into any real
+# build — but Cargo's resolver still walks these entries when computing the dependency
+# graph, including under `-Z minimal-versions`. Used to force a floor pin for a transitive
+# dep whose own Cargo.toml under-declares its true minimum (see root Cargo.toml comment
+# for the per-crate reasoning). Safe to drop once `tracing` corrects its own declared
+# `tracing-core` floor.
+[target.'cfg(any())'.dependencies]
+tracing-core.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 proptest.workspace = true
-tempfile.workspace = true
 
 [lints]
 workspace = true

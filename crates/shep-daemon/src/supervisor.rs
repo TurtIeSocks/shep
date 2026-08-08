@@ -28,7 +28,6 @@
 use core::fmt;
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
-use std::time::SystemTime;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -43,6 +42,7 @@ use crate::brain::{Decision, decide_on_exit};
 use crate::channel::ChildMessage;
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
 use crate::kill::kill_process;
+use crate::privilege::{self, Credentials};
 use crate::runner::{ExitOutcome, ProcIo, ProcessRunner, RunningProcess};
 
 /// Capacity of the actor's own mailbox (commands + internal events).
@@ -341,6 +341,18 @@ struct SheepSlot {
     ctl: Option<mpsc::Sender<SheepCtl>>,
     /// Which manual command (if any) is waiting on this sheep's next exit.
     manual: Option<ManualKind>,
+    /// Set whenever a `Delete` targets this id, even if an earlier command
+    /// already owns `manual` (adversarial finding #2 — the fix for
+    /// Delete-racing-Shutdown). `manual` records who owns the next Kill;
+    /// `pending_delete` records intent that must survive regardless of who
+    /// won that race, so a Delete can never be silently downgraded to a
+    /// Stop (or, worse, a Restart — a Delete racing a Restart the same way
+    /// used to respawn a brand-new live process and still tell the Delete
+    /// caller it succeeded) just because another command's marker got there
+    /// first. `handle_exited` checks this flag on every path that would
+    /// otherwise skip `decide_on_exit` (today, just the manual-Restart
+    /// early return) as well as on the `CleanStop` branch itself.
+    pending_delete: bool,
     /// Bumped on every successful respawn (IMPORTANT-3). A `RestartDue`
     /// timer carries the epoch it was scheduled under; `handle_restart_due`
     /// drops one whose epoch no longer matches — a stale timer left behind
@@ -477,6 +489,13 @@ impl<R: ProcessRunner> Actor<R> {
         let mut results = Vec::new();
         for app in apps {
             let name = app.config().name.clone();
+            // Resolved once per app in this Start batch, not once per
+            // instance: every instance of the same app shares one identity,
+            // and respawn() reuses this same value from ProcessEntry for
+            // every future restart instead of re-touching the passwd
+            // database (crate::privilege's module doc).
+            let credentials = privilege::resolve(app.config())
+                .map_err(|err| SupervisorError::SpawnFailed(err.to_string()))?;
             let mut existing: Vec<u32> = self
                 .sheep
                 .values()
@@ -487,7 +506,7 @@ impl<R: ProcessRunner> Actor<R> {
             let slots = instance_slots(&existing, app.config().instances);
 
             for instance in slots {
-                match self.spawn_fresh(&app, instance) {
+                match self.spawn_fresh(&app, instance, credentials) {
                     Ok(info) => results.push(info),
                     Err(message) => return Err(SupervisorError::SpawnFailed(message)),
                 }
@@ -501,8 +520,13 @@ impl<R: ProcessRunner> Actor<R> {
     /// Always inserts a [`SheepSlot`] — `Online` with a live sheep task on
     /// success, `Errored` with no task on failure — before returning, so the
     /// entry persists regardless of the outcome.
-    fn spawn_fresh(&mut self, app: &ResolvedApp, instance: u32) -> Result<ProcessInfo, String> {
-        let spec = assemble(app, instance, &self.paths);
+    fn spawn_fresh(
+        &mut self,
+        app: &ResolvedApp,
+        instance: u32,
+        credentials: Option<Credentials>,
+    ) -> Result<ProcessInfo, String> {
+        let spec = assemble(app, instance, &self.paths, credentials);
         let id = self.next_id;
         self.next_id += 1;
 
@@ -519,6 +543,7 @@ impl<R: ProcessRunner> Actor<R> {
                     started_at: Some(tokio::time::Instant::now()),
                     budget: RestartBudget::default(),
                     reload: ReloadState::None,
+                    credentials,
                 };
                 let info = to_info(&entry);
                 let ctl = spawn_sheep_task::<R::Proc>(
@@ -535,10 +560,23 @@ impl<R: ProcessRunner> Actor<R> {
                         entry,
                         ctl: Some(ctl),
                         manual: None,
+                        pending_delete: false,
                         epoch: 0,
                     },
                 );
                 self.emit(ProcessEventKind::Start, info.clone(), true);
+                // No readiness-probe gate exists yet (Phase 2b: `readiness_probe`
+                // is parsed into `AppConfig` but not wired to anything here —
+                // see this file's own `Msg::Ready` handler, line 432, the
+                // Phase-4 wait_ready TODO), so `entry.status` above already
+                // went straight to `Online` with no intervening `Starting`
+                // phase ever observed by a caller. The bus must say so too:
+                // a `process.*` subscriber that only ever hears `process.start`
+                // for a sheep whose STATUS already reads `Online` (via
+                // `ListFlock`) is being told less than a status poll would
+                // show it. Once a real readiness gate lands, this is the spot
+                // that defers to it instead of firing unconditionally.
+                self.emit(ProcessEventKind::Online, info.clone(), true);
                 Ok(info)
             }
             Err(error) => {
@@ -552,6 +590,7 @@ impl<R: ProcessRunner> Actor<R> {
                     started_at: None,
                     budget: RestartBudget::default(),
                     reload: ReloadState::None,
+                    credentials,
                 };
                 let info = to_info(&entry);
                 self.sheep.insert(
@@ -560,6 +599,7 @@ impl<R: ProcessRunner> Actor<R> {
                         entry,
                         ctl: None,
                         manual: None,
+                        pending_delete: false,
                         epoch: 0,
                     },
                 );
@@ -577,7 +617,11 @@ impl<R: ProcessRunner> Actor<R> {
         let slot = self.sheep.get(&id).expect("respawn: unknown id");
         let app = slot.entry.spec.clone();
         let instance = slot.entry.instance;
-        let spec = assemble(&app, instance, &self.paths);
+        // Reused as-is from the initial Start (never re-resolved): a
+        // restart must never re-touch the passwd database, and must never
+        // silently change identity out from under an already-running app.
+        let credentials = slot.entry.credentials;
+        let spec = assemble(&app, instance, &self.paths, credentials);
 
         match self.runner.spawn(&spec) {
             Ok((proc, io)) => {
@@ -605,6 +649,10 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.epoch += 1;
                 let info = to_info(&slot.entry);
                 self.emit(ProcessEventKind::Restart, info.clone(), manually);
+                // Same gap as `spawn_fresh`'s Ok arm (see its own comment):
+                // `slot.entry.status` above already went straight to `Online`,
+                // so the bus must announce that too, not just the restart.
+                self.emit(ProcessEventKind::Online, info.clone(), manually);
                 info
             }
             Err(_error) => {
@@ -692,6 +740,14 @@ impl<R: ProcessRunner> Actor<R> {
                     // already in flight (or about to be).
                     if let Some(ctl) = &slot.ctl {
                         let _ = ctl.try_send(SheepCtl::Kill);
+                    }
+                }
+                if kind == ManualKind::Delete {
+                    // Regardless of which command's `manual` marker won,
+                    // this id must still be deregistered once it goes
+                    // terminal — see the SheepSlot::pending_delete doc.
+                    if let Some(slot) = self.sheep.get_mut(&id) {
+                        slot.pending_delete = true;
                     }
                 }
                 remaining.insert(id);
@@ -818,6 +874,7 @@ impl<R: ProcessRunner> Actor<R> {
         slot.ctl = None;
         slot.entry.pid = None;
         let manual = slot.manual.take();
+        let pending_delete = std::mem::take(&mut slot.pending_delete);
         let Some(started_at) = slot.entry.started_at.take() else {
             // MINOR-7: shouldn't happen (a duplicate Msg::Exited would
             // violate the one-exit-path invariant) — but resolve any
@@ -845,7 +902,19 @@ impl<R: ProcessRunner> Actor<R> {
         // `manual.is_some()` true, `decide_on_exit` always resolves to
         // CleanStop, landing the sheep in `Stopped` — an honest answer for
         // a restart request that lost the race to a shutdown.
-        if manual == Some(ManualKind::Restart) && !self.shutting_down {
+        //
+        // Adversarial finding #2 follow-up: also NOT when `pending_delete`
+        // is set — this is the ONLY place in `handle_exited` that can
+        // resolve an exit without ever consulting `decide_on_exit` (every
+        // other path reaches the `Decision::CleanStop if ... || pending_delete`
+        // guard below), so it's the one branch a Delete racing a Restart
+        // could slip past. Respawning here would hand back a brand-new LIVE
+        // process while telling the Delete caller it succeeded — worse than
+        // the original bug (a merely-stale `Stopped` entry), since it also
+        // shows up in `list()` as `Online`. Falling through instead lets
+        // `decide_on_exit` resolve to CleanStop (manual.is_some() is still
+        // true) and the `pending_delete` guard below correctly deregister.
+        if manual == Some(ManualKind::Restart) && !self.shutting_down && !pending_delete {
             slot.entry.budget.reset();
             let info = self.respawn(id, true);
             return self.resolve_pending(id, info);
@@ -878,7 +947,7 @@ impl<R: ProcessRunner> Actor<R> {
                 self.emit(ProcessEventKind::Errored, info.clone(), manual.is_some());
                 info
             }
-            Decision::CleanStop if manual == Some(ManualKind::Delete) => {
+            Decision::CleanStop if manual == Some(ManualKind::Delete) || pending_delete => {
                 let mut removed = self.sheep.remove(&id).expect("checked above");
                 removed.entry.status = ProcStatus::Stopped;
                 let info = to_info(&removed.entry);
@@ -990,7 +1059,7 @@ impl<R: ProcessRunner> Actor<R> {
             event,
             info,
             manually,
-            at_ms: now_ms(),
+            at_ms: crate::now_ms(),
         });
     }
 }
@@ -1028,16 +1097,6 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
         uptime_ms,
         fold: entry.spec.config().fold.clone(),
     }
-}
-
-/// The one real-time read in the supervisor: wall-clock milliseconds since
-/// the Unix epoch, for [`BusEvent::Process::at_ms`]. Everything else in the
-/// actor uses the paused-clock-aware `tokio::time::Instant`.
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Spawns the per-sheep task and returns its control sender.
@@ -1145,21 +1204,7 @@ mod tests {
 
     use super::*;
     use crate::fake::{ProcScript, ScriptedRunner};
-
-    // WHY: an isolated $SHEP_HOME per test, resolved over a real tempdir so
-    // `assemble`'s log-path computation has somewhere plausible to point —
-    // nothing in these tests actually touches the filesystem (the scripted
-    // runner never opens the log files), so leaking the tempdir (no cleanup
-    // guard kept alive) is fine for test-process-lifetime isolation.
-    fn test_paths() -> ShepPaths {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // `into_path()` (not `keep()`) deliberately: `keep()` isn't available
-        // on the workspace's tempfile floor ("3", i.e. 3.0.2 under
-        // -Z minimal-versions), only added in a later 3.x release.
-        #[allow(deprecated, reason = "keep() postdates the workspace's tempfile floor")]
-        let path = dir.into_path();
-        ShepPaths::resolve(&|_| None, &path)
-    }
+    use crate::testing::test_paths; // the one crate-root fixture (IR-33)
 
     // Drives virtual time by parking on recv(); returns when the id reaches `kind`.
     async fn await_event(
@@ -1184,7 +1229,8 @@ mod tests {
         let (events, _rx) = tokio::sync::broadcast::channel(64);
         let runner =
             ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let mut app = AppConfig::minimal("web", "./srv");
         app.instances = 2;
         let infos = handle.start(vec![normalize(app).unwrap()]).await.unwrap();
@@ -1200,7 +1246,8 @@ mod tests {
         let (events, mut rx) = tokio::sync::broadcast::channel(1024);
         // 16 spawns: initial + 15 restarts; every exit instant (unstable).
         let runner = ScriptedRunner::new((0..16).map(|_| ProcScript::const_exit(1)).collect());
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let mut app = AppConfig::minimal("crash", "./boom");
         app.exp_backoff_restart_delay = Some("100".parse().unwrap());
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
@@ -1229,7 +1276,8 @@ mod tests {
         // override) throughout.
         let (events, mut rx) = tokio::sync::broadcast::channel(1024);
         let runner = ScriptedRunner::new((0..20).map(|_| ProcScript::const_exit(1)).collect());
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let app = AppConfig::minimal("crash-default", "./boom"); // no max_restarts override
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         await_event(&mut rx, 0, ProcessEventKind::Errored).await;
@@ -1252,7 +1300,8 @@ mod tests {
         script.push(ProcScript::stable_then_exit(2000, 1)); // > min_uptime 1000ms => stable
         script.extend((0..16).map(|_| ProcScript::const_exit(1)));
         let runner = ScriptedRunner::new(script);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let app = AppConfig::minimal("flappy", "./f");
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // 3 unstable (no backoff => immediate), 1 stable run resets the budget,
@@ -1275,7 +1324,8 @@ mod tests {
             },
             obeys_signal: true,
         }]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let app = AppConfig::minimal("svc", "./svc");
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         let stopped = handle
@@ -1293,7 +1343,8 @@ mod tests {
     async fn stop_exit_codes_mean_clean_stop() {
         let (events, mut rx) = tokio::sync::broadcast::channel(64);
         let runner = ScriptedRunner::new(vec![ProcScript::const_exit(0)]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let mut app = AppConfig::minimal("oneshot", "./job");
         app.stop_exit_codes = vec![0];
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
@@ -1305,7 +1356,8 @@ mod tests {
     async fn spawn_failure_surfaces_and_erroreds() {
         let (events, _rx) = tokio::sync::broadcast::channel(64);
         let runner = ScriptedRunner::new(vec![]); // exhausted immediately
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let app = AppConfig::minimal("ghost", "./missing");
         let err = handle
             .start(vec![normalize(app).unwrap()])
@@ -1316,11 +1368,30 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn an_unresolvable_user_fails_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let handle = spawn_supervisor(
+            ScriptedRunner::new(vec![ProcScript::never_exits()]),
+            test_paths(&dir),
+            events,
+        );
+        let mut app = AppConfig::minimal("svc", "./svc");
+        app.user = Some("definitely-not-a-real-shep-user".to_string());
+        let err = handle
+            .start(vec![normalize(app).unwrap()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SupervisorError::SpawnFailed(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn delete_and_selectors_route() {
         let (events, _rx) = tokio::sync::broadcast::channel(64);
         let runner =
             ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let mut a = AppConfig::minimal("api", "./a");
         a.fold = Some("backend".to_string());
         let b = AppConfig::minimal("web", "./w");
@@ -1355,7 +1426,8 @@ mod tests {
             ProcScript::never_exits(),
             ProcScript::never_exits(),
         ]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let app = AppConfig::minimal("svc", "./svc");
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
@@ -1382,7 +1454,8 @@ mod tests {
         let (events, _rx) = tokio::sync::broadcast::channel(64);
         let runner =
             ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let mut app = AppConfig::minimal("web", "./srv");
         app.instances = 2;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
@@ -1425,7 +1498,8 @@ mod tests {
             ProcScript::ignores_signals(), // web: full 1600ms kill ladder
             ProcScript::never_exits(),     // the ghost respawn, if CRITICAL-1 regresses
         ]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let mut crash = AppConfig::minimal("crash", "./boom");
         crash.exp_backoff_restart_delay = Some("500".parse().unwrap());
         let web = AppConfig::minimal("web", "./srv");
@@ -1459,7 +1533,8 @@ mod tests {
             ProcScript::ignores_signals(), // web: 1600ms ladder
             ProcScript::never_exits(),     // the late Start, if it lands before Shutdown
         ]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let web = AppConfig::minimal("web", "./srv");
         handle.start(vec![normalize(web).unwrap()]).await.unwrap();
 
@@ -1499,7 +1574,8 @@ mod tests {
             ProcScript::never_exits(),             // whoever respawns first takes this
             ProcScript::never_exits(),
         ]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let mut app = AppConfig::minimal("crash", "./boom");
         app.exp_backoff_restart_delay = Some("2000".parse().unwrap());
         app.min_uptime = "5000".parse().unwrap(); // 1500ms uptime counts as unstable
@@ -1541,7 +1617,8 @@ mod tests {
             ProcScript::ignores_signals(), // 1600ms ladder: a wide race window
             ProcScript::never_exits(),
         ]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let app = AppConfig::minimal("svc", "./svc");
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
 
@@ -1577,7 +1654,8 @@ mod tests {
             ProcScript::ignores_signals(),        // sheep a: 1600ms ladder
             ProcScript::stable_then_exit(800, 0), // sheep b: exits at t=800
         ]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let a = AppConfig::minimal("a", "./a");
         let mut b = AppConfig::minimal("b", "./b");
         b.autorestart = false;
@@ -1614,7 +1692,8 @@ mod tests {
     async fn mailbox_flood_during_a_kill_never_deadlocks() {
         let (events, mut rx) = tokio::sync::broadcast::channel(4096);
         let runner = ScriptedRunner::new(vec![ProcScript::ignores_signals()]);
-        let handle = spawn_supervisor(runner, test_paths(), events);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
         let a = AppConfig::minimal("a", "./a");
         handle.start(vec![normalize(a).unwrap()]).await.unwrap();
 
@@ -1649,5 +1728,320 @@ mod tests {
             "DEADLOCK: actor parked in ctl.send() while the sheep task is \
              parked in actor_tx.send() -- the daemon never recovers"
         );
+    }
+
+    // Adversarial finding #2 (whole-branch review, Task 9): a `Delete` that
+    // lands on an id AFTER `begin_shutdown` already claimed it (set
+    // `manual = Some(Stop)`, first-command-wins per IMPORTANT-4) used to hit
+    // `begin_manual`'s `already_in_flight` branch and only join `remaining`
+    // -- it never got a chance to mark its OWN intent anywhere. When the
+    // sheep went terminal, `handle_exited` only deregistered on
+    // `manual == Some(ManualKind::Delete)` (false here: it's `Stop`), so the
+    // sheep stayed registered as `Stopped` while `resolve_pending` still told
+    // the `Delete` caller it succeeded. `pending_delete` fixes this by
+    // recording delete-intent independently of who won the `manual` race.
+    //
+    // A second "decoy" sheep, given a far longer `kill_timeout` than the
+    // target, keeps Shutdown's own aggregation open (its `remaining` set
+    // isn't empty yet) after the target's exit resolves -- so the actor is
+    // still alive and its mailbox still open when this test inspects
+    // `list()` right after. Without the decoy, the target's exit would be
+    // the LAST thing Shutdown is waiting on too, and resolving it would
+    // synchronously complete Shutdown and close the actor's mailbox in the
+    // same poll -- leaving no window in which `list()` could ever observe
+    // anything (a real trap in the brief's original single-sheep sketch of
+    // this test: `handle.list()` after `shutter.await` always hit `EngineStopped`,
+    // whether or not the fix was applied).
+    #[tokio::test(start_paused = true)]
+    async fn delete_racing_shutdown_still_deregisters_the_sheep() {
+        let (events, _rx) = tokio::sync::broadcast::channel(1024);
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::ignores_signals(), // target: default 1600ms kill_timeout ladder
+            ProcScript::ignores_signals(), // decoy: kept alive far longer, see comment above
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let target = AppConfig::minimal("svc", "./svc");
+        let mut decoy = AppConfig::minimal("decoy", "./decoy");
+        decoy.kill_timeout = "600000".parse().unwrap(); // outlives the target's ladder by far
+        let started = handle
+            .start(vec![normalize(target).unwrap(), normalize(decoy).unwrap()])
+            .await
+            .unwrap();
+        let id = started
+            .iter()
+            .find(|info| info.name == "svc")
+            .expect("target sheep registered")
+            .id;
+
+        let h2 = handle.clone();
+        let shutter = tokio::spawn(async move { h2.shutdown().await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await; // let Shutdown claim the manual marker first
+        }
+        let deleted = handle.delete(ProcessSelector::Id(id)).await.unwrap();
+
+        assert_eq!(deleted, vec![id], "the caller was told this id was deleted");
+        assert!(
+            handle.list().await.iter().all(|info| info.id != id),
+            "a Delete that raced a Shutdown must still deregister the sheep, \
+             not just tell its caller it did"
+        );
+
+        // The decoy's own kill ladder (and therefore Shutdown's aggregation)
+        // never resolves under the paused clock within this test -- nothing
+        // left to assert once the race outcome above is confirmed, so drop
+        // the still-in-flight Shutdown call rather than waiting on it.
+        drop(shutter);
+    }
+
+    // Fix-round regression (reviewer finding, Task 9): a Delete racing a
+    // RESTART, not a Shutdown. `handle_exited`'s manual-Restart branch is
+    // the ONE path that resolves an exit without ever consulting
+    // `decide_on_exit` -- every other path reaches the
+    // `Decision::CleanStop if manual == Some(Delete) || pending_delete`
+    // guard, but this one used to `return` straight to `self.respawn(...)`
+    // whenever `manual == Some(Restart)`, ignoring `pending_delete`
+    // entirely. Reachable exactly like the Shutdown race: `Restart(id)`
+    // claims `slot.manual = Some(Restart)` on a running sheep; a racing
+    // `Delete(id)` hits `already_in_flight`, correctly sets
+    // `pending_delete = true`, but never touches `manual`. Worse than the
+    // original bug: instead of leaving a stale `Stopped` entry behind, this
+    // one respawned a BRAND-NEW LIVE PROCESS while still telling the
+    // `Delete` caller it succeeded.
+    #[tokio::test(start_paused = true)]
+    async fn delete_racing_restart_still_deregisters_the_sheep() {
+        let (events, _rx) = tokio::sync::broadcast::channel(1024);
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::ignores_signals(), // wide kill-ladder window
+            // A second script so the pre-fix bug's illegitimate respawn
+            // actually SUCCEEDS into a live, Online process (worse than the
+            // original bug: without this, an exhausted script pool would
+            // land the buggy respawn attempt in Errored instead, still
+            // failing this test but masking exactly how bad the bug is).
+            ProcScript::never_exits(),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let app = AppConfig::minimal("svc", "./svc");
+        let started = handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        let id = started[0].id;
+
+        let h2 = handle.clone();
+        let restarter = tokio::spawn(async move { h2.restart(ProcessSelector::All).await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await; // let Restart claim the manual marker first
+        }
+        let deleted = handle.delete(ProcessSelector::Id(id)).await.unwrap();
+        let restarted = restarter.await.unwrap().unwrap();
+
+        assert_eq!(deleted, vec![id], "the caller was told this id was deleted");
+        // Both callers get the SAME honest outcome (IMPORTANT-4 semantics):
+        // the restart() caller must NOT see a respawned Online process --
+        // if it does, a brand-new live child was spawned behind the
+        // Delete's back.
+        assert_eq!(restarted[0].id, id);
+        assert_eq!(
+            restarted[0].status,
+            ProcStatus::Stopped,
+            "restart() must not report a respawned process once a racing \
+             Delete has claimed this id -- got {restarted:?}"
+        );
+        assert!(
+            handle.list().await.iter().all(|info| info.id != id),
+            "a Delete that raced a Restart must still deregister the sheep, \
+             not respawn a brand-new live process while telling its caller \
+             the sheep was deleted"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // IR-37: supervisor proptest (Task 9, Step 2). A command script (what
+    // the operator does) and a process script (how each spawned child
+    // behaves) are generated independently; their interleaving emerges from
+    // the runtime itself instead of being hand-derived. Invariants are read
+    // off successive `list()` snapshots and the event stream, never off
+    // tick counts.
+    //
+    // `Shutdown` is deliberately NOT one of the five steps below: it is a
+    // one-shot, engine-ending command (the actor's mailbox closes once it
+    // resolves), which doesn't compose with "keep issuing more commands and
+    // keep listing" the way Stop/Restart/Delete/Start do. Finding #2 (Delete
+    // racing Shutdown, fixed above) is exactly the kind of bug this proptest
+    // structurally cannot reach -- that's why it has its own targeted
+    // regression test instead of being folded in here.
+    //
+    // More generally: this proptest's driver below is strictly sequential --
+    // each step's command is fully `.await`ed (its deferred reply resolved)
+    // before the next step runs -- so it can NEVER put two manual commands
+    // in flight against the SAME sheep at once. Every manual-vs-manual race
+    // this file guards against (`overlapping_stop_and_restart_agree_on_one_outcome`,
+    // `delete_racing_shutdown_still_deregisters_the_sheep`,
+    // `delete_racing_restart_still_deregisters_the_sheep`) needs a second
+    // command issued via `tokio::spawn` while the first is still mid-flight,
+    // which is exactly what this driver's "one command, fully awaited, then
+    // the next" shape rules out. Don't read this proptest's invariants
+    // holding as evidence that manual-vs-manual races are covered here --
+    // they aren't, by construction; that coverage lives entirely in the
+    // file's dedicated race tests.
+    // ---------------------------------------------------------------
+
+    #[derive(Debug, Clone, Copy)]
+    enum Step {
+        List,
+        StopAll,
+        RestartAll,
+        DeleteFirst,
+        StartOne,
+    }
+
+    fn step_strategy() -> impl proptest::strategy::Strategy<Value = Step> {
+        proptest::prop_oneof![
+            proptest::strategy::Just(Step::List),
+            proptest::strategy::Just(Step::StopAll),
+            proptest::strategy::Just(Step::RestartAll),
+            proptest::strategy::Just(Step::DeleteFirst),
+            proptest::strategy::Just(Step::StartOne),
+        ]
+    }
+
+    fn script_strategy() -> impl proptest::strategy::Strategy<Value = ProcScript> {
+        // Weighted toward long-lived children so a run explores command
+        // handling rather than only exhausting the restart budget.
+        proptest::prop_oneof![
+            6 => proptest::strategy::Just(ProcScript::never_exits()),
+            2 => proptest::strategy::Just(ProcScript::const_exit(1)),
+            1 => proptest::strategy::Just(ProcScript::stable_then_exit(2_000, 0)),
+            1 => proptest::strategy::Just(ProcScript::ignores_signals()),
+        ]
+    }
+
+    proptest::proptest! {
+        // 128, not the 24 originally sketched for this task: an injected-bug
+        // trial (a Delete on an already-terminal sheep that forgets to
+        // deregister -- see the task report) minimizes to the 3-step
+        // sequence `[StartOne, StopAll, DeleteFirst]`, which only 4 of the 5
+        // equally-weighted `Step` variants touch, so a run needs a handful
+        // of lucky draws to land it. Empirically that meant occasional
+        // clean-yet-buggy runs at cases=24 (1 miss in 6 fresh-seed trials);
+        // 128 caught the same injected bug in 8/8 fresh-seed trials, still
+        // in ~0.1-0.3s under the paused clock -- cheap insurance against a
+        // property test that only sometimes gates the regression it exists
+        // to catch.
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 128,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn supervisor_upholds_its_invariants_under_any_interleaving(
+            steps in proptest::collection::vec(step_strategy(), 1..10),
+            scripts in proptest::collection::vec(script_strategy(), 128..129),
+        ) {
+            // A current-thread runtime with a paused clock inside the
+            // proptest body: every backoff/kill-ladder delay is virtual, so
+            // even a 128-case run stays well under a second regardless of
+            // which scripts land.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            runtime.block_on(async move {
+                let (events, mut rx) = tokio::sync::broadcast::channel(4096);
+                let handle = spawn_supervisor(
+                    ScriptedRunner::new(scripts),
+                    test_paths(&dir),
+                    events,
+                );
+                let mut started = 0u32;
+                let mut highest_restarts = std::collections::HashMap::<u32, u32>::new();
+
+                for step in steps {
+                    match step {
+                        Step::StartOne => {
+                            started += 1;
+                            let app = AppConfig::minimal(&format!("sheep-{started}"), "./s");
+                            let _ = handle.start(vec![normalize(app).unwrap()]).await;
+                        }
+                        Step::StopAll => {
+                            if let Ok(stopped) = handle.stop(ProcessSelector::All).await {
+                                // A deferred reply means every match is terminal.
+                                for info in stopped {
+                                    proptest::prop_assert_eq!(info.status, ProcStatus::Stopped);
+                                }
+                            }
+                        }
+                        Step::RestartAll => {
+                            let _ = handle.restart(ProcessSelector::All).await;
+                        }
+                        Step::DeleteFirst => {
+                            if let Some(first) = handle.list().await.first() {
+                                let id = first.id;
+                                if let Ok(deleted) = handle.delete(ProcessSelector::Id(id)).await {
+                                    proptest::prop_assert_eq!(deleted, vec![id]);
+                                }
+                                proptest::prop_assert!(
+                                    handle.list().await.iter().all(|i| i.id != id)
+                                );
+                            }
+                        }
+                        Step::List => {}
+                    }
+
+                    let listed = handle.list().await;
+                    // (1) ids are unique and the listing is sorted by id.
+                    let ids: Vec<u32> = listed.iter().map(|i| i.id).collect();
+                    let mut sorted = ids.clone();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    proptest::prop_assert_eq!(&ids, &sorted);
+                    for info in &listed {
+                        // (2) restart counts never decrease for a given id.
+                        let seen = highest_restarts.entry(info.id).or_default();
+                        proptest::prop_assert!(info.restarts >= *seen);
+                        *seen = info.restarts;
+                        // (3) no status outside the spec's set ever surfaces.
+                        proptest::prop_assert!(matches!(
+                            info.status,
+                            ProcStatus::Starting | ProcStatus::Online | ProcStatus::Stopping
+                                | ProcStatus::Stopped | ProcStatus::Errored | ProcStatus::WaitingRestart
+                        ));
+                    }
+                }
+
+                // (4) never two live processes for one id: the event stream
+                // must never show Start -> Start for an id without a
+                // terminal event between them. (Ids are never reused by
+                // `spawn_fresh` today, so this is also a regression guard
+                // against that invariant quietly changing later.)
+                let mut live = std::collections::HashSet::<u32>::new();
+                while let Ok(event) = rx.try_recv() {
+                    if let BusEvent::Process { event, info, .. } = event {
+                        match event {
+                            ProcessEventKind::Start => {
+                                proptest::prop_assert!(
+                                    live.insert(info.id),
+                                    "two live spawns for id {}",
+                                    info.id
+                                );
+                            }
+                            ProcessEventKind::Exit
+                            | ProcessEventKind::Stop
+                            | ProcessEventKind::Errored
+                            | ProcessEventKind::Delete => {
+                                live.remove(&info.id);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // The async block's error type is proptest's, so `?` above and
+                // this tail agree; block_on hands the Result back to the
+                // proptest body.
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
     }
 }

@@ -155,6 +155,31 @@ impl ProcessRunner for TokioRunner {
         // reaching the daemon's own group.
         command.process_group(0);
 
+        if let Some(creds) = spec.credentials {
+            // std sets the gid before the uid in the child (setgid must
+            // happen while still privileged), which is the order privilege
+            // drop requires.
+            //
+            // Supplementary groups: we never call `CommandExt::groups`
+            // (still unstable), but that does NOT leave the daemon's own
+            // supplementary groups inherited by the child. Verified against
+            // std's own do_exec (sys/process/unix/unix.rs, this MSRV):
+            // whenever `.uid()` is set and `.groups()` was never called,
+            // std unconditionally calls `setgroups(0, NULL)` before
+            // `setuid()`, clearing every supplementary group before the
+            // child ever runs. The only gap `CommandExt::groups` stabilizing
+            // would close is choosing a NON-EMPTY custom group set (e.g.
+            // the target user's own supplementary groups from
+            // `/etc/group`) — today's child always gets zero supplementary
+            // groups plus whatever `gid` below sets as its single group,
+            // which is the safe direction to be wrong in for a privilege
+            // drop, not the dangerous one.
+            if let Some(gid) = creds.gid {
+                command.gid(gid);
+            }
+            command.uid(creds.uid);
+        }
+
         let (from_child_tx, from_child_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (to_child_tx, to_child_rx) = mpsc::channel(CHANNEL_CAPACITY);
 

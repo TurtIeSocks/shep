@@ -57,9 +57,13 @@ regex = { version = "1.9", default-features = false, features = ["std", "unicode
 globset = { version = "0.4", default-features = false }
 # `tokio::task::JoinHandle::is_finished` (shep-daemon's fake.rs cancel-safety test uses
 # it to assert a `wait()` future is genuinely still pending before dropping it) landed in
-# tokio 1.19.0. Floor to 1.27 — the lowest we've empirically confirmed builds and passes
-# the workspace under `-Z minimal-versions`; safely above the 1.19 feature floor.
-tokio = { version = "1.27", default-features = false }
+# tokio 1.19.0, but shep-daemon's tokio_runner.rs (the real `ProcessRunner`, already
+# landed in Phase 2a but never rehearsed against `-Z minimal-versions` with the `process`
+# feature before Task 2's bus rehearsal caught it) needs two later APIs:
+# `Command::as_std_mut` (added 1.39.1 — 1.39.0 was yanked) and `Command::process_group`
+# losing its `#[cfg(tokio_unstable)]` gate (1.40.0). Floor to 1.40 — the lowest we've
+# empirically confirmed builds and passes the workspace under `-Z minimal-versions`.
+tokio = { version = "1.40", default-features = false }
 # 0.7.0 has a broken minimum floor: it needs a newer tokio (mpsc `reserve_owned`, absent
 # from tokio 1.0.1) and a working log/tracing bridge (`trace!` fails to resolve under
 # minimal deps). Fixed in 0.7.1, which also pulls in a tokio floor high enough to compile.
@@ -67,11 +71,18 @@ tokio-util = { version = "0.7.1", default-features = false, features = ["codec"]
 bytes = { version = "1", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # Only shep-daemon: process-group signal delivery and process-related syscalls for the
-# real ProcessRunner (kill ladder, SIGKILL tree).
-nix = { version = "0.29", default-features = false, features = ["signal", "process"] }
+# real ProcessRunner (kill ladder, SIGKILL tree); `user` adds geteuid for the same-uid
+# peer-cred check and passwd/group lookups for `user`/`group` spawn.
+nix = { version = "0.29", default-features = false, features = ["signal", "process", "user"] }
 # Only shep-daemon: passes the shepherd-channel socketpair as fd 3 into the spawned child.
 command-fds = { version = "0.3", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+# Transitive floor pin: `tracing`'s own Cargo.toml under-declares its `tracing-core`
+# requirement down to versions lacking `impl Value for String`, which shep-daemon's
+# supervisor.rs needs for the bare-field `tracing::debug!(id, name, value, ...)` shorthand
+# (a Phase 2a call site, also caught by Task 2's minimal-versions rehearsal). Missing in
+# 0.1.26/0.1.27; present from 0.1.28.
+tracing-core = { version = "0.1.28", default-features = false }
 # Our `insta::assert_json_snapshot!` calls in shep-core (protocol::request,
 # protocol::events) snapshot newtype/tuple enum variants (the Result-shaped reply
 # payload); 1.18.0 has a JSON-serialization regression with exactly that shape, fixed

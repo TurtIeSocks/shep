@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use shep_daemon::channel::ChildMessage;
+use shep_daemon::privilege::Credentials;
 use shep_daemon::runner::{ProcessRunner, RunningProcess, SpawnSpec, StopSignal};
 use shep_daemon::tokio_runner::TokioRunner;
 
@@ -31,6 +32,27 @@ fn sh_spec(script: &str, channel: bool, out_file: PathBuf, err_file: PathBuf) ->
         out_file,
         err_file,
         channel,
+        credentials: None,
+    }
+}
+
+/// Builds a `program args...` spec writing logs under `dir` — the general
+/// form `sh_spec` doesn't cover (an arbitrary program, not always `/bin/sh
+/// -c <one script string>`). Used by the uid/gid drop proof below, which
+/// needs to run `/bin/sh -c "id -u"` and separately by nothing else today,
+/// but is named/shaped for reuse (Task 8 brief: "this file's existing
+/// helper" — added here since it didn't exist before this task).
+fn spec_for(dir: &tempfile::TempDir, program: &str, args: &[&str]) -> SpawnSpec {
+    SpawnSpec {
+        name: "real-runner-test".to_string(),
+        program: program.to_string(),
+        args: args.iter().map(|s| (*s).to_string()).collect(),
+        cwd: None,
+        env: BTreeMap::new(),
+        out_file: dir.path().join("out.log"),
+        err_file: dir.path().join("err.log"),
+        channel: false,
+        credentials: None,
     }
 }
 
@@ -143,4 +165,256 @@ async fn shepherd_channel_delivers_ready() {
         .await
         .expect("kill_tree should reap promptly");
     assert_eq!(outcome.signal, Some(9));
+}
+
+/// Proves `TokioRunner::spawn`'s `command.uid(creds.uid)` /
+/// `command.gid(gid)` lines (the ones a whole-branch review found a
+/// reviewer could delete with the full suite staying green — the only
+/// other coverage was the root-only, `#[ignore]`d test just below, plus
+/// `fake.rs:401` which hardcodes `credentials: None` and so never reaches
+/// this code at all) are ACTUALLY CALLED, without requiring root.
+///
+/// The obvious version of this test — spawn with your OWN uid/gid and
+/// assert the child reports them back — does NOT work as a regression
+/// gate: verified empirically against this toolchain's own
+/// `library/std/src/sys/process/unix/unix.rs::do_exec` (stable
+/// aarch64-apple-darwin, and confirmed with a standalone probe binary)
+/// that `setuid`/`setgid` to your OWN id is a permitted no-op with zero
+/// observable effect, AND std's own `setgroups(0, NULL)` privilege-drop
+/// call (triggered whenever `.uid()` is set without `.groups()`) silently
+/// swallows `EPERM` for a non-root caller — so a child spawned with the
+/// daemon's own uid/gid looks byte-for-byte identical to one spawned with
+/// `spec.credentials: None`, whether or not `command.uid`/`command.gid`
+/// were ever called. That version would pass unchanged even with both
+/// lines deleted.
+///
+/// This version instead targets a uid/gid the test process does NOT own.
+/// A non-root `setuid`/`setgid` to any id other than your own real/
+/// effective/saved id fails `EPERM` (POSIX) — deterministically, on every
+/// unix — so if `command.uid`/`command.gid` are actually invoked inside
+/// `TokioRunner::spawn`'s child setup, `spawn()` itself returns `Err`
+/// (std pipes a pre-exec failure back to the parent before ever calling
+/// `execve`). If the two lines are deleted, `spec.credentials` is simply
+/// never applied to the `Command` and `spawn()` succeeds instead. That
+/// difference is exactly what each assertion below checks.
+#[tokio::test]
+async fn credentials_are_actually_applied_a_foreign_id_is_refused_by_the_os() {
+    if nix::unistd::geteuid().is_root() {
+        // As root, setuid/setgid to an arbitrary id typically succeeds
+        // instead of failing — this test's whole premise (a guaranteed
+        // EPERM) doesn't hold, and the root-only test below already
+        // covers the apply path under privilege. Nothing to assert here.
+        return;
+    }
+    let own_uid = nix::unistd::geteuid().as_raw();
+    let own_gid = nix::unistd::getegid().as_raw();
+    // Neither number needs to name a real passwd/group entry — a raw
+    // setuid(2)/setgid(2) EPERMs on an unowned id regardless of whether
+    // anything in /etc/passwd or /etc/group claims it.
+    let foreign_uid = if own_uid == 1 { 2 } else { 1 };
+    let foreign_gid = if own_gid == 1 { 2 } else { 1 };
+    let runner = TokioRunner::new();
+
+    // Isolates `command.uid(creds.uid)`: `gid: None` means the
+    // `if let Some(gid) = creds.gid` line is never even reached, so a
+    // failure here can only come from the unconditional `.uid()` call.
+    let dir = tempfile::tempdir().unwrap();
+    let mut uid_spec = spec_for(&dir, "id", &["-u"]);
+    uid_spec.credentials = Some(Credentials {
+        uid: foreign_uid,
+        gid: None,
+    });
+    let uid_result = runner.spawn(&uid_spec);
+    assert!(
+        uid_result.is_err(),
+        "spawning with a foreign uid must be refused by the OS if `command.uid` is really \
+         called; an `Ok` here means the credentials were silently dropped on the floor"
+    );
+
+    // Isolates `command.gid(gid)`: `uid: own_uid` is a permitted no-op
+    // (see this fn's own doc), so a failure here can only come from the
+    // `if let Some(gid) = creds.gid { command.gid(gid); }` line.
+    let dir = tempfile::tempdir().unwrap();
+    let mut gid_spec = spec_for(&dir, "id", &["-g"]);
+    gid_spec.credentials = Some(Credentials {
+        uid: own_uid,
+        gid: Some(foreign_gid),
+    });
+    let gid_result = runner.spawn(&gid_spec);
+    assert!(
+        gid_result.is_err(),
+        "spawning with a foreign gid must be refused by the OS if `command.gid` is really \
+         called; an `Ok` here means the credentials were silently dropped on the floor"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs root: run with `sudo -E cargo test -p shep-daemon --test real_runner -- --ignored`"]
+async fn a_dropped_child_runs_as_the_requested_user() {
+    // Real time: this file's whole tier is real OS behavior.
+    assert!(
+        nix::unistd::geteuid().is_root(),
+        "this test only means anything as root"
+    );
+    let target = nix::unistd::User::from_name("nobody")
+        .unwrap()
+        .expect("every unix box has `nobody`");
+
+    let dir = tempfile::tempdir().unwrap();
+    // `id -G` after `id -u`: proves not just the uid drop but that std's
+    // do_exec cleared root's supplementary groups (setgroups(0, NULL),
+    // called automatically whenever `.uid()` is set without `.groups()` —
+    // see tokio_runner.rs's comment) instead of leaking them into the
+    // dropped-privilege child.
+    let mut spec = spec_for(&dir, "/bin/sh", &["-c", "id -u; id -G"]);
+    spec.credentials = Some(Credentials {
+        uid: target.uid.as_raw(),
+        gid: Some(target.gid.as_raw()),
+    });
+
+    let runner = TokioRunner::new();
+    let (mut proc, mut io) = runner.spawn(&spec).unwrap();
+    let uid_line = tokio::time::timeout(Duration::from_secs(5), io.logs.recv())
+        .await
+        .expect("the child must print its uid")
+        .expect("the log pump must deliver the line");
+    assert_eq!(uid_line.line.trim(), target.uid.as_raw().to_string());
+    assert!(!uid_line.err);
+
+    let groups_line = tokio::time::timeout(Duration::from_secs(5), io.logs.recv())
+        .await
+        .expect("the child must print its group list")
+        .expect("the log pump must deliver the line");
+    let groups: Vec<&str> = groups_line.line.split_whitespace().collect();
+    assert_eq!(
+        groups,
+        vec![target.gid.as_raw().to_string().as_str()],
+        "supplementary groups must be cleared, leaving only the target gid"
+    );
+    assert!(!groups_line.err);
+
+    assert_eq!(proc.wait().await.code, Some(0));
+}
+
+/// RAII guard: sets `PATH` for the duration of a test and restores the
+/// original value on drop (including on panic, so a failing assertion never
+/// leaks a mutated `PATH` into whichever OTHER test the harness's default
+/// multi-threaded runner happens to run concurrently).
+///
+/// # Why `unsafe` is contained to this file, not the `shep-daemon` crate
+///
+/// `std::env::set_var`/`remove_var` are `unsafe fn` (edition 2024): the
+/// hazard they document is an OS thread doing a raw, std-unsynchronized
+/// `getenv` at the same instant. `tests/real_runner.rs` is compiled as its
+/// own crate root (a `[[test]]` binary), not part of the `shep-daemon`
+/// library crate `lib.rs` gates with `#![deny(unsafe_code)]` — so this does
+/// NOT add a second unsafe site to that crate's documented one. Within this
+/// binary specifically: no other test here reads or writes `PATH`, and
+/// `std::process::Command::spawn` (used throughout this file) reads env
+/// through std's OWN `env_read_lock`/fork synchronization (see
+/// `library/std/src/sys/process/unix/unix.rs`), not a raw unsynchronized
+/// `getenv` — so the actual soundness hazard the `unsafe` marker exists for
+/// doesn't apply to anything this binary does.
+struct PathGuard {
+    original: Option<String>,
+}
+
+impl PathGuard {
+    fn set(new_path: &std::path::Path) -> Self {
+        let original = std::env::var("PATH").ok();
+        // SAFETY: see struct doc.
+        unsafe { std::env::set_var("PATH", new_path) };
+        Self { original }
+    }
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        match &self.original {
+            // SAFETY: see PathGuard's doc.
+            Some(value) => unsafe { std::env::set_var("PATH", value) },
+            // SAFETY: see PathGuard's doc.
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_bare_interpreter_resolves_via_the_seeded_path() {
+    // Originally written to stand in for Task 10's not-yet-created e2e tier
+    // (see task-8-report.md); that tier now exists (`tests/daemon_e2e.rs`,
+    // `a_bare_interpreter_resolves_via_the_inherited_path`) and re-proves
+    // this same regression through the full daemon RPC stack — Start over
+    // the real socket -> supervisor -> assemble() -> TokioRunner -> OS exec.
+    // Kept here too rather than deleted: this test isolates the
+    // assemble()+TokioRunner tier specifically (config -> assemble()'s
+    // base_env() PATH seed -> TokioRunner spawn -> OS exec), so a failure
+    // here versus one only in the e2e tier still tells you which layer
+    // regressed.
+    //
+    // WHY a hand-rolled shim instead of `sh`/`node`: `/bin/sh` is reachable
+    // even with a completely EMPTY child env, because glibc/libSystem's
+    // `execvp` falls back to the OS's compiled-in default search path
+    // (`_PATH_DEFPATH`, `/usr/bin:/bin` on macOS/BSD) whenever `PATH` is
+    // ABSENT from the env it's given — independent of anything assemble()
+    // does. Verified empirically: `subprocess.run(["sh", ...], env={})`
+    // (a fully empty env, no PATH key at all) still succeeds. An earlier
+    // version of this test used a bare "sh" and did NOT actually gate the
+    // fix (reverting `base_env()` left it passing). A shim living in a
+    // throwaway tempdir can NEVER be found by that OS-level fallback, so it
+    // can only resolve if assemble()'s seeded PATH genuinely reaches it.
+    use shep_core::config::{AppConfig, normalize};
+    use shep_core::paths::ShepPaths;
+    use shep_daemon::assemble::assemble;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let shim_dir = dir.path().join("bin");
+    fs::create_dir_all(&shim_dir).unwrap();
+    let shim_path = shim_dir.join("shep-test-interp");
+    fs::write(&shim_path, "#!/bin/sh\necho shim-exec-ok\n").unwrap();
+    let mut perms = fs::metadata(&shim_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&shim_path, perms).unwrap();
+
+    // Points the DAEMON's (this test process's) own PATH at ONLY the shim's
+    // directory — no `/usr/bin:/bin`, nothing else — so base_env() has
+    // exactly one place to find "shep-test-interp" and no coincidental
+    // fallback can paper over a regression.
+    let _path_guard = PathGuard::set(&shim_dir);
+
+    let paths = ShepPaths {
+        home: dir.path().to_path_buf(),
+        daemon_config: dir.path().join("shep.toml"),
+        snapshot: dir.path().join("flock.json"),
+        logs: dir.path().join("logs"),
+        pids: dir.path().join("pids"),
+        run: dir.path().join("run"),
+        socket: dir.path().join("run/shep.sock"),
+        barks: dir.path().join("barks.jsonl"),
+    };
+    let app_config = AppConfig {
+        name: "bare".to_string(),
+        script: "unused".to_string(),
+        args: vec![],
+        interpreter: Some("shep-test-interp".to_string()), // bare: only found via seeded PATH
+        ..Default::default()
+    };
+    let app = normalize(app_config).unwrap();
+    let spec = assemble(&app, 0, &paths, None);
+    assert_eq!(
+        spec.program, "shep-test-interp",
+        "sanity: genuinely bare, not accidentally absolute"
+    );
+
+    let runner = TokioRunner::new();
+    let (mut proc, mut io) = runner.spawn(&spec).unwrap();
+    let line = tokio::time::timeout(Duration::from_secs(5), io.logs.recv())
+        .await
+        .expect("the shim must resolve via the seeded PATH and produce output")
+        .expect("logs channel closed before the line arrived");
+    assert_eq!(line.line, "shim-exec-ok");
+    assert!(!line.err);
+    let outcome = proc.wait().await;
+    assert_eq!(outcome.code, Some(0));
 }

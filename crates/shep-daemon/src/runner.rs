@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use crate::channel::{ChildMessage, ShepherdMessage};
+use crate::privilege::Credentials;
 
 /// One exit observation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,7 +155,10 @@ pub struct SpawnSpec {
     pub err_file: PathBuf,
     /// Open the shepherd channel (fd 3 socketpair)
     pub channel: bool,
-    // uid/gid (user/group): deferred to Phase 2b (privilege-drop design) — see roadmap note.
+    /// Unix uid/gid to drop to before exec (`None` inherits the daemon's own
+    /// identity). Resolved once per `Start` by [`crate::privilege::resolve`];
+    /// see that module for how `user`/`group` config names become this.
+    pub credentials: Option<Credentials>,
 }
 
 /// Error type returned from spawn and process control
