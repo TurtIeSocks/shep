@@ -102,6 +102,27 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 # the correct floor.
 tokio-stream = { version = "0.1.3", default-features = false, features = ["sync"] }
 
+# Most debuginfo in `target/` is not ours: the default `debug = true` emits
+# full DWARF for every dependency and links a copy into each of the
+# workspace's test binaries. Line tables carry the backtraces a panicking
+# test prints; dependencies need none at all, since we do not step through
+# them.
+#
+# Measured on a clean build of this workspace (2026-08-08, 91 crates):
+# `target/debug` 899M -> 596M, a third smaller. Wall clock was 13s -> 12s,
+# i.e. noise at this size — the win here is disk, not time. Expect the gap
+# to widen as phases 4-6 add ratatui, sysinfo, rmcp and axum.
+#
+# Separately: a `target/` that has grown to tens of GB is accumulation
+# across feature combos and extra target dirs (`llvm-cov-target`,
+# `x86_64-pc-windows-gnu`), not one build. These settings do not shrink
+# that; `cargo clean` does.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [workspace.lints.rust]
 missing_docs = "deny"
 missing_debug_implementations = "deny"
