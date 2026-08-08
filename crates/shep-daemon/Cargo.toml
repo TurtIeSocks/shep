@@ -8,13 +8,15 @@ repository.workspace = true
 license.workspace = true
 
 [features]
-# Option: expose the scripted fake runner to other crates' tests (2b reuses it).
+# Option: expose the scripted fake runner (`fake::ScriptedRunner`) to other
+# crates' tests. Off by default — it is test scaffolding, not public API.
 test-fakes = []
 
 [dependencies]
 shep-core.workspace = true
-# `fs` (tokio_runner.rs log-file append) and `signal` (Task 2b daemon shutdown
-# handling) both stay alongside the bus/wire-framing features this task adds.
+# `fs` for tokio_runner.rs's log-file append, `signal` for the daemon's
+# shutdown listeners in boot.rs, and `net`/`io-util` for the RPC server's
+# framed connections.
 tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "sync", "net", "fs", "macros", "signal"] }
 # The client<->daemon framing: the SAME codec shep-core exposes, so the daemon can
 # never drift from the shared frame parameters.
