@@ -14,11 +14,13 @@ use shep_core::protocol::RpcErrorCode;
 pub enum ExitCode {
     /// The command did what it was asked.
     ///
-    /// Not constructed anywhere yet: every verb function that would return
-    /// it is still unwritten, and this crate's own dispatch arms are all
-    /// placeholders in the meantime. `#[allow(dead_code)]` says so
-    /// explicitly rather than inventing a call site nothing needs yet.
-    #[allow(dead_code)]
+    /// Its first real call site is unix-only: `run_daemon` returning
+    /// `Ok(())` on a clean shutdown (signal or `KillDaemon`) maps here.
+    /// Every other verb still routes through `not_wired`'s `Internal`
+    /// until its own dispatch arm replaces that placeholder — which is why
+    /// this stays dead on the Windows target, where the whole `daemon`
+    /// dispatch arm does not exist.
+    #[cfg_attr(windows, allow(dead_code))]
     Success = 0,
     /// An error with no more specific code.
     Failure = 1,
@@ -48,11 +50,13 @@ pub enum ExitCode {
     /// process boundary by `shep_client::spawn::DAEMON_ALREADY_RUNNING`,
     /// which must stay equal to 10.
     ///
-    /// Not constructed anywhere yet: only the hidden `daemon` subcommand's
-    /// own exit-code mapping produces it, and that mapping is still
-    /// unwritten. `#[allow(dead_code)]` says so explicitly rather than
-    /// inventing a call site nothing needs yet.
-    #[allow(dead_code)]
+    /// Constructed by the hidden `daemon` subcommand's own exit-code
+    /// mapping (unix-only) when a boot fails with
+    /// `BootError::AlreadyRunning` — the only channel by which a losing
+    /// child in a cold-start race can tell the probing parent it lost.
+    /// Stays dead on the Windows target, where that dispatch arm does not
+    /// exist.
+    #[cfg_attr(windows, allow(dead_code))]
     DaemonAlreadyRunning = 10,
 }
 

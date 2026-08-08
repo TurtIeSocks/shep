@@ -7,7 +7,11 @@
 #![forbid(unsafe_code)]
 
 mod cli;
+#[cfg(unix)]
+mod commands;
 mod exit;
+#[cfg(unix)]
+mod launch;
 mod output;
 
 use std::path::PathBuf;
@@ -16,7 +20,9 @@ use clap::Parser;
 
 use cli::{Cli, GlobalArgs};
 #[cfg(unix)]
-use cli::{Commands, Format};
+use cli::{Commands, DaemonArgs, Format};
+#[cfg(unix)]
+use commands::daemon::{daemon_exit_code, run_daemon};
 use exit::ExitCode;
 use output::Streams;
 use shep_core::paths::ShepPaths;
@@ -106,9 +112,9 @@ fn not_wired(streams: &mut Streams<'_>, fmt: Format, verb: &str) -> ExitCode {
 /// `Completions` and `Daemon` never do — shell completion generation is
 /// exactly what runs in the minimal environments (package build scripts,
 /// container images, shell rc files) that have no `$HOME` at all, and the
-/// re-exec'd `daemon` subcommand resolves its own paths independently once
-/// it lands. Requiring a resolvable home for either was a bug, not a
-/// deliberate restriction.
+/// re-exec'd `daemon` subcommand resolves its own paths independently, in
+/// [`run_daemon_command`], rather than through this shared gate. Requiring
+/// a resolvable home for either was a bug, not a deliberate restriction.
 #[cfg(unix)]
 async fn run(cli: Cli) -> ExitCode {
     let mut out = std::io::stdout().lock();
@@ -121,7 +127,9 @@ async fn run(cli: Cli) -> ExitCode {
 
     match cli.command {
         Commands::Completions(_) => return not_wired(&mut streams, fmt, "completions"),
-        Commands::Daemon(_) => return not_wired(&mut streams, fmt, "daemon"),
+        Commands::Daemon(ref args) => {
+            return run_daemon_command(&mut streams, fmt, &cli.global, args).await;
+        }
         _ => {}
     }
 
@@ -148,6 +156,49 @@ async fn run(cli: Cli) -> ExitCode {
         Commands::Kill => not_wired(&mut streams, fmt, "kill"),
         Commands::Completions(_) | Commands::Daemon(_) => {
             unreachable!("handled above, before resolve_paths runs")
+        }
+    }
+}
+
+/// Resolves this invocation's own [`ShepPaths`] and runs the supervisor in
+/// the foreground until a signal or `KillDaemon`.
+///
+/// Handled from `run`'s early dispatch block rather than through the
+/// shared `resolve_paths` gate below it: that gate exists so `completions`
+/// keeps working with no resolvable `$HOME` at all, and routing `daemon`
+/// through it too would impose the same requirement for no reason — this
+/// re-exec target resolves its own paths instead, independently of that
+/// gate.
+///
+/// `#[cfg(unix)]`: the only caller is `run`'s unix arm — the hidden
+/// `daemon` subcommand is the re-exec target `launch::launch_daemon`
+/// spawns, and that launcher itself only exists on this tier.
+#[cfg(unix)]
+async fn run_daemon_command(
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    global: &GlobalArgs,
+    args: &DaemonArgs,
+) -> ExitCode {
+    let paths = match resolve_paths(global) {
+        Ok(paths) => paths,
+        Err(code) => {
+            let _ = output::emit_error(
+                &mut *streams.err,
+                fmt,
+                code.code_str(),
+                "none of --home, $SHEP_HOME, or $HOME resolves a root directory",
+            );
+            return code;
+        }
+    };
+    match run_daemon(paths, args).await {
+        Ok(()) => ExitCode::Success,
+        Err(err) => {
+            let code = daemon_exit_code(&err);
+            let message = format!("{err}");
+            let _ = output::emit_error(&mut *streams.err, fmt, code.code_str(), &message);
+            code
         }
     }
 }
@@ -218,23 +269,32 @@ mod tests {
     /// dispatch, so `shep completions bash` exited `Usage` ("$HOME is not
     /// set") in exactly the minimal environments — build scripts, container
     /// images, shell rc files — that completion generation is meant for,
-    /// even though neither `Completions` nor `Daemon` ever touches
-    /// `ShepPaths` or the socket. This can't reproduce the original bug by
-    /// unsetting `$HOME` (mutating the environment is `unsafe` in edition
-    /// 2024, and this crate is `#![forbid(unsafe_code)]`), so instead it
-    /// pins the structural fix directly: these two commands never reach
+    /// even though `Completions` never touches `ShepPaths` or the socket.
+    /// This can't reproduce the original bug by unsetting `$HOME`
+    /// (mutating the environment is `unsafe` in edition 2024, and this
+    /// crate is `#![forbid(unsafe_code)]`), so instead it pins the
+    /// structural fix directly: `completions` never reaches
     /// `resolve_paths` at all, so whatever `$HOME` happens to be in any
-    /// environment can't matter to them. If `resolve_paths` were moved back
-    /// onto their path, this fails the moment CI's `$HOME` is unset — but
+    /// environment can't matter to it. If `resolve_paths` were moved back
+    /// onto its path, this fails the moment CI's `$HOME` is unset — but
     /// even on a machine with `$HOME` set, `not_wired`'s `Internal` return
-    /// vs. `resolve_paths`'s would-be `Usage` return still tells them apart.
+    /// vs. `resolve_paths`'s would-be `Usage` return still tells them
+    /// apart.
+    ///
+    /// `daemon` used to share this test (both were routed through
+    /// `not_wired`), but it no longer belongs here: it now genuinely
+    /// resolves its own paths in [`run_daemon_command`] and, on success,
+    /// runs the real supervisor to completion — calling `run(cli).await`
+    /// on `["shep", "daemon"]` from a unit test would bind a real socket
+    /// under whatever `$HOME` this process happens to have and then block
+    /// forever waiting for a signal that never arrives. Exercising the
+    /// daemon dispatch arm for real belongs in the e2e tier
+    /// (`tests/cli_e2e.rs`), against an isolated `--home`, not here.
     #[tokio::test]
-    async fn completions_and_daemon_never_resolve_paths() {
+    async fn completions_never_resolves_paths() {
         use clap::Parser;
-        for argv in [vec!["shep", "completions", "bash"], vec!["shep", "daemon"]] {
-            let cli = Cli::try_parse_from(&argv)
-                .unwrap_or_else(|e| panic!("{argv:?} failed to parse: {e}"));
-            assert_eq!(run(cli).await, ExitCode::Internal, "argv: {argv:?}");
-        }
+        let argv = ["shep", "completions", "bash"];
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} failed: {e}"));
+        assert_eq!(run(cli).await, ExitCode::Internal);
     }
 }
