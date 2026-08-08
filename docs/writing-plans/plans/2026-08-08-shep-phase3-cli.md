@@ -57,6 +57,7 @@ Every task's requirements implicitly include this section. Values here are exact
 - Async trait methods returning futures use RPITIT with an explicit `+ Send` bound — AFIT is not `Send`-provable. (This rule is stated in the Phase 2a/2b plans' Global Constraints; it is not a numbered IR rule. Do not cite it as IR-9 — IR-9 is the unrelated clippy `doc-valid-idents` rule.)
 - Types carrying env or secrets get a manual redacted `Debug` plus an exact-string test (IR-41).
 - Tests: paused tokio clock where time matters, no sleeps as synchronization, hand-rolled fakes, unique fixtures per test (IR-33, IR-34).
+- **Every `recv().await` in a test is wrapped in `tokio::time::timeout`, with a message naming what did not arrive.** A test that fails by hanging gives CI a killed job instead of an assertion — this project has produced nine of them already (Task 8's `lifecycle.rs:613,652`, and Task 9's `query.rs`, whose `ping` mutation test hung past 90 seconds with this rule unapplied). This has now been rediscovered by two different reviewers, one task apart; Tasks 10-12 are briefed from this section specifically so a third rediscovery does not happen.
 
 **Terminology (docs/terminology.md)**
 - `sheep` = one managed process, singular only. The plural is **flock**, never "sheeps".
