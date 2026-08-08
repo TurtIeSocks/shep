@@ -16,9 +16,10 @@
 
 use core::fmt;
 use std::io::ErrorKind;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use tempfile::NamedTempFile;
 use tokio::net::UnixListener;
 
 use shep_core::paths::ShepPaths;
@@ -26,18 +27,45 @@ use shep_core::paths::ShepPaths;
 /// Mode for every directory shep creates (spec §10: no other user, at all)
 pub const DIR_MODE: u32 = 0o700;
 
+/// Creates `dir` (and any missing parents) at [`DIR_MODE`] directly, via
+/// [`DirBuilderExt::mode`] rather than the std default (`0o777`, narrowed
+/// only by whatever the process umask happens to strip).
+///
+/// This is the fix for a real TOCTOU: `create_dir_all` followed by a
+/// separate `chmod` leaves a window where a *freshly created* directory
+/// sits at its umask-derived mode — empirically `0o755` under the common
+/// `umask 022`, and world-*writable* under `umask 0` (a misconfigured
+/// systemd unit), which opens a pre-bind symlink race on the socket path
+/// underneath it. Requesting `0o700` at creation has no group/other bits
+/// for any ordinary umask to strip, so there is nothing left to narrow
+/// after the fact — the directory is never wider than `DIR_MODE`, not even
+/// for the instant between `mkdir` and a later `chmod`.
+///
+/// Does not touch a directory that already exists (the umask given to
+/// `mkdir` only governs directories this call actually creates) — that
+/// case is [`init_dirs`]'s `set_permissions` pass, not this function's job.
+fn create_dir_at_dir_mode(dir: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new()
+        .mode(DIR_MODE)
+        .recursive(true)
+        .create(dir)
+}
+
 /// Creates `$SHEP_HOME` and its subdirectories, tightening loose modes
 ///
 /// Runs on every boot, not just the first: a restart onto a layout that
 /// already exists still forces every directory back to `DIR_MODE`, so a
 /// looser mode left by an external touch (or an older shep version) never
-/// survives a restart.
+/// survives a restart. A directory this call actually creates lands at
+/// `DIR_MODE` immediately (via the private `create_dir_at_dir_mode`
+/// helper); the `set_permissions` call below is what tightens one that was
+/// already there.
 ///
 /// # Errors
 /// - [`BootError::Io`] — a directory could not be created or chmod'ed.
 pub fn init_dirs(paths: &ShepPaths) -> Result<(), BootError> {
     for dir in [&paths.home, &paths.logs, &paths.pids, &paths.run] {
-        std::fs::create_dir_all(dir).map_err(|source| BootError::Io {
+        create_dir_at_dir_mode(dir).map_err(|source| BootError::Io {
             path: dir.clone(),
             source,
         })?;
@@ -57,11 +85,39 @@ pub fn pidfile(paths: &ShepPaths) -> PathBuf {
     paths.pids.join("shepd.pid")
 }
 
+/// Writes the pidfile atomically (temp file in `pids/`, `fsync`, then
+/// `rename`), matching [`crate::snapshot::write_atomic`]'s convention for
+/// every other file this daemon writes. [`crate::snapshot::write_atomic`]
+/// itself isn't reusable here — it's typed to serialize a
+/// [`crate::snapshot::FlockSnapshot`] as JSON, not a bare pid — so this
+/// inlines the same temp+rename shape rather than writing straight to the
+/// final path with `std::fs::write` and risking a reader observing a
+/// truncated file mid-write.
+///
 /// # Errors
 /// - [`BootError::Io`] — the pidfile could not be written.
 pub fn write_pidfile(paths: &ShepPaths, pid: u32) -> Result<(), BootError> {
+    use std::io::Write;
+
     let path = pidfile(paths);
-    std::fs::write(&path, pid.to_string()).map_err(|source| BootError::Io { path, source })
+    let mut tmp = NamedTempFile::new_in(&paths.pids).map_err(|source| BootError::Io {
+        path: paths.pids.clone(),
+        source,
+    })?;
+    tmp.write_all(pid.to_string().as_bytes())
+        .map_err(|source| BootError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    tmp.as_file().sync_all().map_err(|source| BootError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    tmp.persist(&path).map_err(|err| BootError::Io {
+        path,
+        source: err.error,
+    })?;
+    Ok(())
 }
 
 /// Reads the recorded daemon pid, if any
@@ -230,6 +286,26 @@ mod tests {
             assert_eq!(mode_of(path), DIR_MODE, "{}", path.display());
         }
         init_dirs(&paths).unwrap(); // idempotent: a restart must not fail here
+    }
+
+    #[test]
+    fn a_fresh_dir_lands_at_dir_mode_with_no_separate_chmod() {
+        // TOCTOU regression guard: this calls the raw creation primitive
+        // ALONE, with no follow-up set_permissions in this test, so it can
+        // only pass if DirBuilder's `.mode(DIR_MODE)` really lands the mode
+        // at creation. A regression back to `create_dir_all` (0o777, narrowed
+        // only by whatever the ambient umask strips) would still slip past
+        // init_dirs_creates_the_whole_layout_owner_only above, because that
+        // test only observes the mode after init_dirs' own chmod pass has
+        // already run — it can't see the window this test targets.
+        let dir = tempfile::tempdir().unwrap();
+        let never_existed = dir.path().join("nested").join("run");
+        create_dir_at_dir_mode(&never_existed).unwrap();
+        assert_eq!(
+            mode_of(&never_existed),
+            DIR_MODE,
+            "a freshly created dir must be DIR_MODE at creation, not after a later chmod"
+        );
     }
 
     #[test]
