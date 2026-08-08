@@ -13,7 +13,20 @@ test-fakes = []
 
 [dependencies]
 shep-core.workspace = true
-tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "sync", "net", "fs", "macros"] }
+# `fs` (tokio_runner.rs log-file append) and `signal` (Task 2b daemon shutdown
+# handling) both stay alongside the bus/wire-framing features this task adds.
+tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "sync", "net", "fs", "macros", "signal"] }
+# The client<->daemon framing: the SAME codec shep-core exposes, so the daemon can
+# never drift from the shared frame parameters.
+tokio-util.workspace = true
+# SinkExt/StreamExt on the framed halves of a connection.
+futures-util.workspace = true
+# encode_frame hands back Bytes; the per-connection write queue carries them as-is.
+bytes.workspace = true
+# Server-side topic filtering for Subscribe (spec §6 glob topics).
+globset.workspace = true
+# Atomic muster-roll writes: NamedTempFile in the same dir + persist = rename(2).
+tempfile.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -29,10 +42,18 @@ serde_json.workspace = true
 nix.workspace = true
 command-fds.workspace = true
 
+# `cfg(any())` never matches any target, so nothing here is ever compiled into any real
+# build — but Cargo's resolver still walks these entries when computing the dependency
+# graph, including under `-Z minimal-versions`. Used to force a floor pin for a transitive
+# dep whose own Cargo.toml under-declares its true minimum (see root Cargo.toml comment
+# for the per-crate reasoning). Safe to drop once `tracing` corrects its own declared
+# `tracing-core` floor.
+[target.'cfg(any())'.dependencies]
+tracing-core.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 proptest.workspace = true
-tempfile.workspace = true
 
 [lints]
 workspace = true

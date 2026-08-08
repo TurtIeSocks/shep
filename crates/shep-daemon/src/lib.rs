@@ -32,6 +32,7 @@
 //! - [`supervisor`]: the actor — owns registered entries, spawns per-sheep tasks, routes commands
 //! - [`kill`]: kill ladder — SIGTERM, SIGKILL escalation (portable, generic over [`RunningProcess`](runner::RunningProcess))
 //! - [`channel`]: shepherd channel codec (child↔daemon messages, newline-JSON)
+//! - [`bus`]: the daemon-wide event bus — topic-glob filtering, per-subscriber forwarder tasks
 //!
 //! # Quick start
 //!
@@ -102,6 +103,7 @@
 pub mod assemble;
 pub mod backoff;
 pub mod brain;
+pub mod bus;
 pub mod channel;
 pub mod entry;
 pub mod kill;
