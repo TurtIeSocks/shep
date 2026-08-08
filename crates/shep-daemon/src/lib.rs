@@ -25,7 +25,9 @@
 //!
 //! ##### OS tier
 //!
-//! - [`boot`]: daemon boot — `0700` layout dirs, pidfile, socket bind with stale-socket recovery (unix-only)
+//! - [`boot`]: daemon boot — `0700` layout dirs, pidfile, socket bind with stale-socket
+//!   recovery, the readiness pipe, signal handlers, and the ordered teardown sequence (unix-only)
+//! - [`sys`]: adopting an inherited descriptor — the phase's one `unsafe` block (unix-only)
 //! - [`tokio_runner`]: real [`ProcessRunner`](runner::ProcessRunner) over `tokio::process` (unix-only)
 //! - [`server`]: the unix-socket connection layer — peer-cred auth, handshake, subscriptions (unix-only)
 //!
@@ -202,6 +204,13 @@ pub(crate) mod testing {
 // outer `///` here would be the wrong place for it.
 #[cfg(unix)]
 pub mod boot;
+
+// Unix-only: `std::os::unix::io::{FromRawFd, RawFd}` and the one `unsafe` block
+// in this crate (adopting the readiness pipe's inherited descriptor) have no
+// portable equivalent. Doc lives inside sys.rs's own `//!` header (IR-24's
+// rationale essay), not here — same reasoning as `server`'s note below.
+#[cfg(unix)]
+pub mod sys;
 
 /// Real [`ProcessRunner`](runner::ProcessRunner) over actual OS processes.
 ///

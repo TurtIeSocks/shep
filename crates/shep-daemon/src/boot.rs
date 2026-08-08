@@ -1,28 +1,51 @@
-//! Daemon boot: layout, pidfile, and control-socket bind
+//! Daemon boot: layout, pidfile, control-socket bind, and the run/teardown
+//! sequence
 //!
 //! Everything a daemon needs before it can accept its first connection:
 //! creating (and tightening) `$SHEP_HOME`'s directory layout, recording its
-//! own pid, and binding the control socket — including recovering from a
-//! socket file a crashed daemon left behind. This module owns the 0700
-//! guarantee [`crate::server::RpcServer`]'s doc names as the boot path's
-//! responsibility: [`init_dirs`] creates `run/` (and every other layout
-//! directory) `0700` and *tightens* it back down if it already exists
-//! looser, so the guarantee holds whether this is a first boot or a restart
-//! onto a directory some other process touched.
+//! own pid, binding the control socket — including recovering from a socket
+//! file a crashed daemon left behind — and, once bound, reporting readiness
+//! on an inherited pipe if the CLI daemonized us (spec §3). This module owns
+//! the 0700 guarantee [`crate::server::RpcServer`]'s doc names as the boot
+//! path's responsibility: [`init_dirs`] creates `run/` (and every other
+//! layout directory) `0700` and *tightens* it back down if it already
+//! exists looser, so the guarantee holds whether this is a first boot or a
+//! restart onto a directory some other process touched.
 //!
-//! `unsafe`-free: bind/probe/unlink are all safe std and tokio APIs. The
-//! readiness pipe (the phase's one `unsafe`, adopting an inherited
-//! descriptor) is a later addition to this module, in its own `sys.rs`.
+//! [`boot`] assembles every piece earlier tasks built (bus, supervisor,
+//! muster roll, RPC context) into one [`RunningDaemon`]; [`RunningDaemon::run`]
+//! serves connections until a signal or `KillDaemon` arrives, then tears
+//! down in a load-bearing order — see its own doc for why.
+//!
+//! `unsafe`-free itself: bind/probe/unlink/signal-registration are all safe
+//! std and tokio APIs. The one `unsafe` in this phase lives in
+//! [`crate::sys`], which [`signal_ready`] calls into to adopt the readiness
+//! pipe's inherited descriptor.
 
 use core::fmt;
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::net::UnixListener;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
 
 use shep_core::paths::ShepPaths;
+use shep_core::protocol::BusEvent;
+
+use crate::bus::new_bus;
+use crate::rpc::RpcContext;
+use crate::runner::ProcessRunner;
+use crate::server::RpcServer;
+use crate::snapshot::{self, FlockRegistry, SnapshotError, SnapshotWriter, spawn_snapshot_writer};
+use crate::supervisor::{SupervisorHandle, spawn_supervisor};
+use crate::sys::{self, SysError};
 
 /// Mode for every directory shep creates (spec §10: no other user, at all)
 pub const DIR_MODE: u32 = 0o700;
@@ -216,6 +239,335 @@ pub fn bind_socket(paths: &ShepPaths, socket: &Path) -> Result<UnixListener, Boo
     }
 }
 
+/// Environment variable naming the inherited readiness descriptor.
+///
+/// Set by the CLI on the child it re-execs detached (spec §3); read back
+/// into [`BootOptions::ready_fd`] by that same CLI, not by anything in this
+/// crate — shep-daemon only ever sees the already-parsed `RawFd`.
+pub const READY_FD_ENV: &str = "SHEP_READY_FD";
+
+/// What the daemonizing parent reads off the readiness pipe.
+// wire format: shep-cli parses this line; changing it is a breaking change
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonReady {
+    /// This daemon's OS pid.
+    pub pid: u32,
+    /// This daemon's crate version.
+    pub version: String,
+}
+
+/// Reports readiness to the parent and closes the pipe.
+///
+/// Adopts `fd` (see [`sys::adopt_fd`]) and writes one newline-terminated
+/// JSON line; dropping the adopted [`std::fs::File`] at the end of this
+/// call closes the descriptor, which is the parent's own EOF signal that
+/// there is nothing more to read.
+///
+/// # Errors
+/// - [`BootError::Ready`] — the descriptor could not be adopted or written.
+pub fn signal_ready(fd: RawFd, ready: &DaemonReady) -> Result<(), BootError> {
+    use std::io::Write;
+
+    let mut pipe = sys::adopt_fd(fd).map_err(BootError::Ready)?;
+    // DaemonReady is a plain {u32, String} pair: serde_json::to_string only
+    // fails on things neither field can ever be (non-string map keys, NaN
+    // floats), so this can't error in practice. SysError::ReadyWrite below
+    // is for a real IO failure, not this.
+    let mut line = serde_json::to_string(ready).expect("DaemonReady always serializes");
+    line.push('\n');
+    pipe.write_all(line.as_bytes())
+        .map_err(|source| BootError::Ready(SysError::ReadyWrite(source.to_string())))?;
+    Ok(())
+}
+
+/// Options the CLI hands the daemon at boot.
+#[derive(Debug, Default)]
+pub struct BootOptions {
+    /// Overrides the layout's default control-socket path.
+    pub socket: Option<PathBuf>,
+    /// The inherited readiness-pipe descriptor, if the CLI daemonized us
+    /// (see [`READY_FD_ENV`]).
+    pub ready_fd: Option<RawFd>,
+    /// Restore the muster roll if one exists (spec §9's `shep muster`).
+    pub restore: bool,
+}
+
+/// Brings the daemon up: layout, roll restore, bus, supervisor, socket.
+///
+/// # Errors
+/// - [`BootError::AlreadyRunning`] — another daemon owns this `$SHEP_HOME`.
+/// - [`BootError::Io`] — a boot filesystem step failed.
+/// - [`BootError::Ready`] — `options.ready_fd` was set but the descriptor
+///   could not be adopted or written.
+/// - [`BootError::Snapshot`] — `options.restore` was set, a roll exists, but
+///   it could not be read or parsed.
+pub async fn boot<R: ProcessRunner>(
+    runner: R,
+    paths: ShepPaths,
+    options: BootOptions,
+) -> Result<RunningDaemon, BootError> {
+    init_dirs(&paths)?;
+    let socket = socket_path(&paths, options.socket.as_deref());
+    let listener = bind_socket(&paths, &socket)?;
+    let pid = std::process::id();
+    write_pidfile(&paths, pid)?;
+
+    // The spec's contract (sys.rs's rationale essay): report readiness once
+    // the socket is bound, not once the whole flock is restored — a slow
+    // muster must not make the parent think the daemon failed to start.
+    if let Some(fd) = options.ready_fd {
+        let ready = DaemonReady {
+            pid,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        signal_ready(fd, &ready)?;
+    }
+
+    let events = new_bus();
+    let supervisor = spawn_supervisor(runner, paths.clone(), events.clone());
+    let registry = FlockRegistry::new();
+
+    if options.restore {
+        restore_flock(&paths, &registry, &supervisor).await?;
+    }
+
+    let writer = spawn_snapshot_writer(
+        paths.snapshot.clone(),
+        supervisor.clone(),
+        registry.clone(),
+        events.subscribe(),
+    );
+
+    // `shutdown_rx` is kept (not dropped) all the way into `RunningDaemon` —
+    // see that field's own doc for why letting the receiver count hit zero
+    // here would make `ctx.shutdown()` a silent no-op.
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let ctx = RpcContext {
+        supervisor,
+        events,
+        registry,
+        snapshot_path: paths.snapshot.clone(),
+        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        pid,
+        shutdown: Arc::new(shutdown),
+    };
+
+    Ok(RunningDaemon {
+        ctx,
+        listener,
+        writer,
+        paths,
+        socket,
+        shutdown_rx,
+    })
+}
+
+/// Reads the muster roll (if one exists) and starts every app it restores.
+///
+/// A missing roll is not restore's problem to report — a fresh `$SHEP_HOME`
+/// has none, and that's just a first boot, not a [`BootError`]. A roll that
+/// exists but fails to parse IS reported: something already corrupted or
+/// hand-edited it, and silently booting an empty flock instead would hide
+/// that from the operator.
+async fn restore_flock(
+    paths: &ShepPaths,
+    registry: &FlockRegistry,
+    supervisor: &SupervisorHandle,
+) -> Result<(), BootError> {
+    let saved = match snapshot::read(&paths.snapshot) {
+        Ok(saved) => saved,
+        Err(SnapshotError::Io(err)) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(BootError::Snapshot(err)),
+    };
+    let restorable = snapshot::restorable(saved);
+    for (name, err) in &restorable.rejected {
+        tracing::warn!(name, %err, "muster roll entry rejected on restore");
+    }
+    if restorable.apps.is_empty() {
+        return Ok(());
+    }
+    // Recorded regardless of whether `start` below fully succeeds, matching
+    // `rpc::run`'s own Start handler: already-registered entries must
+    // persist even when a later spawn in the same batch fails.
+    registry.record(&restorable.apps);
+    if let Err(err) = supervisor.start(restorable.apps).await {
+        // A restore spawn failure must not sink the whole boot — the same
+        // "one bad entry doesn't sink the muster" policy `restorable`
+        // already applies at validation time. The sheep that failed to
+        // spawn is already recorded `Errored` by the supervisor itself.
+        tracing::warn!(%err, "muster roll restore failed to spawn one or more apps");
+    }
+    Ok(())
+}
+
+/// A booted daemon, not yet serving: everything [`boot`] assembled, handed
+/// back so the caller can read [`Self::context`] before driving [`Self::run`].
+#[derive(Debug)]
+pub struct RunningDaemon {
+    ctx: RpcContext,
+    listener: UnixListener,
+    writer: SnapshotWriter,
+    paths: ShepPaths,
+    socket: PathBuf,
+    // Held from `boot` onward, not created fresh in `run`: `watch::Sender::send`
+    // is a silent no-op (`Err`, value left unchanged — confirmed against
+    // tokio's own source) whenever the receiver count is zero. `ctx.shutdown()`
+    // is callable the moment `boot` returns [`Self::context`], which can race
+    // ahead of `run` ever being polled; without a receiver alive for that
+    // whole window, an early `ctx.shutdown()` is silently lost and `run` hangs
+    // forever waiting on a signal that already fired. (Caught by
+    // `boot_restores_a_saved_flock_and_tears_down_in_order`, which calls
+    // `ctx.shutdown()` immediately after `tokio::spawn(daemon.run())` with no
+    // guaranteed ordering between the two.)
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+impl RunningDaemon {
+    /// Handles for driving this daemon from outside its run loop.
+    #[must_use]
+    pub fn context(&self) -> RpcContext {
+        self.ctx.clone()
+    }
+
+    /// The control socket this daemon is bound to.
+    #[must_use]
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// Serves until a signal or `KillDaemon`, then tears down in order.
+    ///
+    /// TEARDOWN ORDER IS LOAD-BEARING:
+    /// 1. stop the snapshot writer — nothing may rewrite the roll from here on;
+    /// 2. write the final muster roll — records the flock AS IT WAS, still running;
+    /// 3. broadcast [`BusEvent::DaemonShutdown`] — subscribers learn before their sockets close;
+    /// 4. [`SupervisorHandle::shutdown`] — the kill ladder on every online sheep;
+    /// 5. unlink the socket, remove the pidfile.
+    ///
+    /// Steps 1-2 before 4 are the whole point: run them the other way round
+    /// and the roll records a flock of stopped sheep, and `shep muster`
+    /// after a reboot restores nothing — silently breaking spec §13.4, the
+    /// flagship migration scenario. Step 1 specifically must precede step 4
+    /// (not just step 2): the writer would otherwise still be alive to
+    /// observe the kill ladder's own `Exit`/`Stop` events and overwrite the
+    /// roll step 2 just wrote.
+    ///
+    /// # Errors
+    /// - [`BootError::Io`] — a teardown filesystem step failed.
+    pub async fn run(self) -> Result<(), BootError> {
+        let RunningDaemon {
+            ctx,
+            listener,
+            writer,
+            paths,
+            socket,
+            shutdown_rx,
+        } = self;
+
+        // Installed here, not in `boot`, so its tasks start landing right
+        // around when this future is first polled — see
+        // `sigterm_triggers_the_same_graceful_shutdown`'s own comment for
+        // why that timing matters to that test.
+        let _reopens = install_signals(Arc::clone(&ctx.shutdown), paths.clone())?;
+
+        // `shutdown_rx` is the receiver `boot` has kept alive since the
+        // watch channel was created (see the field's own doc) — reused
+        // here rather than a fresh `ctx.shutdown.subscribe()` precisely so
+        // there is never a window with zero receivers between `boot`
+        // returning and this line running.
+        RpcServer::new(listener, ctx.clone())
+            .serve(shutdown_rx)
+            .await;
+
+        // 1. Stop the snapshot writer FIRST — see this fn's doc.
+        writer.stop().await;
+
+        // 2. Write the final roll while every sheep is still online.
+        if let Err(err) = ctx.snapshot_now().await {
+            tracing::warn!(%err, "final muster roll write failed");
+        }
+
+        // 3. Tell subscribers before their sockets close underneath them.
+        let _ = ctx.events.send(BusEvent::DaemonShutdown);
+
+        // 4. Kill ladder on every online sheep.
+        ctx.supervisor.shutdown().await;
+
+        // 5. Unlink what boot created.
+        unlink_if_present(&socket)?;
+        unlink_if_present(&pidfile(&paths))?;
+
+        Ok(())
+    }
+}
+
+/// Removes `path`, treating "already gone" as success rather than an error —
+/// teardown's job is to make sure it's gone, not to prove it was there.
+fn unlink_if_present(path: &Path) -> Result<(), BootError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(BootError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Installs SIGTERM/SIGINT/SIGQUIT (graceful shutdown, first signal wins)
+/// and SIGUSR2 (`shep reopen`'s out-of-band form, spec §9).
+///
+/// SIGUSR2's DEFAULT disposition is to terminate the process, so installing
+/// this handler is load-bearing on its own: without it, an operator's
+/// `kill -USR2` (or `shep reopen`) kills the daemon instead of rotating
+/// logs. Full per-sheep handle reopening lands with `flush`/`reopen` (Phase
+/// 4); today this only re-creates a missing log dir, counts the request,
+/// and logs it.
+///
+/// # Errors
+/// - [`BootError::Io`] — the OS refused to register a signal handler.
+fn install_signals(
+    shutdown: Arc<watch::Sender<bool>>,
+    paths: ShepPaths,
+) -> Result<Arc<AtomicU64>, BootError> {
+    for kind in [
+        SignalKind::terminate(),
+        SignalKind::interrupt(),
+        SignalKind::quit(),
+    ] {
+        let mut stream = signal(kind).map_err(|source| BootError::Io {
+            path: paths.home.clone(),
+            source,
+        })?;
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            stream.recv().await; // first signal only — the daemon is exiting either way
+            let _ = shutdown.send(true);
+        });
+    }
+
+    let reopens = Arc::new(AtomicU64::new(0));
+    let mut usr2 = signal(SignalKind::user_defined2()).map_err(|source| BootError::Io {
+        path: paths.home.clone(),
+        source,
+    })?;
+    let task_reopens = Arc::clone(&reopens);
+    let logs = paths.logs.clone();
+    tokio::spawn(async move {
+        while usr2.recv().await.is_some() {
+            task_reopens.fetch_add(1, Ordering::SeqCst);
+            if let Err(err) = create_dir_at_dir_mode(&logs) {
+                tracing::warn!(%err, path = %logs.display(), "SIGUSR2: could not recreate log dir");
+            }
+            tracing::info!(
+                "SIGUSR2 received: log reopen requested (full per-sheep reopening lands in Phase 4)"
+            );
+        }
+    });
+
+    Ok(reopens)
+}
+
 /// Error type returned from this module's boot steps
 ///
 /// Wraps `io::Error` directly rather than stringifying it (contrast
@@ -223,10 +575,6 @@ pub fn bind_socket(paths: &ShepPaths, socket: &Path) -> Result<UnixListener, Boo
 /// diagnostic via [`core::error::Error::source`]; that costs this enum
 /// `Clone`/`PartialEq`/`Eq` (IR-19's documented exception for variants
 /// wrapping `io::Error`).
-///
-/// Grows two more variants (`Snapshot`, `Ready`) once the readiness pipe and
-/// the assembled `boot()` entry point land — this task only wires the steps
-/// that can fail with an I/O error or find a live daemon already listening.
 #[derive(Debug)]
 pub enum BootError {
     /// A filesystem step failed (carries the path and the OS error)
@@ -241,6 +589,10 @@ pub enum BootError {
         /// The pid recorded in the pidfile, if one was readable
         pid: Option<u32>,
     },
+    /// The muster roll exists but could not be read or parsed on restore
+    Snapshot(SnapshotError),
+    /// The readiness descriptor could not be adopted or written
+    Ready(SysError),
 }
 
 impl fmt::Display for BootError {
@@ -253,6 +605,8 @@ impl fmt::Display for BootError {
                 write!(f, "a shep daemon is already running (pid {pid})")
             }
             Self::AlreadyRunning { pid: None } => write!(f, "a shep daemon is already running"),
+            Self::Snapshot(err) => write!(f, "muster roll restore failed: {err}"),
+            Self::Ready(err) => write!(f, "readiness signal failed: {err}"),
         }
     }
 }
@@ -262,6 +616,8 @@ impl core::error::Error for BootError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::AlreadyRunning { .. } => None,
+            Self::Snapshot(err) => Some(err),
+            Self::Ready(err) => Some(err),
         }
     }
 }
@@ -269,8 +625,12 @@ impl core::error::Error for BootError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fake::{ProcScript, ScriptedRunner};
+    use crate::snapshot::{FlockSnapshot, SNAPSHOT_VERSION, SavedApp};
     use crate::testing::test_paths; // the one crate-root fixture (IR-33)
+    use shep_core::config::AppConfig;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
 
     fn mode_of(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -388,5 +748,111 @@ mod tests {
         std::os::unix::net::UnixStream::connect(&paths.socket)
             .expect("the live listener must still be accepting after a refused bind");
         drop(live);
+    }
+
+    #[test]
+    fn readiness_reports_pid_and_version_then_closes_the_pipe() {
+        use std::io::Read;
+        use std::os::unix::io::IntoRawFd;
+        let (parent, child) = std::os::unix::net::UnixStream::pair().unwrap();
+        let ready = DaemonReady {
+            pid: 4242,
+            version: "0.1.0".to_string(),
+        };
+        signal_ready(child.into_raw_fd(), &ready).unwrap();
+        let mut line = String::new();
+        let mut parent = parent;
+        parent.read_to_string(&mut line).unwrap();
+        assert_eq!(line.trim_end(), serde_json::to_string(&ready).unwrap());
+        assert!(line.ends_with('\n'), "the parent reads a line: {line:?}");
+    }
+
+    #[tokio::test]
+    async fn boot_restores_a_saved_flock_and_tears_down_in_order() {
+        // Real time: binds a real socket.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        // instances_running is a deliberately WRONG sentinel (99, not the 1
+        // instance actually restored below): restore reads `app.instances`
+        // to decide how many to start, never this historical count, so it
+        // has no effect on the boot itself. Its only job is to make the
+        // final-roll assertion below load-bearing: if teardown's roll write
+        // is ever skipped (e.g. because a reordering runs it after the
+        // supervisor has already stopped, when `snapshot_now` silently
+        // no-ops rather than querying a dead engine), this stale 99 survives
+        // untouched and the assertion catches it. A seeded `1` would have
+        // matched the correct post-teardown value by coincidence and let a
+        // skipped write pass unnoticed.
+        let roll = FlockSnapshot {
+            version: SNAPSHOT_VERSION,
+            saved_at_ms: 0,
+            apps: vec![SavedApp {
+                app: AppConfig::minimal("web", "./srv"),
+                instances_running: 99,
+            }],
+        };
+        crate::snapshot::write_atomic(&paths.snapshot, &roll).unwrap();
+
+        let daemon = boot(
+            ScriptedRunner::new(vec![ProcScript::never_exits()]),
+            paths.clone(),
+            BootOptions {
+                restore: true,
+                ..BootOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ctx = daemon.context();
+        let flock = ctx.supervisor.list_checked().await.unwrap();
+        assert_eq!(flock.len(), 1, "the muster roll must be back on its feet");
+        assert_eq!(flock[0].name, "web");
+
+        let run = tokio::spawn(daemon.run());
+        ctx.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        // The roll written during teardown records the flock as it WAS.
+        let final_roll = crate::snapshot::read(&paths.snapshot).unwrap();
+        assert_eq!(
+            final_roll.apps[0].instances_running, 1,
+            "the roll must be written before the flock is killed, or muster restores nothing"
+        );
+        assert!(
+            !paths.socket.exists(),
+            "the socket is unlinked on a clean exit"
+        );
+        assert_eq!(read_pidfile(&paths).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn sigterm_triggers_the_same_graceful_shutdown() {
+        // Real time + a real signal. Safe to raise here only because the
+        // handler is installed first: SIGTERM's default action would kill
+        // the test binary. tokio never uninstalls it, which is harmless.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        let daemon = boot(
+            ScriptedRunner::new(vec![]),
+            paths.clone(),
+            BootOptions::default(),
+        )
+        .await
+        .unwrap();
+        let run = tokio::spawn(daemon.run());
+        tokio::time::sleep(Duration::from_millis(50)).await; // let install_signals land
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!paths.socket.exists());
     }
 }
