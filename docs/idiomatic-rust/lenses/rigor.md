@@ -168,7 +168,7 @@ undocumented_unsafe_blocks = "deny"
 
 ### Unsafe budget (patterns 6-8) — shep-daemon only
 Expected unsafe surface: libc/nix calls around `fork`/`setsid`/`kill`/signal masks/`dup2` for log fds. Rules:
-- All unsafe confined to one module (`shep-daemon/src/sys.rs`); the rest of the daemon calls its safe wrappers.
+- All unsafe confined to one module (`shep-daemon/src/sys.rs`) — either inside it, or a call into one of its `unsafe fn`s at the one site each requires; the rest of the daemon calls its safe wrappers. (Shipped example, Phase 2b: `sys::adopt_fd` is itself `unsafe fn`, not a safe wrapper — its ordering precondition is a caller obligation no internal check can verify — so its one call site in `boot::boot` carries its own `unsafe` block and `// SAFETY:` comment too. Two syntactic sites, one justified operation, still confined to `sys.rs`'s own surface.)
 - Every block: `// SAFETY:` stating the exact invariant ("`fd` is owned by this struct and not yet closed", "no other thread exists between fork and exec"), repeated verbatim at each site — no "see above" (rand repeats its four ThreadRng SAFETY comments, `src/rngs/thread.rs:142,217,225,233`).
 - Where an invariant is checkable, pair the unsafe block with a `debug_assert!` of the stated condition (rand `src/distr/other.rs:170-177`).
 - If a macro or helper generates unsafe code with a caller-side obligation, use rand's `const unsafe fn __unsafe() {}` trick (`src/rng.rs:344-345,384,402-405`) to force callers into an `unsafe` block with their own SAFETY comment.

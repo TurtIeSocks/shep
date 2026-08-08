@@ -85,8 +85,15 @@ Priority when rules collide: **Readability > KISS > DRY** (Rin's global order).
 
 ## E. Unsafe (shep-daemon only)
 
-- **IR-22** All unsafe confined to `shep-daemon/src/sys.rs`; everything else
-  calls its safe wrappers.
+- **IR-22** All unsafe confined to `shep-daemon/src/sys.rs`: either inside
+  it, or a call into one of its `unsafe fn`s at the one site each requires
+  (its own `// SAFETY:` comment, IR-23) — never unsafe scattered elsewhere
+  in the daemon for convenience. An operation whose safety precondition is
+  a CALLER obligation (unverifiable from inside the fn itself) is an
+  `unsafe fn`, not a safe wrapper hiding one internal block — that pushes a
+  matching `unsafe` block to its one call site, which is still confinement
+  to `sys.rs`'s own surface, not a widening of it (`sys::adopt_fd` +
+  `boot::boot`'s one call to it is the shipped example).
 - **IR-23** Every block: `// SAFETY:` stating the exact invariant, repeated
   verbatim at each site (no "see above"). Pair with `debug_assert!` of the
   invariant when checkable.
@@ -200,7 +207,7 @@ Priority when rules collide: **Readability > KISS > DRY** (Rin's global order).
 [ ] deps default-features=false, features commented + additive     (IR-2,3)
 [ ] no new panicking constructor outside shep-cli                  (IR-21)
 [ ] error enums: per-module, variant docs = conditions             (IR-18,19)
-[ ] unsafe only in sys.rs, SAFETY per block                        (IR-22,23)
+[ ] unsafe confined to sys.rs's own definitions + their call sites (IR-22,23)
 [ ] docs: # Errors on Result fns, # Panics ⇔ #[track_caller]       (IR-28,21)
 [ ] secrets types: redacted Debug + exact-string test              (IR-41)
 [ ] wire changes: stability fixtures updated + CHANGELOG           (IR-35,45)
