@@ -28,6 +28,11 @@ use shep_core::protocol::{
 /// reads from, so the two never drift apart.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The framed transport a [`Connection`] wraps, named so callers past this
+/// module (the actor task that takes ownership of it) don't have to spell
+/// out `Framed<UnixStream, LengthDelimitedCodec>` themselves.
+pub(crate) type Frames = Framed<UnixStream, LengthDelimitedCodec>;
+
 /// Why `Connection::open` failed.
 ///
 /// Growth is expected — this is a library crate's public error type (IR-20).
@@ -105,14 +110,8 @@ impl core::error::Error for ConnectError {
 
 /// One handshaken connection to the daemon: an established, version-checked
 /// framed transport plus the daemon's [`HelloAck`].
-// Unused outside this module's own tests today, by design, not by
-// oversight: Task 2's `Client::connect` is the consumer this type is
-// waiting for and does not exist yet. `#[allow(dead_code)]` says so
-// explicitly rather than inventing a caller nothing needs yet (same pattern
-// as `shep-daemon/src/boot.rs`'s `SignalTasks::reopens`).
-#[allow(dead_code)]
 pub(crate) struct Connection {
-    frames: Framed<UnixStream, LengthDelimitedCodec>,
+    frames: Frames,
     ack: HelloAck,
 }
 
@@ -124,7 +123,6 @@ impl fmt::Debug for Connection {
     }
 }
 
-#[allow(dead_code)] // see the struct's own `#[allow(dead_code)]` note above
 impl Connection {
     /// Connects to `socket` and performs the version handshake, bounding
     /// the whole attempt — connect, send [`Hello`], read the reply — by
@@ -187,9 +185,11 @@ impl Connection {
         Ok(Self { frames, ack })
     }
 
-    /// The daemon's handshake acknowledgement.
-    pub(crate) fn ack(&self) -> &HelloAck {
-        &self.ack
+    /// Splits the connection into its raw framed transport and the
+    /// handshake acknowledgement, for the actor task that takes ownership
+    /// of the transport and needs both.
+    pub(crate) fn into_parts(self) -> (Frames, HelloAck) {
+        (self.frames, self.ack)
     }
 }
 
@@ -213,7 +213,8 @@ mod tests {
 
         let conn = Connection::open(&path, HANDSHAKE_TIMEOUT).await.unwrap();
 
-        assert_eq!(conn.ack(), &ack);
+        let (_frames, actual_ack) = conn.into_parts();
+        assert_eq!(actual_ack, ack);
         let hello = served.await.unwrap();
         assert_eq!(
             hello.protocol, PROTOCOL_VERSION,

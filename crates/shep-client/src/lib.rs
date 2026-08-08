@@ -24,7 +24,13 @@
 // Platform tiering follows shep-daemon's ruling — see the phase-3 plan's
 // Global Constraints and `shep-daemon/Cargo.toml:34-40`.
 #[cfg(unix)]
+mod actor;
+#[cfg(unix)]
+mod client;
+#[cfg(unix)]
 mod connection;
+#[cfg(unix)]
+pub use client::{Client, DEADLINE_GRACE, DEFAULT_DEADLINE, RequestError, START_DEADLINE};
 #[cfg(unix)]
 pub use connection::{ConnectError, HANDSHAKE_TIMEOUT};
 
