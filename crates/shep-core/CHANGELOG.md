@@ -14,24 +14,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `ProbeTarget`, parsing a probe's `target` once, at config time, into the
   form its kind promises: `http://host[:port][/path]` for `Http` (port
-  defaults to 80, path to `/`; a bracketed IPv6 host such as `[::1]` is
-  accepted with its brackets stripped), `host:port` for `Tcp`, and any
-  non-empty command line for `Exec`. `https://` targets are rejected with
-  their own error variant — the HTTP prober is a hand-rolled client with no
-  TLS, and a probe that silently failed every poll would look exactly like a
-  down app. `normalize` now validates `readiness_probe` and `liveness_probe`
-  targets (discarding the parsed value; the daemon re-parses when it arms
-  the probe), rejects an explicit `failure_threshold == 0` on either probe,
-  and rejects `watch = true` with no `cwd` — there is no directory to watch,
-  and defaulting to the daemon's own cwd risks recursively watching the
-  whole filesystem under a systemd unit with no `WorkingDirectory=`.
-- `normalize` now compiles every `watch_options` and `ignore_watch` pattern
-  through globset — the engine the daemon's own watch filter uses — and
-  rejects one it will not compile with `NormalizeError::InvalidWatchGlob`,
-  naming the sheep, which of the two lists the pattern came from, the pattern
-  as written and globset's reason. Both lists are checked whether or not
-  `watch` is on. Previously a pattern such as `"["` was accepted, the sheep
-  came up `online`, and the watch it configured simply did not exist.
+  defaults to 80, path to `/`), `host:port` for `Tcp`, and any non-empty
+  command line for `Exec`. Both authority-bearing kinds share one split, so a
+  bracketed IPv6 host such as `[::1]` is accepted on either and carried with
+  its brackets stripped. `https://` targets are rejected with their own error
+  variant — the HTTP prober is a hand-rolled client with no TLS, and a probe
+  that silently failed every poll would look exactly like a down app.
+  `normalize` now validates `readiness_probe` and `liveness_probe` targets
+  (discarding the parsed value; the daemon re-parses when it arms the probe),
+  rejects an explicit `failure_threshold == 0` or `interval` of `0` on either
+  probe, and rejects `watch = true` with no `cwd`. A zero threshold is
+  unhealthy before the first poll ever runs; a zero interval turns the
+  liveness loop into a hot spin, which for an `Exec` probe is hundreds of
+  process spawns a second, per sheep, forever. For `watch`, there is no
+  directory to watch, and defaulting to the daemon's own cwd risks
+  recursively watching the whole filesystem under a systemd unit with no
+  `WorkingDirectory=`.
 - Add `CronSchedule`, validating `cron_restart` against croner's dialect and
   resolving `cron_timezone` against the IANA database, replacing the
   5-token-count stopgap. Accepts the seven vixie `@nickname` shorthands,
@@ -83,6 +81,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixes
 
+- Reject a `watch_options` or `ignore_watch` pattern globset will not compile,
+  with `NormalizeError::InvalidWatchGlob`, naming the sheep, which of the two
+  lists the pattern came from, the pattern as written and globset's reason.
+  `normalize` compiles every pattern through globset — the engine the daemon's
+  own watch filter uses — and checks both lists whether or not `watch` is on.
+  Previously a pattern such as `"["` was accepted, the sheep came up `online`,
+  and the watch it configured simply did not exist.
 - Reject JSON5 documents nested past depth 64 instead of stack-overflowing
   (an uncatchable `SIGABRT`) on deeply nested or malicious `Flockfile` input.
 - Make the JSON5 depth guard comment-aware: `//` and `/* */` comments

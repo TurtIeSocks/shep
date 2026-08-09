@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Additions
 
 - Add the cron-restart worker: one worker per name-group, restarting every
-  instance of the name on its `cron_restart` schedule. The dialect is
-  five-field standard cron in the app's `cron_timezone`, and the next
+  instance of the name — stopped instances included — on its `cron_restart`
+  schedule, the same reach the watch below has. The dialect is five-field
+  standard cron in the app's `cron_timezone`, and the next
   occurrence is re-derived from the wall clock on every iteration rather than
   tracked across one long sleep, so a suspend or an NTP step costs at most one
   `max_cron_sleep` of drift. **A missed occurrence is not replayed**: a
@@ -24,9 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   15 seconds against the sheep's whole **process tree** — its own pid plus
   every lamb — and a breach restarts it. This deviates from pm2, which
   measures the root pid alone; an app that forks workers may therefore see
-  restarts pm2 never gave it. A breach restart does not count against
-  `max_restarts`, so a leaking app restarts indefinitely rather than reaching
-  `errored`.
+  restarts pm2 never gave it. A breach restart **resets the restart budget**,
+  exactly as `shep restart` does — it does not merely skip its own increment,
+  it also forgives every unstable exit counted before it — so a leaking app
+  restarts indefinitely rather than reaching `errored`.
 - Add liveness probes: `liveness_probe` polls a sheep over HTTP, TCP or a
   command on its `interval`, and restarts it once `failure_threshold`
   *consecutive* probes have failed. The HTTP client is hand-rolled and carries
@@ -36,12 +38,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from an app that is down.
 - Add the filesystem watch: an app with `watch = true` gets one watcher over
   its `cwd`, debounced by `watch_delay` (default 500ms), and a change under
-  that tree restarts the app. Dot-entries, `node_modules`, and shep's own
-  `logs/` and `pids/` are ignored before an app's `ignore_watch` is consulted,
-  and an app's list extends those defaults rather than replacing them.
-  `watch = true` without a `cwd` is refused at config time — see `shep-core`'s
-  entry for why arming nothing quietly, or defaulting to the daemon's cwd, was
-  worse.
+  that tree restarts the app. A delivered path triggers when it matches the
+  app's `watch_options` (or `**` when it names none) and does not match the
+  ignores, so ignore always wins; dot-entries, `node_modules`, and shep's own
+  `logs/` and `pids/` are in the ignores by default, and an app's
+  `ignore_watch` extends those defaults rather than replacing them.
+  `watch = true` without a `cwd` is refused at config time rather than arming
+  nothing quietly — see `shep-core`'s entry for why defaulting to the daemon's
+  own cwd was the worse of the two remaining options.
+
+  **One path escapes the globs entirely.** A change reported *at the watch
+  root itself* triggers a restart before either set is consulted, so
+  `ignore_watch` cannot suppress it. That is the rescan signal an inotify
+  queue overflow produces — it means "unknown paths under here changed", not
+  "this path changed", and no user pattern can be matched against it
+  meaningfully. Restarting on it is the conservative reading; the alternative
+  is a watch that goes quiet exactly when it knows least.
 
   Two halves of the reach are worth stating together, because either alone
   misleads. **A triggering change restarts every instance of the name**,
@@ -127,8 +139,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   back up with `restarts: 1` and the `stop` caller was handed an `Online`
   snapshot of it. Two commands that each have an operator waiting on an answer
   still resolve first-command-wins, and an automatic restart still never
-  displaces either. What a restart *does* is unchanged either way — a cron- or
-  watch-triggered one resets the restart budget exactly as `shep restart` does.
+  displaces either. What a restart *does* is unchanged either way — an
+  automatic one resets the restart budget exactly as `shep restart` does,
+  whichever of the four raised it.
 
 ### Changes
 
@@ -146,6 +159,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `online` need to poll instead.
 
   On `listen_timeout` elapsing without a signal, the sheep goes `online`
-  anyway, with a warning. Treating a slow start as a spawn failure would
-  produce exactly the restart loop `max_restarts` exists to contain, out of an
-  app that is slow rather than broken.
+  anyway, and silently: the daemon logs a warning, but no `tracing-subscriber`
+  is wired yet, so nothing renders it and a `starting` that ran long is
+  indistinguishable from one that answered. Treating a slow start as a spawn
+  failure would produce exactly the restart loop `max_restarts` exists to
+  contain, out of an app that is slow rather than broken.
+- `BootOptions` gains a `max_cron_sleep: Option<Duration>` field, carrying
+  `[daemon] max_cron_sleep` from `shep.toml` to the cron workers; `None` means
+  the crate-private default, applied by `boot` and nowhere else. Filed as a
+  change rather than an addition because the struct carries no
+  `#[non_exhaustive]`: any downstream struct literal that names every field
+  stops compiling until it names this one too (`..Default::default()` is
+  unaffected).
+- `supervisor::Command` becomes `pub(crate)`, removing a public type. Same
+  reasoning: it is `pub` in a `pub mod` and not `#[non_exhaustive]`, so every
+  new subsystem's command was a semver break on a surface nobody consumes.
+  `SupervisorHandle` is the only door into the actor, and nothing outside this
+  crate names the enum.

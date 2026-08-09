@@ -1,5 +1,24 @@
 # shep Phase 4 — Lifecycle extras Implementation Plan
 
+> **STATUS: COMPLETE AND SUPERSEDED (2026-08-09).** All fourteen tasks shipped. The
+> unticked `- [ ]` boxes below are left as written: they record the plan as it was
+> drafted, not the state of the tree, and ticking them would assert a step-by-step
+> equivalence the branch does not have — several tasks deviated, and the deviations
+> are recorded where they were decided, not here.
+>
+> **Do not read this file as the state of the code.** For what actually shipped, in
+> descending order of authority: the per-task briefs and reports in `.superpowers/sdd/`
+> (`task-1-brief.md` … `task-14-report.md`, plus `phase4-*.md` for the cross-task
+> amendments), `docs/systematic-refactor/refactor-workspace/map.md` for module-level
+> behavior, and the crate `CHANGELOG.md` files for the user-visible surface.
+>
+> Known drift between this plan and the tree, so nobody re-derives it: the
+> Architecture note below says watch and cron reach the engine through
+> `SupervisorHandle::restart(ProcessSelector)`. They go through
+> `restart_automatic`, which declares `CommandOrigin::Automatic` so an operator's
+> `stop` can displace an automatic restart mid-kill-ladder. The budget-reset
+> behavior the note relies on is unchanged.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 > **REQUIRED SKILL:** invoke `shep-idiomatic-rust` before writing ANY Rust here. Cite rules as `IR-<n>`.
 
