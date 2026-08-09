@@ -111,6 +111,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixes
 
+- Report an automatic restart as automatic. Every restart the daemon raised
+  on its own — cron, watch, a memory breach or a liveness failure — emitted
+  `BusEvent::Process { manually: true }`, whose documented meaning is "a
+  user action caused it". A client using that flag to tell an operator's
+  `shep restart` from the daemon acting alone was wrong on all four. This
+  is a change on the wire, not only in the docs.
+- Stop a watched sheep restarting forever on its own log writes. An app
+  naming an explicit `out_file` or `err_file` under its own `cwd` put those
+  files inside the tree its watch covered, so each startup line triggered
+  the next restart. The default `**/logs/**` ignore never covered it: those
+  globs are matched after the watch root is stripped, and the daemon's own
+  log directory lies outside the app's `cwd` entirely. The assembled log
+  paths are now derived into the watch's ignore set. The loop was
+  self-sustaining and `max_restarts` could not stop it, because an
+  automatic restart resets the restart budget.
 - Send the kill ladder's graceful stop to the sheep's whole process group
   instead of its leader alone, so a wrapper script that forks a child without
   `exec`ing it (`thing & wait`) no longer leaves that child running, orphaned

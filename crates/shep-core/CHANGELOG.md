@@ -22,14 +22,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that silently failed every poll would look exactly like a down app.
   `normalize` now validates `readiness_probe` and `liveness_probe` targets
   (discarding the parsed value; the daemon re-parses when it arms the probe),
-  rejects an explicit `failure_threshold == 0` or `interval` of `0` on either
-  probe, and rejects `watch = true` with no `cwd`. A zero threshold is
-  unhealthy before the first poll ever runs; a zero interval turns the
-  liveness loop into a hot spin, which for an `Exec` probe is hundreds of
-  process spawns a second, per sheep, forever. For `watch`, there is no
-  directory to watch, and defaulting to the daemon's own cwd risks
-  recursively watching the whole filesystem under a systemd unit with no
-  `WorkingDirectory=`.
+  rejects an explicit `failure_threshold == 0`, and rejects `watch = true`
+  with no `cwd`. A zero threshold is unhealthy before the first poll ever
+  runs. For `watch`, there is no directory to watch, and defaulting to the
+  daemon's own cwd risks recursively watching the whole filesystem under a
+  systemd unit with no `WorkingDirectory=`.
+- Reject the zero-valued knobs that turn a loop into a hot spin, each with
+  its own error variant naming the app: `liveness_probe.interval` below one
+  second (`IntervalBelowMinimum`), `max_memory` of `0` (`ZeroMaxMemory`),
+  and `watch_delay` of `0` (`ZeroWatchDelay`). A sub-second liveness
+  interval was previously clamped in silence, which the neighbouring
+  `max_cron_sleep` knob already refused to do on the grounds that a clamp
+  announces itself only in a log file nobody reads. A zero `watch_delay`
+  reaches the debouncer, whose tick is `delay / 4`, and pegs a core per
+  watched app. A zero `max_memory` is a ceiling every process exceeds, so
+  the sheep restarts every poll forever. A `readiness_probe.interval` below
+  the floor is still accepted: that poll is bounded by `listen_timeout`, so
+  it cannot spin.
 - Add `CronSchedule`, validating `cron_restart` against croner's dialect and
   resolving `cron_timezone` against the IANA database, replacing the
   5-token-count stopgap. Accepts the seven vixie `@nickname` shorthands,
