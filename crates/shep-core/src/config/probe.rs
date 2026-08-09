@@ -573,6 +573,48 @@ mod tests {
     }
 
     #[test]
+    fn http_empty_host_before_port_rejected_as_missing_host() {
+        // fails if the empty-host guard that runs AFTER the authority split is
+        // dropped: ":8080" is a non-empty authority, so the pre-split guard
+        // passes it through, and `http://:8080/` would parse to an empty host
+        // that never resolves at poll time. parse_tcp's equivalent guard is
+        // covered by tcp_missing_host_rejected.
+        assert_eq!(
+            ProbeTarget::parse(&probe_config(ProbeKind::Http, "http://:8080/")).unwrap_err(),
+            ProbeTargetError::MissingHost {
+                target: "http://:8080/".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn http_unclosed_bracket_rejected_as_missing_host() {
+        // fails if the bracket branch reports a missing `]` as anything but
+        // MissingHost — there is no host to extract from "[::1", so a BadPort
+        // would point the user at a port the target never carried.
+        assert_eq!(
+            ProbeTarget::parse(&probe_config(ProbeKind::Http, "http://[::1/")).unwrap_err(),
+            ProbeTargetError::MissingHost {
+                target: "http://[::1/".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn http_trailing_characters_after_bracket_rejected_as_bad_port() {
+        // fails if characters after `]` that are neither `:port` nor nothing
+        // are read as "no port": `http://[::1]x` would then quietly become
+        // `::1` on port 80, dropping the `x` the user wrote instead of saying
+        // the port is unreadable.
+        assert_eq!(
+            ProbeTarget::parse(&probe_config(ProbeKind::Http, "http://[::1]x")).unwrap_err(),
+            ProbeTargetError::BadPort {
+                target: "http://[::1]x".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn http_userinfo_in_host_rejected_as_invalid_host() {
         // fails if the host/port split's "last colon" rule is trusted at
         // face value: "user:pass@host:8080" would otherwise parse to host

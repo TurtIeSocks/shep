@@ -474,6 +474,22 @@ mod tests {
     }
 
     #[test]
+    fn bad_cron_timezone_rejected_alongside_a_valid_cron_restart() {
+        // fails if the `cron_restart` branch maps CronParseError::Timezone to
+        // anything but NormalizeError::InvalidTimezone. CronSchedule::parse
+        // resolves the zone before it looks at the pattern, so a valid pattern
+        // paired with a bad zone is the only input that reaches that arm — the
+        // zone-with-no-pattern test below takes the separate `else if` branch.
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.cron_restart = Some("0 3 * * *".to_string());
+        app.cron_timezone = Some("Mars/Olympus".to_string());
+        match normalize(app).unwrap_err() {
+            NormalizeError::InvalidTimezone { name } => assert_eq!(name, "Mars/Olympus"),
+            other => panic!("expected InvalidTimezone, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn cron_timezone_validated_even_without_cron_restart() {
         // fails if timezone validation is skipped when there's no pattern to
         // pair it with — a Flockfile with only a bad `cron_timezone` is a
