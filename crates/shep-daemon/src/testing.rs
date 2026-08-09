@@ -1,10 +1,13 @@
 // IR-33: one crate-root fixture module; every test module in this crate
 // shares this `test_paths` helper instead of hand-rolling its own.
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use chrono::{DateTime, Utc};
 use shep_core::paths::ShepPaths;
 use tokio::sync::{broadcast, watch};
 
+use crate::cron::Clock;
 use crate::fake::{ProcScript, ScriptedRunner};
 use crate::rpc::RpcContext;
 use crate::snapshot::FlockRegistry;
@@ -75,5 +78,50 @@ pub(crate) fn harness(scripts: Vec<ProcScript>) -> Harness {
         _dir: dir,
         _events_rx: events_rx,
         shutdown_rx,
+    }
+}
+
+// WHY a clock derived from tokio's Instant: `start_paused = true` freezes
+// `tokio::time`, but `chrono::Utc::now()` keeps reading the real system clock.
+// A cron test that used the real clock would have to wait real hours. Deriving
+// wall time as `epoch + elapsed-since-construction` means `tokio::time::advance`
+// moves both clocks by the same amount, and a whole day of schedule fits in a
+// test that takes microseconds.
+pub(crate) struct TestClock {
+    epoch: DateTime<Utc>,
+    started: tokio::time::Instant,
+    // Counts `now_utc` calls. The only observable difference between two
+    // `max_sleep` values is how often the loop wakes, and on a paused clock a
+    // wakeup leaves no other trace.
+    reads: AtomicUsize,
+}
+
+impl TestClock {
+    /// A clock that reads `epoch` at construction and advances in lockstep
+    /// with `tokio::time` from there.
+    pub(crate) fn starting_at(epoch: DateTime<Utc>) -> Self {
+        Self {
+            epoch,
+            started: tokio::time::Instant::now(),
+            reads: AtomicUsize::new(0),
+        }
+    }
+
+    /// How many times [`Clock::now_utc`] has been called.
+    pub(crate) fn reads(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
+    }
+}
+
+impl Clock for TestClock {
+    fn now_utc(&self) -> DateTime<Utc> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        // `chrono::Duration::from_std` is fallible over its full range, but a
+        // test clock cannot plausibly run long enough to overflow it; a
+        // panicking fixture would just be a panicking constructor by another
+        // name (IR-21), so this saturates instead.
+        let elapsed =
+            chrono::Duration::from_std(self.started.elapsed()).unwrap_or(chrono::Duration::MAX);
+        self.epoch + elapsed
     }
 }

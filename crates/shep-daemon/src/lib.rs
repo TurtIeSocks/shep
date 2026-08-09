@@ -28,6 +28,8 @@
 //! - [`kill`]: kill ladder — SIGTERM, SIGKILL escalation (portable, generic over [`RunningProcess`](runner::RunningProcess))
 //! - [`supervisor`]: the actor — owns registered entries, spawns per-sheep tasks, routes commands
 //! - [`channel`]: shepherd channel codec (child↔daemon messages, newline-JSON)
+//! - [`cron`]: the [`Clock`](cron::Clock) seam and the worker that restarts a
+//!   name-group on its `cron_restart` schedule
 //!
 //! ##### Plane
 //!
@@ -190,6 +192,7 @@ pub mod backoff;
 pub mod brain;
 pub mod bus;
 pub mod channel;
+pub mod cron;
 pub mod entry;
 pub mod kill;
 pub mod privilege;
