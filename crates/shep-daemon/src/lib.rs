@@ -33,6 +33,9 @@
 //! - [`limits`]: the [`MemorySampler`](limits::sample::MemorySampler) seam
 //!   over a sheep's process tree; the polling enforcer that consumes it is a
 //!   later addition
+//! - [`probes`]: the [`Prober`](probes::Prober) seam and the liveness probe
+//!   loop — reports a sheep's health once `failure_threshold` consecutive
+//!   probes have failed; the concrete OS-backed prober is a later addition
 //!
 //! ##### Plane
 //!
@@ -200,6 +203,7 @@ pub mod entry;
 pub mod kill;
 pub mod limits;
 pub mod privilege;
+pub mod probes;
 pub mod rpc;
 pub mod runner;
 pub mod snapshot;

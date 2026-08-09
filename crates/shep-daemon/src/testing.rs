@@ -1,15 +1,22 @@
 // IR-33: one crate-root fixture module; every test module in this crate
 // shares this `test_paths` helper instead of hand-rolling its own.
+use core::future::Future;
+use core::pin::Pin;
+use core::time::Duration;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::{DateTime, Utc};
+use shep_core::config::{ProbeConfig, ProbeKind, ProbeTarget};
 use shep_core::paths::ShepPaths;
+use shep_core::values::UpDuration;
 use tokio::sync::{broadcast, watch};
 
 use crate::cron::Clock;
 use crate::fake::{ProcScript, ScriptedRunner};
 use crate::limits::sample::{MemorySampler, ProcessRss};
+use crate::probes::{ProbeFailure, Prober};
 use crate::rpc::RpcContext;
 use crate::snapshot::FlockRegistry;
 use crate::supervisor::spawn_supervisor;
@@ -165,5 +172,90 @@ impl MemorySampler for ScriptedSampler {
         let call = self.calls.fetch_add(1, Ordering::Relaxed);
         let index = call.min(self.readings.len() - 1);
         self.readings[index].clone()
+    }
+}
+
+// WHY a scripted sequence rather than one fixed outcome: the liveness loop's
+// tests need pass/fail outcomes to change between polls — e.g. two failures
+// followed by a pass that resets the consecutive-failure counter — and a
+// `probe()` that always returns the same value cannot express that. Unlike
+// `ScriptedSampler`, an empty script is not a fixture bug: `harness` wires
+// one by default and Task 7's own dyn-compatibility line constructs one, so
+// `new(vec![])` has to mean something rather than panic. It means "never
+// fails" — the neutral value for a prober nobody scripted, exactly as an
+// empty `ScriptedSampler` table means "a machine with no visible processes."
+pub(crate) struct ScriptedProber {
+    script: Vec<Result<(), ProbeFailure>>,
+    calls: AtomicUsize,
+    delay: Duration,
+}
+
+impl ScriptedProber {
+    /// A prober that replays `script` in order, one outcome per
+    /// [`Prober::probe`] call, repeating the last outcome once the script is
+    /// exhausted. `script: vec![]` returns `Ok(())` forever.
+    pub(crate) fn new(script: Vec<Result<(), ProbeFailure>>) -> Self {
+        Self {
+            script,
+            calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// Every subsequent `probe()` call sleeps `delay` on the (paused) tokio
+    /// clock before returning its scripted outcome.
+    ///
+    /// Builder-style rather than a second constructor, so call sites built
+    /// around `new`'s signature — the four threshold cases and the
+    /// dyn-compatibility smoke test — stay untouched. The delay is honoured
+    /// even when it exceeds a `probe()` call's own `timeout` argument,
+    /// because this fake ignores that argument like every other one: the
+    /// point of a case that reaches for `with_delay` is a probe that passes
+    /// (or fails) *slowly*, not one that actually times out.
+    pub(crate) fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
+    /// How many times [`Prober::probe`] has been called.
+    pub(crate) fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl Prober for ScriptedProber {
+    fn probe<'a>(
+        &'a self,
+        _target: &'a ProbeTarget,
+        _timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProbeFailure>> + Send + 'a>> {
+        Box::pin(async move {
+            // Counted at call start, not at completion: a liveness loop that
+            // has ended (reported and returned) must never issue another
+            // call, and a count that only advanced once `with_delay`'s sleep
+            // finished would make "no further calls after N intervals"
+            // indistinguishable from "one more call currently in flight."
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(self.delay).await;
+            if self.script.is_empty() {
+                return Ok(());
+            }
+            let index = call.min(self.script.len() - 1);
+            self.script[index].clone()
+        })
+    }
+}
+
+/// Builds a `ProbeConfig` with fixture-friendly `interval`/`timeout`
+/// (production defaults: 10s/5s) and `failure_threshold` at its production
+/// default of 3. A call site that needs a different threshold overwrites the
+/// field directly via struct-update syntax.
+pub(crate) fn probe_config(kind: ProbeKind, target: &str) -> ProbeConfig {
+    ProbeConfig {
+        kind,
+        target: target.to_string(),
+        interval: UpDuration::from_millis(10_000),
+        timeout: UpDuration::from_millis(5_000),
+        failure_threshold: 3,
     }
 }

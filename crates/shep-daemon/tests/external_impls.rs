@@ -12,9 +12,15 @@
 //! file would drop the proof from the Windows CI leg — the leg most likely
 //! to break it.
 
+use core::future::Future;
+use core::pin::Pin;
+use core::time::Duration;
+
+use shep_core::config::ProbeTarget;
 use shep_core::values::MemSize;
 use shep_daemon::limits::LimitEnforcer;
 use shep_daemon::limits::sample::{MemorySampler, ProcessRss};
+use shep_daemon::probes::{ProbeFailure, Prober};
 
 /// An external crate's `MemorySampler`.
 struct ExternalSampler;
@@ -38,10 +44,25 @@ impl LimitEnforcer for ExternalEnforcer {
     }
 }
 
+/// An external crate's `Prober`.
+struct ExternalProber;
+
+impl Prober for ExternalProber {
+    fn probe<'a>(
+        &'a self,
+        _target: &'a ProbeTarget,
+        _timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProbeFailure>> + Send + 'a>> {
+        todo!()
+    }
+}
+
 #[test]
 fn external_types_satisfy_the_traits() {
     let sampler = ExternalSampler;
     let enforcer = ExternalEnforcer;
+    let prober = ExternalProber;
     let _: &dyn MemorySampler = &sampler;
     let _: &dyn LimitEnforcer = &enforcer;
+    let _: &dyn Prober = &prober;
 }
