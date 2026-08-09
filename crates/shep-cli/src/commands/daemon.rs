@@ -90,8 +90,9 @@ fn read_daemon_config_source(paths: &ShepPaths) -> Result<Option<String>, Daemon
 /// [`read_daemon_config_source`]) plus `SHEP_*` environment overrides, folds
 /// `args` in via [`boot_options`], then boots and serves. The re-exec'd
 /// child inherits a real environment on purpose (`launch::launch_command`
-/// deliberately does not `.env_clear()`), so `SHEP_LOG_JSON` and
-/// `SHEP_SOCKET` are read straight from `std::env::var`.
+/// deliberately does not `.env_clear()`), so `SHEP_LOG_JSON`,
+/// `SHEP_SOCKET`, and `SHEP_MAX_CRON_SLEEP` are read straight from
+/// `std::env::var`.
 ///
 /// # Errors
 /// - [`DaemonRunError::Config`] — `shep.toml` failed to parse, or a
