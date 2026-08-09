@@ -31,8 +31,8 @@
 //! - [`cron`]: the [`Clock`](cron::Clock) seam and the worker that restarts a
 //!   name-group on its `cron_restart` schedule
 //! - [`limits`]: the [`MemorySampler`](limits::sample::MemorySampler) seam
-//!   over a sheep's process tree; the polling enforcer that consumes it is a
-//!   later addition
+//!   over a sheep's process tree, and the polling enforcer that consumes it —
+//!   reports a breach once a sheep's tree exceeds its `max_memory`
 //! - [`probes`]: the [`Prober`](probes::Prober) seam and the liveness probe
 //!   loop — reports a sheep's health once `failure_threshold` consecutive
 //!   probes have failed; the concrete OS-backed prober is a later addition
