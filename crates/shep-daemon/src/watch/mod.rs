@@ -347,6 +347,7 @@ mod tests {
     use shep_core::config::{AppConfig, normalize};
     use shep_core::protocol::{BusEvent, ProcessEventKind, ProcessInfo};
     use shep_core::status::ProcStatus;
+    use shep_core::values::UpDuration;
 
     // ------------------------------------------------------------------
     // Step 1: `WatchFilter` and the root-relative boundary — pure, no
@@ -829,6 +830,293 @@ mod tests {
     //   directory; `source`'s own `dropping_the_source_stops_delivery`
     //   covers the guard's drop semantics directly, and the end-to-end
     //   watch scenario is what catches the leak itself.
+
+    // Boundary sweep (IR-40): a watch root that does not exist, seen from
+    // the arming entry point rather than from the seam.
+    // `source::tests::a_nonexistent_root_returns_a_watch_error_naming_the_path`
+    // already pins what `watch_tree` returns; what is unpinned is that
+    // `spawn_watch_group` PROPAGATES it — the failure mode being an arming
+    // path that swallows the error and hands back a live handle over a watch
+    // that was never registered, which would cost an app its watch silently.
+    // The subsystem's other two boundaries are already pinned above too — an
+    // empty `watch_options` by `empty_watch_options_matches_every_path`, and
+    // a glob with no matches by `a_pattern_matching_nothing_never_triggers`,
+    // which also settles that such a glob never triggers rather than
+    // erroring.
+    //
+    // fails if the arming swallows the failure, and fails if the root notify
+    // could not watch comes back as `Backend` (which carries no path, so an
+    // operator running several watched apps cannot tell which cwd went
+    // missing) or as `Watch` carrying some path other than the one it was
+    // handed. `unwrap_err` alone would pass against all three.
+    //
+    // IR-33: real time and a real notify backend, like every other case in
+    // this crate that constructs a watcher. Nothing here waits on an event,
+    // so the real clock costs nothing.
+    #[tokio::test]
+    async fn a_watch_root_that_does_not_exist_names_the_path_it_could_not_watch() {
+        let (handle, _rx, _dir) = spawn_test_fixture(vec![]);
+        // Inside a live tempdir so the parent exists and only the leaf does
+        // not: a root whose whole prefix is missing would leave "which
+        // component did notify object to" ambiguous.
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("no-such-directory");
+
+        let err = spawn_watch_group(
+            "web".to_string(),
+            missing.clone(),
+            WatchFilter::new(&[], &[]).unwrap(),
+            real_time::TEST_DELAY,
+            handle,
+        )
+        .unwrap_err();
+
+        let WatchError::Watch { path, reason } = err else {
+            panic!("a root that does not exist must report `Watch`, got {err:?}");
+        };
+        assert_eq!(path, missing, "`Watch` must carry the root it was handed");
+        assert!(!reason.is_empty(), "`Watch` must carry notify's own reason");
+    }
+
+    // ------------------------------------------------------------------
+    // The single-flight property (IR-37): the group loop against generated
+    // batch sequences and generated restart durations.
+    // ------------------------------------------------------------------
+
+    /// Most batches one generated case feeds the group.
+    const MAX_BATCHES: usize = 8;
+
+    /// Scripted procs one generated case may spawn.
+    ///
+    /// Sized against the maximum a BROKEN loop can demand, not a correct one:
+    /// the worst case is one restart per batch (a loop that never drains, so
+    /// nothing collapses), plus the initial start. An exhausted
+    /// `ScriptedRunner` answers `SpawnFailed("script exhausted")`, which the
+    /// actor reports as `Errored` and not `Restart` — so a pool sized to a
+    /// correct run would swallow exactly the extra restarts this property
+    /// exists to see.
+    const SINGLE_FLIGHT_SCRIPTS: usize = MAX_BATCHES + 4;
+
+    /// One generated debounced batch: whether its path triggers a restart,
+    /// and how long after the previous send it arrives.
+    #[derive(Debug, Clone, Copy)]
+    struct Batch {
+        triggers: bool,
+        gap: Duration,
+    }
+
+    fn gap_strategy() -> impl proptest::strategy::Strategy<Value = Duration> {
+        use proptest::strategy::Strategy as _; // `prop_map` below
+        // Zero is the case the property is really about — a send that lands
+        // while the previous restart is still in flight — so it is drawn
+        // half the time. The other two arms straddle the generated kill
+        // timeout's own 200..2000ms range, so batches also arrive partway
+        // through a ladder and well after one has finished.
+        proptest::prop_oneof![
+            4 => proptest::strategy::Just(Duration::ZERO),
+            3 => (1u64..2_000u64).prop_map(Duration::from_millis),
+            1 => (2_000u64..6_000u64).prop_map(Duration::from_millis),
+        ]
+    }
+
+    fn batch_strategy() -> impl proptest::strategy::Strategy<Value = Batch> {
+        use proptest::strategy::Strategy as _; // `prop_map` below
+        (proptest::bool::ANY, gap_strategy()).prop_map(|(triggers, gap)| Batch { triggers, gap })
+    }
+
+    /// When a correct group loop finishes each restart, given the instants
+    /// its batches arrive at and how long one restart takes.
+    ///
+    /// A model of the loop as written, and deliberately a strictly sequential
+    /// one: it holds no notion of two restarts overlapping, because the loop
+    /// it models has none. Every arrival already queued when the loop next
+    /// looks is folded into one check (`run_group`'s drain), and a restart
+    /// occupies the model for exactly `restart` from the moment that check
+    /// decided to run it.
+    fn expected_restart_instants(batches: &[Batch], restart: Duration) -> Vec<Duration> {
+        let mut arrivals = Vec::with_capacity(batches.len());
+        let mut at = Duration::ZERO;
+        for batch in batches {
+            at += batch.gap;
+            arrivals.push((at, batch.triggers));
+        }
+
+        let mut finished = Vec::new();
+        let mut idle_since = Duration::ZERO;
+        let mut i = 0;
+        while i < arrivals.len() {
+            // The loop is parked on `recv` and wakes at the first arrival it
+            // has not seen — or, if that already happened while it was busy,
+            // the moment it became free again.
+            let woke_at = arrivals[i].0.max(idle_since);
+            let mut triggers = arrivals[i].1;
+            i += 1;
+            // ...and drains everything else already queued at that instant.
+            while i < arrivals.len() && arrivals[i].0 <= woke_at {
+                triggers |= arrivals[i].1;
+                i += 1;
+            }
+            idle_since = if triggers {
+                let done = woke_at + restart;
+                finished.push(done);
+                done
+            } else {
+                woke_at
+            };
+        }
+        finished
+    }
+
+    proptest::proptest! {
+        // 64 rather than the supervisor proptest's 128: each case here boots
+        // a runtime, a supervisor and a group loop and walks virtual time
+        // across every generated gap, so a case costs more. `PROPTEST_CASES`
+        // still overrides it (IR-37) — see `testing::proptest_config`.
+        #![proptest_config(crate::testing::proptest_config(64))]
+
+        // The mechanism is `run_group`'s own ordering — the restart is
+        // awaited before the next `recv`, so single flight falls out of the
+        // shape rather than out of a flag — and this property checks that
+        // ordering against generated batch sequences and generated restart
+        // durations. It does not change the loop.
+        //
+        // A restart's duration is the generated `kill_timeout`, exactly,
+        // because every scripted proc here ignores its graceful signal and
+        // only `kill_tree` ends it: the ladder runs the full timeout every
+        // time. That is what turns "two restarts overlapped" into something
+        // observable from the bus alone — two restarts genuinely in flight at
+        // once finish less than `kill_timeout` apart.
+        //
+        // fails if a batch queued during an in-flight restart gets its own
+        // `recv`/restart cycle instead of being drained into the next check
+        // (too many restarts), if a batch is dropped (too few), or if the
+        // restart is spawned rather than awaited (restarts that finish closer
+        // together than one takes).
+        #[test]
+        fn a_watch_group_never_has_two_restarts_in_flight(
+            batches in proptest::collection::vec(batch_strategy(), 1..=MAX_BATCHES),
+            kill_timeout_ms in 200u64..2_000u64,
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            runtime.block_on(async move {
+                let kill_timeout = Duration::from_millis(kill_timeout_ms);
+                let (events, mut rx) = broadcast::channel(1024);
+                let runner =
+                    ScriptedRunner::new(vec![ProcScript::ignores_signals(); SINGLE_FLIGHT_SCRIPTS]);
+                let handle = spawn_supervisor(runner, test_paths(&dir), events);
+                let name = "web";
+                let mut app = AppConfig::minimal(name, "./srv");
+                app.kill_timeout = UpDuration::from_millis(kill_timeout_ms);
+                handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+                let root = PathBuf::from("/watched");
+                let (tx, group_rx) = mpsc::unbounded_channel();
+                let group = tokio::spawn(run_group(
+                    name.to_string(),
+                    matches_everything(root.clone()),
+                    group_rx,
+                    handle.clone(),
+                ));
+
+                let start = tokio::time::Instant::now();
+                // The bus is drained by its OWN task, started before the
+                // first send, because WHEN a restart landed is half of this
+                // property. A broadcast send wakes this task without moving
+                // the paused clock, so the instant it records is the instant
+                // the actor emitted — whereas a driver that reads the bus
+                // only after its own `sleep` would stamp every event with
+                // the end of that sleep instead. The window is a bounded
+                // `timeout` + `recv` (Global Constraints rule 11), re-armed
+                // on every event, so it expires on real silence rather than
+                // on a gap the generator chose; it comfortably exceeds the
+                // widest generated gap (6s) and kill timeout (2s), and stays
+                // far under a scripted proc's own 30-day deadline.
+                let watched = name.to_string();
+                let collector = tokio::spawn(async move {
+                    let mut observed = Vec::new();
+                    loop {
+                        match tokio::time::timeout(EVENT_WAIT, rx.recv()).await {
+                            Ok(Ok(BusEvent::Process {
+                                event: ProcessEventKind::Restart,
+                                info,
+                                ..
+                            })) if info.name == watched => {
+                                observed
+                                    .push((tokio::time::Instant::now() - start, info.restarts));
+                            }
+                            Ok(Ok(_)) => continue,
+                            // A claim about overlap cannot skip events: a
+                            // dropped one may be the very restart that
+                            // overlapped.
+                            Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                                return Err(skipped);
+                            }
+                            Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                            Err(_elapsed) => break, // the group has gone quiet
+                        }
+                    }
+                    Ok(observed)
+                });
+
+                for (i, batch) in batches.iter().enumerate() {
+                    if batch.gap > Duration::ZERO {
+                        tokio::time::sleep(batch.gap).await;
+                    }
+                    // `.git/` is in `DEFAULT_IGNORE_GLOBS`, so a non-
+                    // triggering batch is a real delivered path the filter
+                    // rejects rather than an empty send the loop would never
+                    // see.
+                    let path = if batch.triggers {
+                        root.join(format!("src/f{i}.rs"))
+                    } else {
+                        root.join(format!(".git/o{i}"))
+                    };
+                    tx.send(vec![path]).unwrap();
+                }
+
+                let observed = match collector.await.expect("collector task panicked") {
+                    Ok(observed) => observed,
+                    Err(skipped) => {
+                        return Err(proptest::test_runner::TestCaseError::fail(format!(
+                            "event stream lagged by {skipped}"
+                        )));
+                    }
+                };
+                group.abort();
+
+                // The invariant itself, read off the bus: consecutive
+                // restarts of one group are never closer together than one
+                // restart takes.
+                for pair in observed.windows(2) {
+                    proptest::prop_assert!(
+                        pair[1].0 - pair[0].0 >= kill_timeout,
+                        "two restarts of {} finished {:?} apart, less than the {:?} one takes: \
+                         they overlapped",
+                        name,
+                        pair[1].0 - pair[0].0,
+                        kill_timeout
+                    );
+                }
+
+                // ...and the same claim stated positively, against the
+                // sequential model: a loop that overlaps restarts, drops a
+                // batch, or gives each queued send its own cycle disagrees
+                // with it on when — and how many times — it restarted.
+                let expected = expected_restart_instants(&batches, kill_timeout);
+                let counted: Vec<u32> = (1..=expected.len() as u32).collect();
+                proptest::prop_assert_eq!(
+                    observed,
+                    expected.into_iter().zip(counted).collect::<Vec<_>>()
+                );
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
+    }
 
     // fails if the debouncer guard is dropped before the loop ever sees an
     // event: the watch dies inside `spawn_watch_group` and the touch below

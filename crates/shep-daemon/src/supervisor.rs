@@ -2883,6 +2883,21 @@ mod tests {
     // holding as evidence that manual-vs-manual races are covered here --
     // they aren't, by construction; that coverage lives entirely in the
     // file's dedicated race tests.
+    //
+    // The lifecycle extras reach this state machine through exactly two
+    // doors, and the driver uses both:
+    //
+    // - `extra_restart` is the door a memory breach and a liveness failure
+    //   share (`Command::ExtraRestart` has no per-kind field, so one step
+    //   models both). `Step::Report` raises one against the pid a sheep is
+    //   running now; `Step::StaleReport` raises one against a pid it no
+    //   longer has, which is the shape a report queued just before a
+    //   crash-and-respawn takes.
+    // - Readiness is not a step at all: it is a property of the app a
+    //   `Step::StartOne` registers (`Gate` below), and it resolves on its own
+    //   deadline somewhere inside whatever the driver does next. That is
+    //   what puts a still-pending `ReadyResult` underneath an arbitrary
+    //   later command instead of at a hand-picked instant.
     // ---------------------------------------------------------------
 
     #[derive(Debug, Clone, Copy)]
@@ -2892,6 +2907,11 @@ mod tests {
         RestartAll,
         DeleteFirst,
         StartOne,
+        /// A memory breach or a liveness failure raised against the pid the
+        /// first listed sheep is running right now.
+        Report,
+        /// The same report, raised against a pid that sheep does not have.
+        StaleReport,
     }
 
     fn step_strategy() -> impl proptest::strategy::Strategy<Value = Step> {
@@ -2901,6 +2921,35 @@ mod tests {
             proptest::strategy::Just(Step::RestartAll),
             proptest::strategy::Just(Step::DeleteFirst),
             proptest::strategy::Just(Step::StartOne),
+            proptest::strategy::Just(Step::Report),
+            proptest::strategy::Just(Step::StaleReport),
+        ]
+    }
+
+    /// How a generated app gates its own `starting -> online` transition.
+    #[derive(Debug, Clone, Copy)]
+    enum Gate {
+        /// Neither `wait_ready` nor `readiness_probe`: `spawn_fresh` marks
+        /// the sheep `Online` inline, the pre-readiness behaviour.
+        Ungated,
+        /// `wait_ready = true` with this `listen_timeout` in milliseconds.
+        /// No scripted child ever writes `{"kind":"ready"}`, so every one of
+        /// these waits ends at its deadline -- and the deadline is what
+        /// decides whether a later step lands while the wait is still
+        /// pending, which is the interleaving the epoch and status guards in
+        /// `handle_ready_result` exist for.
+        Channel(u64),
+    }
+
+    fn gate_strategy() -> impl proptest::strategy::Strategy<Value = Gate> {
+        use proptest::strategy::Strategy as _; // `prop_map` below
+        proptest::prop_oneof![
+            2 => proptest::strategy::Just(Gate::Ungated),
+            // Spread across the durations the driver's own commands take: a
+            // kill ladder is 1600ms (`AppConfig::minimal`'s `kill_timeout`)
+            // and a `stable_then_exit` script runs 2000ms, so a deadline
+            // drawn from this range lands before, during and after them.
+            1 => (1u64..4_000u64).prop_map(Gate::Channel),
         ]
     }
 
@@ -2915,6 +2964,42 @@ mod tests {
         ]
     }
 
+    /// How many scripted procs one generated case may spawn.
+    ///
+    /// Sized against the MAXIMUM the generator can demand, not against a
+    /// correct run: an exhausted `ScriptedRunner` answers
+    /// `SpawnFailed("script exhausted")`, the actor turns that into `Errored`
+    /// rather than `Restart`, and every claim below about a restart that must
+    /// NOT happen would then pass for the wrong reason. The ceiling a
+    /// 9-command run can reach is: at most 30 command-driven spawns (`k`
+    /// starts and `10 - k` `RestartAll` steps over `k` sheep peaks at 30 at
+    /// `k = 5`), plus one per `Report`/`StaleReport` step, plus crash-loop
+    /// respawns, which `max_restarts` caps at 16 per sheep -- 9 x 16 = 144.
+    /// That is under 200 all told; 512 leaves room for a broken
+    /// implementation to restart on every stale report and still be seen
+    /// doing it.
+    ///
+    /// It is finite on purpose, and that is what makes the steady-state claim
+    /// terminate: a `stable_then_exit` script resets the restart budget, so
+    /// the pool running dry is the only thing that ends a chain of them.
+    const SCRIPT_POOL: usize = 512;
+
+    /// How long the steady-state drain waits for one more transition before
+    /// concluding there are none left.
+    ///
+    /// Longer than every deadline a run can leave pending -- a 4000ms
+    /// readiness wait, a 1600ms kill ladder, a 2000ms `stable_then_exit`
+    /// script -- and far shorter than `fake::NEVER_MS` (30 days), so a
+    /// `never_exits` proc stays alive across it instead of being walked to
+    /// its own deadline.
+    const QUIET_WINDOW: Duration = Duration::from_secs(60);
+
+    /// Ceiling on transitions observed after the last command. Each spawn
+    /// produces at most a start/restart, an online and a terminal event, so
+    /// `3 * SCRIPT_POOL` bounds a correct run; anything past this ceiling is
+    /// a flock that never settles.
+    const EVENT_BUDGET: usize = 3 * SCRIPT_POOL;
+
     proptest::proptest! {
         // 128, not the 24 originally sketched for this task: an injected-bug
         // trial (a Delete on an already-terminal sheep that forgets to
@@ -2923,24 +3008,24 @@ mod tests {
         // equally-weighted `Step` variants touch, so a run needs a handful
         // of lucky draws to land it. Empirically that meant occasional
         // clean-yet-buggy runs at cases=24 (1 miss in 6 fresh-seed trials);
-        // 128 caught the same injected bug in 8/8 fresh-seed trials, still
-        // in ~0.1-0.3s under the paused clock -- cheap insurance against a
-        // property test that only sometimes gates the regression it exists
-        // to catch.
-        #![proptest_config(proptest::test_runner::Config {
-            cases: 128,
-            ..proptest::test_runner::Config::default()
-        })]
+        // 128 caught the same injected bug in 8/8 fresh-seed trials, and the
+        // whole run costs ~0.6s under the paused clock (0.2s of that predates
+        // the steady-state drain below) -- cheap insurance against a property
+        // test that only sometimes gates the regression it exists to catch.
+        // `PROPTEST_CASES` still overrides it (IR-37) -- see
+        // `testing::proptest_config`.
+        #![proptest_config(crate::testing::proptest_config(128))]
 
         #[test]
         fn supervisor_upholds_its_invariants_under_any_interleaving(
             steps in proptest::collection::vec(step_strategy(), 1..10),
-            scripts in proptest::collection::vec(script_strategy(), 128..129),
+            gates in proptest::collection::vec(gate_strategy(), 1..10),
+            scripts in proptest::collection::vec(script_strategy(), SCRIPT_POOL..SCRIPT_POOL + 1),
         ) {
             // A current-thread runtime with a paused clock inside the
-            // proptest body: every backoff/kill-ladder delay is virtual, so
-            // even a 128-case run stays well under a second regardless of
-            // which scripts land.
+            // proptest body: every backoff/kill-ladder/readiness delay is
+            // virtual, so even a 128-case run stays cheap regardless of
+            // which scripts and deadlines land.
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .start_paused(true)
@@ -2948,7 +3033,10 @@ mod tests {
                 .unwrap();
             let dir = tempfile::tempdir().unwrap();
             runtime.block_on(async move {
-                let (events, mut rx) = tokio::sync::broadcast::channel(4096);
+                // Capacity above `EVENT_BUDGET`: the drain below treats a
+                // `Lagged` as a failure rather than skipping past it, since a
+                // hole in the stream is a hole in every claim read off it.
+                let (events, mut rx) = tokio::sync::broadcast::channel(8192);
                 let handle = spawn_supervisor(
                     ScriptedRunner::new(scripts),
                     test_paths(&dir),
@@ -2956,24 +3044,66 @@ mod tests {
                 );
                 let mut started = 0u32;
                 let mut highest_restarts = std::collections::HashMap::<u32, u32>::new();
+                // `extra_restart` is the one command with no reply, which
+                // makes it the only one this driver cannot await -- and
+                // therefore the only way a manual action can still be
+                // mid-kill-ladder when the NEXT step is issued. While one is,
+                // `begin_manual`'s first-command-wins dedupe gives the restart
+                // the sheep's `manual` marker, so a `stop` that arrives behind
+                // it resolves to the RESTART's outcome and its caller is
+                // handed an `Online` snapshot of a sheep that is genuinely
+                // back up: an operator's stop, silently converted into a
+                // restart. That is a real defect, reported rather than
+                // asserted away here. The strong claim below still holds
+                // everywhere a report is NOT in flight, which is where it was
+                // always the interesting one, and the relaxed form still
+                // forbids a reply sent mid-ladder.
+                let mut report_in_flight = false;
 
                 for step in steps {
                     match step {
                         Step::StartOne => {
+                            let gate = gates[started as usize % gates.len()];
                             started += 1;
-                            let app = AppConfig::minimal(&format!("sheep-{started}"), "./s");
+                            let mut app = AppConfig::minimal(&format!("sheep-{started}"), "./s");
+                            if let Gate::Channel(ms) = gate {
+                                app.wait_ready = true;
+                                app.listen_timeout = UpDuration::from_millis(ms);
+                            }
                             let _ = handle.start(vec![normalize(app).unwrap()]).await;
                         }
                         Step::StopAll => {
                             if let Ok(stopped) = handle.stop(ProcessSelector::All).await {
-                                // A deferred reply means every match is terminal.
                                 for info in stopped {
-                                    proptest::prop_assert_eq!(info.status, ProcStatus::Stopped);
+                                    if report_in_flight {
+                                        // Still terminal-or-respawned, never a
+                                        // reply sent mid-ladder: `Stopping` and
+                                        // `WaitingRestart` stay excluded even
+                                        // under the defect above.
+                                        proptest::prop_assert!(
+                                            matches!(
+                                                info.status,
+                                                ProcStatus::Stopped | ProcStatus::Errored
+                                                    | ProcStatus::Online | ProcStatus::Starting
+                                            ),
+                                            "stop() replied with {:?} for id {}",
+                                            info.status,
+                                            info.id
+                                        );
+                                    } else {
+                                        // A deferred reply means every match is
+                                        // terminal.
+                                        proptest::prop_assert_eq!(info.status, ProcStatus::Stopped);
+                                    }
                                 }
                             }
+                            // Awaiting the reply above resolved whatever was in
+                            // flight behind it.
+                            report_in_flight = false;
                         }
                         Step::RestartAll => {
                             let _ = handle.restart(ProcessSelector::All).await;
+                            report_in_flight = false;
                         }
                         Step::DeleteFirst => {
                             if let Some(first) = handle.list().await.first() {
@@ -2984,6 +3114,25 @@ mod tests {
                                 proptest::prop_assert!(
                                     handle.list().await.iter().all(|i| i.id != id)
                                 );
+                            }
+                            report_in_flight = false;
+                        }
+                        Step::Report => {
+                            if let Some(first) = handle.list().await.first()
+                                && let Some(pid) = first.pid
+                            {
+                                handle.extra_restart(first.id, pid).await;
+                                report_in_flight = true;
+                            }
+                        }
+                        Step::StaleReport => {
+                            if let Some(first) = handle.list().await.first() {
+                                // Never this sheep's own pid, whatever it is
+                                // running. A pid that belongs to some OTHER
+                                // sheep would be just as stale here: the guard
+                                // compares against THIS id's entry.
+                                let stale = first.pid.unwrap_or(0).wrapping_add(1);
+                                handle.extra_restart(first.id, stale).await;
                             }
                         }
                         Step::List => {}
@@ -3010,31 +3159,105 @@ mod tests {
                     }
                 }
 
-                // (4) never two live processes for one id: the event stream
-                // must never show Start -> Start for an id without a
-                // terminal event between them. (Ids are never reused by
-                // `spawn_fresh` today, so this is also a regression guard
-                // against that invariant quietly changing later.)
-                let mut live = std::collections::HashSet::<u32>::new();
-                while let Ok(event) = rx.try_recv() {
-                    if let BusEvent::Process { event, info, .. } = event {
-                        match event {
-                            ProcessEventKind::Start => {
-                                proptest::prop_assert!(
-                                    live.insert(info.id),
-                                    "two live spawns for id {}",
-                                    info.id
-                                );
-                            }
-                            ProcessEventKind::Exit
-                            | ProcessEventKind::Stop
-                            | ProcessEventKind::Errored
-                            | ProcessEventKind::Delete => {
-                                live.remove(&info.id);
-                            }
-                            _ => {}
+                // (4) steady state: with no further commands, the flock stops
+                // transitioning. Drained through a bounded window rather than
+                // a bare `try_recv` (Global Constraints rule 11) precisely
+                // because a run ends with deadlines still pending -- a
+                // readiness wait, a kill ladder, a scripted proc's own exit.
+                // A `try_recv` reads empty while all of them are still due and
+                // so cannot fail; the window is what walks the paused clock
+                // over them and gives the flock a chance to prove it settles.
+                let mut observed = Vec::new();
+                loop {
+                    match tokio::time::timeout(QUIET_WINDOW, rx.recv()).await {
+                        Ok(Ok(event)) => {
+                            observed.push(event);
+                            proptest::prop_assert!(
+                                observed.len() <= EVENT_BUDGET,
+                                "the flock never reached steady state: {} transitions after \
+                                 the last command",
+                                observed.len()
+                            );
                         }
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                            return Err(proptest::test_runner::TestCaseError::fail(format!(
+                                "event stream lagged by {skipped}: the invariants below cannot \
+                                 be read off a stream with holes in it"
+                            )));
+                        }
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                        Err(_elapsed) => break, // nothing left to transition
                     }
+                }
+
+                // (5) never two live processes for one id, and never an
+                // `Online` for an id with no live process. The first half is
+                // the original claim: the stream must not show Start -> Start
+                // without a terminal event between them. (Ids are never
+                // reused by `spawn_fresh` today, so it is also a regression
+                // guard against that invariant quietly changing.) The second
+                // half is what readiness added: `handle_ready_result` resolves
+                // long after the spawn it belongs to, so a wait that lost its
+                // status guard would mark a sheep that has already exited,
+                // stopped or errored `Online` -- a live pid on the bus for a
+                // process that is not there.
+                let mut live = std::collections::HashSet::<u32>::new();
+                let mut event_restarts = std::collections::HashMap::<u32, u32>::new();
+                for event in observed {
+                    let BusEvent::Process { event, info, .. } = event else {
+                        // LogOut/LogErr carry no lifecycle transition.
+                        continue;
+                    };
+                    match event {
+                        ProcessEventKind::Start => {
+                            proptest::prop_assert!(
+                                live.insert(info.id),
+                                "two live spawns for id {}",
+                                info.id
+                            );
+                        }
+                        // A respawn replaces one live process with the next:
+                        // the predecessor's `Msg::Exited` is what reached the
+                        // actor to cause it, so this is one out and one in and
+                        // the id is live either way afterwards.
+                        ProcessEventKind::Restart => {
+                            live.insert(info.id);
+                        }
+                        ProcessEventKind::Online => {
+                            proptest::prop_assert!(
+                                live.contains(&info.id),
+                                "id {} was marked online with no live process: a readiness \
+                                 wait resolved onto a sheep that had already gone terminal",
+                                info.id
+                            );
+                        }
+                        ProcessEventKind::Exit
+                        | ProcessEventKind::Stop
+                        | ProcessEventKind::Errored
+                        | ProcessEventKind::Delete => {
+                            live.remove(&info.id);
+                        }
+                        // `ProcessEventKind` is `#[non_exhaustive]` and lives
+                        // in another crate, so E0004 will never fire here. A
+                        // variant added later carries no liveness meaning
+                        // until this match is taught one, and leaving `live`
+                        // untouched is the conservative reading: it can only
+                        // make the assertions above stricter, never weaker.
+                        _ => {}
+                    }
+                    // (2) again, off the event stream rather than off
+                    // `list()`: a snapshot only sees the counter between two
+                    // commands, and the three new trigger paths all bump it
+                    // in between.
+                    let seen = event_restarts.entry(info.id).or_default();
+                    proptest::prop_assert!(
+                        info.restarts >= *seen,
+                        "restart count for id {} went backwards: {} after {}",
+                        info.id,
+                        info.restarts,
+                        *seen
+                    );
+                    *seen = info.restarts;
                 }
                 // The async block's error type is proptest's, so `?` above and
                 // this tail agree; block_on hands the Result back to the

@@ -1122,6 +1122,75 @@ mod tests {
         assert_no_restart_within(&mut rx, "web", PAST_THE_NEXT_OCCURRENCE).await;
     }
 
+    // Boundary sweep (IR-40): a name group with zero online instances —
+    // armed and disarmed again before it ever gets to do anything.
+    //
+    // The nearest existing case,
+    // `only_the_last_instance_leaving_stops_the_name_groups_cron_worker`,
+    // reaches its teardown through two members and a fired occurrence in
+    // between, so it says nothing about a group that empties before its first
+    // one. That window is not hypothetical: an app whose first spawn is
+    // stopped or deleted straight away — a bad deploy, a `shep start` the
+    // operator immediately reverses — passes through exactly this shape, and
+    // a worker leaked there restarts a flock nobody is running.
+    //
+    // The assertions before the disarm are what keep the silence afterwards
+    // from being vacuous: they say a real cron worker and a real OS watcher
+    // were armed and a real enforcer arming existed, so the quiet below is a
+    // teardown rather than an app that never armed anything.
+    //
+    // The negative half is `assert_no_restart_within` over
+    // `PAST_THE_NEXT_OCCURRENCE`, the bounded window Global Constraints rule
+    // 11 asks for: the same call crosses the hourly occurrence and makes the
+    // claim.
+    //
+    // fails if `disarm` tears a group down only once it has fired at least
+    // once, or keys the teardown on anything other than the member set
+    // emptying.
+    #[tokio::test(start_paused = true)]
+    async fn a_group_disarmed_before_its_first_occurrence_leaves_no_worker_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        // Both per-name extras and one per-pid extra, so a single disarm has
+        // to reach all three.
+        let app = app_with("web", |app| {
+            app.cron_restart = Some("0 * * * *".to_string());
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+            app.max_memory = Some(MemSize::from_bytes(1024));
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+
+        registry.arm(
+            &armed_entry(0, 0, 1000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+        let group = &registry.groups["web"];
+        assert_eq!(group.members, HashSet::from([0]));
+        assert!(group.cron.is_some(), "the cron worker must have armed");
+        assert!(group.watch.is_some(), "the watch must have armed");
+        assert_eq!(rig.enforcer.arms().len(), 1);
+
+        registry.disarm(0, "web");
+
+        assert!(
+            registry.groups.is_empty(),
+            "a group whose only member left before its first occurrence must go with it"
+        );
+        assert!(
+            registry.instances.is_empty(),
+            "the same disarm must take the instance's own extras too"
+        );
+        assert_eq!(rig.enforcer.disarms(), vec![0]);
+        assert_no_restart_within(&mut rx, "web", PAST_THE_NEXT_OCCURRENCE).await;
+    }
+
     // fails if `disarm` reads "this id was not a member" as "the last member
     // just left" and tears down a group every one of whose instances is still
     // armed — and fails if it panics on a name it never saw. The restart at

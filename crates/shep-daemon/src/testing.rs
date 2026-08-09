@@ -61,6 +61,28 @@ pub(crate) fn test_paths(dir: &tempfile::TempDir) -> ShepPaths {
     )
 }
 
+/// A proptest configuration running `local_cases` by default, and whatever
+/// `PROPTEST_CASES` names when the environment sets it (IR-37: "case count
+/// capped in CI via env").
+///
+/// `Config::default()` already reads `PROPTEST_CASES`, but a struct-update
+/// literal that then writes `cases:` overwrites whatever it read — which is
+/// how a proptest whose case count is tuned in source quietly stops being
+/// capped from outside. Deferring to the default whenever the variable is set
+/// is what keeps both true: a source-tuned count locally, an environment-set
+/// ceiling in CI.
+pub(crate) fn proptest_config(local_cases: u32) -> proptest::test_runner::Config {
+    let default = proptest::test_runner::Config::default();
+    if std::env::var_os("PROPTEST_CASES").is_some() {
+        default
+    } else {
+        proptest::test_runner::Config {
+            cases: local_cases,
+            ..default
+        }
+    }
+}
+
 /// Creates `root.join(rel)`, making its parent directories first, and writes
 /// one byte so the file actually exists on disk. Returns the absolute path
 /// written.

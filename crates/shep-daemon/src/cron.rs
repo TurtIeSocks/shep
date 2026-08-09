@@ -440,6 +440,67 @@ mod tests {
         assert_no_restart_within(&mut rx, name, Duration::from_secs(10)).await;
     }
 
+    // Boundary sweep (IR-40): the one pattern whose next occurrence lands
+    // exactly on `DEFAULT_MAX_CRON_SLEEP`. Five fields cannot express seconds
+    // at all, so per-minute is the tightest granularity the dialect has — and
+    // it is also the interesting one, because 60s is the default sleep cap:
+    // the clamp and the true next occurrence coincide, which is the only
+    // place an off-by-one in either can show. Built with the default rather
+    // than a custom `max_sleep` so the coincidence is real. The subsystem's
+    // other boundary, a pattern with no further occurrence, is already pinned
+    // by `exhausted_pattern_ends_the_task_without_restarting` above.
+    //
+    // The middle assertion is the at-most-one-catch-up claim, and it takes
+    // the bounded-window form Global Constraints rule 11 asks for: the window
+    // both crosses the span where a second firing would land and makes the
+    // claim, and it is deliberately sized to stop a hair before 00:02:00 —
+    // the occurrence that legitimately follows — because a window that
+    // outran it would auto-advance straight into a real restart and turn a
+    // pass into a confusing failure.
+    //
+    // fails if the re-check is `>` rather than `>=`: a wake landing exactly
+    // on its occurrence would then decline to fire and re-derive the next
+    // one, and the schedule would go quiet forever. And fails if
+    // `next_after` were to become inclusive of `now`, which at this boundary
+    // makes the post-restart iteration re-derive the SAME occurrence, sleep
+    // zero and fire again immediately.
+    #[tokio::test(start_paused = true)]
+    async fn a_per_minute_pattern_fires_once_on_the_max_sleep_boundary() {
+        let (handle, mut rx, _dir) = spawn_test_fixture();
+        let name = "web";
+        start_named(&handle, name).await;
+        let clock = Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z")));
+        let schedule = CronSchedule::parse("* * * * *", None).unwrap();
+        // Captured before the worker so the offsets below read as wall-clock
+        // times: `TestClock` maps `epoch + (Instant::now() - started)`, so an
+        // elapsed 60s here is exactly "the clock now says 00:01:00".
+        let start = tokio::time::Instant::now();
+        let worker =
+            spawn_worker_and_settle(name, schedule, clock, &handle, DEFAULT_MAX_CRON_SLEEP).await;
+
+        // A hair short of the boundary: nothing may fire early.
+        assert_no_restart_within(&mut rx, name, Duration::from_millis(59_999)).await;
+        let first = expect_restart(&mut rx, name).await;
+        assert_eq!(first.restarts, 1);
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            Duration::from_secs(60),
+            "the occurrence and the sleep cap coincide here, so the restart belongs at \
+             exactly 00:01:00 -- neither dropped nor early"
+        );
+
+        // ...and exactly once: the window ends a hair before 00:02:00.
+        assert_no_restart_within(&mut rx, name, Duration::from_millis(59_999)).await;
+        let second = expect_restart(&mut rx, name).await;
+        assert_eq!(second.restarts, 2);
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            Duration::from_secs(120),
+            "the schedule must survive its own boundary and fire the next occurrence too"
+        );
+        worker.abort();
+    }
+
     // fails if `max_sleep` is ignored in favor of `DEFAULT_MAX_CRON_SLEEP`
     // (60s): that path wakes 60 times over the hour and reads the clock at
     // least 120 times (2 reads/iteration), well past this bound. A 10-minute

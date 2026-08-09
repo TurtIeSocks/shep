@@ -468,6 +468,58 @@ mod tests {
         );
     }
 
+    // Boundary sweep (IR-40): a `timeout` larger than the `interval`. This
+    // subsystem's other two boundaries are already pinned above —
+    // `failure_threshold = 1` by `threshold_of_one_reports_after_a_single_failure`,
+    // and a zero `interval` by the case below, which also records the
+    // decision taken there: a zero interval is FLOORED here and separately
+    // REJECTED by `shep-core`'s `normalize` (`NormalizeError::ZeroInterval`),
+    // never trusted as written.
+    //
+    // fails if the loop clamps `timeout` down to `interval` before handing it
+    // to `Prober::probe` — the shape that quietly turns "give this probe five
+    // seconds" into "give it two" for any app whose probe is slower than its
+    // own polling period. And fails if a probe outlasting its interval makes
+    // the loop fire the next one early: on a `tokio::time::interval` grid a
+    // 5s probe with a 2s period leaves ticks overdue and bursts them
+    // back-to-back, reaching the threshold at 10s rather than the 21s a
+    // sleep-after-completion loop takes.
+    #[tokio::test(start_paused = true)]
+    async fn a_timeout_longer_than_the_interval_is_honoured_and_paces_the_next_probe() {
+        let config = ProbeConfig {
+            interval: shep_core::values::UpDuration::from_millis(2_000),
+            timeout: shep_core::values::UpDuration::from_millis(5_000),
+            ..config_with_threshold(3)
+        };
+        let interval = config.interval.as_duration();
+        let timeout = config.timeout.as_duration();
+        // A probe that takes its whole timeout to answer is what makes the
+        // ordering visible: one cycle then costs `interval + timeout`, a
+        // number neither duration produces on its own.
+        let prober =
+            Arc::new(ScriptedProber::new(vec![Err(ProbeFailure::Timeout)]).with_delay(timeout));
+        let (tx, mut rx) = mpsc::channel(8);
+        let start = tokio::time::Instant::now();
+        let _handle =
+            spawn_and_settle(9, 900, config, Arc::clone(&prober) as Arc<dyn Prober>, tx).await;
+
+        let failure = expect_failure(&mut rx, 9).await;
+
+        assert_eq!(failure, LivenessFailure { id: 9, pid: 900 });
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            (interval + timeout) * 3,
+            "three probes that each sleep `interval` and then run for `timeout` must report \
+             at 3 x (interval + timeout)"
+        );
+        assert_eq!(
+            prober.last_timeout(),
+            timeout,
+            "the loop must pass config.timeout unclamped, even where it exceeds interval"
+        );
+        assert_eq!(prober.calls(), 3);
+    }
+
     // fails if a zero (or otherwise sub-floor) `interval` is trusted instead
     // of clamped to `MIN_PROBE_INTERVAL`: an unclamped `Duration::ZERO`
     // would spin the loop as fast as the runtime allows — measured live at

@@ -461,6 +461,73 @@ mod tests {
         assert_eq!(breach.observed.bytes(), 501);
     }
 
+    // Boundary sweep (IR-40): a `max_memory` below any reading a real process
+    // can produce, so the very first sample already breaches.
+    //
+    // fails if the enforcer needs more than one reading before it can decide
+    // — a two-sample delta, or a first tick that only primes a baseline —
+    // which would leave a sheep already far over its ceiling running for a
+    // second full `MEMORY_POLL_INTERVAL` before anything noticed. A bare
+    // "a breach arrived" assertion cannot see that: the reading repeats, so
+    // the breach still arrives, just a tick late. Pinning the instant is what
+    // makes the difference observable.
+    #[tokio::test(start_paused = true)]
+    async fn a_limit_below_any_plausible_reading_breaches_on_the_very_first_tick() {
+        // One page. No process this sampler could ever describe sits under
+        // it, which is the point of the boundary.
+        let limit = MemSize::from_bytes(1);
+        let sampler = Arc::new(ScriptedSampler::new(vec![vec![rss(1, None, 4096)]]));
+        let (tx, mut rx) = mpsc::channel(8);
+        let enforcer = start_and_settle(Arc::clone(&sampler) as Arc<dyn MemorySampler>, tx).await;
+        enforcer.arm(11, 1, limit);
+
+        let start = tokio::time::Instant::now();
+        let breach = expect_breach(&mut rx, 11).await;
+
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            MEMORY_POLL_INTERVAL,
+            "a tree already over its ceiling must breach on the first tick, not the second"
+        );
+        assert_eq!(breach.observed.bytes(), 4096);
+        assert_eq!(breach.limit, limit);
+        assert_eq!(sampler.calls(), 1, "one tick, one sample");
+    }
+
+    // Boundary sweep (IR-40): a `max_memory` exactly equal to the observed
+    // TREE, which is a different claim from
+    // `exactly_at_the_limit_does_not_breach_but_one_byte_over_does` above —
+    // that one puts a single process on the boundary, this one puts a root
+    // and its lamb there together, so the equality is reached through
+    // `tree_rss` rather than off one reading.
+    //
+    // The negative half is `assert_no_breach_within`, the bounded window
+    // Global Constraints rule 11 asks for and this module's own helper: it
+    // both crosses the three ticks and makes the claim, where an `advance`
+    // plus `try_recv` would read empty whatever the comparison did. The
+    // sample count is the control that keeps it from passing vacuously — it
+    // is what says the ticks really happened.
+    //
+    // fails if the comparison is `>=` rather than `>`: a tree exactly at its
+    // ceiling has not exceeded it, and an app sized to sit right on its
+    // `max_memory` would otherwise be restarted every 15 seconds forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_tree_summing_to_exactly_the_limit_does_not_breach() {
+        // The root alone is well under; root + lamb lands exactly on it.
+        let table = vec![rss(10, None, 300), rss(11, Some(10), 200)];
+        let sampler = Arc::new(ScriptedSampler::new(vec![table]));
+        let (tx, mut rx) = mpsc::channel(8);
+        let enforcer = start_and_settle(Arc::clone(&sampler) as Arc<dyn MemorySampler>, tx).await;
+        enforcer.arm(12, 10, MemSize::from_bytes(500));
+
+        assert_no_breach_within(&mut rx, ticks(3)).await;
+        assert_eq!(
+            sampler.calls(),
+            3,
+            "expected exactly one sample() call per elapsed tick"
+        );
+    }
+
     // Spec §14.2 fixes this at 15s. `ticks()` above and the `Instant`
     // assertion in `breach_arrives_on_exactly_the_third_tick` are both
     // expressed as `MEMORY_POLL_INTERVAL * n`, so neither derives an
