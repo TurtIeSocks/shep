@@ -379,12 +379,18 @@ struct SheepSlot {
     /// drops one whose epoch no longer matches — a stale timer left behind
     /// by a respawn (manual or automatic) that happened in the meantime.
     epoch: u64,
-    /// The waiting readiness task's signal sender for the CURRENT epoch,
-    /// `Some` only while one is waiting on this slot's shepherd-channel
-    /// ready signal. `Msg::Ready`'s handler takes it to wake the task;
-    /// `None` means either no readiness task was ever armed (an app with
-    /// neither `wait_ready` nor `readiness_probe` set) or its wait already
-    /// resolved.
+    /// The readiness task's signal sender for the CURRENT epoch.
+    /// `Msg::Ready`'s handler takes it to wake the task.
+    ///
+    /// `None` means one of two things, and deliberately not a third: no
+    /// readiness task was ever armed (an app with neither `wait_ready` nor
+    /// `readiness_probe` set), or a channel `Ready` already took the sender
+    /// to wake one. A wait that resolved some OTHER way — a probe that
+    /// passed, a deadline that elapsed — leaves its sender sitting here,
+    /// because `handle_ready_result` has no business reaching into a slot a
+    /// respawn may already have re-armed. Nothing goes wrong: a `Msg::Ready`
+    /// arriving late takes a sender whose receiver is gone, and the send
+    /// simply fails, which is the same silent drop an unarmed slot gets.
     ready_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -1132,10 +1138,10 @@ impl<R: ProcessRunner> Actor<R> {
     }
 
     /// Forwards the shepherd channel's readiness signal to the waiting
-    /// readiness task for `id`, if one is waiting. A `Ready` for a slot with
-    /// no waiting sender (no readiness task armed, or its wait already
-    /// resolved) is dropped silently — an app is free to write
-    /// `{"kind":"ready"}` whenever it likes, including twice.
+    /// readiness task for `id`, if one is waiting. A `Ready` that finds no
+    /// live wait — no sender at all, or a stale one whose task is already
+    /// gone (see [`SheepSlot::ready_tx`]) — is dropped silently: an app is
+    /// free to write `{"kind":"ready"}` whenever it likes, including twice.
     fn handle_ready_signal(&mut self, id: u32) {
         let Some(slot) = self.sheep.get_mut(&id) else {
             return;
