@@ -269,7 +269,8 @@ impl PidfileLock {
 
     /// Overwrites the locked pidfile's content with `pid`, in place —
     /// truncate then write at offset 0, never a temp-file-plus-`rename`
-    /// (contrast [`write_pidfile`]): renaming a fresh inode over this path
+    /// (contrast `write_pidfile`, this module's test-only helper): renaming
+    /// a fresh inode over this path
     /// would swap in a file nothing has locked, silently ending this
     /// type's whole reason to exist for as long as the daemon keeps
     /// running afterward. A `flock` lock lives on the OPEN FILE
