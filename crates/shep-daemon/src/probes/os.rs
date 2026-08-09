@@ -46,6 +46,11 @@ use super::{ProbeFailure, Prober};
 /// comes close to it.
 const HTTP_STATUS_LINE_CAP: u64 = 8 * 1024;
 
+/// The port RFC 7230 §5.4 lets a `Host:` header leave out. `ProbeTarget`
+/// already defaults a portless `http://` target to this, so a header built
+/// from one carries no port either way.
+const HTTP_DEFAULT_PORT: u16 = 80;
+
 /// `Prober` over real sockets and real processes.
 pub struct OsProber {
     /// Working directory for exec probes — `None` inherits the daemon's own,
@@ -252,12 +257,12 @@ async fn http_roundtrip(host: &str, port: u16, path: &str) -> Result<(), ProbeFa
     // `SocketAddr`: `ProbeTarget` strips brackets from a bracketed IPv6
     // literal at parse time, and a bracket-stripped host is exactly what
     // this tuple form needs — it fails as a formatted string, which has no
-    // brackets left to make it parseable (Task 2's obligation).
+    // brackets left to make it parseable.
     let mut stream = TcpStream::connect((host, port))
         .await
         .map_err(|err| ProbeFailure::Transport(err.to_string()))?;
 
-    let header_host = bracket_ipv6(host);
+    let header_host = host_header(host, port);
     let request =
         format!("GET {path} HTTP/1.1\r\nHost: {header_host}\r\nConnection: close\r\n\r\n");
     stream
@@ -269,16 +274,32 @@ async fn http_roundtrip(host: &str, port: u16, path: &str) -> Result<(), ProbeFa
     evaluate_status_line(&status_line)
 }
 
-/// Re-brackets an IPv6 host for the RFC 7230 `Host:` header. `ProbeTarget`
-/// strips the brackets off `[::1]` at parse time so `TcpStream::connect` can
-/// use `(host, port)` directly (Task 2's obligation); the header needs them
-/// back, or `Host: ::1` reads as colon-separated fields instead of one
-/// address.
-fn bracket_ipv6(host: &str) -> String {
-    if host.contains(':') {
+/// Builds the RFC 7230 `Host:` header value for a target.
+///
+/// Two things happen here, and both matter on the wire.
+///
+/// The brackets come back. `ProbeTarget` strips them off `[::1]` at parse
+/// time so `TcpStream::connect` can take `(host, port)` directly — a
+/// formatted `"{host}:{port}"` does not parse as a socket address for IPv6 —
+/// but `Host: ::1` reads as colon-separated fields rather than one address,
+/// so the header needs them again.
+///
+/// The port comes with it, unless it is the scheme default. RFC 7230 §5.4
+/// gives `Host = uri-host [ ":" port ]`, and omitting a non-default port is
+/// not cosmetic: a name-based virtual host serving several ports routes on
+/// this header alone, so `Host: example.com` for a probe of
+/// `http://example.com:8080/health` can be answered by an entirely different
+/// application than the one under test.
+fn host_header(host: &str, port: u16) -> String {
+    let host = if host.contains(':') {
         format!("[{host}]")
     } else {
         host.to_string()
+    };
+    if port == HTTP_DEFAULT_PORT {
+        host
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -454,9 +475,10 @@ mod tests {
     // has already stopped reading) or sent no request at all passed every
     // other test in this module.
     //
-    // The `Host:` header carries no `:port` because the spec's request
-    // template is `Host: {host}`. That is a deliberate pin, not an accident
-    // of writing the test after the code.
+    // The `Host:` header carries the port whenever it is not 80, per RFC
+    // 7230 §5.4. A name-based virtual host serving several ports routes on
+    // this header alone, so dropping the port can hand the probe to an
+    // entirely different application than the one under test.
     #[tokio::test]
     async fn an_http_probe_sends_one_get_carrying_the_targets_path_and_a_host_header() {
         let mut server = loopback_http(vec![HttpReply::Status(200)]).await;
@@ -465,9 +487,12 @@ mod tests {
             .probe(&http_target(server.addr.port(), "/healthz"), PROBE_TIMEOUT)
             .await;
         assert_eq!(result, Ok(()));
+        // The port is ephemeral, so it is formatted in rather than pinned —
+        // but that it appears at all is the assertion.
+        let port = server.addr.port();
         assert_eq!(
             server.next_request().await,
-            "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            format!("GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
         );
     }
 
@@ -477,10 +502,14 @@ mod tests {
     // reads as colon-separated fields rather than one address.
     #[test]
     fn an_ipv6_host_is_re_bracketed_for_the_host_header() {
-        assert_eq!(bracket_ipv6("::1"), "[::1]");
-        assert_eq!(bracket_ipv6("2001:db8::1"), "[2001:db8::1]");
-        assert_eq!(bracket_ipv6("127.0.0.1"), "127.0.0.1");
-        assert_eq!(bracket_ipv6("localhost"), "localhost");
+        // Brackets return for IPv6, and the port rides along unless it is
+        // the scheme default the header may omit.
+        assert_eq!(host_header("::1", 8080), "[::1]:8080");
+        assert_eq!(host_header("2001:db8::1", 443), "[2001:db8::1]:443");
+        assert_eq!(host_header("::1", 80), "[::1]");
+        assert_eq!(host_header("127.0.0.1", 8080), "127.0.0.1:8080");
+        assert_eq!(host_header("127.0.0.1", 80), "127.0.0.1");
+        assert_eq!(host_header("localhost", 9000), "localhost:9000");
     }
 
     // Both of Task 2's IPv6 obligations at once, end to end: the connect uses
@@ -505,9 +534,10 @@ mod tests {
         let result = prober.probe(&target, PROBE_TIMEOUT).await;
 
         assert_eq!(result, Ok(()), "an IPv6 target must connect at all");
+        let port = server.addr.port();
         assert_eq!(
             server.next_request().await,
-            "GET / HTTP/1.1\r\nHost: [::1]\r\nConnection: close\r\n\r\n"
+            format!("GET / HTTP/1.1\r\nHost: [::1]:{port}\r\nConnection: close\r\n\r\n")
         );
     }
 
