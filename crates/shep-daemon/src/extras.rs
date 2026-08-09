@@ -315,16 +315,15 @@ impl ExtrasRegistry {
         if group.cron.as_ref().is_none_or(JoinHandle::is_finished) {
             group.cron = arm_cron(config, extras, supervisor);
         }
-        // An app whose watch can NEVER arm — a mistyped `ignore_watch` glob, a
-        // cwd that will never resolve — pays a fresh `canonicalize`, a fresh
-        // globset compile and a fresh `warn!` on every re-arm, where it used
-        // to be attempted once and then left alone. That is
-        // the price of retrying the transient failures (`max_user_watches`
-        // exhausted, a cwd not yet created) that the rebuild exists for, and
-        // it is bounded by `max_restarts`; permanent failure gets no dedupe on
-        // purpose, because telling the two apart means keeping per-name
-        // failure state that would then need its own invalidation. Deliberate,
-        // not an oversight.
+        // An app whose watch can NEVER arm — a cwd that will never resolve —
+        // pays a fresh `canonicalize`, a fresh globset compile and a fresh
+        // `warn!` on every re-arm, where it used to be attempted once and then
+        // left alone. That is the price of retrying the transient failures
+        // (`max_user_watches` exhausted, a cwd not yet created) that the
+        // rebuild exists for, and it is bounded by `max_restarts`; permanent
+        // failure gets no dedupe on purpose, because telling the two apart
+        // means keeping per-name failure state that would then need its own
+        // invalidation. Deliberate, not an oversight.
         if group.watch.as_ref().is_none_or(JoinHandle::is_finished) {
             group.watch = arm_watch(config, supervisor);
         }
@@ -492,8 +491,8 @@ fn arm_cron(
 /// ask to be watched (or when its root or its globs will not resolve).
 ///
 /// Every failure here arms no watch and logs at `warn` rather than
-/// propagating: a mistyped glob must not take down the same app's cron
-/// worker, enforcer and probe.
+/// propagating: a watch root that will not resolve must not take down the
+/// same app's cron worker, enforcer and probe.
 fn arm_watch(config: &AppConfig, supervisor: &SupervisorHandle) -> Option<JoinHandle<()>> {
     if !config.watch {
         return None;
@@ -528,6 +527,10 @@ fn arm_watch(config: &AppConfig, supervisor: &SupervisorHandle) -> Option<JoinHa
     let filter = match WatchFilter::new(&config.watch_options, &config.ignore_watch) {
         Ok(filter) => filter,
         Err(err) => {
+            // `normalize` compiles every `watch_options` and `ignore_watch`
+            // pattern, so a config that reached the daemon cannot land here —
+            // reported instead of `expect`-ed so a future path that skips
+            // normalization costs one app its watch rather than the daemon.
             tracing::warn!(
                 name = config.name.as_str(),
                 %err,
@@ -943,12 +946,16 @@ mod tests {
         expect_restart(&mut rx, "web", Duration::from_secs(6 * 3_600)).await;
     }
 
-    // fails if a mistyped `ignore_watch` glob takes down the arm path for the
-    // same app's cron worker — the whole reason `arm_watch` reports its
-    // failures instead of propagating them. `[` is an unclosed character
-    // class, which globset rejects and `normalize` never looks at.
+    // fails if a watch root that will not resolve takes down the arm path for
+    // the same app's cron worker — the whole reason `arm_watch` reports its
+    // failures instead of propagating them.
+    //
+    // A mistyped glob used to be this case's trigger. It cannot be any more:
+    // `normalize` compiles both glob lists, so `app_with` would reject such a
+    // config before this test could arm it. An unresolvable cwd is the
+    // config-shaped watch failure that survives normalization.
     #[tokio::test(start_paused = true)]
-    async fn a_glob_that_will_not_compile_costs_the_app_its_watch_and_nothing_else() {
+    async fn a_watch_root_that_will_not_resolve_costs_the_app_its_watch_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         let root = tempfile::tempdir().unwrap();
@@ -957,8 +964,7 @@ mod tests {
         let mut registry = ExtrasRegistry::default();
         let app = app_with("web", |app| {
             app.watch = true;
-            app.cwd = Some(root.path().display().to_string());
-            app.ignore_watch = vec!["[".to_string()];
+            app.cwd = Some(root.path().join("no-such-directory").display().to_string());
             app.cron_restart = Some("0 * * * *".to_string());
         });
 
@@ -970,10 +976,10 @@ mod tests {
         );
 
         let group = &registry.groups["web"];
-        assert!(group.watch.is_none(), "the glob cannot have compiled");
+        assert!(group.watch.is_none(), "the watch root cannot have resolved");
         assert!(
             group.cron.is_some(),
-            "a mistyped glob must not cost this app its cron worker too"
+            "an unresolvable watch root must not cost this app its cron worker too"
         );
     }
 
@@ -1286,9 +1292,10 @@ mod tests {
         let rig = rig(DEFAULT_MAX_CRON_SLEEP);
         let mut registry = ExtrasRegistry::default();
         let limit = MemSize::from_bytes(500);
-        // `normalize` rejects `watch = true` with no cwd, but never checks
-        // that the cwd it names resolves — so `canonicalize` failing is the
-        // one watch-arming failure a config that came through it can reach.
+        // `normalize` rejects `watch = true` with no cwd and compiles both
+        // glob lists, but never checks that the cwd it names resolves — so
+        // `canonicalize` failing is the one watch-arming failure a config
+        // that came through it can reach.
         let missing = dir.path().join("no-such-directory");
         let app = app_with("web", |app| {
             app.watch = true;

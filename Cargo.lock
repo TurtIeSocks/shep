@@ -1066,6 +1066,7 @@ dependencies = [
  "croner",
  "encoding_rs_io",
  "futures-util",
+ "globset",
  "insta",
  "json5",
  "pest",

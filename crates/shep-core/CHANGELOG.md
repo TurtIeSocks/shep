@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and rejects `watch = true` with no `cwd` — there is no directory to watch,
   and defaulting to the daemon's own cwd risks recursively watching the
   whole filesystem under a systemd unit with no `WorkingDirectory=`.
+- `normalize` now compiles every `watch_options` and `ignore_watch` pattern
+  through globset — the engine the daemon's own watch filter uses — and
+  rejects one it will not compile with `NormalizeError::InvalidWatchGlob`,
+  naming the sheep, which of the two lists the pattern came from, the pattern
+  as written and globset's reason. Both lists are checked whether or not
+  `watch` is on. Previously a pattern such as `"["` was accepted, the sheep
+  came up `online`, and the watch it configured simply did not exist.
 - Add `CronSchedule`, validating `cron_restart` against croner's dialect and
   resolving `cron_timezone` against the IANA database, replacing the
   5-token-count stopgap. Accepts the seven vixie `@nickname` shorthands,

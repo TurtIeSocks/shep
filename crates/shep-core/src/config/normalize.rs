@@ -7,6 +7,8 @@ use core::fmt;
 
 use std::collections::BTreeSet;
 
+use globset::Glob;
+
 use crate::config::{AppConfig, CronParseError, CronSchedule, ProbeConfig, ProbeTarget};
 
 /// A validated app config — only obtainable via [`normalize`]
@@ -50,6 +52,9 @@ impl ResolvedApp {
 ///   `0`.
 /// - [`NormalizeError::WatchWithoutCwd`] — `watch` is `true` with no `cwd`
 ///   set.
+/// - [`NormalizeError::InvalidWatchGlob`] — a `watch_options` or
+///   `ignore_watch` pattern globset will not compile (carries the app name,
+///   which of the two lists, the pattern and the reason).
 pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
     if app.name.is_empty() {
         return Err(NormalizeError::MissingName);
@@ -88,7 +93,36 @@ pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
         // with no `WorkingDirectory=` (Rin, 2026-08-08).
         return Err(NormalizeError::WatchWithoutCwd { name: app.name });
     }
+    // Both lists are checked whether or not `watch` is on. A pattern globset
+    // will not compile is a typo, and the user wants it named now rather than
+    // the day they flip `watch = true` and wonder why saving a file changes
+    // nothing — the same reasoning that makes `watch` without `cwd` a config
+    // error above (Rin, 2026-08-09).
+    validate_watch_globs(&app.name, "watch_options", &app.watch_options)?;
+    validate_watch_globs(&app.name, "ignore_watch", &app.ignore_watch)?;
     Ok(ResolvedApp { config: app })
+}
+
+/// Validates one of an app's two watch glob lists, rejecting any pattern
+/// globset will not compile. `field` is the Flockfile field name
+/// (`"watch_options"` or `"ignore_watch"`), carried into any error so the
+/// user knows which list to edit. The compiled globs are discarded — this
+/// function's job is rejection; the daemon builds its own watch filter when
+/// it arms the watch.
+fn validate_watch_globs(
+    name: &str,
+    field: &'static str,
+    patterns: &[String],
+) -> Result<(), NormalizeError> {
+    for pattern in patterns {
+        Glob::new(pattern).map_err(|err| NormalizeError::InvalidWatchGlob {
+            name: name.to_string(),
+            field,
+            pattern: pattern.clone(),
+            reason: err.to_string(),
+        })?;
+    }
+    Ok(())
 }
 
 /// Validates one probe's target and `failure_threshold`, if the probe is
@@ -204,6 +238,19 @@ pub enum NormalizeError {
         /// The sheep name, so the error names which Flockfile entry to edit.
         name: String,
     },
+    /// A `watch_options` or `ignore_watch` pattern is one globset will not
+    /// compile, so the watch it describes could never be armed.
+    InvalidWatchGlob {
+        /// The sheep name, so the error names which Flockfile entry to edit.
+        name: String,
+        /// `"watch_options"` or `"ignore_watch"` — the Flockfile field name,
+        /// so the error names which of the two lists to edit.
+        field: &'static str,
+        /// The pattern as the user wrote it.
+        pattern: String,
+        /// globset's own rendered reason.
+        reason: String,
+    },
 }
 
 impl fmt::Display for NormalizeError {
@@ -235,6 +282,15 @@ impl fmt::Display for NormalizeError {
             Self::WatchWithoutCwd { name } => {
                 write!(f, "sheep `{name}` has watch = true but no cwd to watch")
             }
+            Self::InvalidWatchGlob {
+                name,
+                field,
+                pattern,
+                reason,
+            } => write!(
+                f,
+                "sheep `{name}` has an invalid {field} pattern `{pattern}`: {reason}"
+            ),
         }
     }
 }
@@ -474,6 +530,86 @@ target = "http://127.0.0.1:8080/healthz"
         let mut app = AppConfig::minimal("web", "./srv");
         app.watch = true;
         app.cwd = Some("/srv/web".to_string());
+        assert!(normalize(app).is_ok());
+    }
+
+    #[test]
+    fn a_watch_options_glob_that_will_not_compile_is_rejected() {
+        // fails if `watch_options` patterns are never compiled at config
+        // time — the sheep would then report `online` with no watch armed
+        // and nothing but a log line to say so. Also fails if the rejection
+        // blames the whole list instead of the one bad pattern: the valid
+        // `src/**` comes first, so an error carrying it, or carrying the
+        // patterns joined together, is not the pattern the user must fix.
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.watch = true;
+        app.cwd = Some("/srv/web".to_string());
+        app.watch_options = vec!["src/**".to_string(), "[".to_string()];
+        let err = normalize(app).unwrap_err();
+        assert_eq!(
+            err,
+            NormalizeError::InvalidWatchGlob {
+                name: "web".to_string(),
+                field: "watch_options",
+                pattern: "[".to_string(),
+                reason: Glob::new("[").unwrap_err().to_string(),
+            }
+        );
+        // fails if the message drops the app name, the list or the pattern —
+        // the three things that name the Flockfile line to edit.
+        let rendered = err.to_string();
+        for expected in ["web", "watch_options", "`[`"] {
+            assert!(
+                rendered.contains(expected),
+                "{expected} missing: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ignore_watch_glob_that_will_not_compile_is_rejected() {
+        // fails if only `watch_options` is ever compiled, leaving a mistyped
+        // `ignore_watch` to cost the app its watch at arm time instead
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.watch = true;
+        app.cwd = Some("/srv/web".to_string());
+        app.ignore_watch = vec!["[".to_string()];
+        match normalize(app).unwrap_err() {
+            NormalizeError::InvalidWatchGlob { field, pattern, .. } => {
+                assert_eq!(field, "ignore_watch");
+                assert_eq!(pattern, "[");
+            }
+            other => panic!("expected InvalidWatchGlob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_glob_that_will_not_compile_is_rejected_with_watch_off() {
+        // fails if glob validation is nested inside the `watch` check: an app
+        // carrying a mistyped glob with `watch = false` would then normalize
+        // clean, and the typo would surface only the day someone flips
+        // `watch = true`
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.watch_options = vec!["[".to_string()];
+        assert!(matches!(
+            normalize(app).unwrap_err(),
+            NormalizeError::InvalidWatchGlob { .. }
+        ));
+    }
+
+    #[test]
+    fn well_formed_watch_globs_are_accepted() {
+        // fails if the new check rejects patterns globset compiles happily —
+        // recursive `**`, a character class, a negated character class and a
+        // brace alternation are all ordinary globset syntax a Flockfile is
+        // entitled to use. Also fails if the check is wired to a parser that
+        // is not globset's: every one of these is valid to globset and a
+        // syntax error to a regex engine.
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.watch = true;
+        app.cwd = Some("/srv/web".to_string());
+        app.watch_options = vec!["src/**/*.rs".to_string(), "*.[ch]".to_string()];
+        app.ignore_watch = vec!["target/**".to_string(), "**/[!.]*.{tmp,swp}".to_string()];
         assert!(normalize(app).is_ok());
     }
 

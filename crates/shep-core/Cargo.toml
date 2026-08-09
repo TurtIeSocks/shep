@@ -19,6 +19,10 @@ bytes.workspace = true
 croner.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
+# Compiles `watch_options`/`ignore_watch` globs at config time. The same engine
+# spec §4 names for the daemon's own watch filter, so a pattern `normalize`
+# accepts is one the filter can build (spec §4 "globs via globset").
+globset.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
