@@ -222,8 +222,11 @@ impl RootedFilter {
 /// it.
 ///
 /// A rescan — the OS told notify it dropped events — restarts the group
-/// whatever `watch_options` says, since the paths that changed during the
-/// gap are exactly what nobody knows.
+/// whatever `watch_options` and `ignore_watch` say, since the paths that
+/// changed during the gap are exactly what nobody knows. The rule is keyed
+/// on the watched root itself rather than on a rescan flag, so an event on
+/// the root directory (a `chmod` or rename of that inode) takes the same
+/// path and is likewise not suppressible by either list.
 ///
 /// # Errors
 ///
