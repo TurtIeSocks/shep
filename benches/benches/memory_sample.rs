@@ -7,8 +7,18 @@
 //! generations — see [`synthetic_process_tree`]). It is deterministic: same
 //! input every run, `black_box` on the table and the root pid going in and
 //! on the returned sum coming out, so the optimizer cannot fold the call
-//! away. This half scales with **flock size** (how many processes one sheep
-//! and its lambs have spawned), not with anything about the host.
+//! away. This half scales with **`table.len()`**, the size of the whole
+//! input table: `tree_rss` builds two `HashMap`s over every entry in `table`
+//! before it walks the tree (`limits/sample.rs`'s `tree_rss`), so its cost is
+//! not confined to the flock subtree it sums. In production that table is
+//! the host's entire process list — `limits/sample.rs`'s own comment on the
+//! walk notes "the whole-machine table this feeds from can run to hundreds
+//! of entries" — so `tree_rss`'s real-world cost driver is host process
+//! count, the same driver `sysinfo_sampler` measures below, not an
+//! independent axis. This fixture cannot separate the two: every one of its
+//! 500 entries is a descendant of the benched root, so here `table.len()`
+//! and flock size are equal by construction, and the number below is really
+//! measuring table-size cost, not flock-size cost.
 //!
 //! `SysinfoSampler::sample()` benches the real `/proc` walk (or the
 //! platform-equivalent syscalls sysinfo makes) against whatever machine runs
@@ -32,11 +42,12 @@
 //! 25.2.0), `cargo bench --manifest-path benches/Cargo.toml`, criterion
 //! 0.7.0, release profile:
 //!
-//! - `tree_rss/500_process_tree`: 21.9 µs per call (100-sample estimate,
-//!   [21.858, 21.921] µs)
-//! - `sysinfo_sampler/sample_real_machine`: 4.81 ms per call (100-sample
-//!   estimate, [4.7702, 4.8435] ms; host process count at measurement time:
-//!   896, per `ps aux | wc -l`)
+//! - `tree_rss/500_process_tree`: 22.98 µs per call (100-sample estimate,
+//!   [22.819, 23.168] µs) — this is `table.len() == 500` cost, not flock-size
+//!   cost; see the driver discussion above.
+//! - `sysinfo_sampler/sample_real_machine`: 5.77 ms per call (100-sample
+//!   estimate, [5.6979, 5.8453] ms; host process count at measurement time:
+//!   883, per `ps aux | wc -l`)
 //!
 //! Re-run and update this comment if the numbers drift enough to change the
 //! reasoning at the constant they justify — this is a recorded observation,
