@@ -108,6 +108,16 @@ pub async fn await_ready(
             }
         }
         ReadinessSource::Probe(config, target) => {
+            // Deliberately NOT floored at `MIN_PROBE_INTERVAL` the way
+            // `spawn_liveness_task` floors its own interval, and the
+            // difference is not an oversight. That floor exists because a
+            // liveness loop runs forever, so a zero interval there is an
+            // unbounded hot spin; this loop is bounded by `deadline` (an
+            // app's `listen_timeout`), which ends it either way. And the
+            // cost of flooring runs the wrong direction here: a second is a
+            // long time to hold a sheep at `starting` after it is already
+            // answering, which is exactly what a one-second floor would add
+            // to a fast app configured to poll faster.
             let interval = config.interval.as_duration();
             let timeout = config.timeout.as_duration();
             // Probe first, sleep after: the first probe must land at t=0,
