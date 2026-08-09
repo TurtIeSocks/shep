@@ -88,9 +88,11 @@ pub(crate) enum Command {
         /// Which sheep.
         selector: ProcessSelector,
         /// Who asked: an operator off the control socket, or the daemon's own
-        /// cron or watch worker. Governs only whether this restart can be
-        /// displaced mid-kill-ladder (see `Actor::claim_manual`); it never
-        /// changes what the restart does, including its budget reset.
+        /// cron or watch worker. Governs exactly two things — whether this
+        /// restart can be displaced mid-kill-ladder (see
+        /// `Actor::claim_manual`), and the `manually` flag on the bus events
+        /// it produces. It never changes what the restart DOES, including its
+        /// budget reset.
         origin: CommandOrigin,
         /// Answers once every matched sheep is back online (or errored).
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
@@ -247,9 +249,15 @@ impl SupervisorHandle {
     /// budget (spec §4: a manual action resets budget).
     ///
     /// Declares `CommandOrigin::Operator`: a person typed this, so it is owed
-    /// an answer and nothing may take the sheep off it mid-kill-ladder. A
-    /// restart the daemon raised on its own goes through
-    /// [`Self::restart_automatic`] instead.
+    /// an answer, nothing may take the sheep off it mid-kill-ladder, and the
+    /// events it emits carry `manually: true`.
+    ///
+    /// A restart the daemon raised on its own goes through one of two
+    /// siblings instead, and which one depends on what raised it:
+    /// [`Self::restart_automatic`] for a cron occurrence or a change under a
+    /// watched tree, and [`Self::extra_restart`] for a memory breach or a
+    /// liveness failure. All three reset the budget; only this one reports
+    /// itself as a user action.
     ///
     /// # Errors
     ///
@@ -270,9 +278,10 @@ impl SupervisorHandle {
     /// Declares `CommandOrigin::Automatic`: nobody typed this, so an
     /// operator's `stop` or `delete` landing while it is still mid-kill-ladder
     /// takes the sheep back off it instead of being silently converted into
-    /// the restart it raced. The caller is still handed the same answer
-    /// [`Self::restart`] returns — a cron or watch worker reads it to log a
-    /// failed spawn and to notice the engine going away.
+    /// the restart it raced, and the events it emits carry `manually: false`.
+    /// The caller is still handed the same answer [`Self::restart`] returns —
+    /// a cron or watch worker reads it to log a failed spawn and to notice the
+    /// engine going away.
     ///
     /// # Errors
     ///
@@ -311,6 +320,14 @@ impl SupervisorHandle {
     /// Silently does nothing when the report is stale. There is no reply: a
     /// dropped report is the intended outcome, not an error the reporter can act
     /// on.
+    ///
+    /// The third of the three restart doors, and the only one that guards on
+    /// the reporting process still being current: [`Self::restart`] is an
+    /// operator's, [`Self::restart_automatic`] is a cron occurrence's or a
+    /// watched tree's. Like both of them it resets the restart budget, and
+    /// like [`Self::restart_automatic`] it goes in as
+    /// `CommandOrigin::Automatic` — displaceable by an operator's command,
+    /// and reported on the bus with `manually: false`.
     pub async fn extra_restart(&self, id: u32, pid: u32) {
         let _ = self
             .tx
@@ -474,9 +491,11 @@ enum ManualKind {
     Delete,
 }
 
-/// Who asked for a pending manual command. Read only by
+/// Who asked for a pending manual command. Read in exactly two places:
 /// [`Actor::claim_manual`], to decide which of two racing commands owns a
-/// sheep's next exit.
+/// sheep's next exit, and the two sites that carry the command out
+/// ([`Actor::handle_exited`] and [`Actor::apply_immediate`]), which report it
+/// as the `manually` flag on every bus event the restart emits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandOrigin {
     /// A person asked for it: a `Stop`, `Restart` or `Delete` off the control
@@ -501,8 +520,11 @@ pub(crate) enum CommandOrigin {
 struct PendingManual {
     /// What that exit will be turned into.
     kind: ManualKind,
-    /// Who asked. Never reaches `handle_exited`: once the sheep is down, what
-    /// the command DOES is decided entirely by its `kind`.
+    /// Who asked. What the command DOES once the sheep is down is decided
+    /// entirely by `kind`; `origin` survives into `handle_exited` for one
+    /// purpose, the `manually` flag on the events that exit produces —
+    /// otherwise a cron, watch, memory-breach or liveness restart would be
+    /// broadcast as a user action.
     origin: CommandOrigin,
 }
 
@@ -880,8 +902,17 @@ impl<R: ProcessRunner> Actor<R> {
 
     /// Respawns an already-registered id in place: reassembles from its
     /// stored spec + instance, bumps `restarts` and resets timing on
-    /// success, or marks the entry `Errored` on failure. Used for both
-    /// automatic (`RestartDue`) and manual (forced) respawns.
+    /// success, or marks the entry `Errored` on failure. Used for both the
+    /// crash loop's own respawn (`RestartDue`) and the forced one a
+    /// `Restart` command produces.
+    ///
+    /// `manually` is what the `Restart`, `Online` and `Errored` events this
+    /// respawn emits report about who caused it, and it is narrower than
+    /// "forced": `true` only for an operator's `Restart`, `false` for the
+    /// crash loop AND for every restart the daemon raised itself — a cron
+    /// occurrence, a change under a watched tree, a memory breach, a liveness
+    /// failure. Callers pass `origin == CommandOrigin::Operator`, never a
+    /// literal, wherever a command is what got them here.
     fn respawn(&mut self, id: u32, manually: bool) -> ProcessInfo {
         let slot = self.sheep.get(&id).expect("respawn: unknown id");
         let app = slot.entry.spec.clone();
@@ -1109,7 +1140,7 @@ impl<R: ProcessRunner> Actor<R> {
                     }
                 }
                 remaining.insert(id);
-            } else if let Some(info) = self.apply_immediate(id, kind) {
+            } else if let Some(info) = self.apply_immediate(id, kind, origin) {
                 results.push(info);
             }
         }
@@ -1139,7 +1170,20 @@ impl<R: ProcessRunner> Actor<R> {
     /// this, `shep stop web` issued during a backoff leaves the group's
     /// watcher and cron worker armed, and the next file save or occurrence
     /// brings back a sheep the user stopped.
-    fn apply_immediate(&mut self, id: u32, kind: ManualKind) -> Option<ProcessInfo> {
+    ///
+    /// `origin` is carried for one reason, the same one it is carried into
+    /// `handle_exited` for: the `manually` flag on the events below. A cron
+    /// occurrence or a watched file landing on a name whose instances are
+    /// mid-backoff restarts them from HERE, not from `handle_exited`, so
+    /// hardcoding `true` here would leave exactly that case lying about who
+    /// caused it.
+    fn apply_immediate(
+        &mut self,
+        id: u32,
+        kind: ManualKind,
+        origin: CommandOrigin,
+    ) -> Option<ProcessInfo> {
+        let manually = origin == CommandOrigin::Operator;
         match kind {
             ManualKind::Stop => {
                 let slot = self.sheep.get_mut(&id)?;
@@ -1157,7 +1201,7 @@ impl<R: ProcessRunner> Actor<R> {
                     ProcStatus::WaitingRestart | ProcStatus::Errored => {
                         slot.entry.status = ProcStatus::Stopped;
                         let info = to_info(&slot.entry);
-                        self.emit(ProcessEventKind::Stop, info.clone(), true);
+                        self.emit(ProcessEventKind::Stop, info.clone(), manually);
                         self.disarm_extras(id, &info.name);
                         Some(info)
                     }
@@ -1167,13 +1211,13 @@ impl<R: ProcessRunner> Actor<R> {
             ManualKind::Delete => {
                 let slot = self.sheep.remove(&id)?;
                 let info = to_info(&slot.entry);
-                self.emit(ProcessEventKind::Delete, info.clone(), true);
+                self.emit(ProcessEventKind::Delete, info.clone(), manually);
                 self.disarm_extras(id, &info.name);
                 Some(info)
             }
             ManualKind::Restart => {
                 self.sheep.get_mut(&id)?.entry.budget.reset();
-                Some(self.respawn(id, true))
+                Some(self.respawn(id, manually))
             }
         }
     }
@@ -1238,10 +1282,16 @@ impl<R: ProcessRunner> Actor<R> {
         };
         slot.ctl = None;
         slot.entry.pid = None;
-        // Only the KIND survives into this function: once the sheep is down,
-        // what its owning command does to it is decided entirely by that, and
-        // every branch below reads it exactly as it did before origins existed.
-        let manual = slot.manual.take().map(|pending| pending.kind);
+        // Split the moment the marker is taken, because the two halves answer
+        // different questions. `kind` decides what this exit BECOMES, and
+        // every branch below reads it exactly as it did before origins
+        // existed. The origin decides only what the bus SAYS about who caused
+        // it, and is read once, on the forced-respawn branch. The Stop and
+        // Delete branches stay literal `true`: `Command::Stop`,
+        // `Command::Delete` and `begin_shutdown` are the only sites that put
+        // either kind on a marker, and all three declare `Operator`.
+        let manual = slot.manual.take();
+        let kind = manual.map(|pending| pending.kind);
         let pending_delete = std::mem::take(&mut slot.pending_delete);
         let Some(started_at) = slot.entry.started_at.take() else {
             // MINOR-7: shouldn't happen (a duplicate Msg::Exited would
@@ -1268,7 +1318,7 @@ impl<R: ProcessRunner> Actor<R> {
             // the same price: deregistering without it would leave the name
             // group's cron worker and watch firing at a name `list()` no
             // longer knows.
-            if manual == Some(ManualKind::Delete) || pending_delete {
+            if kind == Some(ManualKind::Delete) || pending_delete {
                 let mut removed = self.sheep.remove(&id).expect("checked above");
                 removed.entry.status = ProcStatus::Stopped;
                 let info = to_info(&removed.entry);
@@ -1291,7 +1341,7 @@ impl<R: ProcessRunner> Actor<R> {
         // and respawning here would spawn a child outside the shutdown
         // aggregation's `online` snapshot, orphaning it exactly like the
         // rejected-at-the-command-level cases. Falling through instead: with
-        // `manual.is_some()` true, `decide_on_exit` always resolves to
+        // `kind.is_some()` true, `decide_on_exit` always resolves to
         // CleanStop, landing the sheep in `Stopped` — an honest answer for
         // a restart request that lost the race to a shutdown.
         //
@@ -1304,11 +1354,23 @@ impl<R: ProcessRunner> Actor<R> {
         // process while telling the Delete caller it succeeded — worse than
         // the original bug (a merely-stale `Stopped` entry), since it also
         // shows up in `list()` as `Online`. Falling through instead lets
-        // `decide_on_exit` resolve to CleanStop (manual.is_some() is still
+        // `decide_on_exit` resolve to CleanStop (`kind.is_some()` is still
         // true) and the `pending_delete` guard below correctly deregister.
-        if manual == Some(ManualKind::Restart) && !self.shutting_down && !pending_delete {
+        if kind == Some(ManualKind::Restart) && !self.shutting_down && !pending_delete {
             slot.entry.budget.reset();
-            let info = self.respawn(id, true);
+            // The one place the origin is read. A person's `shep restart` is a
+            // user action; a cron occurrence, a change under a watched tree, a
+            // memory breach and a liveness failure are the daemon's own doing,
+            // and a subscriber told otherwise cannot tell an operator's
+            // deploy apart from an app thrashing on its own.
+            let manually = matches!(
+                manual,
+                Some(PendingManual {
+                    origin: CommandOrigin::Operator,
+                    ..
+                })
+            );
+            let info = self.respawn(id, manually);
             return self.resolve_pending(id, info);
         }
 
@@ -1319,7 +1381,7 @@ impl<R: ProcessRunner> Actor<R> {
                 &mut slot.entry.budget,
                 uptime,
                 outcome,
-                manual.is_some(),
+                kind.is_some(),
             )
         };
 
@@ -1336,11 +1398,11 @@ impl<R: ProcessRunner> Actor<R> {
             }
             Decision::Errored => {
                 let info = self.set_status(id, ProcStatus::Errored);
-                self.emit(ProcessEventKind::Errored, info.clone(), manual.is_some());
+                self.emit(ProcessEventKind::Errored, info.clone(), kind.is_some());
                 self.disarm_extras(id, &info.name);
                 info
             }
-            Decision::CleanStop if manual == Some(ManualKind::Delete) || pending_delete => {
+            Decision::CleanStop if kind == Some(ManualKind::Delete) || pending_delete => {
                 let mut removed = self.sheep.remove(&id).expect("checked above");
                 removed.entry.status = ProcStatus::Stopped;
                 let info = to_info(&removed.entry);
@@ -1354,7 +1416,7 @@ impl<R: ProcessRunner> Actor<R> {
                 self.emit(
                     ProcessEventKind::Stop,
                     info.clone(),
-                    manual == Some(ManualKind::Stop),
+                    kind == Some(ManualKind::Stop),
                 );
                 info
             }
@@ -2120,11 +2182,12 @@ mod tests {
         );
 
         // Now the respawn path: a manual Restart's own flag has to survive
-        // the readiness wait rather than being defaulted at the far end.
-        // `restart` resolves at the respawn itself (`apply_immediate`'s
-        // `ManualKind::Restart` arm), not at Online, so a gated app's reply
-        // lands here with the new process still `Starting` — no deadlock,
-        // and nothing to signal until after this await.
+        // the readiness wait rather than being defaulted at the far end. The
+        // sheep is `Starting` but its task is live, so this takes the deferred
+        // route — kill ladder, then `handle_exited`'s forced-restart branch —
+        // and `restart` resolves at that respawn rather than at Online, so a
+        // gated app's reply lands here with the new process still `Starting`:
+        // no deadlock, and nothing to signal until after this await.
         let restarted = handle.restart(ProcessSelector::Id(0)).await.unwrap();
         assert_eq!(restarted[0].status, ProcStatus::Starting);
         handle.tx.send(Msg::Ready { id: 0 }).await.unwrap();
@@ -2137,6 +2200,47 @@ mod tests {
         assert!(
             restarted_manually,
             "a manual Restart's Online must stay manual through the readiness gate"
+        );
+    }
+
+    // The positive control for every `manually: false` the lifecycle extras
+    // assert: an operator's `shep restart` really does reach the bus as a user
+    // action, so those cases are reading a flag that still moves rather than
+    // one wired shut. It claims the `Restart` event specifically —
+    // `a_gated_apps_online_carries_the_same_manually_flag_an_ungated_one_does`
+    // covers the deferred `Online` — because that is the event the extras'
+    // cases read.
+    //
+    // fails if `SupervisorHandle::restart` stops declaring
+    // `CommandOrigin::Operator`, or if `handle_exited`'s forced-restart branch
+    // stops reading the origin at all and reports every restart as automatic.
+    #[tokio::test(start_paused = true)]
+    async fn an_operators_restart_is_reported_as_a_user_action() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        // Two: the sheep, and the respawn the restart performs. One would
+        // leave that respawn `SpawnFailed("script exhausted")`, which emits
+        // `Errored` instead of `Restart` — and `await_event` would then wait
+        // for a `Restart` that never comes rather than judging its flag.
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits(); 2]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        handle
+            .start(vec![normalize(AppConfig::minimal("web", "./srv")).unwrap()])
+            .await
+            .unwrap();
+
+        let restarted = handle.restart(ProcessSelector::All).await.unwrap();
+        assert_eq!(restarted[0].restarts, 1, "the restart really respawned");
+
+        let manually = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_event(&mut rx, 0, ProcessEventKind::Restart),
+        )
+        .await
+        .expect("the respawn `restart` performed");
+        assert!(
+            manually,
+            "a person typed `shep restart`; the bus must say a user action caused it"
         );
     }
 

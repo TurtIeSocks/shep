@@ -710,14 +710,30 @@ mod tests {
         name: &str,
         window: Duration,
     ) -> ProcessInfo {
+        expect_restart_event(rx, name, window).await.0
+    }
+
+    /// [`expect_restart`], plus the `manually` flag the bus put on that
+    /// restart — [`BusEvent::Process`]'s own claim about who caused it ("True
+    /// when a user action caused it").
+    ///
+    /// Split out rather than folded into `expect_restart`'s return type
+    /// because only the handful of cases below read the flag, and every other
+    /// caller wants the snapshot alone.
+    async fn expect_restart_event(
+        rx: &mut broadcast::Receiver<BusEvent>,
+        name: &str,
+        window: Duration,
+    ) -> (ProcessInfo, bool) {
         let restart = async {
             loop {
                 match rx.recv().await {
                     Ok(BusEvent::Process {
                         event: ProcessEventKind::Restart,
                         info,
+                        manually,
                         ..
-                    }) if info.name == name => return info,
+                    }) if info.name == name => return (info, manually),
                     Ok(_) => continue,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(err) => panic!("event stream closed before a restart of {name}: {err}"),
@@ -725,7 +741,7 @@ mod tests {
             }
         };
         match tokio::time::timeout(window, restart).await {
-            Ok(info) => info,
+            Ok(observed) => observed,
             Err(_) => panic!("timed out waiting for a restart of {name}"),
         }
     }
@@ -1689,6 +1705,50 @@ mod tests {
         assert_eq!(info.restarts, 1);
     }
 
+    // The watch's own door into the same claim the cron case makes, and it
+    // needs its own case: the two subsystems pick their `SupervisorHandle`
+    // method independently, so a watch loop calling the operator's `restart`
+    // leaves every cron assertion green.
+    //
+    // fails if `run_group` restarts through `restart` rather than
+    // `restart_automatic` — under which a file save reaches every subscriber
+    // as `manually: true`, and an editor's autosave is reported as a deploy.
+    //
+    // Real time and a real filesystem, like every case that drives notify.
+    #[tokio::test]
+    async fn a_watch_restart_is_not_reported_as_a_user_action() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = test_paths(&home);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+            app.watch_delay = Some(UpDuration::from_millis(
+                real_time::TEST_DELAY.as_millis() as u64
+            ));
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+        registry.arm(
+            &armed_entry(0, 0, 1000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+
+        touch(root.path(), "trigger.txt").unwrap();
+
+        let (info, manually) =
+            expect_restart_event(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
+        assert_eq!(info.restarts, 1);
+        assert!(
+            !manually,
+            "a file changing under a watched tree is not a user action"
+        );
+    }
+
     // fails if `arm_watch` builds its filter from empty slices rather than
     // from the app's own `watch_options`/`ignore_watch` — the shape under
     // which every ignore rule the user wrote is silently discarded and a build
@@ -1774,7 +1834,10 @@ mod tests {
     // ------------------------------------------------------------------
 
     // fails if the reporter drops every report, or restarts something other
-    // than the id the breach names
+    // than the id the breach names, or if `handle_extra_restart` stops
+    // declaring `CommandOrigin::Automatic`: a process the daemon restarted
+    // because it outgrew its `max_memory` would reach every subscriber as
+    // `manually: true`, indistinguishable from an operator's `shep restart`.
     #[tokio::test(start_paused = true)]
     async fn a_breach_naming_the_running_pid_restarts_that_sheep() {
         let (handle, mut rx, _fixture) = spawn_test_fixture();
@@ -1794,16 +1857,21 @@ mod tests {
             .await
             .unwrap();
 
-        let info = expect_restart(&mut rx, "web", EVENT_WAIT).await;
+        let (info, manually) = expect_restart_event(&mut rx, "web", EVENT_WAIT).await;
         assert_eq!(info.id, 0);
         assert_eq!(info.restarts, 1);
+        assert!(
+            !manually,
+            "nobody typed this: a memory breach is the daemon's own doing"
+        );
     }
 
     // The liveness twin of the case above, and it needs to exist separately:
     // the reporter's two arms are two `select!` branches, so a `liveness` arm
     // that drops every failure it reads leaves the breach arm — and every
     // assertion riding on it — perfectly green. fails if that arm never calls
-    // `extra_restart`, or calls it for the wrong id.
+    // `extra_restart`, calls it for the wrong id, or restarts the sheep as
+    // though a person had asked for it.
     #[tokio::test(start_paused = true)]
     async fn a_liveness_failure_naming_the_running_pid_restarts_that_sheep() {
         let (handle, mut rx, _fixture) = spawn_test_fixture();
@@ -1815,9 +1883,13 @@ mod tests {
 
         live_tx.send(LivenessFailure { id: 0, pid }).await.unwrap();
 
-        let info = expect_restart(&mut rx, "web", EVENT_WAIT).await;
+        let (info, manually) = expect_restart_event(&mut rx, "web", EVENT_WAIT).await;
         assert_eq!(info.id, 0);
         assert_eq!(info.restarts, 1);
+        assert!(
+            !manually,
+            "nobody typed this: a liveness failure is the daemon's own doing"
+        );
     }
 
     // fails if `handle_extra_restart` drops its unknown-id guard for an
@@ -2111,6 +2183,55 @@ mod tests {
             clock.reads(),
             reads_after_delete,
             "a deleted sheep's cron worker must stop reading the clock, not merely stop finding sheep"
+        );
+    }
+
+    // A cron occurrence reaches a name-group's instances through two doors,
+    // and only one of them ever had a test. A RUNNING instance is killed and
+    // respawned from `handle_exited`'s forced-restart branch; one already
+    // sitting out its restart backoff has no live task, so the same occurrence
+    // restarts it from `apply_immediate` instead. Both have to say the same
+    // thing about who caused it, and neither answer is "a person".
+    //
+    // fails if either respawn site hardcodes the `manually` flag it emits, or
+    // if the cron worker reaches for the operator's `restart` in place of
+    // `restart_automatic`. `BusEvent::Process`'s `manually` is documented as
+    // "True when a user action caused it", so a subscriber cannot otherwise
+    // tell a nightly schedule apart from someone deploying.
+    #[tokio::test(start_paused = true)]
+    async fn a_cron_restart_is_never_reported_as_a_user_action() {
+        let clock = Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z")));
+        // The same fixture the two cases above stand on, and its script pool
+        // is what makes the second half reachable rather than incidental: the
+        // first occurrence respawns onto a proc that exits at once, and the
+        // spares behind it are what the second occurrence respawns from. A
+        // pool sized to a correct run would answer that second spawn
+        // `SpawnFailed("script exhausted")` and emit `Errored`, which carries
+        // no `Restart` for either implementation to be judged on.
+        let h = backoff_harness(&clock);
+        let mut rx = h.ctx.events.subscribe();
+        h.ctx.supervisor.start(vec![backoff_app()]).await.unwrap();
+
+        // Door one: the sheep is online, so the occurrence takes it through
+        // the kill ladder and `handle_exited` performs the respawn.
+        cross_one_hour().await;
+        let (running, manually) = expect_restart_event(&mut rx, "web", EVENT_WAIT).await;
+        assert_eq!(running.restarts, 1);
+        assert!(
+            !manually,
+            "a cron occurrence is nobody typing `shep restart`"
+        );
+
+        // Door two: that respawn exited immediately into a three-hour backoff,
+        // so the next occurrence — an hour later, well inside it — finds no
+        // live task and restarts the sheep from `apply_immediate`.
+        settle_into(&h.ctx.supervisor, 0, ProcStatus::WaitingRestart).await;
+        cross_one_hour().await;
+        let (backing_off, manually) = expect_restart_event(&mut rx, "web", EVENT_WAIT).await;
+        assert_eq!(backing_off.restarts, 2);
+        assert!(
+            !manually,
+            "the same occurrence must answer the same way through `apply_immediate`"
         );
     }
 
