@@ -176,7 +176,7 @@ missing_debug_implementations = "deny"
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 # Enabled 2026-08-09 after auditing the workspace with this lint at `warn`
-# and finding zero existing violations (Phase 4 Task 7 fix round) — every
+# and finding zero existing violations — every
 # pub `Result`-returning item already carries a `# Errors` section per
 # docs/idiomatic-rust.md IR-28, this just makes CI enforce it going forward
 # instead of relying on review to catch drift.

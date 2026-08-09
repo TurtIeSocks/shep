@@ -179,8 +179,8 @@ pub fn normalize_all(apps: Vec<AppConfig>) -> Result<Vec<ResolvedApp>, Normalize
 
 /// Error type returned from [`normalize`] and [`normalize_all`]
 ///
-/// Growth is expected: this enum has already gained five variants across
-/// Phase 4 Tasks 1 and 2, and will gain more this phase (IR-20).
+/// Growth is expected: every config surface this crate learns to validate
+/// brings its own rejection reasons with it (IR-20).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NormalizeError {
