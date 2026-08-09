@@ -7,7 +7,8 @@
 //! ([`ProbeTargetError::HttpsUnsupported`](shep_core::config::ProbeTargetError::HttpsUnsupported)),
 //! and a `301` is a [`ProbeFailure::Rejected`], never followed — a probe
 //! that follows redirects is a probe that can pass against a completely
-//! different service.
+//! different service. For the same reason a response only counts as healthy
+//! if it *is* an HTTP response: see [`evaluate_status_line`].
 
 // Rejected alternatives, so nobody re-litigates: `reqwest` brings tower and a
 // TLS stack into a daemon targeting single-digit-MB idle RSS (spec §14.11);
@@ -289,9 +290,19 @@ async fn read_status_line(stream: TcpStream) -> Result<String, ProbeFailure> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Parses the numeric status out of an HTTP status line's second
-/// space-separated token (`HTTP/1.1 200 OK` -> `200`) and maps it to a pass
-/// or a [`ProbeFailure::Rejected`].
+/// Parses the numeric status out of an HTTP status line (`HTTP/1.1 200 OK`
+/// -> `200`) and maps it to a pass or a [`ProbeFailure::Rejected`].
+///
+/// The line must begin `HTTP/`. The spec words this check positionally —
+/// "the second space-separated token" — and position alone reads `BANANA 204
+/// whatever` as healthy, which is exactly the "a probe that can pass against
+/// a completely different service" hazard this module already invokes to ban
+/// redirects: a probe port that turns out to be some other line-oriented
+/// daemon should fail, not pass. Requiring the prefix cannot cost a real
+/// server anything, since RFC 7230 §3.1.2 makes `HTTP/x.y` the mandatory
+/// first token of every HTTP/1.x status line — this narrows the accepted
+/// grammar, and narrowing is the safe direction to differ from a spec's
+/// shorthand in.
 ///
 /// Never indexes a token that might not be there and never panics on a
 /// malformed line: `.nth(1)` and `.parse().ok()` both return `None` rather
@@ -303,7 +314,14 @@ async fn read_status_line(stream: TcpStream) -> Result<String, ProbeFailure> {
 /// possible — it was just negative, exactly like a non-2xx status.
 fn evaluate_status_line(line: &str) -> Result<(), ProbeFailure> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
-    match trimmed
+    let Some(after_version) = trimmed.strip_prefix("HTTP/") else {
+        return Err(ProbeFailure::Rejected(format!(
+            "not an HTTP status line: {trimmed:?}"
+        )));
+    };
+    // Counted over what follows `HTTP/`, so the token taken is still the one
+    // after the version: `1.1 200 OK` -> `200`.
+    match after_version
         .split(' ')
         .nth(1)
         .and_then(|token| token.parse::<u16>().ok())
@@ -527,11 +545,37 @@ mod tests {
     // The brief's own suggested fixture ("not http\r\n") has two
     // space-separated tokens, so it only exercises a parser whose second
     // token fails to parse as u16 — never one that indexes past the end of
-    // the token list. This one has none, and is what actually catches an
-    // implementation that reaches for `tokens[1]` instead of `.nth(1)`.
+    // the token list. This one is what catches an implementation reaching for
+    // `tokens[1]` instead of `.nth(1)`.
+    //
+    // It has to be a well-formed VERSION with nothing after it, not arbitrary
+    // one-word garbage: since the parser now requires an `HTTP/` prefix, a
+    // line that fails that check never reaches the token indexing at all, and
+    // a fixture like "garbage\r\n" would quietly stop testing anything here.
     #[tokio::test]
-    async fn a_single_token_garbage_line_is_rejected_not_panicked_on() {
-        let server = loopback_http(vec![HttpReply::Raw("garbage\r\n".to_string())]).await;
+    async fn a_status_line_with_no_code_after_the_version_is_rejected_not_panicked_on() {
+        let server = loopback_http(vec![HttpReply::Raw("HTTP/1.1\r\n".to_string())]).await;
+        let prober = OsProber::new(None, BTreeMap::new());
+        let result = prober
+            .probe(&http_target(server.addr.port(), "/"), PROBE_TIMEOUT)
+            .await;
+        assert!(
+            matches!(result, Err(ProbeFailure::Rejected(_))),
+            "expected Rejected, got {result:?}"
+        );
+    }
+
+    // fails if the status check is positional only. `BANANA 204 whatever`
+    // has a 2xx in the slot the spec's wording points at, so a parser that
+    // counts tokens without ever asking what protocol answered calls this
+    // healthy — the same "passes against a completely different service"
+    // hazard the no-redirects rule exists for, one layer down. Some other
+    // line-oriented daemon listening on the port a Flockfile named is a
+    // realistic way to meet this, and it must fail.
+    #[tokio::test]
+    async fn a_2xx_from_a_service_that_is_not_http_is_rejected() {
+        let server =
+            loopback_http(vec![HttpReply::Raw("BANANA 204 whatever\r\n".to_string())]).await;
         let prober = OsProber::new(None, BTreeMap::new());
         let result = prober
             .probe(&http_target(server.addr.port(), "/"), PROBE_TIMEOUT)
