@@ -13,8 +13,11 @@
 //! - [`Prober`], [`ProbeFailure`]
 //! - [`LivenessFailure`], [`spawn_liveness_task`]
 //! - [`os::OsProber`] — the real HTTP/TCP/exec implementation
+//! - [`ready::ReadinessSource`], [`ready::Readiness`], [`ready::await_ready`]
+//!   — the `starting → online` gate (spec §7)
 
 pub mod os;
+pub mod ready;
 
 use core::future::Future;
 use core::pin::Pin;

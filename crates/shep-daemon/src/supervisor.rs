@@ -28,6 +28,8 @@
 use core::fmt;
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -43,6 +45,9 @@ use crate::channel::ChildMessage;
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
 use crate::kill::kill_process;
 use crate::privilege::{self, Credentials};
+use crate::probes::Prober;
+use crate::probes::os::OsProber;
+use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
 use crate::runner::{ExitOutcome, ProcIo, ProcessRunner, RunningProcess};
 
 /// Capacity of the actor's own mailbox (commands + internal events).
@@ -125,11 +130,22 @@ pub(crate) enum Msg {
     },
     /// The sheep's shepherd channel reported readiness.
     ///
-    /// Drained and logged in Phase 2a — the `wait_ready` gate that consumes
-    /// this lands in Phase 4.
+    /// Forwarded to the waiting readiness task's `oneshot::Sender`, if one is
+    /// waiting (`SheepSlot::ready_tx`) — dropped silently otherwise, so an
+    /// app is free to write `{"kind":"ready"}` whenever it likes, including
+    /// twice.
     Ready {
         /// The sheep's id.
         id: u32,
+    },
+    /// A readiness wait resolved.
+    ReadyResult {
+        /// The sheep's id.
+        id: u32,
+        /// The slot's epoch when the wait began; a stale result is dropped.
+        epoch: u64,
+        /// Whether the signal arrived or the deadline elapsed.
+        readiness: Readiness,
     },
 }
 
@@ -358,6 +374,13 @@ struct SheepSlot {
     /// drops one whose epoch no longer matches — a stale timer left behind
     /// by a respawn (manual or automatic) that happened in the meantime.
     epoch: u64,
+    /// The waiting readiness task's signal sender for the CURRENT epoch,
+    /// `Some` only while one is waiting on this slot's shepherd-channel
+    /// ready signal. `Msg::Ready`'s handler takes it to wake the task;
+    /// `None` means either no readiness task was ever armed (an app with
+    /// neither `wait_ready` nor `readiness_probe` set) or its wait already
+    /// resolved.
+    ready_tx: Option<oneshot::Sender<()>>,
 }
 
 /// Where a deferred `Stop`/`Restart`/`Delete`/`Shutdown` reply eventually
@@ -429,7 +452,15 @@ impl<R: ProcessRunner> Actor<R> {
                     false
                 }
                 Msg::Ready { id } => {
-                    tracing::debug!(id, "shepherd-channel ready (wait_ready gating is Phase 4)");
+                    self.handle_ready_signal(id);
+                    false
+                }
+                Msg::ReadyResult {
+                    id,
+                    epoch,
+                    readiness,
+                } => {
+                    self.handle_ready_result(id, epoch, readiness);
                     false
                 }
             };
@@ -517,9 +548,11 @@ impl<R: ProcessRunner> Actor<R> {
 
     /// Registers + spawns one brand-new instance (a fresh id, `restarts: 0`).
     ///
-    /// Always inserts a [`SheepSlot`] — `Online` with a live sheep task on
-    /// success, `Errored` with no task on failure — before returning, so the
-    /// entry persists regardless of the outcome.
+    /// Always inserts a [`SheepSlot`] before returning, so the entry
+    /// persists regardless of the outcome: on success, `Starting` with a
+    /// readiness task armed when the app configures `wait_ready` or
+    /// `readiness_probe`, `Online` immediately otherwise; `Errored` with no
+    /// task on failure.
     fn spawn_fresh(
         &mut self,
         app: &ResolvedApp,
@@ -538,14 +571,27 @@ impl<R: ProcessRunner> Actor<R> {
         let out_file = spec.out_file.clone();
         let err_file = spec.err_file.clone();
 
+        // `app` came through `normalize` (it is a `ResolvedApp`), which
+        // already runs `ProbeTarget::parse` over `readiness_probe` — an
+        // `Err` here would mean the daemon adopted an app that skipped that
+        // step.
+        let source = ReadinessSource::of(app.config())
+            .expect("ResolvedApp already passed ProbeTarget::parse in normalize");
+        let gated = !matches!(source, ReadinessSource::Heuristic);
+
         match self.runner.spawn(&spec) {
             Ok((proc, io)) => {
                 let pid = proc.pid();
+                let status = if gated {
+                    ProcStatus::Starting
+                } else {
+                    ProcStatus::Online
+                };
                 let entry = ProcessEntry {
                     id,
                     spec: app.clone(),
                     instance,
-                    status: ProcStatus::Online,
+                    status,
                     pid: Some(pid),
                     restarts: 0,
                     started_at: Some(tokio::time::Instant::now()),
@@ -564,6 +610,18 @@ impl<R: ProcessRunner> Actor<R> {
                     self.events.clone(),
                     self.tx.clone(),
                 );
+                let ready_tx = if gated {
+                    Some(spawn_readiness_task(
+                        id,
+                        0,
+                        source,
+                        app.config().listen_timeout.as_duration(),
+                        readiness_prober(app),
+                        self.tx.clone(),
+                    ))
+                } else {
+                    None
+                };
                 self.sheep.insert(
                     id,
                     SheepSlot {
@@ -572,21 +630,18 @@ impl<R: ProcessRunner> Actor<R> {
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
+                        ready_tx,
                     },
                 );
                 self.emit(ProcessEventKind::Start, info.clone(), true);
-                // No readiness-probe gate exists yet (Phase 2b: `readiness_probe`
-                // is parsed into `AppConfig` but not wired to anything here —
-                // see this file's own `Msg::Ready` handler, line 432, the
-                // Phase-4 wait_ready TODO), so `entry.status` above already
-                // went straight to `Online` with no intervening `Starting`
-                // phase ever observed by a caller. The bus must say so too:
-                // a `process.*` subscriber that only ever hears `process.start`
-                // for a sheep whose STATUS already reads `Online` (via
-                // `ListFlock`) is being told less than a status poll would
-                // show it. Once a real readiness gate lands, this is the spot
-                // that defers to it instead of firing unconditionally.
-                self.emit(ProcessEventKind::Online, info.clone(), true);
+                // For a gated app, `Online` fires later — from
+                // `handle_ready_result`, once the readiness task above
+                // resolves — not here. `Start` above is still the bus's
+                // first word on this sheep, so a subscriber is never left
+                // silent for the whole readiness window.
+                if !gated {
+                    self.emit(ProcessEventKind::Online, info.clone(), true);
+                }
                 Ok(info)
             }
             Err(error) => {
@@ -613,6 +668,7 @@ impl<R: ProcessRunner> Actor<R> {
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
+                        ready_tx: None,
                     },
                 );
                 self.emit(ProcessEventKind::Errored, info, true);
@@ -633,7 +689,13 @@ impl<R: ProcessRunner> Actor<R> {
         // restart must never re-touch the passwd database, and must never
         // silently change identity out from under an already-running app.
         let credentials = slot.entry.credentials;
+        // Computed ahead of the mutable borrow below (IMPORTANT-3): this
+        // respawn's new epoch, one past the slot's current one.
+        let next_epoch = slot.epoch + 1;
         let spec = assemble(&app, instance, &self.paths, credentials);
+        let source = ReadinessSource::of(app.config())
+            .expect("ResolvedApp already passed ProbeTarget::parse in normalize");
+        let gated = !matches!(source, ReadinessSource::Heuristic);
 
         match self.runner.spawn(&spec) {
             Ok((proc, io)) => {
@@ -642,29 +704,55 @@ impl<R: ProcessRunner> Actor<R> {
                     id,
                     proc,
                     io,
-                    app,
+                    app.clone(),
                     self.events.clone(),
                     self.tx.clone(),
                 );
+                let ready_tx = if gated {
+                    Some(spawn_readiness_task(
+                        id,
+                        next_epoch,
+                        source,
+                        app.config().listen_timeout.as_duration(),
+                        readiness_prober(&app),
+                        self.tx.clone(),
+                    ))
+                } else {
+                    None
+                };
                 let slot = self
                     .sheep
                     .get_mut(&id)
                     .expect("respawn: entry vanished mid-respawn");
-                slot.entry.status = ProcStatus::Online;
+                slot.entry.status = if gated {
+                    ProcStatus::Starting
+                } else {
+                    ProcStatus::Online
+                };
                 slot.entry.pid = Some(pid);
                 slot.entry.started_at = Some(tokio::time::Instant::now());
                 slot.entry.restarts += 1;
                 slot.ctl = Some(ctl);
                 // IMPORTANT-3: a new process now exists for this id — any
-                // RestartDue timer scheduled before this point (targeting
-                // the process this replaced) is stale the moment it fires.
+                // RestartDue timer, or readiness task, scheduled before this
+                // point (targeting the process this replaced) is stale the
+                // moment it fires. Dropping the old `ready_tx` here (the
+                // assignment below) also lets a still-pending OLD readiness
+                // task discover its sender is gone; it rides out its own
+                // deadline instead of resolving early (`await_ready`'s
+                // `Channel` arm), and its eventual `ReadyResult` is dropped
+                // by `handle_ready_result`'s epoch check.
                 slot.epoch += 1;
+                debug_assert_eq!(slot.epoch, next_epoch);
+                slot.ready_tx = ready_tx;
                 let info = to_info(&slot.entry);
                 self.emit(ProcessEventKind::Restart, info.clone(), manually);
                 // Same gap as `spawn_fresh`'s Ok arm (see its own comment):
-                // `slot.entry.status` above already went straight to `Online`,
-                // so the bus must announce that too, not just the restart.
-                self.emit(ProcessEventKind::Online, info.clone(), manually);
+                // for a gated app `Online` fires later, from
+                // `handle_ready_result`, not here.
+                if !gated {
+                    self.emit(ProcessEventKind::Online, info.clone(), manually);
+                }
                 info
             }
             Err(_error) => {
@@ -679,6 +767,7 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.entry.pid = None;
                 slot.entry.started_at = None;
                 slot.ctl = None;
+                slot.ready_tx = None;
                 let info = to_info(&slot.entry);
                 self.emit(ProcessEventKind::Errored, info.clone(), manually);
                 info
@@ -1027,6 +1116,59 @@ impl<R: ProcessRunner> Actor<R> {
         self.respawn(id, false);
     }
 
+    /// Forwards the shepherd channel's readiness signal to the waiting
+    /// readiness task for `id`, if one is waiting. A `Ready` for a slot with
+    /// no waiting sender (no readiness task armed, or its wait already
+    /// resolved) is dropped silently — an app is free to write
+    /// `{"kind":"ready"}` whenever it likes, including twice.
+    fn handle_ready_signal(&mut self, id: u32) {
+        let Some(slot) = self.sheep.get_mut(&id) else {
+            return;
+        };
+        if let Some(tx) = slot.ready_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+
+    /// A readiness wait resolved. Guarded exactly like `handle_restart_due`:
+    ///
+    /// 1. NOT shutting down (CRITICAL-1) — no new bus activity for a sheep
+    ///    once a graceful shutdown has started.
+    /// 2. The slot still existing (a `Delete` may have removed it).
+    /// 3. Its epoch still matching the slot's current one (IMPORTANT-3) — a
+    ///    respawn (manual or automatic) that happened while this wait was
+    ///    still pending makes it stale.
+    /// 4. The entry still being `Starting` — an exit that raced the wait
+    ///    (see the epoch check above) or a status this wait has no business
+    ///    overwriting.
+    ///
+    /// That guard set is not boilerplate to trim: a sheep that exited and
+    /// respawned while its readiness task was still waiting would otherwise
+    /// have the old wait mark the new process online.
+    fn handle_ready_result(&mut self, id: u32, epoch: u64, readiness: Readiness) {
+        if self.shutting_down {
+            return;
+        }
+        let Some(slot) = self.sheep.get(&id) else {
+            return;
+        };
+        if slot.epoch != epoch {
+            return;
+        }
+        if slot.entry.status != ProcStatus::Starting {
+            return;
+        }
+        if readiness == Readiness::TimedOut {
+            // Rin, 2026-08-08: a readiness timeout goes online anyway rather
+            // than erroring — treating it as a spawn failure would turn a
+            // slow-starting app into a restart loop, exactly the failure
+            // mode `max_restarts` exists to contain.
+            tracing::warn!(id, "readiness deadline elapsed; marking online anyway");
+        }
+        let info = self.set_status(id, ProcStatus::Online);
+        self.emit(ProcessEventKind::Online, info, false);
+    }
+
     /// Spawns the backoff timer for a scheduled restart; `None` still hops
     /// through a task + mailbox send rather than respawning inline, so
     /// "immediate" restarts remain observable as a distinct scheduling step.
@@ -1134,6 +1276,49 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
     }
 }
 
+/// The prober a gated readiness task probes with: a fresh [`OsProber`]
+/// scoped to `app`'s own `cwd`/`env`, so an exec-kind readiness probe sees
+/// the same environment (its `PORT`, most commonly) its sheep does.
+fn readiness_prober(app: &ResolvedApp) -> Arc<dyn Prober> {
+    let config = app.config();
+    Arc::new(OsProber::new(
+        config.cwd.clone().map(PathBuf::from),
+        config.env.clone(),
+    ))
+}
+
+/// Spawns a readiness task for `id` at `epoch`, returning the oneshot
+/// sender the actor stores (`SheepSlot::ready_tx`) so a later `Msg::Ready`
+/// can wake it. `source` decides which signal [`await_ready`] waits for;
+/// `deadline` is the app's `listen_timeout`. The task reports its result
+/// back through `actor_tx` as a `Msg::ReadyResult`, which
+/// `Actor::handle_ready_result` drops if `epoch` is no longer current.
+///
+/// Must be called from within a Tokio runtime context: it spawns the
+/// waiting task immediately, the same way `schedule_restart` already
+/// documents for itself.
+fn spawn_readiness_task(
+    id: u32,
+    epoch: u64,
+    source: ReadinessSource,
+    deadline: Duration,
+    prober: Arc<dyn Prober>,
+    actor_tx: mpsc::Sender<Msg>,
+) -> oneshot::Sender<()> {
+    let (ready_tx, ready_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let readiness = await_ready(&source, deadline, ready_rx, prober).await;
+        let _ = actor_tx
+            .send(Msg::ReadyResult {
+                id,
+                epoch,
+                readiness,
+            })
+            .await;
+    });
+    ready_tx
+}
+
 /// Spawns the per-sheep task and returns its control sender.
 fn spawn_sheep_task<P: RunningProcess>(
     id: u32,
@@ -1234,12 +1419,13 @@ async fn run_sheep<P: RunningProcess>(
 
 #[cfg(test)]
 mod tests {
-    use shep_core::config::{AppConfig, normalize};
+    use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, normalize};
     use shep_core::status::ProcStatus;
+    use shep_core::values::UpDuration;
 
     use super::*;
     use crate::fake::{ProcScript, ScriptedRunner};
-    use crate::testing::test_paths; // the one crate-root fixture (IR-33)
+    use crate::testing::{probe_config, test_paths}; // the one crate-root fixture (IR-33)
 
     // Drives virtual time by parking on recv(); returns when the id reaches `kind`.
     async fn await_event(
@@ -1257,6 +1443,295 @@ mod tests {
                 Err(e) => panic!("event stream closed before {kind:?} for id {id}: {e}"),
             }
         }
+    }
+
+    /// Waits up to `window` for `kind` targeting `id`; panics if it arrives.
+    /// A bounded `timeout` + `recv`, not a bare `try_recv` (Global
+    /// Constraints rule 11): right after the clock is driven forward, a
+    /// message already due has not necessarily reached this receiver's
+    /// queue yet, so a bare `try_recv` would read empty regardless of
+    /// whether the code under test is correct.
+    async fn assert_no_event_within(
+        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        id: u32,
+        kind: ProcessEventKind,
+        window: Duration,
+    ) {
+        match tokio::time::timeout(window, await_event(rx, id, kind)).await {
+            Err(_elapsed) => {} // window elapsed with nothing arriving — expected
+            Ok(()) => panic!("unexpected {kind:?} for id {id} within {window:?}"),
+        }
+    }
+
+    // --- Task 9: the readiness gate ---
+
+    // fails if a `wait_ready` app reaches Online at spawn instead of waiting
+    // on the shepherd channel's ready signal
+    #[tokio::test(start_paused = true)]
+    async fn wait_ready_app_stays_starting_until_the_channel_signals() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.wait_ready = true;
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+        assert_no_event_within(
+            &mut rx,
+            0,
+            ProcessEventKind::Online,
+            Duration::from_millis(500),
+        )
+        .await;
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+
+        // `Msg::Ready` is `pub(crate)`, and `tests` is a descendant module of
+        // `supervisor`, so this reaches the actor exactly where the sheep
+        // task's forwarded `ChildMessage::Ready` would — that forwarding
+        // itself is pre-existing, unchanged code (`run_sheep`'s
+        // `from_child.recv()` arm), not this task's own surface.
+        handle.tx.send(Msg::Ready { id: 0 }).await.unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("Online once the channel signals");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Online);
+    }
+
+    // fails if a readiness_probe app reaches Online at spawn instead of
+    // waiting for the probe to pass, or if it never reaches Online once the
+    // probe starts passing. Real time, not the paused clock, and no
+    // `start_paused`: this drives a real TCP connect against a real
+    // listener, and `probes::os::tests` already found that a paused test
+    // waiting on real socket I/O can deadlock — the virtual clock inside the
+    // test never appears to move while the OS on the other end is
+    // unaffected by it.
+    #[tokio::test]
+    async fn readiness_probe_app_stays_starting_until_the_probe_passes() {
+        // Reserve a free port, then release it immediately: the probe
+        // target is fixed at this port before anything is listening on it,
+        // so probes fail (connection refused) until the fixture below binds
+        // it for real, a few lines down.
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.readiness_probe = Some(ProbeConfig {
+            interval: UpDuration::from_millis(50),
+            timeout: UpDuration::from_millis(200),
+            ..probe_config(ProbeKind::Tcp, &addr.to_string())
+        });
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+        // Nothing is listening on `addr` yet: several probe intervals' worth
+        // of real time pass with the probe failing every time.
+        assert_no_event_within(
+            &mut rx,
+            0,
+            ProcessEventKind::Online,
+            Duration::from_millis(220),
+        )
+        .await;
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let _accept = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("Online once the probe starts passing");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Online);
+    }
+
+    // fails if a readiness timeout is treated as a spawn failure instead of
+    // going online anyway — that would turn every slow-starting app into a
+    // restart loop, exactly what max_restarts exists to contain
+    #[tokio::test(start_paused = true)]
+    async fn a_gated_app_whose_deadline_elapses_goes_online_anyway() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.wait_ready = true; // nobody ever signals ready
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+
+        tokio::time::timeout(
+            Duration::from_secs(4), // > the 3000ms default listen_timeout
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("Online once the readiness deadline elapses");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Online);
+    }
+
+    // fails if a stale readiness result — from a sheep that exited and was
+    // automatically respawned while starting — marks the respawned process
+    // online; this is the epoch guard's test, and it is the one that
+    // catches the stale-wait defect. Status alone cannot catch it: the OLD
+    // process and the NEW one are both `Starting`, so only the epoch tells
+    // them apart. This also doubles as the "an event arrives before the
+    // readiness signal does" proof (`Restart` before `Online`) for the
+    // respawn path.
+    #[tokio::test(start_paused = true)]
+    async fn a_gated_app_that_exits_while_starting_never_reaches_online_from_the_old_wait() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::stable_then_exit(500, 1), // unstable exit while Starting
+            ProcScript::never_exits(),            // the automatic respawn
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.wait_ready = true; // nobody ever signals either instance's readiness
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+
+        // The exit at 500ms is unstable (< the 1000ms min_uptime default)
+        // and triggers an immediate automatic respawn (no
+        // exp_backoff_restart_delay configured, so `restart_delay` is
+        // `None`): status goes straight back to `Starting` for the NEW
+        // process, epoch bumped. `Restart` fires here; `Online` does not —
+        // proving the two emits stay separate on the respawn path too.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            await_event(&mut rx, 0, ProcessEventKind::Restart),
+        )
+        .await
+        .expect("the automatic respawn after the unstable exit");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+        assert_eq!(handle.list().await[0].restarts, 1);
+
+        // The ORIGINAL readiness wait's deadline (~3000ms from the FIRST
+        // spawn, ~2500ms from here) elapses next; status reads `Starting`
+        // for both the old and the new process, so only the epoch guard —
+        // not the status guard — can tell them apart.
+        assert_no_event_within(
+            &mut rx,
+            0,
+            ProcessEventKind::Online,
+            Duration::from_millis(2_700),
+        )
+        .await;
+        assert_eq!(
+            handle.list().await[0].status,
+            ProcStatus::Starting,
+            "the OLD wait's stale TimedOut must not have marked the respawned process online"
+        );
+
+        // The RESPAWNED process's own deadline elapses next (~3000ms from
+        // ITS spawn), and this one legitimately goes online.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("the new process's own readiness deadline");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Online);
+    }
+
+    // fails if a stale readiness result marks a STOPPED sheep online. Unlike
+    // the two tests above, no respawn ever happens here, so the epoch never
+    // changes — only the status guard stands between the stale TimedOut and
+    // an incorrect Online, and this is the test that catches its removal
+    // specifically (the epoch check alone would let this one through).
+    #[tokio::test(start_paused = true)]
+    async fn a_gated_app_stopped_while_starting_ignores_the_old_wait() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::stable_then_exit(500, 1)]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.wait_ready = true; // nobody ever signals ready
+        app.autorestart = false; // straight to Stopped: epoch never bumps
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            await_event(&mut rx, 0, ProcessEventKind::Stop),
+        )
+        .await
+        .expect("the natural exit at 500ms");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Stopped);
+
+        // The original readiness task's own 3000ms deadline (from spawn) is
+        // still running in the background and resolves TimedOut around
+        // t=3000ms — roughly 2500ms from here, at the SAME epoch this slot
+        // still carries. That stale ReadyResult must never flip this
+        // Stopped sheep to Online.
+        assert_no_event_within(&mut rx, 0, ProcessEventKind::Online, Duration::from_secs(3)).await;
+        assert_eq!(handle.list().await[0].status, ProcStatus::Stopped);
+    }
+
+    // fails if the OLD readiness wait's eventual result marks the
+    // RESPAWNED process online instead of being dropped by the epoch guard
+    #[tokio::test(start_paused = true)]
+    async fn a_gated_app_restarted_while_starting_ignores_the_old_wait() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner =
+            ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.wait_ready = true; // nobody ever signals either instance's readiness
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+
+        // A gap before the manual restart, so the OLD wait's deadline
+        // (~3000ms from spawn) and the NEW wait's deadline (~3000ms from
+        // THIS point) land far enough apart to tell them apart below.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        handle
+            .restart(ProcessSelector::Name("web".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.list().await[0].status,
+            ProcStatus::Starting,
+            "the respawned process is gated too, so it must still be Starting"
+        );
+
+        // The ORIGINAL readiness wait's deadline elapses first; the epoch
+        // guard must drop it rather than mark the respawned process online.
+        assert_no_event_within(
+            &mut rx,
+            0,
+            ProcessEventKind::Online,
+            Duration::from_millis(2_700),
+        )
+        .await;
+        assert_eq!(
+            handle.list().await[0].status,
+            ProcStatus::Starting,
+            "the old wait's stale TimedOut must not have marked the new process online"
+        );
+
+        // The RESPAWNED process's own deadline elapses next, and this one
+        // legitimately goes online.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("the new process's own readiness deadline");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Online);
     }
 
     #[tokio::test(start_paused = true)]
