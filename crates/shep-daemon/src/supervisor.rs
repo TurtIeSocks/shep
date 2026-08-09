@@ -28,7 +28,6 @@
 use core::fmt;
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -48,7 +47,7 @@ use crate::privilege::{self, Credentials};
 use crate::probes::Prober;
 use crate::probes::os::OsProber;
 use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
-use crate::runner::{ExitOutcome, ProcIo, ProcessRunner, RunningProcess};
+use crate::runner::{ExitOutcome, ProcIo, ProcessRunner, RunningProcess, SpawnSpec};
 
 /// Capacity of the actor's own mailbox (commands + internal events).
 const MAILBOX_CAPACITY: usize = 256;
@@ -616,7 +615,7 @@ impl<R: ProcessRunner> Actor<R> {
                         0,
                         source,
                         app.config().listen_timeout.as_duration(),
-                        readiness_prober(app),
+                        readiness_prober(&spec),
                         self.tx.clone(),
                     ))
                 } else {
@@ -714,7 +713,7 @@ impl<R: ProcessRunner> Actor<R> {
                         next_epoch,
                         source,
                         app.config().listen_timeout.as_duration(),
-                        readiness_prober(&app),
+                        readiness_prober(&spec),
                         self.tx.clone(),
                     ))
                 } else {
@@ -1277,14 +1276,22 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
 }
 
 /// The prober a gated readiness task probes with: a fresh [`OsProber`]
-/// scoped to `app`'s own `cwd`/`env`, so an exec-kind readiness probe sees
-/// the same environment (its `PORT`, most commonly) its sheep does.
-fn readiness_prober(app: &ResolvedApp) -> Arc<dyn Prober> {
-    let config = app.config();
-    Arc::new(OsProber::new(
-        config.cwd.clone().map(PathBuf::from),
-        config.env.clone(),
-    ))
+/// scoped to the ASSEMBLED spec's `cwd`/`env`, so an exec-kind readiness
+/// probe sees the same environment (its `PORT`, most commonly) its sheep
+/// does.
+///
+/// Taking the [`SpawnSpec`] rather than the [`ResolvedApp`] it was assembled
+/// from is the whole point, not a refactor. `probe_exec` runs
+/// `env_clear().envs(&self.env)`, and the app's own `config.env` is only one
+/// of the three things [`assemble`] folds into the child's environment: an
+/// app that sets no `env` at all — the ordinary case — would probe with
+/// NOTHING, no `PATH`, no `HOME`, no `TZ`. The instance slot var
+/// (`SHEP_INSTANCE`, or the app's `increment_var`) is the sharper half: a
+/// `&ResolvedApp` structurally cannot reach `instance`, so every instance of
+/// a clustered app would probe whatever the unexpanded variable left behind
+/// — the same port, every time.
+fn readiness_prober(spec: &SpawnSpec) -> Arc<dyn Prober> {
+    Arc::new(OsProber::new(spec.cwd.clone(), spec.env.clone()))
 }
 
 /// Spawns a readiness task for `id` at `epoch`, returning the oneshot
@@ -1554,6 +1561,68 @@ mod tests {
         )
         .await
         .expect("Online once the probe starts passing");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Online);
+    }
+
+    // fails if the readiness prober is built from the app's own `config.env`
+    // instead of the ASSEMBLED `SpawnSpec::env`. The probe below reads
+    // `$SHEP_INSTANCE`, a variable only `assemble` ever writes, so a prober
+    // scoped to `config.env` — empty here, as it is for most apps — expands
+    // it to nothing under `probe_exec`'s `env_clear()`, watches for a file
+    // that will never exist, and rides out the whole `listen_timeout`
+    // instead of noticing the one that does appear.
+    //
+    // A file, not a port: an exec probe flipping fail->pass on `test -f`
+    // needs no listener, no reserved port, and no race, so the only thing
+    // this test can fail on is the environment the probe ran with.
+    //
+    // Real time, not the paused clock, for the reason the TCP test above
+    // gives: this spawns a real `sh` per probe, and the virtual clock does
+    // not move the OS.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_exec_readiness_probe_sees_the_assembled_env_not_the_apps_own() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        // Instance 0 is the only slot a single-instance app gets, so this is
+        // the exact path a correctly-scoped probe resolves to.
+        let ready_file = dir.path().join("ready-0");
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.readiness_probe = Some(ProbeConfig {
+            interval: UpDuration::from_millis(50),
+            timeout: UpDuration::from_millis(500),
+            ..probe_config(
+                ProbeKind::Exec,
+                &format!(r#"test -f "{}/ready-$SHEP_INSTANCE""#, dir.path().display()),
+            )
+        });
+        // Far longer than this test's own patience below, so an Online it
+        // observes can only have come from a probe that really passed —
+        // never from the deadline path quietly marking it online anyway.
+        app.listen_timeout = UpDuration::from_millis(60_000);
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+        // Several probe intervals of real time with the file absent.
+        assert_no_event_within(
+            &mut rx,
+            0,
+            ProcessEventKind::Online,
+            Duration::from_millis(220),
+        )
+        .await;
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+
+        std::fs::write(&ready_file, b"").unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("Online once the exec probe can resolve $SHEP_INSTANCE");
         assert_eq!(handle.list().await[0].status, ProcStatus::Online);
     }
 
