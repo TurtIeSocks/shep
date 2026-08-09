@@ -40,7 +40,7 @@ use crate::limits::sample::SysinfoSampler;
 use crate::limits::{LimitBreach, LimitEnforcer, PollingEnforcer};
 use crate::probes::{LivenessFailure, Prober, spawn_liveness_task};
 use crate::supervisor::SupervisorHandle;
-use crate::watch::{DEFAULT_WATCH_DELAY, WatchFilter, spawn_watch_group};
+use crate::watch::{DEFAULT_WATCH_DELAY, MIN_WATCH_DELAY, WatchFilter, spawn_watch_group};
 
 /// Where the lifecycle extras send the two out-of-band failure reports.
 ///
@@ -539,11 +539,13 @@ fn arm_watch(config: &AppConfig, supervisor: &SupervisorHandle) -> Option<JoinHa
             return None;
         }
     };
-    let delay = config
-        .watch_delay
-        .map(UpDuration::as_duration)
-        .unwrap_or(DEFAULT_WATCH_DELAY);
-    match spawn_watch_group(config.name.clone(), root, filter, delay, supervisor.clone()) {
+    match spawn_watch_group(
+        config.name.clone(),
+        root,
+        filter,
+        watch_delay_for(config),
+        supervisor.clone(),
+    ) {
         Ok(handle) => Some(handle),
         Err(err) => {
             tracing::warn!(
@@ -554,6 +556,22 @@ fn arm_watch(config: &AppConfig, supervisor: &SupervisorHandle) -> Option<JoinHa
             None
         }
     }
+}
+
+/// The debounce window an app's watch is armed with: its own `watch_delay`
+/// when it set one, [`DEFAULT_WATCH_DELAY`] otherwise, floored either way at
+/// [`MIN_WATCH_DELAY`].
+///
+/// The floor is a last line of defence, not the first: `shep-core`'s
+/// `normalize` already refuses `watch_delay = "0"`, and every value it accepts
+/// passes through here unchanged. See [`MIN_WATCH_DELAY`] for why it is a
+/// single millisecond where its two siblings are a full second.
+fn watch_delay_for(config: &AppConfig) -> Duration {
+    config
+        .watch_delay
+        .map(UpDuration::as_duration)
+        .unwrap_or(DEFAULT_WATCH_DELAY)
+        .max(MIN_WATCH_DELAY)
 }
 
 #[cfg(test)]
@@ -1707,6 +1725,48 @@ mod tests {
         touch(root.path(), "trigger.txt").unwrap();
         let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
         assert_eq!(info.restarts, 1);
+    }
+
+    // fails if `arm_watch` hands `watch_delay` to the debouncer as written.
+    // `notify-debouncer-full` derives its poll tick as `delay / 4` and sleeps
+    // it on a dedicated OS thread, so a zero makes that thread
+    // `loop { sleep(0); lock(); }` — measured at 5.98s of user CPU across a
+    // three-second watch that costs 0.00s at the 500ms default.
+    //
+    // A direct call rather than an armed registry, and deliberately so:
+    // `shep-core`'s `normalize` refuses `watch_delay = "0"`, and a
+    // `ResolvedApp` is only obtainable through it, so no fixture in this
+    // crate can carry a zero as far as `ExtrasRegistry::arm`. This floor
+    // exists for the caller that skipped normalization — a future boot path,
+    // or a bug — which is exactly the shape a bare `AppConfig` here stands
+    // in for. It is also the only observable the floor has: with the tick
+    // gone to zero the watch still delivers every event, it just burns a
+    // core doing it, so there is no batch, no restart and no call count that
+    // could tell the two apart.
+    #[test]
+    fn a_zero_watch_delay_is_floored_before_it_reaches_the_debouncer() {
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.watch_delay = Some(UpDuration::from_millis(0));
+        assert_eq!(watch_delay_for(&app), MIN_WATCH_DELAY);
+    }
+
+    // fails if the floor is raised to something a Flockfile may legitimately
+    // ask for. `normalize` accepts every non-zero `watch_delay`, so a floor
+    // above one millisecond would silently lengthen a save-to-restart round
+    // trip the user deliberately shortened — the clamp-nobody-announces
+    // failure that the probe interval's config-time rejection exists to
+    // avoid. Also fails if an app naming no delay stops getting the default.
+    #[test]
+    fn a_watch_delay_the_config_layer_accepts_is_never_clamped() {
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.watch_delay = Some(UpDuration::from_millis(1));
+        assert_eq!(watch_delay_for(&app), Duration::from_millis(1));
+
+        app.watch_delay = Some(UpDuration::from_millis(20));
+        assert_eq!(watch_delay_for(&app), Duration::from_millis(20));
+
+        app.watch_delay = None;
+        assert_eq!(watch_delay_for(&app), DEFAULT_WATCH_DELAY);
     }
 
     // ------------------------------------------------------------------

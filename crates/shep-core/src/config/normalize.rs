@@ -10,6 +10,33 @@ use std::collections::BTreeSet;
 use globset::Glob;
 
 use crate::config::{AppConfig, CronParseError, CronSchedule, ProbeConfig, ProbeTarget};
+use crate::values::UpDuration;
+
+/// Shortest `interval` a `liveness_probe` may name.
+///
+/// The daemon's liveness loop floors whatever it is handed at this same value
+/// (its own `MIN_PROBE_INTERVAL`), so a smaller number would be *honoured* as
+/// this one with nothing to say so — in a detached daemon, not even a log
+/// line. That is the reasoning `max_cron_sleep` was settled on (`MIN_CRON_SLEEP`
+/// rejects rather than clamps), and it applies here for the same reason: the
+/// user's file is the only place the discrepancy could ever be noticed.
+///
+/// One second is a floor no legitimate configuration wants to be under. A
+/// liveness check asked for more often than that is polling, and for
+/// [`ProbeKind::Exec`](crate::config::ProbeKind::Exec) it is that many process
+/// spawns per second, per sheep, for as long as the sheep runs.
+const MIN_LIVENESS_INTERVAL: UpDuration = UpDuration::from_millis(1_000);
+
+/// Shortest `interval` a `readiness_probe` may name.
+///
+/// A whole second lower than [`MIN_LIVENESS_INTERVAL`], and deliberately so:
+/// the readiness wait honours its `interval` exactly as written and is bounded
+/// by the app's `listen_timeout`, so there is no clamp for a rejection to keep
+/// honest here — only the zero, which would spin that wait for the whole
+/// `listen_timeout`. A fast app that polls every 20ms to leave `starting`
+/// sooner is asking for something the daemon really does, so this floor must
+/// not take it away.
+const MIN_READINESS_INTERVAL: UpDuration = UpDuration::from_millis(1);
 
 /// A validated app config — only obtainable via [`normalize`]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,10 +75,14 @@ impl ResolvedApp {
 ///   the rendered reason).
 /// - [`NormalizeError::ZeroFailureThreshold`] — a probe's `failure_threshold`
 ///   is explicitly `0`.
-/// - [`NormalizeError::ZeroInterval`] — a probe's `interval` is explicitly
-///   `0`.
+/// - [`NormalizeError::IntervalBelowMinimum`] — a probe's `interval` is under
+///   the floor its own loop honours: a full second for `liveness_probe`, and
+///   only "greater than zero" for `readiness_probe` (carries which probe, the
+///   value and the floor).
+/// - [`NormalizeError::ZeroMaxMemory`] — `max_memory` is `0`.
 /// - [`NormalizeError::WatchWithoutCwd`] — `watch` is `true` with no `cwd`
 ///   set.
+/// - [`NormalizeError::ZeroWatchDelay`] — `watch_delay` is `0`.
 /// - [`NormalizeError::InvalidWatchGlob`] — a `watch_options` or
 ///   `ignore_watch` pattern globset will not compile (carries the app name,
 ///   which of the two lists, the pattern and the reason).
@@ -84,14 +115,41 @@ pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
             }
         })?;
     }
-    validate_probe(app.readiness_probe.as_ref(), "readiness_probe")?;
-    validate_probe(app.liveness_probe.as_ref(), "liveness_probe")?;
+    validate_probe(
+        app.readiness_probe.as_ref(),
+        "readiness_probe",
+        MIN_READINESS_INTERVAL,
+    )?;
+    validate_probe(
+        app.liveness_probe.as_ref(),
+        "liveness_probe",
+        MIN_LIVENESS_INTERVAL,
+    )?;
+    if app.max_memory.is_some_and(|limit| limit.bytes() == 0) {
+        // A ceiling every live process is over, armed against every poll: the
+        // enforcer would report a breach on its first reading and on every
+        // reading after it, and the restart that follows is automatic, which
+        // RESETS the restart budget rather than spending it. `max_restarts`
+        // cannot end that loop, so it has to be refused here.
+        return Err(NormalizeError::ZeroMaxMemory { name: app.name });
+    }
     if app.watch && app.cwd.is_none() {
         // `watch` asked for a feature the daemon has no directory to arm:
         // there is no cwd in the Flockfile, and defaulting to the daemon's
         // own cwd risks watching the whole filesystem under a systemd unit
         // with no `WorkingDirectory=` (Rin, 2026-08-08).
         return Err(NormalizeError::WatchWithoutCwd { name: app.name });
+    }
+    if app.watch_delay == Some(UpDuration::from_millis(0)) {
+        // notify's debouncer derives its own poll tick as `watch_delay / 4`
+        // and runs it on a dedicated OS thread, so a zero turns that thread
+        // into `loop { sleep(0); lock(); }`: measured at 5.98s of user CPU
+        // across a three-second watch that costs 0.00s at the 500ms default.
+        // shep-daemon's watch arming floors this independently too (its
+        // `MIN_WATCH_DELAY`), the same belt-and-suspenders shape
+        // `validate_probe`'s interval check has opposite the liveness loop's
+        // own floor.
+        return Err(NormalizeError::ZeroWatchDelay { name: app.name });
     }
     // Both lists are checked whether or not `watch` is on. A pattern globset
     // will not compile is a typo, and the user wants it named now rather than
@@ -125,12 +183,18 @@ fn validate_watch_globs(
     Ok(())
 }
 
-/// Validates one probe's target and `failure_threshold`, if the probe is
-/// configured. `probe` is the Flockfile field name (`"readiness_probe"` or
-/// `"liveness_probe"`), carried into any error so the user knows which
-/// field to edit. Its own parsed [`ProbeTarget`] is discarded — this
+/// Validates one probe's target, `failure_threshold` and `interval`, if the
+/// probe is configured. `probe` is the Flockfile field name
+/// (`"readiness_probe"` or `"liveness_probe"`), carried into any error so the
+/// user knows which field to edit; `min_interval` is the floor that probe's
+/// own loop in the daemon honours, which is why the two call sites pass
+/// different ones. Its own parsed [`ProbeTarget`] is discarded — this
 /// function's job is rejection; the daemon re-parses when it arms the probe.
-fn validate_probe(probe: Option<&ProbeConfig>, name: &'static str) -> Result<(), NormalizeError> {
+fn validate_probe(
+    probe: Option<&ProbeConfig>,
+    name: &'static str,
+    min_interval: UpDuration,
+) -> Result<(), NormalizeError> {
     let Some(probe) = probe else {
         return Ok(());
     };
@@ -144,17 +208,23 @@ fn validate_probe(probe: Option<&ProbeConfig>, name: &'static str) -> Result<(),
         // sheep immediately and forever.
         return Err(NormalizeError::ZeroFailureThreshold { probe: name });
     }
-    if probe.interval.as_millis() == 0 {
-        // Not a configuration anybody wants either: `spawn_liveness_task`
-        // sleeps `interval` between probes, so a zero would turn it into a
-        // hot spin — for `ProbeKind::Exec`, hundreds of process spawns per
-        // second, per sheep, forever. shep-daemon's own loop floors this
-        // independently too (its `MIN_PROBE_INTERVAL`), the same
-        // belt-and-suspenders shape `cron::MIN_MAX_SLEEP` uses opposite
-        // `max_cron_sleep`'s config-time floor — this crate does not own
-        // the boot wiring that guarantees every `ProbeConfig` reaching the
-        // loop came through here.
-        return Err(NormalizeError::ZeroInterval { probe: name });
+    if probe.interval < min_interval {
+        // Not a configuration anybody wants either. Both probe loops sleep
+        // `interval` between attempts, so a zero turns either into a hot
+        // spin — for `ProbeKind::Exec`, hundreds of process spawns per
+        // second, per sheep. A liveness interval that is merely *small*
+        // is refused for a second reason: `spawn_liveness_task` rounds it UP
+        // to its own `MIN_PROBE_INTERVAL`, which would leave the user's file
+        // the only place the discrepancy exists and nothing anywhere to
+        // report it. Rejecting rather than clamping is what `max_cron_sleep`
+        // settled on for that same trade; the daemon-side floor stays too,
+        // because this crate does not own the boot wiring that guarantees
+        // every `ProbeConfig` reaching the loop came through here.
+        return Err(NormalizeError::IntervalBelowMinimum {
+            probe: name,
+            value: probe.interval,
+            min: min_interval,
+        });
     }
     Ok(())
 }
@@ -224,17 +294,35 @@ pub enum NormalizeError {
         /// name, so the error names the line the user has to edit.
         probe: &'static str,
     },
-    /// A `readiness_probe` or `liveness_probe` has `interval == 0`, which
-    /// would spin its liveness/readiness loop as fast as the runtime
-    /// allows.
-    ZeroInterval {
+    /// A `readiness_probe` or `liveness_probe` has an `interval` under the
+    /// floor its own loop in the daemon honours. At `0` that would spin the
+    /// loop as fast as the runtime allows; a `liveness_probe` under a full
+    /// second would instead be silently polled at that second.
+    IntervalBelowMinimum {
         /// `"readiness_probe"` or `"liveness_probe"` — the Flockfile field
         /// name, so the error names the line the user has to edit.
         probe: &'static str,
+        /// The value as the user wrote it.
+        value: UpDuration,
+        /// The floor it failed.
+        min: UpDuration,
+    },
+    /// `max_memory` is `0` — a ceiling every live process is already over, so
+    /// the enforcer would restart the sheep on every poll forever. Carries
+    /// the app name.
+    ZeroMaxMemory {
+        /// The sheep name, so the error names which Flockfile entry to edit.
+        name: String,
     },
     /// `watch` is enabled but the app sets no `cwd`, so there is no
     /// directory to watch. Carries the app name.
     WatchWithoutCwd {
+        /// The sheep name, so the error names which Flockfile entry to edit.
+        name: String,
+    },
+    /// `watch_delay` is `0`, which would spin the debouncer's own OS thread.
+    /// Carries the app name.
+    ZeroWatchDelay {
         /// The sheep name, so the error names which Flockfile entry to edit.
         name: String,
     },
@@ -276,11 +364,23 @@ impl fmt::Display for NormalizeError {
             Self::ZeroFailureThreshold { probe } => {
                 write!(f, "{probe}.failure_threshold must be at least 1")
             }
-            Self::ZeroInterval { probe } => {
-                write!(f, "{probe}.interval must be greater than 0")
+            Self::IntervalBelowMinimum { probe, value, min } => {
+                write!(f, "{probe}.interval is `{value}`: must be at least {min}")
+            }
+            Self::ZeroMaxMemory { name } => {
+                write!(
+                    f,
+                    "sheep `{name}` has max_memory = 0, a limit nothing can stay under"
+                )
             }
             Self::WatchWithoutCwd { name } => {
                 write!(f, "sheep `{name}` has watch = true but no cwd to watch")
+            }
+            Self::ZeroWatchDelay { name } => {
+                write!(
+                    f,
+                    "sheep `{name}` has watch_delay = 0: must be greater than 0"
+                )
             }
             Self::InvalidWatchGlob {
                 name,
@@ -466,21 +566,159 @@ mod tests {
     #[test]
     fn zero_interval_rejected() {
         // fails if interval is never inspected — a zero interval would spin
-        // the liveness/readiness loop as fast as the runtime allows
+        // the readiness wait as fast as the runtime allows for the whole
+        // `listen_timeout` (`await_ready` deliberately does not floor it)
         let mut app = AppConfig::minimal("web", "./srv");
         let mut probe = probe_config("http://127.0.0.1:8080/healthz");
-        probe.interval = crate::values::UpDuration::from_millis(0);
+        probe.interval = UpDuration::from_millis(0);
         app.readiness_probe = Some(probe);
         let err = normalize(app).unwrap_err();
         assert_eq!(
             err,
-            NormalizeError::ZeroInterval {
-                probe: "readiness_probe"
+            NormalizeError::IntervalBelowMinimum {
+                probe: "readiness_probe",
+                value: UpDuration::from_millis(0),
+                min: MIN_READINESS_INTERVAL,
             }
         );
         // fails if the message regresses to a bare variant name with no
         // explanation — following the sibling precedent at app.rs:261.
-        assert!(err.to_string().contains("greater than 0"), "{err}");
+        assert!(err.to_string().contains("must be at least"), "{err}");
+    }
+
+    #[test]
+    fn a_liveness_interval_under_the_floor_is_rejected_rather_than_clamped() {
+        // fails if the liveness check is `interval == 0` rather than a
+        // floor. A 500ms interval survives an equality check and is then
+        // rounded UP to a full second by `spawn_liveness_task`'s own
+        // `MIN_PROBE_INTERVAL` — an app polled at half the rate its
+        // Flockfile asks for, with nothing anywhere to say so (this
+        // workspace wires no `tracing-subscriber`, so the daemon's log would
+        // not say so either). Also fails if the rejection drops the value
+        // the user wrote, which is the one number that tells them what to
+        // edit.
+        let mut app = AppConfig::minimal("web", "./srv");
+        let mut probe = probe_config("http://127.0.0.1:8080/healthz");
+        probe.interval = UpDuration::from_millis(500);
+        app.liveness_probe = Some(probe);
+        let err = normalize(app).unwrap_err();
+        assert_eq!(
+            err,
+            NormalizeError::IntervalBelowMinimum {
+                probe: "liveness_probe",
+                value: UpDuration::from_millis(500),
+                min: MIN_LIVENESS_INTERVAL,
+            }
+        );
+        assert!(err.to_string().contains("500"), "{err}");
+    }
+
+    #[test]
+    fn a_liveness_interval_exactly_at_the_floor_is_accepted() {
+        // fails if the comparison is `<=` rather than `<` — the floor is a
+        // value the liveness loop honours exactly, so naming it must not be
+        // an error (IR-40: sweep the boundary, not just past it).
+        let mut app = AppConfig::minimal("web", "./srv");
+        let mut probe = probe_config("http://127.0.0.1:8080/healthz");
+        probe.interval = MIN_LIVENESS_INTERVAL;
+        app.liveness_probe = Some(probe);
+        assert!(normalize(app).is_ok());
+    }
+
+    #[test]
+    fn a_sub_second_readiness_interval_is_accepted() {
+        // fails if both probes are validated against the liveness floor. A
+        // readiness wait is bounded by `listen_timeout` and honours its
+        // `interval` exactly as written (`await_ready` argues the case
+        // itself), so a fast app polling every 50ms to leave `starting`
+        // sooner is asking for something the daemon really does — refusing
+        // it would take a working feature away to fix a clamp that only the
+        // liveness loop has.
+        let mut app = AppConfig::minimal("web", "./srv");
+        let mut probe = probe_config("http://127.0.0.1:8080/healthz");
+        probe.interval = UpDuration::from_millis(50);
+        app.readiness_probe = Some(probe);
+        assert!(normalize(app).is_ok());
+    }
+
+    #[test]
+    fn zero_max_memory_rejected() {
+        // fails if `max_memory` is never inspected. Zero is a ceiling every
+        // live process is already over, so the enforcer breaches on its
+        // first reading and every reading after it — and the restart that
+        // follows is automatic, which RESETS the restart budget, so
+        // `max_restarts` never ends the loop.
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.max_memory = Some(crate::values::MemSize::from_bytes(0));
+        let err = normalize(app).unwrap_err();
+        assert_eq!(
+            err,
+            NormalizeError::ZeroMaxMemory {
+                name: "web".to_string()
+            }
+        );
+        // fails if the message regresses to a bare variant name with no
+        // explanation — following the sibling precedent at app.rs:261.
+        assert!(err.to_string().contains("max_memory"), "{err}");
+    }
+
+    #[test]
+    fn a_nonzero_max_memory_is_accepted() {
+        // fails if the check fires on `max_memory` being set at all rather
+        // than on its being zero — that would refuse every app that
+        // configures a limit, which is the whole feature
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.max_memory = Some("512M".parse().unwrap());
+        assert!(normalize(app).is_ok());
+    }
+
+    #[test]
+    fn zero_watch_delay_rejected() {
+        // fails if `watch_delay` is never inspected. notify's debouncer
+        // derives its poll tick as `watch_delay / 4` and sleeps it on its own
+        // OS thread, so zero is `loop { sleep(0); lock(); }` — measured at
+        // 5.98s of user CPU across a three-second watch that costs 0.00s at
+        // the 500ms default.
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.watch = true;
+        app.cwd = Some("/srv/web".to_string());
+        app.watch_delay = Some(UpDuration::from_millis(0));
+        let err = normalize(app).unwrap_err();
+        assert_eq!(
+            err,
+            NormalizeError::ZeroWatchDelay {
+                name: "web".to_string()
+            }
+        );
+        // fails if the message regresses to a bare variant name with no
+        // explanation — following the sibling precedent at app.rs:261.
+        assert!(err.to_string().contains("watch_delay"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_watch_delay_is_rejected_with_watch_off() {
+        // fails if the check is nested inside the `watch` block: an app
+        // carrying `watch_delay = "0"` with `watch = false` would normalize
+        // clean, and the spin would arrive the day someone flips `watch =
+        // true` — the same reasoning that puts the glob checks outside it
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.watch_delay = Some(UpDuration::from_millis(0));
+        assert!(matches!(
+            normalize(app).unwrap_err(),
+            NormalizeError::ZeroWatchDelay { .. }
+        ));
+    }
+
+    #[test]
+    fn a_nonzero_watch_delay_is_accepted() {
+        // fails if the check fires on `watch_delay` being set at all rather
+        // than on its being zero — that would refuse every app that tunes
+        // its own debounce
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.watch = true;
+        app.cwd = Some("/srv/web".to_string());
+        app.watch_delay = Some(UpDuration::from_millis(1));
+        assert!(normalize(app).is_ok());
     }
 
     #[test]

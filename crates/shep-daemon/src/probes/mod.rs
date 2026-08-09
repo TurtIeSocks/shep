@@ -137,9 +137,9 @@ pub trait Prober: Send + Sync + 'static {
 
 /// Floor `spawn_liveness_task` enforces on `interval`, regardless of caller.
 ///
-/// `shep-core`'s `normalize` already rejects an explicit `interval = "0"` in
-/// a Flockfile (`NormalizeError::ZeroInterval`) — but that guard lives
-/// behind boot wiring this module does not own (the same reason
+/// `shep-core`'s `normalize` already rejects any `interval` under this same
+/// value in a Flockfile (`NormalizeError::IntervalBelowMinimum`) — but that
+/// guard lives behind boot wiring this module does not own (the same reason
 /// `cron::MIN_MAX_SLEEP` keeps its own floor even though `shep-core`
 /// separately rejects a too-small `max_cron_sleep`), so it protects only the
 /// call site that reaches it, once one exists. Without a floor here too, any
@@ -147,9 +147,11 @@ pub trait Prober: Send + Sync + 'static {
 /// through the validated config — could hand this loop a `Duration::ZERO`
 /// interval and turn it into a hot spin: measured live at roughly 380 probes
 /// per second, which for `ProbeKind::Exec` is that many process spawns per
-/// second, per sheep, forever. The value matches `cron::MIN_MAX_SLEEP` in
-/// spirit; it is declared independently because that constant is private to
-/// its own module.
+/// second, per sheep, forever. The value is the same second `shep-core`'s own
+/// `MIN_PROBE_INTERVAL` rejects under, so nothing normalization accepts is
+/// ever clamped here; it is declared twice because a crate that must not
+/// depend on this one owns the other copy, exactly as `MIN_CRON_SLEEP` and
+/// `cron::MIN_MAX_SLEEP` are.
 const MIN_PROBE_INTERVAL: Duration = Duration::from_millis(1_000);
 
 /// A sheep whose liveness probe hit `failure_threshold`.
@@ -524,8 +526,8 @@ mod tests {
     // `failure_threshold = 1` by `threshold_of_one_reports_after_a_single_failure`,
     // and a zero `interval` by the case below, which also records the
     // decision taken there: a zero interval is FLOORED here and separately
-    // REJECTED by `shep-core`'s `normalize` (`NormalizeError::ZeroInterval`),
-    // never trusted as written.
+    // REJECTED by `shep-core`'s `normalize`
+    // (`NormalizeError::IntervalBelowMinimum`), never trusted as written.
     //
     // fails if the loop clamps `timeout` down to `interval` before handing it
     // to `Prober::probe` — the shape that quietly turns "give this probe five

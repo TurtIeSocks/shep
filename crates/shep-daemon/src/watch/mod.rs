@@ -98,6 +98,27 @@ use crate::watch::source::{WatchError, watch_tree};
 /// app's own `watch_delay` is preferred whenever it set one.
 pub(crate) const DEFAULT_WATCH_DELAY: Duration = Duration::from_millis(500);
 
+/// Floor the watch arming enforces on an app's own `watch_delay`.
+///
+/// `shep-core`'s `normalize` already rejects an explicit `watch_delay = "0"`
+/// (`NormalizeError::ZeroWatchDelay`), but that guard lives behind boot wiring
+/// this crate does not own — the same reason `probes::MIN_PROBE_INTERVAL` and
+/// `crate::cron::MIN_MAX_SLEEP` keep their own floors. Without one here too,
+/// any caller could hand [`spawn_watch_group`] a zero, and
+/// `notify-debouncer-full` derives its poll tick as `delay / 4` and sleeps it
+/// on a dedicated OS thread: at zero that thread becomes `loop { sleep(0);
+/// lock(); }`, measured at 5.98s of user CPU across a three-second watch that
+/// costs 0.00s at [`DEFAULT_WATCH_DELAY`].
+///
+/// One millisecond, where its two siblings are a full second, because this is
+/// a debounce rather than a polling period: a floor high enough to be a
+/// *tuning* value would silently lengthen a save-to-restart round trip the
+/// user deliberately shortened. Zero is the only value that spins — `1ms / 4`
+/// is a 250µs tick, and the thread parks on it — so this is the largest floor
+/// that fixes the spin and clamps nothing else, which is what keeps it in
+/// agreement with the rejection above rather than overruling it.
+pub(crate) const MIN_WATCH_DELAY: Duration = Duration::from_millis(1);
+
 /// Paths ignored by every watch, before `ignore_watch` is even consulted.
 ///
 /// Dot-entries cover editor swap files and `.git`'s own churn — a `git
