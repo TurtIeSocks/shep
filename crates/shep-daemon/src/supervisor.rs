@@ -61,9 +61,14 @@ const SHEEP_CTL_CAPACITY: usize = 4;
 // Public command / handle surface
 // ---------------------------------------------------------------------
 
-/// Commands the supervisor actor accepts (wrapped in `Msg::Command`).
+/// Commands the supervisor actor accepts (wrapped in [`Msg::Command`]).
+///
+/// `pub(crate)` like [`Msg`], and for the same reason: [`SupervisorHandle`] is
+/// the only door into the actor, nothing outside this crate names this type,
+/// and a public non-`#[non_exhaustive]` enum would make every new subsystem's
+/// command a semver break for a surface nobody uses.
 #[derive(Debug)]
-pub enum Command {
+pub(crate) enum Command {
     /// Registers + spawns each app's instances.
     Start {
         /// Already-validated app specs to expand into instances.
@@ -326,8 +331,8 @@ impl SupervisorHandle {
 
 /// Builds a supervisor actor.
 ///
-/// Two subsystems beyond this phase's four (dogs, metrics) are already on the
-/// roadmap, so the optional wiring goes on a builder rather than growing
+/// Two subsystems beyond the four lifecycle extras (dogs, metrics) are already
+/// on the roadmap, so the optional wiring goes on a builder rather than growing
 /// [`spawn_supervisor`] a positional parameter each time.
 #[derive(Debug)]
 pub struct SupervisorBuilder<R: ProcessRunner> {
@@ -1224,6 +1229,13 @@ impl<R: ProcessRunner> Actor<R> {
     /// running, different after every respawn):
     ///
     /// 1. NOT shutting down — a graceful shutdown forbids any new spawn.
+    ///    Defence in depth, and deliberately untested rather than tested by a
+    ///    case that cannot fail: any sheep passing guards 3 and 4 is `Online`
+    ///    with a live pid, which means `ctl.is_some()`, which means
+    ///    `begin_shutdown` already set its `manual` marker — so
+    ///    `begin_manual`'s first-command-wins dedupe would drop this restart
+    ///    even with this guard gone. It stays because that chain is four
+    ///    inferences long and none of them is this handler's to keep true.
     /// 2. The slot still existing (a `Delete` may have removed it).
     /// 3. The pid still being the one the report was raised against — a
     ///    breach for the process a crash-and-restart already replaced would
@@ -1446,11 +1458,32 @@ impl<R: ProcessRunner> Actor<R> {
     /// Disarms `id`'s lifecycle extras, and its name-group's cron worker and
     /// watch when `id` was the last armed instance of `name`.
     ///
-    /// Called from the three terminal branches — errored, deleted, cleanly
-    /// stopped — and from nowhere else. A sheep on its way to `WaitingRestart`
-    /// deliberately keeps its arming: its liveness loop is replaced by the
-    /// re-arm the respawn performs, and any report it raises in between names
-    /// a pid `handle_extra_restart`'s guard no longer recognises.
+    /// Called from **seven** sites, because a sheep reaches a terminal state
+    /// through more than one door. Adding a transition means adding a call
+    /// here; the list is the checklist:
+    ///
+    /// 1. `respawn`'s `Err` arm — a restart that could not spawn lands in
+    ///    `Errored` without ever going through `handle_exited`.
+    /// 2. `apply_immediate`'s Stop arm — a `WaitingRestart` or `Errored`
+    ///    sheep has no live task, so its stop resolves synchronously.
+    /// 3. `apply_immediate`'s Delete arm — ditto, deregistered on the spot.
+    /// 4. `handle_exited`'s duplicate-`Msg::Exited` Delete branch —
+    ///    unreachable today, honoured because the alternative is silent.
+    /// 5. `handle_exited`'s `Decision::Errored`.
+    /// 6. `handle_exited`'s `Decision::CleanStop` that deregisters.
+    /// 7. `handle_exited`'s plain `Decision::CleanStop`.
+    ///
+    /// Nothing else disarms, and nothing needs to: a sheep on its way to
+    /// `WaitingRestart` deliberately keeps its arming (its liveness loop is
+    /// replaced by the re-arm the respawn performs, and any report it raises
+    /// in between names a pid `handle_extra_restart`'s guard no longer
+    /// recognises), and the teardown of the actor itself is
+    /// [`ExtrasRegistry`]'s own `Drop` rather than a call from here — see that
+    /// impl for why the shutdown path cannot be the one that covers it.
+    ///
+    /// Re-disarming an already-disarmed id is a no-op by construction, so a
+    /// site that fires twice costs nothing and a site that is missing costs a
+    /// leaked task.
     fn disarm_extras(&mut self, id: u32, name: &str) {
         self.registry.disarm(id, name);
     }

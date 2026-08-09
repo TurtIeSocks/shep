@@ -1108,9 +1108,9 @@ mod tests {
 
     // fails if `disarm` reads "this id was not a member" as "the last member
     // just left" and tears down a group every one of whose instances is still
-    // armed — and fails if it panics on an id, or a name, it never saw. The
-    // restart at the end is what proves the group really survived, rather
-    // than merely still having a map entry.
+    // armed — and fails if it panics on a name it never saw. The restart at
+    // the end is what proves the group really survived, rather than merely
+    // still having a map entry.
     #[tokio::test(start_paused = true)]
     async fn disarming_an_id_that_was_never_armed_leaves_the_group_alone() {
         let dir = tempfile::tempdir().unwrap();

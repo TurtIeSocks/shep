@@ -130,17 +130,16 @@ pub(crate) fn harness(scripts: Vec<ProcScript>) -> Harness {
 
 /// [`harness`], with the caller deciding the extras.
 ///
-/// Takes a builder rather than a finished [`Extras`] — a deliberate departure
-/// from the brief, which declared `harness_with_extras(scripts, extras)`. The
-/// harness has to own both report RECEIVERS (that is the whole reason it can
-/// hold them: no reporter is spawned, so a test asserts the report itself
-/// rather than racing a restart it did not trigger), and a caller-built
-/// `Extras` already carries senders whose receivers the harness could not
-/// recover. Handing the caller the [`ExtrasReports`] the harness just made
-/// keeps one owner for each half — and it is load-bearing rather than
-/// cosmetic, since `PollingEnforcer` swallows its breach sender at
-/// construction, so a harness that overwrote `reports` afterwards would send
-/// breaches into a channel nobody reads.
+/// Takes a builder rather than a finished [`Extras`], and that is load-bearing
+/// rather than cosmetic. The harness has to own both report RECEIVERS — that
+/// is the whole reason it can hold them: no reporter is spawned, so a test
+/// asserts the report itself rather than racing a restart it did not trigger —
+/// and a caller-built `Extras` already carries senders whose receivers the
+/// harness could not recover. Handing the caller the [`ExtrasReports`] the
+/// harness just made keeps one owner for each half. Overwriting `reports`
+/// after the fact is not the alternative it looks like: `PollingEnforcer`
+/// swallows its breach sender at construction, so a harness that did would
+/// send breaches into a channel nobody reads.
 pub(crate) fn harness_with_extras(
     scripts: Vec<ProcScript>,
     build_extras: impl FnOnce(ExtrasReports) -> Extras,
