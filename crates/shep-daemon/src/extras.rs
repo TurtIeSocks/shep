@@ -882,6 +882,55 @@ mod tests {
         );
     }
 
+    // `InstanceExtras`' Debug is hand-rolled for the same reason `Extras`' is:
+    // `Arc<dyn LimitEnforcer>` is not Debug, and the fact worth printing is
+    // that an arming exists rather than which mechanism performed it. Pinned
+    // as an exact string in both directions (IR-41).
+    //
+    // Both halves are load-bearing. `limit_armed: true` alone cannot tell a
+    // correct `self.limit.is_some()` from a hardcoded `true`, and
+    // `limit_armed: false` alone cannot tell it from a hardcoded `false`; the
+    // inversion to `is_none()` moves the boolean either way, so it takes the
+    // armed instance AND the bare default to say the field reports its own
+    // field. The default is the honest source for the disarmed half: an
+    // instance with nothing armed never reaches the registry, since
+    // `arm_instance` returns `None` for it.
+    //
+    // The liveness loop is left unarmed on purpose. Its field is a derived
+    // `Option<JoinHandle<()>>`, and a live one renders as
+    // `Some(JoinHandle { id: Id(2) })` — a tokio-internal task counter that
+    // shifts with every task this fixture happens to spawn first, so pinning
+    // it would pin tokio's numbering rather than this crate's redaction.
+    //
+    // fails if the struct is renamed out from under its `debug_struct` (a
+    // daemon log naming a type nobody can grep for), and fails if
+    // `limit_armed` reports anything other than whether a limit is armed.
+    #[tokio::test(start_paused = true)]
+    async fn instance_extras_debug_reports_an_arming_without_naming_the_enforcer() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| app.max_memory = Some(MemSize::from_bytes(500)));
+
+        registry.arm(
+            &armed_entry(0, 0, 1000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+
+        assert_eq!(
+            format!("{:?}", registry.instances[&0]),
+            "InstanceExtras { limit_armed: true, liveness: None }"
+        );
+        assert_eq!(
+            format!("{:?}", InstanceExtras::default()),
+            "InstanceExtras { limit_armed: false, liveness: None }"
+        );
+    }
+
     // `Extras::real` is the production wiring and the only constructor `boot`
     // calls, so nothing else in this crate would notice it handing the
     // enforcer a channel of its own (`mpsc::channel(1).0` compiles and reports
