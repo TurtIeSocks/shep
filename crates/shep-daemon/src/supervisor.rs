@@ -143,6 +143,12 @@ pub(crate) enum Msg {
         id: u32,
         /// The slot's epoch when the wait began; a stale result is dropped.
         epoch: u64,
+        /// The `manually` flag the spawn this wait belongs to would have put
+        /// on its own `Online` had it not been gated. Rides along with
+        /// `epoch` (rather than being stored on the slot) because the two
+        /// answer the same question — which spawn is this? — and so cannot
+        /// drift apart.
+        manually: bool,
         /// Whether the signal arrived or the deadline elapsed.
         readiness: Readiness,
     },
@@ -457,9 +463,10 @@ impl<R: ProcessRunner> Actor<R> {
                 Msg::ReadyResult {
                     id,
                     epoch,
+                    manually,
                     readiness,
                 } => {
-                    self.handle_ready_result(id, epoch, readiness);
+                    self.handle_ready_result(id, epoch, manually, readiness);
                     false
                 }
             };
@@ -613,6 +620,10 @@ impl<R: ProcessRunner> Actor<R> {
                     Some(spawn_readiness_task(
                         id,
                         0,
+                        // A `Start` is always a caller's own doing, gated or
+                        // not, so this matches the `manually: true` the
+                        // ungated arm below emits.
+                        true,
                         source,
                         app.config().listen_timeout.as_duration(),
                         readiness_prober(&spec),
@@ -711,6 +722,11 @@ impl<R: ProcessRunner> Actor<R> {
                     Some(spawn_readiness_task(
                         id,
                         next_epoch,
+                        // Carried, not defaulted: whether this respawn was a
+                        // caller's `Restart` or the crash loop's own doing is
+                        // a fact about the respawn, and a gated app must
+                        // report it the same way the ungated arm below does.
+                        manually,
                         source,
                         app.config().listen_timeout.as_duration(),
                         readiness_prober(&spec),
@@ -1144,7 +1160,7 @@ impl<R: ProcessRunner> Actor<R> {
     /// That guard set is not boilerplate to trim: a sheep that exited and
     /// respawned while its readiness task was still waiting would otherwise
     /// have the old wait mark the new process online.
-    fn handle_ready_result(&mut self, id: u32, epoch: u64, readiness: Readiness) {
+    fn handle_ready_result(&mut self, id: u32, epoch: u64, manually: bool, readiness: Readiness) {
         if self.shutting_down {
             return;
         }
@@ -1165,7 +1181,11 @@ impl<R: ProcessRunner> Actor<R> {
             tracing::warn!(id, "readiness deadline elapsed; marking online anyway");
         }
         let info = self.set_status(id, ProcStatus::Online);
-        self.emit(ProcessEventKind::Online, info, false);
+        // `manually` comes from the spawn that armed this wait, so gating an
+        // app changes only WHEN its `Online` fires, never what the event
+        // says about who caused it: the same `shep start` reports the same
+        // flag whether or not the app configures readiness.
+        self.emit(ProcessEventKind::Online, info, manually);
     }
 
     /// Spawns the backoff timer for a scheduled restart; `None` still hops
@@ -1301,12 +1321,16 @@ fn readiness_prober(spec: &SpawnSpec) -> Arc<dyn Prober> {
 /// back through `actor_tx` as a `Msg::ReadyResult`, which
 /// `Actor::handle_ready_result` drops if `epoch` is no longer current.
 ///
+/// `manually` is carried, never inspected here: the task is a courier for
+/// the flag the deferred `Online` needs (see `Msg::ReadyResult`'s own doc).
+///
 /// Must be called from within a Tokio runtime context: it spawns the
 /// waiting task immediately, the same way `schedule_restart` already
 /// documents for itself.
 fn spawn_readiness_task(
     id: u32,
     epoch: u64,
+    manually: bool,
     source: ReadinessSource,
     deadline: Duration,
     prober: Arc<dyn Prober>,
@@ -1319,6 +1343,7 @@ fn spawn_readiness_task(
             .send(Msg::ReadyResult {
                 id,
                 epoch,
+                manually,
                 readiness,
             })
             .await;
@@ -1434,16 +1459,23 @@ mod tests {
     use crate::fake::{ProcScript, ScriptedRunner};
     use crate::testing::{probe_config, test_paths}; // the one crate-root fixture (IR-33)
 
-    // Drives virtual time by parking on recv(); returns when the id reaches `kind`.
+    /// Drives virtual time by parking on recv(); returns when the id reaches
+    /// `kind`, handing back that event's `manually` flag (most callers only
+    /// need the arrival and drop it).
     async fn await_event(
         rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
         id: u32,
         kind: ProcessEventKind,
-    ) {
+    ) -> bool {
         loop {
             match rx.recv().await {
-                Ok(BusEvent::Process { event, info, .. }) if info.id == id && event == kind => {
-                    return;
+                Ok(BusEvent::Process {
+                    event,
+                    info,
+                    manually,
+                    ..
+                }) if info.id == id && event == kind => {
+                    return manually;
                 }
                 Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1466,7 +1498,7 @@ mod tests {
     ) {
         match tokio::time::timeout(window, await_event(rx, id, kind)).await {
             Err(_elapsed) => {} // window elapsed with nothing arriving — expected
-            Ok(()) => panic!("unexpected {kind:?} for id {id} within {window:?}"),
+            Ok(_manually) => panic!("unexpected {kind:?} for id {id} within {window:?}"),
         }
     }
 
@@ -1624,6 +1656,72 @@ mod tests {
         .await
         .expect("Online once the exec probe can resolve $SHEP_INSTANCE");
         assert_eq!(handle.list().await[0].status, ProcStatus::Online);
+    }
+
+    // fails if gating an app changes its `Online` event's `manually` flag —
+    // the gate moves only WHEN that event fires, never what it says about
+    // who caused it. Both halves matter: a `Start` is the caller's doing
+    // either way, and a manual `Restart` must still say so after riding
+    // through the readiness wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_gated_apps_online_carries_the_same_manually_flag_an_ungated_one_does() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::never_exits(), // id 0: gated
+            ProcScript::never_exits(), // id 1: ungated
+            ProcScript::never_exits(), // id 0 again, after the manual restart
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut gated = AppConfig::minimal("gated", "./srv");
+        gated.wait_ready = true;
+        let ungated = AppConfig::minimal("ungated", "./srv");
+        handle
+            .start(vec![normalize(gated).unwrap(), normalize(ungated).unwrap()])
+            .await
+            .unwrap();
+
+        // The ungated app is the control: whatever it reports for a plain
+        // `Start` is what the gated one has to report too.
+        let ungated_manually = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_event(&mut rx, 1, ProcessEventKind::Online),
+        )
+        .await
+        .expect("an ungated app is Online at spawn");
+        assert!(ungated_manually, "sanity: a Start is a manual event");
+
+        handle.tx.send(Msg::Ready { id: 0 }).await.unwrap();
+        let gated_manually = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("Online once the channel signals");
+        assert_eq!(
+            gated_manually, ungated_manually,
+            "the same `shep start` must report the same flag, gated or not"
+        );
+
+        // Now the respawn path: a manual Restart's own flag has to survive
+        // the readiness wait rather than being defaulted at the far end.
+        // `restart` resolves at the respawn itself (`apply_immediate`'s
+        // `ManualKind::Restart` arm), not at Online, so a gated app's reply
+        // lands here with the new process still `Starting` — no deadlock,
+        // and nothing to signal until after this await.
+        let restarted = handle.restart(ProcessSelector::Id(0)).await.unwrap();
+        assert_eq!(restarted[0].status, ProcStatus::Starting);
+        handle.tx.send(Msg::Ready { id: 0 }).await.unwrap();
+        let restarted_manually = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("Online once the respawned sheep signals");
+        assert!(
+            restarted_manually,
+            "a manual Restart's Online must stay manual through the readiness gate"
+        );
     }
 
     // fails if a readiness timeout is treated as a spawn failure instead of
