@@ -426,6 +426,36 @@ enum ManualKind {
     Delete,
 }
 
+/// Who asked for a pending manual command. Read only by
+/// [`Actor::claim_manual`], to decide which of two racing commands owns a
+/// sheep's next exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandOrigin {
+    /// Someone asked for it: a `Stop`, `Restart` or `Delete` off the control
+    /// socket, or the daemon-wide `Shutdown`. Somebody is waiting on the
+    /// reply.
+    ///
+    /// A cron- or watch-triggered restart arrives through the very same
+    /// `Command::Restart` an operator's does, so it counts as one here — the
+    /// actor has no way to tell them apart, and both have a caller awaiting an
+    /// answer.
+    Operator,
+    /// The daemon raised it itself: a memory breach or a liveness failure,
+    /// arriving through [`SupervisorHandle::extra_restart`]. Nobody is waiting
+    /// on the reply.
+    Automatic,
+}
+
+/// The manual command that owns a sheep's next exit, and who asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingManual {
+    /// What that exit will be turned into.
+    kind: ManualKind,
+    /// Who asked. Never reaches `handle_exited`: once the sheep is down, what
+    /// the command DOES is decided entirely by its `kind`.
+    origin: CommandOrigin,
+}
+
 /// One registered instance: its lifecycle state plus a live control sender
 /// (`None` once its sheep task has ended).
 #[derive(Debug)]
@@ -434,8 +464,9 @@ struct SheepSlot {
     entry: ProcessEntry,
     /// Sender for this sheep's control mailbox; `None` when not running.
     ctl: Option<mpsc::Sender<SheepCtl>>,
-    /// Which manual command (if any) is waiting on this sheep's next exit.
-    manual: Option<ManualKind>,
+    /// Which manual command (if any) is waiting on this sheep's next exit,
+    /// and who asked for it. Claimed through [`Actor::claim_manual`].
+    manual: Option<PendingManual>,
     /// Set whenever a `Delete` targets this id, even if an earlier command
     /// already owns `manual` (adversarial finding #2 — the fix for
     /// Delete-racing-Shutdown). `manual` records who owns the next Kill;
@@ -583,7 +614,12 @@ impl<R: ProcessRunner> Actor<R> {
                 false
             }
             Command::Stop { selector, reply } => {
-                self.begin_manual(selector, ManualKind::Stop, ReplyKind::Info(reply));
+                self.begin_manual(
+                    selector,
+                    ManualKind::Stop,
+                    CommandOrigin::Operator,
+                    ReplyKind::Info(reply),
+                );
                 false
             }
             // CRITICAL-1: Restart is rejected outright once shutdown has
@@ -594,7 +630,12 @@ impl<R: ProcessRunner> Actor<R> {
                 if self.shutting_down {
                     send_reply(ReplyKind::Info(reply), Err(SupervisorError::EngineStopped));
                 } else {
-                    self.begin_manual(selector, ManualKind::Restart, ReplyKind::Info(reply));
+                    self.begin_manual(
+                        selector,
+                        ManualKind::Restart,
+                        CommandOrigin::Operator,
+                        ReplyKind::Info(reply),
+                    );
                 }
                 false
             }
@@ -603,7 +644,12 @@ impl<R: ProcessRunner> Actor<R> {
                 false
             }
             Command::Delete { selector, reply } => {
-                self.begin_manual(selector, ManualKind::Delete, ReplyKind::Ids(reply));
+                self.begin_manual(
+                    selector,
+                    ManualKind::Delete,
+                    CommandOrigin::Operator,
+                    ReplyKind::Ids(reply),
+                );
                 false
             }
             Command::Shutdown { reply } => self.begin_shutdown(reply),
@@ -889,6 +935,73 @@ impl<R: ProcessRunner> Actor<R> {
         }
     }
 
+    /// Offers `manual` the `manual` marker on a RUNNING sheep, starting its
+    /// kill ladder if nothing else already has.
+    ///
+    /// IMPORTANT-4: chosen semantics — the FIRST manual command to reach a
+    /// running sheep owns its `manual` marker and its one live Kill; a later
+    /// command racing in against the SAME in-flight kill does not overwrite
+    /// that marker or send a second Kill. It just rides the same eventual
+    /// `Msg::Exited` to whatever terminal state the FIRST command's intent
+    /// produces, so both callers get the SAME honest terminal snapshot instead
+    /// of one of them being lied to (the old last-writer-wins bug handed a
+    /// `stop()` caller back an `Online` `ProcessInfo`). A `stop()` that lands
+    /// first still wins over a racing `restart()`, and vice versa.
+    ///
+    /// With ONE carve-out, and it is not a fairness question: an operator's
+    /// command takes the marker off an in-flight AUTOMATIC restart. First
+    /// command wins is fair between two callers who are each owed an answer,
+    /// and a memory breach or a liveness failure is not one — `extra_restart`
+    /// has no reply and nobody behind it, while the operator's `stop` is the
+    /// only party waiting. Without the carve-out that `stop` came back
+    /// `Online`, having been silently converted into the restart it raced,
+    /// which is precisely the lie the rule above exists to prevent.
+    ///
+    /// Automatic-versus-automatic and operator-versus-operator both keep the
+    /// plain first-command-wins dedupe, and an automatic restart never takes
+    /// the marker off anything.
+    ///
+    /// CRITICAL-2: taking the marker over does NOT send a second Kill — the
+    /// first command's ladder is already running, and the sheep stopped
+    /// draining its ctl mailbox the moment it started. Only a sheep that had
+    /// no marker at all gets one.
+    fn claim_manual(&mut self, id: u32, manual: PendingManual) {
+        let Some(slot) = self.sheep.get_mut(&id) else {
+            return;
+        };
+        match slot.manual.map(|in_flight| in_flight.origin) {
+            // Nothing has claimed this sheep's next exit yet, so this command
+            // owns it — and starts the one kill ladder that will produce it.
+            None => {
+                slot.manual = Some(manual);
+                // CRITICAL-2: try_send, never `.await`. The sheep task stops
+                // draining its ctl mailbox the moment it starts the kill
+                // ladder, so a blocking send here could park the actor for up
+                // to `kill_timeout` — or, with the mailbox-full tail (a flood
+                // of commands after this one), deadlock forever (actor parked
+                // in `ctl.send()`, sheep parked in `actor_tx.send()`, neither
+                // drains the other). `Full`/`Closed` are both fine to ignore:
+                // a Kill already queued means the ladder is already running (a
+                // second would be redundant); `Closed` means the sheep already
+                // exited and its own `Msg::Exited` is already in flight (or
+                // about to be).
+                if let Some(ctl) = &slot.ctl {
+                    let _ = ctl.try_send(SheepCtl::Kill);
+                }
+            }
+            // The carve-out: take the marker, and leave the ladder the
+            // automatic restart already started running.
+            Some(CommandOrigin::Automatic) if manual.origin == CommandOrigin::Operator => {
+                slot.manual = Some(manual);
+            }
+            // Already claimed by an operator, or by an automatic restart this
+            // command has no standing to displace: ride that one's outcome.
+            // Both variants are named rather than wildcarded so that a third
+            // origin has to be ruled on here instead of inheriting this one.
+            Some(CommandOrigin::Operator | CommandOrigin::Automatic) => {}
+        }
+    }
+
     /// Resolves `selector`, then either defers to each matched sheep's next
     /// exit (if running) or applies the command immediately (if not).
     ///
@@ -899,7 +1012,13 @@ impl<R: ProcessRunner> Actor<R> {
     /// the last running one goes terminal too (confirmed by probe C's
     /// equivalent scenario — no code change needed there, this comment is
     /// the "why it already works").
-    fn begin_manual(&mut self, selector: ProcessSelector, kind: ManualKind, reply: ReplyKind) {
+    fn begin_manual(
+        &mut self,
+        selector: ProcessSelector,
+        kind: ManualKind,
+        origin: CommandOrigin,
+        reply: ReplyKind,
+    ) {
         let matched: Vec<u32> = self
             .sheep
             .iter()
@@ -922,41 +1041,10 @@ impl<R: ProcessRunner> Actor<R> {
         for id in matched {
             let is_running = self.sheep.get(&id).is_some_and(|slot| slot.ctl.is_some());
             if is_running {
-                // IMPORTANT-4: chosen semantics — the FIRST manual command
-                // to reach a running sheep owns its `manual` marker and its
-                // one live Kill; a later command racing in against the SAME
-                // in-flight kill (this sheep already has `manual.is_some()`)
-                // does not overwrite that marker or send a second Kill — it
-                // just joins `remaining` and rides the same eventual
-                // Msg::Exited to whatever terminal state the FIRST command's
-                // intent produces. A `stop()` that lands first still wins
-                // over a racing `restart()`, and vice versa; both callers
-                // get the SAME honest terminal snapshot instead of one of
-                // them being lied to (the old last-writer-wins bug handed a
-                // `stop()` caller back an `Online` `ProcessInfo`).
-                let already_in_flight = self
-                    .sheep
-                    .get(&id)
-                    .is_some_and(|slot| slot.manual.is_some());
-                if !already_in_flight {
-                    let slot = self.sheep.get_mut(&id).expect("checked is_running above");
-                    slot.manual = Some(kind);
-                    // CRITICAL-2: try_send, never `.await`. The sheep task
-                    // stops draining its ctl mailbox the moment it starts
-                    // the kill ladder, so a blocking send here could park
-                    // the actor for up to `kill_timeout` — or, with the
-                    // mailbox-full tail (a flood of commands after this
-                    // one), deadlock forever (actor parked in `ctl.send()`,
-                    // sheep parked in `actor_tx.send()`, neither drains the
-                    // other). `Full`/`Closed` are both fine to ignore: a
-                    // Kill already queued means the ladder is already
-                    // running (a second would be redundant); `Closed` means
-                    // the sheep already exited and its own `Msg::Exited` is
-                    // already in flight (or about to be).
-                    if let Some(ctl) = &slot.ctl {
-                        let _ = ctl.try_send(SheepCtl::Kill);
-                    }
-                }
+                // Whoever ends up owning the marker (see `claim_manual`), this
+                // id joins `remaining` below and this command is answered off
+                // the same eventual Msg::Exited.
+                self.claim_manual(id, PendingManual { kind, origin });
                 if kind == ManualKind::Delete {
                     // Regardless of which command's `manual` marker won,
                     // this id must still be deregistered once it goes
@@ -1062,23 +1150,18 @@ impl<R: ProcessRunner> Actor<R> {
         }
 
         for &id in &online {
-            // Same first-command-wins dedupe as `begin_manual` (IMPORTANT-4):
-            // an id already mid-kill from an earlier Stop/Restart/Delete
-            // keeps that command's `manual` marker and doesn't get a
-            // redundant Kill — it still joins `remaining` below either way.
-            let already_in_flight = self
-                .sheep
-                .get(&id)
-                .is_some_and(|slot| slot.manual.is_some());
-            if !already_in_flight {
-                let slot = self.sheep.get_mut(&id).expect("checked online above");
-                slot.manual = Some(ManualKind::Stop);
-                // CRITICAL-2: try_send — see `begin_manual` for why this
-                // must never be a blocking `.await`.
-                if let Some(ctl) = &slot.ctl {
-                    let _ = ctl.try_send(SheepCtl::Kill);
-                }
-            }
+            // Same marker rule as `begin_manual` (IMPORTANT-4): an id already
+            // mid-kill from an earlier operator Stop/Restart/Delete keeps that
+            // command's `manual` marker and doesn't get a redundant Kill,
+            // while one held by an automatic restart is taken over. It joins
+            // `remaining` below either way.
+            self.claim_manual(
+                id,
+                PendingManual {
+                    kind: ManualKind::Stop,
+                    origin: CommandOrigin::Operator,
+                },
+            );
         }
 
         self.pending.push(PendingReply {
@@ -1100,7 +1183,10 @@ impl<R: ProcessRunner> Actor<R> {
         };
         slot.ctl = None;
         slot.entry.pid = None;
-        let manual = slot.manual.take();
+        // Only the KIND survives into this function: once the sheep is down,
+        // what its owning command does to it is decided entirely by that, and
+        // every branch below reads it exactly as it did before origins existed.
+        let manual = slot.manual.take().map(|pending| pending.kind);
         let pending_delete = std::mem::take(&mut slot.pending_delete);
         let Some(started_at) = slot.entry.started_at.take() else {
             // MINOR-7: shouldn't happen (a duplicate Msg::Exited would
@@ -1233,9 +1319,10 @@ impl<R: ProcessRunner> Actor<R> {
     ///    case that cannot fail: any sheep passing guards 3 and 4 is `Online`
     ///    with a live pid, which means `ctl.is_some()`, which means
     ///    `begin_shutdown` already set its `manual` marker — so
-    ///    `begin_manual`'s first-command-wins dedupe would drop this restart
-    ///    even with this guard gone. It stays because that chain is four
-    ///    inferences long and none of them is this handler's to keep true.
+    ///    `claim_manual` would drop this restart even with this guard gone (an
+    ///    automatic restart never takes a marker over, least of all an
+    ///    operator's). It stays because that chain is four inferences long and
+    ///    none of them is this handler's to keep true.
     /// 2. The slot still existing (a `Delete` may have removed it).
     /// 3. The pid still being the one the report was raised against — a
     ///    breach for the process a crash-and-restart already replaced would
@@ -1248,10 +1335,13 @@ impl<R: ProcessRunner> Actor<R> {
     ///    user explicitly stopped and report success.
     ///
     /// Delegates to `begin_manual` rather than `respawn`: that keeps the kill
-    /// ladder, the first-command-wins dedupe, the `pending_delete` interaction
-    /// and the budget reset intact. A breaching sheep is normally `Online`
-    /// with a live pid, so respawning it directly would put two live pids on
-    /// one instance.
+    /// ladder, the marker rule, the `pending_delete` interaction and the budget
+    /// reset intact. A breaching sheep is normally `Online` with a live pid, so
+    /// respawning it directly would put two live pids on one instance.
+    ///
+    /// It goes in as [`CommandOrigin::Automatic`], which is what lets an
+    /// operator's `stop` or `delete` take the sheep back off a restart already
+    /// mid-ladder — see `claim_manual`.
     fn handle_extra_restart(&mut self, id: u32, pid: u32) {
         if self.shutting_down {
             tracing::debug!(id, pid, "extra restart dropped: engine is shutting down");
@@ -1286,6 +1376,7 @@ impl<R: ProcessRunner> Actor<R> {
         self.begin_manual(
             ProcessSelector::Id(id),
             ManualKind::Restart,
+            CommandOrigin::Automatic,
             ReplyKind::Info(reply),
         );
     }
@@ -2604,11 +2695,20 @@ mod tests {
     }
 
     // IMPORTANT-4 (probe I): Stop and Restart racing on the same running
-    // sheep. Chosen semantics (see `begin_manual`'s doc comment): the first
+    // sheep. Chosen semantics (see `claim_manual`'s doc comment): the first
     // command to reach a running sheep owns its `manual` marker and its one
     // live Kill; both callers get back the SAME honest terminal snapshot
     // once it lands, instead of the old last-writer-wins bug handing the
     // `stop()` caller an `Online` `ProcessInfo`.
+    //
+    // This is also the fence around the carve-out that
+    // `an_operators_stop_beats_an_automatic_restart_mid_ladder` covers: BOTH
+    // commands here have a caller awaiting an answer, so neither may displace
+    // the other.
+    //
+    // fails if `claim_manual`'s carve-out widens to operator-versus-operator:
+    // the later `restart` would take the marker off the earlier `stop`, respawn
+    // the sheep, and hand the `stop()` caller an `Online` snapshot again.
     #[tokio::test(start_paused = true)]
     async fn overlapping_stop_and_restart_agree_on_one_outcome() {
         let (events, _rx) = tokio::sync::broadcast::channel(1024);
@@ -2732,7 +2832,7 @@ mod tests {
     // Adversarial finding #2 (whole-branch review, Task 9): a `Delete` that
     // lands on an id AFTER `begin_shutdown` already claimed it (set
     // `manual = Some(Stop)`, first-command-wins per IMPORTANT-4) used to hit
-    // `begin_manual`'s `already_in_flight` branch and only join `remaining`
+    // `claim_manual`'s already-claimed path and only join `remaining`
     // -- it never got a chance to mark its OWN intent anywhere. When the
     // sheep went terminal, `handle_exited` only deregistered on
     // `manual == Some(ManualKind::Delete)` (false here: it's `Stop`), so the
@@ -2803,8 +2903,10 @@ mod tests {
     // whenever `manual == Some(Restart)`, ignoring `pending_delete`
     // entirely. Reachable exactly like the Shutdown race: `Restart(id)`
     // claims `slot.manual = Some(Restart)` on a running sheep; a racing
-    // `Delete(id)` hits `already_in_flight`, correctly sets
-    // `pending_delete = true`, but never touches `manual`. Worse than the
+    // `Delete(id)` finds the marker already claimed by another operator
+    // command, correctly sets `pending_delete = true`, but never touches
+    // `manual` -- the carve-out for an AUTOMATIC restart does not apply, and
+    // that is the whole point of keeping this path working. Worse than the
     // original bug: instead of leaving a stale `Stopped` entry behind, this
     // one respawned a BRAND-NEW LIVE PROCESS while still telling the
     // `Delete` caller it succeeded.
@@ -2851,6 +2953,101 @@ mod tests {
             "a Delete that raced a Restart must still deregister the sheep, \
              not respawn a brand-new live process while telling its caller \
              the sheep was deleted"
+        );
+    }
+
+    // An automatic restart — a memory breach or a liveness failure, arriving
+    // through `extra_restart` — is mid-kill-ladder when an operator's `stop`
+    // lands on the same sheep. The operator's intent wins: the sheep ends
+    // `Stopped`, never respawned, and `stop()` reports that honestly.
+    //
+    // The counterpart of `overlapping_stop_and_restart_agree_on_one_outcome`:
+    // the same race, on the other side of the carve-out. `extra_restart` is
+    // the only command with no reply, which is what lets it still be in flight
+    // when the next command arrives without a second task holding it there.
+    //
+    // fails if `claim_manual` stops letting an operator's command take the
+    // `manual` marker off an automatic restart: the restart keeps the marker,
+    // `handle_exited` respawns, and `stop()` hands its caller an `Online`
+    // snapshot of a sheep that is genuinely back up with `restarts: 1`.
+    #[tokio::test(start_paused = true)]
+    async fn an_operators_stop_beats_an_automatic_restart_mid_ladder() {
+        let (events, _rx) = tokio::sync::broadcast::channel(1024);
+        // Two scripts is the most this test can demand: the sheep itself, plus
+        // the one respawn a broken implementation performs. Sized for that
+        // second spawn on purpose -- a pool of one would answer it
+        // `SpawnFailed("script exhausted")`, landing the bug in `Errored`
+        // instead of the `Online` that shows how bad it is.
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::ignores_signals(), // 1600ms ladder: a wide race window
+            ProcScript::never_exits(),     // the respawn a broken implementation performs
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let app = AppConfig::minimal("svc", "./svc");
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        let running = handle.list().await.remove(0);
+        let pid = running.pid.expect("an online sheep has a pid");
+
+        // Both sends land in the same mailbox in this order, so the actor sets
+        // the restart's marker and starts its ladder before it ever sees the
+        // stop -- no second task and no yielding needed.
+        handle.extra_restart(running.id, pid).await;
+        let stopped = handle.stop(ProcessSelector::All).await.unwrap();
+
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].id, running.id);
+        assert_eq!(
+            (stopped[0].status, stopped[0].restarts),
+            (ProcStatus::Stopped, 0),
+            "an operator's stop was silently converted into the automatic \
+             restart it raced -- got {stopped:?}"
+        );
+        let listed = handle.list().await;
+        assert_eq!(
+            (listed[0].status, listed[0].pid),
+            (ProcStatus::Stopped, None),
+            "the sheep an operator stopped is running again -- got {listed:?}"
+        );
+    }
+
+    // The `Delete` sibling of the test above: an operator's `delete` racing the
+    // same in-flight automatic restart deregisters the sheep instead of respawning
+    // it. Deliberately belt-and-braces — both `claim_manual`'s carve-out and
+    // `pending_delete` independently produce this outcome, which is why it
+    // takes disabling both to redden this test.
+    //
+    // fails if `handle_exited`'s terminal branch stops honouring delete intent
+    // (the `Decision::CleanStop if manual == Some(ManualKind::Delete) ||
+    // pending_delete` guard): the sheep stays registered as `Stopped` while
+    // the `delete()` caller is told it was deleted.
+    #[tokio::test(start_paused = true)]
+    async fn an_operators_delete_beats_an_automatic_restart_mid_ladder() {
+        let (events, _rx) = tokio::sync::broadcast::channel(1024);
+        // Two, for the same reason as above: the sheep, plus the respawn a
+        // broken implementation performs behind the delete's back.
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::ignores_signals(),
+            ProcScript::never_exits(),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let app = AppConfig::minimal("svc", "./svc");
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        let running = handle.list().await.remove(0);
+        let pid = running.pid.expect("an online sheep has a pid");
+
+        handle.extra_restart(running.id, pid).await;
+        let deleted = handle
+            .delete(ProcessSelector::Id(running.id))
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, vec![running.id]);
+        assert!(
+            handle.list().await.is_empty(),
+            "a delete that raced an automatic restart must still deregister \
+             the sheep, not leave one behind for the restart to bring back"
         );
     }
 
@@ -3046,19 +3243,14 @@ mod tests {
                 let mut highest_restarts = std::collections::HashMap::<u32, u32>::new();
                 // `extra_restart` is the one command with no reply, which
                 // makes it the only one this driver cannot await -- and
-                // therefore the only way a manual action can still be
-                // mid-kill-ladder when the NEXT step is issued. While one is,
-                // `begin_manual`'s first-command-wins dedupe gives the restart
-                // the sheep's `manual` marker, so a `stop` that arrives behind
-                // it resolves to the RESTART's outcome and its caller is
-                // handed an `Online` snapshot of a sheep that is genuinely
-                // back up: an operator's stop, silently converted into a
-                // restart. That is a real defect, reported rather than
-                // asserted away here. The strong claim below still holds
-                // everywhere a report is NOT in flight, which is where it was
-                // always the interesting one, and the relaxed form still
-                // forbids a reply sent mid-ladder.
-                let mut report_in_flight = false;
+                // therefore the only way a restart can still be
+                // mid-kill-ladder when the NEXT step is issued. `Step::StopAll`
+                // below keeps its strong claim across that interleaving
+                // because an operator's command takes the `manual` marker off
+                // an automatic restart (see `claim_manual`): without that
+                // carve-out, a `stop` landing behind a report resolved to the
+                // RESTART's outcome and handed its caller an `Online` snapshot
+                // of a sheep that was genuinely back up.
 
                 for step in steps {
                     match step {
@@ -3075,35 +3267,14 @@ mod tests {
                         Step::StopAll => {
                             if let Ok(stopped) = handle.stop(ProcessSelector::All).await {
                                 for info in stopped {
-                                    if report_in_flight {
-                                        // Still terminal-or-respawned, never a
-                                        // reply sent mid-ladder: `Stopping` and
-                                        // `WaitingRestart` stay excluded even
-                                        // under the defect above.
-                                        proptest::prop_assert!(
-                                            matches!(
-                                                info.status,
-                                                ProcStatus::Stopped | ProcStatus::Errored
-                                                    | ProcStatus::Online | ProcStatus::Starting
-                                            ),
-                                            "stop() replied with {:?} for id {}",
-                                            info.status,
-                                            info.id
-                                        );
-                                    } else {
-                                        // A deferred reply means every match is
-                                        // terminal.
-                                        proptest::prop_assert_eq!(info.status, ProcStatus::Stopped);
-                                    }
+                                    // A deferred reply means every match is
+                                    // terminal.
+                                    proptest::prop_assert_eq!(info.status, ProcStatus::Stopped);
                                 }
                             }
-                            // Awaiting the reply above resolved whatever was in
-                            // flight behind it.
-                            report_in_flight = false;
                         }
                         Step::RestartAll => {
                             let _ = handle.restart(ProcessSelector::All).await;
-                            report_in_flight = false;
                         }
                         Step::DeleteFirst => {
                             if let Some(first) = handle.list().await.first() {
@@ -3115,14 +3286,12 @@ mod tests {
                                     handle.list().await.iter().all(|i| i.id != id)
                                 );
                             }
-                            report_in_flight = false;
                         }
                         Step::Report => {
                             if let Some(first) = handle.list().await.first()
                                 && let Some(pid) = first.pid
                             {
                                 handle.extra_restart(first.id, pid).await;
-                                report_in_flight = true;
                             }
                         }
                         Step::StaleReport => {
