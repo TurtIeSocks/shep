@@ -21,10 +21,15 @@
 //! - **A laptop suspend, or an NTP step forward.** The worker wakes, reads
 //!   the clock, and asks the schedule for the next occurrence *after now*.
 //!   Occurrences that passed while it was asleep are gone.
-//! - **A DST shift, or a step backward.** Same answer, from the same
-//!   question. The schedule is evaluated in its own zone, so an occurrence
-//!   skipped by a spring-forward does not fire, and one repeated by a
-//!   fall-back can fire twice — that is what the wall-clock pattern means.
+//! - **A DST shift, or a step backward.** Same question, same answer, and
+//!   the schedule is evaluated in its own zone rather than in UTC. An
+//!   occurrence falling in a spring-forward gap lands on the first valid
+//!   instant after the gap if the pattern names a fixed time, and is skipped
+//!   if it is a wildcard or interval; a fall-back's repeated hour resolves to
+//!   one instant rather than firing on both passes. All three are pinned by
+//!   `shep_core::config::CronSchedule`'s own tests, and its `next_after` doc
+//!   carries the one corner where two successive searches can return the same
+//!   wall-clock occurrence.
 //!
 //! **A missed occurrence is never replayed**, and this is a choice rather
 //! than a limitation. Replaying means a daemon that was asleep for six
