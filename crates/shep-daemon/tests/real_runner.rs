@@ -154,6 +154,20 @@ const REAP_DEADLINE: Duration = Duration::from_secs(5);
 /// Fires ONLY while panicking: on the success path the test has already
 /// proven these pids are gone, and signalling a pid the OS may since have
 /// recycled is a hazard rather than a safety net.
+///
+/// SIGKILLs the whole process GROUP (`-pid`, not `pid`), modelled on
+/// `daemon_e2e.rs`'s `Fixture::drop`, which has done so all along and states
+/// the reason: `TokioRunner` spawns every child as its own group leader, so
+/// the group signal also reaches a forked `sleep` grandchild that a
+/// leader-only signal misses. A leader-only `Reaper` agreed with its sibling
+/// on the happy path of
+/// [`a_graceful_stop_reaches_a_forked_grandchild`] only because that test
+/// pushes its grandchild's pid explicitly — and a panic anywhere between the
+/// spawn and that push (the group-leader assertion and the five-second wait
+/// for the wrapper's `echo $!` both live in that window) left an untracked
+/// `sleep` behind with nothing tracking it. That same test asserts the
+/// leader property this signal depends on, so `-pid` is safe exactly where it
+/// is needed.
 struct Reaper(Vec<i32>);
 
 impl Drop for Reaper {
@@ -163,7 +177,7 @@ impl Drop for Reaper {
         }
         for &pid in &self.0 {
             let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
+                nix::unistd::Pid::from_raw(-pid),
                 nix::sys::signal::Signal::SIGKILL,
             );
         }
