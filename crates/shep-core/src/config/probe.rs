@@ -28,7 +28,7 @@ pub enum ProbeTarget {
         /// The host or IP literal. A bracketed IPv6 literal (`[::1]`) has
         /// its brackets stripped.
         ///
-        /// Carried for Task 8 (the prober): connect with
+        /// Carried for the prober: connect with
         /// `(host.as_str(), port)`, not by formatting `"{host}:{port}"`
         /// into a `SocketAddr` parse — a stripped IPv6 literal has no
         /// brackets to make that string parseable. For the RFC 7230
@@ -51,7 +51,7 @@ pub enum ProbeTarget {
         /// The host or IP literal. A bracketed IPv6 literal (`[::1]`) has
         /// its brackets stripped.
         ///
-        /// Carried for Task 8 (the prober): connect with
+        /// Carried for the prober: connect with
         /// `(host.as_str(), port)`, not by formatting `"{host}:{port}"`
         /// into a `SocketAddr` parse — a stripped IPv6 literal has no
         /// brackets to make that string parseable.
@@ -801,8 +801,8 @@ mod tests {
         // The odd spelling that happened to resolve before this round of
         // fixes (splitting on the last colon put "::1" in the host and
         // "5432" in the port) is now rejected instead: an embedded `:`
-        // outside brackets is exactly what Minor 3's validate_host rejects
-        // everywhere else, and the carried Task 8 note only adjudicates the
+        // outside brackets is exactly what `validate_host` rejects
+        // everywhere else, and the carried prober note only adjudicates the
         // *bracketed* spelling correct. Closing this loophole means the
         // ambiguous form now fails loudly at config time instead of
         // resolving by accident.

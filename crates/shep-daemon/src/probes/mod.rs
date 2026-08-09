@@ -62,8 +62,8 @@ pub enum ProbeFailure {
 /// report, ever. This is an accepted design risk, not a defect (bounding
 /// every code path by `timeout` needs implementation-specific knowledge,
 /// e.g. a connect timeout versus a read timeout, that this seam has no
-/// business dictating) — but any implementor (`OsProber`, Task 8, chief
-/// among them) must itself guarantee `probe` resolves within `timeout` on
+/// business dictating) — but any implementor ([`os::OsProber`] chief among
+/// them) must itself guarantee `probe` resolves within `timeout` on
 /// every path, or a hung sheep's liveness detection silently stops working.
 pub trait Prober: Send + Sync + 'static {
     /// Probes `target`, giving up after `timeout`.
@@ -150,8 +150,8 @@ pub fn spawn_liveness_task(
                 Err(_failure) => {
                     consecutive_failures += 1;
                     if consecutive_failures >= threshold {
-                        // The receiver may already be gone (Task 12's
-                        // reporting task shut down alongside the engine);
+                        // The receiver may already be gone (the reporting
+                        // task shut down alongside the engine);
                         // this loop's job ends either way, so the send
                         // result is intentionally discarded rather than
                         // branched on.
@@ -294,8 +294,7 @@ mod tests {
         // `prober.probe(&target, ..)` — e.g. `interval` where `timeout`
         // belongs, or `Duration::ZERO` — since nothing else exercises this
         // parameter: `ScriptedProber` ignores it for every other purpose,
-        // and `OsProber` (Task 8) is tested standalone, never through this
-        // loop.
+        // and `OsProber` is tested standalone, never through this loop.
         assert_eq!(
             prober.last_timeout(),
             timeout,

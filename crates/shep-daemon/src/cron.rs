@@ -397,7 +397,7 @@ mod tests {
     async fn exhausted_pattern_ends_the_task_without_restarting() {
         let (handle, mut rx, _dir) = spawn_test_fixture();
         let name = "web";
-        // 30 February never occurs — Task 1's own "never matches" fixture.
+        // 30 February never occurs — the canonical "never matches" pattern.
         let schedule = CronSchedule::parse("0 0 30 2 *", None).unwrap();
         let clock = Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z")));
         let worker =

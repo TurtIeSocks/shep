@@ -496,7 +496,8 @@ mod tests {
         );
     }
 
-    // The first of Task 2's two IPv6 obligations, isolated from the network
+    // The first of the two IPv6 obligations `ProbeTarget`'s `host` doc
+    // records, isolated from the network
     // so it holds on a machine with no IPv6 at all: `ProbeTarget` strips the
     // brackets off `[::1]` at parse time, and `Host: ::1` without them back
     // reads as colon-separated fields rather than one address.
@@ -512,7 +513,7 @@ mod tests {
         assert_eq!(host_header("localhost", 9000), "localhost:9000");
     }
 
-    // Both of Task 2's IPv6 obligations at once, end to end: the connect uses
+    // Both IPv6 obligations at once, end to end: the connect uses
     // the bracket-STRIPPED host (formatting `"{host}:{port}"` into a
     // `SocketAddr` parse is what fails, since there are no brackets left to
     // make that string parseable), and the header gets them back.

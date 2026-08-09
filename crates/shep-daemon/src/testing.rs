@@ -203,7 +203,7 @@ impl MemorySampler for ScriptedSampler {
 // followed by a pass that resets the consecutive-failure counter — and a
 // `probe()` that always returns the same value cannot express that. Unlike
 // `ScriptedSampler`, an empty script is not a fixture bug: `harness` wires
-// one by default and Task 7's own dyn-compatibility line constructs one, so
+// one by default and the `Prober` dyn-compatibility test constructs one, so
 // `new(vec![])` has to mean something rather than panic. It means "never
 // fails" — the neutral value for a prober nobody scripted, exactly as an
 // empty `ScriptedSampler` table means "a machine with no visible processes."
