@@ -1197,6 +1197,67 @@ mod tests {
         );
     }
 
+    // The watch twin of the case above, and it needs to exist separately: the
+    // gate is two independent conditions, so a watch half narrowed to
+    // `group.watch.is_none()` leaves the cron case — and every other
+    // assertion in this file — perfectly green while an app that ended its
+    // watch stays unwatched forever. fails if that half stops asking whether
+    // the handle is ALIVE rather than merely present.
+    //
+    // The ending is forced with `abort` rather than by killing the
+    // `WatchSource` the loop really returns on. That source dies with the
+    // debouncer's own OS thread, which nothing available to a test reaches —
+    // deleting the watched tree does not close it — and both leave the map in
+    // the one state the gate reads: a finished handle.
+    //
+    // The save at the end is what makes the claim behavioural rather than
+    // structural. A rebuilt watch has to have re-registered a real OS watcher
+    // on the root; replacing the handle alone would restart nothing.
+    //
+    // Real time and a real filesystem, like every case that drives notify.
+    // Twelve scripts against two spawns: the start, and the save's restart.
+    #[tokio::test]
+    async fn a_watch_that_ended_on_its_own_is_rebuilt_on_the_next_arm() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = test_paths(&home);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+            app.watch_delay = Some(UpDuration::from_millis(
+                real_time::TEST_DELAY.as_millis() as u64
+            ));
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+
+        registry.arm(
+            &armed_entry(0, 0, 1000, app.clone(), &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+        let armed = registry.groups["web"]
+            .watch
+            .as_ref()
+            .expect("the first arm registers a watcher");
+        armed.abort();
+        settle_finished(armed).await;
+
+        registry.arm(
+            &armed_entry(0, 0, 2000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+
+        touch(root.path(), "trigger.txt").unwrap();
+        let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
+        assert_eq!(info.restarts, 1);
+    }
+
     // fails if group membership is recorded from what an arming managed to
     // BUILD rather than from what the app CONFIGURED. This app asks for a
     // watch and gets none — its cwd does not resolve — so under the
@@ -1302,6 +1363,65 @@ mod tests {
             "only the registry that is still alive may report"
         );
         assert_no_liveness_within(&mut rig.liveness, interval * 3).await;
+    }
+
+    // fails if `Drop` aborts the per-instance extras and leaves the name-group
+    // tasks running (`group.abort()` replaced by a discard). This is the half
+    // the whole `Drop` argument rests on: a `WaitingRestart` sheep holds no
+    // live task, so `begin_shutdown` never kills it and `handle_exited` never
+    // runs its terminal branches — its name group's cron worker outlives the
+    // actor. A dropped `JoinHandle` detaches its task rather than cancelling
+    // it, so that worker goes on restarting a name whose engine is gone.
+    //
+    // Two NAMES, not two instances of one: the bus attributes a restart to a
+    // name and never to the registry that armed the worker, so the control
+    // and the subject have to be tellable apart on the wire. `kept` is that
+    // control — it proves a worker on this very schedule really does fire, so
+    // the silence demanded of `dropped` could have failed.
+    //
+    // Twelve scripts against six spawns at worst: two starts, `kept`'s two
+    // occurrences, and — under the broken implementation — `dropped`'s two.
+    // The surviving worker needs something to respawn from, since an
+    // exhausted script makes the supervisor emit `Errored` rather than the
+    // `Restart` the negative helper matches on.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_registry_stops_the_name_group_worker_it_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let hourly = |name: &str| {
+            app_with(name, |app| {
+                app.cron_restart = Some("0 * * * *".to_string());
+            })
+        };
+        handle
+            .start(vec![hourly("kept"), hourly("dropped")])
+            .await
+            .unwrap();
+
+        let mut kept = ExtrasRegistry::default();
+        kept.arm(
+            &armed_entry(0, 0, 1000, hourly("kept"), &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+        let mut discarded = ExtrasRegistry::default();
+        discarded.arm(
+            &armed_entry(1, 0, 1001, hourly("dropped"), &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+        // Lets both workers commit to their first `next` while the clock still
+        // reads close to now — `advance` jumps first and polls after.
+        tokio::task::yield_now().await;
+        drop(discarded);
+
+        cross_one_hour().await;
+        expect_restart(&mut rx, "kept", EVENT_WAIT).await;
+        assert_no_restart_within(&mut rx, "dropped", PAST_THE_NEXT_OCCURRENCE).await;
     }
 
     // fails if `disarm` does not abort the liveness loop it armed. A healthy

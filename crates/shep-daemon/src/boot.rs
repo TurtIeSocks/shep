@@ -501,7 +501,7 @@ pub struct BootOptions {
 pub async fn boot<R: ProcessRunner>(
     runner: R,
     paths: ShepPaths,
-    options: BootOptions,
+    mut options: BootOptions,
 ) -> Result<RunningDaemon, BootError> {
     // 1. Install signal handlers before the socket (or anything else
     //    observable) exists — see this fn's own doc.
@@ -525,8 +525,11 @@ pub async fn boot<R: ProcessRunner>(
     // 3. Report readiness now that the socket is bound. `options.ready_fd`
     //    is already an owned File adopted by the caller — see this fn's
     //    own doc and `BootOptions::ready_fd`'s doc — so this is nothing
-    //    more than a write.
-    if let Some(pipe) = options.ready_fd {
+    //    more than a write. TAKEN out of `options` rather than moved out of
+    //    it: a partial move would leave the struct unborrowable, and the
+    //    steps below hand it whole to `max_cron_sleep` precisely so no call
+    //    site here decides which field that default applies to.
+    if let Some(pipe) = options.ready_fd.take() {
         let ready = DaemonReady {
             pid,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -543,7 +546,7 @@ pub async fn boot<R: ProcessRunner>(
             breaches: breach_tx,
             liveness: live_tx,
         },
-        max_cron_sleep(options.max_cron_sleep),
+        max_cron_sleep(&options),
     );
     let supervisor = SupervisorBuilder::new(runner, paths.clone(), events.clone())
         .extras(extras)
@@ -601,16 +604,24 @@ pub async fn boot<R: ProcessRunner>(
     })
 }
 
-/// The cron sleep bound this boot runs with: `configured`, or
-/// [`DEFAULT_MAX_CRON_SLEEP`] when `shep.toml` named none.
+/// The cron sleep bound this boot runs with: [`BootOptions::max_cron_sleep`],
+/// or [`DEFAULT_MAX_CRON_SLEEP`] when `shep.toml` named none.
 ///
 /// A named function rather than an `unwrap_or` inline in [`boot`] only so the
 /// application has a seam a test can stand on. It is still the ONE place that
 /// constant is applied, and a second application anywhere else is how two
 /// supposedly identical constants drift apart: `shep-core` carries the floor
 /// and never the default, the daemon carries the default and never the floor.
-fn max_cron_sleep(configured: Option<Duration>) -> Duration {
-    configured.unwrap_or(DEFAULT_MAX_CRON_SLEEP)
+///
+/// It reads the whole [`BootOptions`] rather than the one field because the
+/// field is what [`boot`] would otherwise have to pick out, and picking the
+/// wrong one there is a mistake no test in this crate could catch: the only
+/// behavioural trace `max_cron_sleep` leaves is how often a cron worker wakes,
+/// and a wakeup is observable only through the [`Clock`](crate::cron::Clock)
+/// seam that [`Extras::real`] fixes to the system clock. Reading the struct
+/// here leaves nothing at the call site to get wrong.
+fn max_cron_sleep(options: &BootOptions) -> Duration {
+    options.max_cron_sleep.unwrap_or(DEFAULT_MAX_CRON_SLEEP)
 }
 
 /// Reads the muster roll (if one exists) and starts every app it restores.
@@ -1625,16 +1636,25 @@ mod tests {
     // its own test pins that — so nothing else in this workspace would notice
     // a different fallback landing here. fails if the default is replaced (a
     // stray `Duration::from_secs(1)` would have every cron worker in the
-    // daemon waking a minute more often than the constant says).
+    // daemon waking a minute more often than the constant says), and fails if
+    // the configured value is dropped for one of `max_cron_sleep`'s own
+    // invention.
+    //
+    // Whole `BootOptions` values rather than bare `Option`s, because that is
+    // what `boot` hands over: the field this reads is the field the daemon
+    // runs with, with no projection in between for a call site to get wrong.
     #[test]
     fn an_unset_max_cron_sleep_falls_back_to_the_daemons_own_default() {
         assert_eq!(
-            max_cron_sleep(BootOptions::default().max_cron_sleep),
+            max_cron_sleep(&BootOptions::default()),
             DEFAULT_MAX_CRON_SLEEP,
             "unset means the default"
         );
         assert_eq!(
-            max_cron_sleep(Some(Duration::from_secs(300))),
+            max_cron_sleep(&BootOptions {
+                max_cron_sleep: Some(Duration::from_secs(300)),
+                ..BootOptions::default()
+            }),
             Duration::from_secs(300),
             "a configured value must reach the workers unchanged"
         );
