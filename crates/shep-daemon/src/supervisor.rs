@@ -1304,7 +1304,7 @@ impl<R: ProcessRunner> Actor<R> {
             );
             // Deregistration is NOT reachable here today: `pending_delete`
             // is only ever set for a sheep whose `ctl.is_some()` (see the
-            // `is_running` gate in `apply_manual`), which implies a live
+            // `is_running` gate in `begin_manual`), which implies a live
             // task and therefore `started_at.is_some()`; and the ONE exit
             // that consumes the flag removes the slot outright, so a second
             // `Msg::Exited` for that id lands in the unregistered-id branch
@@ -1980,7 +1980,7 @@ mod tests {
         }
     }
 
-    // --- Task 9: the readiness gate ---
+    // --- The readiness gate ---
 
     // fails if a `wait_ready` app reaches Online at spawn instead of waiting
     // on the shepherd channel's ready signal
@@ -2008,7 +2008,7 @@ mod tests {
         // `supervisor`, so this reaches the actor exactly where the sheep
         // task's forwarded `ChildMessage::Ready` would — that forwarding
         // itself is pre-existing, unchanged code (`run_sheep`'s
-        // `from_child.recv()` arm), not this task's own surface.
+        // `from_child.recv()` arm), not the readiness gate's own surface.
         handle.tx.send(Msg::Ready { id: 0 }).await.unwrap();
 
         tokio::time::timeout(

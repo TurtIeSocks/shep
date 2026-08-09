@@ -553,6 +553,19 @@ pub async fn boot<R: ProcessRunner>(
         .spawn();
     // Ordered, not stylistic: the reporter needs the handle the builder
     // returns, and the actor must never own a receiver a subsystem feeds.
+    //
+    // Its `JoinHandle` is discarded, which DETACHES the task rather than
+    // stopping it — and that closes a cycle worth naming, because nothing
+    // here breaks it. The reporter holds a `SupervisorHandle`, so the actor's
+    // mailbox can never reach zero senders while the reporter lives; the
+    // reporter itself only ends once BOTH report senders have dropped, and the
+    // enforcer holding one of them lives as long as the actor's registry does.
+    // What actually ends both is `RunningDaemon::run`'s explicit
+    // `SupervisorHandle::shutdown` (teardown step 4), which stops the actor by
+    // command instead of by sender count and drops the registry with it. That
+    // call is load-bearing for this reason as well as for the kill ladder it
+    // is named after; a future teardown that relied on senders going away
+    // would hang here instead.
     spawn_extras_reporter(breach_rx, live_rx, supervisor.clone());
     let registry = FlockRegistry::new();
 

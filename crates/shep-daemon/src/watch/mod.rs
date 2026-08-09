@@ -32,16 +32,23 @@
 //! watch root:
 //!
 //! - **Include** — the app's `watch_options`, or `**` when it names none.
-//! - **Ignore** — `DEFAULT_IGNORE_GLOBS` *plus* the app's `ignore_watch`.
-//!   The defaults are never replaced by an app's list, only extended.
+//! - **Ignore** — `DEFAULT_IGNORE_GLOBS`, *plus* the app's `ignore_watch`,
+//!   *plus* an entry per log file of the app's own that lies under the root
+//!   (`own_log_ignores`). The defaults are never replaced by an app's list,
+//!   only extended.
 //!
 //! A path triggers when it matches include **and** does not match ignore, so
 //! ignore always wins: `watch_options = ["**/*.rs"]` with `ignore_watch =
 //! ["target/**"]` watches Rust sources outside `target/`, and no
 //! `watch_options` entry can re-admit a dot-file the defaults exclude. The
-//! defaults exist because a `git status` would otherwise restart the flock,
-//! and because shep's own log and pid writes would make every restart trigger
-//! the next one.
+//! defaults exist because a `git status` would otherwise restart the flock.
+//!
+//! Shep's own writes are the derived third list's job, not the defaults'. An
+//! app taking the default log paths writes under `$SHEP_HOME`, outside the
+//! tree entirely; one naming an explicit `out_file`/`err_file` under its own
+//! `cwd` is writing inside it, and `**/logs/**` covers that only if the user
+//! happened to name the directory `logs`. See `own_log_ignores` for the loop
+//! that would otherwise leave behind.
 //!
 //! Two paths never reach the glob sets at all. A change reported *at the
 //! watch root itself* triggers unconditionally — that is the rescan signal an
@@ -70,7 +77,7 @@
 //!
 //! - [`source::WatchSource`], [`source::watch_tree`], [`source::WatchError`]
 //! - [`WatchFilter`], [`WatchFilterError`], [`spawn_watch_group`]
-//! - `DEFAULT_WATCH_DELAY`, `DEFAULT_IGNORE_GLOBS`
+//! - `DEFAULT_WATCH_DELAY`, `DEFAULT_IGNORE_GLOBS`, `own_log_ignores`
 
 pub mod source;
 
@@ -122,9 +129,16 @@ pub(crate) const MIN_WATCH_DELAY: Duration = Duration::from_millis(1);
 /// Paths ignored by every watch, before `ignore_watch` is even consulted.
 ///
 /// Dot-entries cover editor swap files and `.git`'s own churn — a `git
-/// status` would otherwise restart the flock. The log and pid directories
-/// are shep's own writes, and watching them makes every restart trigger the
-/// next one.
+/// status` would otherwise restart the flock.
+///
+/// The `logs`/`pids` entries are narrower than they look, and are not what
+/// keeps shep's own writes from restarting the app. They match a *root-
+/// relative* path, so they cover a `logs/` or `pids/` directory the user
+/// happens to keep inside the watched tree; shep's own defaults are written
+/// under `$SHEP_HOME`, which is normally nowhere near it. The arrangement
+/// that really does put a shep write inside the tree is an app naming an
+/// explicit `out_file`/`err_file` under its own `cwd`, and that path need not
+/// contain a `logs` component at all — `own_log_ignores` is what covers it.
 const DEFAULT_IGNORE_GLOBS: &[&str] = &[
     "**/.*",
     "**/.*/**",
@@ -137,6 +151,63 @@ const DEFAULT_IGNORE_GLOBS: &[&str] = &[
 /// relative path, so an app that names none is filtered by the default
 /// ignores alone.
 const MATCH_EVERYTHING: &str = "**";
+
+/// Ignore patterns covering a sheep's own log files — one per path in `logs`
+/// that lies under `root`, and nothing for the ones that don't.
+///
+/// This is the guard [`DEFAULT_IGNORE_GLOBS`] cannot be. An app naming an
+/// explicit `out_file` or `err_file` under its own `cwd` is watching a file
+/// shep itself writes, and unignored that is a loop nothing breaks: the
+/// startup line trips the debounce, the debounce restarts the name group, the
+/// restart writes another startup line. `max_restarts` is not a backstop
+/// either — an automatic restart resets the budget rather than spending it.
+///
+/// Each path is canonicalized through its parent before being stripped,
+/// because `root` arrives canonical and an app's `cwd` need not be: on macOS a
+/// `/var/…` directory resolves to `/private/var/…`, and stripping the raw form
+/// would silently yield no ignore at all — the same trap the watch root itself
+/// documents.
+pub(crate) fn own_log_ignores<'a>(
+    root: &Path,
+    logs: impl IntoIterator<Item = &'a Path>,
+) -> Vec<String> {
+    logs.into_iter()
+        .filter_map(|log| literal_glob_under(root, log))
+        .collect()
+}
+
+/// One path's root-relative form as a glob matching it and nothing else, or
+/// `None` when it does not lie under `root` (the ordinary case — the default
+/// log paths live in `$SHEP_HOME`) or cannot be spelled as a pattern at all.
+fn literal_glob_under(root: &Path, path: &Path) -> Option<String> {
+    let relative = canonical_parent_of(path);
+    let relative = relative.strip_prefix(root).ok()?;
+    // Assembled component by component rather than from `to_str`, because a
+    // glob's separator is `/` on every platform while a Windows path spells it
+    // `\`. `escape` then makes each component match LITERALLY: a log file whose
+    // name contains `[` or `*` is a filename, not a pattern.
+    let mut pattern = String::new();
+    for component in relative.iter() {
+        if !pattern.is_empty() {
+            pattern.push('/');
+        }
+        pattern.push_str(&globset::escape(component.to_str()?));
+    }
+    (!pattern.is_empty()).then_some(pattern)
+}
+
+/// `path` with its PARENT canonicalized and its file name left alone.
+///
+/// The file itself may not exist yet — a re-arm happens before the respawned
+/// child has written a byte — while its directory does by the time a spawn has
+/// succeeded. Falls back to `path` untouched when even the parent will not
+/// resolve, which just means no ignore is derived from it.
+fn canonical_parent_of(path: &Path) -> PathBuf {
+    let (Some(parent), Some(file)) = (path.parent(), path.file_name()) else {
+        return path.to_path_buf();
+    };
+    std::fs::canonicalize(parent).map_or_else(|_| path.to_path_buf(), |dir| dir.join(file))
+}
 
 /// Decides whether a changed path should trigger a restart.
 #[derive(Debug)]
@@ -290,8 +361,9 @@ impl RootedFilter {
 ///
 /// A triggering change restarts every instance of the name. Stopping a
 /// sheep is what stops its watch: the last instance of a name going away
-/// disarms this group, so a stopped sheep has no watcher left to restart
-/// it.
+/// disarms this group. Stopping ONE instance of a name whose siblings are
+/// still up does not — see this module's own doc for the partially-stopped
+/// group.
 ///
 /// A rescan — the OS told notify it dropped events — restarts the group
 /// whatever `watch_options` and `ignore_watch` say, since the paths that
@@ -299,6 +371,10 @@ impl RootedFilter {
 /// on the watched root itself rather than on a rescan flag, so an event on
 /// the root directory (a `chmod` or rename of that inode) takes the same
 /// path and is likewise not suppressible by either list.
+///
+/// Must be called from within a Tokio runtime context: it spawns the group
+/// loop immediately, the same way [`crate::cron::spawn_cron_worker`] and
+/// [`crate::probes::spawn_liveness_task`] already document for themselves.
 ///
 /// # Errors
 ///
@@ -429,8 +505,8 @@ mod tests {
     use shep_core::values::UpDuration;
 
     // ------------------------------------------------------------------
-    // Step 1: `WatchFilter` and the root-relative boundary — pure, no
-    // tokio, no filesystem (IR-40).
+    // `WatchFilter` and the root-relative boundary — pure, no tokio, no
+    // filesystem (IR-40).
     // ------------------------------------------------------------------
 
     // fails if an empty `watch_options` is treated as "matches nothing"
@@ -532,8 +608,41 @@ mod tests {
         assert!(!filter.triggers(Path::new("/watched/other/a.txt")));
     }
 
+    // fails if `own_log_ignores` derives a pattern from a path OUTSIDE the
+    // watch root — which is the ORDINARY case, since the default log paths
+    // live under `$SHEP_HOME`, and an app that watches its whole `cwd` would
+    // then be handed an ignore beginning `../..` that either matches nothing
+    // or matches by accident. Also fails if the path reaches globset
+    // unescaped: a log file named `app[0].log` would become a character class,
+    // matching `app0.log` while missing its own name — and the loop the
+    // ignore exists to break would run anyway.
+    //
+    // Touches the filesystem (nothing else can canonicalize) but no tokio: the
+    // two directories exist only so the parent resolution has something real
+    // to resolve.
+    #[test]
+    fn own_log_ignores_covers_only_the_paths_under_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        // Canonical, as `arm_watch` hands it over — the raw tempdir path is
+        // `/var/…` on macOS where its resolved form is `/private/var/…`.
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+
+        let inside = root.path().join("app[0].log");
+        let outside = elsewhere.path().join("web-0-out.log");
+        let ignores = own_log_ignores(&canonical, [inside.as_path(), outside.as_path()]);
+
+        assert_eq!(ignores, vec!["app[[]0[]].log".to_string()]);
+        let filter = WatchFilter::new(&[], &ignores).unwrap();
+        assert!(!filter.triggers(Path::new("app[0].log")));
+        // Controls: the escape matches that name and not the class it would
+        // otherwise have spelled, and an unrelated sibling still triggers.
+        assert!(filter.triggers(Path::new("app0.log")));
+        assert!(filter.triggers(Path::new("src/main.rs")));
+    }
+
     // ------------------------------------------------------------------
-    // Step 2: the group loop, paused-clock, driven by a hand-fed channel.
+    // The group loop: paused clock, driven by a hand-fed channel.
     // ------------------------------------------------------------------
 
     /// Generous bound on how long a paused-clock test may wait for a

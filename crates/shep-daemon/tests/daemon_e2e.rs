@@ -430,10 +430,13 @@ const READY_DEADLINE: Duration = Duration::from_secs(5);
 /// production sits at `starting` for its entire `listen_timeout`.
 ///
 /// `listen_timeout` is set two orders of magnitude past [`READY_DEADLINE`]
-/// on purpose. A gated sheep reaches `online` eventually either way (a
-/// readiness deadline is a warning, not a failure — see the supervisor's
-/// `handle_ready_result`), so only an `Online` that arrives EARLY can tell a
-/// forwarded ready message apart from an expired one.
+/// on purpose. A gated sheep reaches `online` eventually either way (an
+/// elapsed readiness deadline brings the sheep online rather than failing it —
+/// see the supervisor's `handle_ready_result`), so only an `Online` that
+/// arrives EARLY can tell a forwarded ready message apart from an expired one.
+/// Nothing else can: the deadline's own `warn!` reaches nobody while this
+/// workspace wires no `tracing-subscriber`, and the two paths produce the same
+/// event and the same status.
 #[tokio::test]
 async fn a_wait_ready_sheep_goes_online_on_its_own_channel_message() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;

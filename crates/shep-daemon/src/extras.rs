@@ -13,8 +13,12 @@
 //! Disarming is the whole of what keeps a stopped sheep down. Neither a
 //! triggering file save nor a cron occurrence filters by status, so a sheep
 //! stays down because nothing is left armed for it — never because a trigger
-//! declined to fire. The user-visible rule is one line: stopping a sheep
-//! stops its watch.
+//! declined to fire. The user-visible rule is one line: stopping a **name**
+//! stops its watch. Not one instance of a name: `disarm` tears a group down
+//! only when its LAST member leaves, so `shep stop web-1` with `web-2` still
+//! up leaves the group's one watcher armed and the next save brings `web-1`
+//! back. [`crate::watch`]'s module doc carries the full case for why that is
+//! the accepted consequence of one watcher per name group rather than a gap.
 //!
 //! ## Reference
 //!
@@ -40,7 +44,9 @@ use crate::limits::sample::SysinfoSampler;
 use crate::limits::{LimitBreach, LimitEnforcer, PollingEnforcer};
 use crate::probes::{LivenessFailure, Prober, spawn_liveness_task};
 use crate::supervisor::SupervisorHandle;
-use crate::watch::{DEFAULT_WATCH_DELAY, MIN_WATCH_DELAY, WatchFilter, spawn_watch_group};
+use crate::watch::{
+    DEFAULT_WATCH_DELAY, MIN_WATCH_DELAY, WatchFilter, own_log_ignores, spawn_watch_group,
+};
 
 /// Where the lifecycle extras send the two out-of-band failure reports.
 ///
@@ -118,16 +124,22 @@ impl fmt::Debug for Extras {
     }
 }
 
-/// Restarts each sheep reported over `breaches` or `liveness`, logging the
-/// observed figure at `warn`.
+/// Restarts each sheep reported over `breaches` or `liveness`.
 ///
 /// Ends when both senders have dropped. Owns both receivers: the actor must
 /// never block on anything a subsystem controls.
 ///
-/// Restarts go through [`SupervisorHandle::extra_restart`], never the public
-/// `restart`: a report already queued when the user runs `shep stop` is
-/// delivered *after* the sheep is `Stopped`, and `restart` would resurrect a
-/// process the user explicitly stopped.
+/// Restarts go through [`SupervisorHandle::extra_restart`], never `restart`: a
+/// report already queued when the user runs `shep stop` is delivered *after*
+/// the sheep is `Stopped`, and `restart` would resurrect a process the user
+/// explicitly stopped.
+///
+/// Both arms write a `warn!` on the way past, and for a breach that record is
+/// the ONLY place the observed RSS and the limit it crossed are ever stated —
+/// the bus event says `restart` and never why. Today it states them to nobody:
+/// this workspace wires no `tracing-subscriber`, so the daemon's log file is
+/// empty after a full run. Until one is wired, a user watching a process get
+/// restarted over and over has nothing anywhere telling them it is memory.
 ///
 /// Must be called from within a Tokio runtime context: it spawns the
 /// reporting task immediately.
@@ -325,7 +337,7 @@ impl ExtrasRegistry {
         // means keeping per-name failure state that would then need its own
         // invalidation. Deliberate, not an oversight.
         if group.watch.as_ref().is_none_or(JoinHandle::is_finished) {
-            group.watch = arm_watch(config, supervisor);
+            group.watch = arm_watch(entry, supervisor);
         }
     }
 
@@ -441,9 +453,13 @@ fn arm_instance(
             }
             Err(err) => {
                 // `normalize` already parses both probe targets, so a config
-                // that reached the daemon cannot land here — reported instead
+                // that reached the daemon cannot land here — swallowed instead
                 // of `expect`-ed so a future path that skips normalization
                 // costs one app its liveness probe rather than the daemon.
+                // "Swallowed" is the honest word: the `warn!` below reaches
+                // nobody while this workspace wires no `tracing-subscriber`,
+                // so the app comes up online with no liveness probe and no
+                // visible sign that it asked for one.
                 tracing::warn!(
                     id = entry.id,
                     name = config.name.as_str(),
@@ -458,6 +474,10 @@ fn arm_instance(
 
 /// Spawns the name-group's cron worker, or `None` when the app configures no
 /// `cron_restart` (or names a pattern that will not parse).
+///
+/// An unparseable pattern costs the app its schedule silently: the `warn!`
+/// below reaches nobody while this workspace wires no `tracing-subscriber`,
+/// and nothing else records that a `cron_restart` was asked for and dropped.
 fn arm_cron(
     config: &AppConfig,
     extras: &Extras,
@@ -490,10 +510,19 @@ fn arm_cron(
 /// Spawns the name-group's filesystem watch, or `None` when the app does not
 /// ask to be watched (or when its root or its globs will not resolve).
 ///
-/// Every failure here arms no watch and logs at `warn` rather than
-/// propagating: a watch root that will not resolve must not take down the
-/// same app's cron worker, enforcer and probe.
-fn arm_watch(config: &AppConfig, supervisor: &SupervisorHandle) -> Option<JoinHandle<()>> {
+/// Every failure here arms no watch rather than propagating: a watch root that
+/// will not resolve must not take down the same app's cron worker, enforcer
+/// and probe. Each one writes a `warn!` on the way out, and nothing subscribes
+/// to those records yet, so the observable outcome is an app that comes up
+/// `online` with no watch and no signal at all. Read the `warn!`s below as the
+/// failure being *swallowed*, not as it being reported.
+///
+/// Takes the whole [`ProcessEntry`] rather than its config because the
+/// assembled `out_file`/`err_file` are what `own_log_ignores` needs, and the
+/// entry is the only place this arming can read the paths the sheep's child is
+/// really writing to without re-deriving them.
+fn arm_watch(entry: &ProcessEntry, supervisor: &SupervisorHandle) -> Option<JoinHandle<()>> {
+    let config = entry.spec.config();
     if !config.watch {
         return None;
     }
@@ -524,7 +553,15 @@ fn arm_watch(config: &AppConfig, supervisor: &SupervisorHandle) -> Option<JoinHa
             return None;
         }
     };
-    let filter = match WatchFilter::new(&config.watch_options, &config.ignore_watch) {
+    // The app's own ignores plus this sheep's log files, for whichever of them
+    // the app pointed back inside the tree it asked to have watched. See
+    // `own_log_ignores` for why the default globs cannot cover that.
+    let mut ignores = config.ignore_watch.clone();
+    ignores.extend(own_log_ignores(
+        &root,
+        [entry.out_file.as_path(), entry.err_file.as_path()],
+    ));
+    let filter = match WatchFilter::new(&config.watch_options, &ignores) {
         Ok(filter) => filter,
         Err(err) => {
             // `normalize` compiles every `watch_options` and `ignore_watch`
@@ -1634,7 +1671,8 @@ mod tests {
     // canonicalized (on macOS a tempdir under `/var/...` is delivered as
     // `/private/var/...`, every `strip_prefix` fails, and the watch fires
     // never); or if the last instance leaving does not abort the group —
-    // which is the whole of "stopping a sheep stops its watch".
+    // which is the whole of "stopping a name stops its watch" (one instance
+    // here, so the name and the instance are the same thing).
     //
     // Real time and a real filesystem: notify's backend is the OS, and a
     // paused clock does not move it.
@@ -1780,6 +1818,58 @@ mod tests {
         );
 
         touch(root.path(), "ignored.txt").unwrap();
+        assert_no_restart_within(&mut rx, "web", real_time::NO_EVENT_WINDOW).await;
+
+        touch(root.path(), "trigger.txt").unwrap();
+        let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
+        assert_eq!(info.restarts, 1);
+    }
+
+    // fails if the watch's ignore set is the default globs plus `ignore_watch`
+    // and nothing else. An app naming an explicit `out_file`/`err_file` under
+    // its own `cwd` then restarts on its own log writes, and the loop is
+    // self-sustaining: the startup line trips the debounce, the debounce
+    // restarts the group, the restart writes another startup line.
+    // `max_restarts` cannot end it — an automatic restart resets the budget —
+    // and `**/logs/**` does not cover it, since nothing makes an explicit log
+    // path live in a directory called `logs`.
+    //
+    // BOTH log paths are pointed inside the tree, so an implementation that
+    // derives an ignore from `out_file` alone still reddens. The trigger at the
+    // end is what makes the silence able to fail: the same watch, the same
+    // window, a sibling file the filter has no reason to ignore.
+    //
+    // Real time and a real filesystem, like every case that drives notify.
+    #[tokio::test]
+    async fn a_watched_app_ignores_its_own_log_writes() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = test_paths(&home);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+            // Absolute, under the watched tree, and named nothing like `logs`
+            // — the arrangement that really does put a shep write inside the
+            // tree an app asked to have watched.
+            app.out_file = Some(root.path().join("app-out.txt").display().to_string());
+            app.err_file = Some(root.path().join("app-err.txt").display().to_string());
+            app.watch_delay = Some(UpDuration::from_millis(
+                real_time::TEST_DELAY.as_millis() as u64
+            ));
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+        registry.arm(
+            &armed_entry(0, 0, 1000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+
+        touch(root.path(), "app-out.txt").unwrap();
+        touch(root.path(), "app-err.txt").unwrap();
         assert_no_restart_within(&mut rx, "web", real_time::NO_EVENT_WINDOW).await;
 
         touch(root.path(), "trigger.txt").unwrap();

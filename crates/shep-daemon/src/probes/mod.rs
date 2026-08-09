@@ -33,8 +33,13 @@
 //! |---|---|---|
 //! | When | `listen_timeout` elapses before the app signals or a probe passes | `failure_threshold` *consecutive* probes fail on a sheep already `online` |
 //! | Verdict | the app is **slow** | the app is **wedged** |
-//! | Result | the sheep goes `online` anyway, with a warning | the sheep is restarted |
-//! | Budget | untouched | untouched — a liveness restart routes through the path that resets it |
+//! | Result | the sheep goes `online` anyway | the sheep is restarted |
+//! | Budget | untouched | **reset** — a liveness restart is a restart command, and every one of those resets it |
+//!
+//! The readiness timeout does log a `warn!` before going online, and that
+//! record currently reaches nobody: this workspace wires no
+//! `tracing-subscriber`, so a sheep that came up only because its deadline
+//! elapsed is indistinguishable, from outside, from one that answered.
 //!
 //! Treating a slow start as a failure produces exactly the restart loop
 //! `max_restarts` exists to contain, out of an app that is merely slow, so
