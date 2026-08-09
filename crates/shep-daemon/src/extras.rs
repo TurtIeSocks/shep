@@ -727,7 +727,19 @@ mod tests {
                     );
                 }
                 Ok(Ok(_)) => continue,
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                // A negative assertion cannot skip events: the ones the
+                // broadcast channel dropped may include the very `Restart`
+                // this forbids, so continuing here would return success on an
+                // overflow. `expect_restart` may skip them safely — the worst
+                // a lag costs it is a timeout — but this one has to fail
+                // loudly instead of failing open. Same fix, same reason, as
+                // `watch`'s own copy of this helper.
+                Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                    panic!(
+                        "event stream lagged by {skipped} while checking for no restart of \
+                         {name}: a skipped event may have been the restart this forbids"
+                    )
+                }
                 Ok(Err(err)) => {
                     panic!("event channel closed while checking for no restart of {name}: {err}")
                 }
@@ -786,19 +798,61 @@ mod tests {
         );
     }
 
-    // fails if `arm` spawns a watch, a cron worker or a liveness loop for an
-    // app that configured none — the shape that hands every app in the flock
-    // a watcher on its own cwd. The positive cases below are what make this
-    // assertion able to fail: they prove both maps really do fill.
+    // `Extras::real` is the production wiring and the only constructor `boot`
+    // calls, so nothing else in this crate would notice it handing the
+    // enforcer a channel of its own (`mpsc::channel(1).0` compiles and reports
+    // into the void). Real sysinfo over this very test process, whose RSS is
+    // comfortably over one byte, on the paused clock the polling loop sleeps
+    // on: the breach has to come back out of the sender this test kept.
+    #[tokio::test(start_paused = true)]
+    async fn real_extras_wire_the_enforcer_to_the_reports_channel() {
+        let (breach_tx, mut breaches) = mpsc::channel(4);
+        let (live_tx, _liveness) = mpsc::channel(4);
+        let extras = Extras::real(
+            ExtrasReports {
+                breaches: breach_tx,
+                liveness: live_tx,
+            },
+            Duration::from_secs(300),
+        );
+        assert_eq!(
+            format!("{extras:?}"),
+            r#"Extras { clock: "<dyn Clock>", enforcer: "<dyn LimitEnforcer>", max_cron_sleep: 300s, .. }"#,
+            "`real` must carry the sleep bound it was handed, not re-derive one"
+        );
+
+        let limit = MemSize::from_bytes(1);
+        extras.enforcer.arm(3, std::process::id(), limit);
+        let breach = match tokio::time::timeout(EVENT_WAIT, breaches.recv()).await {
+            Ok(Some(breach)) => breach,
+            Ok(None) => panic!("the breach channel closed before a breach arrived"),
+            Err(_) => panic!("timed out waiting for a breach from the real enforcer"),
+        };
+        assert_eq!(breach.id, 3);
+        assert_eq!(breach.root_pid, std::process::id());
+        assert_eq!(breach.limit, limit);
+    }
+
+    // fails if `arm` stops gating its per-name work on the configuration —
+    // the shape that hands every app in the flock a group, and, with
+    // `arm_watch`'s own guard gone too, a watcher on its own cwd. The cwd is
+    // a real directory rather than absent so this app is one a watcher COULD
+    // be registered on, instead of one that structurally cannot reach that
+    // far. The positive cases below are what make the rest able to fail: they
+    // prove both maps really do fill.
     #[tokio::test(start_paused = true)]
     async fn an_app_configuring_no_extras_arms_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
+        let root = tempfile::tempdir().unwrap();
         let (handle, _rx, _fixture) = spawn_test_fixture();
         let rig = rig(DEFAULT_MAX_CRON_SLEEP);
         let mut registry = ExtrasRegistry::default();
 
-        let entry = armed_entry(0, 0, 1000, app_with("web", |_| {}), &paths);
+        let app = app_with("web", |app| {
+            app.cwd = Some(root.path().display().to_string());
+        });
+        let entry = armed_entry(0, 0, 1000, app, &paths);
         registry.arm(&entry, idle_prober(), &rig.extras, &handle);
 
         assert!(
@@ -812,6 +866,104 @@ mod tests {
         assert!(
             rig.enforcer.arms().is_empty(),
             "an app with no max_memory must not reach the enforcer at all"
+        );
+    }
+
+    // fails if `arm_watch` stops consulting `config.watch`. A cron-restarting
+    // app is a member of its name group whatever it thinks of watching, so it
+    // is the one shape that reaches `arm_watch` without asking to be watched —
+    // and its cwd is a real directory, so a watcher really would be registered
+    // on it.
+    #[tokio::test(start_paused = true)]
+    async fn a_cron_only_app_with_a_real_cwd_arms_no_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.cron_restart = Some("0 * * * *".to_string());
+            app.cwd = Some(root.path().display().to_string());
+        });
+
+        registry.arm(
+            &armed_entry(0, 0, 1000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+
+        let group = &registry.groups["web"];
+        assert!(group.cron.is_some(), "the cron worker is what armed here");
+        assert!(
+            group.watch.is_none(),
+            "an app that did not ask to be watched must get no watcher on its cwd"
+        );
+    }
+
+    // fails if `cron_timezone` is dropped on the way to `CronSchedule::parse`.
+    // `Etc/GMT+5` is UTC MINUS five (POSIX inverts the sign), so 05:00 local
+    // is 10:00Z — while the same pattern read as UTC fires at 05:00Z, five
+    // hours inside the silent window below.
+    #[tokio::test(start_paused = true)]
+    async fn a_cron_pattern_is_resolved_in_the_apps_own_timezone() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.cron_restart = Some("0 5 * * *".to_string());
+            app.cron_timezone = Some("Etc/GMT+5".to_string());
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+
+        registry.arm(
+            &armed_entry(0, 0, 1000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+        tokio::task::yield_now().await;
+
+        // Six hours from midnight UTC: past a UTC reading of the pattern,
+        // still four hours short of the app's own.
+        assert_no_restart_within(&mut rx, "web", Duration::from_secs(6 * 3_600)).await;
+        expect_restart(&mut rx, "web", Duration::from_secs(6 * 3_600)).await;
+    }
+
+    // fails if a mistyped `ignore_watch` glob takes down the arm path for the
+    // same app's cron worker — the whole reason `arm_watch` reports its
+    // failures instead of propagating them. `[` is an unclosed character
+    // class, which globset rejects and `normalize` never looks at.
+    #[tokio::test(start_paused = true)]
+    async fn a_glob_that_will_not_compile_costs_the_app_its_watch_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+            app.ignore_watch = vec!["[".to_string()];
+            app.cron_restart = Some("0 * * * *".to_string());
+        });
+
+        registry.arm(
+            &armed_entry(0, 0, 1000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+
+        let group = &registry.groups["web"];
+        assert!(group.watch.is_none(), "the glob cannot have compiled");
+        assert!(
+            group.cron.is_some(),
+            "a mistyped glob must not cost this app its cron worker too"
         );
     }
 
@@ -1280,6 +1432,77 @@ mod tests {
         assert_no_restart_within(&mut rx, "web", real_time::NO_EVENT_WINDOW).await;
     }
 
+    // fails if `DEFAULT_WATCH_DELAY` is not what an app naming no
+    // `watch_delay` gets. It is 500ms; any fallback long enough to matter (a
+    // stray `Duration::from_secs(600)`, say) leaves the save below with no
+    // restart inside the deadline, and an app that asked to be watched would
+    // in production appear to be watched by nothing.
+    //
+    // Real time and a real filesystem, like every case that drives notify.
+    #[tokio::test]
+    async fn a_watched_app_naming_no_delay_still_restarts_on_a_save() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = test_paths(&home);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+            // No `watch_delay`: this case exists for the default.
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+        registry.arm(
+            &armed_entry(0, 0, 1000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+
+        touch(root.path(), "trigger.txt").unwrap();
+        let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
+        assert_eq!(info.restarts, 1);
+    }
+
+    // fails if `arm_watch` builds its filter from empty slices rather than
+    // from the app's own `watch_options`/`ignore_watch` — the shape under
+    // which every ignore rule the user wrote is silently discarded and a build
+    // directory's own churn restarts the app forever. The trigger at the end
+    // is what makes the silence able to fail: the same watch, the same window,
+    // a name the filter does not ignore.
+    #[tokio::test]
+    async fn a_watched_app_ignores_the_paths_its_ignore_watch_names() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = test_paths(&home);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+            app.ignore_watch = vec!["ignored.txt".to_string()];
+            app.watch_delay = Some(UpDuration::from_millis(
+                real_time::TEST_DELAY.as_millis() as u64
+            ));
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+        registry.arm(
+            &armed_entry(0, 0, 1000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+
+        touch(root.path(), "ignored.txt").unwrap();
+        assert_no_restart_within(&mut rx, "web", real_time::NO_EVENT_WINDOW).await;
+
+        touch(root.path(), "trigger.txt").unwrap();
+        let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
+        assert_eq!(info.restarts, 1);
+    }
+
     // ------------------------------------------------------------------
     // The reporter: a report becomes a guarded restart, or nothing.
     // ------------------------------------------------------------------
@@ -1308,6 +1531,79 @@ mod tests {
         let info = expect_restart(&mut rx, "web", EVENT_WAIT).await;
         assert_eq!(info.id, 0);
         assert_eq!(info.restarts, 1);
+    }
+
+    // The liveness twin of the case above, and it needs to exist separately:
+    // the reporter's two arms are two `select!` branches, so a `liveness` arm
+    // that drops every failure it reads leaves the breach arm — and every
+    // assertion riding on it — perfectly green. fails if that arm never calls
+    // `extra_restart`, or calls it for the wrong id.
+    #[tokio::test(start_paused = true)]
+    async fn a_liveness_failure_naming_the_running_pid_restarts_that_sheep() {
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        handle.start(vec![app_with("web", |_| {})]).await.unwrap();
+        let pid = handle.list().await[0].pid.expect("a live sheep has a pid");
+        let (_breach_tx, breach_rx) = mpsc::channel(4);
+        let (live_tx, live_rx) = mpsc::channel(4);
+        let _reporter = spawn_extras_reporter(breach_rx, live_rx, handle.clone());
+
+        live_tx.send(LivenessFailure { id: 0, pid }).await.unwrap();
+
+        let info = expect_restart(&mut rx, "web", EVENT_WAIT).await;
+        assert_eq!(info.id, 0);
+        assert_eq!(info.restarts, 1);
+    }
+
+    // fails if `handle_extra_restart` drops its unknown-id guard for an
+    // `.expect(…)`. A report for an id a `Delete` already removed is an
+    // ordinary race, not a fault, and it must not take the whole engine down
+    // with it — which is what the surviving `list()` proves: a panicked actor
+    // closes its mailbox, and `list` panics on the way out.
+    #[tokio::test(start_paused = true)]
+    async fn an_extra_restart_for_an_unknown_id_leaves_the_engine_running() {
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        handle.start(vec![app_with("web", |_| {})]).await.unwrap();
+
+        handle.extra_restart(99, 4242).await;
+
+        assert_eq!(
+            handle.list().await.len(),
+            1,
+            "the actor must still be serving after a report for an id it does not know"
+        );
+    }
+
+    // fails against a guard that checks the pid but not the status. A gated
+    // app between its spawn and its readiness result is `Starting` with a LIVE
+    // pid — the one state in which the pid guard passes and the status guard
+    // is the only thing left — so an unguarded command would kill a process
+    // that has not finished starting and restart it as though it had.
+    //
+    // `a_breach_for_a_stopped_sheep_restarts_nothing` cannot make this claim:
+    // `handle_exited` nulls `entry.pid` before every terminal transition, so
+    // that case rides the pid guard alone.
+    #[tokio::test(start_paused = true)]
+    async fn an_extra_restart_for_a_sheep_that_is_still_starting_restarts_nothing() {
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        let app = app_with("web", |app| {
+            app.wait_ready = true;
+            // Long enough that the readiness wait cannot resolve inside this
+            // test's own windows, so the sheep stays `Starting` throughout.
+            app.listen_timeout = UpDuration::from_millis(6 * 60 * 60 * 1_000);
+        });
+        handle.start(vec![app]).await.unwrap();
+        let listing = handle.list().await;
+        assert_eq!(
+            listing[0].status,
+            ProcStatus::Starting,
+            "this case is only meaningful while the sheep is gated on readiness"
+        );
+        let pid = listing[0].pid.expect("a spawned sheep has a pid");
+
+        handle.extra_restart(0, pid).await;
+
+        assert_no_restart_within(&mut rx, "web", Duration::from_secs(30)).await;
+        assert_eq!(handle.list().await[0].restarts, 0);
     }
 
     // fails against a reporter that calls the public `restart`:
@@ -1639,6 +1935,59 @@ mod tests {
             "the enforcer must be armed against the pid the sheep is actually running as"
         );
         assert_eq!(breach.observed.bytes(), 900);
+    }
+
+    // fails if the readiness-GATED transition to `Online` does not arm.
+    // `arm_extras` is reached from three transitions and only the two ungated
+    // ones were proven; reverting `handle_ready_result`'s `went_online` call
+    // to a plain `emit` leaves every other case in this file green while every
+    // app that configures readiness silently loses all four of its extras.
+    //
+    // The readiness wait ends in a timeout rather than a signal — a scripted
+    // proc writes no `{"kind":"ready"}` — which is the same `Online` and the
+    // same arming site. The `Starting` assertion is what keeps this case from
+    // quietly degrading into a second copy of the ungated one above.
+    #[tokio::test(start_paused = true)]
+    async fn the_actor_arms_a_readiness_gated_app_once_it_comes_online() {
+        let mut h = harness_with_extras(vec![ProcScript::never_exits(); 4], |reports| Extras {
+            clock: Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z"))),
+            enforcer: Arc::new(PollingEnforcer::start(
+                Arc::new(ScriptedSampler::new(vec![vec![ProcessRss {
+                    pid: 1000,
+                    parent: None,
+                    bytes: 900,
+                }]])),
+                reports.breaches.clone(),
+            )),
+            max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+            reports,
+        });
+        h.ctx
+            .supervisor
+            .start(vec![app_with("web", |app| {
+                app.wait_ready = true;
+                app.max_memory = Some(MemSize::from_bytes(500));
+            })])
+            .await
+            .unwrap();
+        let listing = h.ctx.supervisor.list().await;
+        assert_eq!(
+            listing[0].status,
+            ProcStatus::Starting,
+            "a gated app must not be Online when its Start reply lands"
+        );
+        let pid = listing[0].pid.expect("a spawned sheep has a pid");
+
+        let breach = match tokio::time::timeout(EVENT_WAIT, h.breaches.recv()).await {
+            Ok(Some(breach)) => breach,
+            Ok(None) => panic!("the breach channel closed before a breach arrived"),
+            Err(_) => panic!("timed out waiting for a breach"),
+        };
+        assert_eq!(breach.id, 0);
+        assert_eq!(
+            breach.root_pid, pid,
+            "the gated path must arm against the pid the sheep is running as"
+        );
     }
 
     // fails if the actor never arms the liveness loop at the Online

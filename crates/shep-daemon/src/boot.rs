@@ -543,10 +543,7 @@ pub async fn boot<R: ProcessRunner>(
             breaches: breach_tx,
             liveness: live_tx,
         },
-        // The one place `DEFAULT_MAX_CRON_SLEEP` is applied — see its own doc
-        // for why a second application anywhere else is how two supposedly
-        // identical constants drift apart.
-        options.max_cron_sleep.unwrap_or(DEFAULT_MAX_CRON_SLEEP),
+        max_cron_sleep(options.max_cron_sleep),
     );
     let supervisor = SupervisorBuilder::new(runner, paths.clone(), events.clone())
         .extras(extras)
@@ -602,6 +599,18 @@ pub async fn boot<R: ProcessRunner>(
         // `PidfileLock`'s own doc.
         pidfile_lock,
     })
+}
+
+/// The cron sleep bound this boot runs with: `configured`, or
+/// [`DEFAULT_MAX_CRON_SLEEP`] when `shep.toml` named none.
+///
+/// A named function rather than an `unwrap_or` inline in [`boot`] only so the
+/// application has a seam a test can stand on. It is still the ONE place that
+/// constant is applied, and a second application anywhere else is how two
+/// supposedly identical constants drift apart: `shep-core` carries the floor
+/// and never the default, the daemon carries the default and never the floor.
+fn max_cron_sleep(configured: Option<Duration>) -> Duration {
+    configured.unwrap_or(DEFAULT_MAX_CRON_SLEEP)
 }
 
 /// Reads the muster roll (if one exists) and starts every app it restores.
@@ -992,7 +1001,9 @@ mod tests {
     use crate::fake::{ProcScript, ScriptedRunner};
     use crate::snapshot::{FlockSnapshot, SNAPSHOT_VERSION, SavedApp};
     use crate::testing::test_paths; // the one crate-root fixture (IR-33)
-    use shep_core::config::AppConfig;
+    use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, normalize};
+    use shep_core::protocol::ProcessEventKind;
+    use shep_core::values::UpDuration;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
@@ -1607,5 +1618,105 @@ mod tests {
         );
 
         drop(signals); // aborts the listener tasks (SignalTasks::drop)
+    }
+
+    // `boot` is the ONE place `DEFAULT_MAX_CRON_SLEEP` is applied — the CLI
+    // half of the plumbing keeps the knob an `Option` all the way down, and
+    // its own test pins that — so nothing else in this workspace would notice
+    // a different fallback landing here. fails if the default is replaced (a
+    // stray `Duration::from_secs(1)` would have every cron worker in the
+    // daemon waking a minute more often than the constant says).
+    #[test]
+    fn an_unset_max_cron_sleep_falls_back_to_the_daemons_own_default() {
+        assert_eq!(
+            max_cron_sleep(BootOptions::default().max_cron_sleep),
+            DEFAULT_MAX_CRON_SLEEP,
+            "unset means the default"
+        );
+        assert_eq!(
+            max_cron_sleep(Some(Duration::from_secs(300))),
+            Duration::from_secs(300),
+            "a configured value must reach the workers unchanged"
+        );
+    }
+
+    // fails if `boot` never spawns the extras reporter. Nothing else in this
+    // crate drives that call — every other reporter case constructs one by
+    // hand — so dropping it here would leave a real daemon in which no memory
+    // breach and no liveness failure ever restarts anything, with every unit
+    // test still green.
+    //
+    // The whole production chain is what makes the claim: the actor arms a
+    // liveness loop at the Online transition, the loop reports over the sender
+    // `Extras::real` was built with, the reporter reads it, and
+    // `extra_restart`'s guards let it through. Real time and a real
+    // `OsProber` — a paused clock does not move a real TCP connect.
+    #[tokio::test]
+    async fn a_booted_daemon_restarts_a_sheep_whose_liveness_probe_fails() {
+        // Real time: binds a real socket, so it takes the signal lock like
+        // every other successful `boot()` here — see SIGNAL_TEST_LOCK's doc.
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+
+        // Reserve a port, then release it: nothing ever listens there, so
+        // every probe fails with a connection refusal, with no listener to
+        // race and no port to reserve for real.
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let daemon = boot(
+            ScriptedRunner::new(vec![ProcScript::never_exits(); 4]),
+            paths.clone(),
+            BootOptions::default(),
+        )
+        .await
+        .unwrap();
+        let ctx = daemon.context();
+        let mut events = ctx.events.subscribe();
+        let run = tokio::spawn(daemon.run());
+
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.liveness_probe = Some(ProbeConfig {
+            kind: ProbeKind::Tcp,
+            target: addr.to_string(),
+            // The loop floors anything shorter at one second, so a smaller
+            // number here would be a lie about what this test waits for.
+            interval: UpDuration::from_millis(1_000),
+            timeout: UpDuration::from_millis(500),
+            failure_threshold: 1,
+        });
+        ctx.supervisor
+            .start(vec![normalize(app).unwrap()])
+            .await
+            .unwrap();
+
+        let restarted = async {
+            loop {
+                match events.recv().await {
+                    Ok(BusEvent::Process {
+                        event: ProcessEventKind::Restart,
+                        info,
+                        ..
+                    }) => return info,
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("the event stream closed before a restart: {err}"),
+                }
+            }
+        };
+        let info = tokio::time::timeout(Duration::from_secs(20), restarted)
+            .await
+            .expect("a failing liveness probe must restart its sheep");
+        assert_eq!(info.id, 0);
+        assert_eq!(info.restarts, 1);
+
+        ctx.shutdown();
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }
