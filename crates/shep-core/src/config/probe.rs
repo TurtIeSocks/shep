@@ -38,6 +38,12 @@ pub enum ProbeTarget {
         /// The port; defaults to 80 when the authority carries none.
         port: u16,
         /// The path; defaults to `/` when the URL carries none.
+        ///
+        /// Free of whitespace and control characters whenever it came from
+        /// [`ProbeTarget::parse`] — see [`ProbeTargetError::InvalidPath`].
+        /// The prober writes this verbatim into a request line, so that is a
+        /// security property, not a tidiness one; a caller that builds this
+        /// variant by hand rather than parsing takes it on itself.
         path: String,
     },
     /// `host:port`.
@@ -71,6 +77,8 @@ impl ProbeTarget {
     /// - [`ProbeTargetError::MissingHost`] — the authority has no host.
     /// - [`ProbeTargetError::InvalidHost`] — the host contains `@`,
     ///   whitespace, or an embedded `:`.
+    /// - [`ProbeTargetError::InvalidPath`] — the path contains whitespace or
+    ///   a control character.
     /// - [`ProbeTargetError::MissingPort`] — a TCP target with no `:port`.
     /// - [`ProbeTargetError::BadPort`] — the port is not a `u16`.
     pub fn parse(config: &ProbeConfig) -> Result<Self, ProbeTargetError> {
@@ -119,6 +127,14 @@ pub enum ProbeTargetError {
         /// The target as written in the Flockfile.
         target: String,
     },
+    /// The path contains whitespace or a control character. Both break the
+    /// request line the prober builds around it: a `\r\n` appends
+    /// Flockfile-chosen headers — or an entire second request — to what goes
+    /// on the socket, and a space ends the path field early.
+    InvalidPath {
+        /// The target as written in the Flockfile.
+        target: String,
+    },
     /// A TCP target with no `:port`.
     MissingPort {
         /// The target as written in the Flockfile.
@@ -148,6 +164,10 @@ impl fmt::Display for ProbeTargetError {
                 f,
                 "probe target `{target}` has a host containing `@`, whitespace, or an embedded \
                  `:`"
+            ),
+            Self::InvalidPath { target } => write!(
+                f,
+                "probe target `{target}` has a path containing whitespace or a control character"
             ),
             Self::MissingPort { target } => write!(f, "probe target `{target}` has no port"),
             Self::BadPort { target } => {
@@ -197,6 +217,7 @@ fn parse_http(target: &str) -> Result<ProbeTarget, ProbeTargetError> {
         });
     }
     validate_host(host, authority, target)?;
+    validate_path(path, target)?;
     let port = parse_port(port_str.unwrap_or("80"), target)?;
 
     Ok(ProbeTarget::Http {
@@ -263,6 +284,27 @@ fn validate_host(host: &str, authority: &str, target: &str) -> Result<(), ProbeT
         || (!bracketed && host.contains(':'));
     if invalid {
         return Err(ProbeTargetError::InvalidHost {
+            target: target.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Rejects a path containing whitespace or a control character.
+///
+/// The prober writes this path verbatim into `GET {path} HTTP/1.1\r\n…`, so
+/// a `\r\n` inside it is header injection: everything after it arrives at the
+/// server as further headers, and a long enough payload smuggles a whole
+/// second request. A space is the same defect one field earlier — it ends the
+/// request line's path and hands the server whatever follows as the HTTP
+/// version.
+///
+/// Nothing legitimate is lost. RFC 3986 has no spelling for either character
+/// inside a path: a space is written `%20`, and a control character is
+/// percent-encoded too.
+fn validate_path(path: &str, target: &str) -> Result<(), ProbeTargetError> {
+    if path.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(ProbeTargetError::InvalidPath {
             target: target.to_string(),
         });
     }
@@ -569,6 +611,72 @@ mod tests {
                 .unwrap_err(),
             ProbeTargetError::InvalidHost {
                 target: "http://host:8080:9090/".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn http_crlf_in_path_rejected_as_invalid_path() {
+        // fails if the path is carried through unvalidated the way the host
+        // never was. This exact target was demonstrated putting `X-Injected:
+        // yes` on the wire as a real header, with the probe still reporting
+        // success — the prober writes the path verbatim into `GET {path}
+        // HTTP/1.1\r\n…`, so a `\r\n` in it appends headers of the
+        // Flockfile's choosing, and a longer payload a whole second request.
+        // The trailing `yes` matters: a payload ending in the `\r\n` itself
+        // would be removed by this parser's own trim and prove nothing.
+        let target = "http://host:8080/health\r\nX-Injected: yes";
+        assert_eq!(
+            ProbeTarget::parse(&probe_config(ProbeKind::Http, target)).unwrap_err(),
+            ProbeTargetError::InvalidPath {
+                target: target.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn http_space_in_path_rejected_as_invalid_path() {
+        // fails if the check looks for `\r` and `\n` alone: a space is the
+        // same defect one field earlier, ending the request line's path and
+        // handing the server `b` where the HTTP version belongs.
+        assert_eq!(
+            ProbeTarget::parse(&probe_config(ProbeKind::Http, "http://host/a b")).unwrap_err(),
+            ProbeTargetError::InvalidPath {
+                target: "http://host/a b".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn http_control_character_in_path_rejected_as_invalid_path() {
+        // fails if the check tests `is_whitespace` alone — a NUL is neither
+        // whitespace nor printable, and no RFC 3986 path may carry one
+        // unencoded.
+        assert_eq!(
+            ProbeTarget::parse(&probe_config(ProbeKind::Http, "http://host/a\u{0}b")).unwrap_err(),
+            ProbeTargetError::InvalidPath {
+                target: "http://host/a\u{0}b".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn http_query_and_percent_encoded_path_still_accepted() {
+        // fails if the path check is widened into full URI validation: `?`,
+        // `&`, `=` and `%20` are all ordinary text in the tail of a target,
+        // and `%20` is precisely how the space rejected above is meant to be
+        // written.
+        let target = ProbeTarget::parse(&probe_config(
+            ProbeKind::Http,
+            "http://host/health?a=1&b=%20x",
+        ))
+        .unwrap();
+        assert_eq!(
+            target,
+            ProbeTarget::Http {
+                host: "host".to_string(),
+                port: 80,
+                path: "/health?a=1&b=%20x".to_string(),
             }
         );
     }
