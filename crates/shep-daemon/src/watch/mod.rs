@@ -6,16 +6,71 @@
 //! restart loop over them — single-flighted and re-checked, exactly like
 //! [`crate::cron`]'s restart loop.
 //!
-//! A triggering change restarts the whole name-group, stopped instances
-//! included — the same reach [`crate::cron`]'s schedule has. What keeps a
-//! stopped sheep down is disarming its group's watcher the moment the last
-//! instance of its name stops, never a filter on the restart itself; the
-//! extras registry owns that disarm.
+//! # What a change reaches, and what a stop takes away
+//!
+//! **A triggering change restarts every instance of the name**, stopped
+//! instances included — the same reach [`crate::cron`]'s schedule has. What
+//! keeps a stopped sheep down is that **stopping a sheep disarms its watch**,
+//! never a filter on the restart itself; the extras registry owns that
+//! disarm.
+//!
+//! Those two sentences sound contradictory until they are read together, and
+//! the case that shows why is a partially stopped group. With a
+//! single-instance app the protection is total: `shep stop web` disarms the
+//! watcher, and no later save can bring `web` back. With `web` at two
+//! instances, `shep stop web-1` leaves `web-2` running and the group's one
+//! watcher armed — so the next save under the tree restarts the whole name,
+//! and `web-1` comes back up. That is the accepted consequence of a
+//! one-watcher-per-name-group design, not a gap: the alternative was a
+//! restart scope parameter threaded through the actor's manual-command path,
+//! to serve a corner that a full stop already covers. Stop the group, or
+//! delete the instance.
+//!
+//! # What is filtered
+//!
+//! A delivered path is checked against two glob sets, both rooted at the
+//! watch root:
+//!
+//! - **Include** — the app's `watch_options`, or `**` when it names none.
+//! - **Ignore** — `DEFAULT_IGNORE_GLOBS` *plus* the app's `ignore_watch`.
+//!   The defaults are never replaced by an app's list, only extended.
+//!
+//! A path triggers when it matches include **and** does not match ignore, so
+//! ignore always wins: `watch_options = ["**/*.rs"]` with `ignore_watch =
+//! ["target/**"]` watches Rust sources outside `target/`, and no
+//! `watch_options` entry can re-admit a dot-file the defaults exclude. The
+//! defaults exist because a `git status` would otherwise restart the flock,
+//! and because shep's own log and pid writes would make every restart trigger
+//! the next one.
+//!
+//! Two paths never reach the glob sets at all. A change reported *at the
+//! watch root itself* triggers unconditionally — that is the rescan signal an
+//! inotify queue overflow produces, and dropping it would mean silently
+//! losing every event in the overflowed batch. A path that does not lie under
+//! the root never triggers, rather than being matched as though it were
+//! relative.
+//!
+//! # Caveats
+//!
+//! - **The debounce is real time, not virtual.** `watch_delay` (default
+//!   `DEFAULT_WATCH_DELAY`) is enforced inside notify's own debouncer,
+//!   which runs on its own OS thread — `tokio::time`'s paused clock does not
+//!   move it, so tests that need to observe a debounce must wait for it.
+//! - **Delivery is the OS's.** notify uses FSEvents, inotify, or a polling
+//!   fallback depending on platform; coalescing, ordering and latency differ
+//!   between them, and a watch is a heuristic about "something changed"
+//!   rather than a transaction log.
+//! - **`watch = true` requires `cwd`.** There is no directory to watch
+//!   otherwise, and `shep-core`'s `normalize` refuses the app rather than
+//!   arming nothing quietly.
+//! - **The restart is group-wide and all at once.** Rolling restarts are
+//!   what reload is for.
 //!
 //! ## Reference
 //!
 //! - [`source::WatchSource`], [`source::watch_tree`], [`source::WatchError`]
 //! - [`WatchFilter`], [`WatchFilterError`], [`spawn_watch_group`]
+//! - `DEFAULT_WATCH_DELAY`, `DEFAULT_IGNORE_GLOBS`
 
 pub mod source;
 

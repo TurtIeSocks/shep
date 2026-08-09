@@ -33,6 +33,24 @@
 //! > orphan-escape case above, may occasionally miss one where a
 //! > double-forked descendant is killed without ever having been counted.
 //!
+//! # Caveats
+//!
+//! - **Polling granularity is [`MEMORY_POLL_INTERVAL`].** A breach is noticed
+//!   at the next sample, not at the allocation, so an app can sit over its
+//!   ceiling for most of an interval — and one that spikes and returns inside
+//!   a single interval is never noticed at all. Sampling more often would
+//!   narrow both windows without closing either; the benchmark behind the
+//!   current value is committed at `benches/benches/memory_sample.rs` so the
+//!   trade can be re-measured rather than re-argued.
+//! - **RSS, not commit or virtual size.** Shared pages count once per
+//!   process, so a tree of forked workers sharing a large read-only heap
+//!   reads higher than the memory it actually costs the machine.
+//! - **The tree is a ppid walk**, which is not exactly the kill unit — see
+//!   the deviation note above for the two directions they diverge.
+//! - **A breach restart does not count against `max_restarts`.** A leaking
+//!   app restarts indefinitely rather than reaching `errored`, on the grounds
+//!   that a supervisor's job is keeping things up.
+//!
 //! ## Reference
 //!
 //! - [`sample::MemorySampler`], [`sample::SysinfoSampler`],

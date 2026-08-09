@@ -8,13 +8,64 @@
 //! unhealthy is about to be restarted, and the loop for its replacement —
 //! armed against a new pid — is a new one.
 //!
+//! # Which readiness source wins
+//!
+//! An app can name two, and [`ready::ReadinessSource::of`] picks exactly one:
+//!
+//! 1. **`wait_ready = true`** — the shepherd channel's `{"kind":"ready"}`.
+//!    Chosen whenever it is set, even alongside a `readiness_probe`: the
+//!    channel is the app telling us directly, and a probe is an outside guess
+//!    at the same fact.
+//! 2. **`readiness_probe`** — the first probe that passes.
+//! 3. **Neither** — a plain `start` takes the sheep `online` at spawn. (The
+//!    `Heuristic` source, which waits out `listen_timeout`, is reload's; it
+//!    is fully implemented here but `start` never selects it.)
+//!
+//! `failure_threshold` is deliberately not consulted while gating readiness.
+//! It is a liveness concept, and giving up after N failed readiness probes
+//! would nest a second, smaller deadline inside `listen_timeout`.
+//!
+//! # A readiness timeout is not a liveness failure
+//!
+//! They look alike and mean opposite things:
+//!
+//! | | readiness timeout | liveness failure |
+//! |---|---|---|
+//! | When | `listen_timeout` elapses before the app signals or a probe passes | `failure_threshold` *consecutive* probes fail on a sheep already `online` |
+//! | Verdict | the app is **slow** | the app is **wedged** |
+//! | Result | the sheep goes `online` anyway, with a warning | the sheep is restarted |
+//! | Budget | untouched | untouched — a liveness restart routes through the path that resets it |
+//!
+//! Treating a slow start as a failure produces exactly the restart loop
+//! `max_restarts` exists to contain, out of an app that is merely slow, so
+//! readiness gives up *upward*. Liveness has already had the app answer
+//! successfully at least once, so a run of failures is evidence rather than
+//! impatience.
+//!
+//! # Caveats
+//!
+//! - **No TLS.** [`os::OsProber`]'s HTTP client is hand-rolled and speaks
+//!   cleartext only. `https://` targets are refused in `shep-core` at config
+//!   time rather than failing every poll, because a probe that always fails
+//!   is indistinguishable from an app that is down (decision D1).
+//! - **No redirects.** A `3xx` is a non-2xx and therefore a failed probe.
+//!   Point the probe at the endpoint, not at something that forwards to it.
+//! - **`timeout` is the implementation's promise, not this loop's.** See
+//!   [`Prober`]'s own design note: a `probe` future that never resolves
+//!   stalls liveness detection for that sheep forever.
+//! - **Granularity is `interval`, floored at `MIN_PROBE_INTERVAL`.** Worst
+//!   case, a wedged app is noticed `failure_threshold × interval` after it
+//!   wedges.
+//!
 //! ## Reference
 //!
 //! - [`Prober`], [`ProbeFailure`]
-//! - [`LivenessFailure`], [`spawn_liveness_task`]
+//! - [`LivenessFailure`], [`spawn_liveness_task`], `MIN_PROBE_INTERVAL`
 //! - [`os::OsProber`] — the real HTTP/TCP/exec implementation
 //! - [`ready::ReadinessSource`], [`ready::Readiness`], [`ready::await_ready`]
 //!   — the `starting → online` gate (spec §7)
+//! - [`shep_core::config::ProbeTarget`] — where a target is parsed and an
+//!   `https://` one is refused
 
 pub mod os;
 pub mod ready;

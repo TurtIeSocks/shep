@@ -11,6 +11,70 @@
 //! mid-kill-ladder takes the sheep back off it, rather than coming back
 //! `Online` because it lost a race nobody was waiting on. The restart is
 //! otherwise identical to a manual one, budget reset included.
+//!
+//! # When an occurrence fires
+//!
+//! Against **wall time**, in the app's `cron_timezone`, re-derived from the
+//! clock on every iteration rather than tracked across one long sleep. That
+//! is what makes the behaviour under a moving clock predictable:
+//!
+//! - **A laptop suspend, or an NTP step forward.** The worker wakes, reads
+//!   the clock, and asks the schedule for the next occurrence *after now*.
+//!   Occurrences that passed while it was asleep are gone.
+//! - **A DST shift, or a step backward.** Same answer, from the same
+//!   question. The schedule is evaluated in its own zone, so an occurrence
+//!   skipped by a spring-forward does not fire, and one repeated by a
+//!   fall-back can fire twice — that is what the wall-clock pattern means.
+//!
+//! **A missed occurrence is never replayed**, and this is a choice rather
+//! than a limitation. Replaying means a daemon that was asleep for six
+//! hourly occurrences restarts a sheep six times on wake, in a burst, for
+//! schedules whose whole point was to spread work out. Catch-up would also
+//! have to decide how far back to look, and every answer to that is
+//! arbitrary. So a suspended machine's flock restarts **once**, at the next
+//! occurrence, and a schedule with no further occurrence at all ends its
+//! worker instead of spinning.
+//!
+//! # What `max_cron_sleep` trades
+//!
+//! The loop parks for `min(time until next occurrence, max_cron_sleep)` and
+//! re-checks. The knob buys **recovery speed after a clock jump**, and pays
+//! in **wakeups**:
+//!
+//! - Shorter recovers faster from a suspend or an NTP step, because the
+//!   worker re-reads the clock sooner, and costs one wakeup per interval per
+//!   cron-configured name.
+//! - Longer wakes less often and drifts for longer after a jump.
+//! - Neither changes **whether** an occurrence fires. The re-check after the
+//!   sleep is what guarantees that: a capped sleep that expires early loops
+//!   and sleeps again rather than firing.
+//!
+//! It defaults to `DEFAULT_MAX_CRON_SLEEP` and is set by `[daemon]
+//! max_cron_sleep` (or `SHEP_MAX_CRON_SLEEP`). Values below one second are
+//! rejected at config load rather than clamped — see `MIN_MAX_SLEEP` for
+//! why this function *also* floors what it is handed.
+//!
+//! # Caveats
+//!
+//! - **Five-field standard cron only.** No seconds field, and none of
+//!   croner's `L`/`W`/`#`/`?` extensions. The seven vixie `@nicknames` are
+//!   accepted, but shep expands them itself before croner sees them, so the
+//!   dialect stays literally five-field.
+//! - **Granularity is the loop's, not the schedule's.** A restart fires on
+//!   the first wake at or after its occurrence; the wake is scheduled, not
+//!   instantaneous, so a busy runtime can land it late by however long the
+//!   task waits to be polled.
+//! - **The restart is group-wide.** Every instance of the name goes down and
+//!   comes back together, stopped instances included. If you need the app to
+//!   keep serving through it, that is what reload is for.
+//!
+//! ## Reference
+//!
+//! - [`Clock`], [`SystemClock`]
+//! - [`spawn_cron_worker`]
+//! - `DEFAULT_MAX_CRON_SLEEP`, `MIN_MAX_SLEEP`
+//! - [`shep_core::config::CronSchedule`] — the pattern's own grammar and
+//!   timezone resolution
 
 use core::time::Duration;
 use std::sync::Arc;
