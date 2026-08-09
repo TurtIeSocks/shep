@@ -8,7 +8,9 @@
 //! and a `301` is a [`ProbeFailure::Rejected`], never followed — a probe
 //! that follows redirects is a probe that can pass against a completely
 //! different service. For the same reason a response only counts as healthy
-//! if it *is* an HTTP response: see [`evaluate_status_line`].
+//! if it *is* an HTTP response — a status line must begin `HTTP/` before its
+//! status code is worth reading, or any line-oriented daemon that answers
+//! `… 204 …` passes.
 
 // Rejected alternatives, so nobody re-litigates: `reqwest` brings tower and a
 // TLS stack into a daemon targeting single-digit-MB idle RSS (spec §14.11);
@@ -162,6 +164,13 @@ impl OsProber {
         let waited = tokio::time::timeout(timeout, child.wait()).await;
         match waited {
             Ok(Ok(status)) if status.success() => Ok(()),
+            // Load-bearing detail for anyone who later drops the shell: a
+            // command naming a binary that does not exist is `Rejected("127")`
+            // and NOT a spawn failure, because `sh` itself always spawns and
+            // reports "not found" through its own exit code. Exec straight to
+            // the program instead and the same 127 becomes a real spawn
+            // failure, so this classification flips without a line here
+            // changing.
             Ok(Ok(status)) => Err(ProbeFailure::Rejected(exit_code_text(&status))),
             // Both remaining arms abandon a process that may still be
             // running: the timeout by definition, and a `wait` that errored
