@@ -1,0 +1,38 @@
+[package]
+name = "shep-benches"
+version = "0.1.0"
+publish = false
+# Spelled literally, not inherited. The `[workspace]` table below makes this
+# crate its own workspace root, so `edition.workspace = true` would resolve
+# against THIS file's (absent) `[workspace.package]` and the manifest would
+# fail to parse. Keep both in step with the root Cargo.toml (`edition = "2024"`,
+# `rust-version = "1.88"`) by hand.
+edition = "2024"
+rust-version = "1.88"
+
+# Own workspace table: this crate is excluded from the root workspace's
+# dependency unification so a bench-only dependency can never end up in a
+# shipped binary's tree (IR-5).
+[workspace]
+
+[dependencies]
+shep-daemon = { path = "../crates/shep-daemon" }
+# 0.7 is the current line as of 2026-08-09 (re-verified against `cargo info
+# criterion@0.7`; 0.8.2 also exists but is not what this manifest pins).
+# rust-version = "1.80" (under this workspace's 1.88 floor), default =
+# [rayon, plotters, cargo_bench_support] — turning defaults off and naming
+# cargo_bench_support back on is what keeps rayon and plotters out of a bench
+# crate that only ever runs via `cargo bench`.
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "memory_sample"
+harness = false
+
+# No `[lints]` here: `workspace = true` fails for the same reason
+# `edition.workspace = true` does above (this crate has no
+# `[workspace.package]` of its own to inherit from), and restating the root's
+# deny list (`missing_docs`, `missing_debug_implementations`,
+# `clippy::undocumented_unsafe_blocks`) by hand would police an unpublished,
+# unshipped bench crate whose only reader is whoever runs `cargo bench`. This
+# is a deliberate omission, not an oversight.

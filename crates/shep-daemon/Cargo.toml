@@ -32,6 +32,16 @@ tempfile.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# DateTime<Utc> for the Clock seam (cron.rs): cron means wall time, which is
+# not the same clock as tokio::time's paused Instant.
+chrono.workspace = true
+# Process-table RSS sampling for the MemorySampler seam (limits/sample.rs) —
+# resident memory across a sheep's whole process tree.
+sysinfo.workspace = true
+# The OS seam for watch-restart (watch/source.rs): bridges notify's debounced
+# filesystem events onto a tokio mpsc channel.
+notify.workspace = true
+notify-debouncer-full.workspace = true
 
 # nix is #![cfg(unix)] internally and command-fds does unconditional unix-only fd
 # plumbing, so both would fail to compile on a Windows CI leg. Rin's Windows ruling:
@@ -52,6 +62,12 @@ command-fds.workspace = true
 # `tracing-core` floor.
 [target.'cfg(any())'.dependencies]
 tracing-core.workspace = true
+# Same mechanism, for notify's under-declared fsevent-sys floor (root
+# Cargo.toml's comment on the `fsevent-sys` entry has the exact API). macOS
+# only in principle, but this crate has no `cfg(target_os = "macos")`
+# dependency section of its own, so `cfg(any())` is the opt-in that puts it
+# in the graph everywhere the rehearsal needs to see it.
+fsevent-sys.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }

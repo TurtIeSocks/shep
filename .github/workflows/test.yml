@@ -78,3 +78,22 @@ jobs:
       - run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
       - uses: actions/upload-artifact@v4
         with: { name: coverage, path: lcov.info }
+  bench:
+    # `benches/` is its own `[workspace]` (see benches/Cargo.toml), excluded
+    # from the root workspace on purpose so a bench-only dependency can never
+    # end up in a shipped binary's tree. That means the `test` job's `1.88`
+    # matrix leg never touches it — nothing else in this file checks
+    # `benches/Cargo.toml`'s own `rust-version = "1.88"` floor without this
+    # job carrying the same two-toolchain matrix itself.
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, "1.88"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
+      # `--test` runs each benchmark exactly once and asserts nothing: the
+      # point on a shared runner is proving the harness still compiles and
+      # executes, not collecting a timing (see benches/benches/memory_sample.rs).
+      - run: cargo +${{ matrix.toolchain }} bench --manifest-path benches/Cargo.toml -- --test

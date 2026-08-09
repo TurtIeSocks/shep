@@ -1,5 +1,24 @@
 # shep Phase 4 — Lifecycle extras Implementation Plan
 
+> **STATUS: COMPLETE AND SUPERSEDED (2026-08-09).** All fourteen tasks shipped. The
+> unticked `- [ ]` boxes below are left as written: they record the plan as it was
+> drafted, not the state of the tree, and ticking them would assert a step-by-step
+> equivalence the branch does not have — several tasks deviated, and the deviations
+> are recorded where they were decided, not here.
+>
+> **Do not read this file as the state of the code.** For what actually shipped, in
+> descending order of authority: the per-task briefs and reports in `.superpowers/sdd/`
+> (`task-1-brief.md` … `task-14-report.md`, plus `phase4-*.md` for the cross-task
+> amendments), `docs/systematic-refactor/refactor-workspace/map.md` for module-level
+> behavior, and the crate `CHANGELOG.md` files for the user-visible surface.
+>
+> Known drift between this plan and the tree, so nobody re-derives it: the
+> Architecture note below says watch and cron reach the engine through
+> `SupervisorHandle::restart(ProcessSelector)`. They go through
+> `restart_automatic`, which declares `CommandOrigin::Automatic` so an operator's
+> `stop` can displace an automatic restart mid-kill-ladder. The budget-reset
+> behavior the note relies on is unchanged.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 > **REQUIRED SKILL:** invoke `shep-idiomatic-rust` before writing ANY Rust here. Cite rules as `IR-<n>`.
 
@@ -106,6 +125,19 @@ These are not style preferences. Each one cost a review round or a full task cyc
 8. **Third-party APIs are verified against real documentation, never recalled.** Phase 3 wrote three clap facts from memory and all three were wrong. Every third-party signature in this plan was read off docs.rs on 2026-08-08 and is quoted verbatim at the task that uses it; an implementer who needs one this plan does not quote looks it up rather than guessing.
 9. **One task owns each shared type, constant, and fixture.** Later tasks consume and define none. The fixture roster and the dependency-ownership table above are the record.
 10. **No task-relative phrasing in code, docs, or manifests.** No `// Task 7 will…`, no `# Task 2`, no "this task adds". A reader in six months has this plan file at best and cannot locate a task number. Ownership belongs in this document; the code says what it does.
+11. **Advance a paused clock in steps no larger than the shortest period of the loop under test, and make negative assertions poll a bounded window (`timeout` + `recv`) rather than a single `try_recv`.** Task 3 measured why: one `advance(3600s)` against a 60s-period loop produces exactly 1 wakeup, while walking the same span in steps small enough to match the loop's own cadence produces 59 — a single big jump resolves the task's one currently-pending sleep in a single shot and collapses every wakeup in between into that one, hiding whatever the loop does (or fails to do) on each of the wakeups it never gets a chance to take. Auto-advance (no explicit `advance()` call — the runtime just walks its own timers when nothing else is ready) is unaffected and safe; the hazard is explicit `advance()` itself, and small steps shrink it without removing it. **Of the rule's two clauses the bounded window is the one that carries the weight** — the step-size clause is necessary, not sufficient, and the measurements below are why. This governs every task below that adds a periodic loop, not just Task 3's cron worker — Task 6's memory poll, Task 7's probe intervals, and Task 11's watch debounce all inherit it.
+   **Step size alone does not rescue an `advance`-driven test.** `tokio::time::advance` moves the clock and yields once, so a worker the timer just woke is *scheduled* but has not run by the time `advance` returns; the test then reads the world one scheduler pass early, and the last tick of any span is the one it misses. Measured on tokio 1.53, three ticks due in every row:
+
+   | Crossing three 15s periods | `sleep`-then-work loop | `interval` grid loop |
+   |---|---|---|
+   | 3 × `advance(15s)` — steps equal to the period | **1** of 3 | 2 of 3 |
+   | 45 × `advance(1s)` — steps far below the period, as the rule prescribes | **2** of 3 | 2 of 3 |
+   | one `timeout(3 × 15s + 1ms)` + `recv`, auto-advance only | **3** of 3 | 3 of 3 |
+
+   The shipped enforcer is the left column: it sleeps, then works, so its next deadline does not exist until the task has run, and a jump spanning three periods can only ever satisfy the one sleep already pending. The `+ 1ms` is not decoration — a window ending exactly on the last deadline races it, and the hair clears it. Only the bottom row observes the loop the test is about. The 59 in the rule above is the same effect seen from the other end: an hour of a 60s-period loop contains 60 occurrences, and stepping the whole way reaches 59 of them. Stepping buys back all but the last tick, which is exactly the tick a test's final assertion is usually about.
+   **A `try_recv` negative is worse than imprecise: it cannot fail.** After `advance(15s)`, `try_recv` returns `Err(Empty)` while the very next bounded `recv` returns the message that was already due. So a deliberately broken worker that reports on *every* tick still **passes** a `try_recv` negative, because `Err(Empty)` is exactly what that assertion wants; the bounded form fails it, correctly. A test that cannot fail guards nothing (rule 5). The same undercount silently moves any call counter a table pins — see the table above — so the assertion form changes what a test can *count*, not merely how it waits.
+   **The trade-off the carve-out claimed does not exist.** "A timeout that is expected to expire is a test that takes real time to pass" is true only on a real clock. Under `start_paused` the runtime auto-advances to the deadline when nothing else is ready, so an expiring `timeout(60s)` costs **54µs** of wall clock, ten expiring `timeout(3600s)` in sequence — ten virtual hours — cost **534µs** together, and the same 3600s window over a 60s-period loop records all **59** wakeups in **1.8ms** while still expiring. The real clock is where the objection bites: an expiring `timeout(250ms)` there costs the full **252ms**. This rule is scoped to the paused clock that IR-33 already makes the default, so the expensive case is the one the crate does not write.
+   **Size the window to the span whose silence is being claimed.** A bounded window is a claim about an interval, so it should cover exactly the ticks the test says produce nothing — spanning them is the point, and a correct worker that ticks and reports nothing leaves the window to expire. The one way to get it wrong is a window that outruns a message the test expects to arrive *legitimately* later: auto-advance walks to that message and delivers it, turning a real pass into a confusing failure. Where a task's negative sits between two expected events, end the window before the second.
 
 Beyond those: paused tokio clock where time matters (`#[tokio::test(start_paused = true)]` is this crate's default — real time needs a justifying comment, IR-33), no sleeps as synchronization, hand-rolled fakes against the real traits, a unique config literal and tempdir per test (IR-34). **No test may touch the real `$HOME` or `$SHEP_HOME`, and none may bind a real unix socket** — every fixture is rooted in its own `tempfile::TempDir`, exactly as `crate::testing::test_paths` (`crates/shep-daemon/src/lib.rs`) already does. The two tiers that legitimately touch the real OS — the filesystem-watch smoke test and the loopback HTTP probe — still bind only to a tempdir and to `127.0.0.1:0`.
 
@@ -235,12 +267,13 @@ The module currently exists as an inline `mod testing { ... }` inside `lib.rs`. 
 | `loopback_http` | Task 8 | `pub(crate) async fn loopback_http(script: Vec<HttpReply>) -> (SocketAddr, tokio::task::JoinHandle<()>)` — binds `127.0.0.1:0`, serves one reply per connection in order |
 | `touch` | Task 10 | `pub(crate) fn touch(root: &Path, rel: &str) -> std::io::Result<PathBuf>` — creates parent dirs, writes one byte, returns the absolute path |
 | `app_with` | Task 12 | `pub(crate) fn app_with(name: &str, edit: impl FnOnce(&mut AppConfig)) -> ResolvedApp` — `AppConfig::minimal(name, "./srv")`, `edit`, then `normalize().unwrap()` |
+| `armed_entry` | Task 12 | `pub(crate) fn armed_entry(id: u32, instance: u32, pid: u32, app: ResolvedApp, paths: &ShepPaths) -> ProcessEntry` — an `Online` entry with `pid: Some(pid)`, log paths from `assemble`, everything else at its default |
 
 `TestClock::reads` is a counter and not a convenience: the only externally visible difference between two `max_cron_sleep` values is how often the worker wakes, and on a paused clock a wakeup is invisible unless something counts it. It is an `AtomicUsize` rather than a `Cell` because `Clock` is bounded `Send + Sync` and `now_utc` takes `&self`; `Relaxed` ordering is enough, since the assertion happens after the worker has been driven to a quiescent point and nothing orders anything else against this count.
 
 `ScriptedSampler` and `ScriptedProber` both repeat their final scripted value rather than panicking on exhaustion. This is deliberate and it is the difference between a useful fake and an irritating one: a liveness test that scripts three failures wants the fourth poll — if the implementation wrongly makes one — to *also* fail, so the assertion is about the threshold count and not about the fake running dry. Both expose `calls()` so a test can assert the exact number of polls, which is the claim that catches an off-by-one threshold.
 
-**An empty script is a defined case, not an accident**, because this plan constructs one at Task 7's dyn-compatibility line and `harness` wires one by default: `ScriptedProber::new(vec![])` returns `Ok(())` forever and `ScriptedSampler::new(vec![])` returns an empty table forever. That is the neutral value in both cases — a prober that never fails and a machine with no visible processes — so a fixture nobody scripted arms nothing and reports nothing. `with_delay` composes with it: an empty script still sleeps.
+**An empty script is a defined case, not an accident**, because this plan constructs one at Task 7's dyn-compatibility line and `harness` wires one sampler by default: `ScriptedProber::new(vec![])` returns `Ok(())` forever and `ScriptedSampler::new(vec![])` returns an empty table forever. That is the neutral value in both cases — a prober that never fails and a machine with no visible processes — so a fixture nobody scripted arms nothing and reports nothing. `with_delay` composes with it: an empty script still sleeps.
 
 `ScriptedProber::with_delay` is builder-style rather than a second constructor precisely so the four threshold cases and the dyn-compatibility line keep using `new` unchanged. The delay is honoured even when it exceeds the `timeout` argument, because the fake ignores that argument — the point of the case that uses it is a probe that passes *slowly*.
 
@@ -827,7 +860,7 @@ All under `#[tokio::test(start_paused = true)]`. Required cases, each with its "
 
 The clock-read bound is deliberately a bound and not an equality, and rule 7 is satisfied anyway because the two sides are twelve and a hundred and twenty. The loop as written reads twice per iteration; an implementer who carries the post-sleep read forward into the next iteration's `now` gets seven, which is a better loop and must not fail this test. Name the hundred and twenty in the "fails if" comment so the margin is visible to whoever next edits the number.
 
-**Observation is by event subscription, not by `handle.list()`, and the choice is not the implementer's.** Subscribe to the harness's event channel; assert positives with `tokio::time::timeout` naming the restart that did not arrive, and negatives with `try_recv()` returning `Err(Empty)` after advancing — the same discipline Tasks 6, 7 and 11 use. A `list()` read is a poll of a value that changes asynchronously: taken before the worker task has been polled it reports 0 restarts, which passes a negative case against a worker that is merely late and fails a positive one that is merely early. Every negative case in this table is a claim that something did *not* happen, and a poll cannot make that claim.
+**Observation is by event subscription, not by `handle.list()`, and the choice is not the implementer's.** Subscribe to the harness's event channel; assert positives with `tokio::time::timeout` naming the restart that did not arrive, and negatives with a bounded `timeout` + `recv` over the span that must stay quiet, per Global Constraints rule 11 — the same discipline Tasks 6, 7 and 11 use. A `list()` read is a poll of a value that changes asynchronously: taken before the worker task has been polled it reports 0 restarts, which passes a negative case against a worker that is merely late and fails a positive one that is merely early. Every negative case in this table is a claim that something did *not* happen, and a poll cannot make that claim. The bounded window is also what crosses the span: the abort row's "advance a further hour" is one `timeout(1h, recv)` that must expire, not sixty stepped `advance` calls, because auto-advance walks the whole hour and takes every wakeup in it — the 59 in rule 11 — for 1.8ms of wall clock.
 
 - [ ] **Step 4: Dyn-compatibility smoke test** — `let _: &dyn Clock = &SystemClock;`, one line, in the module's test block. It fails to compile the moment somebody adds a generic method to `Clock`.
 
@@ -1144,7 +1177,9 @@ All under `#[tokio::test(start_paused = true)]`, driven by `ScriptedSampler`. Re
 | `disarm` before the next tick produces no breach | an enforcer that leaks armed entries |
 | a sheep whose root pid is absent from the table produces no breach | a `tree_rss` of 0 compared with `>=` against a limit of 0, or a panic on the missing pid |
 
-Every `breaches.recv().await` is wrapped in `tokio::time::timeout` naming the breach that did not arrive. The negative cases — "no breach" — are asserted with `try_recv()` returning `Err(Empty)` after advancing the clock, **not** with a timeout, because a timeout that is *expected* to expire is a test that takes real time to pass.
+Every `breaches.recv().await` is wrapped in `tokio::time::timeout` naming the breach that did not arrive. The negative cases — "no breach" — are asserted the same way, with a bounded `timeout` + `recv` over the ticks that must stay silent, per Global Constraints rule 11. An earlier draft of this task carved out a `try_recv()` here on the reasoning that a timeout expected to expire costs real time; it does not, on a paused clock, and the carve-out silently defeated the cases it was applied to — measurements in rule 11.
+
+This task is implemented and its tests already use the bounded form: `assert_no_breach_within` in `crates/shep-daemon/src/limits/mod.rs` takes a window and panics if a breach arrives inside it. **It is not to be "fixed" back to `try_recv`.** It also crosses ticks by letting `timeout` auto-advance the paused clock rather than by calling `advance` at all, which is the shape the first two rows of this table need. `sampler.calls()` reads 3 after three ticks that way; the same three ticks crossed by `3 × advance(15s)` read 1, and by `45 × advance(1s)` read 2. The first row pins the count at exactly 3 and the second asserts a breach on exactly the third tick, so neither row is observable through an `advance`-driven test at all — the third tick never happens.
 
 The comparison is `observed > limit`, strictly. A tree exactly at `max_memory` has not exceeded it, and the boundary sweep asserts that a reading of exactly the limit does not breach while `limit + 1` does.
 
@@ -1254,7 +1289,9 @@ All `#[tokio::test(start_paused = true)]`. Required cases with their "fails if" 
 
 The arithmetic on the cadence row, so the implementer pins the right number rather than the number their loop happens to produce: the mandated loop sleeps *then* probes, so probe starts land at I, 4I, 7I, 10I — four calls by 12I. An `interval` loop starts at 0, 2I, 4I, 6I, 8I, 10I, 12I — seven. A gap of three is a guard that bites; without `with_delay` the two loops differ by exactly one call, which is a difference the first row of this table already asserts more precisely, and the case would be guarding nothing.
 
-The `failures.recv().await` in the positive cases is wrapped in `tokio::time::timeout` naming the id that did not arrive. The negative cases assert with `try_recv()` after advancing, as in Task 6.
+The `failures.recv().await` in the positive cases is wrapped in `tokio::time::timeout` naming the id that did not arrive. The negative cases assert with a bounded `timeout` + `recv` over the intervals that must stay silent, as in Task 6 and per Global Constraints rule 11.
+
+**Two rows of this table pin a call count, and the count is only correct if the clock is crossed that way.** The cadence row's four and the no-further-probing row's "does not grow" are both readings of `prober.calls()` taken after a span. This loop sleeps *then* probes, which is the shape rule 11's left column measures: an explicit `advance` returns before the woken loop has run, so its next sleep does not yet exist, and a span crossed that way loses its last tick at best and nearly all of them at worst — three due, one observed. That would turn the pinned 4 into a smaller number the implementer then bakes in as correct, and it would let a loop that *does* keep probing a sheep it declared dead sail through the row written to catch it. Cross both spans by awaiting a bounded `timeout` that clears the final deadline by a hair, and the counter reads what the arithmetic above says it should.
 
 - [ ] **Step 3: Add the `Prober` implementation to `tests/external_impls.rs`**
 
@@ -1785,7 +1822,7 @@ Two more for the group's reach and for the error arm, which no other case reache
 
 The first row is the one that would have gone the other way a draft ago, and it is worth saying why it is asserted so precisely: `Online` alone would pass against a group that never touched the stopped instance if something else had started it, so the `restarts` count is what makes the claim about *this* restart.
 
-Every `recv().await` in these tests — on the event channel used to observe restarts — is inside a `tokio::time::timeout` naming the restart that did not arrive.
+Every `recv().await` in these tests — on the event channel used to observe restarts — is inside a `tokio::time::timeout` naming the restart that did not arrive. The two cases that are claims about a restart *not* happening take the same form over a window that outlasts the debounce delay: the only-ignored batch, and the "exactly two, not three" row, whose third restart would arrive after the second and so is only excluded by waiting past it. Neither is a `try_recv` — Global Constraints rule 11 has the measurements, and the debounce timer is precisely the pending timer a bare poll reads too early.
 
 - [ ] **Step 3: Run the full gate list from Global Constraints, each from its own exit code**
 - [ ] **Step 4: Commit** — `feat(daemon): watch-triggered restarts with glob filtering and re-check`
@@ -1802,7 +1839,7 @@ Every `recv().await` in these tests — on the event channel used to observe res
 - Modify: `crates/shep-cli/src/commands/daemon.rs` — **unix tier** (`boot_options` folds the configured `max_cron_sleep` into `BootOptions`, and `run_daemon`'s doc names the third `SHEP_*` variable)
 
 **Interfaces:**
-- Consumes: `crate::cron::{Clock, spawn_cron_worker, DEFAULT_MAX_CRON_SLEEP}`, `crate::limits::{LimitEnforcer, LimitBreach}`, `crate::probes::{Prober, LivenessFailure, spawn_liveness_task}`, `crate::watch::{WatchFilter, spawn_watch_group, DEFAULT_WATCH_DELAY}`, `crate::entry::ProcessEntry`, `crate::supervisor::SupervisorHandle`, `crate::runner::ProcessRunner`, `shep_core::paths::ShepPaths`, `shep_core::protocol::BusEvent`, `shep_core::values::UpDuration::as_duration`
+- Consumes: `crate::cron::{Clock, spawn_cron_worker, DEFAULT_MAX_CRON_SLEEP}`, `crate::limits::{LimitEnforcer, LimitBreach}`, `crate::probes::{Prober, LivenessFailure, spawn_liveness_task}`, `crate::watch::{WatchFilter, spawn_watch_group, DEFAULT_WATCH_DELAY}`, `crate::entry::ProcessEntry`, `crate::supervisor::SupervisorHandle`, `crate::runner::{ProcessRunner, SpawnSpec}`, `crate::assemble::assemble`, `shep_core::paths::ShepPaths`, `shep_core::protocol::BusEvent`, `shep_core::values::UpDuration::as_duration`
 - Produces:
 
 ```rust
@@ -1828,8 +1865,6 @@ pub struct Extras {
     pub clock: Arc<dyn Clock>,
     /// Memory-limit mechanism.
     pub enforcer: Box<dyn LimitEnforcer>,
-    /// Probe transport for readiness and liveness.
-    pub prober: Arc<dyn Prober>,
     /// Longest a cron worker parks before re-reading the clock, from
     /// `[daemon] max_cron_sleep`. Already defaulted: this is a value, not an
     /// option, because the layer that knew whether the user set anything is
@@ -1842,8 +1877,11 @@ pub struct Extras {
 }
 
 impl Extras {
-    /// The production wiring: system clock, polling enforcer over sysinfo, and
-    /// probes over real sockets.
+    /// The production wiring: system clock and polling enforcer over
+    /// sysinfo.
+    ///
+    /// No prober: one is scoped to a single sheep's assembled environment,
+    /// and boot has no sheep in scope.
     ///
     /// Must be called from within a Tokio runtime context: constructing the
     /// polling enforcer starts its sampling task immediately.
@@ -1870,9 +1908,19 @@ pub struct ExtrasRegistry { /* private */ }
 impl ExtrasRegistry {
     /// Arms everything an entry's configuration asks for.
     ///
+    /// `prober` is scoped to this instance's assembled `SpawnSpec` and is
+    /// read only by the liveness loop; an entry configuring no
+    /// `liveness_probe` never touches it.
+    ///
     /// Idempotent per id: arming an already-armed id disarms it first, which
     /// is what a respawn needs — the new process has a new pid.
-    pub fn arm(&mut self, entry: &ProcessEntry, extras: &Extras, supervisor: &SupervisorHandle);
+    pub fn arm(
+        &mut self,
+        entry: &ProcessEntry,
+        prober: Arc<dyn Prober>,
+        extras: &Extras,
+        supervisor: &SupervisorHandle,
+    );
 
     /// Aborts everything armed for `id`, and both of the name-group's
     /// per-name tasks — its watch and its cron worker — when this was the
@@ -1890,20 +1938,23 @@ impl ExtrasRegistry {
 }
 ```
 
-**`Extras` needs a manual `Debug`, and it is required rather than optional.** `Clock`, `LimitEnforcer` and `Prober` are all bounded `Send + Sync + 'static` and nothing more, so `#[derive(Debug)]` does not compile — while the workspace denies `missing_debug_implementations`, so omitting it does not compile either. Write the seams by role, not by value, and finish non-exhaustively:
+**`Extras` carries no prober, and an earlier draft of this plan said it did — the defect that draft described is one Task 9 has already shipped and already fixed.** `Extras::real` runs at boot with no app in scope, so the only prober it could construct is `OsProber::new(None, BTreeMap::new())`. `probe_exec` runs `env_clear().envs(&self.env)` (`crates/shep-daemon/src/probes/os.rs:160`), so a prober built from an empty map runs *every* exec probe — readiness and liveness alike — with no `PATH`, no `HOME`, no `USER`, no `LANG`, no `TZ`. The sharper half is `SHEP_INSTANCE` (or the app's `increment_var`), which `assemble` writes and nothing else does (`crates/shep-daemon/src/assemble.rs:135-136`): under a shared prober every instance of a clustered app probes whatever the unexpanded variable leaves behind, which is the same port, every time. Task 9 shipped exactly that and it was invisible, because the `&ResolvedApp` its first signature took structurally cannot reach `instance`; the fix was `readiness_prober(spec: &SpawnSpec)` (`crates/shep-daemon/src/supervisor.rs:1304-1321`), scoping the prober to the assembled spec's `cwd` and `env`, and a review adjudicated that departure correct. The rows this task declares would not have caught the same defect on the liveness path either: `ScriptedProber` ignores both `cwd` and `env`, so a shared prober would have shipped dead and untested twice.
+
+**The `Prober` seam is unchanged; what moves is who holds it.** `spawn_liveness_task` still takes an `Arc<dyn Prober>` (`crates/shep-daemon/src/probes/mod.rs:123-130`), and Global Constraints' three-trait-objects claim still stands. A prober is per-sheep state scoped to one assembled `SpawnSpec`, not daemon-wide wiring like a clock or an enforcer, so it reaches the liveness loop as an argument to `arm` rather than as a field sitting beside them.
+
+**`Extras` needs a manual `Debug`, and it is required rather than optional.** `Clock` and `LimitEnforcer` are both bounded `Send + Sync + 'static` and nothing more, so `#[derive(Debug)]` does not compile — while the workspace denies `missing_debug_implementations`, so omitting it does not compile either. Write the seams by role, not by value, and finish non-exhaustively:
 
 ```rust
 impl fmt::Debug for Extras {
-    // Roles, not values, for the seams: none of the three is Debug, and
-    // printing the report channels would say nothing a reader wants. The
-    // sleep bound is the exception and prints for real — it is a tuning knob
-    // the user set, so a daemon log that dumps this struct should say what it
-    // ended up being.
+    // Roles, not values, for the seams: neither is Debug, and printing the
+    // report channels would say nothing a reader wants. The sleep bound is
+    // the exception and prints for real — it is a tuning knob the user set,
+    // so a daemon log that dumps this struct should say what it ended up
+    // being.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Extras")
             .field("clock", &"<dyn Clock>")
             .field("enforcer", &"<dyn LimitEnforcer>")
-            .field("prober", &"<dyn Prober>")
             .field("max_cron_sleep", &self.max_cron_sleep)
             .finish_non_exhaustive()
     }
@@ -1931,6 +1982,12 @@ Cron and watch are per-name because both select by `ProcessSelector::Name` and w
 - **Root** is `std::fs::canonicalize(entry.spec.config().cwd)`. `cwd` is `Some` by construction here, because Task 2's `normalize` rejects `watch = true` with no `cwd` — read that task for why the daemon's own cwd is not an acceptable fallback. Canonicalizing is not tidiness: Task 11 matches by stripping the root prefix off notify's absolute paths, and on macOS a `TempDir` under `/var/...` is delivered by FSEvents as `/private/var/...`, so without it `strip_prefix` fails for every event and Task 11's own treat-as-non-triggering rule makes the watch fire never. Task 11's real-filesystem case and Task 14's e2e case 1 both walk straight into this. A failed canonicalize — the directory does not exist — arms nothing and logs at `warn` naming the path.
 - **Delay** is `config.watch_delay.map(UpDuration::as_duration).unwrap_or(DEFAULT_WATCH_DELAY)`. `as_duration` is `const` and takes `self` (`crates/shep-core/src/values.rs:173`), so the `map` compiles as written.
 - **Filter** is `WatchFilter::new(&config.watch_options, &config.ignore_watch)`. On `Err` — a glob the user mistyped — arm no watch and log at `warn`; a bad glob must not take down the arm path for that app's cron worker, enforcer and probe.
+
+**Where the liveness prober comes from, and why `arm` takes one rather than building one.** The actor builds it at the call site, from a spec it assembles exactly the way `respawn` already does — `assemble(&entry.spec, entry.instance, &self.paths, entry.credentials)` (`crates/shep-daemon/src/supervisor.rs:711`; `Credentials` is `Copy`, which is why that line needs no clone) — and hands the result to `arm`. Three things follow, and none of them is optional:
+
+- **Reuse the helper Task 9 shipped, and rename it.** `readiness_prober` (`crates/shep-daemon/src/supervisor.rs:1319-1321`) is one line — `Arc::new(OsProber::new(spec.cwd.clone(), spec.env.clone()))` — and its name is the only readiness-specific thing about it. Rename it `spec_prober`, widen its doc's opening line to name both callers, and change nothing else: a second spelling of that constructor is how the empty-env defect grows back on one path while the other stays fixed.
+- **`arm` takes the prober, not the spec, because that is what keeps the fake usable.** A registry test constructs a `ScriptedProber` and calls `arm` directly, on the paused clock, on every platform this workspace compiles for. Hand `arm` a `&SpawnSpec` instead and it must build an `OsProber` itself, which pushes every liveness-wiring assertion onto real processes and a real clock — and the `#[cfg(unix)]` that then comes with them takes the Windows leg's coverage of this file along.
+- **The construction is unconditional.** One `assemble` and one `Arc::new` per transition to `Online`, immediately after a process spawn. Skipping it for an app with no `liveness_probe` would mean `Option<Arc<dyn Prober>>` and an arm path that has to decide what a `None` means, which is more surface than the allocation costs.
 
 **The cron worker's fifth argument comes from the same place, and it is not per-app.** `arm` passes `extras.max_cron_sleep` straight through to `spawn_cron_worker`. It is a daemon-wide knob rather than a Flockfile field on purpose — it tunes how the shepherd wakes up, not how any one app behaves — so it rides on `Extras` beside the seams instead of being read off `entry.spec.config()` like the watch's three. Read it from `extras`, never re-derive it.
 
@@ -1968,6 +2025,10 @@ The consequence is load-bearing rather than cosmetic, and it is what makes the g
 
 Note the interaction with Task 9: for a gated app the transition to `Online` happens in the `ReadyResult` handler, not in `spawn_fresh`. **Arming happens at the transition, wherever it is** — a liveness probe armed at spawn against an app that has not finished starting will fail its threshold and restart the app before it ever comes up. Put the `arm` call in one place that both paths reach, not two.
 
+Every line number in that three-call-site list, and in the paragraph after it, predates Task 9's edits to both spawn paths and now points somewhere else — `spawn_fresh` opens at `:568`, `respawn` at `:700`, `handle_exited` at `:991`, `set_status` at `:1235`. Follow the function names; they have not moved and neither has the argument.
+
+That single place also settles the prober question above. `handle_ready_result` (`crates/shep-daemon/src/supervisor.rs:1169-1195`) holds an `id` and a slot and nothing else — no `SpawnSpec`, because the spawn that assembled one returned long before — so the arm site cannot be fed a spec by its callers without the gated path smuggling one through the slot for the length of a readiness wait. Re-assembling from `&ProcessEntry` is what makes one arm site possible at all: `spec` and `instance` never change after registration (`crates/shep-daemon/src/entry.rs:31-33`), `credentials` is resolved once and reused for exactly this reason, and `assemble` is the same pure function both spawn paths call, so the spec it returns is the one the running process was spawned from rather than a second derivation of it.
+
 **`ProcessEventKind` gives no compile-time gate here, and the plan says so rather than letting the implementer assume one.** It is `#[non_exhaustive]` (`crates/shep-core/src/protocol/events.rs:11`), so any match on it from `shep-daemon` must carry a `_` arm and E0004 cannot fire. If this task maps lifecycle events to arm/disarm at all, the `_` arm's behaviour is stated in a comment — arm nothing, disarm nothing, log at `debug` — and never a `todo!()`. Prefer not to match it: arming from the *transition sites* listed above is direct, drop-free and needs no event at all, whereas driving arm/disarm off the bus would also have to survive the bus's bounded drop-oldest queue (`shep-core/src/protocol/events.rs`, the `Dropped` variant), and a dropped `Stop` would leave a probe firing at a process that no longer exists.
 
 **Breach and liveness reporting are consumed by a single task** — `spawn_extras_reporter`, declared above and living in `extras.rs` rather than `boot.rs`, because it is the code that turns a report into a restart and therefore has to be unit-testable and has to face the Windows compiler. In production it owns both receivers; the actor must never block on anything a subsystem controls. In tests the `Harness` owns them instead and no reporter is spawned, so a test asserts the raw report rather than racing a restart it did not trigger. Ownership is per tier, and stating only one of the two tiers is what made an earlier draft read as if two owners held one `mpsc::Receiver`.
@@ -1990,7 +2051,7 @@ pub async fn extra_restart(&self, id: u32, pid: u32);
 
 Its handler drops on any of four conditions, each logged at `debug` naming which guard fired: `self.shutting_down`; the slot is gone; `slot.entry.pid != Some(pid)`; `slot.entry.status != ProcStatus::Online`. Otherwise it falls through to `begin_manual(ProcessSelector::Id(id), ManualKind::Restart, ...)` — **not** to `respawn`. Delegating is what keeps the kill ladder, IMPORTANT-4's first-command-wins dedupe (`supervisor.rs:722-756`), the `pending_delete` interaction and the budget reset intact. Mirroring `handle_restart_due` literally would be wrong here: that handler respawns a sheep in `WaitingRestart`, which has no live process, while a breaching sheep is normally `Online` with a live pid — respawning it directly would put two live pids on one instance and break the first invariant Task 13 lists. The settled decision that breach and liveness restarts do not count against `max_restarts` is unaffected: `begin_manual` is still the budget-resetting path.
 
-- [ ] **Step 1: `app_with` in `testing.rs`, and the `Harness` change**
+- [ ] **Step 1: `app_with` and `armed_entry` in `testing.rs`, and the `Harness` change**
 
 `Harness` (`crates/shep-daemon/src/testing.rs`) gains two fields so tests can drive the extras:
 
@@ -2011,24 +2072,48 @@ pub(crate) struct Harness {
 
 **The harness holds both receivers and spawns no reporter**, which is the whole reason it can hold them at all. A test asserts the report itself — the id and pid that arrived — rather than the restart a production reporter would have caused. The reporter's own behaviour is tested separately, below, by handing it receivers directly.
 
-`harness(scripts)` keeps its signature and wires scripted extras — a `ScriptedProber::new(vec![])` and a `ScriptedSampler::new(vec![])`, both of which are the neutral fixtures described in the roster, so a harness nobody configured arms nothing and reports nothing. Its `max_cron_sleep` is `DEFAULT_MAX_CRON_SLEEP`, because a fixture nobody configured should behave like a daemon nobody configured. A second constructor `harness_with_extras(scripts: Vec<ProcScript>, extras: Extras) -> Harness` takes a caller-built `Extras`. Both are declared here and nowhere else.
+`harness(scripts)` keeps its signature and wires scripted extras — a `ScriptedSampler::new(vec![])`, the neutral fixture described in the roster, so a harness nobody configured arms nothing and reports nothing. Its `max_cron_sleep` is `DEFAULT_MAX_CRON_SLEEP`, because a fixture nobody configured should behave like a daemon nobody configured. A second constructor `harness_with_extras(scripts: Vec<ProcScript>, extras: Extras) -> Harness` takes a caller-built `Extras`. Both are declared here and nowhere else.
+
+**No prober is wired into the harness, and none can be**, since `Extras` no longer holds one: at the actor tier the prober is built from the assembled spec, so a harness-level test gets a real `OsProber` whatever it does. That is the position Task 9's supervisor tests are already in, and it takes the same answer — an exec probe over a real file, gated `#[cfg(unix)]` as a *test*, on the real clock, with `crates/shep-daemon/src/supervisor.rs:1605-1665` as the shipped model to copy rather than reinvent. Tests that want the fake call `ExtrasRegistry::arm` directly, which is the tier the fake belongs to anyway: `arm`'s job is handing a live sender and the right pid to a loop, not probing anything.
+
+`armed_entry` builds the `ProcessEntry` those registry-tier tests need:
+
+```rust
+pub(crate) fn armed_entry(
+    id: u32,
+    instance: u32,
+    pid: u32,
+    app: ResolvedApp,
+    paths: &ShepPaths,
+) -> ProcessEntry
+```
+
+— an `Online` entry with `pid: Some(pid)`, `restarts: 0`, `started_at: None`, `budget: RestartBudget::default()`, `reload: ReloadState::None`, `credentials: None`, and its two log paths taken from `assemble(&app, instance, paths, None)` rather than invented, so a registry test's entry is shaped like one the actor really registered. It is declared here and nowhere else (rule 9).
 
 - [ ] **Step 2: `ExtrasRegistry` and its tests**
 
 Cases with their "fails if" comments: an app with no extras configured arms nothing (assert no tasks were spawned, by asserting the registry is empty); an app with `cron_restart` arms one worker for the name and a second instance of the same name arms no second worker; a `max_memory` app arms the enforcer with its **root pid**, and a respawn re-arms with the *new* pid (the assertion is on the pid passed to a scripted enforcer — this is the case that catches a registry that arms once and never updates); `disarm` on the last instance of a name stops the cron worker and the watch group, and `disarm` on a non-last instance does not; disarming an id that was never armed is a no-op rather than a panic.
 
-Asserting "a task was aborted" is done by observing its effect stop, not by inspecting a `JoinHandle` — advance the clock past an occurrence and assert no restart, with the negative asserted by `try_recv` after advancing rather than by a timeout.
+Asserting "a task was aborted" is done by observing its effect stop, not by inspecting a `JoinHandle` — assert no restart across a window spanning the next occurrence, which is a bounded `timeout` + `recv` that must expire, per Global Constraints rule 11. That one call both crosses the occurrence and makes the claim; a `try_recv` after `advance` would report `Err(Empty)` whether or not the worker was ever aborted.
 
-**Four more cases, because a declared channel with no test is a channel that can be wired to a dropped receiver.** The liveness path is the one seam in this phase that no other task's tests touch at all, and an implementer with no visible sender will reach for `let (tx, _rx) = mpsc::channel(1);` inside `arm` — which compiles, probes forever, and reports into the void.
+**Five more cases, because a declared channel with no test is a channel that can be wired to a dropped receiver.** The liveness path is the one seam in this phase that no other task's tests touch at all, and an implementer with no visible sender will reach for `let (tx, _rx) = mpsc::channel(1);` inside `arm` — which compiles, probes forever, and reports into the void.
 
 | Case | The broken implementation it catches |
 |---|---|
-| an armed sheep whose `ScriptedProber` fails `failure_threshold` times puts exactly one `LivenessFailure` on the harness's receiver, carrying that instance's id **and pid** | `arm` creating a throwaway channel, or passing the id without the pid |
+| `arm` called directly on an `armed_entry` with a `ScriptedProber` that fails `failure_threshold` times puts exactly one `LivenessFailure` on the receiver the test holds, carrying that entry's id **and pid** | `arm` creating a throwaway channel, or passing the id without the pid |
+| a two-instance app whose liveness probe is `test -f <tempdir>/live-$SHEP_INSTANCE`, with only `live-0` present: one `LivenessFailure` arrives and it carries instance 1's id and pid, and a further window spanning another probe cycle stays empty | a prober built from `entry.spec.config().env`, or one built once at boot — both probe with `env_clear()` over an empty map, so `$SHEP_INSTANCE` expands to nothing, `live-` matches no file, and BOTH instances report; also catches an `assemble` call that hardcodes instance 0, which makes neither report |
 | `spawn_extras_reporter`, fed a breach for an `Online` sheep whose pid matches, produces exactly one `Restart` bus event for that id | a reporter that drops every report, or one that restarts the wrong id |
 | the same reporter, fed a breach for a `Stopped` sheep, restarts nothing: status still `Stopped`, no `Restart`/`Online` event | a reporter calling the public `restart`, which resurrects it |
 | the same reporter, fed a breach carrying the *previous* pid after a respawn, restarts nothing: `restarts` unchanged | a guard that checks status but not pid |
 
-The positive rows wrap their `recv().await` in `tokio::time::timeout` naming what did not arrive; the two negative rows assert with `try_recv()` after advancing. The last two are the cases that fail against an unguarded reporter, and they are cheap: both are a scripted enforcer, a `stop` or a respawn, and one `try_recv`.
+The positive rows wrap their `recv().await` in `tokio::time::timeout` naming what did not arrive; the negative rows assert the same way, over a window the report or restart would have to land inside. The last two are the cases that fail against an unguarded reporter, and they are cheap: both are a scripted enforcer, a `stop` or a respawn, and one bounded wait that expires in microseconds.
+
+**The second row is the one that catches the empty environment, so its shape is not free to vary.** It runs at the actor tier through the harness, because the whole claim is about what the *actor* assembles before it calls `arm`; a registry-tier version could only assert that `arm` forwarded the prober it was handed. Four constraints come with that:
+
+- **A file, not a port.** `test -f` flips fail→pass with no listener, no reserved port and no race, so the only thing the case can fail on is the environment the probe ran with — the reasoning `crates/shep-daemon/src/supervisor.rs:1613-1615` already wrote down for the readiness twin.
+- **Real clock, `#[tokio::test]` with no `start_paused`, and `#[cfg(unix)]` on the test rather than on anything else.** Each probe spawns a real `sh`, and a paused clock does not move the OS (`crates/shep-daemon/src/supervisor.rs:1617-1619`). Gating the test keeps the Windows leg compiling and running the registry-tier row above it.
+- **`interval` at `MIN_PROBE_INTERVAL` and `failure_threshold = 1`.** The loop floors any shorter interval at 1000ms (`crates/shep-daemon/src/probes/mod.rs:87-102`), so a smaller number in the fixture would be a lie about what the test waits for. One second of real time buys the whole claim.
+- **Both orderings must fail against the broken implementation.** Under a shared or config-scoped prober both instances report, and which one arrives first is a race — so assert on the id of the first report *and* keep the second window, which is what catches the other ordering. Per rule 11 that second window is a bounded `timeout` + `recv` spanning at least one interval plus one timeout, never a `try_recv`.
 
 - [ ] **Step 3: `boot.rs` — construct `Extras::real` and hand it to the builder**
 
@@ -2084,6 +2169,8 @@ Cap the case count in CI through proptest's env var, as IR-37 requires, matching
 | a cron pattern that never fires again; `* * * * *`, whose next occurrence lands exactly on the `DEFAULT_MAX_CRON_SLEEP` boundary of 60s | `cron.rs` |
 | a name-group with zero online instances (arm and immediately disarm) | `extras.rs` |
 
+**Two of these rows are negative claims and take the bounded form of Global Constraints rule 11, not a poll.** The `limits/mod.rs` row's "no breach" is `assert_no_breach_within` — Task 6 owns that helper and this sweep consumes it rather than declaring a second one (rule 9). The cron row's "does not double-fire" is the same shape: a window that extends past where a second firing would land, asserted to expire. Both sweeps also cross their spans with that window rather than with `advance`, for the reason rule 11's table gives.
+
 The cron row is a per-minute pattern, not a per-second one: the settled five-field dialect cannot express seconds at all, so "a pattern firing every second" — which an earlier draft asked for — is unwritable. Per-minute is the tightest granularity the dialect has, and it is also the more interesting boundary, because 60s is exactly `DEFAULT_MAX_CRON_SLEEP`: the clamp and the true next occurrence coincide, which is where an off-by-one in the clamp shows up. Build this worker with the default rather than a custom `max_sleep`, so the coincidence is real. Assert that the boundary neither drops an occurrence nor double-fires under the at-most-one-catch-up rule.
 
 The floor on `max_cron_sleep` is not swept here: it is a `shep-core` config rejection with its own rows at Task 3, and `daemon.rs` is not one of this task's files.
@@ -2102,6 +2189,7 @@ An `interval` of zero deserves a decision rather than a sweep result: a zero-int
 
 **Files:**
 - Modify: `crates/shep-cli/tests/cli_e2e.rs` — **unix tier** (the file opens `#![cfg(unix)]`)
+- Modify: `crates/shep-daemon/tests/real_runner.rs` — **unix tier** (one signal, and its doc)
 - Modify: `docs/systematic-refactor/refactor-workspace/map.md`
 - Modify: `crates/shep-core/CHANGELOG.md`, `crates/shep-daemon/CHANGELOG.md`
 - Modify: the module docs of every file this phase created
@@ -2117,6 +2205,31 @@ An `interval` of zero deserves a decision rather than a sweep result: a zero-int
 5. **An `https://` probe target is a config error.** Same shape, exit `4`, message names the target.
 
 Cases 4 and 5 are the cheapest and the most valuable: they are the proof that spec §5's "typos fail loudly at parse time" survived the trip from `normalize` through the RPC boundary to an exit code.
+
+**The orphan-leak family, closed here because this task owns the tier that leaks.** shep has produced four orphan bugs across this port. Two were product bugs, fixed at the source and guarded: a wrapper script's forked child surviving a graceful `stop`, and probe grandchildren surviving a probe timeout. The other two were `shep-cli` test binaries found alive after thirteen hours, one of them parked in `start_asks_for_the_longer_deadline` — a hang rather than a leak, and that one is already fixed where it happened (`crates/shep-cli/src/commands/lifecycle.rs:574-590` records the missing-fixture cause, and its `recv` is bounded at `:613`); Global Constraints rules 4 and 11 are what keep it from recurring. What is *not* fixed is the leak half: the e2e harness's own teardown, which can leave a daemon and its whole flock running when a case panics. This task adds five cases to that tier, three of which start real sheep, so the harness gets fixed **before** the cases land rather than after the next stray `sleep` is found. Four concrete changes, each verified against the files as they stand:
+
+1. **`DaemonGuard::drop` gives up silently on a pidfile it cannot read** (`crates/shep-cli/tests/cli_e2e.rs:224-228`): `read_to_string` and `parse::<i32>()` each `continue` on failure, so an unreadable pidfile means the daemon is never signalled and nothing says so. The empty case is reachable rather than theoretical. `PidfileLock::acquire` opens the file with `create(true)` and `truncate(false)` (`crates/shep-daemon/src/boot.rs:246-257`) and `record` writes the pid only after the socket is bound (`boot.rs:502`→`:506`), so in a fresh `$SHEP_HOME` — which is every case here — the file exists and is empty for the whole bind. Replace both silent `continue`s with a bounded retry for a parseable pid: a daemon still alive populates the file the moment `record` runs, and one that never populates it is one that already exited, so a short named deadline separates the two. When it expires, `eprintln!` naming the `$SHEP_HOME`. `Drop` must not panic — panicking while already panicking aborts the process — so a loud line is the strongest signal available here, and it is strictly better than the silence it replaces.
+
+2. **Nothing reaps the sheep, and the guard's own doc says so** (`cli_e2e.rs:189-204`). `graceful_kill` drives the daemon's real kill ladder and every success path calls it, but a panicking case never reaches it, and SIGKILLing the daemon does not reach a sheep: `TokioRunner` deliberately gives each sheep its own process group so the daemon's `kill_tree` can target one without hitting itself. That doc calls this a gap the tier has "no RPC-free way" to close; there is one, and it costs a line. Every fixture script this file writes goes through `write_script` (`:135-142`), so having `write_test_script` and `write_logging_script` open with `echo $$ >> "<home>/fixture.pids"` — the case's own `$SHEP_HOME`, spelled absolutely, since the script's cwd is not this test's to assume — records every sheep the case ever had, one line per spawn, restarts included. `$$` in `/bin/sh` is the pid the daemon tracks and the leader of its own group, so `-pid` per line reaches its lambs too. The append goes to a file and never to stdout, so case 4's byte-exact `bleats` fixture is untouched. Two ordering constraints, both load-bearing: kill the daemon **first**, or autorestart brings back everything the sweep just killed; and gate the sweep on `std::thread::panicking()`, exactly as `crates/shep-daemon/tests/real_runner.rs`'s `Reaper` does (`:150-171`) and for the reason it already states — on the success path `graceful_kill` has proven them gone, and signalling a pid the OS may have recycled is a hazard, not a safety net. Rewrite the guard's doc: the gap it documents is the gap this closes.
+
+3. **Case 8 sets exactly the timeout this file's own constant exists to forbid.** `home_reaches_the_spawned_daemon` (`cli_e2e.rs:905-938`) carries an inline `.timeout(Duration::from_secs(30))`, and `SPAWN_DEADLINE` is `Duration::from_secs(30)` (`crates/shep-client/src/spawn.rs:24`). `CMD_TIMEOUT`'s doc (`cli_e2e.rs:39-52`) says in as many words that a bound merely equal to `SPAWN_DEADLINE` races `assert_cmd`'s kill against the autostart path's own report, and that on a loaded machine the kill wins. When it wins, the CLI dies with a daemon it launched still booting — and that daemon survives, because `probe_until_ready` never kills or waits its child (`crates/shep-client/src/spawn.rs:283-339`) and `launch.rs:72` gave it its own process group, so `assert_cmd`'s kill reaches the CLI and stops there. Use `CMD_TIMEOUT`, add the `graceful_kill(dir.path())` this case alone omits, and rewrite the doc at `:900-904` that defends both omissions as "the brief's own given form, verbatim" — that defence is the reason the defect survived this long.
+
+   **`spawn.rs` is deliberately not changed.** Whether an autostart that exhausts its deadline should kill the daemon it launched is a real product question with a real argument on the other side — the daemon may be a second from serving, and may not even be the one this process launched — and a test tier is the wrong place to settle it. What this task takes from it is the constraint: nothing in `assert_cmd`'s timeout reaps a daemon, so the guard is the only thing that can.
+
+4. **`real_runner.rs`'s `Reaper` signals the leader where its sibling signals the group.** `Reaper::drop` (`crates/shep-daemon/tests/real_runner.rs:159-171`) sends SIGKILL to `Pid::from_raw(pid)`, while `daemon_e2e.rs`'s `Fixture::drop` (`:140-153`) sends it to `-pid` under a doc explaining that group-wide is what reaches the `sleep` grandchild a leader-only signal misses. The two agree on the happy path only because `a_graceful_stop_reaches_a_forked_grandchild` pushes its grandchild's pid explicitly (`real_runner.rs:241`) — but a panic anywhere between the spawn at `:217` and that push, which includes the group-leader assertion at `:225-231` and the five-second wait for the wrapper's pid at `:236-239`, leaves an untracked `sleep 30` behind with nothing tracking it. That same test asserts the leader property the group signal depends on, so `-pid` is safe exactly where it is needed. Make it `-pid`, and name the sibling file in the doc as the model.
+
+**Acceptance: a full suite run leaves nothing new reparented to init.** Checked after **both** suite runs in Global Constraints' gate list — the default one and the `--test-threads=1` one — because interleaving is what decides which teardown wins:
+
+```
+ps -eo ppid=,command= | awk '$1 == 1' | sort > /tmp/shep-orphans-before
+cargo test --workspace --all-features
+ps -eo ppid=,command= | awk '$1 == 1' | sort > /tmp/shep-orphans-after
+diff /tmp/shep-orphans-before /tmp/shep-orphans-after
+```
+
+`diff` must report nothing added. A before/after rather than a grep for names is deliberate: a leaked sheep is `/bin/sh <tmpdir>/sheep.sh`, a leaked lamb is a bare `sleep 60`, and a leaked daemon is `target/debug/shep daemon` — three unrelated spellings, one of which any developer machine may legitimately be running already. The diff names whatever appeared without having to predict it.
+
+**Calibrate the check before trusting it.** All four fixes above govern the panic path, and a green suite never takes it, so a clean `diff` on a passing run proves nothing about them. Force one panic — a temporary `assert!(false)` at the end of case 1, which by then has a daemon and a live sheep — and confirm the `diff` is clean anyway. That single run is the whole evidence that the guard, the pid sweep and the ordering work; without it this criterion is a check nobody has ever seen fail.
 
 **map.md sync — three drifts, recorded not silently fixed:**
 - `probes/` is a module map.md never named; spec §7 requires it (`docs/specs/shep-v1.md:8-9` — where the two disagree the spec wins and map.md gets fixed).
@@ -2139,12 +2252,16 @@ Each gets its links in a bottom reference block, and each names its honest cavea
 
 `shep-core` gets the cron dialect entry above plus the new `[daemon] max_cron_sleep` key: what it defaults to, that `SHEP_MAX_CRON_SLEEP` overrides it, and that a value under one second is rejected rather than clamped. Note the millisecond grammar in the entry itself — `"60"` is sixty milliseconds and `"60s"` is what the reader means — because a changelog is where someone reads about a new key for the first time. The `DaemonConfigError::BelowMinimum` variant goes under Changes rather than Additions: that enum carries no `#[non_exhaustive]`, so growing it breaks any downstream `match`, and IR-45 wants that said rather than filed as a feature.
 
-- [ ] **Step 1: Write the five e2e cases, run, confirm each fails against a stub before it passes**
-- [ ] **Step 2: map.md sync**
-- [ ] **Step 3: Module docs pass across every new file**
-- [ ] **Step 4: Both changelogs**
-- [ ] **Step 5: Run the full gate list from Global Constraints, each from its own exit code**
-- [ ] **Step 6: Commit** — `test(cli): end-to-end coverage for watch, readiness and config rejection`
+- [ ] **Step 1: Close the orphan-leak family, calibrate the acceptance check, and commit it alone** — `fix(test): reap a case's whole flock when it panics, and signal the group`
+
+  First, because the five cases below add three more sheep-starting cases to the tier being fixed. Its own commit, because it is a repair to the harness rather than coverage of this phase, and it should be revertable and bisectable without taking this task's e2e cases with it.
+
+- [ ] **Step 2: Write the five e2e cases, run, confirm each fails against a stub before it passes**
+- [ ] **Step 3: map.md sync**
+- [ ] **Step 4: Module docs pass across every new file**
+- [ ] **Step 5: Both changelogs**
+- [ ] **Step 6: Run the full gate list from Global Constraints, each from its own exit code, then the orphan diff after each of the two suite runs**
+- [ ] **Step 7: Commit** — `test(cli): end-to-end coverage for watch, readiness and config rejection`
 
 ---
 
@@ -2175,6 +2292,7 @@ Each gets its links in a bottom reference block, and each names its honest cavea
 6. `grep -rn "assert_ne!" crates/shep-daemon/src crates/shep-core/src` returns nothing new.
 7. A report to Rin listing: every third-party API where the real documentation differed from `docs/research/phase4-lifecycle.md`; every judgement call made on her behalf; the bench numbers and the machine they came from; and the `interval = 0` decision from Task 13. Three items are already known to belong in it and should not have to be rediscovered — the sysinfo pin held at 0.38.x for MSRV rather than tracking 0.39, the bench crate's MSRV spelled literally in a second place because IR-5's own-`[workspace]` rule forbids inheriting it, and the bracketed-IPv6 decision from Task 2. Two items an earlier draft listed here are gone because they are no longer open questions: whether the cron worker restarts stopped instances (it does, and so does watch), and whether the bench crate shipped (it does).
 8. Every test added by this phase has its "fails if" comment. A reviewer spot-checking three of them at random should be able to break the implementation in the named way and watch the named test go red.
+9. Neither suite run leaves a process reparented to init — the before/after `diff` at Task 14, run after `cargo test --workspace --all-features` and again after the `--test-threads=1` pass, adds nothing. Includes the calibration run Task 14 specifies: a deliberately panicking case must also leave the diff clean, since a green suite never exercises the teardown any of it governs.
 
 ## Open questions for Rin
 

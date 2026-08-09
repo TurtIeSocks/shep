@@ -60,10 +60,50 @@ const BLEATS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How long a fixture sheep's script sleeps after writing whatever it
 /// writes. Long enough that no case in this file could plausibly outlast it
 /// (every case finishes in well under a second of real daemon/sheep work);
-/// short enough that a sheep orphaned by a panicking test (see
-/// [`DaemonGuard`]'s own doc on the one case it cannot close) self-terminates
-/// quickly rather than lingering for the rest of a CI job.
+/// short enough that a sheep the [`DaemonGuard`] sweep somehow missed
+/// self-terminates quickly rather than lingering for the rest of a CI job.
 const SCRIPT_SLEEP_SECS: u32 = 60;
+
+/// Basename, under a case's own `$SHEP_HOME`, of the file every fixture
+/// script appends its own pid to. See [`record_pid_line`] for why, and
+/// [`DaemonGuard`] for who reads it.
+const FIXTURE_PIDS: &str = "fixture.pids";
+
+/// How long [`DaemonGuard::drop`] keeps retrying for a parseable daemon pid
+/// before giving up and saying so.
+///
+/// The window it covers is real rather than theoretical:
+/// `PidfileLock::acquire` opens the pidfile with `create(true)` and
+/// `truncate(false)` (`shep-daemon/src/boot.rs`), while `record` writes the
+/// pid into it only once the control socket is bound — so in a fresh
+/// `$SHEP_HOME`, which is every case here, the file exists and is *empty* for
+/// the whole bind. A case that panics inside that window would otherwise hand
+/// this guard an unparseable pidfile and get silence.
+const GUARD_PID_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Gap between [`GUARD_PID_DEADLINE`]'s and [`GUARD_SWEEP_WINDOW`]'s retries.
+const GUARD_PID_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long [`sweep_flock`] keeps re-reading a case's recorded sheep pids
+/// before giving up. Covers the gap between a sheep being spawned (which is
+/// when `shep start` reports it `Online`) and its script's first line actually
+/// running, which is when the pid reaches disk. See [`sweep_flock`].
+const GUARD_SWEEP_WINDOW: Duration = Duration::from_secs(2);
+
+/// How long [`poll_flock`] keeps asking before returning whatever it last
+/// saw.
+///
+/// One deadline for both directions, deliberately: the case that waits for a
+/// watch-triggered restart and the case that waits to be sure a dot-file
+/// caused none must wait the *same* length, or the negative case proves only
+/// that it looked sooner. Sized against the 500ms `DEFAULT_WATCH_DELAY`
+/// debounce plus a spawn and two RPC round trips — roughly an order of
+/// magnitude of headroom on an idle machine, which is what a loaded one
+/// needs.
+const FLOCK_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Gap between [`poll_flock`]'s attempts.
+const FLOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 // --- Fixture helpers ---------------------------------------------------
 
@@ -107,13 +147,45 @@ fn write_test_script(dir: &TempDir) -> PathBuf {
     write_script(
         dir,
         "sheep.sh",
-        &format!("#!/bin/sh\nsleep {SCRIPT_SLEEP_SECS}\n"),
+        &format!(
+            "#!/bin/sh\n{}sleep {SCRIPT_SLEEP_SECS}\n",
+            record_pid_line(dir)
+        ),
+    )
+}
+
+/// The line every fixture script opens with: this spawn's own pid, appended
+/// to `<home>/`[`FIXTURE_PIDS`].
+///
+/// `$$` in `/bin/sh` is the pid the daemon tracks and the leader of its own
+/// process group (`shep-daemon/src/tokio_runner.rs` spawns every sheep with
+/// `process_group(0)`), so `-pid` per recorded line reaches that sheep's
+/// lambs too — which is what makes [`DaemonGuard`]'s panic-path sweep able to
+/// reap a whole flock the daemon's own kill ladder never got to drive.
+///
+/// One line per *spawn*, appended rather than overwritten, so a restart adds
+/// a row instead of replacing one: the dead pid is an `ESRCH` no-op later,
+/// and the live one is the whole point.
+///
+/// The path is `dir`'s own `$SHEP_HOME`, spelled absolutely, because a
+/// script's cwd is the sheep's `cwd` and is not this test's to assume. It is
+/// quoted for the same reason `write_script`'s callers never build a path by
+/// hand — a tempdir path is not guaranteed free of shell metacharacters.
+///
+/// The append goes to a file and never to stdout: case 4 compares
+/// `bleats --no-follow` byte-for-byte against a committed fixture, and one
+/// extra line on the sheep's own stdout would break it.
+fn record_pid_line(dir: &TempDir) -> String {
+    format!(
+        "echo $$ >> \"{}\"\n",
+        dir.path().join(FIXTURE_PIDS).display()
     )
 }
 
 /// Writes a script that emits one marker line on stdout, optionally one on
 /// stderr, and then sleeps. Same `0o755` requirement as [`write_test_script`],
-/// and the same forked trailing `sleep` for the same reason.
+/// the same [`record_pid_line`] prologue, and the same forked trailing
+/// `sleep`, each for the reason given there.
 ///
 /// `None` writes to stderr not at all — not an empty line. An empty line is
 /// still a line: it reaches the err file, `--no-follow` renders it, and
@@ -123,7 +195,7 @@ fn write_test_script(dir: &TempDir) -> PathBuf {
 /// restarted, and each restart appends another copy of every marker, so a
 /// byte-exact fixture would stop being byte-exact after the first respawn.
 fn write_logging_script(dir: &TempDir, out_marker: &str, err_marker: Option<&str>) -> PathBuf {
-    let mut script = format!("#!/bin/sh\necho '{out_marker}'\n");
+    let mut script = format!("#!/bin/sh\n{}echo '{out_marker}'\n", record_pid_line(dir));
     if let Some(err_marker) = err_marker {
         script.push_str(&format!("echo '{err_marker}' 1>&2\n"));
     }
@@ -131,13 +203,54 @@ fn write_logging_script(dir: &TempDir, out_marker: &str, err_marker: Option<&str
     write_script(dir, "logging.sh", &script)
 }
 
-/// Shared write-plus-chmod tail of both script helpers above.
+/// Writes a script that blocks until `sentinel` exists, then announces
+/// readiness on the shepherd channel and sleeps.
+///
+/// The gate is a file the test creates, never a delay. An app's
+/// `listen_timeout` takes a `wait_ready` sheep `Online` on elapse whether or
+/// not it ever signalled, so a script that merely slept would give the test a
+/// `starting` window bounded above by that timeout — and a window a test has
+/// to *race* is a window a loaded runner closes early, reddening the suite
+/// with no regression behind it. A sentinel makes the window as wide as the
+/// test needs it.
+///
+/// `>&3` is the fd the runner hands every sheep whose app asks for a
+/// shepherd channel, and `{"kind":"ready"}` is the wire string
+/// `shep-daemon`'s `ChildMessage::Ready` pins.
+///
+/// `sleep 0.1` is a fractional interval, which POSIX does not require but
+/// both platforms this file compiles on provide. If some `/bin/sleep` ever
+/// refuses it the loop degrades to a busy-wait rather than a hang, so the
+/// case still passes — it just spins for the moment the gate is shut.
+fn write_ready_script(dir: &TempDir, sentinel: &Path) -> PathBuf {
+    write_script(
+        dir,
+        "ready.sh",
+        &format!(
+            "#!/bin/sh\n{}until [ -e \"{}\" ]; do sleep 0.1; done\n\
+             printf '{{\"kind\":\"ready\"}}\\n' >&3\nsleep {SCRIPT_SLEEP_SECS}\n",
+            record_pid_line(dir),
+            sentinel.display(),
+        ),
+    )
+}
+
+/// Shared write-plus-chmod tail of the script helpers above.
 fn write_script(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
     let path = dir.path().join(name);
     std::fs::write(&path, contents).unwrap();
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+/// Writes `Flockfile.toml` into `dir` and returns its path. The `.toml`
+/// extension is what routes `shep start <path>` down `FlockFormat::from_path`
+/// rather than the bare-script arm.
+fn write_flockfile(dir: &TempDir, body: &str) -> PathBuf {
+    let path = dir.path().join("Flockfile.toml");
+    std::fs::write(&path, body).unwrap();
     path
 }
 
@@ -169,9 +282,10 @@ fn assert_success(output: &Output) {
 /// precedent: on every success path this makes the trailing `DaemonGuard`
 /// Drop a no-op, and `DaemonGuard` only does real work on a panic path this
 /// function never reaches. It matters for more than tidiness here —
-/// `DaemonGuard` SIGKILLs only the daemon's own process group (see its own
-/// doc), never the sheep it spawned, while `shep kill` drives the daemon's
-/// own graceful stop of each running sheep. Verified empirically with
+/// `DaemonGuard`'s flock sweep is deliberately gated on
+/// `std::thread::panicking()` (see its own doc), so on this path nothing but
+/// `shep kill` reaps the sheep, and what it drives is the daemon's own
+/// graceful stop of each one rather than a `SIGKILL`. Verified empirically with
 /// `ps`/`kill` against a real daemon: three back-to-back runs of this suite
 /// before this helper existed left eight orphaned `sleep` processes behind,
 /// one per sheep started; after adding this call at the end of every case
@@ -183,26 +297,42 @@ fn graceful_kill(home: &Path) {
     let _ = shep(home).arg("kill").output();
 }
 
-/// A `$SHEP_HOME` whose daemon this test spawned, reaped on `Drop` even if
-/// the test panics before its own assertions run.
+/// A `$SHEP_HOME` whose daemon *and whole flock* this test is responsible
+/// for, reaped on `Drop` even if the test panics before its own assertions
+/// run.
 ///
-/// # A gap this guard does not close
+/// # What the panic path costs, and how this closes it
 ///
-/// This reaps the *daemon* — the process this crate's own launcher
-/// (`launch.rs`) makes its own process-group leader via
-/// `Command::process_group(0)`, so `-pid` reaches it and nothing else.
-/// `shep-daemon`'s `tokio_runner.rs` gives every *sheep* the exact same
-/// treatment, deliberately, so the daemon's own `kill_tree` can target one
-/// sheep without also hitting itself
-/// (`crates/shep-daemon/src/tokio_runner.rs:153-156`) — which means a sheep
-/// is never in the daemon's process group either, and SIGKILLing the daemon
-/// does not reach it. A sheep orphaned by a panicking test therefore keeps
-/// running, reparented, until its own script exits — which is exactly why
-/// every script this file writes sleeps for [`SCRIPT_SLEEP_SECS`] and not
-/// longer: closing this gap for real would mean every case tracking its own
-/// sheep pids the way `shep-daemon`'s own `daemon_e2e.rs` fixture does,
-/// which this tier has no RPC-free way to learn without widening scope
-/// beyond what Task 12 asks for.
+/// SIGKILLing the daemon does not reach a sheep. `shep-daemon`'s
+/// `tokio_runner.rs` gives every sheep its own process group, deliberately,
+/// so the daemon's own `kill_tree` can target one sheep without also hitting
+/// itself — which means a sheep is never in the daemon's group, and the one
+/// signal this guard can send the daemon stops at the daemon. On the success
+/// path that costs nothing, because [`graceful_kill`] has already driven the
+/// daemon's real kill ladder over every sheep. On the *panic* path the case
+/// never reaches `graceful_kill`, and every sheep it started keeps running,
+/// reparented to init, until its own script exits.
+///
+/// The sweep below closes that: [`record_pid_line`] has every fixture script
+/// append its own pid to `<home>/`[`FIXTURE_PIDS`] as its first act, so the
+/// pids are on disk before the daemon has even reported the spawn, and this
+/// guard can reach a flock it has no RPC-free way to enumerate.
+///
+/// Two orderings are load-bearing:
+///
+/// - **The daemon dies first.** A sheep killed while its supervisor is still
+///   running is a sheep the restart brain brings straight back, so a sweep
+///   that ran first would kill a flock and hand the daemon a reason to
+///   respawn it.
+/// - **The sweep runs only while panicking**, exactly as
+///   `shep-daemon/tests/real_runner.rs`'s `Reaper` does and for the reason it
+///   already states: on the success path `graceful_kill` has proven these
+///   pids gone, and signalling a pid the OS may since have recycled is a
+///   hazard rather than a safety net.
+///
+/// `Drop` must not panic — panicking while already panicking aborts the
+/// process, taking the rest of the run's output with it — so an unreachable
+/// daemon is reported with `eprintln!` rather than asserted.
 #[derive(Debug, Default)]
 struct DaemonGuard(Vec<PathBuf>);
 
@@ -220,30 +350,133 @@ impl DaemonGuard {
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
+        let panicking = std::thread::panicking();
         for home in &self.0 {
-            let Ok(text) = std::fs::read_to_string(home.join("pids/shepd.pid")) else {
+            match daemon_pid(home) {
+                Some(pid) => kill_group_of(pid),
+                // No parseable pid, and the case succeeded: the daemon's own
+                // graceful shutdown unlinks the pidfile as its last act
+                // (`boot.rs`'s teardown), so this is "already gone" rather
+                // than "never wrote one".
+                None if !panicking => {}
+                // No parseable pid on the panic path: the case may have died
+                // inside the empty-pidfile window GUARD_PID_DEADLINE
+                // documents, so retry before concluding anything.
+                None => match wait_for_daemon_pid(home) {
+                    Some(pid) => kill_group_of(pid),
+                    None => eprintln!(
+                        "DaemonGuard: no parseable daemon pid at {} after {GUARD_PID_DEADLINE:?}; \
+                         if a daemon is still up it was NOT reaped",
+                        home.display()
+                    ),
+                },
+            }
+
+            if !panicking {
                 continue;
-            };
-            let Ok(pid) = text.trim().parse::<i32>() else {
-                continue;
-            };
-            let pid = nix::unistd::Pid::from_raw(pid);
-            // Group, not leader: the daemon's own children are in its group.
-            // But only while the daemon really IS its own group leader —
-            // signalling `-pid` when it is not reaches somebody else's group,
-            // and in a test runner that group contains the harness. Case 1
-            // asserts the leader property holds; this checks it rather than
-            // assuming it, because Drop also runs on the path where case 1
-            // failed. ESRCH here means already reaped: fall back to the
-            // leader-only signal, which is a no-op in that case.
-            let target = match nix::unistd::getpgid(Some(pid)) {
-                Ok(pgid) if pgid == pid => nix::unistd::Pid::from_raw(-pid.as_raw()),
-                _ => pid,
-            };
-            // ESRCH on an already-reaped daemon is the expected happy path.
-            let _ = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGKILL);
+            }
+            sweep_flock(home);
         }
     }
+}
+
+/// SIGKILLs every process group named in `home`'s [`FIXTURE_PIDS`], resweeping
+/// until [`GUARD_SWEEP_WINDOW`] expires.
+///
+/// The window, not the single read, is the fix. A sheep records its pid as its
+/// script's first line, but `shep start` reports `Online` off the *spawn*, not
+/// off the child's first executed statement — so a case that panics
+/// immediately after `start` returns reaches this code while its sheep is
+/// still somewhere between `fork` and `execve`, with an empty (or absent)
+/// pid file. Measured, not assumed: the first calibration run of this guard
+/// read `pids=[]` and left a live `/bin/sh sheep.sh` reparented to init, with
+/// the script on disk and correct. Resweeping catches that sheep the moment
+/// it writes.
+///
+/// Bounded rather than convergent on purpose: "the file stopped growing" is
+/// not observable from here (no case tells this guard how many sheep to
+/// expect), so a named deadline is the honest stopping rule. It costs nothing
+/// on the success path, which never calls this, and on the panic path the run
+/// is already red.
+///
+/// The daemon must already be dead when this runs — see [`DaemonGuard`] on
+/// why — since a sheep killed under a live supervisor is a sheep the restart
+/// brain brings straight back.
+fn sweep_flock(home: &Path) {
+    let start = Instant::now();
+    loop {
+        for pid in recorded_fixture_pids(home) {
+            // `-pid`: every recorded pid is a `/bin/sh` that leads its own
+            // process group, so this reaches its forked lambs too. Re-signalling
+            // one already killed on an earlier pass is an ESRCH no-op.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(-pid.as_raw()),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        if start.elapsed() >= GUARD_SWEEP_WINDOW {
+            return;
+        }
+        std::thread::sleep(GUARD_PID_POLL_INTERVAL);
+    }
+}
+
+/// One non-blocking attempt at the daemon pid recorded at `home`.
+fn daemon_pid(home: &Path) -> Option<nix::unistd::Pid> {
+    let text = std::fs::read_to_string(home.join("pids/shepd.pid")).ok()?;
+    let raw: i32 = text.trim().parse().ok()?;
+    Some(nix::unistd::Pid::from_raw(raw))
+}
+
+/// [`daemon_pid`], retried until it answers or [`GUARD_PID_DEADLINE`]
+/// expires. A daemon still alive populates the pidfile the moment its
+/// `PidfileLock::record` runs; one that never populates it is one that
+/// already exited, so the deadline is what separates the two.
+fn wait_for_daemon_pid(home: &Path) -> Option<nix::unistd::Pid> {
+    let start = Instant::now();
+    loop {
+        if let Some(pid) = daemon_pid(home) {
+            return Some(pid);
+        }
+        if start.elapsed() >= GUARD_PID_DEADLINE {
+            return None;
+        }
+        std::thread::sleep(GUARD_PID_POLL_INTERVAL);
+    }
+}
+
+/// SIGKILLs `pid`'s process group, or `pid` alone if it does not lead one.
+///
+/// Group, not leader: the daemon's own children are in its group. But only
+/// while the daemon really IS its own group leader — signalling `-pid` when
+/// it is not reaches somebody else's group, and in a test runner that group
+/// contains the harness. Case 1 asserts the leader property holds; this
+/// checks it rather than assuming it, because `Drop` also runs on the path
+/// where case 1 failed. `ESRCH` from `getpgid` means already reaped: fall
+/// back to the leader-only signal, which is a no-op in that case.
+fn kill_group_of(pid: nix::unistd::Pid) {
+    let target = match nix::unistd::getpgid(Some(pid)) {
+        Ok(pgid) if pgid == pid => nix::unistd::Pid::from_raw(-pid.as_raw()),
+        _ => pid,
+    };
+    // ESRCH on an already-reaped daemon is the expected happy path.
+    let _ = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGKILL);
+}
+
+/// Every pid a fixture script recorded under `home`, in spawn order.
+///
+/// A missing file means the case started no sheep — several do not — and an
+/// unparseable line is skipped rather than fatal: this runs on a path that
+/// is already failing, and the pids either side of it are still worth
+/// signalling.
+fn recorded_fixture_pids(home: &Path) -> Vec<nix::unistd::Pid> {
+    let Ok(text) = std::fs::read_to_string(home.join(FIXTURE_PIDS)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| line.trim().parse::<i32>().ok())
+        .map(nix::unistd::Pid::from_raw)
+        .collect()
 }
 
 /// Reads the daemon pid recorded at `home`'s pidfile — the same path
@@ -301,6 +534,38 @@ fn bleats_no_follow_until_written(home: &Path, args: &[&str]) -> Output {
             return output;
         }
         std::thread::sleep(BLEATS_POLL_INTERVAL);
+    }
+}
+
+/// Runs `shep flock --format json` until `done` accepts the single sheep's
+/// `ProcessInfo`, or [`FLOCK_DEADLINE`] expires, and returns the last
+/// observation either way.
+///
+/// Polls rather than sleeping once: nothing in this tier is synchronous with
+/// the daemon's own work, and every deadline in it is sized for a loaded
+/// runner. Returning the last observation instead of panicking on expiry
+/// keeps the failure that reaches CI the caller's own assertion, naming the
+/// value it wanted and the value it got.
+///
+/// Each attempt carries the same [`CMD_TIMEOUT`] every other command here
+/// does, so nothing in the loop can block unbounded.
+fn poll_flock(home: &Path, done: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+    let start = Instant::now();
+    loop {
+        let output = shep(home)
+            .arg("--format")
+            .arg("json")
+            .arg("flock")
+            .output()
+            .unwrap();
+        assert_success(&output);
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|e| panic!("flock stdout was not JSON: {e}"));
+        let info = envelope["data"][0].clone();
+        if done(&info) || start.elapsed() >= FLOCK_DEADLINE {
+            return info;
+        }
+        std::thread::sleep(FLOCK_POLL_INTERVAL);
     }
 }
 
@@ -897,11 +1162,22 @@ fn bleats_no_follow_prints_what_a_sheep_actually_wrote() {
 /// `$SHEP_HOME` the test process happened to inherit could make this pass
 /// for the wrong reason.
 ///
-/// Code below is the brief's own given form, verbatim — including relying
-/// on `DaemonGuard` alone rather than this file's own `graceful_kill`
-/// helper, so this one case's sheep is left for `DaemonGuard`'s SIGKILL to
-/// orphan (see that type's own doc) rather than the daemon's real kill
-/// ladder to reap. Bounded by `SCRIPT_SLEEP_SECS`, same as every other case.
+/// This case cannot use the [`shep`] helper — it needs `env_remove` and a
+/// hand-built argv — but it takes [`CMD_TIMEOUT`] from it rather than naming
+/// its own bound. It used to carry an inline `Duration::from_secs(30)`, which
+/// is exactly `shep_client::spawn::SPAWN_DEADLINE` and exactly the value
+/// `CMD_TIMEOUT`'s own doc exists to forbid: a bound merely *equal* to the
+/// autostart budget races `assert_cmd`'s kill against the autostart path's own
+/// report, and on a loaded machine the kill wins. When it wins, this CLI dies
+/// with a daemon it launched still booting — and that daemon survives, because
+/// `probe_until_ready` never kills or waits its child and `launch.rs` gave it
+/// its own process group, so `assert_cmd`'s kill reaches the CLI and stops
+/// there. `spawn.rs` is deliberately not changed to close that: whether an
+/// autostart that exhausts its deadline should kill the daemon it launched is
+/// a product question, not a test-tier one. What follows from it is that
+/// nothing in `assert_cmd`'s timeout reaps a daemon, so [`DaemonGuard`] is the
+/// only thing that can — and the [`graceful_kill`] below is what keeps it from
+/// having to.
 #[test]
 fn home_reaches_the_spawned_daemon() {
     let dir = tempfile::tempdir().unwrap();
@@ -917,7 +1193,7 @@ fn home_reaches_the_spawned_daemon() {
             script.to_str().unwrap(),
         ])
         .env_remove("SHEP_HOME") // the ambient value must not be what makes this pass
-        .timeout(Duration::from_secs(30)) // never block unbounded; see above
+        .timeout(CMD_TIMEOUT) // never block unbounded; see above
         .output()
         .unwrap();
 
@@ -935,4 +1211,291 @@ fn home_reaches_the_spawned_daemon() {
         socket.exists(),
         "the daemon bound somewhere other than --home"
     );
+
+    graceful_kill(dir.path());
+}
+
+// --- Case 9 --------------------------------------------------------------
+
+/// A write under a `watch = true` sheep's `cwd` restarts it: `restarts` goes
+/// from 0 to 1.
+///
+/// The watched tree is its own [`TempDir`], never this case's `$SHEP_HOME`.
+/// That separation is load-bearing rather than tidy: every fixture script
+/// appends its pid to `<home>/`[`FIXTURE_PIDS`] on each spawn, so a watch
+/// rooted at the home would see its own sheep's restart as the next change
+/// to restart on, and the case would never stop restarting.
+///
+/// What a broken implementation this would catch: a watch that was never
+/// armed, or armed against the wrong root (`restarts` stays 0 and this fails
+/// on the observed value); a `watch = true` that reached the daemon but
+/// normalized away (the sheep comes up and nothing ever restarts it); a
+/// debounce that swallowed the trailing event of a burst rather than firing
+/// after it (same observable).
+#[test]
+fn a_write_under_a_watched_tree_restarts_the_sheep() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let watched = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"watcher\"\nscript = \"{}\"\ncwd = \"{}\"\nwatch = true\n",
+            script.display(),
+            watched.path().display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    let before = poll_flock(home, |info| info["status"] == "online");
+    assert_eq!(before["restarts"], 0, "precondition: {before}");
+
+    std::fs::write(watched.path().join("app.txt"), "changed").unwrap();
+
+    let after = poll_flock(home, |info| info["restarts"] == 1);
+    assert_eq!(
+        after["restarts"], 1,
+        "a write under the watched tree must restart the sheep exactly once: {after}"
+    );
+
+    graceful_kill(home);
+}
+
+// --- Case 10 -------------------------------------------------------------
+
+/// A write to a dot-file under the same watched tree restarts nothing — and
+/// the watcher was demonstrably alive the whole time it did not.
+///
+/// [`a_write_under_a_watched_tree_restarts_the_sheep`] alone cannot catch a
+/// dropped default-ignore set: it writes a plain file, which triggers either
+/// way. This case is the other half, and the second act is what makes its
+/// zero mean something. A dot-file, then a full [`FLOCK_DEADLINE`] of nothing
+/// happening, would also be what a watcher that was never armed produces —
+/// so afterwards it writes a plain file and requires the restart to land.
+/// One armed, delivering watcher; two writes; exactly one restart.
+///
+/// What a broken implementation this would catch: `DEFAULT_IGNORE_GLOBS`
+/// dropped or reduced to `**/.git/**` (the dot-file restarts the sheep and
+/// the first assertion fails); an ignore set applied to the wrong side of the
+/// filter, so *only* ignored paths triggered (the first assertion fails and
+/// the second one would too).
+#[test]
+fn a_write_to_a_dot_file_under_a_watched_tree_restarts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let watched = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"watcher\"\nscript = \"{}\"\ncwd = \"{}\"\nwatch = true\n",
+            script.display(),
+            watched.path().display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    let before = poll_flock(home, |info| info["status"] == "online");
+    assert_eq!(before["restarts"], 0, "precondition: {before}");
+
+    std::fs::write(watched.path().join(".hidden.swp"), "editor churn").unwrap();
+    // Polls for the restart that must NOT come, for the same deadline the
+    // positive case gives the restart that must: `done` never accepts, so
+    // this returns on expiry having asked the whole time.
+    let quiet = poll_flock(home, |_| false);
+    assert_eq!(
+        quiet["restarts"], 0,
+        "a dot-file is ignored by default and must not restart anything: {quiet}"
+    );
+
+    std::fs::write(watched.path().join("app.txt"), "changed").unwrap();
+    let after = poll_flock(home, |info| info["restarts"] == 1);
+    assert_eq!(
+        after["restarts"], 1,
+        "the watcher must have been armed and delivering all along: {after}"
+    );
+
+    graceful_kill(home);
+}
+
+// --- Case 11 -------------------------------------------------------------
+
+/// A `wait_ready` sheep stays `starting` until it writes `{"kind":"ready"}`
+/// to the shepherd channel, and only then reads `online`.
+///
+/// The only tier that exercises the real fd-3 channel end to end: every
+/// other test of this gate hands the supervisor a `ChildMessage` directly.
+///
+/// Two deliberate choices keep it from being a race dressed as a test. The
+/// script blocks on a sentinel file rather than a delay (see
+/// [`write_ready_script`]), and the app raises `listen_timeout` far above its
+/// 3000ms default — because on elapse the daemon takes a `wait_ready` sheep
+/// `Online` anyway, so leaving it at the default would make the observation
+/// window and the timeout window the same window, and a slow runner would
+/// then see `online` for the wrong reason.
+///
+/// What a broken implementation this would catch: a spawn that ignored
+/// `wait_ready` and reported `Online` immediately (the `starting` assertion
+/// fails before the sentinel is ever created); a shepherd channel that was
+/// never opened on fd 3, or opened and never read (the sheep stays `starting`
+/// past the sentinel and the second poll expires); a `Ready` message parsed
+/// under a different wire string (same observable, and the byte string here
+/// is the one `ChildMessage::Ready` pins).
+#[test]
+fn a_wait_ready_sheep_goes_online_only_once_it_signals_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let sentinel = dir.path().join("go");
+    let script = write_ready_script(&dir, &sentinel);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"gated\"\nscript = \"{}\"\nwait_ready = true\nlisten_timeout = \"120s\"\n",
+            script.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&flockfile)
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    let envelope: serde_json::Value = serde_json::from_slice(&boot.stdout).unwrap();
+    assert_eq!(
+        envelope["data"][0]["status"], "starting",
+        "a wait_ready sheep must not be online before it signals: {envelope}"
+    );
+
+    std::fs::write(&sentinel, "").unwrap();
+
+    let ready = poll_flock(home, |info| info["status"] == "online");
+    assert_eq!(
+        ready["status"], "online",
+        "the sheep must reach online once it writes ready to fd 3: {ready}"
+    );
+
+    graceful_kill(home);
+}
+
+// --- Case 12 -------------------------------------------------------------
+
+/// A `cron_restart` pattern that is not a cron pattern is a config error:
+/// exit `4`, JSON on stderr, and the offending pattern in the message.
+///
+/// This and [`an_https_probe_target_is_a_config_error`] are the proof that
+/// spec §5's "typos fail loudly at parse time" survives the whole trip —
+/// `normalize` rejects the app, the daemon answers `InvalidConfig` over RPC,
+/// and the CLI turns that into an exit code. Nothing before this tier spans
+/// all three.
+///
+/// The message is asserted on the presence of the pattern, not on wording:
+/// the reason text is croner's and is not ours to pin.
+///
+/// What a broken implementation this would catch: a `normalize` that
+/// validated `cron_restart` only when some other field was set, or not at all
+/// (`shep start` exits 0 and the sheep comes up with a schedule that never
+/// fires — the silent-failure shape this project keeps rooting out); an RPC
+/// layer that mapped `NormalizeError` onto `Internal` or `SpawnFailed`
+/// instead of `InvalidConfig` (the exit code is 1 or 6, not 4); a CLI that
+/// dropped the daemon's message and substituted its own (the pattern is
+/// absent from stderr).
+#[test]
+fn a_bad_cron_pattern_is_a_config_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"crony\"\nscript = \"{}\"\ncron_restart = \"not a cron\"\n",
+            script.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let output = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&flockfile)
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+
+    assert_json_error(&output, 4, "invalid_config");
+    let err: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    let message = err["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not a cron"),
+        "the rejection must name the offending pattern: {err}"
+    );
+
+    graceful_kill(home);
+}
+
+// --- Case 13 -------------------------------------------------------------
+
+/// An `https://` probe target is a config error: exit `4`, JSON on stderr,
+/// and the offending target in the message.
+///
+/// The daemon's HTTP prober is hand-rolled and carries no TLS stack, and a
+/// probe that silently failed every poll would look exactly like a down app —
+/// so the target is refused at config time instead (decision D1). Same shape
+/// and same three-layer reach as
+/// [`a_bad_cron_pattern_is_a_config_error`].
+///
+/// What a broken implementation this would catch: a `ProbeTarget` parser that
+/// accepted any URL scheme and left the prober to fail at runtime
+/// (`shep start` exits 0, and the app is unreachable in a way indistinguishable
+/// from being down); a `normalize` that validated `liveness_probe` but not
+/// `readiness_probe`, or the reverse — this case configures the readiness
+/// one, and `normalize`'s own unit tier covers the other.
+#[test]
+fn an_https_probe_target_is_a_config_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"probed\"\nscript = \"{}\"\n\
+             readiness_probe = {{ kind = \"http\", target = \"https://localhost:8443/health\" }}\n",
+            script.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let output = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&flockfile)
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+
+    assert_json_error(&output, 4, "invalid_config");
+    let err: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    let message = err["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("https://localhost:8443/health"),
+        "the rejection must name the offending target: {err}"
+    );
+
+    graceful_kill(home);
 }

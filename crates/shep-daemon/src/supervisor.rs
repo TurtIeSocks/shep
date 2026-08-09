@@ -18,16 +18,17 @@
 //! # Deferred, aggregated replies
 //!
 //! [`SupervisorHandle::stop`]/[`restart`](SupervisorHandle::restart)/
+//! [`restart_automatic`](SupervisorHandle::restart_automatic)/
 //! [`delete`](SupervisorHandle::delete) and
 //! [`shutdown`](SupervisorHandle::shutdown) resolve their selector into a
 //! set of matched ids up front, then wait until every matched sheep is
-//! terminal before answering the caller. Automatic restarts internal to the
-//! crash loop go through the same exit path without ever registering a
-//! deferred reply.
+//! terminal before answering the caller. The crash loop's own restarts go
+//! through the same exit path without ever registering a deferred reply.
 
 use core::fmt;
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -41,9 +42,13 @@ use crate::assemble::{assemble, instance_slots};
 use crate::brain::{Decision, decide_on_exit};
 use crate::channel::ChildMessage;
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
+use crate::extras::{Extras, ExtrasRegistry};
 use crate::kill::kill_process;
 use crate::privilege::{self, Credentials};
-use crate::runner::{ExitOutcome, ProcIo, ProcessRunner, RunningProcess};
+use crate::probes::Prober;
+use crate::probes::os::OsProber;
+use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
+use crate::runner::{ExitOutcome, ProcIo, ProcessRunner, RunningProcess, SpawnSpec};
 
 /// Capacity of the actor's own mailbox (commands + internal events).
 const MAILBOX_CAPACITY: usize = 256;
@@ -56,9 +61,14 @@ const SHEEP_CTL_CAPACITY: usize = 4;
 // Public command / handle surface
 // ---------------------------------------------------------------------
 
-/// Commands the supervisor actor accepts (wrapped in `Msg::Command`).
+/// Commands the supervisor actor accepts (wrapped in [`Msg::Command`]).
+///
+/// `pub(crate)` like [`Msg`], and for the same reason: [`SupervisorHandle`] is
+/// the only door into the actor, nothing outside this crate names this type,
+/// and a public non-`#[non_exhaustive]` enum would make every new subsystem's
+/// command a semver break for a surface nobody uses.
 #[derive(Debug)]
-pub enum Command {
+pub(crate) enum Command {
     /// Registers + spawns each app's instances.
     Start {
         /// Already-validated app specs to expand into instances.
@@ -77,8 +87,26 @@ pub enum Command {
     Restart {
         /// Which sheep.
         selector: ProcessSelector,
+        /// Who asked: an operator off the control socket, or the daemon's own
+        /// cron or watch worker. Governs exactly two things — whether this
+        /// restart can be displaced mid-kill-ladder (see
+        /// `Actor::claim_manual`), and the `manually` flag on the bus events
+        /// it produces. It never changes what the restart DOES, including its
+        /// budget reset.
+        origin: CommandOrigin,
         /// Answers once every matched sheep is back online (or errored).
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
+    },
+    /// Restarts one sheep on behalf of a memory breach or a liveness failure,
+    /// if the process that produced the report is still the one running now.
+    ///
+    /// The only command with no `reply`: dropping a stale report is the
+    /// intended outcome, not an error its reporter could act on.
+    ExtraRestart {
+        /// The sheep's id.
+        id: u32,
+        /// The pid the report was raised against, used as a generation token.
+        pid: u32,
     },
     /// Stops + deregisters every sheep matching `selector`.
     Delete {
@@ -100,7 +128,7 @@ pub enum Command {
     },
 }
 
-/// The actor's mailbox message: public [`Command`]s plus events the actor
+/// The actor's mailbox message: [`Command`]s plus events the actor
 /// generates for itself (sheep-task exits, restart timers, drained
 /// readiness signals).
 #[derive(Debug)]
@@ -125,11 +153,28 @@ pub(crate) enum Msg {
     },
     /// The sheep's shepherd channel reported readiness.
     ///
-    /// Drained and logged in Phase 2a — the `wait_ready` gate that consumes
-    /// this lands in Phase 4.
+    /// Forwarded to the waiting readiness task's `oneshot::Sender`, if one is
+    /// waiting (`SheepSlot::ready_tx`) — dropped silently otherwise, so an
+    /// app is free to write `{"kind":"ready"}` whenever it likes, including
+    /// twice.
     Ready {
         /// The sheep's id.
         id: u32,
+    },
+    /// A readiness wait resolved.
+    ReadyResult {
+        /// The sheep's id.
+        id: u32,
+        /// The slot's epoch when the wait began; a stale result is dropped.
+        epoch: u64,
+        /// The `manually` flag the spawn this wait belongs to would have put
+        /// on its own `Online` had it not been gated. Rides along with
+        /// `epoch` (rather than being stored on the slot) because the two
+        /// answer the same question — which spawn is this? — and so cannot
+        /// drift apart.
+        manually: bool,
+        /// Whether the signal arrived or the deadline elapsed.
+        readiness: Readiness,
     },
 }
 
@@ -203,6 +248,17 @@ impl SupervisorHandle {
     /// Restarts every sheep matching `selector`, resetting its restart
     /// budget (spec §4: a manual action resets budget).
     ///
+    /// Declares `CommandOrigin::Operator`: a person typed this, so it is owed
+    /// an answer, nothing may take the sheep off it mid-kill-ladder, and the
+    /// events it emits carry `manually: true`.
+    ///
+    /// A restart the daemon raised on its own goes through one of two
+    /// siblings instead, and which one depends on what raised it:
+    /// [`Self::restart_automatic`] for a cron occurrence or a change under a
+    /// watched tree, and [`Self::extra_restart`] for a memory breach or a
+    /// liveness failure. All three reset the budget; only this one reports
+    /// itself as a user action.
+    ///
     /// # Errors
     ///
     /// - [`SupervisorError::NotFound`] — nothing matched.
@@ -211,12 +267,72 @@ impl SupervisorHandle {
         &self,
         selector: ProcessSelector,
     ) -> Result<Vec<ProcessInfo>, SupervisorError> {
+        self.restart_with_origin(selector, CommandOrigin::Operator)
+            .await
+    }
+
+    /// Restarts every sheep matching `selector` on the daemon's own
+    /// initiative — a cron occurrence, or a change under a watched tree —
+    /// resetting its restart budget exactly as [`Self::restart`] does.
+    ///
+    /// Declares `CommandOrigin::Automatic`: nobody typed this, so an
+    /// operator's `stop` or `delete` landing while it is still mid-kill-ladder
+    /// takes the sheep back off it instead of being silently converted into
+    /// the restart it raced, and the events it emits carry `manually: false`.
+    /// The caller is still handed the same answer [`Self::restart`] returns —
+    /// a cron or watch worker reads it to log a failed spawn and to notice the
+    /// engine going away.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::NotFound`] — nothing matched.
+    /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    pub async fn restart_automatic(
+        &self,
+        selector: ProcessSelector,
+    ) -> Result<Vec<ProcessInfo>, SupervisorError> {
+        self.restart_with_origin(selector, CommandOrigin::Automatic)
+            .await
+    }
+
+    /// The body both restart methods share; they differ only in the origin
+    /// they declare.
+    async fn restart_with_origin(
+        &self,
+        selector: ProcessSelector,
+        origin: CommandOrigin,
+    ) -> Result<Vec<ProcessInfo>, SupervisorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Msg::Command(Command::Restart { selector, reply }))
+            .send(Msg::Command(Command::Restart {
+                selector,
+                origin,
+                reply,
+            }))
             .await
             .map_err(|_| SupervisorError::EngineStopped)?;
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
+    /// Restarts `id` on behalf of a memory breach or a liveness failure, if the
+    /// process that produced the report is still the process running now.
+    ///
+    /// Silently does nothing when the report is stale. There is no reply: a
+    /// dropped report is the intended outcome, not an error the reporter can act
+    /// on.
+    ///
+    /// The third of the three restart doors, and the only one that guards on
+    /// the reporting process still being current: [`Self::restart`] is an
+    /// operator's, [`Self::restart_automatic`] is a cron occurrence's or a
+    /// watched tree's. Like both of them it resets the restart budget, and
+    /// like [`Self::restart_automatic`] it goes in as
+    /// `CommandOrigin::Automatic` — displaceable by an operator's command,
+    /// and reported on the bus with `manually: false`.
+    pub async fn extra_restart(&self, id: u32, pid: u32) {
+        let _ = self
+            .tx
+            .send(Msg::Command(Command::ExtraRestart { id, pid }))
+            .await;
     }
 
     /// Stops + deregisters every sheep matching `selector`.
@@ -278,9 +394,65 @@ impl SupervisorHandle {
     }
 }
 
-/// Spawns the actor; `events` receives [`BusEvent::Process`] (+
-/// `LogOut`/`LogErr` forwarded from each sheep's `ProcIo::logs`) — Phase 2b
-/// plugs its bus straight in.
+/// Builds a supervisor actor.
+///
+/// Two subsystems beyond the four lifecycle extras (dogs, metrics) are already
+/// on the roadmap, so the optional wiring goes on a builder rather than growing
+/// [`spawn_supervisor`] a positional parameter each time.
+#[derive(Debug)]
+pub struct SupervisorBuilder<R: ProcessRunner> {
+    runner: R,
+    paths: ShepPaths,
+    events: broadcast::Sender<BusEvent>,
+    extras: Option<Extras>,
+}
+
+impl<R: ProcessRunner> SupervisorBuilder<R> {
+    /// A builder with no lifecycle extras: the engine spawns, restarts and
+    /// kills, and nothing watches, schedules or probes.
+    ///
+    /// `events` receives [`BusEvent::Process`] (+ `LogOut`/`LogErr` forwarded
+    /// from each sheep's `ProcIo::logs`).
+    pub fn new(runner: R, paths: ShepPaths, events: broadcast::Sender<BusEvent>) -> Self {
+        Self {
+            runner,
+            paths,
+            events,
+            extras: None,
+        }
+    }
+
+    /// Wires in the lifecycle extras.
+    #[must_use]
+    pub fn extras(mut self, extras: Extras) -> Self {
+        self.extras = Some(extras);
+        self
+    }
+
+    /// Spawns the actor.
+    ///
+    /// Must be called from within a Tokio runtime context.
+    pub fn spawn(self) -> SupervisorHandle {
+        let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
+        let actor = Actor {
+            runner: self.runner,
+            paths: self.paths,
+            events: self.events,
+            tx: tx.clone(),
+            sheep: HashMap::new(),
+            next_id: 0,
+            pending: Vec::new(),
+            shutting_down: false,
+            extras: self.extras,
+            registry: ExtrasRegistry::default(),
+        };
+        tokio::spawn(actor.run(rx));
+        SupervisorHandle { tx }
+    }
+}
+
+/// Spawns the actor with no lifecycle extras — shorthand for
+/// `SupervisorBuilder::new(runner, paths, events).spawn()` (IR-28).
 ///
 /// Must be called from within a Tokio runtime context: it spawns the actor
 /// task immediately.
@@ -289,19 +461,7 @@ pub fn spawn_supervisor<R: ProcessRunner>(
     paths: ShepPaths,
     events: broadcast::Sender<BusEvent>,
 ) -> SupervisorHandle {
-    let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
-    let actor = Actor {
-        runner,
-        paths,
-        events,
-        tx: tx.clone(),
-        sheep: HashMap::new(),
-        next_id: 0,
-        pending: Vec::new(),
-        shutting_down: false,
-    };
-    tokio::spawn(actor.run(rx));
-    SupervisorHandle { tx }
+    SupervisorBuilder::new(runner, paths, events).spawn()
 }
 
 // ---------------------------------------------------------------------
@@ -331,6 +491,43 @@ enum ManualKind {
     Delete,
 }
 
+/// Who asked for a pending manual command. Read in exactly two places:
+/// [`Actor::claim_manual`], to decide which of two racing commands owns a
+/// sheep's next exit, and the two sites that carry the command out
+/// ([`Actor::handle_exited`] and [`Actor::apply_immediate`]), which report it
+/// as the `manually` flag on every bus event the restart emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandOrigin {
+    /// A person asked for it: a `Stop`, `Restart` or `Delete` off the control
+    /// socket, or the daemon-wide `Shutdown`. An operator is waiting on the
+    /// answer.
+    Operator,
+    /// The daemon raised it itself: a memory breach or a liveness failure
+    /// (through [`SupervisorHandle::extra_restart`]), or a cron occurrence or
+    /// watched-file change firing its name-group's restart (through
+    /// [`SupervisorHandle::restart_automatic`]).
+    ///
+    /// Having a reply is not what separates these from an operator's command
+    /// — a cron or watch worker does read the `Result`, to log a failed spawn
+    /// and to notice the engine going away. What separates them is that
+    /// nobody is owed the answer, so an operator's `stop` may take the sheep
+    /// off one mid-ladder rather than be converted into it.
+    Automatic,
+}
+
+/// The manual command that owns a sheep's next exit, and who asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingManual {
+    /// What that exit will be turned into.
+    kind: ManualKind,
+    /// Who asked. What the command DOES once the sheep is down is decided
+    /// entirely by `kind`; `origin` survives into `handle_exited` for one
+    /// purpose, the `manually` flag on the events that exit produces —
+    /// otherwise a cron, watch, memory-breach or liveness restart would be
+    /// broadcast as a user action.
+    origin: CommandOrigin,
+}
+
 /// One registered instance: its lifecycle state plus a live control sender
 /// (`None` once its sheep task has ended).
 #[derive(Debug)]
@@ -339,8 +536,9 @@ struct SheepSlot {
     entry: ProcessEntry,
     /// Sender for this sheep's control mailbox; `None` when not running.
     ctl: Option<mpsc::Sender<SheepCtl>>,
-    /// Which manual command (if any) is waiting on this sheep's next exit.
-    manual: Option<ManualKind>,
+    /// Which manual command (if any) is waiting on this sheep's next exit,
+    /// and who asked for it. Claimed through [`Actor::claim_manual`].
+    manual: Option<PendingManual>,
     /// Set whenever a `Delete` targets this id, even if an earlier command
     /// already owns `manual` (adversarial finding #2 — the fix for
     /// Delete-racing-Shutdown). `manual` records who owns the next Kill;
@@ -358,6 +556,19 @@ struct SheepSlot {
     /// drops one whose epoch no longer matches — a stale timer left behind
     /// by a respawn (manual or automatic) that happened in the meantime.
     epoch: u64,
+    /// The readiness task's signal sender for the CURRENT epoch.
+    /// `Msg::Ready`'s handler takes it to wake the task.
+    ///
+    /// `None` means one of two things, and deliberately not a third: no
+    /// readiness task was ever armed (an app with neither `wait_ready` nor
+    /// `readiness_probe` set), or a channel `Ready` already took the sender
+    /// to wake one. A wait that resolved some OTHER way — a probe that
+    /// passed, a deadline that elapsed — leaves its sender sitting here,
+    /// because `handle_ready_result` has no business reaching into a slot a
+    /// respawn may already have re-armed. Nothing goes wrong: a `Msg::Ready`
+    /// arriving late takes a sender whose receiver is gone, and the send
+    /// simply fails, which is the same silent drop an unarmed slot gets.
+    ready_tx: Option<oneshot::Sender<()>>,
 }
 
 /// Where a deferred `Stop`/`Restart`/`Delete`/`Shutdown` reply eventually
@@ -409,6 +620,13 @@ struct Actor<R: ProcessRunner> {
     /// nothing — nothing is allowed to spawn a child the shutdown
     /// aggregation (fixed at the moment it ran) doesn't know to kill.
     shutting_down: bool,
+    /// The lifecycle extras' seams and report wiring, or `None` for an engine
+    /// built without them (`spawn_supervisor`, and every test that exercises
+    /// no schedule, limit, probe or watch).
+    extras: Option<Extras>,
+    /// What is armed right now, per sheep and per name. Stays empty while
+    /// `extras` is `None`: there are no seams to arm anything on.
+    registry: ExtrasRegistry,
 }
 
 impl<R: ProcessRunner> Actor<R> {
@@ -429,7 +647,16 @@ impl<R: ProcessRunner> Actor<R> {
                     false
                 }
                 Msg::Ready { id } => {
-                    tracing::debug!(id, "shepherd-channel ready (wait_ready gating is Phase 4)");
+                    self.handle_ready_signal(id);
+                    false
+                }
+                Msg::ReadyResult {
+                    id,
+                    epoch,
+                    manually,
+                    readiness,
+                } => {
+                    self.handle_ready_result(id, epoch, manually, readiness);
                     false
                 }
             };
@@ -459,23 +686,46 @@ impl<R: ProcessRunner> Actor<R> {
                 false
             }
             Command::Stop { selector, reply } => {
-                self.begin_manual(selector, ManualKind::Stop, ReplyKind::Info(reply));
+                self.begin_manual(
+                    selector,
+                    ManualKind::Stop,
+                    CommandOrigin::Operator,
+                    ReplyKind::Info(reply),
+                );
                 false
             }
             // CRITICAL-1: Restart is rejected outright once shutdown has
             // begun, for the same reason as Start — its forced respawn
             // (handle_exited's manual-Restart branch, or apply_immediate's)
             // would spawn a child outside the shutdown aggregation.
-            Command::Restart { selector, reply } => {
+            Command::Restart {
+                selector,
+                origin,
+                reply,
+            } => {
                 if self.shutting_down {
                     send_reply(ReplyKind::Info(reply), Err(SupervisorError::EngineStopped));
                 } else {
-                    self.begin_manual(selector, ManualKind::Restart, ReplyKind::Info(reply));
+                    self.begin_manual(
+                        selector,
+                        ManualKind::Restart,
+                        origin,
+                        ReplyKind::Info(reply),
+                    );
                 }
                 false
             }
+            Command::ExtraRestart { id, pid } => {
+                self.handle_extra_restart(id, pid);
+                false
+            }
             Command::Delete { selector, reply } => {
-                self.begin_manual(selector, ManualKind::Delete, ReplyKind::Ids(reply));
+                self.begin_manual(
+                    selector,
+                    ManualKind::Delete,
+                    CommandOrigin::Operator,
+                    ReplyKind::Ids(reply),
+                );
                 false
             }
             Command::Shutdown { reply } => self.begin_shutdown(reply),
@@ -517,9 +767,11 @@ impl<R: ProcessRunner> Actor<R> {
 
     /// Registers + spawns one brand-new instance (a fresh id, `restarts: 0`).
     ///
-    /// Always inserts a [`SheepSlot`] — `Online` with a live sheep task on
-    /// success, `Errored` with no task on failure — before returning, so the
-    /// entry persists regardless of the outcome.
+    /// Always inserts a [`SheepSlot`] before returning, so the entry
+    /// persists regardless of the outcome: on success, `Starting` with a
+    /// readiness task armed when the app configures `wait_ready` or
+    /// `readiness_probe`, `Online` immediately otherwise; `Errored` with no
+    /// task on failure.
     fn spawn_fresh(
         &mut self,
         app: &ResolvedApp,
@@ -538,14 +790,27 @@ impl<R: ProcessRunner> Actor<R> {
         let out_file = spec.out_file.clone();
         let err_file = spec.err_file.clone();
 
+        // `app` came through `normalize` (it is a `ResolvedApp`), which
+        // already runs `ProbeTarget::parse` over `readiness_probe` — an
+        // `Err` here would mean the daemon adopted an app that skipped that
+        // step.
+        let source = ReadinessSource::of(app.config())
+            .expect("ResolvedApp already passed ProbeTarget::parse in normalize");
+        let gated = !matches!(source, ReadinessSource::Heuristic);
+
         match self.runner.spawn(&spec) {
             Ok((proc, io)) => {
                 let pid = proc.pid();
+                let status = if gated {
+                    ProcStatus::Starting
+                } else {
+                    ProcStatus::Online
+                };
                 let entry = ProcessEntry {
                     id,
                     spec: app.clone(),
                     instance,
-                    status: ProcStatus::Online,
+                    status,
                     pid: Some(pid),
                     restarts: 0,
                     started_at: Some(tokio::time::Instant::now()),
@@ -564,6 +829,22 @@ impl<R: ProcessRunner> Actor<R> {
                     self.events.clone(),
                     self.tx.clone(),
                 );
+                let ready_tx = if gated {
+                    Some(spawn_readiness_task(
+                        id,
+                        0,
+                        // A `Start` is always a caller's own doing, gated or
+                        // not, so this matches the `manually: true` the
+                        // ungated arm below emits.
+                        true,
+                        source,
+                        app.config().listen_timeout.as_duration(),
+                        spec_prober(&spec),
+                        self.tx.clone(),
+                    ))
+                } else {
+                    None
+                };
                 self.sheep.insert(
                     id,
                     SheepSlot {
@@ -572,21 +853,18 @@ impl<R: ProcessRunner> Actor<R> {
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
+                        ready_tx,
                     },
                 );
                 self.emit(ProcessEventKind::Start, info.clone(), true);
-                // No readiness-probe gate exists yet (Phase 2b: `readiness_probe`
-                // is parsed into `AppConfig` but not wired to anything here —
-                // see this file's own `Msg::Ready` handler, line 432, the
-                // Phase-4 wait_ready TODO), so `entry.status` above already
-                // went straight to `Online` with no intervening `Starting`
-                // phase ever observed by a caller. The bus must say so too:
-                // a `process.*` subscriber that only ever hears `process.start`
-                // for a sheep whose STATUS already reads `Online` (via
-                // `ListFlock`) is being told less than a status poll would
-                // show it. Once a real readiness gate lands, this is the spot
-                // that defers to it instead of firing unconditionally.
-                self.emit(ProcessEventKind::Online, info.clone(), true);
+                // For a gated app, `Online` fires later — from
+                // `handle_ready_result`, once the readiness task above
+                // resolves — not here. `Start` above is still the bus's
+                // first word on this sheep, so a subscriber is never left
+                // silent for the whole readiness window.
+                if !gated {
+                    self.went_online(id, info.clone(), true);
+                }
                 Ok(info)
             }
             Err(error) => {
@@ -613,6 +891,7 @@ impl<R: ProcessRunner> Actor<R> {
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
+                        ready_tx: None,
                     },
                 );
                 self.emit(ProcessEventKind::Errored, info, true);
@@ -623,8 +902,17 @@ impl<R: ProcessRunner> Actor<R> {
 
     /// Respawns an already-registered id in place: reassembles from its
     /// stored spec + instance, bumps `restarts` and resets timing on
-    /// success, or marks the entry `Errored` on failure. Used for both
-    /// automatic (`RestartDue`) and manual (forced) respawns.
+    /// success, or marks the entry `Errored` on failure. Used for both the
+    /// crash loop's own respawn (`RestartDue`) and the forced one a
+    /// `Restart` command produces.
+    ///
+    /// `manually` is what the `Restart`, `Online` and `Errored` events this
+    /// respawn emits report about who caused it, and it is narrower than
+    /// "forced": `true` only for an operator's `Restart`, `false` for the
+    /// crash loop AND for every restart the daemon raised itself — a cron
+    /// occurrence, a change under a watched tree, a memory breach, a liveness
+    /// failure. Callers pass `origin == CommandOrigin::Operator`, never a
+    /// literal, wherever a command is what got them here.
     fn respawn(&mut self, id: u32, manually: bool) -> ProcessInfo {
         let slot = self.sheep.get(&id).expect("respawn: unknown id");
         let app = slot.entry.spec.clone();
@@ -633,7 +921,13 @@ impl<R: ProcessRunner> Actor<R> {
         // restart must never re-touch the passwd database, and must never
         // silently change identity out from under an already-running app.
         let credentials = slot.entry.credentials;
+        // Computed ahead of the mutable borrow below (IMPORTANT-3): this
+        // respawn's new epoch, one past the slot's current one.
+        let next_epoch = slot.epoch + 1;
         let spec = assemble(&app, instance, &self.paths, credentials);
+        let source = ReadinessSource::of(app.config())
+            .expect("ResolvedApp already passed ProbeTarget::parse in normalize");
+        let gated = !matches!(source, ReadinessSource::Heuristic);
 
         match self.runner.spawn(&spec) {
             Ok((proc, io)) => {
@@ -642,29 +936,60 @@ impl<R: ProcessRunner> Actor<R> {
                     id,
                     proc,
                     io,
-                    app,
+                    app.clone(),
                     self.events.clone(),
                     self.tx.clone(),
                 );
+                let ready_tx = if gated {
+                    Some(spawn_readiness_task(
+                        id,
+                        next_epoch,
+                        // Carried, not defaulted: whether this respawn was a
+                        // caller's `Restart` or the crash loop's own doing is
+                        // a fact about the respawn, and a gated app must
+                        // report it the same way the ungated arm below does.
+                        manually,
+                        source,
+                        app.config().listen_timeout.as_duration(),
+                        spec_prober(&spec),
+                        self.tx.clone(),
+                    ))
+                } else {
+                    None
+                };
                 let slot = self
                     .sheep
                     .get_mut(&id)
                     .expect("respawn: entry vanished mid-respawn");
-                slot.entry.status = ProcStatus::Online;
+                slot.entry.status = if gated {
+                    ProcStatus::Starting
+                } else {
+                    ProcStatus::Online
+                };
                 slot.entry.pid = Some(pid);
                 slot.entry.started_at = Some(tokio::time::Instant::now());
                 slot.entry.restarts += 1;
                 slot.ctl = Some(ctl);
                 // IMPORTANT-3: a new process now exists for this id — any
-                // RestartDue timer scheduled before this point (targeting
-                // the process this replaced) is stale the moment it fires.
+                // RestartDue timer, or readiness task, scheduled before this
+                // point (targeting the process this replaced) is stale the
+                // moment it fires. Dropping the old `ready_tx` here (the
+                // assignment below) also lets a still-pending OLD readiness
+                // task discover its sender is gone; it rides out its own
+                // deadline instead of resolving early (`await_ready`'s
+                // `Channel` arm), and its eventual `ReadyResult` is dropped
+                // by `handle_ready_result`'s epoch check.
                 slot.epoch += 1;
+                debug_assert_eq!(slot.epoch, next_epoch);
+                slot.ready_tx = ready_tx;
                 let info = to_info(&slot.entry);
                 self.emit(ProcessEventKind::Restart, info.clone(), manually);
                 // Same gap as `spawn_fresh`'s Ok arm (see its own comment):
-                // `slot.entry.status` above already went straight to `Online`,
-                // so the bus must announce that too, not just the restart.
-                self.emit(ProcessEventKind::Online, info.clone(), manually);
+                // for a gated app `Online` fires later, from
+                // `handle_ready_result`, not here.
+                if !gated {
+                    self.went_online(id, info.clone(), manually);
+                }
                 info
             }
             Err(_error) => {
@@ -679,10 +1004,87 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.entry.pid = None;
                 slot.entry.started_at = None;
                 slot.ctl = None;
+                slot.ready_tx = None;
                 let info = to_info(&slot.entry);
                 self.emit(ProcessEventKind::Errored, info.clone(), manually);
+                // The same terminal status `Decision::Errored` reaches, and it
+                // needs the same disarm: a respawn that fails to spawn (the
+                // binary replaced mid-deploy, `EAGAIN`, a cwd that is gone)
+                // would otherwise leave the name-group's cron worker and watch
+                // live, and the enforcer armed against a pid that no longer
+                // exists. Re-disarming an already-disarmed id is a no-op by
+                // construction, so this is safe from every caller.
+                self.disarm_extras(id, &info.name);
                 info
             }
+        }
+    }
+
+    /// Offers `manual` the `manual` marker on a RUNNING sheep, starting its
+    /// kill ladder if nothing else already has.
+    ///
+    /// IMPORTANT-4: chosen semantics — the FIRST manual command to reach a
+    /// running sheep owns its `manual` marker and its one live Kill; a later
+    /// command racing in against the SAME in-flight kill does not overwrite
+    /// that marker or send a second Kill. It just rides the same eventual
+    /// `Msg::Exited` to whatever terminal state the FIRST command's intent
+    /// produces, so both callers get the SAME honest terminal snapshot instead
+    /// of one of them being lied to (the old last-writer-wins bug handed a
+    /// `stop()` caller back an `Online` `ProcessInfo`). A `stop()` that lands
+    /// first still wins over a racing `restart()`, and vice versa.
+    ///
+    /// With ONE carve-out, and it is not a fairness question: an operator's
+    /// command takes the marker off an in-flight AUTOMATIC restart. First
+    /// command wins is fair between two operators who are each owed an
+    /// answer, and a memory breach, a liveness failure, a cron occurrence or
+    /// a watched file changing is not one — nobody is behind any of them,
+    /// while the operator's `stop` is the only party waiting. Without the
+    /// carve-out that `stop` came back `Online`, having been silently
+    /// converted into the restart it raced, which is precisely the lie the
+    /// rule above exists to prevent.
+    ///
+    /// Automatic-versus-automatic and operator-versus-operator both keep the
+    /// plain first-command-wins dedupe, and an automatic restart never takes
+    /// the marker off anything.
+    ///
+    /// CRITICAL-2: taking the marker over does NOT send a second Kill — the
+    /// first command's ladder is already running, and the sheep stopped
+    /// draining its ctl mailbox the moment it started. Only a sheep that had
+    /// no marker at all gets one.
+    fn claim_manual(&mut self, id: u32, manual: PendingManual) {
+        let Some(slot) = self.sheep.get_mut(&id) else {
+            return;
+        };
+        match slot.manual.map(|in_flight| in_flight.origin) {
+            // Nothing has claimed this sheep's next exit yet, so this command
+            // owns it — and starts the one kill ladder that will produce it.
+            None => {
+                slot.manual = Some(manual);
+                // CRITICAL-2: try_send, never `.await`. The sheep task stops
+                // draining its ctl mailbox the moment it starts the kill
+                // ladder, so a blocking send here could park the actor for up
+                // to `kill_timeout` — or, with the mailbox-full tail (a flood
+                // of commands after this one), deadlock forever (actor parked
+                // in `ctl.send()`, sheep parked in `actor_tx.send()`, neither
+                // drains the other). `Full`/`Closed` are both fine to ignore:
+                // a Kill already queued means the ladder is already running (a
+                // second would be redundant); `Closed` means the sheep already
+                // exited and its own `Msg::Exited` is already in flight (or
+                // about to be).
+                if let Some(ctl) = &slot.ctl {
+                    let _ = ctl.try_send(SheepCtl::Kill);
+                }
+            }
+            // The carve-out: take the marker, and leave the ladder the
+            // automatic restart already started running.
+            Some(CommandOrigin::Automatic) if manual.origin == CommandOrigin::Operator => {
+                slot.manual = Some(manual);
+            }
+            // Already claimed by an operator, or by an automatic restart this
+            // command has no standing to displace: ride that one's outcome.
+            // Both variants are named rather than wildcarded so that a third
+            // origin has to be ruled on here instead of inheriting this one.
+            Some(CommandOrigin::Operator | CommandOrigin::Automatic) => {}
         }
     }
 
@@ -696,7 +1098,13 @@ impl<R: ProcessRunner> Actor<R> {
     /// the last running one goes terminal too (confirmed by probe C's
     /// equivalent scenario — no code change needed there, this comment is
     /// the "why it already works").
-    fn begin_manual(&mut self, selector: ProcessSelector, kind: ManualKind, reply: ReplyKind) {
+    fn begin_manual(
+        &mut self,
+        selector: ProcessSelector,
+        kind: ManualKind,
+        origin: CommandOrigin,
+        reply: ReplyKind,
+    ) {
         let matched: Vec<u32> = self
             .sheep
             .iter()
@@ -719,41 +1127,10 @@ impl<R: ProcessRunner> Actor<R> {
         for id in matched {
             let is_running = self.sheep.get(&id).is_some_and(|slot| slot.ctl.is_some());
             if is_running {
-                // IMPORTANT-4: chosen semantics — the FIRST manual command
-                // to reach a running sheep owns its `manual` marker and its
-                // one live Kill; a later command racing in against the SAME
-                // in-flight kill (this sheep already has `manual.is_some()`)
-                // does not overwrite that marker or send a second Kill — it
-                // just joins `remaining` and rides the same eventual
-                // Msg::Exited to whatever terminal state the FIRST command's
-                // intent produces. A `stop()` that lands first still wins
-                // over a racing `restart()`, and vice versa; both callers
-                // get the SAME honest terminal snapshot instead of one of
-                // them being lied to (the old last-writer-wins bug handed a
-                // `stop()` caller back an `Online` `ProcessInfo`).
-                let already_in_flight = self
-                    .sheep
-                    .get(&id)
-                    .is_some_and(|slot| slot.manual.is_some());
-                if !already_in_flight {
-                    let slot = self.sheep.get_mut(&id).expect("checked is_running above");
-                    slot.manual = Some(kind);
-                    // CRITICAL-2: try_send, never `.await`. The sheep task
-                    // stops draining its ctl mailbox the moment it starts
-                    // the kill ladder, so a blocking send here could park
-                    // the actor for up to `kill_timeout` — or, with the
-                    // mailbox-full tail (a flood of commands after this
-                    // one), deadlock forever (actor parked in `ctl.send()`,
-                    // sheep parked in `actor_tx.send()`, neither drains the
-                    // other). `Full`/`Closed` are both fine to ignore: a
-                    // Kill already queued means the ladder is already
-                    // running (a second would be redundant); `Closed` means
-                    // the sheep already exited and its own `Msg::Exited` is
-                    // already in flight (or about to be).
-                    if let Some(ctl) = &slot.ctl {
-                        let _ = ctl.try_send(SheepCtl::Kill);
-                    }
-                }
+                // Whoever ends up owning the marker (see `claim_manual`), this
+                // id joins `remaining` below and this command is answered off
+                // the same eventual Msg::Exited.
+                self.claim_manual(id, PendingManual { kind, origin });
                 if kind == ManualKind::Delete {
                     // Regardless of which command's `manual` marker won,
                     // this id must still be deregistered once it goes
@@ -763,7 +1140,7 @@ impl<R: ProcessRunner> Actor<R> {
                     }
                 }
                 remaining.insert(id);
-            } else if let Some(info) = self.apply_immediate(id, kind) {
+            } else if let Some(info) = self.apply_immediate(id, kind, origin) {
                 results.push(info);
             }
         }
@@ -783,7 +1160,30 @@ impl<R: ProcessRunner> Actor<R> {
 
     /// Applies a manual command synchronously to a matched sheep that has no
     /// live task right now (already `Stopped`/`Errored`/`WaitingRestart`).
-    fn apply_immediate(&mut self, id: u32, kind: ManualKind) -> Option<ProcessInfo> {
+    ///
+    /// Two of these three arms are terminal transitions, and both disarm.
+    /// `handle_exited`'s branches cannot cover them: a sheep waiting out its
+    /// restart backoff still holds every extra its last `Online` armed (that
+    /// is deliberate — the respawn re-arms them, and the pid guard drops
+    /// anything reported in between), and its exit already happened, so
+    /// stopping or deleting it HERE is the moment it goes terminal. Without
+    /// this, `shep stop web` issued during a backoff leaves the group's
+    /// watcher and cron worker armed, and the next file save or occurrence
+    /// brings back a sheep the user stopped.
+    ///
+    /// `origin` is carried for one reason, the same one it is carried into
+    /// `handle_exited` for: the `manually` flag on the events below. A cron
+    /// occurrence or a watched file landing on a name whose instances are
+    /// mid-backoff restarts them from HERE, not from `handle_exited`, so
+    /// hardcoding `true` here would leave exactly that case lying about who
+    /// caused it.
+    fn apply_immediate(
+        &mut self,
+        id: u32,
+        kind: ManualKind,
+        origin: CommandOrigin,
+    ) -> Option<ProcessInfo> {
+        let manually = origin == CommandOrigin::Operator;
         match kind {
             ManualKind::Stop => {
                 let slot = self.sheep.get_mut(&id)?;
@@ -801,7 +1201,8 @@ impl<R: ProcessRunner> Actor<R> {
                     ProcStatus::WaitingRestart | ProcStatus::Errored => {
                         slot.entry.status = ProcStatus::Stopped;
                         let info = to_info(&slot.entry);
-                        self.emit(ProcessEventKind::Stop, info.clone(), true);
+                        self.emit(ProcessEventKind::Stop, info.clone(), manually);
+                        self.disarm_extras(id, &info.name);
                         Some(info)
                     }
                     _ => Some(to_info(&slot.entry)),
@@ -810,12 +1211,13 @@ impl<R: ProcessRunner> Actor<R> {
             ManualKind::Delete => {
                 let slot = self.sheep.remove(&id)?;
                 let info = to_info(&slot.entry);
-                self.emit(ProcessEventKind::Delete, info.clone(), true);
+                self.emit(ProcessEventKind::Delete, info.clone(), manually);
+                self.disarm_extras(id, &info.name);
                 Some(info)
             }
             ManualKind::Restart => {
                 self.sheep.get_mut(&id)?.entry.budget.reset();
-                Some(self.respawn(id, true))
+                Some(self.respawn(id, manually))
             }
         }
     }
@@ -847,23 +1249,18 @@ impl<R: ProcessRunner> Actor<R> {
         }
 
         for &id in &online {
-            // Same first-command-wins dedupe as `begin_manual` (IMPORTANT-4):
-            // an id already mid-kill from an earlier Stop/Restart/Delete
-            // keeps that command's `manual` marker and doesn't get a
-            // redundant Kill — it still joins `remaining` below either way.
-            let already_in_flight = self
-                .sheep
-                .get(&id)
-                .is_some_and(|slot| slot.manual.is_some());
-            if !already_in_flight {
-                let slot = self.sheep.get_mut(&id).expect("checked online above");
-                slot.manual = Some(ManualKind::Stop);
-                // CRITICAL-2: try_send — see `begin_manual` for why this
-                // must never be a blocking `.await`.
-                if let Some(ctl) = &slot.ctl {
-                    let _ = ctl.try_send(SheepCtl::Kill);
-                }
-            }
+            // Same marker rule as `begin_manual` (IMPORTANT-4): an id already
+            // mid-kill from an earlier operator Stop/Restart/Delete keeps that
+            // command's `manual` marker and doesn't get a redundant Kill,
+            // while one held by an automatic restart is taken over. It joins
+            // `remaining` below either way.
+            self.claim_manual(
+                id,
+                PendingManual {
+                    kind: ManualKind::Stop,
+                    origin: CommandOrigin::Operator,
+                },
+            );
         }
 
         self.pending.push(PendingReply {
@@ -885,7 +1282,16 @@ impl<R: ProcessRunner> Actor<R> {
         };
         slot.ctl = None;
         slot.entry.pid = None;
+        // Split the moment the marker is taken, because the two halves answer
+        // different questions. `kind` decides what this exit BECOMES, and
+        // every branch below reads it exactly as it did before origins
+        // existed. The origin decides only what the bus SAYS about who caused
+        // it, and is read once, on the forced-respawn branch. The Stop and
+        // Delete branches stay literal `true`: `Command::Stop`,
+        // `Command::Delete` and `begin_shutdown` are the only sites that put
+        // either kind on a marker, and all three declare `Operator`.
         let manual = slot.manual.take();
+        let kind = manual.map(|pending| pending.kind);
         let pending_delete = std::mem::take(&mut slot.pending_delete);
         let Some(started_at) = slot.entry.started_at.take() else {
             // MINOR-7: shouldn't happen (a duplicate Msg::Exited would
@@ -898,7 +1304,7 @@ impl<R: ProcessRunner> Actor<R> {
             );
             // Deregistration is NOT reachable here today: `pending_delete`
             // is only ever set for a sheep whose `ctl.is_some()` (see the
-            // `is_running` gate in `apply_manual`), which implies a live
+            // `is_running` gate in `begin_manual`), which implies a live
             // task and therefore `started_at.is_some()`; and the ONE exit
             // that consumes the flag removes the slot outright, so a second
             // `Msg::Exited` for that id lands in the unregistered-id branch
@@ -907,11 +1313,17 @@ impl<R: ProcessRunner> Actor<R> {
             // `std::mem::take` above has already consumed both markers, so
             // a future change to WHEN `pending_delete` is set would drop a
             // Delete on the floor while telling its caller it succeeded.
-            if manual == Some(ManualKind::Delete) || pending_delete {
+            //
+            // The disarm below is honoured for exactly the same reason and at
+            // the same price: deregistering without it would leave the name
+            // group's cron worker and watch firing at a name `list()` no
+            // longer knows.
+            if kind == Some(ManualKind::Delete) || pending_delete {
                 let mut removed = self.sheep.remove(&id).expect("checked above");
                 removed.entry.status = ProcStatus::Stopped;
                 let info = to_info(&removed.entry);
                 self.emit(ProcessEventKind::Delete, info.clone(), true);
+                self.disarm_extras(id, &info.name);
                 return self.resolve_pending(id, info);
             }
             let info = to_info(&self.sheep.get(&id).expect("checked above").entry);
@@ -929,7 +1341,7 @@ impl<R: ProcessRunner> Actor<R> {
         // and respawning here would spawn a child outside the shutdown
         // aggregation's `online` snapshot, orphaning it exactly like the
         // rejected-at-the-command-level cases. Falling through instead: with
-        // `manual.is_some()` true, `decide_on_exit` always resolves to
+        // `kind.is_some()` true, `decide_on_exit` always resolves to
         // CleanStop, landing the sheep in `Stopped` — an honest answer for
         // a restart request that lost the race to a shutdown.
         //
@@ -942,11 +1354,23 @@ impl<R: ProcessRunner> Actor<R> {
         // process while telling the Delete caller it succeeded — worse than
         // the original bug (a merely-stale `Stopped` entry), since it also
         // shows up in `list()` as `Online`. Falling through instead lets
-        // `decide_on_exit` resolve to CleanStop (manual.is_some() is still
+        // `decide_on_exit` resolve to CleanStop (`kind.is_some()` is still
         // true) and the `pending_delete` guard below correctly deregister.
-        if manual == Some(ManualKind::Restart) && !self.shutting_down && !pending_delete {
+        if kind == Some(ManualKind::Restart) && !self.shutting_down && !pending_delete {
             slot.entry.budget.reset();
-            let info = self.respawn(id, true);
+            // The one place the origin is read. A person's `shep restart` is a
+            // user action; a cron occurrence, a change under a watched tree, a
+            // memory breach and a liveness failure are the daemon's own doing,
+            // and a subscriber told otherwise cannot tell an operator's
+            // deploy apart from an app thrashing on its own.
+            let manually = matches!(
+                manual,
+                Some(PendingManual {
+                    origin: CommandOrigin::Operator,
+                    ..
+                })
+            );
+            let info = self.respawn(id, manually);
             return self.resolve_pending(id, info);
         }
 
@@ -957,7 +1381,7 @@ impl<R: ProcessRunner> Actor<R> {
                 &mut slot.entry.budget,
                 uptime,
                 outcome,
-                manual.is_some(),
+                kind.is_some(),
             )
         };
 
@@ -974,28 +1398,104 @@ impl<R: ProcessRunner> Actor<R> {
             }
             Decision::Errored => {
                 let info = self.set_status(id, ProcStatus::Errored);
-                self.emit(ProcessEventKind::Errored, info.clone(), manual.is_some());
+                self.emit(ProcessEventKind::Errored, info.clone(), kind.is_some());
+                self.disarm_extras(id, &info.name);
                 info
             }
-            Decision::CleanStop if manual == Some(ManualKind::Delete) || pending_delete => {
+            Decision::CleanStop if kind == Some(ManualKind::Delete) || pending_delete => {
                 let mut removed = self.sheep.remove(&id).expect("checked above");
                 removed.entry.status = ProcStatus::Stopped;
                 let info = to_info(&removed.entry);
                 self.emit(ProcessEventKind::Delete, info.clone(), true);
+                self.disarm_extras(id, &info.name);
                 info
             }
             Decision::CleanStop => {
                 let info = self.set_status(id, ProcStatus::Stopped);
+                self.disarm_extras(id, &info.name);
                 self.emit(
                     ProcessEventKind::Stop,
                     info.clone(),
-                    manual == Some(ManualKind::Stop),
+                    kind == Some(ManualKind::Stop),
                 );
                 info
             }
         };
 
         self.resolve_pending(id, info)
+    }
+
+    /// A memory breach or a liveness failure asked for a restart. Guarded the
+    /// same way `RestartDue` is, on the **pid** rather than the epoch — the
+    /// epoch lives on the private [`SheepSlot`], while the pid is already on
+    /// both reports and is just as good a generation token (`None` while not
+    /// running, different after every respawn):
+    ///
+    /// 1. NOT shutting down — a graceful shutdown forbids any new spawn.
+    ///    Defence in depth, and deliberately untested rather than tested by a
+    ///    case that cannot fail: any sheep passing guards 3 and 4 is `Online`
+    ///    with a live pid, which means `ctl.is_some()`, which means
+    ///    `begin_shutdown` already set its `manual` marker — so
+    ///    `claim_manual` would drop this restart even with this guard gone (an
+    ///    automatic restart never takes a marker over, least of all an
+    ///    operator's). It stays because that chain is four inferences long and
+    ///    none of them is this handler's to keep true.
+    /// 2. The slot still existing (a `Delete` may have removed it).
+    /// 3. The pid still being the one the report was raised against — a
+    ///    breach for the process a crash-and-restart already replaced would
+    ///    otherwise restart its healthy successor and reset its budget.
+    /// 4. The entry still being `Online`. The extras stay armed for the whole
+    ///    kill ladder (there is no `Stopping` transition to disarm at), so a
+    ///    report raised *during* a `shep stop` can arrive seconds after the
+    ///    sheep is `Stopped` — and `ProcessSelector::Id` matches regardless of
+    ///    status, so without this the daemon would resurrect a process the
+    ///    user explicitly stopped and report success.
+    ///
+    /// Delegates to `begin_manual` rather than `respawn`: that keeps the kill
+    /// ladder, the marker rule, the `pending_delete` interaction and the budget
+    /// reset intact. A breaching sheep is normally `Online` with a live pid, so
+    /// respawning it directly would put two live pids on one instance.
+    ///
+    /// It goes in as [`CommandOrigin::Automatic`], which is what lets an
+    /// operator's `stop` or `delete` take the sheep back off a restart already
+    /// mid-ladder — see `claim_manual`.
+    fn handle_extra_restart(&mut self, id: u32, pid: u32) {
+        if self.shutting_down {
+            tracing::debug!(id, pid, "extra restart dropped: engine is shutting down");
+            return;
+        }
+        let Some(slot) = self.sheep.get(&id) else {
+            tracing::debug!(id, pid, "extra restart dropped: no such sheep");
+            return;
+        };
+        if slot.entry.pid != Some(pid) {
+            tracing::debug!(
+                id,
+                pid,
+                current = slot.entry.pid,
+                "extra restart dropped: the reported pid is no longer this sheep's"
+            );
+            return;
+        }
+        if slot.entry.status != ProcStatus::Online {
+            tracing::debug!(
+                id,
+                pid,
+                status = %slot.entry.status,
+                "extra restart dropped: the sheep is no longer online"
+            );
+            return;
+        }
+        // A throwaway reply: `send_reply` already ignores a closed receiver,
+        // and there is nobody to answer — the reporter is fire-and-forget by
+        // contract.
+        let (reply, _dropped) = oneshot::channel();
+        self.begin_manual(
+            ProcessSelector::Id(id),
+            ManualKind::Restart,
+            CommandOrigin::Automatic,
+            ReplyKind::Info(reply),
+        );
     }
 
     /// A scheduled restart's backoff elapsed. Guarded on:
@@ -1025,6 +1525,63 @@ impl<R: ProcessRunner> Actor<R> {
             return;
         }
         self.respawn(id, false);
+    }
+
+    /// Forwards the shepherd channel's readiness signal to the waiting
+    /// readiness task for `id`, if one is waiting. A `Ready` that finds no
+    /// live wait — no sender at all, or a stale one whose task is already
+    /// gone (see [`SheepSlot::ready_tx`]) — is dropped silently: an app is
+    /// free to write `{"kind":"ready"}` whenever it likes, including twice.
+    fn handle_ready_signal(&mut self, id: u32) {
+        let Some(slot) = self.sheep.get_mut(&id) else {
+            return;
+        };
+        if let Some(tx) = slot.ready_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+
+    /// A readiness wait resolved. Guarded exactly like `handle_restart_due`:
+    ///
+    /// 1. NOT shutting down (CRITICAL-1) — no new bus activity for a sheep
+    ///    once a graceful shutdown has started.
+    /// 2. The slot still existing (a `Delete` may have removed it).
+    /// 3. Its epoch still matching the slot's current one (IMPORTANT-3) — a
+    ///    respawn (manual or automatic) that happened while this wait was
+    ///    still pending makes it stale.
+    /// 4. The entry still being `Starting` — an exit that raced the wait
+    ///    (see the epoch check above) or a status this wait has no business
+    ///    overwriting.
+    ///
+    /// That guard set is not boilerplate to trim: a sheep that exited and
+    /// respawned while its readiness task was still waiting would otherwise
+    /// have the old wait mark the new process online.
+    fn handle_ready_result(&mut self, id: u32, epoch: u64, manually: bool, readiness: Readiness) {
+        if self.shutting_down {
+            return;
+        }
+        let Some(slot) = self.sheep.get(&id) else {
+            return;
+        };
+        if slot.epoch != epoch {
+            return;
+        }
+        if slot.entry.status != ProcStatus::Starting {
+            return;
+        }
+        if readiness == Readiness::TimedOut {
+            // Rin, 2026-08-08: a readiness timeout goes online anyway rather
+            // than erroring — treating it as a spawn failure would turn a
+            // slow-starting app into a restart loop, exactly the failure
+            // mode `max_restarts` exists to contain.
+            tracing::warn!(id, "readiness deadline elapsed; marking online anyway");
+        }
+        let info = self.set_status(id, ProcStatus::Online);
+        // `manually` comes from the spawn that armed this wait, so gating an
+        // app changes only WHEN its `Online` fires, never what the event
+        // says about who caused it: the same `shep start` reports the same
+        // flag whether or not the app configures readiness.
+        self.went_online(id, info, manually);
     }
 
     /// Spawns the backoff timer for a scheduled restart; `None` still hops
@@ -1062,6 +1619,88 @@ impl<R: ProcessRunner> Actor<R> {
             }
         }
         shutdown_completed
+    }
+
+    /// One sheep's transition to `Online`: emits the event, then arms every
+    /// lifecycle extra its configuration asks for.
+    ///
+    /// The single arming site, reached by all three transitions — the two
+    /// ungated spawn paths and, for a gated app, `handle_ready_result`.
+    /// Arming has to happen AT the transition rather than at the spawn: a
+    /// liveness probe armed against an app that has not finished starting
+    /// fails its threshold and restarts the app before it ever comes up.
+    fn went_online(&mut self, id: u32, info: ProcessInfo, manually: bool) {
+        self.emit(ProcessEventKind::Online, info, manually);
+        self.arm_extras(id);
+    }
+
+    /// Arms `id`'s lifecycle extras, re-assembling the spec the running
+    /// process was spawned from.
+    ///
+    /// Re-assembly is what makes one arming site possible: `handle_ready_result`
+    /// holds an id and nothing else, and `assemble` is the same pure function
+    /// both spawn paths already call over the same never-changing `spec`,
+    /// `instance` and `credentials`, so it returns that spawn's own spec
+    /// rather than a second derivation of it.
+    fn arm_extras(&mut self, id: u32) {
+        let Some(extras) = self.extras.as_ref() else {
+            return;
+        };
+        let Some(slot) = self.sheep.get(&id) else {
+            return;
+        };
+        let supervisor = SupervisorHandle {
+            tx: self.tx.clone(),
+        };
+        // `Credentials` is `Copy`, which is why this needs no clone.
+        let spec = assemble(
+            &slot.entry.spec,
+            slot.entry.instance,
+            &self.paths,
+            slot.entry.credentials,
+        );
+        self.registry
+            .arm(&slot.entry, spec_prober(&spec), extras, &supervisor);
+    }
+
+    /// Disarms `id`'s lifecycle extras, and its name-group's cron worker and
+    /// watch when `id` was the last armed instance of `name`.
+    ///
+    /// Called from **seven** sites, because a sheep reaches a terminal state
+    /// through more than one door. Adding a transition means adding a call
+    /// here; the list is the checklist:
+    ///
+    /// 1. `respawn`'s `Err` arm — a restart that could not spawn lands in
+    ///    `Errored` without ever going through `handle_exited`.
+    /// 2. `apply_immediate`'s Stop arm — a `WaitingRestart` or `Errored`
+    ///    sheep has no live task, so its stop resolves synchronously.
+    /// 3. `apply_immediate`'s Delete arm — ditto, deregistered on the spot.
+    /// 4. `handle_exited`'s duplicate-`Msg::Exited` Delete branch —
+    ///    unreachable today, honoured because the alternative is silent.
+    /// 5. `handle_exited`'s `Decision::Errored`.
+    /// 6. `handle_exited`'s `Decision::CleanStop` that deregisters.
+    /// 7. `handle_exited`'s plain `Decision::CleanStop`.
+    ///
+    /// One further terminal transition reaches `Errored` and correctly does
+    /// NOT disarm: `spawn_fresh`'s `Err` arm. A spawn that never came up was
+    /// never armed — its id is fresh from `next_id` and has joined no name
+    /// group. It is named here so that an auditor who greps
+    /// `ProcStatus::Errored` finds that site already accounted for rather
+    /// than re-deriving why it is exempt.
+    ///
+    /// Nothing else disarms, and nothing needs to: a sheep on its way to
+    /// `WaitingRestart` deliberately keeps its arming (its liveness loop is
+    /// replaced by the re-arm the respawn performs, and any report it raises
+    /// in between names a pid `handle_extra_restart`'s guard no longer
+    /// recognises), and the teardown of the actor itself is
+    /// [`ExtrasRegistry`]'s own `Drop` rather than a call from here — see that
+    /// impl for why the shutdown path cannot be the one that covers it.
+    ///
+    /// Re-disarming an already-disarmed id is a no-op by construction, so a
+    /// site that fires twice costs nothing and a site that is missing costs a
+    /// leaked task.
+    fn disarm_extras(&mut self, id: u32, name: &str) {
+        self.registry.disarm(id, name);
     }
 
     /// Sets `id`'s status and returns its refreshed snapshot.
@@ -1132,6 +1771,62 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
         out_file: Some(entry.out_file.to_string_lossy().into_owned()),
         err_file: Some(entry.err_file.to_string_lossy().into_owned()),
     }
+}
+
+/// The prober a gated readiness task — or a sheep's liveness loop — probes
+/// with: a fresh [`OsProber`] scoped to the ASSEMBLED spec's `cwd`/`env`, so
+/// an exec-kind probe sees the same environment (its `PORT`, most commonly)
+/// its sheep does.
+///
+/// Taking the [`SpawnSpec`] rather than the [`ResolvedApp`] it was assembled
+/// from is the whole point, not a refactor. `probe_exec` runs
+/// `env_clear().envs(&self.env)`, and the app's own `config.env` is only one
+/// of the three things [`assemble`] folds into the child's environment: an
+/// app that sets no `env` at all — the ordinary case — would probe with
+/// NOTHING, no `PATH`, no `HOME`, no `TZ`. The instance slot var
+/// (`SHEP_INSTANCE`, or the app's `increment_var`) is the sharper half: a
+/// `&ResolvedApp` structurally cannot reach `instance`, so every instance of
+/// a clustered app would probe whatever the unexpanded variable left behind
+/// — the same port, every time.
+fn spec_prober(spec: &SpawnSpec) -> Arc<dyn Prober> {
+    Arc::new(OsProber::new(spec.cwd.clone(), spec.env.clone()))
+}
+
+/// Spawns a readiness task for `id` at `epoch`, returning the oneshot
+/// sender the actor stores (`SheepSlot::ready_tx`) so a later `Msg::Ready`
+/// can wake it. `source` decides which signal [`await_ready`] waits for;
+/// `deadline` is the app's `listen_timeout`. The task reports its result
+/// back through `actor_tx` as a `Msg::ReadyResult`, which
+/// `Actor::handle_ready_result` drops if `epoch` is no longer current.
+///
+/// `manually` is carried, never inspected here: the task is a courier for
+/// the flag the deferred `Online` needs (see `Msg::ReadyResult`'s own doc).
+///
+/// Must be called from within a Tokio runtime context: it spawns the
+/// waiting task immediately, the same way `schedule_restart` already
+/// documents for itself.
+fn spawn_readiness_task(
+    id: u32,
+    epoch: u64,
+    manually: bool,
+    source: ReadinessSource,
+    deadline: Duration,
+    prober: Arc<dyn Prober>,
+    actor_tx: mpsc::Sender<Msg>,
+) -> oneshot::Sender<()> {
+    let (ready_tx, ready_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let readiness = await_ready(&source, deadline, ready_rx, prober).await;
+        let _ = actor_tx
+            .send(Msg::ReadyResult {
+                id,
+                epoch,
+                manually,
+                readiness,
+            })
+            .await;
+    });
+    ready_tx
 }
 
 /// Spawns the per-sheep task and returns its control sender.
@@ -1220,10 +1915,10 @@ async fn run_sheep<P: RunningProcess>(
                         let _ = actor_tx.send(Msg::Ready { id }).await;
                     }
                     Some(ChildMessage::Metric { name, value }) => {
-                        tracing::debug!(id, name, value, "child metric (full handling is Phase 4)");
+                        tracing::debug!(id, name, value, "child metric (the metrics dog reads these; not built yet)");
                     }
                     Some(ChildMessage::ActionReply { action, body }) => {
-                        tracing::debug!(id, action, body, "child action reply (full handling is Phase 4)");
+                        tracing::debug!(id, action, body, "child action reply (custom actions are not built yet)");
                     }
                     None => from_child_open = false,
                 }
@@ -1234,29 +1929,496 @@ async fn run_sheep<P: RunningProcess>(
 
 #[cfg(test)]
 mod tests {
-    use shep_core::config::{AppConfig, normalize};
+    use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, normalize};
     use shep_core::status::ProcStatus;
+    use shep_core::values::UpDuration;
 
     use super::*;
     use crate::fake::{ProcScript, ScriptedRunner};
-    use crate::testing::test_paths; // the one crate-root fixture (IR-33)
+    use crate::testing::{probe_config, test_paths}; // the one crate-root fixture (IR-33)
 
-    // Drives virtual time by parking on recv(); returns when the id reaches `kind`.
+    /// Drives virtual time by parking on recv(); returns when the id reaches
+    /// `kind`, handing back that event's `manually` flag (most callers only
+    /// need the arrival and drop it).
     async fn await_event(
         rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
         id: u32,
         kind: ProcessEventKind,
-    ) {
+    ) -> bool {
         loop {
             match rx.recv().await {
-                Ok(BusEvent::Process { event, info, .. }) if info.id == id && event == kind => {
-                    return;
+                Ok(BusEvent::Process {
+                    event,
+                    info,
+                    manually,
+                    ..
+                }) if info.id == id && event == kind => {
+                    return manually;
                 }
                 Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(e) => panic!("event stream closed before {kind:?} for id {id}: {e}"),
             }
         }
+    }
+
+    /// Waits up to `window` for `kind` targeting `id`; panics if it arrives.
+    /// A bounded `timeout` + `recv`, not a bare `try_recv` (Global
+    /// Constraints rule 11): right after the clock is driven forward, a
+    /// message already due has not necessarily reached this receiver's
+    /// queue yet, so a bare `try_recv` would read empty regardless of
+    /// whether the code under test is correct.
+    async fn assert_no_event_within(
+        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        id: u32,
+        kind: ProcessEventKind,
+        window: Duration,
+    ) {
+        match tokio::time::timeout(window, await_event(rx, id, kind)).await {
+            Err(_elapsed) => {} // window elapsed with nothing arriving — expected
+            Ok(_manually) => panic!("unexpected {kind:?} for id {id} within {window:?}"),
+        }
+    }
+
+    // --- The readiness gate ---
+
+    // fails if a `wait_ready` app reaches Online at spawn instead of waiting
+    // on the shepherd channel's ready signal
+    #[tokio::test(start_paused = true)]
+    async fn wait_ready_app_stays_starting_until_the_channel_signals() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.wait_ready = true;
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+        assert_no_event_within(
+            &mut rx,
+            0,
+            ProcessEventKind::Online,
+            Duration::from_millis(500),
+        )
+        .await;
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+
+        // `Msg::Ready` is `pub(crate)`, and `tests` is a descendant module of
+        // `supervisor`, so this reaches the actor exactly where the sheep
+        // task's forwarded `ChildMessage::Ready` would — that forwarding
+        // itself is pre-existing, unchanged code (`run_sheep`'s
+        // `from_child.recv()` arm), not the readiness gate's own surface.
+        handle.tx.send(Msg::Ready { id: 0 }).await.unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("Online once the channel signals");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Online);
+    }
+
+    // fails if a readiness_probe app reaches Online at spawn instead of
+    // waiting for the probe to pass, or if it never reaches Online once the
+    // probe starts passing. Real time, not the paused clock, and no
+    // `start_paused`: this drives a real TCP connect against a real
+    // listener, and `probes::os::tests` already found that a paused test
+    // waiting on real socket I/O can deadlock — the virtual clock inside the
+    // test never appears to move while the OS on the other end is
+    // unaffected by it.
+    #[tokio::test]
+    async fn readiness_probe_app_stays_starting_until_the_probe_passes() {
+        // Reserve a free port, then release it immediately: the probe
+        // target is fixed at this port before anything is listening on it,
+        // so probes fail (connection refused) until the fixture below binds
+        // it for real, a few lines down.
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.readiness_probe = Some(ProbeConfig {
+            interval: UpDuration::from_millis(50),
+            timeout: UpDuration::from_millis(200),
+            ..probe_config(ProbeKind::Tcp, &addr.to_string())
+        });
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+        // Nothing is listening on `addr` yet: several probe intervals' worth
+        // of real time pass with the probe failing every time.
+        assert_no_event_within(
+            &mut rx,
+            0,
+            ProcessEventKind::Online,
+            Duration::from_millis(220),
+        )
+        .await;
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let _accept = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("Online once the probe starts passing");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Online);
+    }
+
+    // fails if the readiness prober is built from the app's own `config.env`
+    // instead of the ASSEMBLED `SpawnSpec::env`. The probe below reads
+    // `$SHEP_INSTANCE`, a variable only `assemble` ever writes, so a prober
+    // scoped to `config.env` — empty here, as it is for most apps — expands
+    // it to nothing under `probe_exec`'s `env_clear()`, watches for a file
+    // that will never exist, and rides out the whole `listen_timeout`
+    // instead of noticing the one that does appear.
+    //
+    // A file, not a port: an exec probe flipping fail->pass on `test -f`
+    // needs no listener, no reserved port, and no race, so the only thing
+    // this test can fail on is the environment the probe ran with.
+    //
+    // Real time, not the paused clock, for the reason the TCP test above
+    // gives: this spawns a real `sh` per probe, and the virtual clock does
+    // not move the OS.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_exec_readiness_probe_sees_the_assembled_env_not_the_apps_own() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        // Instance 0 is the only slot a single-instance app gets, so this is
+        // the exact path a correctly-scoped probe resolves to.
+        let ready_file = dir.path().join("ready-0");
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.readiness_probe = Some(ProbeConfig {
+            interval: UpDuration::from_millis(50),
+            timeout: UpDuration::from_millis(500),
+            ..probe_config(
+                ProbeKind::Exec,
+                &format!(r#"test -f "{}/ready-$SHEP_INSTANCE""#, dir.path().display()),
+            )
+        });
+        // Far longer than this test's own patience below, so an Online it
+        // observes can only have come from a probe that really passed —
+        // never from the deadline path quietly marking it online anyway.
+        app.listen_timeout = UpDuration::from_millis(60_000);
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+        // Several probe intervals of real time with the file absent.
+        assert_no_event_within(
+            &mut rx,
+            0,
+            ProcessEventKind::Online,
+            Duration::from_millis(220),
+        )
+        .await;
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+
+        std::fs::write(&ready_file, b"").unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("Online once the exec probe can resolve $SHEP_INSTANCE");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Online);
+    }
+
+    // fails if gating an app changes its `Online` event's `manually` flag —
+    // the gate moves only WHEN that event fires, never what it says about
+    // who caused it. Both halves matter: a `Start` is the caller's doing
+    // either way, and a manual `Restart` must still say so after riding
+    // through the readiness wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_gated_apps_online_carries_the_same_manually_flag_an_ungated_one_does() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::never_exits(), // id 0: gated
+            ProcScript::never_exits(), // id 1: ungated
+            ProcScript::never_exits(), // id 0 again, after the manual restart
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut gated = AppConfig::minimal("gated", "./srv");
+        gated.wait_ready = true;
+        let ungated = AppConfig::minimal("ungated", "./srv");
+        handle
+            .start(vec![normalize(gated).unwrap(), normalize(ungated).unwrap()])
+            .await
+            .unwrap();
+
+        // The ungated app is the control: whatever it reports for a plain
+        // `Start` is what the gated one has to report too.
+        let ungated_manually = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_event(&mut rx, 1, ProcessEventKind::Online),
+        )
+        .await
+        .expect("an ungated app is Online at spawn");
+        assert!(ungated_manually, "sanity: a Start is a manual event");
+
+        handle.tx.send(Msg::Ready { id: 0 }).await.unwrap();
+        let gated_manually = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("Online once the channel signals");
+        assert_eq!(
+            gated_manually, ungated_manually,
+            "the same `shep start` must report the same flag, gated or not"
+        );
+
+        // Now the respawn path: a manual Restart's own flag has to survive
+        // the readiness wait rather than being defaulted at the far end. The
+        // sheep is `Starting` but its task is live, so this takes the deferred
+        // route — kill ladder, then `handle_exited`'s forced-restart branch —
+        // and `restart` resolves at that respawn rather than at Online, so a
+        // gated app's reply lands here with the new process still `Starting`:
+        // no deadlock, and nothing to signal until after this await.
+        let restarted = handle.restart(ProcessSelector::Id(0)).await.unwrap();
+        assert_eq!(restarted[0].status, ProcStatus::Starting);
+        handle.tx.send(Msg::Ready { id: 0 }).await.unwrap();
+        let restarted_manually = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("Online once the respawned sheep signals");
+        assert!(
+            restarted_manually,
+            "a manual Restart's Online must stay manual through the readiness gate"
+        );
+    }
+
+    // The positive control for every `manually: false` the lifecycle extras
+    // assert: an operator's `shep restart` really does reach the bus as a user
+    // action, so those cases are reading a flag that still moves rather than
+    // one wired shut. It claims the `Restart` event specifically —
+    // `a_gated_apps_online_carries_the_same_manually_flag_an_ungated_one_does`
+    // covers the deferred `Online` — because that is the event the extras'
+    // cases read.
+    //
+    // fails if `SupervisorHandle::restart` stops declaring
+    // `CommandOrigin::Operator`, or if `handle_exited`'s forced-restart branch
+    // stops reading the origin at all and reports every restart as automatic.
+    #[tokio::test(start_paused = true)]
+    async fn an_operators_restart_is_reported_as_a_user_action() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        // Two: the sheep, and the respawn the restart performs. One would
+        // leave that respawn `SpawnFailed("script exhausted")`, which emits
+        // `Errored` instead of `Restart` — and `await_event` would then wait
+        // for a `Restart` that never comes rather than judging its flag.
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits(); 2]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        handle
+            .start(vec![normalize(AppConfig::minimal("web", "./srv")).unwrap()])
+            .await
+            .unwrap();
+
+        let restarted = handle.restart(ProcessSelector::All).await.unwrap();
+        assert_eq!(restarted[0].restarts, 1, "the restart really respawned");
+
+        let manually = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_event(&mut rx, 0, ProcessEventKind::Restart),
+        )
+        .await
+        .expect("the respawn `restart` performed");
+        assert!(
+            manually,
+            "a person typed `shep restart`; the bus must say a user action caused it"
+        );
+    }
+
+    // fails if a readiness timeout is treated as a spawn failure instead of
+    // going online anyway — that would turn every slow-starting app into a
+    // restart loop, exactly what max_restarts exists to contain
+    #[tokio::test(start_paused = true)]
+    async fn a_gated_app_whose_deadline_elapses_goes_online_anyway() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.wait_ready = true; // nobody ever signals ready
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+
+        tokio::time::timeout(
+            Duration::from_secs(4), // > the 3000ms default listen_timeout
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("Online once the readiness deadline elapses");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Online);
+    }
+
+    // fails if a stale readiness result — from a sheep that exited and was
+    // automatically respawned while starting — marks the respawned process
+    // online; this is the epoch guard's test, and it is the one that
+    // catches the stale-wait defect. Status alone cannot catch it: the OLD
+    // process and the NEW one are both `Starting`, so only the epoch tells
+    // them apart. This also doubles as the "an event arrives before the
+    // readiness signal does" proof (`Restart` before `Online`) for the
+    // respawn path.
+    #[tokio::test(start_paused = true)]
+    async fn a_gated_app_that_exits_while_starting_never_reaches_online_from_the_old_wait() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::stable_then_exit(500, 1), // unstable exit while Starting
+            ProcScript::never_exits(),            // the automatic respawn
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.wait_ready = true; // nobody ever signals either instance's readiness
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+
+        // The exit at 500ms is unstable (< the 1000ms min_uptime default)
+        // and triggers an immediate automatic respawn (no
+        // exp_backoff_restart_delay configured, so `restart_delay` is
+        // `None`): status goes straight back to `Starting` for the NEW
+        // process, epoch bumped. `Restart` fires here; `Online` does not —
+        // proving the two emits stay separate on the respawn path too.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            await_event(&mut rx, 0, ProcessEventKind::Restart),
+        )
+        .await
+        .expect("the automatic respawn after the unstable exit");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+        assert_eq!(handle.list().await[0].restarts, 1);
+
+        // The ORIGINAL readiness wait's deadline (~3000ms from the FIRST
+        // spawn, ~2500ms from here) elapses next; status reads `Starting`
+        // for both the old and the new process, so only the epoch guard —
+        // not the status guard — can tell them apart.
+        assert_no_event_within(
+            &mut rx,
+            0,
+            ProcessEventKind::Online,
+            Duration::from_millis(2_700),
+        )
+        .await;
+        assert_eq!(
+            handle.list().await[0].status,
+            ProcStatus::Starting,
+            "the OLD wait's stale TimedOut must not have marked the respawned process online"
+        );
+
+        // The RESPAWNED process's own deadline elapses next (~3000ms from
+        // ITS spawn), and this one legitimately goes online.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("the new process's own readiness deadline");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Online);
+    }
+
+    // fails if a stale readiness result marks a STOPPED sheep online. Unlike
+    // the two tests above, no respawn ever happens here, so the epoch never
+    // changes — only the status guard stands between the stale TimedOut and
+    // an incorrect Online, and this is the test that catches its removal
+    // specifically (the epoch check alone would let this one through).
+    #[tokio::test(start_paused = true)]
+    async fn a_gated_app_stopped_while_starting_ignores_the_old_wait() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::stable_then_exit(500, 1)]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.wait_ready = true; // nobody ever signals ready
+        app.autorestart = false; // straight to Stopped: epoch never bumps
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            await_event(&mut rx, 0, ProcessEventKind::Stop),
+        )
+        .await
+        .expect("the natural exit at 500ms");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Stopped);
+
+        // The original readiness task's own 3000ms deadline (from spawn) is
+        // still running in the background and resolves TimedOut around
+        // t=3000ms — roughly 2500ms from here, at the SAME epoch this slot
+        // still carries. That stale ReadyResult must never flip this
+        // Stopped sheep to Online.
+        assert_no_event_within(&mut rx, 0, ProcessEventKind::Online, Duration::from_secs(3)).await;
+        assert_eq!(handle.list().await[0].status, ProcStatus::Stopped);
+    }
+
+    // fails if the OLD readiness wait's eventual result marks the
+    // RESPAWNED process online instead of being dropped by the epoch guard
+    #[tokio::test(start_paused = true)]
+    async fn a_gated_app_restarted_while_starting_ignores_the_old_wait() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let runner =
+            ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.wait_ready = true; // nobody ever signals either instance's readiness
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
+
+        // A gap before the manual restart, so the OLD wait's deadline
+        // (~3000ms from spawn) and the NEW wait's deadline (~3000ms from
+        // THIS point) land far enough apart to tell them apart below.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        handle
+            .restart(ProcessSelector::Name("web".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.list().await[0].status,
+            ProcStatus::Starting,
+            "the respawned process is gated too, so it must still be Starting"
+        );
+
+        // The ORIGINAL readiness wait's deadline elapses first; the epoch
+        // guard must drop it rather than mark the respawned process online.
+        assert_no_event_within(
+            &mut rx,
+            0,
+            ProcessEventKind::Online,
+            Duration::from_millis(2_700),
+        )
+        .await;
+        assert_eq!(
+            handle.list().await[0].status,
+            ProcStatus::Starting,
+            "the old wait's stale TimedOut must not have marked the new process online"
+        );
+
+        // The RESPAWNED process's own deadline elapses next, and this one
+        // legitimately goes online.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            await_event(&mut rx, 0, ProcessEventKind::Online),
+        )
+        .await
+        .expect("the new process's own readiness deadline");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Online);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1500,22 +2662,40 @@ mod tests {
         assert_eq!(handle.list().await.len(), 1);
     }
 
+    // An operator's `shep restart` aimed at a RUNNING sheep resets the restart
+    // budget (spec §4) and respawns, and the operator gets the respawned sheep
+    // back as its reply. The not-running half of that claim is a third test,
+    // two below.
+    //
+    // fails if `handle_exited`'s `slot.entry.budget.reset()` is dropped —
+    // that leaves the two spent unstable exits on the books, so the crash
+    // after the restart is the third of three and errors the sheep out at
+    // three restarts instead of carrying it to a fourth.
     #[tokio::test(start_paused = true)]
     async fn manual_restart_resets_budget_and_respawns() {
         let (events, _rx) = tokio::sync::broadcast::channel(64);
-        // Two unstable crashes bring the budget to 2; then a manual restart must
-        // reset it (spec §4) and respawn. Script needs FOUR procs: initial +
-        // 2 crash-respawns landing on the long-lived third, + the respawn the
-        // manual restart itself performs.
+        // Five procs, sized against the mutation rather than against a correct
+        // run: two unstable crashes, the long-lived proc they land on, the
+        // respawn the manual restart performs (unstable again, to spend the
+        // budget the reset just cleared), and the proc a still-solvent budget
+        // restarts onto. A pool of four would answer that last spawn
+        // `SpawnFailed("script exhausted")` and land the sheep in `Errored` —
+        // the very state a lost budget reset produces — so the assertion
+        // below would hold identically whether or not the reset happened.
         let runner = ScriptedRunner::new(vec![
             ProcScript::const_exit(1),
             ProcScript::const_exit(1),
             ProcScript::never_exits(),
+            ProcScript::const_exit(1),
             ProcScript::never_exits(),
         ]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
-        let app = AppConfig::minimal("svc", "./svc");
+        let mut app = AppConfig::minimal("svc", "./svc");
+        // Three rather than the default sixteen, so the two crashes below
+        // leave the budget one short of exhausted and a single further crash
+        // decides the test.
+        app.max_restarts = 3;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
         // mean restarts==2 once the never_exits proc is up.
@@ -1530,10 +2710,223 @@ mod tests {
             .restart(ProcessSelector::Name("svc".to_string()))
             .await
             .unwrap();
+        // The deferred reply is the operator's own answer, snapshotted at the
+        // respawn — so it reads Online regardless of what that proc does next.
         assert_eq!(restarted[0].status, ProcStatus::Online);
-        // Budget reset by the manual action: online, not errored.
-        assert_eq!(handle.list().await[0].status, ProcStatus::Online);
-        assert_eq!(handle.list().await[0].restarts, 3);
+
+        // The proc that restart landed on is itself unstable. With the budget
+        // reset its exit is the FIRST of three again and the sheep restarts
+        // once more; without it, the third, and the sheep errors out.
+        // Bounded, unlike the sync loop above: the failing outcome here is a
+        // settled `Errored`, so an unbounded wait for the passing one would
+        // hang the test rather than fail it (rule 11). Every step in between
+        // is ready work — the restarts at this config are immediate — so the
+        // round trips below cannot be starved by the paused clock.
+        let mut settled = handle.list().await.remove(0);
+        for _ in 0..200 {
+            if settled.status == ProcStatus::Errored
+                || (settled.status == ProcStatus::Online && settled.restarts == 4)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+            settled = handle.list().await.remove(0);
+        }
+        assert_eq!(
+            (settled.status, settled.restarts),
+            (ProcStatus::Online, 4),
+            "an operator's restart left the two spent unstable exits on the \
+             books -- got {settled:?}"
+        );
+    }
+
+    // The budget reset belongs to `ManualKind::Restart` and to nothing else:
+    // a restart the daemon raised itself — a cron occurrence, a watched file
+    // changing, a memory breach — resets it exactly as an operator's `shep
+    // restart` does. `CommandOrigin` governs only which of two racing
+    // commands owns a sheep's next exit (`claim_manual`), and classifying
+    // cron and watch as automatic must not make the budget depend on it.
+    //
+    // The sibling above makes the same claim through `restart`; the two
+    // differ in that one call, and in the operator's extra check on the
+    // reply only its path has.
+    //
+    // fails if a budget reset is ever gated on origin — dropping
+    // `handle_exited`'s `slot.entry.budget.reset()` for an automatic restart
+    // leaves the two spent unstable exits on the books, so the very next
+    // crash is the third of three and errors the sheep out instead of
+    // restarting it.
+    #[tokio::test(start_paused = true)]
+    async fn an_automatic_restart_resets_the_budget_like_an_operators_does() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        // Five procs, which is the most this test can demand: two unstable
+        // crashes, the long-lived proc they land on, the respawn the
+        // automatic restart performs (unstable again, to spend the budget the
+        // reset just cleared), and the proc a still-solvent budget restarts
+        // onto. A pool of four would answer that last spawn
+        // `SpawnFailed("script exhausted")` and land the sheep in `Errored` —
+        // the very state a lost budget reset produces — so the assertion
+        // below would fail identically whether the reset worked or not.
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::const_exit(1),
+            ProcScript::const_exit(1),
+            ProcScript::never_exits(),
+            ProcScript::const_exit(1),
+            ProcScript::never_exits(),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("svc", "./svc");
+        // Three rather than the default sixteen, so the two crashes below
+        // leave the budget one short of exhausted and a single further crash
+        // decides the test.
+        app.max_restarts = 3;
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        // Sync on state, not on the repeated Online event: immediate restarts
+        // mean restarts==2 once the never_exits proc is up.
+        loop {
+            let info = handle.list().await.remove(0);
+            if info.restarts == 2 && info.status == ProcStatus::Online {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        handle
+            .restart_automatic(ProcessSelector::Name("svc".to_string()))
+            .await
+            .unwrap();
+
+        // The proc that restart landed on is itself unstable. With the budget
+        // reset its exit is the FIRST of three again and the sheep restarts
+        // once more; without it, the third, and the sheep errors out.
+        // Bounded, unlike the sync loop above: the failing outcome here is a
+        // settled `Errored`, so an unbounded wait for the passing one would
+        // hang the test rather than fail it (rule 11). Every step in between
+        // is ready work — the restarts at this config are immediate — so the
+        // round trips below cannot be starved by the paused clock.
+        let mut settled = handle.list().await.remove(0);
+        for _ in 0..200 {
+            if settled.status == ProcStatus::Errored
+                || (settled.status == ProcStatus::Online && settled.restarts == 4)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+            settled = handle.list().await.remove(0);
+        }
+        assert_eq!(
+            (settled.status, settled.restarts),
+            (ProcStatus::Online, 4),
+            "an automatic restart left the two spent unstable exits on the \
+             books -- got {settled:?}"
+        );
+    }
+
+    // The same reset, on the other of the two paths that perform it. A
+    // `restart` aimed at a sheep with no live task has no exit to ride, so it
+    // never reaches `handle_exited` — `apply_immediate` resets and respawns
+    // inline instead, and the operator's reply is that respawn rather than a
+    // deferred snapshot.
+    //
+    // `Stopped` is the not-running state used here because it is the settled
+    // one: `WaitingRestart` still holds a RestartDue timer scheduled against
+    // it, and `Errored` is only reachable with the budget already at the cap,
+    // where this proves the reset clears a PARTIAL carry.
+    //
+    // fails if `apply_immediate`'s `ManualKind::Restart` arm loses its
+    // `budget.reset()` -- that leaves the two unstable exits spent before the
+    // stop on the books, so the crash after the restart is the third of three
+    // and errors the sheep out at three restarts instead of carrying it to a
+    // fourth.
+    #[tokio::test(start_paused = true)]
+    async fn restarting_a_stopped_sheep_resets_the_budget() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        // Five procs, sized against the mutation rather than against a correct
+        // run: two unstable crashes, the long-lived proc they land on and the
+        // stop below ends, the respawn the restart performs (unstable again,
+        // to spend the budget the reset just cleared), and the proc a
+        // still-solvent budget restarts onto. That fifth spawn is the one a
+        // correct implementation performs and a mutated one never reaches —
+        // with the reset dropped the sheep is already `Errored` by then. A
+        // pool of four would answer it `SpawnFailed("script exhausted")`,
+        // which `respawn` also lands in `Errored` at three restarts, so the
+        // assertion below would fail identically whether the reset worked or
+        // not.
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::const_exit(1),
+            ProcScript::const_exit(1),
+            ProcScript::never_exits(),
+            ProcScript::const_exit(1),
+            ProcScript::never_exits(),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("svc", "./svc");
+        // Three rather than the default sixteen, so the two crashes below
+        // leave the budget one short of exhausted and a single further crash
+        // decides the test.
+        app.max_restarts = 3;
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        // Sync on state, not on the repeated Online event: immediate restarts
+        // mean restarts==2 once the never_exits proc is up.
+        loop {
+            let info = handle.list().await.remove(0);
+            if info.restarts == 2 && info.status == ProcStatus::Online {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // `stop` is what takes the sheep off its live task without touching
+        // the budget: `decide_on_exit` short-circuits to CleanStop on
+        // `manual_stop`, before it would ever classify the exit. The deferred
+        // reply resolves only once that exit has landed, so the sheep is
+        // settled in `Stopped` — no task, no timer — by the time the restart
+        // below is sent, and the two spent unstable exits are still on the
+        // books.
+        let stopped = handle
+            .stop(ProcessSelector::Name("svc".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(stopped[0].status, ProcStatus::Stopped);
+
+        let restarted = handle
+            .restart(ProcessSelector::Name("svc".to_string()))
+            .await
+            .unwrap();
+        // `apply_immediate`'s reply is the respawn itself, sent in the same
+        // actor turn that performed it — so it reads Online at the bumped
+        // restart count regardless of what that proc does next.
+        assert_eq!(
+            (restarted[0].status, restarted[0].restarts),
+            (ProcStatus::Online, 3)
+        );
+
+        // The proc that restart landed on is itself unstable. With the budget
+        // reset its exit is the FIRST of three again and the sheep restarts
+        // once more; without it, the third, and the sheep errors out.
+        // Bounded, unlike the sync loop above: the failing outcome here is a
+        // settled `Errored`, so an unbounded wait for the passing one would
+        // hang the test rather than fail it (rule 11). Every step in between
+        // is ready work — the restarts at this config are immediate — so the
+        // round trips below cannot be starved by the paused clock.
+        let mut settled = handle.list().await.remove(0);
+        for _ in 0..200 {
+            if settled.status == ProcStatus::Errored
+                || (settled.status == ProcStatus::Online && settled.restarts == 4)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+            settled = handle.list().await.remove(0);
+        }
+        assert_eq!(
+            (settled.status, settled.restarts),
+            (ProcStatus::Online, 4),
+            "restarting a stopped sheep left the two spent unstable exits on \
+             the books -- got {settled:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1606,6 +2999,64 @@ mod tests {
         assert!(
             !ghost,
             "GHOST RESPAWN during shutdown: events after shutdown = {seen:?}"
+        );
+    }
+
+    // CRITICAL-1: a readiness wait that resolves after a shutdown has begun
+    // must not mark its sheep online. The sibling guards on this handler are
+    // both pinned already — the epoch guard by
+    // `a_gated_app_restarted_while_starting_ignores_the_old_wait`, the
+    // `Starting` guard by `a_gated_app_stopped_while_starting_ignores_the_old_wait`
+    // — and neither reaches this one: the shutdown leaves the slot at the same
+    // epoch and in the same `Starting` status the wait was armed under, so
+    // this guard is the only thing standing between a mid-shutdown `TimedOut`
+    // and an `Online` for a sheep the daemon is in the middle of killing. That
+    // `Online` also arms every lifecycle extra the app configures, at the one
+    // moment nothing is left to disarm them.
+    //
+    // The timings: `listen_timeout` is 1000ms and the app ignores signals, so
+    // its own kill ladder runs the full 1600ms `kill_timeout` default — the
+    // readiness deadline elapses 600ms inside it, while the sheep is still
+    // `Starting` with a live pid. `shutdown()` is the call that carries the
+    // paused clock across both, and the actor is gone by the time it returns,
+    // so the drained stream below can no longer grow.
+    //
+    // ONE script, and one is right under both implementations: the mutated
+    // handler emits and sets status, it never spawns, so there is no ghost
+    // spawn to leave a script for. What an exhausted script COULD hide is the
+    // setup — a failed spawn leaves the sheep `Errored` with no readiness wait
+    // armed and so no `Online` to forbid — which is what the `Starting`
+    // assertion rules out before the shutdown, and the `Stop` assertion (the
+    // ladder really ran, past the deadline) after it.
+    //
+    // fails if `handle_ready_result` stops guarding on `shutting_down`.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_ignores_a_pending_readiness_wait() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(1024);
+        let runner = ScriptedRunner::new(vec![ProcScript::ignores_signals()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("gated", "./g");
+        app.wait_ready = true; // nobody ever signals ready
+        app.listen_timeout = UpDuration::from_millis(1_000);
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        assert_eq!(
+            handle.list().await[0].status,
+            ProcStatus::Starting,
+            "the readiness wait has to be armed for its result to be droppable"
+        );
+
+        handle.shutdown().await; // the ladder burns 1600ms of virtual time
+
+        let seen = drain_kinds(&mut rx).await;
+        assert!(
+            seen.contains(&(0, ProcessEventKind::Stop)),
+            "the kill ladder must have outlasted the readiness deadline: events = {seen:?}"
+        );
+        assert!(
+            !seen.contains(&(0, ProcessEventKind::Online)),
+            "a readiness wait resolved during shutdown marked a dying sheep online: \
+             events = {seen:?}"
         );
     }
 
@@ -1692,11 +3143,20 @@ mod tests {
     }
 
     // IMPORTANT-4 (probe I): Stop and Restart racing on the same running
-    // sheep. Chosen semantics (see `begin_manual`'s doc comment): the first
+    // sheep. Chosen semantics (see `claim_manual`'s doc comment): the first
     // command to reach a running sheep owns its `manual` marker and its one
     // live Kill; both callers get back the SAME honest terminal snapshot
     // once it lands, instead of the old last-writer-wins bug handing the
     // `stop()` caller an `Online` `ProcessInfo`.
+    //
+    // This is also the fence around the carve-out that
+    // `an_operators_stop_beats_an_automatic_restart_mid_ladder` covers: BOTH
+    // commands here have a caller awaiting an answer, so neither may displace
+    // the other.
+    //
+    // fails if `claim_manual`'s carve-out widens to operator-versus-operator:
+    // the later `restart` would take the marker off the earlier `stop`, respawn
+    // the sheep, and hand the `stop()` caller an `Online` snapshot again.
     #[tokio::test(start_paused = true)]
     async fn overlapping_stop_and_restart_agree_on_one_outcome() {
         let (events, _rx) = tokio::sync::broadcast::channel(1024);
@@ -1820,7 +3280,7 @@ mod tests {
     // Adversarial finding #2 (whole-branch review, Task 9): a `Delete` that
     // lands on an id AFTER `begin_shutdown` already claimed it (set
     // `manual = Some(Stop)`, first-command-wins per IMPORTANT-4) used to hit
-    // `begin_manual`'s `already_in_flight` branch and only join `remaining`
+    // `claim_manual`'s already-claimed path and only join `remaining`
     // -- it never got a chance to mark its OWN intent anywhere. When the
     // sheep went terminal, `handle_exited` only deregistered on
     // `manual == Some(ManualKind::Delete)` (false here: it's `Stop`), so the
@@ -1891,8 +3351,10 @@ mod tests {
     // whenever `manual == Some(Restart)`, ignoring `pending_delete`
     // entirely. Reachable exactly like the Shutdown race: `Restart(id)`
     // claims `slot.manual = Some(Restart)` on a running sheep; a racing
-    // `Delete(id)` hits `already_in_flight`, correctly sets
-    // `pending_delete = true`, but never touches `manual`. Worse than the
+    // `Delete(id)` finds the marker already claimed by another operator
+    // command, correctly sets `pending_delete = true`, but never touches
+    // `manual` -- the carve-out for an AUTOMATIC restart does not apply, and
+    // that is the whole point of keeping this path working. Worse than the
     // original bug: instead of leaving a stale `Stopped` entry behind, this
     // one respawned a BRAND-NEW LIVE PROCESS while still telling the
     // `Delete` caller it succeeded.
@@ -1942,6 +3404,101 @@ mod tests {
         );
     }
 
+    // An automatic restart — a memory breach or a liveness failure, arriving
+    // through `extra_restart` — is mid-kill-ladder when an operator's `stop`
+    // lands on the same sheep. The operator's intent wins: the sheep ends
+    // `Stopped`, never respawned, and `stop()` reports that honestly.
+    //
+    // The counterpart of `overlapping_stop_and_restart_agree_on_one_outcome`:
+    // the same race, on the other side of the carve-out. `extra_restart` is
+    // the only command with no reply, which is what lets it still be in flight
+    // when the next command arrives without a second task holding it there.
+    //
+    // fails if `claim_manual` stops letting an operator's command take the
+    // `manual` marker off an automatic restart: the restart keeps the marker,
+    // `handle_exited` respawns, and `stop()` hands its caller an `Online`
+    // snapshot of a sheep that is genuinely back up with `restarts: 1`.
+    #[tokio::test(start_paused = true)]
+    async fn an_operators_stop_beats_an_automatic_restart_mid_ladder() {
+        let (events, _rx) = tokio::sync::broadcast::channel(1024);
+        // Two scripts is the most this test can demand: the sheep itself, plus
+        // the one respawn a broken implementation performs. Sized for that
+        // second spawn on purpose -- a pool of one would answer it
+        // `SpawnFailed("script exhausted")`, landing the bug in `Errored`
+        // instead of the `Online` that shows how bad it is.
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::ignores_signals(), // 1600ms ladder: a wide race window
+            ProcScript::never_exits(),     // the respawn a broken implementation performs
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let app = AppConfig::minimal("svc", "./svc");
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        let running = handle.list().await.remove(0);
+        let pid = running.pid.expect("an online sheep has a pid");
+
+        // Both sends land in the same mailbox in this order, so the actor sets
+        // the restart's marker and starts its ladder before it ever sees the
+        // stop -- no second task and no yielding needed.
+        handle.extra_restart(running.id, pid).await;
+        let stopped = handle.stop(ProcessSelector::All).await.unwrap();
+
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].id, running.id);
+        assert_eq!(
+            (stopped[0].status, stopped[0].restarts),
+            (ProcStatus::Stopped, 0),
+            "an operator's stop was silently converted into the automatic \
+             restart it raced -- got {stopped:?}"
+        );
+        let listed = handle.list().await;
+        assert_eq!(
+            (listed[0].status, listed[0].pid),
+            (ProcStatus::Stopped, None),
+            "the sheep an operator stopped is running again -- got {listed:?}"
+        );
+    }
+
+    // The `Delete` sibling of the test above: an operator's `delete` racing the
+    // same in-flight automatic restart deregisters the sheep instead of respawning
+    // it. Deliberately belt-and-braces — both `claim_manual`'s carve-out and
+    // `pending_delete` independently produce this outcome, which is why it
+    // takes disabling both to redden this test.
+    //
+    // fails if `handle_exited`'s terminal branch stops honouring delete intent
+    // (the `Decision::CleanStop if manual == Some(ManualKind::Delete) ||
+    // pending_delete` guard): the sheep stays registered as `Stopped` while
+    // the `delete()` caller is told it was deleted.
+    #[tokio::test(start_paused = true)]
+    async fn an_operators_delete_beats_an_automatic_restart_mid_ladder() {
+        let (events, _rx) = tokio::sync::broadcast::channel(1024);
+        // Two, for the same reason as above: the sheep, plus the respawn a
+        // broken implementation performs behind the delete's back.
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::ignores_signals(),
+            ProcScript::never_exits(),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let app = AppConfig::minimal("svc", "./svc");
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        let running = handle.list().await.remove(0);
+        let pid = running.pid.expect("an online sheep has a pid");
+
+        handle.extra_restart(running.id, pid).await;
+        let deleted = handle
+            .delete(ProcessSelector::Id(running.id))
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, vec![running.id]);
+        assert!(
+            handle.list().await.is_empty(),
+            "a delete that raced an automatic restart must still deregister \
+             the sheep, not leave one behind for the restart to bring back"
+        );
+    }
+
     // ---------------------------------------------------------------
     // IR-37: supervisor proptest (Task 9, Step 2). A command script (what
     // the operator does) and a process script (how each spawned child
@@ -1971,6 +3528,21 @@ mod tests {
     // holding as evidence that manual-vs-manual races are covered here --
     // they aren't, by construction; that coverage lives entirely in the
     // file's dedicated race tests.
+    //
+    // The lifecycle extras reach this state machine through exactly two
+    // doors, and the driver uses both:
+    //
+    // - `extra_restart` is the door a memory breach and a liveness failure
+    //   share (`Command::ExtraRestart` has no per-kind field, so one step
+    //   models both). `Step::Report` raises one against the pid a sheep is
+    //   running now; `Step::StaleReport` raises one against a pid it no
+    //   longer has, which is the shape a report queued just before a
+    //   crash-and-respawn takes.
+    // - Readiness is not a step at all: it is a property of the app a
+    //   `Step::StartOne` registers (`Gate` below), and it resolves on its own
+    //   deadline somewhere inside whatever the driver does next. That is
+    //   what puts a still-pending `ReadyResult` underneath an arbitrary
+    //   later command instead of at a hand-picked instant.
     // ---------------------------------------------------------------
 
     #[derive(Debug, Clone, Copy)]
@@ -1980,6 +3552,11 @@ mod tests {
         RestartAll,
         DeleteFirst,
         StartOne,
+        /// A memory breach or a liveness failure raised against the pid the
+        /// first listed sheep is running right now.
+        Report,
+        /// The same report, raised against a pid that sheep does not have.
+        StaleReport,
     }
 
     fn step_strategy() -> impl proptest::strategy::Strategy<Value = Step> {
@@ -1989,6 +3566,35 @@ mod tests {
             proptest::strategy::Just(Step::RestartAll),
             proptest::strategy::Just(Step::DeleteFirst),
             proptest::strategy::Just(Step::StartOne),
+            proptest::strategy::Just(Step::Report),
+            proptest::strategy::Just(Step::StaleReport),
+        ]
+    }
+
+    /// How a generated app gates its own `starting -> online` transition.
+    #[derive(Debug, Clone, Copy)]
+    enum Gate {
+        /// Neither `wait_ready` nor `readiness_probe`: `spawn_fresh` marks
+        /// the sheep `Online` inline, the pre-readiness behaviour.
+        Ungated,
+        /// `wait_ready = true` with this `listen_timeout` in milliseconds.
+        /// No scripted child ever writes `{"kind":"ready"}`, so every one of
+        /// these waits ends at its deadline -- and the deadline is what
+        /// decides whether a later step lands while the wait is still
+        /// pending, which is the interleaving the epoch and status guards in
+        /// `handle_ready_result` exist for.
+        Channel(u64),
+    }
+
+    fn gate_strategy() -> impl proptest::strategy::Strategy<Value = Gate> {
+        use proptest::strategy::Strategy as _; // `prop_map` below
+        proptest::prop_oneof![
+            2 => proptest::strategy::Just(Gate::Ungated),
+            // Spread across the durations the driver's own commands take: a
+            // kill ladder is 1600ms (`AppConfig::minimal`'s `kill_timeout`)
+            // and a `stable_then_exit` script runs 2000ms, so a deadline
+            // drawn from this range lands before, during and after them.
+            1 => (1u64..4_000u64).prop_map(Gate::Channel),
         ]
     }
 
@@ -2003,6 +3609,42 @@ mod tests {
         ]
     }
 
+    /// How many scripted procs one generated case may spawn.
+    ///
+    /// Sized against the MAXIMUM the generator can demand, not against a
+    /// correct run: an exhausted `ScriptedRunner` answers
+    /// `SpawnFailed("script exhausted")`, the actor turns that into `Errored`
+    /// rather than `Restart`, and every claim below about a restart that must
+    /// NOT happen would then pass for the wrong reason. The ceiling a
+    /// 9-command run can reach is: at most 30 command-driven spawns (`k`
+    /// starts and `10 - k` `RestartAll` steps over `k` sheep peaks at 30 at
+    /// `k = 5`), plus one per `Report`/`StaleReport` step, plus crash-loop
+    /// respawns, which `max_restarts` caps at 16 per sheep -- 9 x 16 = 144.
+    /// That is under 200 all told; 512 leaves room for a broken
+    /// implementation to restart on every stale report and still be seen
+    /// doing it.
+    ///
+    /// It is finite on purpose, and that is what makes the steady-state claim
+    /// terminate: a `stable_then_exit` script resets the restart budget, so
+    /// the pool running dry is the only thing that ends a chain of them.
+    const SCRIPT_POOL: usize = 512;
+
+    /// How long the steady-state drain waits for one more transition before
+    /// concluding there are none left.
+    ///
+    /// Longer than every deadline a run can leave pending -- a 4000ms
+    /// readiness wait, a 1600ms kill ladder, a 2000ms `stable_then_exit`
+    /// script -- and far shorter than `fake::NEVER_MS` (30 days), so a
+    /// `never_exits` proc stays alive across it instead of being walked to
+    /// its own deadline.
+    const QUIET_WINDOW: Duration = Duration::from_secs(60);
+
+    /// Ceiling on transitions observed after the last command. Each spawn
+    /// produces at most a start/restart, an online and a terminal event, so
+    /// `3 * SCRIPT_POOL` bounds a correct run; anything past this ceiling is
+    /// a flock that never settles.
+    const EVENT_BUDGET: usize = 3 * SCRIPT_POOL;
+
     proptest::proptest! {
         // 128, not the 24 originally sketched for this task: an injected-bug
         // trial (a Delete on an already-terminal sheep that forgets to
@@ -2011,24 +3653,24 @@ mod tests {
         // equally-weighted `Step` variants touch, so a run needs a handful
         // of lucky draws to land it. Empirically that meant occasional
         // clean-yet-buggy runs at cases=24 (1 miss in 6 fresh-seed trials);
-        // 128 caught the same injected bug in 8/8 fresh-seed trials, still
-        // in ~0.1-0.3s under the paused clock -- cheap insurance against a
-        // property test that only sometimes gates the regression it exists
-        // to catch.
-        #![proptest_config(proptest::test_runner::Config {
-            cases: 128,
-            ..proptest::test_runner::Config::default()
-        })]
+        // 128 caught the same injected bug in 8/8 fresh-seed trials, and the
+        // whole run costs ~0.6s under the paused clock (0.2s of that predates
+        // the steady-state drain below) -- cheap insurance against a property
+        // test that only sometimes gates the regression it exists to catch.
+        // `PROPTEST_CASES` still overrides it (IR-37) -- see
+        // `testing::proptest_config`.
+        #![proptest_config(crate::testing::proptest_config(128))]
 
         #[test]
         fn supervisor_upholds_its_invariants_under_any_interleaving(
             steps in proptest::collection::vec(step_strategy(), 1..10),
-            scripts in proptest::collection::vec(script_strategy(), 128..129),
+            gates in proptest::collection::vec(gate_strategy(), 1..10),
+            scripts in proptest::collection::vec(script_strategy(), SCRIPT_POOL..SCRIPT_POOL + 1),
         ) {
             // A current-thread runtime with a paused clock inside the
-            // proptest body: every backoff/kill-ladder delay is virtual, so
-            // even a 128-case run stays well under a second regardless of
-            // which scripts land.
+            // proptest body: every backoff/kill-ladder/readiness delay is
+            // virtual, so even a 128-case run stays cheap regardless of
+            // which scripts and deadlines land.
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .start_paused(true)
@@ -2036,7 +3678,10 @@ mod tests {
                 .unwrap();
             let dir = tempfile::tempdir().unwrap();
             runtime.block_on(async move {
-                let (events, mut rx) = tokio::sync::broadcast::channel(4096);
+                // Capacity above `EVENT_BUDGET`: the drain below treats a
+                // `Lagged` as a failure rather than skipping past it, since a
+                // hole in the stream is a hole in every claim read off it.
+                let (events, mut rx) = tokio::sync::broadcast::channel(8192);
                 let handle = spawn_supervisor(
                     ScriptedRunner::new(scripts),
                     test_paths(&dir),
@@ -2044,18 +3689,34 @@ mod tests {
                 );
                 let mut started = 0u32;
                 let mut highest_restarts = std::collections::HashMap::<u32, u32>::new();
+                // `extra_restart` is the one command with no reply, which
+                // makes it the only one this driver cannot await -- and
+                // therefore the only way a restart can still be
+                // mid-kill-ladder when the NEXT step is issued. `Step::StopAll`
+                // below keeps its strong claim across that interleaving
+                // because an operator's command takes the `manual` marker off
+                // an automatic restart (see `claim_manual`): without that
+                // carve-out, a `stop` landing behind a report resolved to the
+                // RESTART's outcome and handed its caller an `Online` snapshot
+                // of a sheep that was genuinely back up.
 
                 for step in steps {
                     match step {
                         Step::StartOne => {
+                            let gate = gates[started as usize % gates.len()];
                             started += 1;
-                            let app = AppConfig::minimal(&format!("sheep-{started}"), "./s");
+                            let mut app = AppConfig::minimal(&format!("sheep-{started}"), "./s");
+                            if let Gate::Channel(ms) = gate {
+                                app.wait_ready = true;
+                                app.listen_timeout = UpDuration::from_millis(ms);
+                            }
                             let _ = handle.start(vec![normalize(app).unwrap()]).await;
                         }
                         Step::StopAll => {
                             if let Ok(stopped) = handle.stop(ProcessSelector::All).await {
-                                // A deferred reply means every match is terminal.
                                 for info in stopped {
+                                    // A deferred reply means every match is
+                                    // terminal.
                                     proptest::prop_assert_eq!(info.status, ProcStatus::Stopped);
                                 }
                             }
@@ -2072,6 +3733,23 @@ mod tests {
                                 proptest::prop_assert!(
                                     handle.list().await.iter().all(|i| i.id != id)
                                 );
+                            }
+                        }
+                        Step::Report => {
+                            if let Some(first) = handle.list().await.first()
+                                && let Some(pid) = first.pid
+                            {
+                                handle.extra_restart(first.id, pid).await;
+                            }
+                        }
+                        Step::StaleReport => {
+                            if let Some(first) = handle.list().await.first() {
+                                // Never this sheep's own pid, whatever it is
+                                // running. A pid that belongs to some OTHER
+                                // sheep would be just as stale here: the guard
+                                // compares against THIS id's entry.
+                                let stale = first.pid.unwrap_or(0).wrapping_add(1);
+                                handle.extra_restart(first.id, stale).await;
                             }
                         }
                         Step::List => {}
@@ -2098,31 +3776,105 @@ mod tests {
                     }
                 }
 
-                // (4) never two live processes for one id: the event stream
-                // must never show Start -> Start for an id without a
-                // terminal event between them. (Ids are never reused by
-                // `spawn_fresh` today, so this is also a regression guard
-                // against that invariant quietly changing later.)
-                let mut live = std::collections::HashSet::<u32>::new();
-                while let Ok(event) = rx.try_recv() {
-                    if let BusEvent::Process { event, info, .. } = event {
-                        match event {
-                            ProcessEventKind::Start => {
-                                proptest::prop_assert!(
-                                    live.insert(info.id),
-                                    "two live spawns for id {}",
-                                    info.id
-                                );
-                            }
-                            ProcessEventKind::Exit
-                            | ProcessEventKind::Stop
-                            | ProcessEventKind::Errored
-                            | ProcessEventKind::Delete => {
-                                live.remove(&info.id);
-                            }
-                            _ => {}
+                // (4) steady state: with no further commands, the flock stops
+                // transitioning. Drained through a bounded window rather than
+                // a bare `try_recv` (Global Constraints rule 11) precisely
+                // because a run ends with deadlines still pending -- a
+                // readiness wait, a kill ladder, a scripted proc's own exit.
+                // A `try_recv` reads empty while all of them are still due and
+                // so cannot fail; the window is what walks the paused clock
+                // over them and gives the flock a chance to prove it settles.
+                let mut observed = Vec::new();
+                loop {
+                    match tokio::time::timeout(QUIET_WINDOW, rx.recv()).await {
+                        Ok(Ok(event)) => {
+                            observed.push(event);
+                            proptest::prop_assert!(
+                                observed.len() <= EVENT_BUDGET,
+                                "the flock never reached steady state: {} transitions after \
+                                 the last command",
+                                observed.len()
+                            );
                         }
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                            return Err(proptest::test_runner::TestCaseError::fail(format!(
+                                "event stream lagged by {skipped}: the invariants below cannot \
+                                 be read off a stream with holes in it"
+                            )));
+                        }
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                        Err(_elapsed) => break, // nothing left to transition
                     }
+                }
+
+                // (5) never two live processes for one id, and never an
+                // `Online` for an id with no live process. The first half is
+                // the original claim: the stream must not show Start -> Start
+                // without a terminal event between them. (Ids are never
+                // reused by `spawn_fresh` today, so it is also a regression
+                // guard against that invariant quietly changing.) The second
+                // half is what readiness added: `handle_ready_result` resolves
+                // long after the spawn it belongs to, so a wait that lost its
+                // status guard would mark a sheep that has already exited,
+                // stopped or errored `Online` -- a live pid on the bus for a
+                // process that is not there.
+                let mut live = std::collections::HashSet::<u32>::new();
+                let mut event_restarts = std::collections::HashMap::<u32, u32>::new();
+                for event in observed {
+                    let BusEvent::Process { event, info, .. } = event else {
+                        // LogOut/LogErr carry no lifecycle transition.
+                        continue;
+                    };
+                    match event {
+                        ProcessEventKind::Start => {
+                            proptest::prop_assert!(
+                                live.insert(info.id),
+                                "two live spawns for id {}",
+                                info.id
+                            );
+                        }
+                        // A respawn replaces one live process with the next:
+                        // the predecessor's `Msg::Exited` is what reached the
+                        // actor to cause it, so this is one out and one in and
+                        // the id is live either way afterwards.
+                        ProcessEventKind::Restart => {
+                            live.insert(info.id);
+                        }
+                        ProcessEventKind::Online => {
+                            proptest::prop_assert!(
+                                live.contains(&info.id),
+                                "id {} was marked online with no live process: a readiness \
+                                 wait resolved onto a sheep that had already gone terminal",
+                                info.id
+                            );
+                        }
+                        ProcessEventKind::Exit
+                        | ProcessEventKind::Stop
+                        | ProcessEventKind::Errored
+                        | ProcessEventKind::Delete => {
+                            live.remove(&info.id);
+                        }
+                        // `ProcessEventKind` is `#[non_exhaustive]` and lives
+                        // in another crate, so E0004 will never fire here. A
+                        // variant added later carries no liveness meaning
+                        // until this match is taught one, and leaving `live`
+                        // untouched is the conservative reading: it can only
+                        // make the assertions above stricter, never weaker.
+                        _ => {}
+                    }
+                    // (2) again, off the event stream rather than off
+                    // `list()`: a snapshot only sees the counter between two
+                    // commands, and the three new trigger paths all bump it
+                    // in between.
+                    let seen = event_restarts.entry(info.id).or_default();
+                    proptest::prop_assert!(
+                        info.restarts >= *seen,
+                        "restart count for id {} went backwards: {} after {}",
+                        info.id,
+                        info.restarts,
+                        *seen
+                    );
+                    *seen = info.restarts;
                 }
                 // The async block's error type is proptest's, so `?` above and
                 // this tail agree; block_on hands the Result back to the

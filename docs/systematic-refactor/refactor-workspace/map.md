@@ -40,8 +40,31 @@ src/
       Action: port + redesign
       Notes: pure AppConfig → Result<ResolvedApp> functions (mutation+Error-or-value → typed).
              Alias/default/env-merge rules byte-compatible: cmd→script, fork_mode, bash -c
-             on spaced scripts, log path defaults, filter_env. Cron validation via croner crate
-             (same pattern dialect as JS croner — compat safe).
+             on spaced scripts, log path defaults, filter_env. Cron validation delegates to
+             config/cron.rs, whose `cron_parser()` builds croner with `Seconds::Disallowed`:
+             FIVE-FIELD standard cron only, and croner's own `L`/`W`/`#`/`?` extensions are
+             rejected before the pattern reaches it. The seven vixie `@nicknames` are expanded
+             to five-field patterns first; `@reboot` is rejected. Same dialect stated from the
+             worker's side: the daemon's cron.rs entry below.
+      Rejects (spec §5 — a typo fails at parse time, not three seconds into a worker's life).
+             The list grows as subsystems land; as of Phase 4, `normalize` refuses:
+             - InvalidCron / InvalidTimezone — a pattern outside the dialect above; a
+               `cron_timezone` that is not an IANA name, checked even with no `cron_restart`
+             - InvalidProbe — a `readiness_probe`/`liveness_probe` target ProbeTarget::parse
+               rejects, `https://` included (no TLS in the prober — decision D1)
+             - ZeroFailureThreshold — a probe's `failure_threshold` explicitly `0`
+             - IntervalBelowMinimum — a `liveness_probe.interval` under one second, which
+               would hot-spin an unbounded loop. A `readiness_probe.interval` is exempt:
+               that poll is bounded by `listen_timeout`
+             - ZeroMaxMemory / ZeroWatchDelay — `max_memory` of `0` (a ceiling every
+               process exceeds) or `watch_delay` of `0` (the debouncer's tick is
+               `delay / 4`, so zero pegs a core per watched app)
+             - WatchWithoutCwd — `watch = true` with no `cwd` to arm a watcher over
+             - InvalidWatchGlob — a `watch_options` or `ignore_watch` pattern globset will
+               not compile; both lists are checked whether or not `watch` is on
+             Each carries the field it came from; the parsed values are discarded, since the
+             daemon re-parses when it arms the subsystem. `normalize`'s own `# Errors` section
+             is the authoritative list — keep the two in step.
     daemon_config.rs ← new module, no old equivalent            [MUST-HAVE #8]
       Action: write fresh
       Notes: daemon-level config file (TOML): metrics on/off+port, webhook targets, alert
@@ -120,11 +143,45 @@ src/
              → DrainOld(shutdown msg | SIGTERM, GRACEFUL_TIMEOUT 8000) → ReapOld. Zero-downtime
              for ALL runtimes: SO_REUSEPORT (socket2) default, LISTEN_FDS fd-passing protocol
              as the principled option — pm2 only had it for Node cluster.
-  watcher.rs         ← was lib/Watcher.js
+  watch/             ← was lib/Watcher.js
       Action: port + redesign
+      Drift (Phase 4, recorded): built as a DIRECTORY, not the `watcher.rs` named above — the
+             OS seam and the filtering logic have different test tiers (source.rs needs a real
+             filesystem, mod.rs is pure), and one file would have crossed Rin's 500-line split.
       Notes: notify + notify-debouncer-full; ONE watcher per name-group (fixes O(N²) fan-out);
              ignore defaults (dotfiles, node_modules) via globset; watch_delay = debounce dur;
              re-check after restart completes (fixes dropped-event gap). disableAll bug not ported.
+             A trigger restarts the WHOLE name-group, stopped instances included; what keeps a
+             stopped sheep down is disarming its group's watcher, never a filter on the restart.
+    source.rs        the OS seam: notify's debounced batches → tokio mpsc, `WatchSource` drop
+                     guard. `watch_tree` is the seam fn (no trait — one implementation, and the
+                     fake tier drives the channel directly).
+    mod.rs           `WatchFilter` (pure globset include/ignore) + `spawn_watch_group`'s restart
+                     loop. A path equal to the watch root triggers before either glob set is
+                     consulted — that is the inotify-overflow rescan signal.
+  probes/            ← new module (spec §7 — pm2 had no probes at all)
+      Action: write fresh
+      Drift (Phase 4, recorded): map.md never named this module; spec §7 requires it, and where
+             the two disagree the spec wins.
+      Notes: `Prober` seam (SEAM TRAIT 3/3) + the liveness loop; failure_threshold consecutive
+             misses report once, then the loop ends (the replacement pid gets a new loop).
+             Hand-rolled HTTP with no TLS and no redirect following — `https://` targets are a
+             config error (decision D1), rejected in shep-core so a typo fails at parse time.
+    os.rs            the real HTTP/TCP/exec prober, and these modules' OS tier. Three things in
+                     `probe_exec` and beside it are `cfg(unix)`/`cfg(windows)`, not one: shell
+                     selection (`sh -c` vs `cmd /C`), `process_group(0)` on the probe child, and
+                     the `kill_probe_group` unix/windows pair that SIGKILLs an abandoned probe's
+                     whole group (a no-op on windows, which has no group to signal). Everywhere
+                     else in the Phase 4 modules a `cfg` gates a TEST, not behavior — one in
+                     extras.rs, one in watch/source.rs, plus os.rs's own unix-only cases.
+    ready.rs         `ReadinessSource`/`await_ready` — the starting→online gate. `wait_ready`
+                     (channel) beats `readiness_probe`; with neither, a plain start is online at
+                     spawn (the Heuristic source is reload's, not start's). A readiness TIMEOUT
+                     takes the sheep online SILENTLY — never `errored`, which would be the
+                     restart loop max_restarts exists to contain, out of an app that is merely
+                     slow. `Actor::handle_ready_result` does emit a `tracing::warn!` on that path,
+                     but no `tracing-subscriber` is wired anywhere in the workspace yet, so
+                     nothing renders it and the operator sees only the `online` transition.
   actions.rs         ← was lib/God/ActionMethods.js
       Action: port + redesign
       Notes: each RPC verb = async handler on Request enum arm (string dispatch dies).
@@ -148,9 +205,44 @@ src/
              server-side filtering (pm2: broadcast-everything). Bounded queue + drop-oldest +
              drop-count event (pm2: unbounded, silent).
   worker.rs          ← was lib/Worker.js
-      Action: port
-      Notes: tokio interval tasks: max_memory_restart poll, backoff reset, cron_restart registry
-             (croner crate), host metrics cadence. domain → catch_unwind per tick.
+      Action: NOT BUILT
+      Drift (Phase 4, recorded): pm2's Worker.js is one timer loop doing four unrelated jobs, and
+             porting it as one module would have rebuilt that coupling. Its loops were split to
+             live beside the subsystems they serve: cron_restart → cron.rs, max_memory_restart
+             poll → limits/. Backoff reset already lives in the restart brain; host metrics
+             cadence belongs to the metrics dog, not the daemon. Nothing is missing — the file
+             is.
+  cron.rs            ← was lib/Worker.js (cron_restart half)
+      Action: write fresh
+      Notes: `Clock` seam (SEAM TRAIT 1/3) — cron means WALL time, every other deadline here is
+             a tokio Instant a paused test can move, so the two cannot be one clock. Five-field
+             standard cron via croner, seconds disallowed, croner's L/W/#/? extensions rejected;
+             the seven vixie @nicknames expanded to five-field patterns by shep before croner
+             ever sees them. Re-derives the next occurrence at least every `max_cron_sleep`
+             ([daemon] key, 60s default, floor 1s) so a laptop suspend or NTP step costs at most
+             that much drift. A missed occurrence is NOT replayed. Restarts the whole name-group,
+             stopped instances included — same reach as watch/.
+  limits/            ← was lib/Worker.js (max_memory_restart half)
+      Action: write fresh
+      Drift (Phase 4, recorded): a DIRECTORY, for the same seam/logic split as watch/.
+      Notes: `MemorySampler` seam (SEAM TRAIT 2/3) over sysinfo + the pure `tree_rss` sum;
+             `LimitEnforcer`/`PollingEnforcer` watch for a breach at MEMORY_POLL_INTERVAL (15s,
+             benchmark-backed by benches/). DEVIATION from pm2: the ceiling is enforced against
+             the process TREE (sheep + lambs via the ppid walk), not the root pid, because a
+             root-pid limit is trivially dodged by any app that forks workers. Wants a line in
+             docs/migration.md.
+  extras.rs          ← new module (no pm2 counterpart)
+      Action: write fresh
+      Notes: the registry that arms all four subsystems above when a sheep goes live and disarms
+             them across eight terminal transitions (seven disarming) plus its own Drop, which
+             aborts every armed task — covering both a graceful shutdown that never kills a
+             WaitingRestart sheep and a panicking actor. Cron and watch restarts route through
+             `SupervisorHandle::restart_automatic`; breach and liveness route through
+             `SupervisorHandle::extra_restart`, a separate `Command` variant whose handler drops
+             a stale report first — slot still present, pid still this sheep's, status still
+             Online — three guards `restart_automatic` does not carry (`handle_extra_restart`).
+             Both doors declare CommandOrigin::Automatic, so an operator's stop or delete
+             displaces either one mid-ladder.
   dog_support.rs    ← new module (decision #3: dog architecture)
       Action: write fresh
       Notes: daemon-side dog plumbing ONLY: enabled-dogs list in daemon_config → autostart
@@ -301,7 +393,7 @@ CI: fmt+clippy+nextest × {ubuntu,macos,windows} × {stable,MSRV}; llvm-cov; doc
 | ansis | owo-colors + anstream | NO_COLOR aware |
 | async.js | async/await + futures combinators | disappears |
 | eventemitter2 | tokio::sync::broadcast + typed enum | |
-| croner (JS) | croner (Rust, same lineage) | pattern-compat |
+| croner (JS) | croner (Rust, same lineage) | five-field subset only; croner's own `L`/`W`/`#`/`?` rejected |
 | dayjs | jiff/chrono + moment-token translator | log_date_format compat needs shim |
 | debug | tracing + EnvFilter (DEBUG=pm2:* mapped) | |
 | js-yaml | serde_yml | serde_yaml archived |

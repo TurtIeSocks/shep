@@ -8,6 +8,7 @@
 
 use shep_core::config::{DaemonConfig, DaemonConfigError};
 use shep_core::paths::ShepPaths;
+use shep_core::values::UpDuration;
 use shep_daemon::boot::{BootError, BootOptions, boot};
 use shep_daemon::tokio_runner::TokioRunner;
 
@@ -90,8 +91,9 @@ fn read_daemon_config_source(paths: &ShepPaths) -> Result<Option<String>, Daemon
 /// [`read_daemon_config_source`]) plus `SHEP_*` environment overrides, folds
 /// `args` in via [`boot_options`], then boots and serves. The re-exec'd
 /// child inherits a real environment on purpose (`launch::launch_command`
-/// deliberately does not `.env_clear()`), so `SHEP_LOG_JSON` and
-/// `SHEP_SOCKET` are read straight from `std::env::var`.
+/// deliberately does not `.env_clear()`), so `SHEP_LOG_JSON`,
+/// `SHEP_SOCKET`, and `SHEP_MAX_CRON_SLEEP` are read straight from
+/// `std::env::var`.
 ///
 /// # Errors
 /// - [`DaemonRunError::Config`] — `shep.toml` failed to parse, or a
@@ -121,12 +123,17 @@ pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), Daemo
 /// `ready_fd` stays `None` unconditionally: readiness is established by a
 /// completed handshake in this phase's design, never by an inherited
 /// descriptor (see this crate's `#![forbid(unsafe_code)]`).
+///
+/// `max_cron_sleep` stays an `Option` the whole way through: the daemon owns
+/// the default and applies it once, so nothing here invents a value on the
+/// way past.
 #[must_use]
 pub fn boot_options(config: &DaemonConfig, args: &DaemonArgs) -> BootOptions {
     BootOptions {
         socket: config.daemon.socket.clone(),
         ready_fd: None,
         restore: !args.no_restore,
+        max_cron_sleep: config.daemon.max_cron_sleep.map(UpDuration::as_duration),
     }
 }
 
@@ -176,6 +183,28 @@ mod tests {
             Some(std::path::Path::new("/tmp/custom.sock"))
         );
         assert!(opts.restore, "the default is to restore the muster roll");
+    }
+
+    /// The knob has to survive the trip from `shep.toml` into `BootOptions`.
+    /// Fails if the field is dropped on the floor between the two structs —
+    /// the entire failure mode of a knob nobody plumbed — and fails if a
+    /// default is invented here instead of being left to the daemon, which
+    /// owns the one place `DEFAULT_MAX_CRON_SLEEP` is applied.
+    #[test]
+    fn boot_options_carry_the_configured_max_cron_sleep_and_invent_none() {
+        let configured =
+            DaemonConfig::load(Some("[daemon]\nmax_cron_sleep = \"5m\"\n"), &|_| None).unwrap();
+        assert_eq!(
+            boot_options(&configured, &DaemonArgs { no_restore: false }).max_cron_sleep,
+            Some(core::time::Duration::from_secs(300))
+        );
+
+        let unset = DaemonConfig::load(None, &|_| None).unwrap();
+        assert_eq!(
+            boot_options(&unset, &DaemonArgs { no_restore: false }).max_cron_sleep,
+            None,
+            "an unset knob must stay None: the daemon owns the default"
+        );
     }
 
     /// The negated flag has to actually reach `BootOptions`. With the old

@@ -1,2 +1,6 @@
 /target
+# The bench crate (benches/Cargo.toml) declares its own [workspace] table,
+# excluding it from the root workspace, so it builds into its own target dir
+# that the bare `/target` entry above does not cover.
+/benches/target
 *.snap.new

@@ -39,6 +39,7 @@
 //! `# Safety` section and rationale essay for the full contract.)
 
 use core::fmt;
+use core::time::Duration;
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -48,21 +49,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::BusEvent;
 
 use crate::bus::new_bus;
+use crate::cron::DEFAULT_MAX_CRON_SLEEP;
+use crate::extras::{Extras, ExtrasReports, spawn_extras_reporter};
 use crate::rpc::RpcContext;
 use crate::runner::ProcessRunner;
 use crate::server::RpcServer;
 use crate::snapshot::{self, FlockRegistry, SnapshotError, SnapshotWriter, spawn_snapshot_writer};
-use crate::supervisor::{SupervisorHandle, spawn_supervisor};
+use crate::supervisor::{SupervisorBuilder, SupervisorHandle};
 
 /// Mode for every directory shep creates (spec §10: no other user, at all)
 pub const DIR_MODE: u32 = 0o700;
+
+/// Capacity of each of the two lifecycle-extra report channels.
+///
+/// Bounded rather than unbounded on purpose: a report producer that outruns
+/// the reporting task should back-pressure (the enforcer's own send is
+/// awaited) rather than grow a queue of restarts nobody has performed yet.
+/// Generous enough that a whole flock breaching on one sampling pass fits.
+const EXTRAS_REPORT_CAPACITY: usize = 64;
 
 /// Creates `dir` (and any missing parents) at [`DIR_MODE`] directly, via
 /// [`DirBuilderExt::mode`] rather than the std default (`0o777`, narrowed
@@ -269,7 +280,8 @@ impl PidfileLock {
 
     /// Overwrites the locked pidfile's content with `pid`, in place —
     /// truncate then write at offset 0, never a temp-file-plus-`rename`
-    /// (contrast [`write_pidfile`]): renaming a fresh inode over this path
+    /// (contrast `write_pidfile`, this module's test-only helper): renaming
+    /// a fresh inode over this path
     /// would swap in a file nothing has locked, silently ending this
     /// type's whole reason to exist for as long as the daemon keeps
     /// running afterward. A `flock` lock lives on the OPEN FILE
@@ -444,6 +456,12 @@ pub struct BootOptions {
     pub ready_fd: Option<std::fs::File>,
     /// Restore the muster roll if one exists (spec §9's `shep muster`).
     pub restore: bool,
+    /// Longest a cron worker parks before re-reading the wall clock, from
+    /// `[daemon] max_cron_sleep`. Unset means the default (`cron`'s
+    /// crate-private `DEFAULT_MAX_CRON_SLEEP`, applied by [`boot`] and
+    /// nowhere else) — the same `Option` shape [`Self::socket`] uses, so
+    /// nothing between `shep.toml` and here invents a value.
+    pub max_cron_sleep: Option<Duration>,
 }
 
 /// Brings the daemon up: signal handlers, layout, roll restore, bus,
@@ -483,7 +501,7 @@ pub struct BootOptions {
 pub async fn boot<R: ProcessRunner>(
     runner: R,
     paths: ShepPaths,
-    options: BootOptions,
+    mut options: BootOptions,
 ) -> Result<RunningDaemon, BootError> {
     // 1. Install signal handlers before the socket (or anything else
     //    observable) exists — see this fn's own doc.
@@ -507,8 +525,11 @@ pub async fn boot<R: ProcessRunner>(
     // 3. Report readiness now that the socket is bound. `options.ready_fd`
     //    is already an owned File adopted by the caller — see this fn's
     //    own doc and `BootOptions::ready_fd`'s doc — so this is nothing
-    //    more than a write.
-    if let Some(pipe) = options.ready_fd {
+    //    more than a write. TAKEN out of `options` rather than moved out of
+    //    it: a partial move leaves the struct unborrowable, and step 4 hands
+    //    it whole to `max_cron_sleep` — see that fn's own doc for why the
+    //    field is not picked out here.
+    if let Some(pipe) = options.ready_fd.take() {
         let ready = DaemonReady {
             pid,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -518,7 +539,34 @@ pub async fn boot<R: ProcessRunner>(
 
     // 4. Bus, supervisor, muster restore, snapshot writer, context.
     let events = new_bus();
-    let supervisor = spawn_supervisor(runner, paths.clone(), events.clone());
+    let (breach_tx, breach_rx) = mpsc::channel(EXTRAS_REPORT_CAPACITY);
+    let (live_tx, live_rx) = mpsc::channel(EXTRAS_REPORT_CAPACITY);
+    let extras = Extras::real(
+        ExtrasReports {
+            breaches: breach_tx,
+            liveness: live_tx,
+        },
+        max_cron_sleep(&options),
+    );
+    let supervisor = SupervisorBuilder::new(runner, paths.clone(), events.clone())
+        .extras(extras)
+        .spawn();
+    // Ordered, not stylistic: the reporter needs the handle the builder
+    // returns, and the actor must never own a receiver a subsystem feeds.
+    //
+    // Its `JoinHandle` is discarded, which DETACHES the task rather than
+    // stopping it — and that closes a cycle worth naming, because nothing
+    // here breaks it. The reporter holds a `SupervisorHandle`, so the actor's
+    // mailbox can never reach zero senders while the reporter lives; the
+    // reporter itself only ends once BOTH report senders have dropped, and the
+    // enforcer holding one of them lives as long as the actor's registry does.
+    // What actually ends both is `RunningDaemon::run`'s explicit
+    // `SupervisorHandle::shutdown` (teardown step 4), which stops the actor by
+    // command instead of by sender count and drops the registry with it. That
+    // call is load-bearing for this reason as well as for the kill ladder it
+    // is named after; a future teardown that relied on senders going away
+    // would hang here instead.
+    spawn_extras_reporter(breach_rx, live_rx, supervisor.clone());
     let registry = FlockRegistry::new();
 
     if options.restore {
@@ -567,6 +615,26 @@ pub async fn boot<R: ProcessRunner>(
         // `PidfileLock`'s own doc.
         pidfile_lock,
     })
+}
+
+/// The cron sleep bound this boot runs with: [`BootOptions::max_cron_sleep`],
+/// or [`DEFAULT_MAX_CRON_SLEEP`] when `shep.toml` named none.
+///
+/// A named function rather than an `unwrap_or` inline in [`boot`] only so the
+/// application has a seam a test can stand on. It is still the ONE place that
+/// constant is applied, and a second application anywhere else is how two
+/// supposedly identical constants drift apart: `shep-core` carries the floor
+/// and never the default, the daemon carries the default and never the floor.
+///
+/// It reads the whole [`BootOptions`] rather than the one field because the
+/// field is what [`boot`] would otherwise have to pick out, and picking the
+/// wrong one there is a mistake no test in this crate could catch: the only
+/// behavioural trace `max_cron_sleep` leaves is how often a cron worker wakes,
+/// and a wakeup is observable only through the [`Clock`](crate::cron::Clock)
+/// seam that [`Extras::real`] fixes to the system clock. Reading the struct
+/// here leaves nothing at the call site to get wrong.
+fn max_cron_sleep(options: &BootOptions) -> Duration {
+    options.max_cron_sleep.unwrap_or(DEFAULT_MAX_CRON_SLEEP)
 }
 
 /// Reads the muster roll (if one exists) and starts every app it restores.
@@ -760,9 +828,10 @@ fn unlink_if_present(path: &Path) -> Result<(), BootError> {
 #[derive(Debug)]
 struct SignalTasks {
     // SIGUSR2 reopen requests observed since boot. Write-only today by
-    // design, not by oversight: Phase 4's `flush`/`reopen` work is the
-    // reader this is waiting for. `#[allow(dead_code)]` says so explicitly
-    // rather than inventing an accessor nothing calls yet.
+    // design, not by oversight: the per-sheep log `flush`/`reopen` work
+    // (spec §5) is the reader this is waiting for, and it has not been
+    // built. `#[allow(dead_code)]` says so explicitly rather than
+    // inventing an accessor nothing calls yet.
     #[allow(dead_code)]
     reopens: Arc<AtomicU64>,
     tasks: Vec<JoinHandle<()>>,
@@ -881,7 +950,7 @@ fn install_signals(
                 tracing::warn!(%err, path = %logs.display(), "SIGUSR2: could not recreate log dir");
             }
             tracing::info!(
-                "SIGUSR2 received: log reopen requested (full per-sheep reopening lands in Phase 4)"
+                "SIGUSR2 received: log reopen requested (per-sheep reopening is not built yet)"
             );
         }
     }));
@@ -957,7 +1026,9 @@ mod tests {
     use crate::fake::{ProcScript, ScriptedRunner};
     use crate::snapshot::{FlockSnapshot, SNAPSHOT_VERSION, SavedApp};
     use crate::testing::test_paths; // the one crate-root fixture (IR-33)
-    use shep_core::config::AppConfig;
+    use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, normalize};
+    use shep_core::protocol::ProcessEventKind;
+    use shep_core::values::UpDuration;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
@@ -1081,14 +1152,82 @@ mod tests {
         drop(listener);
     }
 
+    /// Fabricates exactly what a crashed daemon leaves behind: a socket file
+    /// at `socket` that nothing is listening on. Neither std nor tokio
+    /// unlinks a `UnixListener`'s path on drop, so binding and dropping is
+    /// the right shape — but it is NOT, on its own, enough to guarantee the
+    /// second half of that sentence inside this test binary.
+    ///
+    /// macOS has no atomic `SOCK_CLOEXEC` (the descriptor is marked
+    /// close-on-exec a moment AFTER `socket(2)` returns), and a `fork` copies
+    /// the whole descriptor table, so any child another test spawns
+    /// concurrently — the exec probes, the runner tests — can end up holding
+    /// a duplicate of the listener below. For as long as that duplicate lives
+    /// (until the child's `exec` or exit; measured at up to ~25ms) the socket
+    /// object is NOT destroyed, `connect` to the path SUCCEEDS, and any
+    /// prober is looking at a live socket. That is not a daemon bug — it is a
+    /// lying fixture, and it is what made
+    /// [`two_concurrent_boots_on_a_stale_socket_exactly_one_wins`] fail as
+    /// `[AlreadyRunning, AlreadyRunning]`, both racers refused, roughly 1 run
+    /// in 28 of this crate's suite under a saturated machine: the flock's
+    /// loser refused correctly, and the flock's WINNER then found this
+    /// leftover answering and refused too, exactly as `bind_socket` should.
+    ///
+    /// So establish the precondition instead of assuming it: don't return
+    /// until the path actually refuses a connection. That verdict is stable
+    /// once it lands — a refused socket is a destroyed socket, and only a
+    /// fresh `bind` can make the path answer again, which nothing but the
+    /// code under test does.
+    ///
+    /// Real sleeps, in a module whose default is a paused clock (IR-33): a
+    /// descriptor's lifetime in ANOTHER process is not on any clock tokio can
+    /// advance, and every caller of this helper is already a real-time test
+    /// for the same reason (real socket IO).
+    ///
+    /// # Panics
+    /// If the leftover never goes stale, or the probe fails for any reason
+    /// other than nobody listening.
+    #[track_caller]
+    fn stale_socket_leftover(socket: &Path) {
+        // Two nested loops for two different holders. The inner one waits out
+        // the common case, a child that copied the descriptor mid-spawn and
+        // drops it on `exec`. The outer one re-fabricates for the rarer one,
+        // a child that forked inside the socket(2)-to-close-on-exec window
+        // and therefore keeps the descriptor for its whole life: unlinking
+        // detaches that socket from this path for good, and the next bind
+        // starts clean.
+        for _ in 0..20 {
+            let _ = std::fs::remove_file(socket);
+            drop(std::os::unix::net::UnixListener::bind(socket).unwrap());
+            for _ in 0..40 {
+                match std::os::unix::net::UnixStream::connect(socket) {
+                    Err(refused)
+                        if matches!(
+                            refused.kind(),
+                            ErrorKind::ConnectionRefused | ErrorKind::NotFound
+                        ) =>
+                    {
+                        return;
+                    }
+                    Ok(_) => std::thread::sleep(Duration::from_millis(5)),
+                    Err(other) => {
+                        panic!("probing the fabricated leftover socket failed: {other}")
+                    }
+                }
+            }
+        }
+        panic!(
+            "{} never went stale: something kept answering on it",
+            socket.display()
+        );
+    }
+
     #[tokio::test]
     async fn a_socket_left_by_a_crash_is_unlinked_and_rebound() {
-        // Neither std nor tokio unlinks a UnixListener's path on drop, so this
-        // is exactly the file a killed daemon leaves behind.
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
-        drop(UnixListener::bind(&paths.socket).unwrap());
+        stale_socket_leftover(&paths.socket);
         assert!(paths.socket.exists(), "the stale file must still be there");
         let listener = bind_socket(&paths, &paths.socket).unwrap();
         assert!(paths.socket.exists());
@@ -1174,13 +1313,13 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let paths = test_paths(&dir);
             init_dirs(&paths).unwrap();
-            // The crashed predecessor's leftover: neither std nor tokio
-            // unlinks a UnixListener's path on drop (see
-            // `a_socket_left_by_a_crash_is_unlinked_and_rebound`). Plain
-            // `std::os::unix::net::UnixListener`, not tokio's: this outer
-            // fn has no runtime of its own (each racer below builds its
-            // own), and std's needs none to bind.
-            drop(std::os::unix::net::UnixListener::bind(&paths.socket).unwrap());
+            // The crashed predecessor's leftover, and it must really be
+            // leftover before the racers start: a socket another test's
+            // mid-spawn child is briefly keeping alive would make the flock's
+            // WINNER refuse too, for a reason that has nothing to do with the
+            // race under test. See `stale_socket_leftover`'s own doc — that
+            // exact false failure is why it exists.
+            stale_socket_leftover(&paths.socket);
 
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let handles: Vec<_> = (0..2)
@@ -1504,5 +1643,114 @@ mod tests {
         );
 
         drop(signals); // aborts the listener tasks (SignalTasks::drop)
+    }
+
+    // `boot` is the ONE place `DEFAULT_MAX_CRON_SLEEP` is applied — the CLI
+    // half of the plumbing keeps the knob an `Option` all the way down, and
+    // its own test pins that — so nothing else in this workspace would notice
+    // a different fallback landing here. fails if the default is replaced (a
+    // stray `Duration::from_secs(1)` would have every cron worker in the
+    // daemon waking a minute more often than the constant says), and fails if
+    // the configured value is dropped for one of `max_cron_sleep`'s own
+    // invention.
+    //
+    // Whole `BootOptions` values rather than bare `Option`s, because that is
+    // what `boot` hands over: the field this reads is the field the daemon
+    // runs with, with no projection in between for a call site to get wrong.
+    #[test]
+    fn an_unset_max_cron_sleep_falls_back_to_the_daemons_own_default() {
+        assert_eq!(
+            max_cron_sleep(&BootOptions::default()),
+            DEFAULT_MAX_CRON_SLEEP,
+            "unset means the default"
+        );
+        assert_eq!(
+            max_cron_sleep(&BootOptions {
+                max_cron_sleep: Some(Duration::from_secs(300)),
+                ..BootOptions::default()
+            }),
+            Duration::from_secs(300),
+            "a configured value must reach the workers unchanged"
+        );
+    }
+
+    // fails if `boot` never spawns the extras reporter. Nothing else in this
+    // crate drives that call — every other reporter case constructs one by
+    // hand — so dropping it here would leave a real daemon in which no memory
+    // breach and no liveness failure ever restarts anything, with every unit
+    // test still green.
+    //
+    // The whole production chain is what makes the claim: the actor arms a
+    // liveness loop at the Online transition, the loop reports over the sender
+    // `Extras::real` was built with, the reporter reads it, and
+    // `extra_restart`'s guards let it through. Real time and a real
+    // `OsProber` — a paused clock does not move a real TCP connect.
+    #[tokio::test]
+    async fn a_booted_daemon_restarts_a_sheep_whose_liveness_probe_fails() {
+        // Real time: binds a real socket, so it takes the signal lock like
+        // every other successful `boot()` here — see SIGNAL_TEST_LOCK's doc.
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+
+        // Reserve a port, then release it: nothing ever listens there, so
+        // every probe fails with a connection refusal, with no listener to
+        // race and no port to reserve for real.
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let daemon = boot(
+            ScriptedRunner::new(vec![ProcScript::never_exits(); 4]),
+            paths.clone(),
+            BootOptions::default(),
+        )
+        .await
+        .unwrap();
+        let ctx = daemon.context();
+        let mut events = ctx.events.subscribe();
+        let run = tokio::spawn(daemon.run());
+
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.liveness_probe = Some(ProbeConfig {
+            kind: ProbeKind::Tcp,
+            target: addr.to_string(),
+            // The loop floors anything shorter at one second, so a smaller
+            // number here would be a lie about what this test waits for.
+            interval: UpDuration::from_millis(1_000),
+            timeout: UpDuration::from_millis(500),
+            failure_threshold: 1,
+        });
+        ctx.supervisor
+            .start(vec![normalize(app).unwrap()])
+            .await
+            .unwrap();
+
+        let restarted = async {
+            loop {
+                match events.recv().await {
+                    Ok(BusEvent::Process {
+                        event: ProcessEventKind::Restart,
+                        info,
+                        ..
+                    }) => return info,
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("the event stream closed before a restart: {err}"),
+                }
+            }
+        };
+        let info = tokio::time::timeout(Duration::from_secs(20), restarted)
+            .await
+            .expect("a failing liveness probe must restart its sheep");
+        assert_eq!(info.id, 0);
+        assert_eq!(info.restarts, 1);
+
+        ctx.shutdown();
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }
