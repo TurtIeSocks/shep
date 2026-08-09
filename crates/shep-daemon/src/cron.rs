@@ -54,11 +54,30 @@ impl Clock for SystemClock {
 #[allow(dead_code)]
 pub(crate) const DEFAULT_MAX_CRON_SLEEP: Duration = Duration::from_secs(60);
 
+/// Floor `spawn_cron_worker` enforces on `max_sleep`, regardless of caller.
+///
+/// `shep-core`'s `DaemonConfig::load` already rejects a configured
+/// `max_cron_sleep` below this same one-second bound — but that guard lives
+/// behind boot wiring this module does not own (see `DEFAULT_MAX_CRON_SLEEP`'s
+/// doc above), so it protects only the call site that reaches it, once one
+/// exists. Without a floor here too, any caller — today's tests, or a boot
+/// path added later that forgets to route through the validated config —
+/// could hand this function a `Duration::ZERO` and turn the loop into a hot
+/// spin that re-derives the schedule as fast as the runtime allows while
+/// still firing correctly, which is exactly what makes that failure mode
+/// hard to attribute. The value matches `shep-core`'s `MIN_CRON_SLEEP` in
+/// spirit; it is declared independently rather than imported because that
+/// constant is private to its module and the two crates use different
+/// duration types (`UpDuration` there, `core::time::Duration` here).
+const MIN_MAX_SLEEP: Duration = Duration::from_millis(1_000);
+
 /// Runs one sheep-group's cron schedule until the handle is dropped.
 ///
 /// `max_sleep` bounds how long the loop parks before it re-reads the clock;
 /// it changes how quickly the worker recovers from a wall-clock jump, never
-/// whether an occurrence fires.
+/// whether an occurrence fires. Clamped to at least `MIN_MAX_SLEEP` — see
+/// its doc for why this function keeps its own floor instead of trusting the
+/// caller to have validated one.
 ///
 /// Cancellation: the returned handle aborts the loop on `abort()`; the loop
 /// itself holds no state that needs unwinding.
@@ -69,6 +88,7 @@ pub fn spawn_cron_worker(
     supervisor: SupervisorHandle,
     max_sleep: Duration,
 ) -> tokio::task::JoinHandle<()> {
+    let max_sleep = max_sleep.max(MIN_MAX_SLEEP);
     tokio::spawn(async move {
         loop {
             let now = clock.now_utc();
@@ -92,9 +112,13 @@ pub fn spawn_cron_worker(
                     return;
                 }
             };
-            // `to_std` fails on a negative delta (`next` already due); a
-            // zero sleep is the correct saturating behavior there, not a
-            // reason to skip the loop's own re-check below.
+            // `next` is `schedule.next_after(now)`, which is strictly after
+            // `now` by contract (`CronSchedule::next_after`'s own doc), so
+            // `next - now` is always positive and `to_std` cannot actually
+            // take the `Err` arm here. `unwrap_or(Duration::ZERO)` is
+            // defensive, not a path this loop can reach today — it costs
+            // nothing to keep and saves a `.expect()` panic if that contract
+            // ever loosens.
             let until_next = (next - now).to_std().unwrap_or(Duration::ZERO);
             tokio::time::sleep(until_next.min(max_sleep)).await;
 
@@ -357,7 +381,18 @@ mod tests {
     }
 
     // fails if `Ok(None)` ("never fires again") is treated as "try again":
-    // that implementation spins forever and the join below times out
+    // that mutation (`Ok(None) => continue`) has no `.await` between loop
+    // iterations, so it starves this current-thread runtime outright rather
+    // than raising the `tokio::time::timeout` below — a pure busy-spin never
+    // yields back to the executor, so the timeout's own timer future is
+    // never polled again either. This test does not fail on that mutation;
+    // it hangs forever, and the backstop is the CI job's own timeout, not
+    // this test's `tokio::time::timeout`. Don't "fix" that with an in-test
+    // watchdog task: `start_paused` cannot be combined with
+    // `flavor = "multi_thread"` (tokio's own proc macro rejects it at
+    // compile time), so on this single-threaded runtime a watchdog *task*
+    // would starve alongside the spin it's meant to catch — only a real OS
+    // thread could preempt it, and this test doesn't reach for one.
     #[tokio::test(start_paused = true)]
     async fn exhausted_pattern_ends_the_task_without_restarting() {
         let (handle, mut rx, _dir) = spawn_test_fixture();

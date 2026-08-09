@@ -99,6 +99,13 @@ impl CronSchedule {
     /// willing to search for — a pattern like `0 0 30 2 *` (30 February) that
     /// can never match.
     ///
+    /// A pattern that matches an hour repeated by a DST fall-back can return
+    /// the same wall-clock occurrence twice across two successive calls —
+    /// once for each pass through that hour. This is croner's own standard
+    /// local-time search semantics, not a defect this wrapper introduces or
+    /// could suppress without also making the reverse case (a spring-forward
+    /// hour that never occurs) harder to reason about.
+    ///
     /// # Errors
     ///
     /// - [`CronScheduleError::Search`] — croner failed the search for a reason

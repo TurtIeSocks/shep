@@ -260,6 +260,23 @@ mod tests {
         );
     }
 
+    // fails if the message wording drifts (e.g. "invalid" alone, or the
+    // `key`/`min` operands swapped) without anyone noticing — this is the
+    // entire user-facing payload of the reject-don't-clamp decision: it is
+    // what actually reaches `shepd.err.log` on exit code 4.
+    #[test]
+    fn below_minimum_display_is_exact() {
+        let err = DaemonConfigError::BelowMinimum {
+            key: "max_cron_sleep",
+            value: UpDuration::from_millis(999),
+            min: UpDuration::from_millis(1_000),
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid value `999` for max_cron_sleep: must be at least 1s"
+        );
+    }
+
     #[test]
     fn missing_file_yields_defaults() {
         let cfg = DaemonConfig::load(None, &no_env).unwrap();
