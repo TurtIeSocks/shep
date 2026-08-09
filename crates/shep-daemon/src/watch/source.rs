@@ -88,45 +88,7 @@ pub fn watch_tree(
 
     let mut debouncer = new_debouncer(delay, None, move |result: DebounceEventResult| {
         // Runs on the debouncer's own OS thread — see this module's doc.
-        match result {
-            Ok(events) => {
-                // `.event.paths`, not `.paths` through the `Deref`: moving
-                // out of a deref target does not compile, and `DebouncedEvent`
-                // exposes its wrapped `Event` as a plain owned field for
-                // exactly this.
-                let paths: Vec<PathBuf> = events
-                    .into_iter()
-                    .flat_map(|debounced| debounced.event.paths)
-                    .collect();
-                // A `need_rescan` marker event carries no paths of its own —
-                // notify dropped events (e.g. an inotify queue overflow) and
-                // wants the whole tree re-read. Silently eating it here would
-                // produce no batch and therefore no restart precisely when
-                // the watch most needs to fire. Forwarding the root itself
-                // keeps this function's "a batch is never empty" doc promise
-                // and still gives the caller something to act on.
-                let paths = if paths.is_empty() {
-                    vec![watched_root.clone()]
-                } else {
-                    paths
-                };
-                // An `Err` here means the receiver (and `WatchSource`)
-                // has already been dropped. Nothing to do: this thread
-                // keeps running until its own `Drop` stops it.
-                let _ = tx.send(paths);
-            }
-            Err(errors) => {
-                for err in errors {
-                    // `root` named explicitly: with several watches armed,
-                    // "filesystem watch error" alone does not say which one.
-                    tracing::warn!(
-                        root = %watched_root.display(),
-                        %err,
-                        "filesystem watch error"
-                    );
-                }
-            }
-        }
+        forward_batch(result, &watched_root, &tx);
     })
     .map_err(|err| WatchError::Backend {
         reason: render_reason(&err),
@@ -145,6 +107,60 @@ pub fn watch_tree(
         },
         rx,
     ))
+}
+
+/// Shapes one debounced result into a batch and forwards it — the body of
+/// the handler [`watch_tree`] installs, and so the code that runs on the
+/// debouncer's own OS thread rather than on a tokio one.
+///
+/// A function rather than an inline closure because the batch it produces
+/// for a path-less result is the only signal an inotify overflow leaves, and
+/// a real overflow is not something a test can ask an OS for: named here,
+/// the shaping can be driven directly.
+fn forward_batch(
+    result: DebounceEventResult,
+    root: &Path,
+    tx: &mpsc::UnboundedSender<Vec<PathBuf>>,
+) {
+    match result {
+        Ok(events) => {
+            // `.event.paths`, not `.paths` through the `Deref`: moving
+            // out of a deref target does not compile, and `DebouncedEvent`
+            // exposes its wrapped `Event` as a plain owned field for
+            // exactly this.
+            let paths: Vec<PathBuf> = events
+                .into_iter()
+                .flat_map(|debounced| debounced.event.paths)
+                .collect();
+            // A `need_rescan` marker event carries no paths of its own —
+            // notify dropped events (e.g. an inotify queue overflow) and
+            // wants the whole tree re-read. Silently eating it here would
+            // produce no batch and therefore no restart precisely when
+            // the watch most needs to fire. Forwarding the root itself
+            // keeps [`watch_tree`]'s "a batch is never empty" doc promise
+            // and still gives the caller something to act on.
+            let paths = if paths.is_empty() {
+                vec![root.to_path_buf()]
+            } else {
+                paths
+            };
+            // An `Err` here means the receiver (and `WatchSource`)
+            // has already been dropped. Nothing to do: this thread
+            // keeps running until its own `Drop` stops it.
+            let _ = tx.send(paths);
+        }
+        Err(errors) => {
+            for err in errors {
+                // `root` named explicitly: with several watches armed,
+                // "filesystem watch error" alone does not say which one.
+                tracing::warn!(
+                    root = %root.display(),
+                    %err,
+                    "filesystem watch error"
+                );
+            }
+        }
+    }
 }
 
 /// `err`'s rendered message, minus notify's own trailing `about [paths]`
@@ -216,7 +232,11 @@ mod tests {
     use core::time::Duration;
 
     use std::path::PathBuf;
+    use std::time::Instant;
 
+    use notify::event::{Flag, ModifyKind};
+    use notify::{Event, EventKind};
+    use notify_debouncer_full::DebouncedEvent;
     use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::time::timeout;
 
@@ -260,6 +280,56 @@ mod tests {
             .await
             .expect("no batch arrived within the deadline")
             .expect("watch source ended before a batch arrived")
+    }
+
+    // fails if [`forward_batch`] stops substituting the root for a path-less
+    // batch — `let paths = paths;` in place of the `vec![root.to_path_buf()]`
+    // arm. A `need_rescan` marker carries no paths of its own, so under that
+    // mutation an overflow forwards an empty batch instead: `RootedFilter`
+    // is asked about nothing, no restart follows, and the watch goes quiet
+    // exactly when notify has already dropped events.
+    //
+    // The one case that enters the code PRODUCING that marker. Both existing
+    // rescan cases fabricate it downstream — `run_group` is handed
+    // `vec![root]` on a channel, and `RootedFilter::triggers` is asked about
+    // the root directly — so they pin the consumer and leave this side of
+    // the contract free to change.
+    //
+    // Driven directly rather than through a real watcher because the OS is
+    // what emits a rescan (an inotify queue overflow, an FSEvents drop), and
+    // no test can ask it for one.
+    #[test]
+    fn a_path_less_batch_is_forwarded_as_the_root_itself() {
+        let root = PathBuf::from("/watched");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // A marker exactly as notify delivers one: the `Rescan` flag, and no
+        // path of its own.
+        let rescan = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        forward_batch(
+            Ok(vec![DebouncedEvent::new(rescan, Instant::now())]),
+            &root,
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().expect("a rescan marker must produce a batch"),
+            vec![root.clone()]
+        );
+
+        // Control: a batch that does carry paths is forwarded as itself, so
+        // the substitution above belongs to the path-less case alone and is
+        // not a root standing in for every change.
+        let changed = root.join("src/main.rs");
+        let modified = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(changed.clone());
+        forward_batch(
+            Ok(vec![DebouncedEvent::new(modified, Instant::now())]),
+            &root,
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().expect("a path batch must be forwarded"),
+            vec![changed]
+        );
     }
 
     // fails if the watch is non-recursive, or if the handler's

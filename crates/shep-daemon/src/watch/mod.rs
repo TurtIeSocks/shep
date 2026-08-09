@@ -576,6 +576,29 @@ mod tests {
         };
     }
 
+    // Pins the rendered text, which the case above does not: it destructures
+    // the variant and never renders it, leaving `Display` reachable only
+    // through code no test ran.
+    //
+    // fails if the body stops writing what it carries — an empty rendering,
+    // or one that drops the pattern or the reason. At config load this string
+    // is the only thing telling a user WHICH of their patterns globset
+    // refused, and why.
+    #[test]
+    fn watch_filter_error_display_names_the_pattern_and_its_reason() {
+        // A fabricated reason rather than globset's own, so the assertion is
+        // an exact string and not a re-statement of whatever that crate
+        // happens to render this release.
+        let err = WatchFilterError::Glob {
+            pattern: "[".to_string(),
+            reason: "unclosed character class".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid watch pattern `[`: unclosed character class"
+        );
+    }
+
     // fails if a strip-prefix failure falls back to matching the untouched
     // absolute path — `MATCH_EVERYTHING` would then wrongly trigger on a
     // path that lies entirely outside the watched root
@@ -1077,6 +1100,51 @@ mod tests {
         assert_eq!(info.restarts, 1);
 
         group.abort();
+    }
+
+    // The loop's other exit: not its source going away, but the engine it
+    // restarts through. `dropping_the_sender_ends_the_group_task` covers the
+    // first; nothing covered this one.
+    //
+    // fails if the `EngineStopped` arm falls through to the next iteration
+    // instead of returning: the group would sit on a live OS watch, spending
+    // a debouncer thread and one restart attempt per save on a mailbox nobody
+    // reads, for as long as the process lives. The sender is held until after
+    // the join, so the arm under test is the only way the task can end.
+    //
+    // No scripts in the fixture, and that is the honest count: the engine is
+    // shut down before the batch is sent, so no spawn is reachable under
+    // either implementation — the correct one or the fallen-through one.
+    #[tokio::test(start_paused = true)]
+    async fn the_group_task_ends_when_the_supervisor_engine_has_stopped() {
+        let (handle, _rx, _dir) = spawn_test_fixture(Vec::new());
+        let name = "web";
+        handle.shutdown().await;
+        // The premise, stated rather than assumed: with the actor gone, the
+        // restart this batch is about to trigger answers `EngineStopped`.
+        assert_eq!(
+            handle
+                .restart_automatic(ProcessSelector::Name(name.to_string()))
+                .await
+                .unwrap_err(),
+            SupervisorError::EngineStopped
+        );
+
+        let root = PathBuf::from("/watched");
+        let (tx, group_rx) = mpsc::unbounded_channel();
+        let group = tokio::spawn(run_group(
+            name.to_string(),
+            matches_everything(root.clone()),
+            group_rx,
+            handle,
+        ));
+
+        tx.send(vec![root.join("src/main.rs")]).unwrap();
+        tokio::time::timeout(EVENT_WAIT, group)
+            .await
+            .expect("the group task did not end after the engine shut down")
+            .expect("group task panicked");
+        drop(tx); // kept alive until here: a dropped sender ends the loop too
     }
 
     // IR-33: real time, not the paused clock — the same OS-seam

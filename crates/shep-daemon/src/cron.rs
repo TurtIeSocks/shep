@@ -502,6 +502,49 @@ mod tests {
         assert_no_restart_pending(&mut rx, name);
     }
 
+    // The worker's other exit: not a schedule that ran out, but the engine it
+    // restarts through going away. `exhausted_pattern_ends_the_task_without_
+    // restarting` covers the first; nothing covered this one.
+    //
+    // fails if the `EngineStopped` arm falls through to the next iteration
+    // instead of returning: the worker would keep re-deriving occurrences and
+    // firing restarts into a mailbox nobody reads, one per occurrence, for as
+    // long as the process lives.
+    //
+    // No scripts in the fixture, and that is the honest count: the engine is
+    // shut down before the occurrence fires, so no spawn is reachable under
+    // either implementation — the correct one or the fallen-through one.
+    #[tokio::test(start_paused = true)]
+    async fn the_worker_ends_when_the_supervisor_engine_has_stopped() {
+        let (handle, _rx, _dir) = spawn_test_fixture_with(Vec::new());
+        let name = "web";
+        handle.shutdown().await;
+        // The premise, stated rather than assumed: with the actor gone, the
+        // restart this worker is about to attempt answers `EngineStopped`.
+        assert_eq!(
+            handle
+                .restart_automatic(ProcessSelector::Name(name.to_string()))
+                .await
+                .unwrap_err(),
+            SupervisorError::EngineStopped
+        );
+
+        let clock = Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z")));
+        let schedule = CronSchedule::parse("0 * * * *", None).unwrap();
+        let worker =
+            spawn_worker_and_settle(name, schedule, clock, &handle, DEFAULT_MAX_CRON_SLEEP).await;
+
+        // Stepped finer than the sleep cap rather than jumped (rule 11), so
+        // the worker's own cadence decides when it wakes on the occurrence.
+        for _ in 0..120 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+        }
+        tokio::time::timeout(EVENT_WAIT, worker)
+            .await
+            .expect("the worker did not end after the engine shut down")
+            .expect("worker task panicked");
+    }
+
     // fails two ways: a worker that outlives its sheep (a second restart
     // arrives after abort), and — because the first restart is observed
     // before the abort — a worker that never fired at all, which a bare
@@ -626,6 +669,54 @@ mod tests {
         assert!(
             clock.reads() < 20,
             "expected fewer than 20 clock reads with a 10-minute max_sleep honored, got {}",
+            clock.reads()
+        );
+        worker.abort();
+    }
+
+    // fails if `max_sleep.max(MIN_MAX_SLEEP)` becomes plain `max_sleep`: a
+    // caller that skipped `shep-core`'s config-time rejection would then have
+    // this loop re-derive its schedule a thousand times a second, per
+    // cron-configured name, while still firing every occurrence correctly —
+    // which is exactly what makes that burn hard to attribute to its cause.
+    //
+    // A sub-second value rather than the `Duration::ZERO` the floor's own doc
+    // names, because zero does not redden this test — it hangs it. A zero
+    // sleep resolves the instant it is polled, so the loop never parks on a
+    // pending timer for the paused runtime to auto-advance past; it spins,
+    // and the backstop is the CI job's own timeout, the shape
+    // `exhausted_pattern_ends_the_task_without_restarting` already documents
+    // above. One millisecond parks on a real timer, which keeps the mutation
+    // observable as a count.
+    //
+    // The occurrence is an hour out, so nothing fires under either
+    // implementation and no script is reachable — on a paused clock the only
+    // trace a wakeup leaves is a clock read.
+    #[tokio::test(start_paused = true)]
+    async fn a_sub_second_max_sleep_is_floored_instead_of_waking_every_millisecond() {
+        let (handle, _rx, _dir) = spawn_test_fixture_with(Vec::new());
+        let name = "web";
+        let clock = Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z")));
+        let schedule = CronSchedule::parse("0 * * * *", None).unwrap();
+        let worker = spawn_worker_and_settle(
+            name,
+            schedule,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            &handle,
+            Duration::from_millis(1),
+        )
+        .await;
+
+        // Five floored sleeps' worth of virtual time. The runtime's own
+        // auto-advance walks it in whatever steps the worker's timers ask for
+        // — one `MIN_MAX_SLEEP` while the floor holds, one millisecond
+        // without it — so no step here can outrun the loop under test
+        // (rule 11).
+        tokio::time::sleep(MIN_MAX_SLEEP * 5).await;
+        assert!(
+            clock.reads() < 20,
+            "max_sleep must be floored at MIN_MAX_SLEEP: five floored sleeps cost about \
+             two clock reads each, got {}",
             clock.reads()
         );
         worker.abort();
