@@ -12,6 +12,9 @@
 //!
 //! - [`Prober`], [`ProbeFailure`]
 //! - [`LivenessFailure`], [`spawn_liveness_task`]
+//! - [`os::OsProber`] — the real HTTP/TCP/exec implementation
+
+pub mod os;
 
 use core::future::Future;
 use core::pin::Pin;

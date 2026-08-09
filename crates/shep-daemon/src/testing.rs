@@ -4,6 +4,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::time::Duration;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -11,6 +12,8 @@ use chrono::{DateTime, Utc};
 use shep_core::config::{ProbeConfig, ProbeKind, ProbeTarget};
 use shep_core::paths::ShepPaths;
 use shep_core::values::UpDuration;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 
 use crate::cron::Clock;
@@ -279,4 +282,60 @@ pub(crate) fn probe_config(kind: ProbeKind, target: &str) -> ProbeConfig {
         timeout: UpDuration::from_millis(5_000),
         failure_threshold: 3,
     }
+}
+
+/// One scripted reply [`loopback_http`] serves for one accepted connection.
+pub(crate) enum HttpReply {
+    /// Writes a minimal `HTTP/1.1 {code} OK\r\n\r\n` status line, then closes.
+    Status(u16),
+    /// Writes `raw` verbatim, then closes — for a response that is not a
+    /// well-formed HTTP status line at all.
+    Raw(String),
+    /// Accepts the connection and then never writes a byte — the only way to
+    /// exercise `OsProber`'s read-side timeout honestly, since a scripted
+    /// reply that writes something (even garbage) always resolves the read.
+    Hang,
+}
+
+/// Binds a loopback HTTP fake on `127.0.0.1:0` and serves one scripted reply
+/// per accepted connection, in order.
+///
+/// Binds before spawning the accept loop and returns the already-bound
+/// address, so a probe dialing the returned `SocketAddr` cannot race the
+/// bind — restructuring this into "spawn a task that binds" reintroduces
+/// that race (a fake torn down, or not yet listening, before the code under
+/// test connects makes the connection fail for the wrong reason).
+///
+/// The returned `JoinHandle` is not detached: callers abort it once the test
+/// is done with it.
+pub(crate) async fn loopback_http(
+    script: Vec<HttpReply>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback HTTP listener");
+    let addr = listener.local_addr().expect("read bound loopback address");
+    let handle = tokio::spawn(async move {
+        for reply in script {
+            let Ok((mut stream, _peer)) = listener.accept().await else {
+                return; // listener gone (test dropped it) — nothing left to serve
+            };
+            match reply {
+                HttpReply::Status(code) => {
+                    let response = format!("HTTP/1.1 {code} OK\r\n\r\n");
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }
+                HttpReply::Raw(raw) => {
+                    let _ = stream.write_all(raw.as_bytes()).await;
+                }
+                HttpReply::Hang => {
+                    // Never write, never drop `stream` early: the connection
+                    // stays open until the caller's own timeout fires or this
+                    // task is aborted.
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    });
+    (addr, handle)
 }

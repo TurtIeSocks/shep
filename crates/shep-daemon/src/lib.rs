@@ -35,7 +35,8 @@
 //!   reports a breach once a sheep's tree exceeds its `max_memory`
 //! - [`probes`]: the [`Prober`](probes::Prober) seam and the liveness probe
 //!   loop — reports a sheep's health once `failure_threshold` consecutive
-//!   probes have failed; the concrete OS-backed prober is a later addition
+//!   probes have failed; [`os::OsProber`](probes::os::OsProber) is the
+//!   concrete hand-rolled HTTP/TCP/exec implementation
 //!
 //! ##### Plane
 //!
