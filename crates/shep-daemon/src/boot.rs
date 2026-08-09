@@ -815,9 +815,10 @@ fn unlink_if_present(path: &Path) -> Result<(), BootError> {
 #[derive(Debug)]
 struct SignalTasks {
     // SIGUSR2 reopen requests observed since boot. Write-only today by
-    // design, not by oversight: Phase 4's `flush`/`reopen` work is the
-    // reader this is waiting for. `#[allow(dead_code)]` says so explicitly
-    // rather than inventing an accessor nothing calls yet.
+    // design, not by oversight: the per-sheep log `flush`/`reopen` work
+    // (spec §5) is the reader this is waiting for, and it has not been
+    // built. `#[allow(dead_code)]` says so explicitly rather than
+    // inventing an accessor nothing calls yet.
     #[allow(dead_code)]
     reopens: Arc<AtomicU64>,
     tasks: Vec<JoinHandle<()>>,
@@ -936,7 +937,7 @@ fn install_signals(
                 tracing::warn!(%err, path = %logs.display(), "SIGUSR2: could not recreate log dir");
             }
             tracing::info!(
-                "SIGUSR2 received: log reopen requested (full per-sheep reopening lands in Phase 4)"
+                "SIGUSR2 received: log reopen requested (per-sheep reopening is not built yet)"
             );
         }
     }));

@@ -1853,10 +1853,10 @@ async fn run_sheep<P: RunningProcess>(
                         let _ = actor_tx.send(Msg::Ready { id }).await;
                     }
                     Some(ChildMessage::Metric { name, value }) => {
-                        tracing::debug!(id, name, value, "child metric (full handling is Phase 4)");
+                        tracing::debug!(id, name, value, "child metric (the metrics dog reads these; not built yet)");
                     }
                     Some(ChildMessage::ActionReply { action, body }) => {
-                        tracing::debug!(id, action, body, "child action reply (full handling is Phase 4)");
+                        tracing::debug!(id, action, body, "child action reply (custom actions are not built yet)");
                     }
                     None => from_child_open = false,
                 }

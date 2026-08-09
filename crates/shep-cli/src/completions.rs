@@ -8,9 +8,8 @@
 //! Static only — sheep names, fold names and other daemon-side identifiers
 //! are never completed. Dynamic completion would need an already-connected
 //! daemon at completion time, and clap_complete's dynamic-completion engine
-//! is `unstable-dynamic` upstream, out of scope for this phase (Global
-//! Constraints). Noted here as a Phase 4+ follow-up rather than letting it
-//! quietly drop off spec §9's list.
+//! is `unstable-dynamic` upstream. Recorded here as deliberately deferred,
+//! rather than letting it quietly drop off spec §9's list.
 
 use clap::CommandFactory;
 
