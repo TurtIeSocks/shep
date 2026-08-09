@@ -121,6 +121,15 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # Resolves cron_timezone's IANA name to a chrono::TimeZone. croner carries this
 # only as a dev-dependency, so it is ours to declare.
 chrono-tz = { version = "0.10.4", default-features = false, features = ["std"] }
+# Process-table RSS sampling for the polling memory-limit enforcer. Held at the
+# 0.38 line: sysinfo 0.39.0+ declares rust-version = "1.95" and this workspace's
+# MSRV is 1.88 (Cargo.toml:14, and the 1.88 leg of the CI test matrix). 0.38.4
+# carries the identical API this crate uses — refresh_processes_specifics,
+# ProcessRefreshKind::nothing/with_memory, Process::memory/parent, Pid::as_u32.
+# Defaults bring component/disk/network/user, none of which the daemon reads;
+# the `multithread` feature pulls rayon into a daemon whose idle-footprint goal
+# is single-digit MB (spec §14.11) and is not enabled.
+sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
 
 # Most debuginfo in `target/` is not ours: the default `debug = true` emits
 # full DWARF for every dependency and links a copy into each of the

@@ -30,6 +30,9 @@
 //! - [`channel`]: shepherd channel codec (child↔daemon messages, newline-JSON)
 //! - [`cron`]: the [`Clock`](cron::Clock) seam and the worker that restarts a
 //!   name-group on its `cron_restart` schedule
+//! - [`limits`]: the [`MemorySampler`](limits::sample::MemorySampler) seam
+//!   over a sheep's process tree; the polling enforcer that consumes it is a
+//!   later addition
 //!
 //! ##### Plane
 //!
@@ -195,6 +198,7 @@ pub mod channel;
 pub mod cron;
 pub mod entry;
 pub mod kill;
+pub mod limits;
 pub mod privilege;
 pub mod rpc;
 pub mod runner;

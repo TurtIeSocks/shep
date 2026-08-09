@@ -35,6 +35,9 @@ serde_json.workspace = true
 # DateTime<Utc> for the Clock seam (cron.rs): cron means wall time, which is
 # not the same clock as tokio::time's paused Instant.
 chrono.workspace = true
+# Process-table RSS sampling for the MemorySampler seam (limits/sample.rs) —
+# resident memory across a sheep's whole process tree.
+sysinfo.workspace = true
 
 # nix is #![cfg(unix)] internally and command-fds does unconditional unix-only fd
 # plumbing, so both would fail to compile on a Windows CI leg. Rin's Windows ruling:

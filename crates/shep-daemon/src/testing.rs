@@ -9,6 +9,7 @@ use tokio::sync::{broadcast, watch};
 
 use crate::cron::Clock;
 use crate::fake::{ProcScript, ScriptedRunner};
+use crate::limits::sample::{MemorySampler, ProcessRss};
 use crate::rpc::RpcContext;
 use crate::snapshot::FlockRegistry;
 use crate::supervisor::spawn_supervisor;
@@ -123,5 +124,46 @@ impl Clock for TestClock {
         let elapsed =
             chrono::Duration::from_std(self.started.elapsed()).unwrap_or(chrono::Duration::MAX);
         self.epoch + elapsed
+    }
+}
+
+// WHY a scripted sequence rather than one fixed table: the polling
+// memory-limit enforcer's tests need the process-table reading to change
+// between polls — e.g. a tree that stays under its limit for two ticks and
+// crosses it on the third — and a `sample()` that always returns the same
+// table cannot express that.
+pub(crate) struct ScriptedSampler {
+    readings: Vec<Vec<ProcessRss>>,
+    calls: AtomicUsize,
+}
+
+impl ScriptedSampler {
+    /// A sampler that replays `readings` in order, one per [`MemorySampler::sample`]
+    /// call, repeating the last reading once the script is exhausted.
+    pub(crate) fn new(readings: Vec<Vec<ProcessRss>>) -> Self {
+        // A script with nothing to replay is a fixture bug: failing loudly
+        // here, at the call site that misconfigured it, beats an
+        // index-out-of-bounds panic three frames away inside `sample`.
+        assert!(
+            !readings.is_empty(),
+            "ScriptedSampler needs at least one reading to replay"
+        );
+        Self {
+            readings,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// How many times [`MemorySampler::sample`] has been called.
+    pub(crate) fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl MemorySampler for ScriptedSampler {
+    fn sample(&self) -> Vec<ProcessRss> {
+        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        let index = call.min(self.readings.len() - 1);
+        self.readings[index].clone()
     }
 }
