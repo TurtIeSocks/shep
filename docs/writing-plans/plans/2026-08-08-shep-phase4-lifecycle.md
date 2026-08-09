@@ -327,6 +327,7 @@ pub enum CronError { EmptyPattern, InvalidDate, InvalidTime, TimeSearchLimitExce
 1. **`find_next_occurrence` returns `Result`, not `Option`.** The research note plans around a `None` for "never fires again" (`docs/research/phase4-lifecycle.md:213`); there is no `None`. Exhaustion arrives as `Err(CronError::TimeSearchLimitExceeded)`. `next_after` maps *that one variant* to `Ok(None)` and every other variant to `Err(CronScheduleError::Search)`, which is why its return type is `Result<Option<_>, _>` and not either half alone. Getting this backwards — treating every error as "no more occurrences" — silently turns a transient failure into a permanently disarmed cron.
 2. **`CronParserBuilder::build` returns `CronParser`, not `Result<CronParser>`.** A `?` on it does not compile.
 3. **`CronError` is neither `Clone` nor `PartialEq`**, which is why both new error enums carry `String`s. This is the constraint the File Structure section states; it is repeated here because this is the task that would otherwise discover it at `cargo check` time.
+4. **`Cron::as_str` gives back croner's *normalized* pattern, not the input.** `0 0 * JUL WED` comes out as `0 0 * 7 3` and `@daily` as `0 0 * * *` — both verified by running them. `CronSchedule::pattern` promises the pattern *as written in the Flockfile*, so it returns a stored `String` and never `as_str`; the same normalization is why an error message has to carry the user's own spelling rather than croner's rendering of it.
 
 Do **not** call `.dom_and_dow(true)`. croner's default is OR semantics between day-of-month and day-of-week, which is what the JS-croner dialect map.md promises does; `true` switches to AND and would silently change what an existing pattern means.
 
@@ -394,7 +395,7 @@ The tests are the interesting half of this task, because `next_after` is a pure 
 
 The three DST rows are five-field on purpose and their pinned instants are unaffected by that: croner inserts a literal `0` seconds component for any five-token pattern (`parser.rs:126-127`), so `30 2 * * *` normalizes to exactly the same schedule a six-field `0 30 2 * * *` would have described. The DST scenarios each row exists to pin survive the spelling unchanged.
 
-Every rejection row asserts the **variant**, never croner's sentence. croner renders "Pattern must have 5 fields when seconds are disallowed." for the first three and "Number out of bounds." for the garbage row; both strings are croner's to reword, and pinning either makes a patch bump a red suite.
+Every rejection row asserts the **variant**, never croner's sentence. croner renders "Pattern must have 5 fields when seconds are disallowed." for the six-field row, the year row *and* the `not a cron` row — three tokens, so the same field-count gate catches it — and "Number out of bounds." for the garbage row. The nickname row is the exception: croner accepts `@daily`, so that sentence is ours, not croner's. All of these are somebody's to reword, and pinning any of them makes a patch bump a red suite.
 
 The DST rows come from croner's documented `JobType` behaviour, and the whole point of pinning them is that this plan is not the authority on them — croner is. **Derive the expected values by running the case, read the result, and then decide whether it matches croner's documented rule before pinning it.** If it does not, that is a finding for the report, not a number to paste in. This applies to the accepted rows only: a rejection row that fails to parse is the assertion passing, not a croner defect to report.
 
@@ -624,13 +625,19 @@ loop {
             // NotFound: the sheep is gone but the registry has not disarmed us
             // yet — log at debug and keep the schedule. EngineStopped: the
             // actor is gone, so end the task.
-            match err { NotFound => debug!(...), EngineStopped => { warn!(%err); return } }
+            match err {
+                NotFound       => debug!(...),
+                SpawnFailed(_) => warn!(%err),          // this occurrence lost; keep the schedule
+                EngineStopped  => { warn!(%err); return }
+            }
         }
     }
 }
 ```
 
-Two things in that shape are load-bearing against `-D warnings` rather than stylistic. The `?` this replaces would not compile: the body returns `()`, so `Result`'s `From` conversion has nothing to convert into — and the plan's own prose two paragraphs down says the `Err` case logs and ends the task, which is a `match`, not a `?`. And `SupervisorHandle::restart` returns `Result<Vec<ProcessInfo>, SupervisorError>` (`crates/shep-daemon/src/supervisor.rs:210-213`), which is `#[must_use]` through `Result`: discarding it is `unused_must_use`, a hard error under the gate. Discarding it is also how a worker ends up looping forever against a dead actor with nothing in the log.
+Three things in that shape are load-bearing against `-D warnings` rather than stylistic. The `?` this replaces would not compile: the body returns `()`, so `Result`'s `From` conversion has nothing to convert into — and the plan's own prose two paragraphs down says the `Err` case logs and ends the task, which is a `match`, not a `?`. And `SupervisorHandle::restart` returns `Result<Vec<ProcessInfo>, SupervisorError>` (`crates/shep-daemon/src/supervisor.rs:210-213`), which is `#[must_use]` through `Result`: discarding it is `unused_must_use`, a hard error under the gate. Discarding it is also how a worker ends up looping forever against a dead actor with nothing in the log.
+
+The third is the arm count. `SupervisorError` has **three** variants — `NotFound`, `SpawnFailed(String)`, `EngineStopped` (`supervisor.rs:138-146`) — and carries no `#[non_exhaustive]`, so a two-arm match is `E0004` and not a stylistic omission. `SpawnFailed` is the one an implementer forgets, and it is reachable: `restart` on a live sheep runs the kill ladder and respawns, and that respawn can fail. It is a lost occurrence, not a dead engine, so the schedule stands.
 
 1. **The `if` after the sleep is not optional.** Without it, a capped sleep that expires before `next` fires the job early, every minute, forever. With it, a capped sleep that expires early simply loops and re-derives.
 2. **Missed occurrences are not replayed.** A daemon that was suspended for six hours with an hourly cron wakes to a `next_after(now)` that is one occurrence in the future, and the sheep restarts at most once. Firing the six missed occurrences would be a restart storm; the loop's structure gives the at-most-one behaviour for free, and the reason belongs in an IR-31 `//` comment so nobody "fixes" it into a catch-up loop.
@@ -868,7 +875,9 @@ A `bench` job in `.github/workflows/test.yml` running `cargo bench --manifest-pa
 
 Run the bench locally and write the two numbers, with the machine they came from and the date, into the bench file's own header comment. Task 6's `MEMORY_POLL_INTERVAL` comment cites them. **Numbers do not go into this plan** — a measured value belongs next to the thing it justifies, and a plan file is not where anyone will look for it in a year.
 
-- [ ] **Step 5: Run the full gate list from Global Constraints, each from its own exit code.** The workspace gates do not cover the bench crate (it is outside the workspace); run `cargo check --manifest-path benches/Cargo.toml`, `cargo +1.88 check --manifest-path benches/Cargo.toml` and `cargo bench --manifest-path benches/Cargo.toml -- --test` as three more, each from its own exit code. The MSRV one is not ceremony: the crate declares `rust-version = "1.88"` literally rather than inheriting it, so nothing else in the repo will ever notice if a bench dependency outruns it. criterion 0.7.0 declares 1.80 today.
+- [ ] **Step 5: Run the full gate list from Global Constraints, each from its own exit code.** The workspace gates do not cover the bench crate (it is outside the workspace); run `cargo check --benches --manifest-path benches/Cargo.toml`, `cargo +1.88 check --benches --manifest-path benches/Cargo.toml` and `cargo bench --manifest-path benches/Cargo.toml -- --test` as three more, each from its own exit code. The MSRV one is not ceremony: the crate declares `rust-version = "1.88"` literally rather than inheriting it, so nothing else in the repo will ever notice if a bench dependency outruns it. criterion 0.7.0 declares 1.80 today.
+
+**`--benches` is the whole gate, not a flag to tidy away.** This package has no `src/lib.rs` and no `[[bin]]`, so its only target is the `[[bench]]`, and plain `cargo check` builds nothing at all: it prints `Finished` in a fraction of a second over a bench file containing a type error. The MSRV form is worse, because it is the one the paragraph above calls load-bearing — `cargo +1.85 check` against this manifest exits `0` even though the crate and three of its dependencies declare `rustc 1.88`; add `--benches` and the same command fails with `error: rustc 1.85.1 is not supported by the following packages`. Both were reproduced against this exact manifest before being written down.
 - [ ] **Step 6: Commit** — `bench: add the workspace's first criterion harness for memory sampling`
 
 ---
@@ -1246,7 +1255,7 @@ pub async fn await_ready(
 
 **The `ReadinessSource` match inside `await_ready` carries no `_` arm.** Three sources, three arms, and a fourth source added later fails `cargo check`. Rule 6 again.
 
-**Readiness gates the start path only when the app configures it — this is a departure from the research note and it is deliberate.** `docs/research/phase4-lifecycle.md:161-166` has one `await_ready` serving both normal start and reload's AwaitReady, `Heuristic` included. Applied to the start path, `Heuristic` means every app that configures no readiness at all waits `listen_timeout` — 3000ms by default (`crates/shep-core/src/config/app.rs:107`) — before reaching `online`. That is a three-second regression on every `shep start` in the default configuration, and nothing in the spec asks for it: §7 says readiness "gates reload", and §4 puts the heuristic inside reload's `AwaitReady` state. **The spec wins** (`docs/specs/shep-v1.md:8-9`). So:
+**Readiness gates the start path only when the app configures it — this is a departure from the research note and it is deliberate.** `docs/research/phase4-lifecycle.md:161-166` has one `await_ready` serving both normal start and reload's AwaitReady, `Heuristic` included. Applied to the start path, `Heuristic` means every app that configures no readiness at all waits `listen_timeout` — 3000ms by default (`crates/shep-core/src/config/app.rs:106`, `:178`) — before reaching `online`. That is a three-second regression on every `shep start` in the default configuration, and nothing in the spec asks for it: §7 says readiness "gates reload", and §4 puts the heuristic inside reload's `AwaitReady` state. **The spec wins** (`docs/specs/shep-v1.md:8-9`). So:
 
 - `wait_ready = true` or `readiness_probe` set → the sheep enters `starting` and reaches `online` on the signal, or on the deadline.
 - Neither → `online` on spawn success, exactly as the engine behaves today. No new latency, and no existing supervisor test changes its expectations.
@@ -1291,7 +1300,7 @@ Note the last row carefully: `Heuristic` returns `Ready`, not `TimedOut`. That i
 
 - [ ] **Step 2: The supervisor changes, and the existing tests**
 
-`crates/shep-daemon/src/supervisor.rs` has 22 paused-clock tests. **The default path is unchanged, so none of them should need editing.** If any does, that is evidence the gate leaked into the ungated path — fix the implementation, not the test, and say so in the report.
+`crates/shep-daemon/src/supervisor.rs` has 21 paused-clock tests — every `#[tokio::test]` in the file. **The default path is unchanged, so none of them should need editing.** If any does, that is evidence the gate leaked into the ungated path — fix the implementation, not the test, and say so in the report.
 
 New supervisor tests, each with its "fails if" comment: a `wait_ready` app is `Starting` until its channel ready arrives and `Online` after; a `readiness_probe` app is `Starting` until the scripted prober passes; a gated app whose deadline elapses reaches `Online` with the warning; a gated app that *exits* while starting takes the normal exit path and never reaches `Online` (this is the epoch guard's test, and it is the one that catches the stale-wait defect); a gated app restarted manually while `Starting` does not have the old wait mark the new process online.
 
@@ -1381,6 +1390,19 @@ notify 8.2.0 has exactly **one** default feature — `[features] default = ["mac
 Two things a reviewer should know before reading `cargo tree`. The `RecommendedCache` claim above is platform-conditional and the platform that matters most is the one where it does the least: `notify-debouncer-full-0.7.0/src/cache.rs:61-65` types it as `NoCache` on Linux, Android and wasm, and as `FileIdMap` everywhere else. And the macOS polling-fallback trap the feature line guards against cannot actually fire from this manifest alone — notify-debouncer-full's own `[dependencies.notify]` leaves default features on, so feature unification switches `macos_fsevent` on regardless. The explicit line is belt-and-braces: it keeps the guarantee if the debouncer ever tightens its own dependency, and it is one line.
 
 - [ ] **Step 1: Add both crates, run the `-Z minimal-versions` rehearsal** (the three-command sequence from Task 1, Step 4) **and the MSRV check from Global Constraints**, each from its own exit code. notify 8.2.0 declares 1.77 and notify-debouncer-full 0.7.0 declares 1.85, so both clear 1.88 — running it is what makes that checked rather than assumed.
+
+**The rehearsal fails here, and the floor it wants is already known**, so this is the one dependency whose pin can be written before the command is run rather than after. notify 8.2.0 asks for `fsevent-sys = "4.0.0"` (`notify-8.2.0/Cargo.toml`, the `cfg(target_os="macos")` block) but its `fsevent.rs` calls `FSEventsGetCurrentEventId`, `FSEventStreamGetDeviceBeingWatched` and `FSEventsPurgeEventsForDeviceUpToEventId`, none of which exist before fsevent-sys 4.1.0. Under `-Z minimal-versions` on macOS that is three `E0425`s inside notify itself. The pin follows the block already in the root manifest, and needs shep-daemon's `[target.'cfg(any())'.dependencies]` opt-in to be in the graph at all:
+
+```toml
+# Transitive floor pin: notify 8.2.0 declares fsevent-sys "4.0.0", but its
+# fsevent.rs needs `FSEventsGetCurrentEventId`,
+# `FSEventStreamGetDeviceBeingWatched` and
+# `FSEventsPurgeEventsForDeviceUpToEventId`, all added in 4.1.0. macOS only,
+# but the pin is unconditional because that is where the rehearsal runs.
+fsevent-sys = "4.1.0"
+```
+
+With it, the rehearsal resolves and builds clean; without it, it does not. Run the rehearsal anyway — this floor is the one that is known, not the only one that can exist.
 
 `#[derive(Debug)]` on `WatchSource` is fine and needs no manual impl: `Debouncer<T, C>` derives `Debug` (`notify-debouncer-full-0.7.0/src/lib.rs:544`) and both `RecommendedWatcher` and `RecommendedCache` satisfy the derive's bounds. Verified by compiling the exact newtype.
 - [ ] **Step 2: `touch` in `testing.rs`**
@@ -1481,7 +1503,7 @@ pub fn spawn_watch_group(
 loop {
     batch = rx.recv().await                        // None => the source is gone, return
     if !batch.iter().any(|p| filter.triggers(p)) { continue }
-    supervisor.restart(Name(name)).await
+    if let Err(err) = supervisor.restart(Name(name)).await { ... }   // cron.rs's three arms
     // events that arrived during the restart are still queued in rx;
     // the next iteration drains and re-filters them
 }
@@ -1641,7 +1663,7 @@ impl fmt::Debug for Extras {
 }
 ```
 
-`SupervisorBuilder`'s `#[derive(Debug)]` below then works, and only then: a derive bounds the type parameter but requires every *field* type to be `Debug` unconditionally, and it will hold an `Extras`. `PollingEnforcer` and `SysinfoSampler` need the same decision made deliberately — both wrap types that are not `Debug`-friendly. `WatchSource` is the one that does **not**: `Debouncer<T, C>` derives `Debug` and both recommended type aliases satisfy the bounds, verified by compiling the newtype, so its `#[derive(Debug)]` stands as written.
+`SupervisorBuilder`'s `#[derive(Debug)]` below then works, and only then: a derive bounds the type parameter but requires every *field* type to be `Debug` unconditionally, and it will hold an `Extras`. `PollingEnforcer` needs the same decision made deliberately — it holds a seam that is not `Debug`. `SysinfoSampler` does **not**, and an earlier draft of this plan said it did: `sysinfo::System` implements `Debug`, so a plain `#[derive(Debug)]` over its `Mutex<System>` compiles as written, checked against 0.38.4 on the host and on `x86_64-pc-windows-gnu`. A hand-rolled impl there is work for nothing. `WatchSource` is likewise fine: `Debouncer<T, C>` derives `Debug` and both recommended type aliases satisfy the bounds, verified by compiling the newtype, so its `#[derive(Debug)]` stands as written.
 
 **What is armed where, and why the shapes differ:**
 
@@ -1830,7 +1852,7 @@ An `interval` of zero deserves a decision rather than a sweep result: a zero-int
 2. **Watch ignores what it should.** The same sheep, a write to a dot-file, and the restart count still 0 after the same deadline. This is the case that fails if the default ignores are dropped, and it is the reason case 1 alone is not enough.
 3. **Readiness gates online.** A sheep with `wait_ready = true` whose script blocks on an explicit signal — a sentinel file the test creates — before writing `{"kind":"ready"}` to the shepherd channel: `shep flock` shows `starting`, then `online`. This is the only tier that exercises the real fd-3 channel end to end.
 
-   **Do not script this as a delay.** `listen_timeout` defaults to 3000ms (`crates/shep-core/src/config/app.rs:105`, `:180`) and on elapse this phase takes the sheep `Online` anyway, so a delay-based script gives the test a `starting` window bounded above by three seconds — inside which it must fit a spawn, an RPC round trip and a JSON parse — and a loaded runner turns that into a red suite with no regression behind it. A sentinel makes the window as wide as the test needs. Raise the app's `listen_timeout` for this case too, so the observation window and the timeout window are not the same window.
+   **Do not script this as a delay.** `listen_timeout` defaults to 3000ms (`crates/shep-core/src/config/app.rs:105-106`, `:178`) and on elapse this phase takes the sheep `Online` anyway, so a delay-based script gives the test a `starting` window bounded above by three seconds — inside which it must fit a spawn, an RPC round trip and a JSON parse — and a loaded runner turns that into a red suite with no regression behind it. A sentinel makes the window as wide as the test needs. Raise the app's `listen_timeout` for this case too, so the observation window and the timeout window are not the same window.
 4. **A bad cron pattern is a config error with the right exit code.** `shep start` against a Flockfile with `cron_restart = "not a cron"` exits `4` (invalid config, spec §9) and its stderr JSON carries the pattern. Assert the exit code and the presence of the pattern in the message — the exact wording is croner's and is not ours to pin.
 5. **An `https://` probe target is a config error.** Same shape, exit `4`, message names the target.
 
