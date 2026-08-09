@@ -64,7 +64,7 @@ pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
     } else if let Some(tz_name) = &app.cron_timezone {
         // A Flockfile can carry `cron_timezone` with no `cron_restart` to
         // pair it with — still a typo the user wants to hear about (spec §5).
-        crate::config::cron::parse_timezone_name(tz_name).map_err(|()| {
+        crate::config::cron::parse_timezone_name(tz_name).ok_or_else(|| {
             NormalizeError::InvalidTimezone {
                 name: tz_name.clone(),
             }

@@ -65,7 +65,7 @@ impl CronSchedule {
     /// - [`CronParseError::Timezone`] — the name is not an IANA zone.
     pub fn parse(pattern: &str, timezone: Option<&str>) -> Result<Self, CronParseError> {
         let zone = match timezone {
-            Some(name) => parse_timezone_name(name).map_err(|()| CronParseError::Timezone {
+            Some(name) => parse_timezone_name(name).ok_or_else(|| CronParseError::Timezone {
                 name: name.to_string(),
             })?,
             None => Tz::UTC,
@@ -103,6 +103,18 @@ impl CronSchedule {
     ///
     /// - [`CronScheduleError::Search`] — croner failed the search for a reason
     ///   other than exhaustion, carrying its own sentence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if converting `after` into `zone`'s local calendar lands
+    /// outside the range chrono's `NaiveDateTime` can represent — chrono
+    /// panics rather than erroring in that case, and croner has no fallible
+    /// entry point that avoids it (e.g. `DateTime::<Utc>::MAX_UTC` read in
+    /// `Pacific/Kiritimati`, UTC+14, which pushes the local instant past the
+    /// representable range). Unreachable from `Utc::now()`, which is the
+    /// only `after` this crate's own callers pass; documented rather than
+    /// guarded because a guard would exist solely for an instant no caller
+    /// can construct without going out of their way to do it.
     pub fn next_after(
         &self,
         after: DateTime<Utc>,
@@ -202,14 +214,22 @@ fn cron_parser() -> CronParser {
 /// `normalize`'s standalone `cron_timezone` check — a Flockfile may carry a
 /// timezone with no `cron_restart` to pair it with, and spec §5 says that
 /// typo fails loudly too.
-pub(super) fn parse_timezone_name(name: &str) -> Result<Tz, ()> {
-    name.parse::<Tz>().map_err(|_| ())
+pub(super) fn parse_timezone_name(name: &str) -> Option<Tz> {
+    name.parse::<Tz>().ok()
 }
 
 /// True when `trimmed` is exactly one whitespace-free token starting with
 /// `@` — the only shape nickname expansion applies to. A multi-token pattern
 /// that happens to contain `@` is left alone; croner will reject it on its
 /// own terms.
+///
+/// The `split_whitespace().count() == 1` clause has no mutation test of its
+/// own: a multi-token `@`-leading pattern ends in `Err(CronParseError::Pattern)`
+/// either way, whether this function routes it to [`expand_nickname`]'s
+/// "not a recognized nickname" rejection or leaves it for croner's own
+/// malformed-pattern rejection. Weakening the clause changes which message
+/// fires, not whether the pattern is accepted, so it reads as unguarded —
+/// noted here rather than left looking load-bearing.
 fn is_single_at_token(trimmed: &str) -> bool {
     trimmed.starts_with('@') && trimmed.split_whitespace().count() == 1
 }
@@ -220,11 +240,13 @@ fn is_single_at_token(trimmed: &str) -> bool {
 /// read as a field-count complaint that says nothing about nicknames.
 fn expand_nickname(trimmed: &str, original: &str) -> Result<String, CronParseError> {
     if trimmed.eq_ignore_ascii_case("@reboot") {
+        // Just the reason, not "@reboot is not a supported cron_restart
+        // pattern:" again — the caller's `CronParseError::Pattern` Display
+        // impl already renders `invalid cron_restart pattern `@reboot`:`
+        // ahead of this, and repeating it here doubled the message.
         return Err(CronParseError::Pattern {
             pattern: original.to_string(),
-            reason: "@reboot is not a supported cron_restart pattern: shep's own restart \
-                      policy already decides when a sheep starts"
-                .to_string(),
+            reason: "shep's own restart policy already decides when a sheep starts".to_string(),
         });
     }
     for (name, expansion) in NICKNAMES {
@@ -372,8 +394,26 @@ mod tests {
         // fails if any expansion is wrong (`@weekly` as `0 0 * * 1` is the
         // likely slip) and fails if `@midnight` was left to croner, whose
         // nickname table has no arm for it
+        //
+        // The five-field forms below are transcribed by hand from spec §4
+        // and do NOT read the module's `NICKNAMES` table — comparing a
+        // nickname's expansion against a copy of the same table it came
+        // from is a tautology (corrupting `NICKNAMES` corrupts both sides
+        // of the comparison identically, so the test still passes). Proven
+        // by mutation: with this table read from `NICKNAMES`, mutating
+        // `@weekly`'s row to `0 0 * * 1` — the exact slip named above — left
+        // all tests green.
         let anchor = dt("2026-01-01T00:00:00Z");
-        for (nickname, five_field) in NICKNAMES {
+        let expected_expansions: [(&str, &str); 7] = [
+            ("@yearly", "0 0 1 1 *"),
+            ("@annually", "0 0 1 1 *"),
+            ("@monthly", "0 0 1 * *"),
+            ("@weekly", "0 0 * * 0"),
+            ("@daily", "0 0 * * *"),
+            ("@midnight", "0 0 * * *"),
+            ("@hourly", "0 * * * *"),
+        ];
+        for (nickname, five_field) in expected_expansions {
             let via_nickname = CronSchedule::parse(nickname, None).unwrap();
             let via_five_field = CronSchedule::parse(five_field, None).unwrap();
             assert_eq!(
@@ -415,8 +455,7 @@ mod tests {
                 assert_eq!(pattern, "@reboot");
                 assert_eq!(
                     reason,
-                    "@reboot is not a supported cron_restart pattern: shep's own restart \
-                     policy already decides when a sheep starts"
+                    "shep's own restart policy already decides when a sheep starts"
                 );
             }
             other => panic!("expected Pattern error, got {other:?}"),
@@ -538,6 +577,24 @@ mod tests {
         // `Ok(None)` that `TimeSearchLimitExceeded` alone must produce
         let schedule = CronSchedule::parse("0 0 30 2 *", None).unwrap();
         assert_eq!(schedule.next_after(dt("2026-01-01T00:00:00Z")), Ok(None));
+    }
+
+    #[test]
+    fn search_failure_other_than_exhaustion_surfaces_as_err() {
+        // fails if `Err(_) => Ok(None)` collapses the two `CronError` arms
+        // into one — the inversion that turns a transient search failure
+        // into "this schedule never fires again", the same shape as the
+        // `Ok(None)` above but silently wrong instead of correct. A
+        // maximal-UTC instant pushes the zone conversion past what croner
+        // can search from, which it reports as `InvalidTime` rather than
+        // `TimeSearchLimitExceeded` — the `Err` arm this schedule must take.
+        let schedule = CronSchedule::parse("0 3 * * *", None).unwrap();
+        match schedule.next_after(DateTime::<Utc>::MAX_UTC) {
+            Err(CronScheduleError::Search { reason }) => {
+                assert_eq!(reason, "CronScheduler encountered an invalid time.");
+            }
+            other => panic!("expected Err(Search), got {other:?}"),
+        }
     }
 
     #[test]
