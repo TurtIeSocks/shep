@@ -25,6 +25,7 @@ use core::time::Duration;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -117,6 +118,15 @@ impl OsProber {
         // running — a 10s interval against a command that takes 30s
         // accumulates processes until the box falls over.
         cmd.kill_on_drop(true);
+        // A probe's output is the probe's business, never the daemon's. The
+        // default is inheritance, which puts a `curl`-style probe's entire
+        // response body — bearer tokens, session cookies, whatever the
+        // endpoint returns — into the daemon's own stdout once per interval,
+        // forever. The verdict this prober needs is the exit status alone,
+        // so there is nothing to read and no reason to keep a pipe.
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
         if let Some(cwd) = &self.cwd {
             cmd.current_dir(cwd);
         }
@@ -564,6 +574,28 @@ mod tests {
         env.insert("SHEP_PROBE_OWN_VAR".to_string(), "expected".to_string());
         let prober = OsProber::new(None, env);
         let command = "test \"$SHEP_PROBE_OWN_VAR\" = expected && [ -z \"${HOME:-}\" ]";
+        let result = prober.probe(&exec_target(command), PROBE_TIMEOUT).await;
+        assert_eq!(result, Ok(()));
+    }
+
+    // fails if the exec probe leaves stdio inherited, which is `Command`'s
+    // default: a `curl`-style probe then writes its whole response body —
+    // bearer tokens and all — into the daemon's own stdout once per interval.
+    //
+    // Asserted from INSIDE the child because nothing in the parent can read a
+    // `Command`'s configured stdio back, and because libtest's capture swaps
+    // a thread-local rather than fd 1 — an inherited child really does write
+    // to the harness's own stdout. `/dev/null` is a character device that is
+    // not a terminal; every realistic inherited stdout is a pipe (CI, any
+    // captured run), a regular file (`cargo test > log`) or a terminal, and
+    // each of those fails one of the two checks.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_probe_gets_null_stdio_rather_than_the_daemons() {
+        let prober = OsProber::new(None, BTreeMap::new());
+        let command = "[ -c /dev/fd/0 ] && [ ! -t 0 ] \
+                       && [ -c /dev/fd/1 ] && [ ! -t 1 ] \
+                       && [ -c /dev/fd/2 ] && [ ! -t 2 ]";
         let result = prober.probe(&exec_target(command), PROBE_TIMEOUT).await;
         assert_eq!(result, Ok(()));
     }
