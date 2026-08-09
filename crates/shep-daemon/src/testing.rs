@@ -1,6 +1,5 @@
-// IR-33: one crate-root fixture module. Every test mod from Task 3 onward
-// (and the harness in Tasks 4-5) shares this one `test_paths` helper instead
-// of hand-rolling its own.
+// IR-33: one crate-root fixture module; every test module in this crate
+// shares this `test_paths` helper instead of hand-rolling its own.
 use std::sync::Arc;
 
 use shep_core::paths::ShepPaths;
@@ -42,8 +41,8 @@ pub(crate) fn test_paths(dir: &tempfile::TempDir) -> ShepPaths {
     )
 }
 
-// IR-33: `rpc.rs`'s dispatch tests (Task 4) and the connection-server's
-// tests (Task 5) need the exact same fixture — one factory, not two.
+// IR-33: the dispatch tests and the connection-server's tests need the
+// exact same fixture — one factory, not two.
 pub(crate) struct Harness {
     pub(crate) ctx: RpcContext,
     // Kept alive only: dropping the tempdir would remove the paths `ctx`
