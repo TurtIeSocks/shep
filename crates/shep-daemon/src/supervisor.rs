@@ -2558,8 +2558,10 @@ mod tests {
         assert_eq!(handle.list().await.len(), 1);
     }
 
-    // An operator's `shep restart` resets the restart budget (spec §4) and
-    // respawns, and the operator gets the respawned sheep back as its reply.
+    // An operator's `shep restart` aimed at a RUNNING sheep resets the restart
+    // budget (spec §4) and respawns, and the operator gets the respawned sheep
+    // back as its reply. The not-running half of that claim is a third test,
+    // two below.
     //
     // fails if `handle_exited`'s `slot.entry.budget.reset()` is dropped —
     // that leaves the two spent unstable exits on the books, so the crash
@@ -2714,6 +2716,112 @@ mod tests {
             (ProcStatus::Online, 4),
             "an automatic restart left the two spent unstable exits on the \
              books -- got {settled:?}"
+        );
+    }
+
+    // The same reset, on the other of the two paths that perform it. A
+    // `restart` aimed at a sheep with no live task has no exit to ride, so it
+    // never reaches `handle_exited` — `apply_immediate` resets and respawns
+    // inline instead, and the operator's reply is that respawn rather than a
+    // deferred snapshot.
+    //
+    // `Stopped` is the not-running state used here because it is the settled
+    // one: `WaitingRestart` still holds a RestartDue timer scheduled against
+    // it, and `Errored` is only reachable with the budget already at the cap,
+    // where this proves the reset clears a PARTIAL carry.
+    //
+    // fails if `apply_immediate`'s `ManualKind::Restart` arm loses its
+    // `budget.reset()` -- that leaves the two unstable exits spent before the
+    // stop on the books, so the crash after the restart is the third of three
+    // and errors the sheep out at three restarts instead of carrying it to a
+    // fourth.
+    #[tokio::test(start_paused = true)]
+    async fn restarting_a_stopped_sheep_resets_the_budget() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        // Five procs, sized against the mutation rather than against a correct
+        // run: two unstable crashes, the long-lived proc they land on and the
+        // stop below ends, the respawn the restart performs (unstable again,
+        // to spend the budget the reset just cleared), and the proc a
+        // still-solvent budget restarts onto. That fifth spawn is the one a
+        // correct implementation performs and a mutated one never reaches —
+        // with the reset dropped the sheep is already `Errored` by then. A
+        // pool of four would answer it `SpawnFailed("script exhausted")`,
+        // which `respawn` also lands in `Errored` at three restarts, so the
+        // assertion below would fail identically whether the reset worked or
+        // not.
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::const_exit(1),
+            ProcScript::const_exit(1),
+            ProcScript::never_exits(),
+            ProcScript::const_exit(1),
+            ProcScript::never_exits(),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("svc", "./svc");
+        // Three rather than the default sixteen, so the two crashes below
+        // leave the budget one short of exhausted and a single further crash
+        // decides the test.
+        app.max_restarts = 3;
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        // Sync on state, not on the repeated Online event: immediate restarts
+        // mean restarts==2 once the never_exits proc is up.
+        loop {
+            let info = handle.list().await.remove(0);
+            if info.restarts == 2 && info.status == ProcStatus::Online {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // `stop` is what takes the sheep off its live task without touching
+        // the budget: `decide_on_exit` short-circuits to CleanStop on
+        // `manual_stop`, before it would ever classify the exit. The deferred
+        // reply resolves only once that exit has landed, so the sheep is
+        // settled in `Stopped` — no task, no timer — by the time the restart
+        // below is sent, and the two spent unstable exits are still on the
+        // books.
+        let stopped = handle
+            .stop(ProcessSelector::Name("svc".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(stopped[0].status, ProcStatus::Stopped);
+
+        let restarted = handle
+            .restart(ProcessSelector::Name("svc".to_string()))
+            .await
+            .unwrap();
+        // `apply_immediate`'s reply is the respawn itself, sent in the same
+        // actor turn that performed it — so it reads Online at the bumped
+        // restart count regardless of what that proc does next.
+        assert_eq!(
+            (restarted[0].status, restarted[0].restarts),
+            (ProcStatus::Online, 3)
+        );
+
+        // The proc that restart landed on is itself unstable. With the budget
+        // reset its exit is the FIRST of three again and the sheep restarts
+        // once more; without it, the third, and the sheep errors out.
+        // Bounded, unlike the sync loop above: the failing outcome here is a
+        // settled `Errored`, so an unbounded wait for the passing one would
+        // hang the test rather than fail it (rule 11). Every step in between
+        // is ready work — the restarts at this config are immediate — so the
+        // round trips below cannot be starved by the paused clock.
+        let mut settled = handle.list().await.remove(0);
+        for _ in 0..200 {
+            if settled.status == ProcStatus::Errored
+                || (settled.status == ProcStatus::Online && settled.restarts == 4)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+            settled = handle.list().await.remove(0);
+        }
+        assert_eq!(
+            (settled.status, settled.restarts),
+            (ProcStatus::Online, 4),
+            "restarting a stopped sheep left the two spent unstable exits on \
+             the books -- got {settled:?}"
         );
     }
 
