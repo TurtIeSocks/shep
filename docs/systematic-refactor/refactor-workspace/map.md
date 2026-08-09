@@ -40,8 +40,26 @@ src/
       Action: port + redesign
       Notes: pure AppConfig → Result<ResolvedApp> functions (mutation+Error-or-value → typed).
              Alias/default/env-merge rules byte-compatible: cmd→script, fork_mode, bash -c
-             on spaced scripts, log path defaults, filter_env. Cron validation via croner crate
-             (same pattern dialect as JS croner — compat safe).
+             on spaced scripts, log path defaults, filter_env. Cron validation delegates to
+             config/cron.rs, whose `cron_parser()` builds croner with `Seconds::Disallowed`:
+             FIVE-FIELD standard cron only, and croner's own `L`/`W`/`#`/`?` extensions are
+             rejected before the pattern reaches it. The seven vixie `@nicknames` are expanded
+             to five-field patterns first; `@reboot` is rejected. Same dialect stated from the
+             worker's side: the daemon's cron.rs entry below.
+      Rejects (spec §5 — a typo fails at parse time, not three seconds into a worker's life).
+             The list grows as subsystems land; as of Phase 4, `normalize` refuses:
+             - InvalidCron / InvalidTimezone — a pattern outside the dialect above; a
+               `cron_timezone` that is not an IANA name, checked even with no `cron_restart`
+             - InvalidProbe — a `readiness_probe`/`liveness_probe` target ProbeTarget::parse
+               rejects, `https://` included (no TLS in the prober — decision D1)
+             - ZeroFailureThreshold / ZeroInterval — a probe's `failure_threshold` or
+               `interval` explicitly `0`
+             - WatchWithoutCwd — `watch = true` with no `cwd` to arm a watcher over
+             - InvalidWatchGlob — a `watch_options` or `ignore_watch` pattern globset will
+               not compile; both lists are checked whether or not `watch` is on
+             Each carries the field it came from; the parsed values are discarded, since the
+             daemon re-parses when it arms the subsystem. `normalize`'s own `# Errors` section
+             is the authoritative list — keep the two in step.
     daemon_config.rs ← new module, no old equivalent            [MUST-HAVE #8]
       Action: write fresh
       Notes: daemon-level config file (TOML): metrics on/off+port, webhook targets, alert
@@ -144,14 +162,21 @@ src/
              misses report once, then the loop ends (the replacement pid gets a new loop).
              Hand-rolled HTTP with no TLS and no redirect following — `https://` targets are a
              config error (decision D1), rejected in shep-core so a typo fails at parse time.
-    os.rs            the real HTTP/TCP/exec prober. The only `cfg(unix)`/`cfg(windows)` in the
-                     Phase 4 modules, and only for shell selection.
+    os.rs            the real HTTP/TCP/exec prober, and these modules' OS tier. Three things in
+                     `probe_exec` and beside it are `cfg(unix)`/`cfg(windows)`, not one: shell
+                     selection (`sh -c` vs `cmd /C`), `process_group(0)` on the probe child, and
+                     the `kill_probe_group` unix/windows pair that SIGKILLs an abandoned probe's
+                     whole group (a no-op on windows, which has no group to signal). Everywhere
+                     else in the Phase 4 modules a `cfg` gates a TEST, not behavior — one in
+                     extras.rs, one in watch/source.rs, plus os.rs's own unix-only cases.
     ready.rs         `ReadinessSource`/`await_ready` — the starting→online gate. `wait_ready`
                      (channel) beats `readiness_probe`; with neither, a plain start is online at
                      spawn (the Heuristic source is reload's, not start's). A readiness TIMEOUT
-                     takes the sheep online with a warning — never `errored`, which would be the
+                     takes the sheep online SILENTLY — never `errored`, which would be the
                      restart loop max_restarts exists to contain, out of an app that is merely
-                     slow.
+                     slow. `Actor::handle_ready_result` does emit a `tracing::warn!` on that path,
+                     but no `tracing-subscriber` is wired anywhere in the workspace yet, so
+                     nothing renders it and the operator sees only the `online` transition.
   actions.rs         ← was lib/God/ActionMethods.js
       Action: port + redesign
       Notes: each RPC verb = async handler on Request enum arm (string dispatch dies).
@@ -206,9 +231,13 @@ src/
       Notes: the registry that arms all four subsystems above when a sheep goes live and disarms
              them across eight terminal transitions (seven disarming) plus its own Drop, which
              aborts every armed task — covering both a graceful shutdown that never kills a
-             WaitingRestart sheep and a panicking actor. Breach, liveness, cron and watch
-             restarts all route through `restart_automatic` (CommandOrigin::Automatic), so an
-             operator's stop or delete displaces one mid-ladder.
+             WaitingRestart sheep and a panicking actor. Cron and watch restarts route through
+             `SupervisorHandle::restart_automatic`; breach and liveness route through
+             `SupervisorHandle::extra_restart`, a separate `Command` variant whose handler drops
+             a stale report first — slot still present, pid still this sheep's, status still
+             Online — three guards `restart_automatic` does not carry (`handle_extra_restart`).
+             Both doors declare CommandOrigin::Automatic, so an operator's stop or delete
+             displaces either one mid-ladder.
   dog_support.rs    ← new module (decision #3: dog architecture)
       Action: write fresh
       Notes: daemon-side dog plumbing ONLY: enabled-dogs list in daemon_config → autostart
@@ -359,7 +388,7 @@ CI: fmt+clippy+nextest × {ubuntu,macos,windows} × {stable,MSRV}; llvm-cov; doc
 | ansis | owo-colors + anstream | NO_COLOR aware |
 | async.js | async/await + futures combinators | disappears |
 | eventemitter2 | tokio::sync::broadcast + typed enum | |
-| croner (JS) | croner (Rust, same lineage) | pattern-compat |
+| croner (JS) | croner (Rust, same lineage) | five-field subset only; croner's own `L`/`W`/`#`/`?` rejected |
 | dayjs | jiff/chrono + moment-token translator | log_date_format compat needs shim |
 | debug | tracing + EnvFilter (DEBUG=pm2:* mapped) | |
 | js-yaml | serde_yml | serde_yaml archived |
