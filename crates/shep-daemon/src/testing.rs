@@ -5,7 +5,7 @@ use core::pin::Pin;
 use core::time::Duration;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use chrono::{DateTime, Utc};
 use shep_core::config::{ProbeConfig, ProbeKind, ProbeTarget};
@@ -188,6 +188,14 @@ pub(crate) struct ScriptedProber {
     script: Vec<Result<(), ProbeFailure>>,
     calls: AtomicUsize,
     delay: Duration,
+    // The `timeout` argument of the most recent `probe()` call, in
+    // milliseconds. Nothing else in this fake reads it — `probe()` ignores
+    // its own `timeout` parameter exactly like it ignores `target` — but a
+    // caller that wires the wrong value in (e.g. `interval` where `timeout`
+    // belongs) has nothing else in this fixture to fail against, since
+    // every other assertion here is keyed on pass/fail outcomes and call
+    // counts alone.
+    last_timeout_ms: AtomicU64,
 }
 
 impl ScriptedProber {
@@ -199,6 +207,7 @@ impl ScriptedProber {
             script,
             calls: AtomicUsize::new(0),
             delay: Duration::ZERO,
+            last_timeout_ms: AtomicU64::new(0),
         }
     }
 
@@ -221,13 +230,19 @@ impl ScriptedProber {
     pub(crate) fn calls(&self) -> usize {
         self.calls.load(Ordering::Relaxed)
     }
+
+    /// The `timeout` argument passed to the most recently started
+    /// [`Prober::probe`] call. `Duration::ZERO` before the first call.
+    pub(crate) fn last_timeout(&self) -> Duration {
+        Duration::from_millis(self.last_timeout_ms.load(Ordering::Relaxed))
+    }
 }
 
 impl Prober for ScriptedProber {
     fn probe<'a>(
         &'a self,
         _target: &'a ProbeTarget,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<(), ProbeFailure>> + Send + 'a>> {
         Box::pin(async move {
             // Counted at call start, not at completion: a liveness loop that
@@ -236,6 +251,12 @@ impl Prober for ScriptedProber {
             // finished would make "no further calls after N intervals"
             // indistinguishable from "one more call currently in flight."
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            // Test timeouts are always small (single-digit seconds), so this
+            // cast cannot truncate in practice — and a wrong recorded value
+            // here only breaks a test's own assertion, never production
+            // behavior.
+            self.last_timeout_ms
+                .store(timeout.as_millis() as u64, Ordering::Relaxed);
             tokio::time::sleep(self.delay).await;
             if self.script.is_empty() {
                 return Ok(());

@@ -46,14 +46,54 @@ pub enum ProbeFailure {
 // — once per `interval`, default 10s — against three extra generic parameters
 // threaded through the actor and every fixture.
 /// Runs one probe against one target.
+///
+/// # Design note: `timeout` enforcement is the implementation's job
+///
+/// [`spawn_liveness_task`] awaits [`Self::probe`] directly; it does not
+/// additionally wrap the call in its own `tokio::time::timeout`. That means
+/// a `Prober` whose `probe` future never resolves — hangs rather than
+/// erroring — stalls the liveness loop forever: no further probes, no
+/// report, ever. This is an accepted design risk, not a defect (bounding
+/// every code path by `timeout` needs implementation-specific knowledge,
+/// e.g. a connect timeout versus a read timeout, that this seam has no
+/// business dictating) — but any implementor (`OsProber`, Task 8, chief
+/// among them) must itself guarantee `probe` resolves within `timeout` on
+/// every path, or a hung sheep's liveness detection silently stops working.
 pub trait Prober: Send + Sync + 'static {
     /// Probes `target`, giving up after `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ProbeFailure::Timeout`] — the probe did not finish inside
+    ///   `timeout`.
+    /// - [`ProbeFailure::Transport`] — the transport failed before a verdict
+    ///   was possible (connection refused, DNS failure, the command could
+    ///   not be spawned).
+    /// - [`ProbeFailure::Rejected`] — the probe completed and the answer was
+    ///   negative (a non-2xx status, or a non-zero exit).
     fn probe<'a>(
         &'a self,
         target: &'a ProbeTarget,
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<(), ProbeFailure>> + Send + 'a>>;
 }
+
+/// Floor `spawn_liveness_task` enforces on `interval`, regardless of caller.
+///
+/// `shep-core`'s `normalize` already rejects an explicit `interval = "0"` in
+/// a Flockfile (`NormalizeError::ZeroInterval`) — but that guard lives
+/// behind boot wiring this module does not own (the same reason
+/// `cron::MIN_MAX_SLEEP` keeps its own floor even though `shep-core`
+/// separately rejects a too-small `max_cron_sleep`), so it protects only the
+/// call site that reaches it, once one exists. Without a floor here too, any
+/// caller — today's tests, or a boot path added later that forgets to route
+/// through the validated config — could hand this loop a `Duration::ZERO`
+/// interval and turn it into a hot spin: measured live at roughly 380 probes
+/// per second, which for `ProbeKind::Exec` is that many process spawns per
+/// second, per sheep, forever. The value matches `cron::MIN_MAX_SLEEP` in
+/// spirit; it is declared independently because that constant is private to
+/// its own module.
+const MIN_PROBE_INTERVAL: Duration = Duration::from_millis(1_000);
 
 /// A sheep whose liveness probe hit `failure_threshold`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +122,7 @@ pub fn spawn_liveness_task(
     prober: Arc<dyn Prober>,
     failures: mpsc::Sender<LivenessFailure>,
 ) -> tokio::task::JoinHandle<()> {
-    let interval = config.interval.as_duration();
+    let interval = config.interval.as_duration().max(MIN_PROBE_INTERVAL);
     let timeout = config.timeout.as_duration();
     let threshold = config.failure_threshold;
     tokio::spawn(async move {
@@ -225,6 +265,7 @@ mod tests {
     async fn three_consecutive_failures_report_at_exactly_three_intervals() {
         let config = config_with_threshold(3);
         let interval = config.interval.as_duration();
+        let timeout = config.timeout.as_duration();
         let prober = Arc::new(ScriptedProber::new(vec![
             Err(ProbeFailure::Timeout),
             Err(ProbeFailure::Timeout),
@@ -243,41 +284,36 @@ mod tests {
             interval * 3,
             "liveness failure should be reported at exactly the third probe, not before or after"
         );
+        // fails if `spawn_liveness_task` wires the wrong argument into
+        // `prober.probe(&target, ..)` — e.g. `interval` where `timeout`
+        // belongs, or `Duration::ZERO` — since nothing else exercises this
+        // parameter: `ScriptedProber` ignores it for every other purpose,
+        // and `OsProber` (Task 8) is tested standalone, never through this
+        // loop.
+        assert_eq!(
+            prober.last_timeout(),
+            timeout,
+            "the loop must pass config.timeout, not some other duration, to Prober::probe"
+        );
     }
 
-    // fails if the consecutive-failure counter accumulates non-consecutive
-    // failures instead of resetting on any pass
-    #[tokio::test(start_paused = true)]
-    async fn a_pass_resets_the_consecutive_failure_counter() {
-        let config = config_with_threshold(3);
-        let interval = config.interval.as_duration();
-        let prober = Arc::new(ScriptedProber::new(vec![
-            Err(ProbeFailure::Timeout),
-            Err(ProbeFailure::Timeout),
-            Ok(()),
-            Err(ProbeFailure::Timeout),
-            Err(ProbeFailure::Timeout),
-        ]));
-        let (tx, mut rx) = mpsc::channel(8);
-        // A held clone, not the moved original: `failures` is documented as
-        // a shared sender cloned once per arming, and this loop never
-        // reports in this test, but the pattern is kept uniform with the
-        // tests below where it matters — a self-ending loop holding the
-        // *only* sender would close the channel out from under a
-        // still-pending `assert_no_failure_within`, turning "nothing
-        // arrived" into a spurious "channel disconnected" panic.
-        let _handle = spawn_and_settle(
-            2,
-            200,
-            config,
-            Arc::clone(&prober) as Arc<dyn Prober>,
-            tx.clone(),
-        )
-        .await;
-
-        assert_no_failure_within(&mut rx, intervals(interval, 5)).await;
-    }
-
+    // No separate "a pass resets the counter" test: an earlier version of
+    // this test ran the same `[Fail, Fail, Pass, Fail, Fail]` timeline as
+    // `counter_re_accumulates_after_a_reset_and_trips_on_the_sixth_probe`
+    // below and asserted only "no failure within 5 intervals." That claim
+    // is a strict corollary of the test below's — which pins the failure to
+    // *exactly* interval 6 — not an independent one: `ScriptedProber`
+    // repeats its last scripted outcome (`Fail`) forever, so this timeline
+    // was never going to stay silent past interval 6 either way, and the
+    // 5-interval bound was really just "however far below 6 stays true," a
+    // fact the removed test never stated. Mutation testing already showed
+    // the equivalence directly — removing the counter's reset broke *both*
+    // the old absence check (an unexpected failure arrived early) and this
+    // test's exact-instant assertion (tripped at 4×interval, not 6×) for
+    // the same single-line bug. A test whose failure mode is a strictly
+    // weaker read of a fact this one already pins exactly earns deletion
+    // instead of a documentation-only note in the brief.
+    //
     // fails if the counter resets on a pass but then double-counts
     // afterward, or if a reset counter never re-arms and the loop stops
     // checking the threshold at all
@@ -343,14 +379,14 @@ mod tests {
         let interval = config.interval.as_duration();
         let prober = Arc::new(ScriptedProber::new(vec![Err(ProbeFailure::Timeout)]));
         let (tx, mut rx) = mpsc::channel(8);
-        // A held clone, not the moved original (see the comment in
-        // `a_pass_resets_the_consecutive_failure_counter`): this loop DOES
-        // report and end partway through this test, so without a spare
-        // clone kept alive here, the channel would close the instant the
-        // loop's own sender drops, and the `assert_no_failure_within` below
-        // would observe `Ok(None)` (disconnected) instead of a timeout —
-        // "channel closed" and "loop correctly silent" must stay
-        // distinguishable, and only a live spare sender keeps them so.
+        // A held clone, not the moved original: `failures` is documented as
+        // a shared sender cloned once per arming, and this loop DOES report
+        // and end partway through this test, so without a spare clone kept
+        // alive here, the channel would close the instant the loop's own
+        // sender drops, and the `assert_no_failure_within` below would
+        // observe `Ok(None)` (disconnected) instead of a timeout — "channel
+        // closed" and "loop correctly silent" must stay distinguishable,
+        // and only a live spare sender keeps them so.
         let _handle = spawn_and_settle(
             5,
             500,
@@ -424,6 +460,46 @@ mod tests {
             prober.calls(),
             calls_before_abort,
             "prober must not be called again once the handle has been aborted"
+        );
+    }
+
+    // fails if a zero (or otherwise sub-floor) `interval` is trusted instead
+    // of clamped to `MIN_PROBE_INTERVAL`: an unclamped `Duration::ZERO`
+    // would spin the loop as fast as the runtime allows — measured live at
+    // roughly 380 probes/sec, which for `ProbeKind::Exec` means that many
+    // process spawns per second, per sheep, forever. `shep-core::normalize`
+    // rejects an explicit `interval = "0"` in a Flockfile, but this test
+    // constructs a `ProbeConfig` directly (as a caller that skipped
+    // normalization, or a future boot path with a bug, would) to prove this
+    // loop does not simply trust that every caller validated first.
+    //
+    // Confirmed live (mutation testing, not just written down): with the
+    // clamp removed, this test does not fail — it hangs. A `Duration::ZERO`
+    // sleep resolves the instant it is polled, on a paused clock exactly as
+    // on a real one, so the loop never actually parks on a pending timer for
+    // the runtime's auto-advance to fast-forward past; it just spins,
+    // consuming real CPU forever. The backstop for that mutation is the CI
+    // job's own timeout, the same shape `cron::tests::
+    // exhausted_pattern_ends_the_task_without_restarting` already documents
+    // for its own busy-spin mutation.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_interval_is_clamped_instead_of_hot_spinning() {
+        let config = ProbeConfig {
+            interval: shep_core::values::UpDuration::from_millis(0),
+            ..config_with_threshold(1000) // high enough it never trips
+        };
+        let prober = Arc::new(ScriptedProber::new(vec![Ok(())]));
+        let (tx, _rx) = mpsc::channel(8);
+        let _handle =
+            spawn_and_settle(8, 800, config, Arc::clone(&prober) as Arc<dyn Prober>, tx).await;
+
+        // Cross exactly 5 floored intervals; a hot-spinning loop would rack
+        // up far more than 5 calls in this same span.
+        tokio::time::sleep(intervals(MIN_PROBE_INTERVAL, 5)).await;
+        assert_eq!(
+            prober.calls(),
+            5,
+            "interval must be clamped to MIN_PROBE_INTERVAL, not trusted as-is"
         );
     }
 }

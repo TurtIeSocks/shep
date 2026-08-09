@@ -46,6 +46,8 @@ impl ResolvedApp {
 ///   the rendered reason).
 /// - [`NormalizeError::ZeroFailureThreshold`] — a probe's `failure_threshold`
 ///   is explicitly `0`.
+/// - [`NormalizeError::ZeroInterval`] — a probe's `interval` is explicitly
+///   `0`.
 /// - [`NormalizeError::WatchWithoutCwd`] — `watch` is `true` with no `cwd`
 ///   set.
 pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
@@ -107,6 +109,18 @@ fn validate_probe(probe: Option<&ProbeConfig>, name: &'static str) -> Result<(),
         // anybody wants, and it would make the liveness loop restart the
         // sheep immediately and forever.
         return Err(NormalizeError::ZeroFailureThreshold { probe: name });
+    }
+    if probe.interval.as_millis() == 0 {
+        // Not a configuration anybody wants either: `spawn_liveness_task`
+        // sleeps `interval` between probes, so a zero would turn it into a
+        // hot spin — for `ProbeKind::Exec`, hundreds of process spawns per
+        // second, per sheep, forever. shep-daemon's own loop floors this
+        // independently too (its `MIN_PROBE_INTERVAL`), the same
+        // belt-and-suspenders shape `cron::MIN_MAX_SLEEP` uses opposite
+        // `max_cron_sleep`'s config-time floor — this crate does not own
+        // the boot wiring that guarantees every `ProbeConfig` reaching the
+        // loop came through here.
+        return Err(NormalizeError::ZeroInterval { probe: name });
     }
     Ok(())
 }
@@ -176,6 +190,14 @@ pub enum NormalizeError {
         /// name, so the error names the line the user has to edit.
         probe: &'static str,
     },
+    /// A `readiness_probe` or `liveness_probe` has `interval == 0`, which
+    /// would spin its liveness/readiness loop as fast as the runtime
+    /// allows.
+    ZeroInterval {
+        /// `"readiness_probe"` or `"liveness_probe"` — the Flockfile field
+        /// name, so the error names the line the user has to edit.
+        probe: &'static str,
+    },
     /// `watch` is enabled but the app sets no `cwd`, so there is no
     /// directory to watch. Carries the app name.
     WatchWithoutCwd {
@@ -206,6 +228,9 @@ impl fmt::Display for NormalizeError {
             Self::InvalidProbe { probe, reason } => write!(f, "{probe}: {reason}"),
             Self::ZeroFailureThreshold { probe } => {
                 write!(f, "{probe}.failure_threshold must be at least 1")
+            }
+            Self::ZeroInterval { probe } => {
+                write!(f, "{probe}.interval must be greater than 0")
             }
             Self::WatchWithoutCwd { name } => {
                 write!(f, "sheep `{name}` has watch = true but no cwd to watch")
@@ -380,6 +405,26 @@ mod tests {
         // fails if the message regresses to a bare variant name with no
         // explanation — following the sibling precedent at app.rs:261.
         assert!(err.to_string().contains("at least 1"), "{err}");
+    }
+
+    #[test]
+    fn zero_interval_rejected() {
+        // fails if interval is never inspected — a zero interval would spin
+        // the liveness/readiness loop as fast as the runtime allows
+        let mut app = AppConfig::minimal("web", "./srv");
+        let mut probe = probe_config("http://127.0.0.1:8080/healthz");
+        probe.interval = crate::values::UpDuration::from_millis(0);
+        app.readiness_probe = Some(probe);
+        let err = normalize(app).unwrap_err();
+        assert_eq!(
+            err,
+            NormalizeError::ZeroInterval {
+                probe: "readiness_probe"
+            }
+        );
+        // fails if the message regresses to a bare variant name with no
+        // explanation — following the sibling precedent at app.rs:261.
+        assert!(err.to_string().contains("greater than 0"), "{err}");
     }
 
     #[test]
