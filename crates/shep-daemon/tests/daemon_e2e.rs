@@ -25,6 +25,7 @@ use shep_core::protocol::{
     decode_frame, encode_frame,
 };
 use shep_core::status::ProcStatus;
+use shep_core::values::UpDuration;
 
 use shep_daemon::boot::{BootError, BootOptions, boot};
 use shep_daemon::rpc::RpcContext;
@@ -409,6 +410,78 @@ async fn log_lines_reach_a_log_subscriber() {
 
     let line = client.await_log_line(id).await;
     assert_eq!(line, "hello-flock");
+
+    fixture.shutdown().await;
+}
+
+/// How long this test waits for the gated sheep's `Online`. Generous for a
+/// loaded runner, but a small fraction of the `listen_timeout` below — the
+/// gap between the two is the whole assertion.
+const READY_DEADLINE: Duration = Duration::from_secs(5);
+
+/// A `wait_ready` sheep must go online off its OWN `{"kind":"ready"}` write,
+/// not off the deadline that follows it.
+///
+/// This is the only test in the workspace that drives a real child's fd 3
+/// all the way through `run_sheep`'s `ChildMessage::Ready -> Msg::Ready`
+/// forward to the readiness wait. The unit tier pushes `Msg::Ready` into the
+/// actor's mailbox directly — downstream of that forward — so deleting the
+/// forward leaves the whole unit tier green while every `wait_ready` app in
+/// production sits at `starting` for its entire `listen_timeout`.
+///
+/// `listen_timeout` is set two orders of magnitude past [`READY_DEADLINE`]
+/// on purpose. A gated sheep reaches `online` eventually either way (a
+/// readiness deadline is a warning, not a failure — see the supervisor's
+/// `handle_ready_result`), so only an `Online` that arrives EARLY can tell a
+/// forwarded ready message apart from an expired one.
+#[tokio::test]
+async fn a_wait_ready_sheep_goes_online_on_its_own_channel_message() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+
+    // Subscribe BEFORE starting: the bus delivers from the moment you join.
+    let subscribed = client
+        .request(Request::Subscribe {
+            topics: vec!["process.*".to_string()],
+        })
+        .await;
+    assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
+
+    let mut app = AppConfig::minimal("greeter", "/bin/sh");
+    app.interpreter = Some("none".to_string());
+    // `wait_ready` is what makes `assemble` open fd 3 at all, so the same
+    // flag arms the gate and gives the child something to write to.
+    app.wait_ready = true;
+    app.args = vec![
+        "-c".to_string(),
+        r#"printf '{"kind":"ready"}\n' >&3; while :; do sleep 1; done"#.to_string(),
+    ];
+    app.listen_timeout = UpDuration::from_millis(600_000);
+
+    let started = client.request(Request::Start { apps: vec![app] }).await;
+    let Response::Started(infos) = started.result.unwrap() else {
+        panic!("expected started")
+    };
+    let id = infos[0].id;
+    assert_eq!(
+        infos[0].status,
+        ProcStatus::Starting,
+        "a gated sheep is `starting` when Start replies, never `online`"
+    );
+
+    let online = tokio::time::timeout(
+        READY_DEADLINE,
+        client.await_process_event(id, ProcessEventKind::Online),
+    )
+    .await
+    .expect("the child's own ready message must bring the sheep online");
+    assert_eq!(online.status, ProcStatus::Online);
+
+    let listed = client.request(Request::ListFlock).await;
+    let Response::Flock(flock) = listed.result.unwrap() else {
+        panic!("expected flock")
+    };
+    assert_eq!(flock[0].status, ProcStatus::Online);
 
     fixture.shutdown().await;
 }
