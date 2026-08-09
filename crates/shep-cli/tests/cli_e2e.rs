@@ -90,6 +90,21 @@ const GUARD_PID_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// running, which is when the pid reaches disk. See [`sweep_flock`].
 const GUARD_SWEEP_WINDOW: Duration = Duration::from_secs(2);
 
+/// How long [`poll_flock`] keeps asking before returning whatever it last
+/// saw.
+///
+/// One deadline for both directions, deliberately: the case that waits for a
+/// watch-triggered restart and the case that waits to be sure a dot-file
+/// caused none must wait the *same* length, or the negative case proves only
+/// that it looked sooner. Sized against the 500ms `DEFAULT_WATCH_DELAY`
+/// debounce plus a spawn and two RPC round trips — roughly an order of
+/// magnitude of headroom on an idle machine, which is what a loaded one
+/// needs.
+const FLOCK_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Gap between [`poll_flock`]'s attempts.
+const FLOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 // --- Fixture helpers ---------------------------------------------------
 
 /// The path of the committed `--format json` fixture named `name`.
@@ -188,13 +203,54 @@ fn write_logging_script(dir: &TempDir, out_marker: &str, err_marker: Option<&str
     write_script(dir, "logging.sh", &script)
 }
 
-/// Shared write-plus-chmod tail of both script helpers above.
+/// Writes a script that blocks until `sentinel` exists, then announces
+/// readiness on the shepherd channel and sleeps.
+///
+/// The gate is a file the test creates, never a delay. An app's
+/// `listen_timeout` takes a `wait_ready` sheep `Online` on elapse whether or
+/// not it ever signalled, so a script that merely slept would give the test a
+/// `starting` window bounded above by that timeout — and a window a test has
+/// to *race* is a window a loaded runner closes early, reddening the suite
+/// with no regression behind it. A sentinel makes the window as wide as the
+/// test needs it.
+///
+/// `>&3` is the fd the runner hands every sheep whose app asks for a
+/// shepherd channel, and `{"kind":"ready"}` is the wire string
+/// `shep-daemon`'s `ChildMessage::Ready` pins.
+///
+/// `sleep 0.1` is a fractional interval, which POSIX does not require but
+/// both platforms this file compiles on provide. If some `/bin/sleep` ever
+/// refuses it the loop degrades to a busy-wait rather than a hang, so the
+/// case still passes — it just spins for the moment the gate is shut.
+fn write_ready_script(dir: &TempDir, sentinel: &Path) -> PathBuf {
+    write_script(
+        dir,
+        "ready.sh",
+        &format!(
+            "#!/bin/sh\n{}until [ -e \"{}\" ]; do sleep 0.1; done\n\
+             printf '{{\"kind\":\"ready\"}}\\n' >&3\nsleep {SCRIPT_SLEEP_SECS}\n",
+            record_pid_line(dir),
+            sentinel.display(),
+        ),
+    )
+}
+
+/// Shared write-plus-chmod tail of the script helpers above.
 fn write_script(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
     let path = dir.path().join(name);
     std::fs::write(&path, contents).unwrap();
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+/// Writes `Flockfile.toml` into `dir` and returns its path. The `.toml`
+/// extension is what routes `shep start <path>` down `FlockFormat::from_path`
+/// rather than the bare-script arm.
+fn write_flockfile(dir: &TempDir, body: &str) -> PathBuf {
+    let path = dir.path().join("Flockfile.toml");
+    std::fs::write(&path, body).unwrap();
     path
 }
 
@@ -478,6 +534,38 @@ fn bleats_no_follow_until_written(home: &Path, args: &[&str]) -> Output {
             return output;
         }
         std::thread::sleep(BLEATS_POLL_INTERVAL);
+    }
+}
+
+/// Runs `shep flock --format json` until `done` accepts the single sheep's
+/// `ProcessInfo`, or [`FLOCK_DEADLINE`] expires, and returns the last
+/// observation either way.
+///
+/// Polls rather than sleeping once: nothing in this tier is synchronous with
+/// the daemon's own work, and every deadline in it is sized for a loaded
+/// runner. Returning the last observation instead of panicking on expiry
+/// keeps the failure that reaches CI the caller's own assertion, naming the
+/// value it wanted and the value it got.
+///
+/// Each attempt carries the same [`CMD_TIMEOUT`] every other command here
+/// does, so nothing in the loop can block unbounded.
+fn poll_flock(home: &Path, done: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+    let start = Instant::now();
+    loop {
+        let output = shep(home)
+            .arg("--format")
+            .arg("json")
+            .arg("flock")
+            .output()
+            .unwrap();
+        assert_success(&output);
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|e| panic!("flock stdout was not JSON: {e}"));
+        let info = envelope["data"][0].clone();
+        if done(&info) || start.elapsed() >= FLOCK_DEADLINE {
+            return info;
+        }
+        std::thread::sleep(FLOCK_POLL_INTERVAL);
     }
 }
 
@@ -1125,4 +1213,289 @@ fn home_reaches_the_spawned_daemon() {
     );
 
     graceful_kill(dir.path());
+}
+
+// --- Case 9 --------------------------------------------------------------
+
+/// A write under a `watch = true` sheep's `cwd` restarts it: `restarts` goes
+/// from 0 to 1.
+///
+/// The watched tree is its own [`TempDir`], never this case's `$SHEP_HOME`.
+/// That separation is load-bearing rather than tidy: every fixture script
+/// appends its pid to `<home>/`[`FIXTURE_PIDS`] on each spawn, so a watch
+/// rooted at the home would see its own sheep's restart as the next change
+/// to restart on, and the case would never stop restarting.
+///
+/// What a broken implementation this would catch: a watch that was never
+/// armed, or armed against the wrong root (`restarts` stays 0 and this fails
+/// on the observed value); a `watch = true` that reached the daemon but
+/// normalized away (the sheep comes up and nothing ever restarts it); a
+/// debounce that swallowed the trailing event of a burst rather than firing
+/// after it (same observable).
+#[test]
+fn a_write_under_a_watched_tree_restarts_the_sheep() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let watched = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"watcher\"\nscript = \"{}\"\ncwd = \"{}\"\nwatch = true\n",
+            script.display(),
+            watched.path().display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    let before = poll_flock(home, |info| info["status"] == "online");
+    assert_eq!(before["restarts"], 0, "precondition: {before}");
+
+    std::fs::write(watched.path().join("app.txt"), "changed").unwrap();
+
+    let after = poll_flock(home, |info| info["restarts"] == 1);
+    assert_eq!(
+        after["restarts"], 1,
+        "a write under the watched tree must restart the sheep exactly once: {after}"
+    );
+
+    graceful_kill(home);
+}
+
+// --- Case 10 -------------------------------------------------------------
+
+/// A write to a dot-file under the same watched tree restarts nothing — and
+/// the watcher was demonstrably alive the whole time it did not.
+///
+/// [`a_write_under_a_watched_tree_restarts_the_sheep`] alone cannot catch a
+/// dropped default-ignore set: it writes a plain file, which triggers either
+/// way. This case is the other half, and the second act is what makes its
+/// zero mean something. A dot-file, then a full [`FLOCK_DEADLINE`] of nothing
+/// happening, would also be what a watcher that was never armed produces —
+/// so afterwards it writes a plain file and requires the restart to land.
+/// One armed, delivering watcher; two writes; exactly one restart.
+///
+/// What a broken implementation this would catch: `DEFAULT_IGNORE_GLOBS`
+/// dropped or reduced to `**/.git/**` (the dot-file restarts the sheep and
+/// the first assertion fails); an ignore set applied to the wrong side of the
+/// filter, so *only* ignored paths triggered (the first assertion fails and
+/// the second one would too).
+#[test]
+fn a_write_to_a_dot_file_under_a_watched_tree_restarts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let watched = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"watcher\"\nscript = \"{}\"\ncwd = \"{}\"\nwatch = true\n",
+            script.display(),
+            watched.path().display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    let before = poll_flock(home, |info| info["status"] == "online");
+    assert_eq!(before["restarts"], 0, "precondition: {before}");
+
+    std::fs::write(watched.path().join(".hidden.swp"), "editor churn").unwrap();
+    // Polls for the restart that must NOT come, for the same deadline the
+    // positive case gives the restart that must: `done` never accepts, so
+    // this returns on expiry having asked the whole time.
+    let quiet = poll_flock(home, |_| false);
+    assert_eq!(
+        quiet["restarts"], 0,
+        "a dot-file is ignored by default and must not restart anything: {quiet}"
+    );
+
+    std::fs::write(watched.path().join("app.txt"), "changed").unwrap();
+    let after = poll_flock(home, |info| info["restarts"] == 1);
+    assert_eq!(
+        after["restarts"], 1,
+        "the watcher must have been armed and delivering all along: {after}"
+    );
+
+    graceful_kill(home);
+}
+
+// --- Case 11 -------------------------------------------------------------
+
+/// A `wait_ready` sheep stays `starting` until it writes `{"kind":"ready"}`
+/// to the shepherd channel, and only then reads `online`.
+///
+/// The only tier that exercises the real fd-3 channel end to end: every
+/// other test of this gate hands the supervisor a `ChildMessage` directly.
+///
+/// Two deliberate choices keep it from being a race dressed as a test. The
+/// script blocks on a sentinel file rather than a delay (see
+/// [`write_ready_script`]), and the app raises `listen_timeout` far above its
+/// 3000ms default — because on elapse the daemon takes a `wait_ready` sheep
+/// `Online` anyway, so leaving it at the default would make the observation
+/// window and the timeout window the same window, and a slow runner would
+/// then see `online` for the wrong reason.
+///
+/// What a broken implementation this would catch: a spawn that ignored
+/// `wait_ready` and reported `Online` immediately (the `starting` assertion
+/// fails before the sentinel is ever created); a shepherd channel that was
+/// never opened on fd 3, or opened and never read (the sheep stays `starting`
+/// past the sentinel and the second poll expires); a `Ready` message parsed
+/// under a different wire string (same observable, and the byte string here
+/// is the one `ChildMessage::Ready` pins).
+#[test]
+fn a_wait_ready_sheep_goes_online_only_once_it_signals_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let sentinel = dir.path().join("go");
+    let script = write_ready_script(&dir, &sentinel);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"gated\"\nscript = \"{}\"\nwait_ready = true\nlisten_timeout = \"120s\"\n",
+            script.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&flockfile)
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    let envelope: serde_json::Value = serde_json::from_slice(&boot.stdout).unwrap();
+    assert_eq!(
+        envelope["data"][0]["status"], "starting",
+        "a wait_ready sheep must not be online before it signals: {envelope}"
+    );
+
+    std::fs::write(&sentinel, "").unwrap();
+
+    let ready = poll_flock(home, |info| info["status"] == "online");
+    assert_eq!(
+        ready["status"], "online",
+        "the sheep must reach online once it writes ready to fd 3: {ready}"
+    );
+
+    graceful_kill(home);
+}
+
+// --- Case 12 -------------------------------------------------------------
+
+/// A `cron_restart` pattern that is not a cron pattern is a config error:
+/// exit `4`, JSON on stderr, and the offending pattern in the message.
+///
+/// This and [`an_https_probe_target_is_a_config_error`] are the proof that
+/// spec §5's "typos fail loudly at parse time" survives the whole trip —
+/// `normalize` rejects the app, the daemon answers `InvalidConfig` over RPC,
+/// and the CLI turns that into an exit code. Nothing before this tier spans
+/// all three.
+///
+/// The message is asserted on the presence of the pattern, not on wording:
+/// the reason text is croner's and is not ours to pin.
+///
+/// What a broken implementation this would catch: a `normalize` that
+/// validated `cron_restart` only when some other field was set, or not at all
+/// (`shep start` exits 0 and the sheep comes up with a schedule that never
+/// fires — the silent-failure shape this project keeps rooting out); an RPC
+/// layer that mapped `NormalizeError` onto `Internal` or `SpawnFailed`
+/// instead of `InvalidConfig` (the exit code is 1 or 6, not 4); a CLI that
+/// dropped the daemon's message and substituted its own (the pattern is
+/// absent from stderr).
+#[test]
+fn a_bad_cron_pattern_is_a_config_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"crony\"\nscript = \"{}\"\ncron_restart = \"not a cron\"\n",
+            script.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let output = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&flockfile)
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+
+    assert_json_error(&output, 4, "invalid_config");
+    let err: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    let message = err["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not a cron"),
+        "the rejection must name the offending pattern: {err}"
+    );
+
+    graceful_kill(home);
+}
+
+// --- Case 13 -------------------------------------------------------------
+
+/// An `https://` probe target is a config error: exit `4`, JSON on stderr,
+/// and the offending target in the message.
+///
+/// The daemon's HTTP prober is hand-rolled and carries no TLS stack, and a
+/// probe that silently failed every poll would look exactly like a down app —
+/// so the target is refused at config time instead (decision D1). Same shape
+/// and same three-layer reach as
+/// [`a_bad_cron_pattern_is_a_config_error`].
+///
+/// What a broken implementation this would catch: a `ProbeTarget` parser that
+/// accepted any URL scheme and left the prober to fail at runtime
+/// (`shep start` exits 0, and the app is unreachable in a way indistinguishable
+/// from being down); a `normalize` that validated `liveness_probe` but not
+/// `readiness_probe`, or the reverse — this case configures the readiness
+/// one, and `normalize`'s own unit tier covers the other.
+#[test]
+fn an_https_probe_target_is_a_config_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"probed\"\nscript = \"{}\"\n\
+             readiness_probe = {{ kind = \"http\", target = \"https://localhost:8443/health\" }}\n",
+            script.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let output = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&flockfile)
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+
+    assert_json_error(&output, 4, "invalid_config");
+    let err: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    let message = err["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("https://localhost:8443/health"),
+        "the rejection must name the offending target: {err}"
+    );
+
+    graceful_kill(home);
 }
