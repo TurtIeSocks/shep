@@ -130,6 +130,23 @@ chrono-tz = { version = "0.10.4", default-features = false, features = ["std"] }
 # the `multithread` feature pulls rayon into a daemon whose idle-footprint goal
 # is single-digit MB (spec §14.11) and is not enabled.
 sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
+# Filesystem events for watch-restart (spec §4). notify picks its own backend
+# per platform — inotify, ReadDirectoryChangesW — except on macOS, where
+# `macos_fsevent` is a DEFAULT feature: dropping default features without
+# naming it again falls back to the polling watcher, and watch latency on
+# macOS silently becomes seconds.
+notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
+# Coalesces the burst a single editor save produces into one batch. On macOS
+# and Windows it additionally stitches renames through a file-id cache; on
+# Linux `RecommendedCache` is `NoCache` and inotify's own rename cookies do
+# that job.
+notify-debouncer-full = { version = "0.7.0", default-features = false }
+# Transitive floor pin: notify 8.2.0 declares fsevent-sys "4.0.0", but its
+# fsevent.rs needs `FSEventsGetCurrentEventId`,
+# `FSEventStreamGetDeviceBeingWatched` and
+# `FSEventsPurgeEventsForDeviceUpToEventId`, all added in 4.1.0. macOS only,
+# but the pin is unconditional because that is where the rehearsal runs.
+fsevent-sys = "4.1.0"
 
 # Most debuginfo in `target/` is not ours: the default `debug = true` emits
 # full DWARF for every dependency and links a copy into each of the

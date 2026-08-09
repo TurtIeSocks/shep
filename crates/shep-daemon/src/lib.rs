@@ -37,6 +37,8 @@
 //!   loop — reports a sheep's health once `failure_threshold` consecutive
 //!   probes have failed; [`os::OsProber`](probes::os::OsProber) is the
 //!   concrete hand-rolled HTTP/TCP/exec implementation
+//! - [`watch`]: the [`WatchSource`](watch::source::WatchSource) OS seam —
+//!   bridges notify's debounced filesystem events onto a tokio channel
 //!
 //! ##### Plane
 //!
@@ -209,6 +211,7 @@ pub mod rpc;
 pub mod runner;
 pub mod snapshot;
 pub mod supervisor;
+pub mod watch;
 
 use std::time::SystemTime;
 
