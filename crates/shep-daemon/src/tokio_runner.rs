@@ -112,6 +112,12 @@ impl RunningProcess for TokioProc {
 // sheep's group, and a leader-only signal kills the wrapper while that child
 // runs on, orphaned and no longer tracked by anything.
 //
+// The exec prober's timeout path (`probes/os.rs`) is the third caller, for
+// the third instance of that same shape: a probe command that forks leaves
+// the fork behind when `kill_on_drop` reaches only the `sh` above it. It is
+// `pub(crate)` for that caller alone — a fourth copy of `kill(-pid)` is what
+// this function exists to prevent.
+//
 // # What `-pid` assumes, and what breaks if it stops holding
 //
 // `command.process_group(0)` in `spawn` below makes each child the leader of
@@ -135,7 +141,12 @@ impl RunningProcess for TokioProc {
 // timeout. It can never reach the daemon's own group, whose pgid is the
 // daemon's pid and therefore not this child's.
 /// Sends `sig` to the whole process group led by `pid`.
-fn signal_group(pid: u32, sig: Signal) -> Result<(), RunnerError> {
+///
+/// # Errors
+///
+/// [`RunnerError::SignalFailed`] — `pid` is not a signallable process id, or
+/// the `kill(2)` itself failed (typically `ESRCH`: no group led by `pid`).
+pub(crate) fn signal_group(pid: u32, sig: Signal) -> Result<(), RunnerError> {
     // Rejecting 0 is not a range formality: `kill(0, ...)` means "every
     // process in the CALLER's group" — the daemon itself — and `-0` is `0`,
     // so a zero pid must never reach the syscall. `spawn` only ever records a

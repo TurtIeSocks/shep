@@ -114,10 +114,19 @@ impl OsProber {
             c
         };
 
-        // Mandatory: without it, a probe that times out leaves the child
-        // running — a 10s interval against a command that takes 30s
-        // accumulates processes until the box falls over.
+        // Kills and reaps the shell itself when `child` goes out of scope,
+        // so a probe that times out leaves no zombie behind. It is only half
+        // the cleanup: `kill_on_drop` reaches the one process it spawned, and
+        // the reason a timed-out probe "accumulates processes until the box
+        // falls over" is everything that process forked. `kill_probe_group`
+        // below is the other half.
         cmd.kill_on_drop(true);
+        // Puts the shell in a process group of its own, whose pgid is its own
+        // pid — the property `kill(-pid)` needs, and the same one
+        // `TokioRunner::spawn` sets for a sheep. Without it, `-pid` names no
+        // group at all and the timeout path has nothing group-wide to signal.
+        #[cfg(unix)]
+        cmd.process_group(0);
         // A probe's output is the probe's business, never the daemon's. The
         // default is inheritance, which puts a `curl`-style probe's entire
         // response body — bearer tokens, session cookies, whatever the
@@ -136,14 +145,62 @@ impl OsProber {
         // sheep, and a probe is not a special case.
         cmd.env_clear().envs(&self.env);
 
-        match tokio::time::timeout(timeout, cmd.status()).await {
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| ProbeFailure::Transport(err.to_string()))?;
+        // Bound to a `let` rather than matched inline: a `match` keeps its
+        // scrutinee's temporaries — here the `child.wait()` future, holding
+        // `&mut child` — alive across every arm, and the abandon arms need
+        // `child` back to signal its group.
+        let waited = tokio::time::timeout(timeout, child.wait()).await;
+        match waited {
             Ok(Ok(status)) if status.success() => Ok(()),
             Ok(Ok(status)) => Err(ProbeFailure::Rejected(exit_code_text(&status))),
-            Ok(Err(err)) => Err(ProbeFailure::Transport(err.to_string())),
-            Err(_elapsed) => Err(ProbeFailure::Timeout),
+            // Both remaining arms abandon a process that may still be
+            // running: the timeout by definition, and a `wait` that errored
+            // (ECHILD — something outside our control reaped the pid) without
+            // ever establishing that the child is gone.
+            Ok(Err(err)) => {
+                kill_probe_group(&child);
+                Err(ProbeFailure::Transport(err.to_string()))
+            }
+            Err(_elapsed) => {
+                kill_probe_group(&child);
+                Err(ProbeFailure::Timeout)
+            }
         }
     }
 }
+
+/// SIGKILLs the whole process group of a probe child being abandoned.
+///
+/// Reuses the runner's own [`signal_group`](crate::tokio_runner::signal_group)
+/// rather than spelling `kill(-pid)` a third time — the two stop rungs are
+/// the other callers, and this is the same orphan shape they were built for:
+/// `sh -c 'thing & …'` leaves a fork that a leader-only kill never reaches.
+///
+/// Failure is logged, never returned: the verdict a timed-out probe reports
+/// is [`ProbeFailure::Timeout`] whether or not the corpse was cleared, and
+/// `ESRCH` here just means the group was already gone.
+#[cfg(unix)]
+fn kill_probe_group(child: &tokio::process::Child) {
+    // `None` once the child has been waited to completion — nothing left to
+    // signal, and a pid the OS may since have recycled is the one thing this
+    // must never send SIGKILL to.
+    let Some(pid) = child.id() else {
+        return;
+    };
+    if let Err(error) = crate::tokio_runner::signal_group(pid, nix::sys::signal::Signal::SIGKILL) {
+        tracing::warn!(pid, %error, "probe process group kill failed");
+    }
+}
+
+/// Windows has no process group this can signal, and `kill_on_drop` reaches
+/// the `cmd` alone. That gap is the same one the whole OS tier carries there
+/// — `TokioRunner` and its own group signalling are `#[cfg(unix)]`, so a
+/// Windows daemon has no supervised processes to leak in the first place.
+#[cfg(windows)]
+fn kill_probe_group(_child: &tokio::process::Child) {}
 
 /// Renders an `ExitStatus` for [`ProbeFailure::Rejected`]. `code()` is
 /// `None` on unix when the child died from a signal rather than exiting —
@@ -529,6 +586,111 @@ mod tests {
             elapsed < short * 3,
             "expected the probe to give up within a small multiple of {short:?}, took {elapsed:?}"
         );
+    }
+
+    /// How long the forked grandchild in
+    /// [`a_timed_out_exec_probe_kills_the_grandchild_too`] sleeps: comfortably
+    /// longer than [`REAP_DEADLINE`], so a passing run proves the kill reached
+    /// it rather than that it finished on its own; short enough that a run
+    /// panicking before [`Reaper`] fires leaves nothing lingering for a whole
+    /// CI job.
+    #[cfg(unix)]
+    const ORPHAN_SLEEP_SECS: u32 = 30;
+
+    /// How long [`assert_reaped`] waits for a pid to leave the process table.
+    /// A signal that lands takes milliseconds; this is slack for a loaded
+    /// runner, not an expected duration.
+    #[cfg(unix)]
+    const REAP_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// Last-resort net for a test that PANICS with real processes still
+    /// alive, so a failing assertion never leaks a 30-second `sleep` into the
+    /// rest of the run.
+    ///
+    /// Fires ONLY while panicking: on the success path the test has already
+    /// proven the pid is gone, and signalling a pid the OS may since have
+    /// recycled is a hazard rather than a safety net.
+    #[cfg(unix)]
+    struct Reaper(i32);
+
+    #[cfg(unix)]
+    impl Drop for Reaper {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                return;
+            }
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(self.0),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+
+    /// Polls `kill(pid, None)` for `ESRCH` instead of sleeping a fixed guess.
+    /// `kill(pid, None)` still returns `Ok` for a zombie, so only a
+    /// transition all the way to `ESRCH` proves the process is really gone
+    /// rather than exited-but-unreaped.
+    ///
+    /// Copied from `tests/real_runner.rs`'s own `assert_reaped` for the same
+    /// reason that one is a copy of `daemon_e2e.rs`'s: an integration binary
+    /// is a separate crate and cannot share a `#[cfg(test)]` helper with this
+    /// module.
+    #[cfg(unix)]
+    async fn assert_reaped(pid: i32, what: &str) {
+        let reaped = tokio::time::timeout(REAP_DEADLINE, async {
+            loop {
+                match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+                    Err(nix::errno::Errno::ESRCH) => break,
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await;
+        assert!(reaped.is_ok(), "{what} (pid {pid}) is still alive");
+    }
+
+    // fails if a timed-out probe kills only the shell it spawned, which is
+    // all `kill_on_drop(true)` can reach. The brief's rationale for that flag
+    // — probes otherwise "accumulate processes until the box falls over" —
+    // is about what the command leaves behind, and a single simple command is
+    // the only case a leader-only kill actually covers, because `sh` execs
+    // into it. `sleep &` is the same orphan shape
+    // `tests/real_runner.rs`'s `a_graceful_stop_reaches_a_forked_grandchild`
+    // pins for the stop ladder, pointed at the prober.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_exec_probe_kills_the_grandchild_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        // The pid comes back through a FILE, not stdout: this probe's stdio
+        // is `/dev/null` by design, and `probe()` hands back a verdict rather
+        // than a pid. `echo $!` runs only after the fork, so a written file
+        // is itself proof the grandchild existed.
+        // `wait` rather than a second foreground `sleep`, matching
+        // `real_runner.rs`'s wrapper: both hold the shell open past the
+        // timeout, but `wait` leaves exactly ONE process for a failing run's
+        // `Reaper` to clean up instead of two.
+        let command = format!(
+            "sleep {ORPHAN_SLEEP_SECS} & echo $! > \"{}\"; wait",
+            pidfile.display()
+        );
+        // Three orders of magnitude more than a `sh` fork-and-write needs, so
+        // the file is on disk long before the timeout fires, and still fast.
+        let short = Duration::from_millis(500);
+
+        let prober = OsProber::new(None, BTreeMap::new());
+        let result = prober.probe(&exec_target(&command), short).await;
+        assert_eq!(result, Err(ProbeFailure::Timeout));
+
+        let grandchild: i32 = std::fs::read_to_string(&pidfile)
+            .expect("fixture precondition: the shell must record its forked child's pid")
+            .trim()
+            .parse()
+            .expect("`echo $!` prints a pid");
+        let _reaper = Reaper(grandchild);
+
+        // The assertion the whole test exists for.
+        assert_reaped(grandchild, "the probe command's forked child").await;
     }
 
     // fails if a spawn-level failure (the probe is misconfigured, not the
