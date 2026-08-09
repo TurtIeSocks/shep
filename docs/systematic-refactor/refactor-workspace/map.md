@@ -120,11 +120,38 @@ src/
              → DrainOld(shutdown msg | SIGTERM, GRACEFUL_TIMEOUT 8000) → ReapOld. Zero-downtime
              for ALL runtimes: SO_REUSEPORT (socket2) default, LISTEN_FDS fd-passing protocol
              as the principled option — pm2 only had it for Node cluster.
-  watcher.rs         ← was lib/Watcher.js
+  watch/             ← was lib/Watcher.js
       Action: port + redesign
+      Drift (Phase 4, recorded): built as a DIRECTORY, not the `watcher.rs` named above — the
+             OS seam and the filtering logic have different test tiers (source.rs needs a real
+             filesystem, mod.rs is pure), and one file would have crossed Rin's 500-line split.
       Notes: notify + notify-debouncer-full; ONE watcher per name-group (fixes O(N²) fan-out);
              ignore defaults (dotfiles, node_modules) via globset; watch_delay = debounce dur;
              re-check after restart completes (fixes dropped-event gap). disableAll bug not ported.
+             A trigger restarts the WHOLE name-group, stopped instances included; what keeps a
+             stopped sheep down is disarming its group's watcher, never a filter on the restart.
+    source.rs        the OS seam: notify's debounced batches → tokio mpsc, `WatchSource` drop
+                     guard. `watch_tree` is the seam fn (no trait — one implementation, and the
+                     fake tier drives the channel directly).
+    mod.rs           `WatchFilter` (pure globset include/ignore) + `spawn_watch_group`'s restart
+                     loop. A path equal to the watch root triggers before either glob set is
+                     consulted — that is the inotify-overflow rescan signal.
+  probes/            ← new module (spec §7 — pm2 had no probes at all)
+      Action: write fresh
+      Drift (Phase 4, recorded): map.md never named this module; spec §7 requires it, and where
+             the two disagree the spec wins.
+      Notes: `Prober` seam (SEAM TRAIT 3/3) + the liveness loop; failure_threshold consecutive
+             misses report once, then the loop ends (the replacement pid gets a new loop).
+             Hand-rolled HTTP with no TLS and no redirect following — `https://` targets are a
+             config error (decision D1), rejected in shep-core so a typo fails at parse time.
+    os.rs            the real HTTP/TCP/exec prober. The only `cfg(unix)`/`cfg(windows)` in the
+                     Phase 4 modules, and only for shell selection.
+    ready.rs         `ReadinessSource`/`await_ready` — the starting→online gate. `wait_ready`
+                     (channel) beats `readiness_probe`; with neither, a plain start is online at
+                     spawn (the Heuristic source is reload's, not start's). A readiness TIMEOUT
+                     takes the sheep online with a warning — never `errored`, which would be the
+                     restart loop max_restarts exists to contain, out of an app that is merely
+                     slow.
   actions.rs         ← was lib/God/ActionMethods.js
       Action: port + redesign
       Notes: each RPC verb = async handler on Request enum arm (string dispatch dies).
@@ -148,9 +175,40 @@ src/
              server-side filtering (pm2: broadcast-everything). Bounded queue + drop-oldest +
              drop-count event (pm2: unbounded, silent).
   worker.rs          ← was lib/Worker.js
-      Action: port
-      Notes: tokio interval tasks: max_memory_restart poll, backoff reset, cron_restart registry
-             (croner crate), host metrics cadence. domain → catch_unwind per tick.
+      Action: NOT BUILT
+      Drift (Phase 4, recorded): pm2's Worker.js is one timer loop doing four unrelated jobs, and
+             porting it as one module would have rebuilt that coupling. Its loops were split to
+             live beside the subsystems they serve: cron_restart → cron.rs, max_memory_restart
+             poll → limits/. Backoff reset already lives in the restart brain; host metrics
+             cadence belongs to the metrics dog, not the daemon. Nothing is missing — the file
+             is.
+  cron.rs            ← was lib/Worker.js (cron_restart half)
+      Action: write fresh
+      Notes: `Clock` seam (SEAM TRAIT 1/3) — cron means WALL time, every other deadline here is
+             a tokio Instant a paused test can move, so the two cannot be one clock. Five-field
+             standard cron via croner, seconds disallowed, croner's L/W/#/? extensions rejected;
+             the seven vixie @nicknames expanded to five-field patterns by shep before croner
+             ever sees them. Re-derives the next occurrence at least every `max_cron_sleep`
+             ([daemon] key, 60s default, floor 1s) so a laptop suspend or NTP step costs at most
+             that much drift. A missed occurrence is NOT replayed. Restarts the whole name-group,
+             stopped instances included — same reach as watch/.
+  limits/            ← was lib/Worker.js (max_memory_restart half)
+      Action: write fresh
+      Drift (Phase 4, recorded): a DIRECTORY, for the same seam/logic split as watch/.
+      Notes: `MemorySampler` seam (SEAM TRAIT 2/3) over sysinfo + the pure `tree_rss` sum;
+             `LimitEnforcer`/`PollingEnforcer` watch for a breach at MEMORY_POLL_INTERVAL (15s,
+             benchmark-backed by benches/). DEVIATION from pm2: the ceiling is enforced against
+             the process TREE (sheep + lambs via the ppid walk), not the root pid, because a
+             root-pid limit is trivially dodged by any app that forks workers. Wants a line in
+             docs/migration.md.
+  extras.rs          ← new module (no pm2 counterpart)
+      Action: write fresh
+      Notes: the registry that arms all four subsystems above when a sheep goes live and disarms
+             them across eight terminal transitions (seven disarming) plus its own Drop, which
+             aborts every armed task — covering both a graceful shutdown that never kills a
+             WaitingRestart sheep and a panicking actor. Breach, liveness, cron and watch
+             restarts all route through `restart_automatic` (CommandOrigin::Automatic), so an
+             operator's stop or delete displaces one mid-ladder.
   dog_support.rs    ← new module (decision #3: dog architecture)
       Action: write fresh
       Notes: daemon-side dog plumbing ONLY: enabled-dogs list in daemon_config → autostart
