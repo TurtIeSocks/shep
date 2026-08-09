@@ -78,3 +78,12 @@ jobs:
       - run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
       - uses: actions/upload-artifact@v4
         with: { name: coverage, path: lcov.info }
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      # `--test` runs each benchmark exactly once and asserts nothing: the
+      # point on a shared runner is proving the harness still compiles and
+      # executes, not collecting a timing (see benches/benches/memory_sample.rs).
+      - run: cargo bench --manifest-path benches/Cargo.toml -- --test
