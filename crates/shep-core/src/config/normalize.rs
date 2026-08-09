@@ -130,6 +130,10 @@ pub fn normalize_all(apps: Vec<AppConfig>) -> Result<Vec<ResolvedApp>, Normalize
 }
 
 /// Error type returned from [`normalize`] and [`normalize_all`]
+///
+/// Growth is expected: this enum has already gained five variants across
+/// Phase 4 Tasks 1 and 2, and will gain more this phase (IR-20).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NormalizeError {
     /// `name` is empty
@@ -366,20 +370,36 @@ mod tests {
         let mut probe = probe_config("http://127.0.0.1:8080/healthz");
         probe.failure_threshold = 0;
         app.readiness_probe = Some(probe);
+        let err = normalize(app).unwrap_err();
         assert_eq!(
-            normalize(app).unwrap_err(),
+            err,
             NormalizeError::ZeroFailureThreshold {
                 probe: "readiness_probe"
             }
         );
+        // fails if the message regresses to a bare variant name with no
+        // explanation — following the sibling precedent at app.rs:261.
+        assert!(err.to_string().contains("at least 1"), "{err}");
     }
 
     #[test]
-    fn default_failure_threshold_of_three_accepted() {
+    fn default_failure_threshold_from_toml_accepted() {
         // fails if the check fires on the ordinary default instead of only
-        // an explicit 0 (ProbeConfig::failure_threshold defaults to 3)
-        let mut app = AppConfig::minimal("web", "./srv");
-        app.readiness_probe = Some(probe_config("http://127.0.0.1:8080/healthz"));
+        // an explicit 0. Deserializes a Flockfile snippet that omits
+        // `failure_threshold` entirely, so this exercises the real
+        // `#[serde(default = "default_failure_threshold")]` path
+        // (config/app.rs) rather than duplicating `probe_config`'s
+        // hardcoded `3` — a literal that wouldn't notice if the wired
+        // default ever changed.
+        let src = r#"
+name = "web"
+script = "./srv"
+
+[readiness_probe]
+kind = "http"
+target = "http://127.0.0.1:8080/healthz"
+"#;
+        let app: AppConfig = toml::from_str(src).unwrap();
         assert!(normalize(app).is_ok());
     }
 
@@ -390,12 +410,16 @@ mod tests {
         // Flockfile entry to edit
         let mut app = AppConfig::minimal("web", "./srv");
         app.watch = true;
+        let err = normalize(app).unwrap_err();
         assert_eq!(
-            normalize(app).unwrap_err(),
+            err,
             NormalizeError::WatchWithoutCwd {
                 name: "web".to_string()
             }
         );
+        // fails if the message regresses to a bare variant name with no
+        // explanation — following the sibling precedent at app.rs:261.
+        assert!(err.to_string().contains("no cwd to watch"), "{err}");
     }
 
     #[test]

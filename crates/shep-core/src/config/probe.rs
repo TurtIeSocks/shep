@@ -27,6 +27,13 @@ pub enum ProbeTarget {
     Http {
         /// The host or IP literal. A bracketed IPv6 literal (`[::1]`) has
         /// its brackets stripped.
+        ///
+        /// Carried for Task 8 (the prober): connect with
+        /// `(host.as_str(), port)`, not by formatting `"{host}:{port}"`
+        /// into a `SocketAddr` parse — a stripped IPv6 literal has no
+        /// brackets to make that string parseable. For the RFC 7230
+        /// `Host:` header, re-bracket an IPv6 host (`format!("[{host}]")`)
+        /// before writing it.
         host: String,
         /// The port; defaults to 80 when the authority carries none.
         port: u16,
@@ -35,7 +42,13 @@ pub enum ProbeTarget {
     },
     /// `host:port`.
     Tcp {
-        /// The host or IP literal.
+        /// The host or IP literal. A bracketed IPv6 literal (`[::1]`) has
+        /// its brackets stripped.
+        ///
+        /// Carried for Task 8 (the prober): connect with
+        /// `(host.as_str(), port)`, not by formatting `"{host}:{port}"`
+        /// into a `SocketAddr` parse — a stripped IPv6 literal has no
+        /// brackets to make that string parseable.
         host: String,
         /// The port.
         port: u16,
@@ -56,6 +69,8 @@ impl ProbeTarget {
     /// - [`ProbeTargetError::HttpsUnsupported`] — an `https://` URL.
     /// - [`ProbeTargetError::NotHttpUrl`] — no `http://` scheme.
     /// - [`ProbeTargetError::MissingHost`] — the authority has no host.
+    /// - [`ProbeTargetError::InvalidHost`] — the host contains `@`,
+    ///   whitespace, or an embedded `:`.
     /// - [`ProbeTargetError::MissingPort`] — a TCP target with no `:port`.
     /// - [`ProbeTargetError::BadPort`] — the port is not a `u16`.
     pub fn parse(config: &ProbeConfig) -> Result<Self, ProbeTargetError> {
@@ -96,6 +111,14 @@ pub enum ProbeTargetError {
         /// The target as written in the Flockfile.
         target: String,
     },
+    /// The host contains a character the grammar has no field for: `@`
+    /// (userinfo), whitespace, or — outside a bracketed IPv6 literal, where
+    /// a colon is part of the address itself — an embedded `:` (a sign the
+    /// authority carried more than one `host:port` pair).
+    InvalidHost {
+        /// The target as written in the Flockfile.
+        target: String,
+    },
     /// A TCP target with no `:port`.
     MissingPort {
         /// The target as written in the Flockfile.
@@ -121,6 +144,11 @@ impl fmt::Display for ProbeTargetError {
                 write!(f, "probe target `{target}` is not an http:// URL")
             }
             Self::MissingHost { target } => write!(f, "probe target `{target}` has no host"),
+            Self::InvalidHost { target } => write!(
+                f,
+                "probe target `{target}` has a host containing `@`, whitespace, or an embedded \
+                 `:`"
+            ),
             Self::MissingPort { target } => write!(f, "probe target `{target}` has no port"),
             Self::BadPort { target } => {
                 write!(
@@ -136,8 +164,13 @@ impl core::error::Error for ProbeTargetError {}
 
 /// Parses an `http://` target into host, port and path.
 fn parse_http(target: &str) -> Result<ProbeTarget, ProbeTargetError> {
-    let Some(rest) = target.strip_prefix("http://") else {
-        if target.starts_with("https://") {
+    // The empty check in `ProbeTarget::parse` trims before deciding whether
+    // there's anything here at all; the scheme match trims too, so
+    // `"  http://host/  "` is accepted the same as `"http://host/"` instead
+    // of falling through to `NotHttpUrl`.
+    let trimmed = target.trim();
+    let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "http://") else {
+        if strip_prefix_ignore_ascii_case(trimmed, "https://").is_some() {
             return Err(ProbeTargetError::HttpsUnsupported {
                 target: target.to_string(),
             });
@@ -163,7 +196,8 @@ fn parse_http(target: &str) -> Result<ProbeTarget, ProbeTargetError> {
             target: target.to_string(),
         });
     }
-    let port = parse_port(port_str, target)?;
+    validate_host(host, authority, target)?;
+    let port = parse_port(port_str.unwrap_or("80"), target)?;
 
     Ok(ProbeTarget::Http {
         host: host.to_string(),
@@ -172,8 +206,11 @@ fn parse_http(target: &str) -> Result<ProbeTarget, ProbeTargetError> {
     })
 }
 
-/// Splits an HTTP authority into `(host, port)`, the port left as text
-/// (defaulted to `"80"` when absent) for [`parse_port`] to finish.
+/// Splits an authority into `(host, port)`. The port is `None` when the
+/// authority carries none, leaving "default it" (HTTP, to 80) versus
+/// "require it" (TCP, [`ProbeTargetError::MissingPort`]) to the caller —
+/// shared by [`parse_http`] and [`parse_tcp`] so both schemes agree on what
+/// a bracketed IPv6 host looks like.
 ///
 /// Bracketed IPv6 (`[::1]:8080`) is matched before the general "split on the
 /// last colon" rule runs. Splitting `[::1]:8080` on the *last* colon alone
@@ -184,7 +221,7 @@ fn parse_http(target: &str) -> Result<ProbeTarget, ProbeTargetError> {
 fn split_authority<'a>(
     authority: &'a str,
     target: &str,
-) -> Result<(&'a str, &'a str), ProbeTargetError> {
+) -> Result<(&'a str, Option<&'a str>), ProbeTargetError> {
     if let Some(inner) = authority.strip_prefix('[') {
         // A missing closing bracket leaves no host to extract; report it the
         // same way an empty authority is reported.
@@ -196,8 +233,8 @@ fn split_authority<'a>(
         let host = &inner[..close];
         let after = &inner[close + 1..];
         let port_str = match after.strip_prefix(':') {
-            Some(p) => p,
-            None if after.is_empty() => "80",
+            Some(p) => Some(p),
+            None if after.is_empty() => None,
             // Trailing characters after `]` that are neither `:port` nor
             // nothing — e.g. `[::1]x` — have no valid port to report.
             None => {
@@ -209,23 +246,54 @@ fn split_authority<'a>(
         return Ok((host, port_str));
     }
     match authority.rsplit_once(':') {
-        Some((host, port_str)) => Ok((host, port_str)),
-        None => Ok((authority, "80")),
+        Some((host, port_str)) => Ok((host, Some(port_str))),
+        None => Ok((authority, None)),
     }
 }
 
-/// Parses a TCP `host:port` target.
-fn parse_tcp(target: &str) -> Result<ProbeTarget, ProbeTargetError> {
-    let Some((host, port_str)) = target.rsplit_once(':') else {
-        return Err(ProbeTargetError::MissingPort {
+/// Rejects a host containing `@` (a userinfo the grammar has no field for),
+/// whitespace, or — outside a bracketed IPv6 literal, where a colon is part
+/// of the address itself — an embedded `:` (a sign the authority carried
+/// more than one `host:port` pair, e.g. `host:8080:9090`). All three parse
+/// as a syntactically fine host and then simply never resolve at poll time.
+fn validate_host(host: &str, authority: &str, target: &str) -> Result<(), ProbeTargetError> {
+    let bracketed = authority.starts_with('[');
+    let invalid = host.contains('@')
+        || host.chars().any(char::is_whitespace)
+        || (!bracketed && host.contains(':'));
+    if invalid {
+        return Err(ProbeTargetError::InvalidHost {
             target: target.to_string(),
         });
-    };
+    }
+    Ok(())
+}
+
+/// Case-insensitively strips `prefix` from the start of `s`, so `HTTPS://`
+/// is recognized the same as `https://` (schemes are case-insensitive per
+/// RFC 3986 §3.1). `s.get(..prefix.len())` rather than a byte-index slice:
+/// a multi-byte character straddling that boundary would otherwise panic.
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then_some(&s[prefix.len()..])
+}
+
+/// Parses a TCP `host:port` target — the whole target is the authority,
+/// since a TCP target carries no scheme or path.
+fn parse_tcp(target: &str) -> Result<ProbeTarget, ProbeTargetError> {
+    let (host, port_str) = split_authority(target, target)?;
     if host.is_empty() {
         return Err(ProbeTargetError::MissingHost {
             target: target.to_string(),
         });
     }
+    validate_host(host, target, target)?;
+    let Some(port_str) = port_str else {
+        return Err(ProbeTargetError::MissingPort {
+            target: target.to_string(),
+        });
+    };
     if port_str.is_empty() {
         return Err(ProbeTargetError::MissingPort {
             target: target.to_string(),
@@ -367,10 +435,60 @@ mod tests {
     fn https_scheme_rejected_as_unsupported() {
         // fails if https:// is treated as a generic "not http" failure
         // instead of its own named variant
+        let err = ProbeTarget::parse(&probe_config(ProbeKind::Http, "https://x/")).unwrap_err();
         assert_eq!(
-            ProbeTarget::parse(&probe_config(ProbeKind::Http, "https://x/")).unwrap_err(),
+            err,
             ProbeTargetError::HttpsUnsupported {
                 target: "https://x/".to_string()
+            }
+        );
+        // fails if the settled "must say why" decision regresses to a
+        // generic message — variant identity alone doesn't guard the text.
+        assert!(err.to_string().contains("no TLS"), "{err}");
+    }
+
+    #[test]
+    fn https_scheme_matched_case_insensitively() {
+        // fails if scheme matching is case-sensitive: `HTTPS://` would then
+        // fall through to the generic NotHttpUrl, losing the TLS-specific
+        // explanation the settled decision requires
+        assert_eq!(
+            ProbeTarget::parse(&probe_config(ProbeKind::Http, "HTTPS://x/")).unwrap_err(),
+            ProbeTargetError::HttpsUnsupported {
+                target: "HTTPS://x/".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn http_scheme_matched_case_insensitively() {
+        // fails if scheme matching is case-sensitive: `HTTP://` would then
+        // be rejected as NotHttpUrl instead of parsed
+        let target = ProbeTarget::parse(&probe_config(ProbeKind::Http, "HTTP://host/x")).unwrap();
+        assert_eq!(
+            target,
+            ProbeTarget::Http {
+                host: "host".to_string(),
+                port: 80,
+                path: "/x".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_trimmed_before_scheme_match() {
+        // fails if only the empty-check trims (config.target.trim().is_empty())
+        // while the scheme matcher runs on the untrimmed target — that
+        // combination accepts "" but rejects "  http://host/  " as
+        // NotHttpUrl, even though both are just whitespace-padded
+        let target =
+            ProbeTarget::parse(&probe_config(ProbeKind::Http, "  http://host/  ")).unwrap();
+        assert_eq!(
+            target,
+            ProbeTarget::Http {
+                host: "host".to_string(),
+                port: 80,
+                path: "/".to_string(),
             }
         );
     }
@@ -408,6 +526,61 @@ mod tests {
             ProbeTarget::parse(&probe_config(ProbeKind::Http, "http:///path")).unwrap_err(),
             ProbeTargetError::MissingHost {
                 target: "http:///path".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn http_userinfo_in_host_rejected_as_invalid_host() {
+        // fails if the host/port split's "last colon" rule is trusted at
+        // face value: "user:pass@host:8080" would otherwise parse to host
+        // "user:pass@host", a userinfo prefix the grammar has no field for
+        // and that will never resolve at poll time
+        assert_eq!(
+            ProbeTarget::parse(&probe_config(
+                ProbeKind::Http,
+                "http://user:pass@host:8080/"
+            ))
+            .unwrap_err(),
+            ProbeTargetError::InvalidHost {
+                target: "http://user:pass@host:8080/".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn http_whitespace_in_host_rejected_as_invalid_host() {
+        // fails if a host containing a literal space is accepted outright
+        assert_eq!(
+            ProbeTarget::parse(&probe_config(ProbeKind::Http, "http://my host/")).unwrap_err(),
+            ProbeTargetError::InvalidHost {
+                target: "http://my host/".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn http_second_colon_in_host_rejected_as_invalid_host() {
+        // fails if "host:8080:9090" is trusted after a single rsplit_once —
+        // that puts "9090" in the port and leaves "host:8080" as the host,
+        // silently dropping the middle port instead of rejecting the target
+        assert_eq!(
+            ProbeTarget::parse(&probe_config(ProbeKind::Http, "http://host:8080:9090/"))
+                .unwrap_err(),
+            ProbeTargetError::InvalidHost {
+                target: "http://host:8080:9090/".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn tcp_userinfo_in_host_rejected_as_invalid_host() {
+        // fails if validate_host is wired only into parse_http and not
+        // parse_tcp, which shares the same split_authority call
+        assert_eq!(
+            ProbeTarget::parse(&probe_config(ProbeKind::Tcp, "user:pass@host:5432")).unwrap_err(),
+            ProbeTargetError::InvalidHost {
+                target: "user:pass@host:5432".to_string()
             }
         );
     }
@@ -482,6 +655,53 @@ mod tests {
             ProbeTarget::parse(&probe_config(ProbeKind::Tcp, ":8080")).unwrap_err(),
             ProbeTargetError::MissingHost {
                 target: ":8080".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn tcp_bracketed_ipv6_with_port_accepted() {
+        // fails if parse_tcp still hands its target straight to
+        // rsplit_once(':') instead of routing through split_authority: that
+        // would put "1]" in the host, and separately `("[::1]", 8080)` fails
+        // DNS lookup where `("::1", 8080)` succeeds — the conventional
+        // bracketed spelling would silently fail every poll forever
+        let target = ProbeTarget::parse(&probe_config(ProbeKind::Tcp, "[::1]:5432")).unwrap();
+        assert_eq!(
+            target,
+            ProbeTarget::Tcp {
+                host: "::1".to_string(),
+                port: 5432,
+            }
+        );
+    }
+
+    #[test]
+    fn tcp_bracketed_ipv6_without_port_rejected_as_missing_port() {
+        // fails if the bracket branch's "no port" case is defaulted to 80
+        // for TCP the way it is for HTTP — TCP has no default port
+        assert_eq!(
+            ProbeTarget::parse(&probe_config(ProbeKind::Tcp, "[::1]")).unwrap_err(),
+            ProbeTargetError::MissingPort {
+                target: "[::1]".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn tcp_unbracketed_ipv6_rejected_as_invalid_host() {
+        // The odd spelling that happened to resolve before this round of
+        // fixes (splitting on the last colon put "::1" in the host and
+        // "5432" in the port) is now rejected instead: an embedded `:`
+        // outside brackets is exactly what Minor 3's validate_host rejects
+        // everywhere else, and the carried Task 8 note only adjudicates the
+        // *bracketed* spelling correct. Closing this loophole means the
+        // ambiguous form now fails loudly at config time instead of
+        // resolving by accident.
+        assert_eq!(
+            ProbeTarget::parse(&probe_config(ProbeKind::Tcp, "::1:5432")).unwrap_err(),
+            ProbeTargetError::InvalidHost {
+                target: "::1:5432".to_string()
             }
         );
     }
