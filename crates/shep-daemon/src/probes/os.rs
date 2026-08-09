@@ -525,7 +525,7 @@ mod tests {
     // service that looks slow, not refused" shape a bare `connect().await`
     // with no timeout would hang on forever.
     #[tokio::test]
-    async fn tcp_probe_against_a_non_routable_address_times_out() {
+    async fn tcp_probe_against_a_non_routable_address_gives_up_within_the_budget() {
         let short = Duration::from_millis(300);
         let prober = OsProber::new(None, BTreeMap::new());
         let target = ProbeTarget::Tcp {
@@ -537,7 +537,23 @@ mod tests {
         let result = prober.probe(&target, short).await;
         let elapsed = start.elapsed();
 
-        assert_eq!(result, Err(ProbeFailure::Timeout));
+        // Either failure is correct, and which one arrives is the network's
+        // call, not the prober's: a blackholing path (this machine, and the
+        // usual CI shape) leaves the connect hanging until the timeout fires,
+        // while a path whose router answers ICMP unreachable refuses it
+        // outright and yields `Transport`. Pinning `Timeout` alone would fail
+        // on the second kind of network without anything being wrong.
+        //
+        // The bound below is what this test is really for, and it holds
+        // either way: a connect with no `timeout` around it does not come
+        // back at all.
+        assert!(
+            matches!(
+                result,
+                Err(ProbeFailure::Timeout | ProbeFailure::Transport(_))
+            ),
+            "expected Timeout or Transport, got {result:?}"
+        );
         assert!(
             elapsed < short * 3,
             "expected the probe to give up within a small multiple of {short:?}, took {elapsed:?}"
