@@ -132,7 +132,7 @@ pub fn tree_rss(table: &[ProcessRss], root: u32) -> u64 {
         if !visited.insert(pid) {
             continue;
         }
-        sum += bytes_by_pid.get(&pid).copied().unwrap_or(0);
+        sum = sum.saturating_add(bytes_by_pid.get(&pid).copied().unwrap_or(0));
         if let Some(children) = children_of.get(&pid) {
             stack.extend(children.iter().copied());
         }
@@ -234,12 +234,33 @@ mod tests {
     fn sysinfo_sampler_finds_this_process_with_nonzero_rss() {
         let sampler = SysinfoSampler::new();
         let pid = std::process::id();
-        let reading = sampler
-            .sample()
-            .into_iter()
+        let table = sampler.sample();
+        let reading = table
+            .iter()
+            .copied()
             .find(|p| p.pid == pid)
             .unwrap_or_else(|| panic!("own pid {pid} not found in sampled process table"));
         assert!(reading.bytes > 0, "own RSS reading was zero");
+
+        // Guards the parent-pid decision itself (see limits/mod.rs's
+        // deviation note): a sampler that hardcoded `parent: None`, or that
+        // refreshed only `ProcessesToUpdate::Some(&[own_pid])` instead of
+        // `All`, would still pass the RSS assertion above while collapsing
+        // the tree to the root pid. A real table has more than one entry,
+        // at least one parent link, and this process's own parent resolves
+        // in-table to a tree sum bigger than this process's RSS alone.
+        assert!(table.len() > 1, "table had only one process in it");
+        assert!(
+            table.iter().any(|p| p.parent.is_some()),
+            "no entry in the table carried a parent pid"
+        );
+        let parent = reading
+            .parent
+            .unwrap_or_else(|| panic!("own reading for pid {pid} carried no parent"));
+        assert!(
+            tree_rss(&table, parent) > reading.bytes,
+            "tree sum rooted at own parent ({parent}) was not larger than this process's own RSS"
+        );
     }
 
     // fails if the scripted sampler ignores the call index and always
