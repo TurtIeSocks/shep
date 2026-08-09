@@ -12,9 +12,9 @@ use chrono::{DateTime, Utc};
 use shep_core::config::{ProbeConfig, ProbeKind, ProbeTarget};
 use shep_core::paths::ShepPaths;
 use shep_core::values::UpDuration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::cron::Clock;
 use crate::fake::{ProcScript, ScriptedRunner};
@@ -297,8 +297,52 @@ pub(crate) enum HttpReply {
     Hang,
 }
 
-/// Binds a loopback HTTP fake on `127.0.0.1:0` and serves one scripted reply
-/// per accepted connection, in order.
+/// Longest request head [`loopback_http`] will read off a connection before
+/// replying anyway, so a client that never sends the blank line ending its
+/// headers cannot grow this fixture's buffer without bound.
+const REQUEST_HEAD_CAP: usize = 8 * 1024;
+
+/// How long [`LoopbackHttp::next_request`] waits for a request to arrive.
+/// Failing there beats hanging a test binary that has no per-test deadline.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+
+/// A bound loopback HTTP fake, plus the requests it has received.
+///
+/// Aborts its own accept loop on drop, so a test owns the fake for exactly
+/// its own scope and never has to remember the teardown.
+pub(crate) struct LoopbackHttp {
+    /// Where it is listening. Already bound by the time this struct exists.
+    pub(crate) addr: SocketAddr,
+    requests: mpsc::UnboundedReceiver<String>,
+    accept_loop: tokio::task::JoinHandle<()>,
+}
+
+impl LoopbackHttp {
+    /// The request head of the next connection this fake accepted, verbatim.
+    ///
+    /// Requests are queued as they arrive, so this may return immediately;
+    /// what it never does is wait forever.
+    pub(crate) async fn next_request(&mut self) -> String {
+        tokio::time::timeout(REQUEST_DEADLINE, self.requests.recv())
+            .await
+            .expect("the fake received no request within the deadline")
+            .expect("the fake's accept loop ended without sending a request")
+    }
+}
+
+impl Drop for LoopbackHttp {
+    fn drop(&mut self) {
+        self.accept_loop.abort();
+    }
+}
+
+/// Binds a loopback HTTP fake on `127.0.0.1:0` — see [`loopback_http_on`].
+pub(crate) async fn loopback_http(script: Vec<HttpReply>) -> LoopbackHttp {
+    loopback_http_on("127.0.0.1:0", script).await
+}
+
+/// Binds a loopback HTTP fake on `bind` and serves one scripted reply per
+/// accepted connection, in order, recording each request it read.
 ///
 /// Binds before spawning the accept loop and returns the already-bound
 /// address, so a probe dialing the returned `SocketAddr` cannot race the
@@ -306,20 +350,28 @@ pub(crate) enum HttpReply {
 /// that race (a fake torn down, or not yet listening, before the code under
 /// test connects makes the connection fail for the wrong reason).
 ///
-/// The returned `JoinHandle` is not detached: callers abort it once the test
-/// is done with it.
-pub(crate) async fn loopback_http(
-    script: Vec<HttpReply>,
-) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+/// Every connection is READ before it is replied to, including
+/// [`HttpReply::Hang`]'s. Without that, a prober that ignored the target's
+/// path, dropped the `Host:` header or never wrote a request at all would
+/// pass every test here — the reply does not depend on the request, so only
+/// recording it can tell those apart.
+pub(crate) async fn loopback_http_on(bind: &str, script: Vec<HttpReply>) -> LoopbackHttp {
+    let listener = TcpListener::bind(bind)
         .await
-        .expect("bind loopback HTTP listener");
+        .unwrap_or_else(|err| panic!("bind loopback HTTP fake on {bind}: {err}"));
     let addr = listener.local_addr().expect("read bound loopback address");
-    let handle = tokio::spawn(async move {
+    let (requests_tx, requests) = mpsc::unbounded_channel();
+    let accept_loop = tokio::spawn(async move {
         for reply in script {
             let Ok((mut stream, _peer)) = listener.accept().await else {
                 return; // listener gone (test dropped it) — nothing left to serve
             };
+            if requests_tx
+                .send(read_request_head(&mut stream).await)
+                .is_err()
+            {
+                return; // the owning test dropped its LoopbackHttp
+            }
             match reply {
                 HttpReply::Status(code) => {
                     let response = format!("HTTP/1.1 {code} OK\r\n\r\n");
@@ -337,5 +389,25 @@ pub(crate) async fn loopback_http(
             }
         }
     });
-    (addr, handle)
+    LoopbackHttp {
+        addr,
+        requests,
+        accept_loop,
+    }
+}
+
+/// Reads one request head — everything through the blank line that ends the
+/// headers — giving up at EOF, at a read error, or at [`REQUEST_HEAD_CAP`].
+async fn read_request_head(stream: &mut tokio::net::TcpStream) -> String {
+    let mut head = Vec::new();
+    let mut chunk = [0_u8; 256];
+    while !head.ends_with(b"\r\n\r\n") && head.len() < REQUEST_HEAD_CAP {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => head.extend_from_slice(&chunk[..n]),
+        }
+    }
+    // Lossy, not `expect`: what a prober writes is exactly what a test needs
+    // to see, including bytes that are not UTF-8 at all.
+    String::from_utf8_lossy(&head).into_owned()
 }

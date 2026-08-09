@@ -344,7 +344,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::testing::{HttpReply, loopback_http};
+    use crate::testing::{HttpReply, loopback_http, loopback_http_on};
 
     /// Every test's probe timeout — generous enough that CI/loaded-machine
     /// scheduling jitter can't turn a real pass into a flaky timeout, small
@@ -364,13 +364,12 @@ mod tests {
     #[tokio::test]
     async fn passing_status_codes_are_accepted_across_the_2xx_range() {
         for code in [200u16, 204, 299] {
-            let (addr, handle) = loopback_http(vec![HttpReply::Status(code)]).await;
+            let server = loopback_http(vec![HttpReply::Status(code)]).await;
             let prober = OsProber::new(None, BTreeMap::new());
             let result = prober
-                .probe(&http_target(addr.port(), "/"), PROBE_TIMEOUT)
+                .probe(&http_target(server.addr.port(), "/"), PROBE_TIMEOUT)
                 .await;
             assert_eq!(result, Ok(()), "status {code} should pass");
-            handle.abort();
         }
     }
 
@@ -379,26 +378,24 @@ mod tests {
     // follows redirects can pass against a completely different service
     #[tokio::test]
     async fn a_301_is_rejected_not_followed() {
-        let (addr, handle) = loopback_http(vec![HttpReply::Status(301)]).await;
+        let server = loopback_http(vec![HttpReply::Status(301)]).await;
         let prober = OsProber::new(None, BTreeMap::new());
         let result = prober
-            .probe(&http_target(addr.port(), "/"), PROBE_TIMEOUT)
+            .probe(&http_target(server.addr.port(), "/"), PROBE_TIMEOUT)
             .await;
         assert_eq!(result, Err(ProbeFailure::Rejected("301".to_string())));
-        handle.abort();
     }
 
     // fails if the prober only checks whether ANY bytes arrived rather than
     // parsing the actual status code
     #[tokio::test]
     async fn a_500_is_rejected() {
-        let (addr, handle) = loopback_http(vec![HttpReply::Status(500)]).await;
+        let server = loopback_http(vec![HttpReply::Status(500)]).await;
         let prober = OsProber::new(None, BTreeMap::new());
         let result = prober
-            .probe(&http_target(addr.port(), "/"), PROBE_TIMEOUT)
+            .probe(&http_target(server.addr.port(), "/"), PROBE_TIMEOUT)
             .await;
         assert_eq!(result, Err(ProbeFailure::Rejected("500".to_string())));
-        handle.abort();
     }
 
     // fails if connect/write/read each get their own `timeout` instead of
@@ -406,12 +403,14 @@ mod tests {
     // take up to 3x `short` instead of resting at very roughly `short`
     #[tokio::test]
     async fn a_hanging_response_times_out_within_a_small_multiple_of_the_budget() {
-        let (addr, handle) = loopback_http(vec![HttpReply::Hang]).await;
+        let server = loopback_http(vec![HttpReply::Hang]).await;
         let short = Duration::from_millis(150);
         let prober = OsProber::new(None, BTreeMap::new());
 
         let start = std::time::Instant::now();
-        let result = prober.probe(&http_target(addr.port(), "/"), short).await;
+        let result = prober
+            .probe(&http_target(server.addr.port(), "/"), short)
+            .await;
         let elapsed = start.elapsed();
 
         assert_eq!(result, Err(ProbeFailure::Timeout));
@@ -419,7 +418,70 @@ mod tests {
             elapsed < short * 3,
             "expected the probe to give up within a small multiple of {short:?}, took {elapsed:?}"
         );
-        handle.abort();
+    }
+
+    // Pins the bytes the probe puts on the wire, which nothing else here
+    // reads: the fake's reply does not depend on its request, so a prober
+    // that ignored the target's path, dropped `Host:`, dropped `Connection:
+    // close` (leaving the server holding a connection open for a client that
+    // has already stopped reading) or sent no request at all passed every
+    // other test in this module.
+    //
+    // The `Host:` header carries no `:port` because the spec's request
+    // template is `Host: {host}`. That is a deliberate pin, not an accident
+    // of writing the test after the code.
+    #[tokio::test]
+    async fn an_http_probe_sends_one_get_carrying_the_targets_path_and_a_host_header() {
+        let mut server = loopback_http(vec![HttpReply::Status(200)]).await;
+        let prober = OsProber::new(None, BTreeMap::new());
+        let result = prober
+            .probe(&http_target(server.addr.port(), "/healthz"), PROBE_TIMEOUT)
+            .await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            server.next_request().await,
+            "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    // The first of Task 2's two IPv6 obligations, isolated from the network
+    // so it holds on a machine with no IPv6 at all: `ProbeTarget` strips the
+    // brackets off `[::1]` at parse time, and `Host: ::1` without them back
+    // reads as colon-separated fields rather than one address.
+    #[test]
+    fn an_ipv6_host_is_re_bracketed_for_the_host_header() {
+        assert_eq!(bracket_ipv6("::1"), "[::1]");
+        assert_eq!(bracket_ipv6("2001:db8::1"), "[2001:db8::1]");
+        assert_eq!(bracket_ipv6("127.0.0.1"), "127.0.0.1");
+        assert_eq!(bracket_ipv6("localhost"), "localhost");
+    }
+
+    // Both of Task 2's IPv6 obligations at once, end to end: the connect uses
+    // the bracket-STRIPPED host (formatting `"{host}:{port}"` into a
+    // `SocketAddr` parse is what fails, since there are no brackets left to
+    // make that string parseable), and the header gets them back.
+    //
+    // Needs an IPv6 loopback. Every GitHub-hosted runner carries `::1` on
+    // `lo`; a container with IPv6 switched off fails the bind, and
+    // `loopback_http_on`'s panic names the address so that reads as a missing
+    // capability rather than a mystery.
+    #[tokio::test]
+    async fn an_ipv6_target_connects_unbracketed_and_brackets_the_host_header() {
+        let mut server = loopback_http_on("[::1]:0", vec![HttpReply::Status(200)]).await;
+        let target = ProbeTarget::Http {
+            host: "::1".to_string(),
+            port: server.addr.port(),
+            path: "/".to_string(),
+        };
+
+        let prober = OsProber::new(None, BTreeMap::new());
+        let result = prober.probe(&target, PROBE_TIMEOUT).await;
+
+        assert_eq!(result, Ok(()), "an IPv6 target must connect at all");
+        assert_eq!(
+            server.next_request().await,
+            "GET / HTTP/1.1\r\nHost: [::1]\r\nConnection: close\r\n\r\n"
+        );
     }
 
     // fails if a refused connection is collapsed into Timeout instead of
@@ -451,16 +513,15 @@ mod tests {
     // just negative.
     #[tokio::test]
     async fn a_garbage_first_line_is_rejected_not_panicked_on() {
-        let (addr, handle) = loopback_http(vec![HttpReply::Raw("not http\r\n".to_string())]).await;
+        let server = loopback_http(vec![HttpReply::Raw("not http\r\n".to_string())]).await;
         let prober = OsProber::new(None, BTreeMap::new());
         let result = prober
-            .probe(&http_target(addr.port(), "/"), PROBE_TIMEOUT)
+            .probe(&http_target(server.addr.port(), "/"), PROBE_TIMEOUT)
             .await;
         assert!(
             matches!(result, Err(ProbeFailure::Rejected(_))),
             "expected Rejected, got {result:?}"
         );
-        handle.abort();
     }
 
     // The brief's own suggested fixture ("not http\r\n") has two
@@ -470,16 +531,15 @@ mod tests {
     // implementation that reaches for `tokens[1]` instead of `.nth(1)`.
     #[tokio::test]
     async fn a_single_token_garbage_line_is_rejected_not_panicked_on() {
-        let (addr, handle) = loopback_http(vec![HttpReply::Raw("garbage\r\n".to_string())]).await;
+        let server = loopback_http(vec![HttpReply::Raw("garbage\r\n".to_string())]).await;
         let prober = OsProber::new(None, BTreeMap::new());
         let result = prober
-            .probe(&http_target(addr.port(), "/"), PROBE_TIMEOUT)
+            .probe(&http_target(server.addr.port(), "/"), PROBE_TIMEOUT)
             .await;
         assert!(
             matches!(result, Err(ProbeFailure::Rejected(_))),
             "expected Rejected, got {result:?}"
         );
-        handle.abort();
     }
 
     // fails if a TCP probe reports success against any resolvable address
