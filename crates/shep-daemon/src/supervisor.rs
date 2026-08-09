@@ -2558,22 +2558,38 @@ mod tests {
         assert_eq!(handle.list().await.len(), 1);
     }
 
+    // An operator's `shep restart` resets the restart budget (spec §4) and
+    // respawns, and the operator gets the respawned sheep back as its reply.
+    //
+    // fails if `handle_exited`'s `slot.entry.budget.reset()` is dropped —
+    // that leaves the two spent unstable exits on the books, so the crash
+    // after the restart is the third of three and errors the sheep out at
+    // three restarts instead of carrying it to a fourth.
     #[tokio::test(start_paused = true)]
     async fn manual_restart_resets_budget_and_respawns() {
         let (events, _rx) = tokio::sync::broadcast::channel(64);
-        // Two unstable crashes bring the budget to 2; then a manual restart must
-        // reset it (spec §4) and respawn. Script needs FOUR procs: initial +
-        // 2 crash-respawns landing on the long-lived third, + the respawn the
-        // manual restart itself performs.
+        // Five procs, sized against the mutation rather than against a correct
+        // run: two unstable crashes, the long-lived proc they land on, the
+        // respawn the manual restart performs (unstable again, to spend the
+        // budget the reset just cleared), and the proc a still-solvent budget
+        // restarts onto. A pool of four would answer that last spawn
+        // `SpawnFailed("script exhausted")` and land the sheep in `Errored` —
+        // the very state a lost budget reset produces — so the assertion
+        // below would hold identically whether or not the reset happened.
         let runner = ScriptedRunner::new(vec![
             ProcScript::const_exit(1),
             ProcScript::const_exit(1),
             ProcScript::never_exits(),
+            ProcScript::const_exit(1),
             ProcScript::never_exits(),
         ]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
-        let app = AppConfig::minimal("svc", "./svc");
+        let mut app = AppConfig::minimal("svc", "./svc");
+        // Three rather than the default sixteen, so the two crashes below
+        // leave the budget one short of exhausted and a single further crash
+        // decides the test.
+        app.max_restarts = 3;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
         // mean restarts==2 once the never_exits proc is up.
@@ -2588,10 +2604,34 @@ mod tests {
             .restart(ProcessSelector::Name("svc".to_string()))
             .await
             .unwrap();
+        // The deferred reply is the operator's own answer, snapshotted at the
+        // respawn — so it reads Online regardless of what that proc does next.
         assert_eq!(restarted[0].status, ProcStatus::Online);
-        // Budget reset by the manual action: online, not errored.
-        assert_eq!(handle.list().await[0].status, ProcStatus::Online);
-        assert_eq!(handle.list().await[0].restarts, 3);
+
+        // The proc that restart landed on is itself unstable. With the budget
+        // reset its exit is the FIRST of three again and the sheep restarts
+        // once more; without it, the third, and the sheep errors out.
+        // Bounded, unlike the sync loop above: the failing outcome here is a
+        // settled `Errored`, so an unbounded wait for the passing one would
+        // hang the test rather than fail it (rule 11). Every step in between
+        // is ready work — the restarts at this config are immediate — so the
+        // round trips below cannot be starved by the paused clock.
+        let mut settled = handle.list().await.remove(0);
+        for _ in 0..200 {
+            if settled.status == ProcStatus::Errored
+                || (settled.status == ProcStatus::Online && settled.restarts == 4)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+            settled = handle.list().await.remove(0);
+        }
+        assert_eq!(
+            (settled.status, settled.restarts),
+            (ProcStatus::Online, 4),
+            "an operator's restart left the two spent unstable exits on the \
+             books -- got {settled:?}"
+        );
     }
 
     // The budget reset belongs to `ManualKind::Restart` and to nothing else:
@@ -2602,7 +2642,8 @@ mod tests {
     // cron and watch as automatic must not make the budget depend on it.
     //
     // The sibling above makes the same claim through `restart`; the two
-    // differ in one call and in nothing else.
+    // differ in that one call, and in the operator's extra check on the
+    // reply only its path has.
     //
     // fails if a budget reset is ever gated on origin — dropping
     // `handle_exited`'s `slot.entry.budget.reset()` for an automatic restart
