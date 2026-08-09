@@ -179,17 +179,32 @@ impl RootedFilter {
     /// Whether `path` — an absolute path exactly as notify delivered it —
     /// triggers a restart: strips `root`, then asks `filter`.
     ///
-    /// A path that does not lie under `root` never triggers, rather than
-    /// falling back to matching the untouched absolute form against
-    /// patterns written for relative ones. The OS should not deliver one —
-    /// `root` is the tree being watched — but a symlinked subtree inside it
-    /// can (see [`source::watch_tree`]'s own doc on resolved-vs-literal
-    /// paths).
+    /// `root` itself always triggers, ahead of both glob sets. A path that
+    /// does not lie under `root` never triggers, rather than falling back
+    /// to matching the untouched absolute form against patterns written for
+    /// relative ones. The OS should not deliver one — `root` is the tree
+    /// being watched — but a symlinked subtree inside it can (see
+    /// [`source::watch_tree`]'s own doc on resolved-vs-literal paths).
     fn triggers(&self, path: &Path) -> bool {
-        match path.strip_prefix(&self.root) {
-            Ok(relative) => self.filter.triggers(relative),
-            Err(_) => false,
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        if relative.as_os_str().is_empty() {
+            // `path == root`: the rescan marker [`source::watch_tree`]
+            // forwards as `vec![root]` when notify dropped events and wants
+            // the tree re-read. Stripping the root leaves an empty relative
+            // path, which no user pattern can match — `["src/**/*.rs"]`
+            // would silently swallow it and leave the watch deaf exactly
+            // when it has already lost events.
+            //
+            // Answered before either glob set on purpose. "Ignore wins over
+            // include" is a rule about paths, and a rescan is not a path: it
+            // is a signal that unknown paths changed. Restarting on it is
+            // conservative, and the alternative is a watch that goes quiet
+            // precisely when it knows least.
+            return true;
         }
+        self.filter.triggers(relative)
     }
 }
 
@@ -205,6 +220,10 @@ impl RootedFilter {
 /// sheep is what stops its watch: the last instance of a name going away
 /// disarms this group, so a stopped sheep has no watcher left to restart
 /// it.
+///
+/// A rescan — the OS told notify it dropped events — restarts the group
+/// whatever `watch_options` says, since the paths that changed during the
+/// gap are exactly what nobody knows.
 ///
 /// # Errors
 ///
@@ -285,6 +304,40 @@ async fn run_group(
     }
 }
 
+/// The real-time constants shared by both of this subsystem's OS-seam test
+/// suites (IR-33): [`source`]'s smoke tests, and this module's own
+/// real-filesystem case for [`spawn_watch_group`].
+///
+/// One owner rather than a copy per suite. Both suites drive the same
+/// debouncer at the same delay, so a value tuned in one place and not the
+/// other silently weakens whichever copy was left behind — and the
+/// relationship between `TEST_DELAY` and `NO_EVENT_WINDOW` is load-bearing
+/// (see the assertion beside `dropping_the_source_stops_delivery`).
+#[cfg(test)]
+mod real_time {
+    use core::time::Duration;
+
+    /// Debounce window for every real-filesystem test in this subsystem:
+    /// tens of milliseconds, so a real save-to-batch round trip finishes
+    /// fast without accidentally coalescing writes a test means to keep
+    /// distinct.
+    pub(super) const TEST_DELAY: Duration = Duration::from_millis(50);
+
+    /// How long a test waits for something that IS expected to arrive — a
+    /// delivered batch, or a watch-triggered restart. Generous enough that
+    /// a loaded CI runner's real inotify/FSEvents latency cannot turn a
+    /// genuine pass into a flaky timeout.
+    pub(super) const SMOKE_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// How long a test waits for something that must NOT arrive. Short on
+    /// purpose: this window is a cost every passing run of such a test pays
+    /// (its passing path is a timeout, not an event), and it exists only to
+    /// prove a negative — generous enough that a real event, if whatever
+    /// was meant to stop did not, has time to land; short enough not to
+    /// make a green suite slow.
+    pub(super) const NO_EVENT_WINDOW: Duration = Duration::from_millis(500);
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::sync::broadcast;
@@ -324,9 +377,15 @@ mod tests {
     // fails if the default ignore set is only consulted when `ignore_watch`
     // is non-empty — the bug that makes every app with custom
     // `watch_options` restart on its own log writes
+    //
+    // The include pattern is the literal `"**"` a user would write, not the
+    // `MATCH_EVERYTHING` const: passing the const would make this case's
+    // premise track whatever that const later becomes, and stop it being
+    // distinguishable from the empty-`watch_options` case it exists to
+    // contrast with.
     #[test]
     fn default_ignores_beat_an_explicit_include() {
-        let filter = WatchFilter::new(&[MATCH_EVERYTHING.to_string()], &[]).unwrap();
+        let filter = WatchFilter::new(&["**".to_string()], &[]).unwrap();
         assert!(!filter.triggers(Path::new(".git/index")));
         assert!(!filter.triggers(Path::new("node_modules/x/y.js")));
     }
@@ -334,8 +393,7 @@ mod tests {
     // fails if `ignore_watch` patterns are never merged into the ignore set
     #[test]
     fn an_ignore_watch_entry_beats_an_include() {
-        let filter =
-            WatchFilter::new(&[MATCH_EVERYTHING.to_string()], &["dist/**".to_string()]).unwrap();
+        let filter = WatchFilter::new(&["**".to_string()], &["dist/**".to_string()]).unwrap();
         assert!(!filter.triggers(Path::new("dist/bundle.js")));
         // Control: only `dist/**` is excluded, not everything.
         assert!(filter.triggers(Path::new("src/main.rs")));
@@ -376,6 +434,24 @@ mod tests {
         assert!(!filter.triggers(Path::new("/elsewhere/file.rs")));
         // Control: the same filter, under the root, does trigger.
         assert!(filter.triggers(Path::new("/watched/file.rs")));
+    }
+
+    // fails if the root itself is matched against the glob sets like any
+    // other path: stripping the root leaves an empty relative path, which a
+    // configured `watch_options` cannot match, so `source::watch_tree`'s
+    // rescan marker would be filtered away and the watch would go deaf
+    // exactly when notify has already dropped events
+    #[test]
+    fn the_root_itself_triggers_even_under_a_non_matching_watch_options() {
+        let filter = RootedFilter {
+            root: PathBuf::from("/watched"),
+            filter: WatchFilter::new(&["src/**/*.rs".to_string()], &[]).unwrap(),
+        };
+        assert!(filter.triggers(Path::new("/watched")));
+        // Control: the same filter still rejects an ordinary path its
+        // patterns do not cover, so the case above is about the root and
+        // not about a filter that matches everything.
+        assert!(!filter.triggers(Path::new("/watched/other/a.txt")));
     }
 
     // ------------------------------------------------------------------
@@ -478,7 +554,18 @@ mod tests {
                     );
                 }
                 Ok(Ok(_)) => continue,
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                // A negative assertion cannot skip events: the ones the
+                // broadcast channel dropped may include the very `Restart`
+                // this forbids, so continuing here would return success on
+                // an overflow. `expect_restart` may skip them safely — the
+                // worst a lag costs it is a timeout — but this one has to
+                // fail loudly instead of failing open.
+                Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                    panic!(
+                        "event stream lagged by {skipped} while checking for no restart of \
+                         {name}: a skipped event may have been the restart this forbids"
+                    )
+                }
                 Ok(Err(err)) => {
                     panic!("event channel closed while checking for no restart of {name}: {err}")
                 }
@@ -499,7 +586,13 @@ mod tests {
     // filter
     #[tokio::test(start_paused = true)]
     async fn a_batch_of_only_ignored_paths_produces_no_restart() {
-        let (handle, mut rx, _dir) = spawn_test_fixture(vec![ProcScript::never_exits()]);
+        // Two scripts, not one: `start_app` consumes the first, so a
+        // filter-bypassing implementation needs a second for its respawn to
+        // succeed and emit a real `Restart`. With one, that respawn would
+        // hit an exhausted script and report `Errored` instead — invisible
+        // to `assert_no_restart_within`, which only watches for `Restart` —
+        // and the mutation this test names would pass by accident.
+        let (handle, mut rx, _dir) = spawn_test_fixture(vec![ProcScript::never_exits(); 2]);
         let name = "web";
         start_app(&handle, name, 1).await;
         let root = PathBuf::from("/watched");
@@ -521,7 +614,13 @@ mod tests {
     // restarts more than once for a single batch
     #[tokio::test(start_paused = true)]
     async fn a_batch_with_one_triggering_path_produces_exactly_one_restart() {
-        let (handle, mut rx, _dir) = spawn_test_fixture(vec![ProcScript::never_exits(); 2]);
+        // Three scripts: one for `start_app`, one for the expected restart,
+        // and a third so a double-firing implementation has something left
+        // to spawn from and emits a second visible `Restart`. With only
+        // two, that second restart would hit an exhausted script and report
+        // `Errored` — which `assert_no_restart_within` does not watch for —
+        // leaving the trailing negative below unable to fail.
+        let (handle, mut rx, _dir) = spawn_test_fixture(vec![ProcScript::never_exits(); 3]);
         let name = "web";
         start_app(&handle, name, 1).await;
         let root = PathBuf::from("/watched");
@@ -537,6 +636,38 @@ mod tests {
         let info = expect_restart(&mut rx, name, EVENT_WAIT).await;
         assert_eq!(info.restarts, 1);
         assert_no_restart_within(&mut rx, name, Duration::from_secs(5)).await;
+
+        group.abort();
+    }
+
+    // fails if a rescan marker is filtered away like an ordinary path:
+    // `source::watch_tree` forwards "notify dropped events, re-read the
+    // tree" as a batch of the root alone, and the root strips to an empty
+    // relative path that no configured `watch_options` can match. Two
+    // scripts — one for `start_app`, one for the restart this expects —
+    // which is enough for the mutation to fail visibly, since dropping the
+    // marker produces no restart at all rather than an extra one.
+    #[tokio::test(start_paused = true)]
+    async fn a_rescan_marker_restarts_under_a_non_matching_watch_options() {
+        let (handle, mut rx, _dir) = spawn_test_fixture(vec![ProcScript::never_exits(); 2]);
+        let name = "web";
+        start_app(&handle, name, 1).await;
+        let root = PathBuf::from("/watched");
+        let filter = RootedFilter {
+            root: root.clone(),
+            filter: WatchFilter::new(&["src/**/*.rs".to_string()], &[]).unwrap(),
+        };
+        let (tx, group_rx) = mpsc::unbounded_channel();
+        let group = tokio::spawn(run_group(
+            name.to_string(),
+            filter,
+            group_rx,
+            handle.clone(),
+        ));
+
+        tx.send(vec![root.clone()]).unwrap();
+        let info = expect_restart(&mut rx, name, EVENT_WAIT).await;
+        assert_eq!(info.restarts, 1);
 
         group.abort();
     }
@@ -681,27 +812,30 @@ mod tests {
 
     // IR-33: real time, not the paused clock — the same OS-seam
     // justification as `source`'s own smoke tests. This is the only case
-    // that can catch a dropped `WatchSource` guard (see
-    // `spawn_watch_group`'s own doc): every other test above drives
-    // `run_group` directly over a hand-fed channel and never constructs a
-    // real `WatchSource` at all.
-    const REAL_TEST_DELAY: Duration = Duration::from_millis(50);
-    const REAL_SMOKE_DEADLINE: Duration = Duration::from_secs(5);
-    const REAL_NO_RESTART_WINDOW: Duration = Duration::from_millis(500);
-
-    // Mirrors `source`'s own `NO_DELIVERY_WINDOW` guard: raising
-    // `REAL_TEST_DELAY` for CI-flake reasons without raising this window
-    // would silently stop the abort-half of the test below from being able
-    // to catch a leaked watch.
-    const _: () = assert!(
-        REAL_NO_RESTART_WINDOW.as_millis() >= REAL_TEST_DELAY.as_millis() * 4,
-        "REAL_NO_RESTART_WINDOW must stay at least 4x REAL_TEST_DELAY, or \
-         the abort case stops catching a leaked watch"
-    );
+    // that constructs a real `WatchSource` at all: every other test above
+    // drives `run_group` directly over a hand-fed channel.
+    //
+    // What each half proves, precisely:
+    //
+    // - The touch half is load-bearing. It is the only case anywhere that
+    //   catches a `WatchSource` guard dropped before the loop sees an event
+    //   — `let _ = source;` in place of `let _source = source;` — which
+    //   kills the watch and produces no restart at all.
+    // - The abort half proves only that the loop stops. It cannot catch a
+    //   *leaked* guard: `rx` is owned by the aborted future, so `abort()`
+    //   drops the receiver together with `_source`. A deliberately leaked
+    //   `WatchSource` would keep an OS thread alive with no reader left to
+    //   call `restart`, so no `Restart` event can exist under that mutation
+    //   at this tier. A leak is observable only end-to-end, where the
+    //   orphaned thread outlives a removed sheep and keeps watching its
+    //   directory; `source`'s own `dropping_the_source_stops_delivery`
+    //   covers the guard's drop semantics directly, and the end-to-end
+    //   watch scenario is what catches the leak itself.
 
     // fails if the debouncer guard is dropped before the loop ever sees an
-    // event (no restart at all), or if it is leaked past `abort()` (a
-    // restart for the post-abort touch)
+    // event: the watch dies inside `spawn_watch_group` and the touch below
+    // produces no restart. The abort half asserts the weaker claim its
+    // comment above describes — the loop stops — not a leak check.
     #[tokio::test]
     async fn spawn_watch_group_restarts_on_a_real_touch_and_stops_on_abort() {
         let (handle, mut rx, _dir) = spawn_test_fixture(vec![ProcScript::never_exits(); 2]);
@@ -715,17 +849,17 @@ mod tests {
             name.to_string(),
             root.clone(),
             filter,
-            REAL_TEST_DELAY,
+            real_time::TEST_DELAY,
             handle.clone(),
         )
         .unwrap();
 
         crate::testing::touch(&root, "trigger.txt").unwrap();
-        let info = expect_restart(&mut rx, name, REAL_SMOKE_DEADLINE).await;
+        let info = expect_restart(&mut rx, name, real_time::SMOKE_DEADLINE).await;
         assert_eq!(info.restarts, 1);
 
         group.abort();
         crate::testing::touch(&root, "after-abort.txt").unwrap();
-        assert_no_restart_within(&mut rx, name, REAL_NO_RESTART_WINDOW).await;
+        assert_no_restart_within(&mut rx, name, real_time::NO_EVENT_WINDOW).await;
     }
 }

@@ -221,39 +221,23 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-
-    /// Debounce window for every test below: tens of milliseconds, so a real
-    /// save-to-batch round trip finishes fast without accidentally
-    /// coalescing writes a test means to keep distinct.
-    const TEST_DELAY: Duration = Duration::from_millis(50);
-
-    /// How long a test waits for a batch that IS expected to arrive.
-    /// Generous enough that a loaded CI runner's real inotify/FSEvents
-    /// latency cannot turn a genuine pass into a flaky timeout.
-    const WATCH_SMOKE_DEADLINE: Duration = Duration::from_secs(5);
-
-    /// How long the "delivery has stopped" case waits for a batch that must
-    /// NOT arrive. Short on purpose: this window is a cost every passing run
-    /// of that one test pays (it is the one case whose passing path is a
-    /// timeout, not an event), and it exists only to prove a negative —
-    /// generous enough that a real event, if the guard failed to stop the
-    /// watch, has time to reach the channel; short enough not to make a
-    /// green suite slow.
-    const NO_DELIVERY_WINDOW: Duration = Duration::from_millis(500);
+    // The subsystem's shared real-time constants, owned by `watch` itself
+    // rather than re-declared per suite — see that module for why.
+    use crate::watch::real_time::{NO_EVENT_WINDOW, SMOKE_DEADLINE, TEST_DELAY};
 
     // `dropping_the_source_stops_delivery` only catches a leaked debouncer
-    // because `NO_DELIVERY_WINDOW` outlasts `TEST_DELAY` by a wide margin: a
+    // because `NO_EVENT_WINDOW` outlasts `TEST_DELAY` by a wide margin: a
     // leaked debouncer keeps debouncing on `TEST_DELAY`, so its stray batch
     // for `second.txt` lands roughly one `TEST_DELAY` after the write, well
     // inside the window. Someone who later hits CI flake on that test and
-    // "fixes" it by raising `TEST_DELAY` — without also raising this window
+    // "fixes" it by raising `TEST_DELAY` — without also raising that window
     // — silently deletes the guard: at `TEST_DELAY` close to or past
-    // `NO_DELIVERY_WINDOW`, the stray batch would arrive *after* the window
+    // `NO_EVENT_WINDOW`, the stray batch would arrive *after* the window
     // closes and the leak would pass undetected. This assertion turns that
     // edit into a compile error instead of a silent regression.
     const _: () = assert!(
-        NO_DELIVERY_WINDOW.as_millis() >= TEST_DELAY.as_millis() * 4,
-        "NO_DELIVERY_WINDOW must stay at least 4x TEST_DELAY, or \
+        NO_EVENT_WINDOW.as_millis() >= TEST_DELAY.as_millis() * 4,
+        "NO_EVENT_WINDOW must stay at least 4x TEST_DELAY, or \
          dropping_the_source_stops_delivery stops catching a leaked \
          debouncer guard"
     );
@@ -270,9 +254,9 @@ mod tests {
             .expect("canonicalize tempdir root")
     }
 
-    /// Waits up to [`WATCH_SMOKE_DEADLINE`] for the next batch.
+    /// Waits up to [`SMOKE_DEADLINE`] for the next batch.
     async fn expect_batch(rx: &mut UnboundedReceiver<Vec<PathBuf>>) -> Vec<PathBuf> {
-        timeout(WATCH_SMOKE_DEADLINE, rx.recv())
+        timeout(SMOKE_DEADLINE, rx.recv())
             .await
             .expect("no batch arrived within the deadline")
             .expect("watch source ended before a batch arrived")
@@ -339,7 +323,7 @@ mod tests {
         // and a closed channel (the debouncer thread already tore down and
         // dropped its sender) are honest readings of "delivery stopped";
         // only a delivered batch is the leak this test exists to catch.
-        match timeout(NO_DELIVERY_WINDOW, rx.recv()).await {
+        match timeout(NO_EVENT_WINDOW, rx.recv()).await {
             Err(_) => {}   // window elapsed with nothing arriving — expected
             Ok(None) => {} // sender dropped alongside the debouncer thread — expected
             Ok(Some(batch)) => {
@@ -415,7 +399,7 @@ mod tests {
             "writes inside `delay` must land in one batch, got {batch:?}"
         );
 
-        match timeout(NO_DELIVERY_WINDOW, rx.recv()).await {
+        match timeout(NO_EVENT_WINDOW, rx.recv()).await {
             Err(_) => {} // window elapsed with nothing further — expected
             Ok(None) => panic!("watch source ended unexpectedly"),
             Ok(Some(extra)) => panic!("unexpected second batch: {extra:?}"),
