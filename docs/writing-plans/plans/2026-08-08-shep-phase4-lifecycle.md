@@ -57,6 +57,18 @@ Every task's requirements implicitly include this section. Values here are exact
   lower pin on the offending crate, never an MSRV bump: `Cargo.toml:14` is Rin's
   support-window decision and is out of this phase's scope.
 
+- **The 1.88 baseline is green locally, and that became true only on
+  2026-08-08.** The toolchain was not installed on this machine before that
+  date, so every earlier "MSRV is fine" claim in this repo rested on CI alone.
+  It is installed now, and `cargo +1.88 test --workspace --locked` passes on
+  `main`. Two consequences for the tasks below: the `rustup toolchain install`
+  line is a no-op rather than a first install, and a 1.88 rejection a task sees
+  is that task's own new dependency rather than an inherited red baseline. Note
+  the two commands are not the same one — the baseline run was
+  `test --workspace --locked` on the default feature set; the gate above stays
+  the `check --workspace --all-features --locked` form, which builds less but
+  reaches every feature-gated dependency.
+
 - The research's crate table (`docs/research/phase4-lifecycle.md:9-18`) was verified against crates.io on 2026-08-07 and re-verified against docs.rs on 2026-08-08. Three of its claims did not survive; the corrected facts are stated at the task that consumes them, and the corrections are listed in this plan's report obligations (Exit criteria 7).
 
 **Platform tiering (spec §11 — CI-enforced)**
@@ -165,8 +177,9 @@ crates/shep-daemon/
                                       queued-event re-check
   src/watch/source.rs        [pure]   the OS seam: notify + debouncer -> mpsc bridge
   src/extras.rs              [pure]   ExtrasRegistry: arms and disarms all four on lifecycle
-  src/supervisor.rs          [pure]   MODIFY: SupervisorBuilder, the readiness gate, four
-                                      arm/disarm call sites
+  src/supervisor.rs          [pure]   MODIFY: SupervisorBuilder, the readiness gate, the
+                                      arm/disarm call sites, and restart_running — the
+                                      running-only manual restart the watch group needs
   src/boot.rs                [unix]   MODIFY: construct the real seams and hand them to the
                                       builder
   tests/external_impls.rs    [pure]   compile-only proof that an outside crate can implement
@@ -280,8 +293,9 @@ impl CronSchedule {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CronParseError {
-    /// The pattern is not valid in croner's dialect. Carries the pattern and
-    /// croner's own rendered reason.
+    /// The pattern is not valid in shep's dialect. Carries the pattern as the
+    /// user wrote it and the rendered reason — croner's own sentence where
+    /// croner did the rejecting, ours where the pre-parse pass did.
     Pattern { pattern: String, reason: String },
     /// The `cron_timezone` value is not a name in the IANA database.
     Timezone { name: String },
@@ -327,7 +341,7 @@ pub enum CronError { EmptyPattern, InvalidDate, InvalidTime, TimeSearchLimitExce
 1. **`find_next_occurrence` returns `Result`, not `Option`.** The research note plans around a `None` for "never fires again" (`docs/research/phase4-lifecycle.md:213`); there is no `None`. Exhaustion arrives as `Err(CronError::TimeSearchLimitExceeded)`. `next_after` maps *that one variant* to `Ok(None)` and every other variant to `Err(CronScheduleError::Search)`, which is why its return type is `Result<Option<_>, _>` and not either half alone. Getting this backwards — treating every error as "no more occurrences" — silently turns a transient failure into a permanently disarmed cron.
 2. **`CronParserBuilder::build` returns `CronParser`, not `Result<CronParser>`.** A `?` on it does not compile.
 3. **`CronError` is neither `Clone` nor `PartialEq`**, which is why both new error enums carry `String`s. This is the constraint the File Structure section states; it is repeated here because this is the task that would otherwise discover it at `cargo check` time.
-4. **`Cron::as_str` gives back croner's *normalized* pattern, not the input.** `0 0 * JUL WED` comes out as `0 0 * 7 3` and `@daily` as `0 0 * * *` — both verified by running them. `CronSchedule::pattern` promises the pattern *as written in the Flockfile*, so it returns a stored `String` and never `as_str`; the same normalization is why an error message has to carry the user's own spelling rather than croner's rendering of it.
+4. **`Cron::as_str` gives back croner's *normalized* pattern, not the input.** `0 0 * JUL WED` comes out as `0 0 * 7 3`, verified by running it. `CronSchedule::pattern` promises the pattern *as written in the Flockfile*, so it returns a stored `String` and never `as_str`; the same normalization is why an error message has to carry the user's own spelling rather than croner's rendering of it. The settled nicknames reach this the same way by a different route: shep expands `@daily` before croner sees it, so `as_str` would report `0 0 * * *` there too, and the stored string is what keeps `pattern()` honest.
 
 Do **not** call `.dom_and_dow(true)`. croner's default is OR semantics between day-of-month and day-of-week, which is what the JS-croner dialect map.md promises does; `true` switches to AND and would silently change what an existing pattern means.
 
@@ -337,7 +351,7 @@ Call `.seconds(Seconds::Disallowed)`, which rejects the six-field form for us. *
 
 `Seconds::Disallowed` alone pins the grammar to exactly five fields, and no `.year(...)` call is needed. croner's field-count gate is `if num_parts == 5 { parts.insert(0, "0") } else if self.seconds.is_disallowed() { return Err(...) }` (`parser.rs:122-130`), and `num_parts` is captured *before* the insert — so the disallowed arm fires for every token count that is not exactly five, ahead of croner's own year handling. Verified: `0 3 * * * 2027` is rejected under `Seconds::Disallowed`. Do not add `.year(Year::Disallowed)` as a belt-and-braces change; it is unreachable here and it would only change which sentence croner renders.
 
-**Every pattern in this plan — test rows included — is therefore five-field.** A six-field pattern in a test is a failing test, not a wider case.
+**Every pattern that reaches croner — test rows included — is therefore five-field.** A six-field pattern in a test is a failing test, not a wider case. The `@nickname` shorthands settled below are the only single-token spelling the grammar accepts, and they are expanded to five fields before croner sees them, so they are sugar over this rule rather than an exception to it.
 
 croner still accepts `L`, `W`, `#` and `?` natively, so **rejecting those is our job, not croner's** — a pattern reaching `CronParser::parse` with them in it parses happily and we would have shipped the wide dialect by accident. Reject them before parsing, with a typed error naming the offending character. (Verified against croner 3.0.1 in their legal positions: `0 0 L * *`, `0 0 1W * *`, `0 0 * * 5#3` and `0 0 ? * *` all parse. croner rejects them only when they sit in a field where the extension does not belong, e.g. `W` in day-of-week — so its positional validation is no substitute for our own check.)
 
@@ -347,11 +361,33 @@ So the check is token-aware, not character-wise: split on whitespace, and within
 
 Test both directions explicitly, and cover all four characters — `0 0 L * *`, `0 0 1W * *`, `0 0 * * 5#3` and `0 0 ? * *` are rejected with the character named, while `0 0 * JUL WED` and `0 0 * * MON-FRI` are accepted. `W` needs its own row rather than riding on `L`'s: it is the character most likely to be dropped from the scan, because the name trap below makes it the awkward one. A test suite that only covers the rejections would pass an implementation that rejects every name-bearing pattern.
 
-**`@nickname` shorthands are rejected in the same pre-parse pass, and this one is a grammar call rather than an oversight.** croner expands `@yearly`/`@annually`/`@monthly`/`@weekly`/`@daily`/`@hourly` at `parser.rs:113-115`, *before* the field-count gate, so `@daily` parses to `0 0 * * *` under `Seconds::Disallowed` — verified by running it. A nickname is a single token, not five-field standard cron, so accepting it would widen the dialect past what Rin settled, and the merged stopgap rejects it today (one token, not five) so rejecting keeps behaviour unchanged for every existing Flockfile. Reject a leading `@` alongside `#` and `?` — it never occurs inside a day or month name, so it needs no name-aware handling. This is item 6 in Still open: widening later is backwards-compatible and costs one deleted line, which is why the narrow reading is the cheap direction to take now.
+**The `@nickname` shorthands are accepted — the vixie set, and only that set (Rin, 2026-08-08).** Seven spellings, and shep expands each one itself, in the pre-parse pass, before the pattern reaches croner:
 
-Note what this fixes in the existing stopgap (`crates/shep-core/src/config/normalize.rs:54-60`), which is a bare `pattern.split_whitespace().count() != 5`: it accepts any five whitespace-separated tokens — `99 99 99 99 99` passes today and croner rejects it with `ComponentError("Number out of bounds.")` — while rejecting everything that is not exactly five tokens, including the `@nicknames` above. It is a token counter, not a grammar.
+| Nickname | Expands to | Meaning |
+|---|---|---|
+| `@yearly` | `0 0 1 1 *` | midnight, 1 January |
+| `@annually` | `0 0 1 1 *` | the same schedule, the other spelling |
+| `@monthly` | `0 0 1 * *` | midnight on the 1st |
+| `@weekly` | `0 0 * * 0` | midnight on Sunday |
+| `@daily` | `0 0 * * *` | midnight |
+| `@midnight` | `0 0 * * *` | the same schedule, the other spelling |
+| `@hourly` | `0 * * * *` | on the hour |
 
-`docs/migration.md` gets two lines, and they are two lines because the errors read differently. A pm2 user whose pattern used `L`, `W`, `#`, `?` or a leading `@` now gets a config error naming the offending character. A user whose pattern carried a seconds field gets one naming the field count instead — croner's own message there is about the shape of the pattern, not about a character, and promising otherwise would be a promise the implementation cannot keep.
+Matching is ASCII-case-insensitive, which is not a widening but the same rule the pass already applies to the three-letter day and month names below it. `@DAILY` and `@daily` are one spelling, and a test row pins that so the choice cannot drift.
+
+**Why accepting these does not reopen the five-field decision.** That decision was made to avoid an open-ended commitment: croner's `L`, `W` and `#` extensions are the crate's own dialect and grow with it, so accepting them would bind shep's config grammar to somebody else's roadmap. The vixie set has the opposite shape — it is closed, it has been these seven spellings for decades, and accepting it commits shep to nothing further. And because we expand rather than delegate, the settled grammar stays literally five-field: croner never sees a nickname, so the accepted-pattern surface is exactly the five-field one plus seven names that are textual sugar for members of it.
+
+**Expanding it ourselves is load-bearing, not a stylistic preference, and the reason is a verified gap in croner's own table.** croner's `handle_nicknames` (`croner-3.0.1/src/parser.rs:276-280`) has arms for `@yearly`/`@annually`, `@monthly`, `@weekly`, `@daily` and `@hourly` — and **no arm for `@midnight`**. An unmatched `@`-token falls through its `_ => pattern` arm unchanged, arrives at the field-count gate as one token, and is rejected. So delegating to croner would ship an incoherent subset of a closed set: `@daily` accepted, `@midnight` rejected, with a message about field counts. Expanding first also keeps the mapping ours rather than a private implementation detail croner's next version can widen underneath us — the same reasoning that keeps `croner::Cron` out of `CronSchedule`'s public signature (IR-11).
+
+**`@reboot` is rejected, with its own message.** It means "run once at boot", which has no coherent meaning for a supervisor that already owns restart policy: shep decides when a sheep starts, and a pattern asking for one start at machine boot is asking the cron worker to do the thing the engine is for. The message says that, and names `@reboot`.
+
+**A correction to the compile check's note, because the plan's report obligations track exactly this class.** That note read croner as accepting every nickname it was handed and concluded that rejecting `@reboot` was our job rather than croner's, by analogy with `L`/`W`/`#`/`?`. The three nicknames it ran were all in croner's table; `@reboot` is not, so croner *does* reject it — but with `InvalidPattern("Pattern must have 5 fields when seconds are disallowed.")`, which is a misleading sentence to hand a user who wrote a real cron nickname. What is ours is the *message*, not the rejection. Do not write a test row asserting that croner would have accepted it.
+
+**Ordering in the pre-parse pass, which the extension-character scan constrains:** nickname expansion runs first, on the whole trimmed pattern, and only when it is a single token beginning with `@`. An `@`-leading token that is not one of the seven is rejected — `@reboot` with its own sentence, anything else naming the unrecognised nickname. Everything that survives is five-field text, and the seven expansions contain no `L`, `W`, `#` or `?`, so the character scan below runs unchanged on the expanded form. `@` therefore leaves the character scan's reject list entirely: it is handled by the table, not by a character test.
+
+Note what this fixes in the existing stopgap (`crates/shep-core/src/config/normalize.rs:54-60`), which is a bare `pattern.split_whitespace().count() != 5`: it accepts any five whitespace-separated tokens — `99 99 99 99 99` passes today and croner rejects it with `ComponentError("Number out of bounds.")` — while rejecting everything that is not exactly five tokens, the nicknames included. It is a token counter, not a grammar.
+
+`docs/migration.md` gets three lines, and they are three because the errors read differently. A pm2 user whose pattern used `L`, `W`, `#` or `?` now gets a config error naming the offending character. A user whose pattern carried a seconds field gets one naming the field count instead — croner's own message there is about the shape of the pattern, not about a character, and promising otherwise would be a promise the implementation cannot keep. A user on `@reboot` gets the third line: the nickname is recognised and refused on purpose, and the fix is to let shep's own restart policy do the job.
 
 - [ ] **Step 1: Add the three dependencies**
 
@@ -363,7 +399,7 @@ Root `Cargo.toml`, in `[workspace.dependencies]`:
 croner = { version = "3.0.1", default-features = false }
 # croner is generic over chrono::TimeZone; `clock` is what provides Utc::now(),
 # which the daemon's cron worker reads to derive the next occurrence.
-chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Resolves cron_timezone's IANA name to a chrono::TimeZone. croner carries this
 # only as a dev-dependency, so it is ours to declare.
 chrono-tz = { version = "0.10.4", default-features = false, features = ["std"] }
@@ -371,7 +407,9 @@ chrono-tz = { version = "0.10.4", default-features = false, features = ["std"] }
 
 `crates/shep-core/Cargo.toml` opts all three in with `.workspace = true`.
 
-The chrono floor of `0.4.42` is croner 3.0.1's own declared minimum per the research note. **Verify it during the rehearsal rather than trusting it**: if `-Z minimal-versions` resolves chrono below 0.4.42 and the build succeeds, drop our floor to `0.4` and let croner's own bound do the work — an unnecessary floor pin is a maintenance burden with no comment that can honestly justify it. If it fails, the pin stays and its comment names the *API* that forced it, not the version.
+**The chrono entry is `"0.4"`, not the `0.4.42` an earlier draft pinned, and the floor pin was dropped because it is provably redundant.** croner 3.0.1 declares `chrono = "0.4.42"` itself (`croner-3.0.1/Cargo.toml`, the `[dependencies.chrono]` block — read off the vendored manifest, not the research note), and shep-core depends on croner and chrono together, so cargo unifies to the higher of the two floors whatever we write. `-Z minimal-versions` therefore resolves 0.4.42 through croner with no help from us. Nothing this phase writes needs a chrono API newer than `DateTime`, `TimeZone` and `Duration::from_std`, all of which long predate 0.4.42, so a floor pin here could not carry the comment naming an API that this manifest's other pins carry — which is the tell that it was never ours to make. Run the rehearsal anyway and confirm 0.4.42 comes out; if some other floor appears, it goes in with a comment naming the API that forced it.
+
+For completeness, chrono-tz 0.10.4 declares only `chrono = "0.4.25"` (its own vendored manifest), so it never raises the floor and is not the reason for anything here.
 
 - [ ] **Step 2: Write `cron.rs` with its pinned-array tests first (TDD)**
 
@@ -382,7 +420,11 @@ The tests are the interesting half of this task, because `next_after` is a pure 
 | five-field baseline | `0 3 * * *` | none (UTC) | a parser configured with `Seconds::Required`, which would reject it |
 | six-field rejected | `30 0 3 * * *` | none | expects `Err(CronParseError::Pattern)`. Fails if the builder was left on croner's default `Seconds::Optional` (`croner-3.0.1/src/parser.rs:56`), which accepts the seconds field and would ship the wide dialect by accident |
 | year form rejected | `0 3 * * * 2027` | none | expects `Err(CronParseError::Pattern)`. Fails if somebody "simplified away" the `.seconds(Seconds::Disallowed)` call believing croner's `Year` default needed its own knob — this row is what documents that one setting closes both widenings |
-| nickname rejected | `@daily` | none | expects `Err(CronParseError::Pattern)`. Fails if the pre-parse pass checks only `L`/`W`/`#`/`?`: croner expands nicknames before its own field-count gate, so `@daily` reaches `find_next_occurrence` as `0 0 * * *` and the dialect has silently grown a sixth spelling |
+| nicknames expand | each of the seven in the table above | none (UTC) | the pinned occurrence array for a nickname equals the array its stated five-field equivalent produces, asserted pair by pair rather than against a hand-written instant. Fails if any expansion is wrong — `@weekly` as `0 0 * * 1` is the likely slip — and fails if `@midnight` was left to croner, whose table has no arm for it |
+| nickname case | `@DAILY` | none | the same schedule as `@daily`. Fails if the table is matched with `==` rather than an ASCII-case-insensitive compare, which would turn one of the two spellings into an unrecognised nickname |
+| nickname keeps its spelling | `@daily` | none | `pattern()` returns `@daily`, not `0 0 * * *`. Fails if the expansion is stored in place of the user's own text — the same defect fact 4 below describes for `Cron::as_str` |
+| `@reboot` rejected | `@reboot` | none | expects `Err(CronParseError::Pattern)` whose `pattern` field is `@reboot`. Fails if the nickname handling is a permissive "leading `@`, not obviously malformed" check rather than a closed table |
+| unknown nickname rejected | `@fortnightly` | none | expects `Err(CronParseError::Pattern)`. Fails if an unrecognised `@`-token is handed to croner anyway, which rejects it with a field-count sentence that tells the user nothing about nicknames |
 | zone offset | `0 3 * * *` | `Europe/Oslo` | a `next_after` that ignores the zone and returns 03:00 UTC — the two answers differ by one or two hours, and the assertion is on the exact UTC instant |
 | zone across midnight | `30 23 * * *` | `Pacific/Auckland` | the same defect, in the case where the local date and the UTC date disagree |
 | spring-forward gap | `30 2 * * *` | `America/New_York`, across 2026-03-08 | a fixed-time job silently skipping the day it lands in the gap. croner's documented rule fires it at the first valid instant after the gap |
@@ -395,7 +437,7 @@ The tests are the interesting half of this task, because `next_after` is a pure 
 
 The three DST rows are five-field on purpose and their pinned instants are unaffected by that: croner inserts a literal `0` seconds component for any five-token pattern (`parser.rs:126-127`), so `30 2 * * *` normalizes to exactly the same schedule a six-field `0 30 2 * * *` would have described. The DST scenarios each row exists to pin survive the spelling unchanged.
 
-Every rejection row asserts the **variant**, never croner's sentence. croner renders "Pattern must have 5 fields when seconds are disallowed." for the six-field row, the year row *and* the `not a cron` row — three tokens, so the same field-count gate catches it — and "Number out of bounds." for the garbage row. The nickname row is the exception: croner accepts `@daily`, so that sentence is ours, not croner's. All of these are somebody's to reword, and pinning any of them makes a patch bump a red suite.
+**A rejection row asserts croner's sentence only when the sentence is ours.** croner renders "Pattern must have 5 fields when seconds are disallowed." for the six-field row, the year row *and* the `not a cron` row — three tokens, so the same field-count gate catches it — and "Number out of bounds." for the garbage row. Those four assert the **variant** and nothing else: the wording is croner's to reword and pinning it makes a patch bump a red suite. The rows the pre-parse pass rejects are the other case — the four extension characters, `@reboot` and the unknown nickname never reach croner at all, so their text is ours and asserting it is asserting our own contract.
 
 The DST rows come from croner's documented `JobType` behaviour, and the whole point of pinning them is that this plan is not the authority on them — croner is. **Derive the expected values by running the case, read the result, and then decide whether it matches croner's documented rule before pinning it.** If it does not, that is a finding for the report, not a number to paste in. This applies to the accepted rows only: a rejection row that fails to parse is the assertion passing, not a croner defect to report.
 
@@ -441,7 +483,11 @@ cargo +1.88 check --workspace --all-features --locked
 - [ ] **Step 5: Run the full gate list from Global Constraints, each from its own exit code**
 - [ ] **Step 6: CHANGELOG** — `shep-core`, under Additions and Changes.
 
-The dialect change is user-visible and it moves in **one** direction: patterns the stopgap accepted purely on token count (`99 99 99 99 99`) now fail with croner's own reason, and `L`, `W`, `#`, `?` and `@nickname` shorthands are newly rejected with the offending character named. Six-field and seconds-bearing patterns were already rejected by the token count and stay rejected — the error now says why instead of saying "not a 5-field pattern". `0 0 * JUL WED` and `0 0 * * MON-FRI` keep working. Do **not** write "and vice versa" or that any previously-rejected pattern now passes; there is no loosening direction, and the same sentence has to be right in Task 14's changelog pass.
+The dialect change is user-visible and it moves in **both** directions. An earlier draft of this plan said it moved in one and told the writer not to claim otherwise; the settled nickname decision made that instruction false, and the same sentence has to be right here and in Task 14's changelog pass.
+
+*Changes* — the tightening: patterns the stopgap accepted purely on token count (`99 99 99 99 99`) now fail with croner's own reason, and `L`, `W`, `#` and `?` are newly rejected with the offending character named. Six-field and seconds-bearing patterns were already rejected by the token count and stay rejected; the error now says why instead of saying "not a 5-field pattern". `@reboot` also stays rejected, with a message about what it means rather than one about field counts. `0 0 * JUL WED` and `0 0 * * MON-FRI` keep working.
+
+*Additions* — the loosening, and it is exactly seven spellings: `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily`, `@midnight` and `@hourly` are accepted where the token-count stopgap rejected them, each expanded to the five-field pattern this task's table names. List the expansions in the entry; a user upgrading wants to know what `@weekly` means here without reading the source.
 - [ ] **Step 7: Commit** — `feat(core): validate cron_restart against the croner dialect`
 
 ---
@@ -540,7 +586,7 @@ InvalidProbe { probe: &'static str, reason: String },
 
 Also reject `failure_threshold == 0`, with its own `NormalizeError` variant. A threshold of zero means "unhealthy before the first probe runs", which is not a configuration anybody wants and which would make the liveness loop restart the sheep immediately and forever. `ProbeConfig::failure_threshold` defaults to 3 (`crates/shep-core/src/config/app.rs:41`), so this only fires on an explicit `0`.
 
-**And reject `watch = true` with no `cwd`, with a third variant.** This one is not about probes at all; it lands here because Task 2 owns `normalize`'s new variants and because it is what makes Task 12's watch-root derivation total.
+**And reject `watch = true` with no `cwd`, with a third variant (Rin, 2026-08-08).** This one is not about probes at all; it lands here because Task 2 owns `normalize`'s new variants and because it is what makes Task 12's watch-root derivation total.
 
 ```rust
 /// `watch` is enabled but the app sets no `cwd`, so there is no directory to
@@ -548,9 +594,19 @@ Also reject `failure_threshold == 0`, with its own `NormalizeError` variant. A t
 WatchWithoutCwd { name: String },
 ```
 
-The reason it must be a rejection rather than a fallback: `AppConfig::cwd` defaults to `None` (`crates/shep-core/src/config/app.rs:78`, `:164`) and its doc calls the default "the daemon's cwd at spawn registration" — but nothing in this workspace ever chdirs (`grep -rn "set_current_dir\|chdir" crates/` is empty), so the shepherd's cwd is whichever directory the user first ran `shep start` from. Commonly `$HOME`, possibly `/`. A recursive watch there exhausts Linux's default `max_user_watches` and turns unrelated filesystem churn into flock-wide restarts, on a machine where nothing in the Flockfile asked for it. A watch root must come from the Flockfile, never from invocation history. The alternative — arm nothing and warn — defers the surprise to the moment the user wonders why saving a file does nothing, which is the failure mode this plan already rejects for `https://` targets.
+Both alternatives were considered and both are worse. **Defaulting to the daemon's own cwd is the dangerous one.** `AppConfig::cwd` defaults to `None` (`crates/shep-core/src/config/app.rs:78`, `:164`) and its doc calls the default "the daemon's cwd at spawn registration" — but nothing in this workspace ever chdirs (`grep -rn "set_current_dir\|chdir" crates/` is empty), so the shepherd's cwd is whichever directory the user first ran `shep start` from. Commonly `$HOME`; under a systemd unit with no `WorkingDirectory=`, it is `/`, and shep would arm a recursive watch over the entire filesystem. Short of that it exhausts Linux's default `max_user_watches` and turns unrelated churn into flock-wide restarts, on a machine where nothing in the Flockfile asked for it. A watch root must come from the Flockfile, never from invocation history.
 
-`watch` is a plain `bool` defaulting to `false` (`app.rs:112`, `:181`), so this fires only on an app that explicitly asked to be watched. An app with `watch_options` set but `watch = false` is left alone: nothing arms, so nothing needs a root. Whether that silence is right is item 5 in Still open.
+**Arming nothing with a warning is the quieter one, and it is the silent-failure shape this project keeps rooting out.** It defers the surprise to the moment the user wonders why saving a file does nothing — the same failure mode this plan rejects for `https://` probe targets, where a silently-failing probe is indistinguishable from a down app. A config that asks for a feature and gets none of it should say so at `shep start`.
+
+`watch` is a plain `bool` defaulting to `false` (`app.rs:112`, `:181`), so this fires only on an app that explicitly asked to be watched. An app with `watch_options` set but `watch = false` is left alone and that silence is deliberate: nothing arms, so nothing needs a root, and rejecting there would fail a Flockfile that is merely carrying options for a flag the user has not turned on yet.
+
+Three test rows, and the third is the one that catches an over-broad rejection:
+
+| Case | The broken implementation it catches |
+|---|---|
+| `watch = true`, no `cwd` → `Err(NormalizeError::WatchWithoutCwd)` carrying the app name | a validator that never looks at `watch`, or one that carries no name and so cannot tell the user which app to edit |
+| `watch = true` with a `cwd` → `Ok` | a check that fires on `watch` alone |
+| `watch = false`, `watch_options` set, no `cwd` → `Ok` | a check keyed on `watch_options` being non-empty rather than on `watch` being true, which would reject a Flockfile that asked for nothing |
 
 All three of this task's new variants go into `normalize`'s `# Errors` list (`crates/shep-core/src/config/normalize.rs:36-40`) alongside the two Task 1 adds. That list is the one place a caller learns what rejection looks like, and it is currently four lines describing a validator that is about to grow to nine.
 
@@ -638,6 +694,8 @@ loop {
 Three things in that shape are load-bearing against `-D warnings` rather than stylistic. The `?` this replaces would not compile: the body returns `()`, so `Result`'s `From` conversion has nothing to convert into — and the plan's own prose two paragraphs down says the `Err` case logs and ends the task, which is a `match`, not a `?`. And `SupervisorHandle::restart` returns `Result<Vec<ProcessInfo>, SupervisorError>` (`crates/shep-daemon/src/supervisor.rs:210-213`), which is `#[must_use]` through `Result`: discarding it is `unused_must_use`, a hard error under the gate. Discarding it is also how a worker ends up looping forever against a dead actor with nothing in the log.
 
 The third is the arm count. `SupervisorError` has **three** variants — `NotFound`, `SpawnFailed(String)`, `EngineStopped` (`supervisor.rs:138-146`) — and carries no `#[non_exhaustive]`, so a two-arm match is `E0004` and not a stylistic omission. `SpawnFailed` is the one an implementer forgets, and it is reachable: `restart` on a live sheep runs the kill ladder and respawns, and that respawn can fail. It is a lost occurrence, not a dead engine, so the schedule stands.
+
+**The plain `restart` there is deliberate and is not an oversight to be tidied into Task 11's `restart_running`.** A cron restart reaches every instance of the name, including ones the user stopped; a watch-triggered restart does not. That asymmetry is settled for watch and open for cron (Still open item 3), and the default is to leave this call as written. An implementer who changes it is answering a question that is not theirs.
 
 1. **The `if` after the sleep is not optional.** Without it, a capped sleep that expires before `next` fires the job early, every minute, forever. With it, a capped sleep that expires early simply loops and re-derives.
 2. **Missed occurrences are not replayed.** A daemon that was suspended for six hours with an hourly cron wakes to a `next_after(now)` that is one occurrence in the future, and the sheep restarts at most once. Firing the six missed occurrences would be a restart storm; the loop's structure gives the at-most-one behaviour for free, and the reason belongs in an IR-31 `//` comment so nobody "fixes" it into a catch-up loop.
@@ -1261,7 +1319,7 @@ pub async fn await_ready(
 - Neither → `online` on spawn success, exactly as the engine behaves today. No new latency, and no existing supervisor test changes its expectations.
 - `Heuristic` still exists, is still tested, and is what reload will use when reload is built. It is simply not reachable from the start path.
 
-**On deadline elapse the sheep goes online anyway, with a `tracing::warn!`.** The alternative — treating a readiness timeout as a spawn failure — turns a slow-starting app into a restart loop, which is the failure mode `max_restarts` exists to contain and which users hit constantly in pm2. This is a judgement call; it is in Open Questions.
+**On deadline elapse the sheep goes online anyway, with a `tracing::warn!` (Rin, 2026-08-08).** Treating a readiness timeout as a spawn failure turns a slow-starting app into a restart loop — precisely the failure mode `max_restarts` exists to contain, reached by an app that is slow rather than broken, and the one pm2 users hit constantly. The stricter reading is rejected on that basis: `errored` is arguably more honest about what happened, but it converts a latency problem into an outage. Reporting the elapse as its own `ProcessEventKind::ReadinessTimeout` is a third option and is out of reach here for an unrelated reason — a new event kind is a wire-additive change and this phase's out-of-scope list forbids one. It stays available to the phase that wants it.
 
 **The supervisor changes, precisely:**
 
@@ -1350,7 +1408,26 @@ pub struct WatchSource { /* private: the Debouncer guard */ }
 /// - [`WatchError::Watch`] — notify could not watch `root`, carrying the path.
 pub fn watch_tree(root: &Path, delay: Duration)
     -> Result<(WatchSource, mpsc::UnboundedReceiver<Vec<PathBuf>>), WatchError>;
+
+/// Why a filesystem watch could not be established.
+///
+/// Two variants and no `#[non_exhaustive]`: notify gives this module exactly
+/// two failure points — building the backend and registering a path — and a
+/// third reason would mean a third API call, not a third rendering of these
+/// (IR-20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchError {
+    /// notify could not construct a watcher for this platform's backend.
+    /// Carries notify's rendered reason.
+    Backend { reason: String },
+    /// notify could not begin watching the path: it does not exist, it is not
+    /// readable, or the backend's watch limit is exhausted. Carries the path
+    /// and notify's rendered reason.
+    Watch { path: PathBuf, reason: String },
+}
 ```
+
+**The payloads are owned `String`s for the same hard API reason `CronParseError`'s are.** `notify::Error` carries `#[derive(Debug)]` and nothing else (`notify-8.2.0/src/error.rs:44`) — not `Clone`, not `PartialEq` — so a variant wrapping it could not hold the `Clone, PartialEq, Eq` derives that let Task 11's boundary sweep and Task 13's non-existent-root sweep assert a whole value. Render through `Display` at the boundary, exactly as Task 1 does with `CronError`.
 
 **The verified notify-debouncer-full 0.7 API, read off docs.rs on 2026-08-08:**
 
@@ -1428,9 +1505,10 @@ The third case is the subtle one: proving a *negative* needs a bounded wait that
 
 **Files:**
 - Modify: `crates/shep-daemon/src/watch/mod.rs` — pure tier
+- Modify: `crates/shep-daemon/src/supervisor.rs` — pure tier (one handle method, one `Msg` variant, one parameter on `begin_manual`)
 
 **Interfaces:**
-- Consumes: `globset::{Glob, GlobSet, GlobSetBuilder}` (already a `shep-daemon` dependency, `crates/shep-daemon/Cargo.toml:29`), `crate::watch::source::watch_tree`, `SupervisorHandle::restart`
+- Consumes: `globset::{Glob, GlobSet, GlobSetBuilder}` (already a `shep-daemon` dependency, `crates/shep-daemon/Cargo.toml:29`), `crate::watch::source::{watch_tree, WatchError}`, `crate::supervisor::{SupervisorHandle, SupervisorError}`, `shep_core::selector::ProcessSelector`, `shep_core::protocol::ProcessInfo`
 - Produces:
 
 ```rust
@@ -1472,12 +1550,43 @@ impl WatchFilter {
     pub fn triggers(&self, path: &Path) -> bool;
 }
 
+/// Why a watch filter could not be built.
+///
+/// One variant and no `#[non_exhaustive]`: the only way this construction
+/// fails is a pattern globset rejects (IR-20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchFilterError {
+    /// A `watch_options` or `ignore_watch` pattern globset rejected. Carries
+    /// the pattern as the user wrote it and globset's rendered reason.
+    Glob { pattern: String, reason: String },
+}
+
+// Declared here rather than with the rest of the supervisor's surface because
+// the watch group is the only caller and this task is where the requirement
+// comes from. It lives in supervisor.rs beside `restart`.
+impl SupervisorHandle {
+    /// Restarts every sheep matching `selector` that has a live process,
+    /// resetting its restart budget exactly as [`Self::restart`] does. An
+    /// instance the user stopped, one that errored out, and one waiting on a
+    /// restart backoff are all skipped.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::NotFound`] — nothing matched the selector, or
+    ///   nothing that matched was running. The second case is the ordinary
+    ///   outcome when every instance of a name is stopped, not a fault.
+    /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    pub async fn restart_running(&self, selector: ProcessSelector)
+        -> Result<Vec<ProcessInfo>, SupervisorError>;
+}
+
 /// Runs one name-group's watch until the returned handle is aborted.
 ///
-/// `root` is an already-canonicalized absolute directory; Task 12 states where
-/// it comes from and why it is never the daemon's own cwd. Aborting the handle
-/// stops the OS watch as well as the loop, because the debouncer guard lives
-/// inside the spawned future.
+/// `root` is an already-canonicalized absolute directory. It comes from the
+/// app's own `cwd`, which config validation requires whenever `watch` is on,
+/// and never from the daemon's working directory. Aborting the handle stops
+/// the OS watch as well as the loop, because the debouncer guard lives inside
+/// the spawned future.
 ///
 /// # Errors
 ///
@@ -1493,9 +1602,34 @@ pub fn spawn_watch_group(
 ) -> Result<tokio::task::JoinHandle<()>, WatchError>;
 ```
 
-**One watch per name-group, not per instance.** Spec §4 says so, and the reason is that N instances of one app share one source tree: N debouncers over the same tree means N inotify watch sets, N copies of every event, and N restarts racing each other for one file save. The group's restart is `SupervisorHandle::restart(ProcessSelector::Name(name))`, which restarts every instance. This is what makes watch state live in a `HashMap<String, _>` keyed by name rather than in `SheepSlot` — Task 12 owns that map.
+**`WatchFilterError` carries owned `String`s by choice, not by constraint, and the distinction is worth one sentence** because the reader has just met `WatchError`'s hard version of the same shape. `globset::Error` derives `Clone, Debug, Eq, PartialEq` (`globset-0.4.20/src/lib.rs:156`) and exposes `glob()` and `kind()`, so wrapping it would keep every derive. It stays owned anyway under IR-11: a config-rejection type is shep's own contract, and pinning it to globset's public error makes globset's next major version a breaking change to shep's config surface — the same reasoning that keeps `croner::Cron` out of `CronSchedule`.
 
-**That includes instances the user stopped, and it is deliberate.** `ProcessSelector::Name` matches on the name alone (`crates/shep-core/src/selector.rs`), regardless of status, and `restart` on a sheep with no live process resets its budget and respawns it (`supervisor.rs:816-819`). So a `shep stop web-1` followed by a file save brings `web-1` back. That matches what `restart` means everywhere else in this engine and what a pm2 user expects, and the alternative — a group restart that skips stopped instances — makes `shep stop` a state a file save cannot clear, which is its own surprise. Write it as an IR-31 `//` comment on the group loop so nobody "fixes" it, and see Open question 4, which this is a consequence of. Cron restarts have the identical shape for the identical reason. It is **not** the same situation as a memory breach or a liveness failure, which Task 12 guards: those are reports about a specific process that may no longer exist, while a file save is a fresh, live intention about a name.
+**One watch per name-group, not per instance.** Spec §4 says so, and the reason is that N instances of one app share one source tree: N debouncers over the same tree means N inotify watch sets, N copies of every event, and N restarts racing each other for one file save. The group's restart is `SupervisorHandle::restart_running(ProcessSelector::Name(name))`. This is what makes watch state live in a `HashMap<String, _>` keyed by name rather than in `SheepSlot` — Task 12 owns that map.
+
+**It restarts only the instances that are running (Rin, 2026-08-08).** A file save must not resurrect an instance the user explicitly stopped: `shep stop web-1` is a standing intention, and a text editor is not the place to overturn it. This is why `restart_running` exists rather than the plain `restart` an earlier draft used — `ProcessSelector::Name` matches on the name alone (`crates/shep-core/src/selector.rs`) regardless of status, and `restart` on a sheep with no live process falls through to `apply_immediate`, which resets the budget and respawns unconditionally (`supervisor.rs:816-819`).
+
+**The running set is determined inside the actor, at the moment the command is handled — never by the caller.** `begin_manual` (`supervisor.rs:699`) already computes the predicate it needs, per matched id: `slot.ctl.is_some()` (`:712`), true exactly while a sheep task is alive holding a live process. The change is a scope parameter on that function:
+
+```rust
+/// Whether a manual command reaches every matched sheep, or only the ones
+/// with a live process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualScope { Matched, RunningOnly }
+```
+
+`RunningOnly` filters `matched` by that predicate before the loop; the five existing call sites pass `ManualScope::Matched` and behave exactly as they do today. Everything downstream is untouched — the IMPORTANT-4 first-command-wins dedupe (`:722-756`), the kill ladder, the budget reset, the `pending_delete` interaction — so this adds a *filter*, not a second respawn path. `restart_running` is delivered on a new `pub(crate) enum Msg` variant carrying a `ReplyKind::Info` sender (`Msg` is already `pub(crate)`, `supervisor.rs:107`), rather than a `Command` variant: `Command` is the public surface the RPC layer maps user verbs onto, and no user verb means "restart the running ones".
+
+The alternative an implementer reaches for first is a `list()` read followed by per-id restarts. It is wrong twice: it reintroduces the very race the decision closes — a `shep stop` landing between the read and the restart resurrects the instance anyway — and it is the asynchronous-poll shape Task 3 already rules out for observing a value that changes under you.
+
+Three consequences, all of which belong in the group loop's IR-31 `//` comment so nobody "fixes" them:
+
+- **`Starting` counts as running.** A readiness-gated app mid-start has a live process, and a save restarts it.
+- **`Errored` and `WaitingRestart` do not.** A `WaitingRestart` instance is already coming back on its own, so restarting it would only move the clock. An `Errored` one — restart budget exhausted — stays down until someone runs `shep restart`, which is the narrow reading of "only running instances" and the one this decision's wording takes.
+- **When every instance of a name is stopped the question never arises**, because Task 12 disarms the group's watch as the last instance goes terminal and there is no watcher left to fire. The filter is observable only for a name holding a mix of running and stopped instances, which is also why it needs its own test row rather than riding on an existing one.
+
+**Cron does not get this treatment, and the asymmetry is deliberate rather than an oversight.** Task 3's worker still calls `restart(ProcessSelector::Name(name))`, so a scheduled restart still reaches a stopped instance. The decision above is about a file save; extending it to a wall-clock schedule is a separate call and is item 3 in Still open, with "leave cron as it is" as the standing default so nothing here is blocked.
+
+It is also **not** the same guard Task 12 applies to a memory breach or a liveness failure. Those are stale-signal guards keyed on the pid, protecting against a report about a process that no longer exists. This one is keyed on status, and protects a live intention the user expressed. Two different problems, two different guards, and neither substitutes for the other.
 
 **The re-check needs no dirty flag, because the channel is the mechanism.** The loop is:
 
@@ -1503,13 +1637,15 @@ pub fn spawn_watch_group(
 loop {
     batch = rx.recv().await                        // None => the source is gone, return
     if !batch.iter().any(|p| filter.triggers(p)) { continue }
-    if let Err(err) = supervisor.restart(Name(name)).await { ... }   // cron.rs's three arms
+    if let Err(err) = supervisor.restart_running(Name(name)).await { ... }  // cron.rs's three arms
     // events that arrived during the restart are still queued in rx;
     // the next iteration drains and re-filters them
 }
 ```
 
-Spec §4's "Events during an in-flight restart are re-checked after it completes" falls out of the ordering: `restart` is awaited, the receiver keeps buffering, and the next `recv` returns whatever accumulated. Nothing needs to remember that a restart happened. **Do not add a dirty flag or a state machine here** — the reason it is unnecessary is worth an IR-31 `//` comment, because it looks like a missing feature until someone traces the buffering.
+Spec §4's "Events during an in-flight restart are re-checked after it completes" falls out of the ordering: the restart is awaited, the receiver keeps buffering, and the next `recv` returns whatever accumulated. Nothing needs to remember that a restart happened. **Do not add a dirty flag or a state machine here** — the reason it is unnecessary is worth an IR-31 `//` comment, because it looks like a missing feature until someone traces the buffering.
+
+The awaiting is also what keeps the running-set filter honest: the set is read inside the actor while the loop is parked on the reply, so nothing the loop observed earlier can go stale before the restart uses it. `NotFound` on that call is the everything-is-stopped case and takes cron.rs's `debug!` arm — the loop keeps running, because the user may start the flock again without touching the Flockfile.
 
 **The consequence is a single-flight guarantee**, and it is the invariant the proptest in Task 13 checks: because the loop awaits its restart before reading the next batch, a WatchGroup can never have two restarts in flight.
 
@@ -1553,6 +1689,13 @@ Giving `run_group` a fifth `_source: WatchSource` parameter is also wrong, for a
 **Neither Task 10's smoke tests nor these tests can catch a dropped guard**, which is why it is written into the contract rather than left to be inferred. Task 10 exercises `watch_tree` directly and owns the `WatchSource` itself; these tests never construct one. The only behavioural catch is Task 14's e2e case 1, three tasks downstream, where the failure surfaces in somebody else's module. Add one real-filesystem case here to close that gap, tiered with the same IR-33 real-time justification Task 10's smoke tests carry: spawn a group over a tempdir, touch a file, expect a restart; then abort the handle, touch again, expect none within a bounded wait.
 
 Cases with their "fails if" comments: a batch of only-ignored paths produces no restart; a batch with one triggering path produces exactly one restart; two batches sent before the first restart completes produce exactly two restarts, not three (the second batch is drained as one); a batch arriving *during* a restart is re-checked after it (the spec §4 requirement, asserted by observing the second restart); dropping the sender ends the task.
+
+Two more for the running-set filter, which no other case reaches:
+
+| Case | The broken implementation it catches |
+|---|---|
+| a name with two instances, one of them stopped: a triggering batch restarts the running one and the stopped one is still `Stopped` afterwards | a group restart through the plain `restart`, which resurrects it — assert the stopped instance's status and its unchanged `restarts` count, not merely that *a* restart happened |
+| a name whose every instance is stopped: a triggering batch produces no restart and the loop is still alive for the next batch | a loop that treats the resulting `NotFound` as fatal and returns, leaving the watch armed but deaf |
 
 Every `recv().await` in these tests — on the event channel used to observe restarts — is inside a `tokio::time::timeout` naming the restart that did not arrive.
 
@@ -1641,8 +1784,8 @@ impl ExtrasRegistry {
     /// was its last armed instance.
     ///
     /// Aborting the watch-group handle is sufficient to stop the OS watch:
-    /// the debouncer guard rides inside the aborted future (Task 11), so no
-    /// second drop is needed and none is available.
+    /// the debouncer guard rides inside the aborted future, so no second drop
+    /// is needed and none is available.
     pub fn disarm(&mut self, id: u32, name: &str);
 }
 ```
@@ -1674,7 +1817,9 @@ impl fmt::Debug for Extras {
 | memory limit | sheep id | every time an instance goes online (new pid) | that instance leaves |
 | liveness probe | sheep id | ditto | ditto |
 
-Cron and watch are per-name because a cron restart and a watch restart both target `ProcessSelector::Name` and would otherwise fire N times for N instances. Memory and liveness are per-instance because each has its own pid and its own health.
+Cron and watch are per-name because both select by `ProcessSelector::Name` and would otherwise fire N times for N instances. That is a statement about *arming*, not about reach: a cron worker restarts every instance of the name, while a watch group restarts only the running ones (Task 11). Memory and liveness are per-instance because each has its own pid and its own health.
+
+The watch group's disarm-on-last-instance rule is what makes Task 11's filter narrow rather than load-bearing in the common case: once the last instance of a name goes terminal — stopped, errored or deleted — the group's watch is aborted, so a name with nothing running has no watcher to fire. The filter earns its place on the mixed case, `shep stop web-1` with `web-2` still up.
 
 **Where the watch's root, delay and filter come from.** No other task states this and `spawn_watch_group` takes all three as given, so `arm` is the only place they can be produced:
 
@@ -1820,7 +1965,7 @@ Cap the case count in CI through proptest's env var, as IR-37 requires, matching
 
 | Sweep | Where |
 |---|---|
-| `watch_options` empty; a glob matching nothing; a watch root that does not exist | `watch/mod.rs` |
+| `watch_options` empty; a glob matching nothing (never triggers rather than erroring); a watch root that does not exist, asserted as `WatchError::Watch` carrying that path rather than as a bare `is_err()` | `watch/mod.rs` |
 | `failure_threshold = 1`; `timeout` greater than `interval`; `interval` of zero | `probes/mod.rs` |
 | `max_memory` smaller than any plausible reading (immediate breach on the first tick); `max_memory` exactly equal to the observed tree (no breach) | `limits/mod.rs` |
 | a cron pattern that never fires again; `* * * * *`, whose next occurrence lands exactly on the `MAX_CRON_SLEEP` boundary of 60s | `cron.rs` |
@@ -1873,7 +2018,9 @@ Also record `limits/` and `probes/` being directories rather than files, and the
 
 Each gets its links in a bottom reference block, and each names its honest caveats inline: no TLS, no redirects, polling granularity, real-time debounce.
 
-**Changelogs (IR-45).** `shep-core` gets the cron dialect change under both Additions and Changes. The entry a user needs is the one Task 1 Step 6 spells out, and it moves in one direction only: patterns that used to pass now fail; **nothing that used to fail now passes**. Do not write "and vice versa" — six-field, seconds-bearing and `@nickname` patterns were all rejected by the merged token-count stopgap and stay rejected, now with an error that says why. `shep-daemon` gets the four subsystems, the `Online` timing change for readiness-gated apps (bus-visible even though no wire type changed), and the new `watch = true` requires `cwd` rejection.
+**Changelogs (IR-45).** `shep-core` gets the cron dialect change under both Additions and Changes, and the entry a user needs is the one Task 1 Step 6 spells out. It moves in both directions and the two must not be blurred into one bullet: under Changes, patterns that used to pass now fail (five tokens of garbage, and the `L`/`W`/`#`/`?` extensions) plus `@reboot`'s new message; under Additions, the seven vixie nicknames that the token-count stopgap rejected and shep now expands. Six-field and seconds-bearing patterns are in neither list — they were rejected before and are rejected now, only with a better sentence.
+
+`shep-daemon` gets the four subsystems, the `Online` timing change for readiness-gated apps (bus-visible even though no wire type changed), the new `watch = true` requires `cwd` rejection, and the watch group's running-only reach: a file save restarts the instances that are up and leaves a stopped one stopped.
 
 - [ ] **Step 1: Write the five e2e cases, run, confirm each fails against a stub before it passes**
 - [ ] **Step 2: map.md sync**
@@ -1902,33 +2049,34 @@ Each gets its links in a bottom reference block, and each names its honest cavea
 
    returns nothing — those are the files this phase **creates**, and `testing.rs` is on the list because Task 3 moves two Phase 1-3 task references into it and then rewrites them. For files this phase only *modifies* (`supervisor.rs`, `lib.rs`, `boot.rs`, `normalize.rs`, `config/mod.rs`, `cli_e2e.rs`, `Cargo.toml`, the CHANGELOGs), rule 10 binds the lines this phase adds; check it in review of the diff.
 
-   **The 39 pre-existing Phase 1-3 task references on `main` are out of scope and must not be rewritten.** An unscoped `grep -rn "Phase 4\|Task [0-9]" crates/ Cargo.toml` returns 41 hits today, only two of which this phase retires — which is why the tree-wide form was replaced. `benches/` is off the path entirely: it does not exist yet and never will if Open question 2 resolves to "defer", and grep on a missing path exits non-zero and fails the criterion for the wrong reason.
+   **The 39 pre-existing Phase 1-3 task references on `main` are out of scope and must not be rewritten.** An unscoped `grep -rn "Phase 4\|Task [0-9]" crates/ Cargo.toml` returns 41 hits today, only two of which this phase retires — which is why the tree-wide form was replaced. `benches/` is off the path entirely: it does not exist yet and never will if Still open item 1 resolves to "defer", and grep on a missing path exits non-zero and fails the criterion for the wrong reason.
 
    The two retirements are a positive requirement, since the scoped grep no longer reaches them: Task 9 removes both `Phase 4` markers on the readiness path — the `Msg::Ready` doc at `supervisor.rs:129` and the debug line at `supervisor.rs:432`. Verify both are gone.
 
    Five other `Phase 4` promises survive in code this phase does not touch (`boot.rs:763`, `:884` log flush/reopen; `supervisor.rs:1223`, `:1226` child metric and child action reply; `completions.rs:12`), all of them in the out-of-scope list at the top of this plan. After Phase 4 ships without delivering them those comments become false promises: re-point them at the phase that will, or say so in the report. Do not let a grep deputize an implementer to rewrite them silently.
 6. `grep -rn "assert_ne!" crates/shep-daemon/src crates/shep-core/src` returns nothing new.
-7. A report to Rin listing: every third-party API where the real documentation differed from `docs/research/phase4-lifecycle.md`; every judgement call made on her behalf; the bench numbers and the machine they came from; and the `interval = 0` decision from Task 13. Four items are already known to belong in it and should not have to be rediscovered — the sysinfo pin held at 0.38.x for MSRV rather than tracking 0.39, the bench crate's MSRV spelled literally in a second place because IR-5's own-`[workspace]` rule forbids inheriting it, the bracketed-IPv6 decision from Task 2, and whichever way Open questions 5 and 6 land if Rin has not answered them by the time the tasks that need them run.
+7. A report to Rin listing: every third-party API where the real documentation differed from `docs/research/phase4-lifecycle.md`; every judgement call made on her behalf; the bench numbers and the machine they came from; and the `interval = 0` decision from Task 13. Five items are already known to belong in it and should not have to be rediscovered — the sysinfo pin held at 0.38.x for MSRV rather than tracking 0.39, the bench crate's MSRV spelled literally in a second place because IR-5's own-`[workspace]` rule forbids inheriting it, the bracketed-IPv6 decision from Task 2, whether the cron worker was left restarting stopped instances (Still open item 3, whose default is yes), and whether the bench crate shipped (item 1).
 8. Every test added by this phase has its "fails if" comment. A reviewer spot-checking three of them at random should be able to break the implementation in the named way and watch the named test go red.
 
 ## Open questions for Rin
 
-**Four are settled (Rin, 2026-08-08); six remain below.** Items 5 and 6 were surfaced by the plan's adversarial verification pass, not by the original draft. Both carry a stated default so no implementer is blocked, and both are cheap to overturn.
+**Eight are settled (Rin, 2026-08-08); three remain below.** The first four were settled when the plan was drafted. The other four close later questions — two from the original draft's open list, two the adversarial verification pass surfaced. Each remaining item carries a stated default, so no implementer is blocked on any of them.
 
 - **Cron dialect: five-field standard cron only.** Widening a grammar later is backwards-compatible, narrowing one is not, so the wide default was the expensive direction to guess. See Task 1 for the `Seconds::Disallowed` setting, the extension-character rejection, and the day/month-name trap it has to avoid.
 - **`https://` probe targets: rejected at config time**, with a typed error. A probe that silently fails every poll is indistinguishable from an app that is down, so failing loudly at config time is the honest option. A user with an HTTPS health endpoint cannot use a readiness probe in v1; that is the accepted cost of keeping a TLS stack out of the daemon (decision D1).
 - **Memory-limit scope: the process tree**, sheep plus lambs. The tree is what gets killed, so the tree is what gets measured, and a root-pid limit is trivially dodged by any app that forks workers. This deviates from pm2 and wants a line in `docs/migration.md`: someone migrating with `max_memory` on a forking app will see restarts pm2 never gave them.
 - **Breach and liveness restarts do not count against `max_restarts`.** Both keep routing through the path that resets the budget, matching spec §4's wording that only exits inside `min_uptime` count as unstable. A memory-leak loop therefore restarts indefinitely rather than reaching `errored` — accepted, on the grounds that a supervisor's job is keeping things up. Revisit if it proves wrong in practice.
+- **`watch = true` with no `cwd`: rejected at config time**, with a typed `NormalizeError::WatchWithoutCwd` naming the app. Both alternatives were rejected for named reasons. Arming nothing and logging a warning is the silent-failure shape this project keeps rooting out — the user learns their watch does nothing at the moment they wonder why saving a file changes nothing, which is the same fault the `https://` rejection exists to avoid. Defaulting to the daemon's own cwd is worse than quiet, it is dangerous: nothing in this workspace chdirs, so under a systemd unit with no `WorkingDirectory=` that default is `/` and shep would arm a recursive watch over the whole filesystem. Task 2 owns the variant and its three test rows; an app carrying `watch_options` with `watch = false` is deliberately left alone.
+- **Cron nicknames: the vixie set is accepted, `@reboot` is not.** `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily`, `@midnight` and `@hourly` are accepted and **shep expands each one itself, before the pattern reaches croner** — so croner never sees a nickname and the settled grammar stays literally five-field. These are textual sugar, not a wider dialect. The reason this does not reopen the five-field decision is that the vixie set is *closed*: it has been these seven spellings for decades and commits shep to nothing further, unlike croner's `L`/`W`/`#` extensions, which are that crate's own dialect and grow with it. Expanding ourselves is also what makes the set coherent — croner's own table has no `@midnight` arm, so delegating would accept `@daily` and reject `@midnight`. `@reboot` is refused with its own message: "run once at boot" has no meaning for a supervisor that already owns restart policy. Task 1 carries the expansion table and the rows in both directions.
+- **A readiness timeout on start takes the sheep online, with a warning.** Treating a slow start as a spawn failure produces exactly the restart loop `max_restarts` exists to contain, out of an app that is slow rather than broken. `errored` is the honest-but-brittle reading and is rejected on that basis; a dedicated `ReadinessTimeout` event is wire-additive and therefore out of this phase either way. Task 9 owns the behaviour and the warning.
+- **A watch-triggered restart reaches only the running instances.** A file save must not resurrect an instance the user explicitly stopped — `shep stop web-1` is a standing intention and a text editor is not where it gets overturned. The running set is read inside the actor at the moment the command is handled, using the `slot.ctl.is_some()` predicate `begin_manual` already computes, so nothing can go stale between deciding and acting; Task 11 owns the `restart_running` seam, the `ManualScope` parameter that implements it, and the two test rows. `Starting` counts as running; `Errored` and `WaitingRestart` do not.
 
 ### Still open — do not resolve these unilaterally
 
-1. **What happens when readiness times out on start?** This plan goes `online` anyway with a `tracing::warn!`, on the grounds that treating a slow start as a spawn failure produces exactly the restart loop `max_restarts` exists to contain — and that pm2 users expect the lenient behaviour. The alternative is `errored`, which is stricter and arguably more honest: an app that did not signal readiness inside `listen_timeout` is, by its own configuration, not ready. A third option is a new `ProcessEventKind::ReadinessTimeout`, which is a wire-additive change and therefore out of this phase's scope but not out of the question for the next.
-2. **Does the bench crate land in this phase?** Task 5 builds it because IR-26 requires a benchmark-backed comment on `MEMORY_POLL_INTERVAL` and IR-5 specifies exactly what a bench crate should look like — but it is the phase's only task that ships no user-visible behaviour, and deferring it means the const's comment cites a one-off measurement instead of a committed harness. If the answer is "defer", say so before Task 4 finishes, because Task 6's const comment is written either way.
-3. **`MAX_CRON_SLEEP = 60s`, and at-most-one catch-up.** A cron worker re-derives its next occurrence at least once a minute, so a suspended laptop or an NTP step costs at most a minute of drift; and a daemon that missed six occurrences fires once on wake rather than six times. Both are restart-storm guards and both are guesses at what a user wants. Sixty seconds is one wakeup per minute per cron-configured sheep, which is cheap but not free on a large flock.
-4. **The watch group restarts every instance of a name.** Spec §4 says one watcher per name-group, and this plan takes the restart to be group-wide to match. A rolling per-instance restart on file change would keep the app serving through a save, which is arguably what a watch is *for* in development — but it is also reload's job, and reload is not in this phase.
+1. **Does the bench crate land in this phase?** Task 5 builds it because IR-26 requires a benchmark-backed comment on `MEMORY_POLL_INTERVAL` and IR-5 specifies exactly what a bench crate should look like — but it is the phase's only task that ships no user-visible behaviour, and deferring it means the const's comment cites a one-off measurement instead of a committed harness. Default: build it. If the answer is "defer", say so before Task 4 finishes, because Task 6's const comment is written either way.
 
-   One consequence worth deciding with it, because it is user-visible and mildly surprising: `ProcessSelector::Name` matches every instance regardless of status, and `restart` on a stopped sheep starts it. So `shep stop web-1` followed by a file save brings `web-1` back, and the same is true of a cron restart. Task 11 takes that as intended — it is what `restart` means everywhere else in the engine, and the alternative makes `shep stop` a state a save cannot clear — but if a stopped instance should stay stopped, both group restarts need to filter to running instances and that is a change to make once, here, rather than twice later.
+2. **`MAX_CRON_SLEEP = 60s`, and at-most-one catch-up.** A cron worker re-derives its next occurrence at least once a minute, so a suspended laptop or an NTP step costs at most a minute of drift; and a daemon that missed six occurrences fires once on wake rather than six times. Both are restart-storm guards and both are guesses at what a user wants. Sixty seconds is one wakeup per minute per cron-configured sheep, which is cheap but not free on a large flock. Default: as written.
 
-5. **What should an app with `watch = true` and no `cwd` do?** This plan has `normalize` reject it, with a `NormalizeError::WatchWithoutCwd` and the exit-code-4 path Task 14 cases 4 and 5 already exercise. The reason it cannot simply default is that the obvious default is dangerous: `AppConfig::cwd`'s doc says the default is the daemon's cwd at spawn registration, but nothing in this workspace ever chdirs, so that is whichever directory the user first ran `shep start` from — commonly `$HOME`, possibly `/`. A recursive watch there exhausts Linux's `max_user_watches` and turns unrelated churn into flock-wide restarts. The cheaper alternative is to arm nothing and log at `warn`, which is less disruptive to an existing Flockfile but defers the surprise to the moment the user wonders why saving does nothing. The two are behaviourally and test-visibly different, so the plan cannot ship with the choice unmade. The narrow reading is also in play: this plan rejects only `watch = true` with no `cwd`, and leaves an app with `watch_options` set but `watch = false` alone.
+3. **Should a cron restart also skip stopped instances?** The settled watch decision says a file save must not resurrect an instance the user explicitly stopped. The identical argument reads across to a scheduled restart — `shep stop web-1` followed by 03:00 brings `web-1` back — but it was not the decision made, and the two are genuinely different in kind: a file save is a fresh intention the user just expressed, while a cron schedule is one they expressed once and left running. Leaving them different is defensible and leaving them the same is defensible; leaving it *undecided* is what is not, because the asymmetry is user-visible. The mechanism costs one call site if the answer is yes: Task 3's worker swaps `restart` for the `restart_running` Task 11 already builds, and gains a test row. Default: cron stays as written, restarting every instance of the name.
 
-6. **Are `@daily` and friends part of the dialect?** croner expands the six `@nickname` shorthands before its own field-count gate, so they parse under `Seconds::Disallowed` — `@daily` becomes `0 0 * * *`. They are the one class of pattern that would go from rejected to accepted, since the merged token-count stopgap rejects a one-token pattern today. This plan rejects them, on the same reasoning that settled the five-field decision: a nickname is not five-field standard cron, widening later is backwards-compatible and costs one deleted line, and rejecting keeps every existing Flockfile's behaviour unchanged. Accepting them instead is defensible — they are readable, pm2 users know them, and they are croner's own feature — and would cost a table row, a migration line and a changelog entry under Additions.
+**Two things this section no longer decides, recorded so nobody re-opens them from the old numbering.** Whether a watch should restart the group *rolling* rather than all at once was folded into the settled watch decision: a rolling restart keeps the app serving through a save, which is what reload is for, and reload is on this phase's out-of-scope list. And the `interval = 0` probe question is not here because it is not Rin's — Task 13 states it as the implementer's call between rejecting at `normalize` and flooring at a named minimum, with the choice going in the report either way.
