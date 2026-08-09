@@ -66,12 +66,18 @@ impl OsProber {
 /// Debug implementation does not leak env values (IR-41): mirrors
 /// `AppConfig`'s manual `Debug` (`crates/shep-core/src/config/app.rs`) —
 /// one redaction spelling in the workspace, not two.
+///
+/// `finish_non_exhaustive`, not `finish`: this is a redacting impl, and the
+/// trailing `..` is the honest rendering of one. `finish` would assert that
+/// what it printed is every field there is, which stops being true the day
+/// somebody adds a second secret-bearing one and does not think to come back
+/// here.
 impl fmt::Debug for OsProber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OsProber")
             .field("cwd", &self.cwd)
             .field("env", &format_args!("<{} vars>", self.env.len()))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -778,7 +784,7 @@ mod tests {
         let prober = OsProber::new(None, env);
         assert_eq!(
             format!("{prober:?}"),
-            "OsProber { cwd: None, env: <2 vars> }"
+            "OsProber { cwd: None, env: <2 vars>, .. }"
         );
     }
 }
