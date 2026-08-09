@@ -5,7 +5,7 @@
 
 **Goal:** Give the merged supervisor the four lifecycle extras spec §4 and §7 promise and the engine does not yet have: restart on file change, restart on a cron schedule, restart on a memory-limit breach, and readiness/liveness probes.
 
-**Architecture:** Four independent subsystems, each a task (or task pair) that owns one module and one seam trait, plus one integration module that arms and disarms them. None of them reaches into the supervisor actor's state: watch, cron and limits all trigger a restart through the *existing public* `SupervisorHandle::restart(ProcessSelector)` (`crates/shep-daemon/src/supervisor.rs:210`), which already resets the restart budget the way spec §4 wants a non-crash restart to. Only readiness needs actor surgery, because only readiness changes what `starting → online` means.
+**Architecture:** Four independent subsystems, each a task (or task pair) that owns one module and one seam trait, plus one integration module that arms and disarms them. Watch and cron reach the engine through the *existing public* `SupervisorHandle::restart(ProcessSelector)` (`crates/shep-daemon/src/supervisor.rs:210`), which already resets the restart budget the way spec §4 wants a non-crash restart to, and neither adds a line to the actor. Two things do reach into the actor, and only two: readiness, because it changes what `starting → online` means, and the pid guard the memory-breach and liveness reports need — a new command that drops a stale report and otherwise delegates straight back to the same budget-resetting path, never a second respawn route (Task 12).
 
 Parsing lives in `shep-core`: a cron pattern and a probe target are Flockfile grammar, and spec §5's "typos fail loudly at parse time" means a bad one must be rejected by `normalize`, not discovered by a worker three seconds after the daemon adopts the app.
 
@@ -115,7 +115,7 @@ Beyond those: paused tokio clock where time matters (`#[tokio::test(start_paused
 - `# Panics` and `#[track_caller]` travel together, or neither appears (IR-21).
 - No panicking constructors outside `shep-cli` (IR-21) — which means none at all in this phase, since it touches only `shep-core` and `shep-daemon`.
 - `#[non_exhaustive]` where growth is genuinely anticipated, with a comment saying why (IR-20). `ProbeFailure` and `CronParseError` qualify; a two-variant internal enum does not.
-- **No magic numbers.** Every duration, threshold and cap is a named `const` with a comment giving the unit and the reason (IR-26). This phase introduces six — `MAX_CRON_SLEEP`, `MEMORY_POLL_INTERVAL`, `HTTP_STATUS_LINE_CAP`, `DEFAULT_WATCH_DELAY`, `DEFAULT_IGNORE_GLOBS`, `WATCH_SMOKE_DEADLINE` — and each is declared at exactly one task.
+- **No magic numbers.** Every duration, threshold and cap is a named `const` with a comment giving the unit and the reason (IR-26). This phase introduces seven — `DEFAULT_MAX_CRON_SLEEP`, `MIN_CRON_SLEEP`, `MEMORY_POLL_INTERVAL`, `HTTP_STATUS_LINE_CAP`, `DEFAULT_WATCH_DELAY`, `DEFAULT_IGNORE_GLOBS`, `WATCH_SMOKE_DEADLINE` — and each is declared at exactly one task. The first two are the two halves of one configurable knob and are both Task 3's, but they live in different crates: the default in `shep-daemon`, because that is where it is applied, and the floor in `shep-core`, because that is where the value is validated.
 - Implementation rationale is a `//` block above the item, never `///` (IR-31).
 - Types carrying env or secrets get a manual redacted `Debug` plus an exact-string test (IR-41). The exec probe's `ProbeTarget::Exec` carries a command line and the spawn env carries the sheep's environment — see Task 8.
 
@@ -159,6 +159,9 @@ crates/shep-core/
                                       ProbeConfig::target, one variant per ProbeKind
   src/config/normalize.rs    [pure]   MODIFY: the 5-field cron stopgap (lines 54-60) becomes
                                       a real parse; probe targets get validated
+  src/config/daemon.rs       [pure]   MODIFY: the [daemon] max_cron_sleep knob, its
+                                      SHEP_MAX_CRON_SLEEP override, and the floor that
+                                      keeps a cron worker off a busy-spin
   src/config/mod.rs          [pure]   MODIFY: re-export the two new modules' public types
 
 crates/shep-daemon/
@@ -178,17 +181,24 @@ crates/shep-daemon/
   src/watch/source.rs        [pure]   the OS seam: notify + debouncer -> mpsc bridge
   src/extras.rs              [pure]   ExtrasRegistry: arms and disarms all four on lifecycle
   src/supervisor.rs          [pure]   MODIFY: SupervisorBuilder, the readiness gate, the
-                                      arm/disarm call sites, and restart_running — the
-                                      running-only manual restart the watch group needs
+                                      arm/disarm call sites, and the pid-guarded
+                                      extra_restart the breach and liveness reports use
   src/boot.rs                [unix]   MODIFY: construct the real seams and hand them to the
-                                      builder
+                                      builder; BootOptions carries max_cron_sleep
   tests/external_impls.rs    [pure]   compile-only proof that an outside crate can implement
                                       the three new traits (IR-38)
+
+crates/shep-cli/
+  src/commands/daemon.rs     [unix]   MODIFY: boot_options folds max_cron_sleep into
+                                      BootOptions, and run_daemon's doc names the third
+                                      SHEP_* variable it now reads
 
 benches/                              outside the workspace: own [workspace], publish = false
   Cargo.toml                          criterion (declared inline), harness = false
   benches/memory_sample.rs            the number behind MEMORY_POLL_INTERVAL
 ```
+
+`crates/shep-cli/src/commands/` is declared `#[cfg(unix)]` in `main.rs:10-11`, so the CLI half of the cron knob is unix-tier for the same reason the whole hidden `daemon` subcommand is. Nothing about the knob itself is: the field, its validation, `BootOptions` and the worker are all pure, and the Windows leg still compiles and tests every one of them.
 
 `watcher.rs` and `worker.rs` — both named in map.md — are **not** created. `watcher.rs` becomes the `watch/` directory because Rin's 500-line split rule bites once the OS seam and the filtering logic share a file, and because the two halves have genuinely different test tiers (real filesystem versus paused clock). `worker.rs` was map.md's host for interval tasks; this phase's two interval loops live with the subsystems they serve (`cron.rs`, `limits/mod.rs`), which is one fewer indirection and one fewer place to look. `probes/` is a module map.md never named at all; spec §7 requires it and the spec wins (`docs/specs/shep-v1.md:8-9`). Task 14 records all three in map.md.
 
@@ -208,9 +218,10 @@ The module currently exists as an inline `mod testing { ... }` inside `lib.rs`. 
 
 | Helper | Owner | Signature |
 |---|---|---|
-| `TestClock` | Task 3 | `pub(crate) struct TestClock { epoch: DateTime<Utc>, started: tokio::time::Instant }` |
+| `TestClock` | Task 3 | `pub(crate) struct TestClock { epoch: DateTime<Utc>, started: tokio::time::Instant, reads: AtomicUsize }` |
 | `TestClock::starting_at` | Task 3 | `pub(crate) fn starting_at(epoch: DateTime<Utc>) -> Self` |
-| `impl Clock for TestClock` | Task 3 | `fn now_utc(&self) -> DateTime<Utc>` — `epoch + (Instant::now() - started)`, so `tokio::time::advance` moves wall time |
+| `TestClock::reads` | Task 3 | `pub(crate) fn reads(&self) -> usize` — how many times `now_utc` has been called |
+| `impl Clock for TestClock` | Task 3 | `fn now_utc(&self) -> DateTime<Utc>` — `epoch + (Instant::now() - started)`, so `tokio::time::advance` moves wall time; increments `reads` |
 | `ScriptedSampler` | Task 4 | `pub(crate) struct ScriptedSampler { readings: Mutex<VecDeque<Vec<ProcessRss>>>, calls: AtomicUsize }` |
 | `ScriptedSampler::new` | Task 4 | `pub(crate) fn new(readings: Vec<Vec<ProcessRss>>) -> Self` — the last reading repeats once exhausted |
 | `ScriptedSampler::calls` | Task 4 | `pub(crate) fn calls(&self) -> usize` |
@@ -224,6 +235,8 @@ The module currently exists as an inline `mod testing { ... }` inside `lib.rs`. 
 | `loopback_http` | Task 8 | `pub(crate) async fn loopback_http(script: Vec<HttpReply>) -> (SocketAddr, tokio::task::JoinHandle<()>)` — binds `127.0.0.1:0`, serves one reply per connection in order |
 | `touch` | Task 10 | `pub(crate) fn touch(root: &Path, rel: &str) -> std::io::Result<PathBuf>` — creates parent dirs, writes one byte, returns the absolute path |
 | `app_with` | Task 12 | `pub(crate) fn app_with(name: &str, edit: impl FnOnce(&mut AppConfig)) -> ResolvedApp` — `AppConfig::minimal(name, "./srv")`, `edit`, then `normalize().unwrap()` |
+
+`TestClock::reads` is a counter and not a convenience: the only externally visible difference between two `max_cron_sleep` values is how often the worker wakes, and on a paused clock a wakeup is invisible unless something counts it. It is an `AtomicUsize` rather than a `Cell` because `Clock` is bounded `Send + Sync` and `now_utc` takes `&self`; `Relaxed` ordering is enough, since the assertion happens after the worker has been driven to a quiescent point and nothing orders anything else against this count.
 
 `ScriptedSampler` and `ScriptedProber` both repeat their final scripted value rather than panicking on exhaustion. This is deliberate and it is the difference between a useful fake and an irritating one: a liveness test that scripts three failures wants the fourth poll — if the implementation wrongly makes one — to *also* fail, so the assertion is about the threshold count and not about the fake running dry. Both expose `calls()` so a test can assert the exact number of polls, which is the claim that catches an off-by-one threshold.
 
@@ -616,16 +629,17 @@ All three of this task's new variants go into `normalize`'s `# Errors` list (`cr
 
 ---
 
-### Task 3: The `Clock` seam and the cron worker
+### Task 3: The `Clock` seam, the cron worker, and its configurable sleep bound
 
 **Files:**
 - Create: `crates/shep-daemon/src/cron.rs` — pure tier
 - Create: `crates/shep-daemon/src/testing.rs` — pure tier (the inline `mod testing` in `lib.rs`, moved verbatim, plus `TestClock`)
 - Modify: `crates/shep-daemon/src/lib.rs` — pure (module declarations; the inline `mod testing { ... }` block becomes `#[cfg(test)] pub(crate) mod testing;`)
 - Modify: `crates/shep-daemon/Cargo.toml` — chrono opt-in
+- Modify: `crates/shep-core/src/config/daemon.rs` — pure tier (the `max_cron_sleep` knob, its env override, and its floor)
 
 **Interfaces:**
-- Consumes: `shep_core::config::CronSchedule`, `shep_core::selector::ProcessSelector::Name` (`crates/shep-core/src/selector.rs:15`), `crate::supervisor::SupervisorHandle::restart` (`crates/shep-daemon/src/supervisor.rs:210`)
+- Consumes: `shep_core::config::CronSchedule`, `shep_core::selector::ProcessSelector::Name` (`crates/shep-core/src/selector.rs:15`), `crate::supervisor::SupervisorHandle::restart` (`crates/shep-daemon/src/supervisor.rs:210`), `shep_core::values::UpDuration` (`crates/shep-core/src/values.rs:160`) — already in `shep-core`, so the config half adds no dependency and runs no rehearsal
 - Produces:
 
 ```rust
@@ -644,16 +658,21 @@ pub trait Clock: Send + Sync + 'static {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
-/// Longest a cron worker sleeps before re-deriving its next occurrence.
+/// Longest a cron worker sleeps before re-deriving its next occurrence, when
+/// `shep.toml` names no `max_cron_sleep`.
 ///
 /// A single `sleep_until(next)` is wrong across a laptop suspend, an NTP step
 /// or a DST wall-clock shift: the sleep was computed against a wall time that
 /// no longer holds, and the job fires late by however far the clock moved.
 /// Re-deriving at least this often bounds that error to one minute at the cost
 /// of one wakeup per minute per cron-configured sheep.
-const MAX_CRON_SLEEP: Duration = Duration::from_secs(60);
+pub(crate) const DEFAULT_MAX_CRON_SLEEP: Duration = Duration::from_secs(60);
 
 /// Runs one sheep-group's cron schedule until the handle is dropped.
+///
+/// `max_sleep` bounds how long the loop parks before it re-reads the clock;
+/// it changes how quickly the worker recovers from a wall-clock jump, never
+/// whether an occurrence fires.
 ///
 /// Cancellation: the returned handle aborts the loop on `abort()`; the loop
 /// itself holds no state that needs unwinding.
@@ -662,7 +681,44 @@ pub fn spawn_cron_worker(
     schedule: CronSchedule,
     clock: Arc<dyn Clock>,
     supervisor: SupervisorHandle,
+    max_sleep: Duration,
 ) -> tokio::task::JoinHandle<()>;
+```
+
+And in `shep-core`, the knob itself. The field goes **last** in `DaemonSection`, so the derived `Debug` gains a trailing field rather than reordering the three an exact-string test already pins; and `BelowMinimum` is a struct variant rather than a third tuple form in `DaemonConfigError`, because three positional fields stop being readable — the shape `BootError::Io { path, source }` already uses:
+
+```rust
+/// Longest a cron worker sleeps before re-deriving its next occurrence.
+///
+/// Shorter recovers faster from a suspended laptop or an NTP step and costs
+/// proportionally more wakeups per cron-configured sheep; longer is cheaper
+/// and drifts further. Unset means the daemon's own default. There is no
+/// upper bound: a very long value only degrades to sleeping straight through
+/// to the occurrence, which still fires.
+pub max_cron_sleep: Option<UpDuration>,
+
+/// Floor on `[daemon] max_cron_sleep`.
+///
+/// Zero makes every sleep return immediately and turns the loop into a hot
+/// spin that re-derives a schedule as fast as the runtime allows — while
+/// still firing correctly, which is what makes it hard to attribute. Low
+/// milliseconds are the same fault with a smaller constant. One second is a
+/// floor no legitimate configuration wants to be under: a five-field cron
+/// pattern cannot name anything finer than a minute, so even this is
+/// sixty times more often than the tightest schedule can fire.
+const MIN_CRON_SLEEP: UpDuration = UpDuration::from_millis(1_000);
+
+/// A `[daemon]` duration is below the floor that keeps the daemon from
+/// spinning. Carries the key the user actually set — the TOML key or the
+/// environment variable, whichever supplied the winning value.
+BelowMinimum {
+    /// `max_cron_sleep` or `SHEP_MAX_CRON_SLEEP`.
+    key: &'static str,
+    /// The value as the user wrote it.
+    value: UpDuration,
+    /// The floor it failed.
+    min: UpDuration,
+},
 ```
 
 **The loop shape, and the two ways to get it wrong:**
@@ -675,7 +731,7 @@ loop {
         Ok(None)  => { info!(...);  return }   // never fires again
         Err(err)  => { warn!(%err); return }   // cannot resolve; retrying would spin
     }
-    sleep(min(next - now, MAX_CRON_SLEEP))     // saturating: a negative delta is zero
+    sleep(min(next - now, max_sleep))          // saturating: a negative delta is zero
     if clock.now_utc() >= next {
         if let Err(err) = supervisor.restart(ProcessSelector::Name(name.clone())).await {
             // NotFound: the sheep is gone but the registry has not disarmed us
@@ -695,12 +751,39 @@ Three things in that shape are load-bearing against `-D warnings` rather than st
 
 The third is the arm count. `SupervisorError` has **three** variants — `NotFound`, `SpawnFailed(String)`, `EngineStopped` (`supervisor.rs:138-146`) — and carries no `#[non_exhaustive]`, so a two-arm match is `E0004` and not a stylistic omission. `SpawnFailed` is the one an implementer forgets, and it is reachable: `restart` on a live sheep runs the kill ladder and respawns, and that respawn can fail. It is a lost occurrence, not a dead engine, so the schedule stands.
 
-**The plain `restart` there is deliberate and is not an oversight to be tidied into Task 11's `restart_running`.** A cron restart reaches every instance of the name, including ones the user stopped; a watch-triggered restart does not. That asymmetry is settled for watch and open for cron (Still open item 3), and the default is to leave this call as written. An implementer who changes it is answering a question that is not theirs.
+**The plain `restart` there is the settled behaviour, and the watch group's is identical.** Both reach every instance of the name, stopped ones included, because `ProcessSelector::Name` matches on the name alone. An earlier draft of this plan gave watch a narrower reach and left cron's open; Rin closed both the same way on 2026-08-08, so there is no asymmetry left to preserve and no scope parameter to thread. What actually keeps a stopped sheep down is disarming: a sheep with no armed cron worker and no armed watcher cannot be reached by either, and Task 12 disarms both as the last instance of a name leaves. An implementer who reintroduces a status filter here is reopening a settled question.
 
 1. **The `if` after the sleep is not optional.** Without it, a capped sleep that expires before `next` fires the job early, every minute, forever. With it, a capped sleep that expires early simply loops and re-derives.
 2. **Missed occurrences are not replayed.** A daemon that was suspended for six hours with an hourly cron wakes to a `next_after(now)` that is one occurrence in the future, and the sheep restarts at most once. Firing the six missed occurrences would be a restart storm; the loop's structure gives the at-most-one behaviour for free, and the reason belongs in an IR-31 `//` comment so nobody "fixes" it into a catch-up loop.
 
 `next_after` returning `Ok(None)` — a pattern that can never fire again — logs at `info` and ends the task. Returning `Err` logs at `warn` and also ends the task: a schedule that cannot resolve its own next occurrence will not start resolving it later, and a loop that retries would spin.
+
+**The sleep bound is a daemon-config knob, and its default stays 60s (Rin, 2026-08-08).** The number was never wrong, it was unjustifiable: sixty seconds is the drift a suspended laptop or an NTP step costs, and a dev machine suspending is the common case rather than the exotic one, so bounding the error at one minute is the right thing to pick for someone who has not thought about it. What a hard `const` could not do is let the person who *has* thought about it choose differently — a server that never suspends and runs a thousand cron-configured flock members wants fewer wakeups, and a laptop that suspends hourly wants faster recovery. Both are one line of `shep.toml` now.
+
+**Where it lives, and the layering it inherits.** `DaemonSection` (`crates/shep-core/src/config/daemon.rs:15`) gains `max_cron_sleep: Option<UpDuration>`, declared after `enabled_dogs`. `Option`, not a serde default, and the reason is the precedent already in the same struct: `socket: Option<PathBuf>` (`:19`) carries "unset" all the way through to the one place that knows the default, and that is what keeps file < env < flags honest — a layer that has to write a value in order to say nothing cannot be distinguished from a layer that meant that value. So the default is applied exactly once, in `boot.rs`, and `DEFAULT_MAX_CRON_SLEEP` never appears in `shep-core`.
+
+`UpDuration` is the type because it is already the Flockfile's duration grammar and already `Deserialize` (`crates/shep-core/src/values.rs:246-252`), so `max_cron_sleep = "5m"` parses with no new code. It is also where the sharpest footgun lives: **plain digits are milliseconds** (`values.rs:147`), so `max_cron_sleep = "60"` from a user who meant sixty seconds is sixty milliseconds.
+
+**The environment override is `SHEP_MAX_CRON_SLEEP`.** The two `[daemon]` keys that have an override today are `log_json` and `socket`, spelled `SHEP_LOG_JSON` and `SHEP_SOCKET` — `SHEP_` plus the screaming-snake form of the key, with no exception to work around. Read it in `DaemonConfig::load` beside the other two (`:73-82`), parse it with `UpDuration`'s `FromStr`, and on failure return the existing `DaemonConfigError::BadEnvValue("SHEP_MAX_CRON_SLEEP", v)` (`:93`) — no new variant, because that is precisely the fault it already names. A bad value in the *file* needs no new code either: `UpDuration`'s `Deserialize` routes its parse error through `serde::de::Error::custom`, so `toml::from_str` fails and `load` already maps that to `DaemonConfigError::Toml`. Do not add a second check for it.
+
+**The floor is one second, and a value below it is rejected rather than clamped.** `MIN_CRON_SLEEP` is `UpDuration::from_millis(1_000)`; anything strictly below it fails `load` with the new `BelowMinimum` variant, which reaches the user as exit code 4 through the mapping that already exists (`crates/shep-cli/src/commands/daemon.rs:149`). Five things make that the right call rather than a harsh one:
+
+- **Zero is expressible and is a pure spin.** `max_cron_sleep = "0"` makes every sleep `Duration::ZERO`, and the loop then re-derives a next occurrence as fast as the runtime will let it — burning a core per cron-configured sheep while *still firing correctly*, because the `if clock.now_utc() >= next` guard holds. A fault with no wrong output is the one nobody attributes.
+- **One second is not an arbitrary line.** The settled five-field dialect cannot express anything finer than a minute, so a one-second bound already re-derives sixty times per shortest-possible occurrence. Nothing legitimate lives below it, which is what makes rejection cheap: no real configuration is being refused.
+- **Rejecting is what this file already does with a bad `shep.toml`.** A daemon that will not boot on malformed TOML but silently repairs a value that would peg a core is inconsistent in the direction that hurts.
+- **Clamping is the silent-failure shape** this plan rejects twice already, for `watch = true` with no `cwd` and for `https://` probe targets. It would be quieter here than in either of those, because the daemon runs detached with its stderr redirected to `shepd.err.log` (`crates/shep-cli/src/launch.rs:74`) — a `warn!` about a clamped knob lands in a file nobody opens.
+- **The loud path is genuinely loud enough.** The child exits before it answers, and `connect_or_spawn` treats any exit other than "already running" as immediately fatal rather than burning its deadline (`crates/shep-client/src/spawn.rs:307-319`), so the user's next `shep` command fails at once with `the daemon process exited before it started answering: exit status: 4`. The sentence naming the key and the floor is in `shepd.err.log`; the failure is not.
+
+**There is no upper bound, and that is deliberate.** A very large `max_cron_sleep` degrades to the plain `sleep_until(next)` this const exists to avoid, which is a worse *recovery* story and not a correctness problem — every occurrence still fires, just late after a clock jump. Bounding a knob whose only failure mode is the behaviour we had before it existed would be ceremony. Say so in the field's doc so the asymmetry does not read as an oversight.
+
+**There is no CLI flag either.** Spec §5's third layer is real but `DaemonArgs` carries exactly one flag today (`crates/shep-cli/src/cli.rs:146-150`), and `shep daemon` is the hidden re-exec target `launch_daemon` spawns — never typed by a person, so a flag on it would be unreachable in practice. A flag would also need its own copy of the floor check, since it lands *after* `DaemonConfig::load` has run. One validation gate, one way in.
+
+**Two existing items go stale the moment the field lands, and both are exact-match:**
+
+- `debug_redacts_dog_values` (`crates/shep-core/src/config/daemon.rs:169-179`) pins the whole `Debug` string. Declaring the field last means the literal gains a trailing `, max_cron_sleep: None` and nothing reorders. Update the literal — do **not** loosen the assertion into a `contains`, which is the entire point of IR-41's exact-string rule.
+- `DaemonConfig::load`'s `# Errors` section (`:56-60`) names two variants and one env var. It gains `BelowMinimum` and `SHEP_MAX_CRON_SLEEP`, and so does `run_daemon`'s doc in the CLI (`crates/shep-cli/src/commands/daemon.rs:92-94`), which currently says the child reads `SHEP_LOG_JSON` and `SHEP_SOCKET` and would otherwise be a two-thirds-true list.
+
+**Validate the effective value once, after layering, and name the layer that supplied it.** Provenance needs no tracking: if the env var was present it won, and the key is `"SHEP_MAX_CRON_SLEEP"`; otherwise the value came from the file and the key is `"max_cron_sleep"`. One `BelowMinimum` check on the winner. Validating each layer as it is read is the tempting alternative and it is worse: it makes a good `SHEP_MAX_CRON_SLEEP` unable to rescue a broken `shep.toml`, which is not what "file < env" means.
 
 - [ ] **Step 1: Move `mod testing` into its own file**
 
@@ -717,10 +800,17 @@ The third is the arm count. `SupervisorError` has **three** variants — `NotFou
 // wall time as `epoch + elapsed-since-construction` means `tokio::time::advance`
 // moves both clocks by the same amount, and a whole day of schedule fits in a
 // test that takes microseconds.
-pub(crate) struct TestClock { epoch: DateTime<Utc>, started: tokio::time::Instant }
+pub(crate) struct TestClock {
+    epoch: DateTime<Utc>,
+    started: tokio::time::Instant,
+    // Counts `now_utc` calls. The only observable difference between two
+    // `max_sleep` values is how often the loop wakes, and on a paused clock a
+    // wakeup leaves no other trace.
+    reads: AtomicUsize,
+}
 ```
 
-`started` is captured with `tokio::time::Instant::now()` at construction, inside the paused runtime. `now_utc` is `epoch + chrono::Duration::from_std(self.started.elapsed())`. The `from_std` conversion is fallible; a test clock cannot plausibly exceed `chrono::Duration`'s range, so saturate rather than panicking — a panicking fixture is a panicking constructor by another name (IR-21).
+`started` is captured with `tokio::time::Instant::now()` at construction, inside the paused runtime. `now_utc` is `epoch + chrono::Duration::from_std(self.started.elapsed())`, and it bumps `reads` with `Ordering::Relaxed` on the way past. The `from_std` conversion is fallible; a test clock cannot plausibly exceed `chrono::Duration`'s range, so saturate rather than panicking — a panicking fixture is a panicking constructor by another name (IR-21).
 
 - [ ] **Step 3: Write the worker's tests, then the worker**
 
@@ -733,12 +823,36 @@ All under `#[tokio::test(start_paused = true)]`. Required cases, each with its "
 | advancing past six occurrences in one jump produces exactly one restart | a catch-up loop replaying the backlog |
 | a pattern with no further occurrence ends the task without restarting | a loop that treats `Ok(None)` as "try again" and spins |
 | aborting the handle stops the worker — observe one restart first, *then* abort, then advance a further hour and assert no second restart | a worker that outlives its sheep; and, because of the observe-first half, a worker that never fired at all, which would pass a bare "no restart after the abort" |
+| a worker built with a ten-minute `max_sleep` and a `0 * * * *` schedule fires exactly once at the top of the hour **and** reads its clock fewer than twenty times doing it | a worker that ignores its `max_sleep` parameter and sleeps `DEFAULT_MAX_CRON_SLEEP` anyway — that path wakes sixty times and reads the clock at least a hundred and twenty |
+
+The clock-read bound is deliberately a bound and not an equality, and rule 7 is satisfied anyway because the two sides are twelve and a hundred and twenty. The loop as written reads twice per iteration; an implementer who carries the post-sleep read forward into the next iteration's `now` gets seven, which is a better loop and must not fail this test. Name the hundred and twenty in the "fails if" comment so the margin is visible to whoever next edits the number.
 
 **Observation is by event subscription, not by `handle.list()`, and the choice is not the implementer's.** Subscribe to the harness's event channel; assert positives with `tokio::time::timeout` naming the restart that did not arrive, and negatives with `try_recv()` returning `Err(Empty)` after advancing — the same discipline Tasks 6, 7 and 11 use. A `list()` read is a poll of a value that changes asynchronously: taken before the worker task has been polled it reports 0 restarts, which passes a negative case against a worker that is merely late and fails a positive one that is merely early. Every negative case in this table is a claim that something did *not* happen, and a poll cannot make that claim.
 
 - [ ] **Step 4: Dyn-compatibility smoke test** — `let _: &dyn Clock = &SystemClock;`, one line, in the module's test block. It fails to compile the moment somebody adds a generic method to `Clock`.
-- [ ] **Step 5: Run the full gate list from Global Constraints, each from its own exit code**
-- [ ] **Step 6: Commit** — `feat(daemon): cron-scheduled restarts with a wall-clock seam`
+
+- [ ] **Step 5: The `max_cron_sleep` knob in `shep-core`, as its own commit**
+
+The field, the `SHEP_MAX_CRON_SLEEP` read, `MIN_CRON_SLEEP`, and the `BelowMinimum` variant with its `Display` arm — the whole knob in one diff, separate from the worker's, because the two touch different crates and only one of them is about scheduling.
+
+`DaemonConfigError`'s `Display` matches exhaustively with no `_` arm (`crates/shep-core/src/config/daemon.rs:98-101`), so the compiler demands the new arm rather than letting a variant render as nothing. Word it to the shape already there: `invalid value \`{value}\` for {key}: must be at least {min}`, which reuses the "invalid value … for …" opening `BadEnvValue` uses and adds the one fact the user needs to fix it. `UpDuration`'s own `Display` renders in the largest unit that divides the value exactly (`values.rs:227-238`), so a rejected `"999"` reads back as `999` and the floor as `1s` — the rendering is itself the hint about the grammar.
+
+Cases, in `daemon.rs`'s existing test module, each with its "fails if" comment:
+
+| Case | The broken implementation it catches |
+|---|---|
+| no `max_cron_sleep` anywhere leaves the field `None` | a serde default that invents 60s in `shep-core` and takes the "unset" state away from the layer below |
+| `max_cron_sleep = "5m"` in the file parses to five minutes | a field typed as a bare integer, where `"5m"` is a TOML error and `5` is five milliseconds |
+| `SHEP_MAX_CRON_SLEEP=90s` beats a file value of `"5m"` | an env read placed before the file is folded in, or omitted entirely |
+| `SHEP_MAX_CRON_SLEEP=banana` is `BadEnvValue("SHEP_MAX_CRON_SLEEP", "banana")` | an env read that swallows its parse failure — `.ok()` and drop it, or an `Err` arm that only logs — leaving the file's value silently in force and the typo invisible |
+| `max_cron_sleep = "1s"` is accepted; `"999"` is `BelowMinimum` naming the key `max_cron_sleep` | a floor compared with `>` instead of `>=`, and a check that silently clamps |
+| `SHEP_MAX_CRON_SLEEP=0` is `BelowMinimum` naming the key `SHEP_MAX_CRON_SLEEP`, **even when the file carries a valid `"5m"`** | a check that validates the file value and never the override, and one that reports the file's key for a fault the environment introduced |
+| `debug_redacts_dog_values` still pins the exact `Debug` string, now ending `, max_cron_sleep: None` | a `contains`-style loosening of the one assertion in this file that exists to catch a leak (IR-41) |
+
+The `"999"` row is the millisecond footgun in test form: it is the value a user writes meaning "just under a second" and also the value they write meaning "999 seconds". Rejecting it is what sends them back to the grammar.
+
+- [ ] **Step 6: Run the full gate list from Global Constraints, each from its own exit code**
+- [ ] **Step 7: Commit** — `feat(daemon): cron-scheduled restarts with a wall-clock seam` for the worker, and `feat(core): make the cron worker's sleep bound configurable` for Step 5's diff
 
 ---
 
@@ -1505,10 +1619,9 @@ The third case is the subtle one: proving a *negative* needs a bounded wait that
 
 **Files:**
 - Modify: `crates/shep-daemon/src/watch/mod.rs` — pure tier
-- Modify: `crates/shep-daemon/src/supervisor.rs` — pure tier (one handle method, one `Msg` variant, one parameter on `begin_manual`)
 
 **Interfaces:**
-- Consumes: `globset::{Glob, GlobSet, GlobSetBuilder}` (already a `shep-daemon` dependency, `crates/shep-daemon/Cargo.toml:29`), `crate::watch::source::{watch_tree, WatchError}`, `crate::supervisor::{SupervisorHandle, SupervisorError}`, `shep_core::selector::ProcessSelector`, `shep_core::protocol::ProcessInfo`
+- Consumes: `globset::{Glob, GlobSet, GlobSetBuilder}` (already a `shep-daemon` dependency, `crates/shep-daemon/Cargo.toml:29`), `crate::watch::source::{watch_tree, WatchError}`, `crate::supervisor::{SupervisorHandle, SupervisorError}`, `shep_core::selector::ProcessSelector`
 - Produces:
 
 ```rust
@@ -1561,25 +1674,6 @@ pub enum WatchFilterError {
     Glob { pattern: String, reason: String },
 }
 
-// Declared here rather than with the rest of the supervisor's surface because
-// the watch group is the only caller and this task is where the requirement
-// comes from. It lives in supervisor.rs beside `restart`.
-impl SupervisorHandle {
-    /// Restarts every sheep matching `selector` that has a live process,
-    /// resetting its restart budget exactly as [`Self::restart`] does. An
-    /// instance the user stopped, one that errored out, and one waiting on a
-    /// restart backoff are all skipped.
-    ///
-    /// # Errors
-    ///
-    /// - [`SupervisorError::NotFound`] — nothing matched the selector, or
-    ///   nothing that matched was running. The second case is the ordinary
-    ///   outcome when every instance of a name is stopped, not a fault.
-    /// - [`SupervisorError::EngineStopped`] — the actor is gone.
-    pub async fn restart_running(&self, selector: ProcessSelector)
-        -> Result<Vec<ProcessInfo>, SupervisorError>;
-}
-
 /// Runs one name-group's watch until the returned handle is aborted.
 ///
 /// `root` is an already-canonicalized absolute directory. It comes from the
@@ -1587,6 +1681,10 @@ impl SupervisorHandle {
 /// and never from the daemon's working directory. Aborting the handle stops
 /// the OS watch as well as the loop, because the debouncer guard lives inside
 /// the spawned future.
+///
+/// A triggering change restarts every instance of the name. Stopping a sheep
+/// is what stops its watch: the last instance of a name going away disarms
+/// this group, so a stopped sheep has no watcher left to restart it.
 ///
 /// # Errors
 ///
@@ -1604,32 +1702,20 @@ pub fn spawn_watch_group(
 
 **`WatchFilterError` carries owned `String`s by choice, not by constraint, and the distinction is worth one sentence** because the reader has just met `WatchError`'s hard version of the same shape. `globset::Error` derives `Clone, Debug, Eq, PartialEq` (`globset-0.4.20/src/lib.rs:156`) and exposes `glob()` and `kind()`, so wrapping it would keep every derive. It stays owned anyway under IR-11: a config-rejection type is shep's own contract, and pinning it to globset's public error makes globset's next major version a breaking change to shep's config surface — the same reasoning that keeps `croner::Cron` out of `CronSchedule`.
 
-**One watch per name-group, not per instance.** Spec §4 says so, and the reason is that N instances of one app share one source tree: N debouncers over the same tree means N inotify watch sets, N copies of every event, and N restarts racing each other for one file save. The group's restart is `SupervisorHandle::restart_running(ProcessSelector::Name(name))`. This is what makes watch state live in a `HashMap<String, _>` keyed by name rather than in `SheepSlot` — Task 12 owns that map.
+**One watch per name-group, not per instance.** Spec §4 says so, and the reason is that N instances of one app share one source tree: N debouncers over the same tree means N inotify watch sets, N copies of every event, and N restarts racing each other for one file save. The group's restart is `SupervisorHandle::restart(ProcessSelector::Name(name))` — the existing public method, unchanged. This is what makes watch state live in a `HashMap<String, _>` keyed by name rather than in `SheepSlot` — Task 12 owns that map.
 
-**It restarts only the instances that are running (Rin, 2026-08-08).** A file save must not resurrect an instance the user explicitly stopped: `shep stop web-1` is a standing intention, and a text editor is not the place to overturn it. This is why `restart_running` exists rather than the plain `restart` an earlier draft used — `ProcessSelector::Name` matches on the name alone (`crates/shep-core/src/selector.rs`) regardless of status, and `restart` on a sheep with no live process falls through to `apply_immediate`, which resets the budget and respawns unconditionally (`supervisor.rs:816-819`).
+**It restarts the whole name-group, stopped instances included, exactly as cron does (Rin, 2026-08-08).** An earlier draft of this plan filtered the restart down to instances with a live process, and specified real machinery to do it: a scope parameter threaded through `begin_manual`, a new `pub(crate) Msg` variant, and a `restart_running` handle method beside `restart`. All of that is withdrawn. Four reasons, in the order that decides it:
 
-**The running set is determined inside the actor, at the moment the command is handled — never by the caller.** `begin_manual` (`supervisor.rs:699`) already computes the predicate it needs, per matched id: `slot.ctl.is_some()` (`:712`), true exactly while a sheep task is alive holding a live process. The change is a scope parameter on that function:
+- **Disarming already covers the case anyone actually hits.** Task 12 arms and disarms a name's watcher on lifecycle transitions, so a fully-stopped sheep has no armed watcher and a file save cannot reach it at all. The filter would only ever have been observable for a *partially* stopped multi-instance group — some instances up, keeping the watcher armed, others individually stopped. That is a narrow corner, and it is the whole of what the machinery bought.
+- **The price was engine surface in a lifecycle phase.** A parameter on the actor's manual-command path, a new message variant and a second public restart verb, all added by the phase that is supposed to be bolting four subsystems *onto* the engine without reaching into it.
+- **Spec §4 says one watcher per name-group**, and a group whose restart reaches only part of the group is a quieter thing than what that wording describes.
+- **It keeps watch and cron identical.** Leaving cron alone while narrowing watch was always going to leave a user-visible asymmetry that neither the code nor the docs could explain in a sentence.
 
-```rust
-/// Whether a manual command reaches every matched sheep, or only the ones
-/// with a live process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ManualScope { Matched, RunningOnly }
-```
+What protects a stopped sheep is therefore disarming, not filtering — and that is a claim a user has to be able to find. Task 12 states it where the disarm rule lives, the `watch/` module doc states it in the header, and the changelog states it in the entry for this subsystem. It should not survive as folklore in three implementers' heads.
 
-`RunningOnly` filters `matched` by that predicate before the loop; the five existing call sites pass `ManualScope::Matched` and behave exactly as they do today. Everything downstream is untouched — the IMPORTANT-4 first-command-wins dedupe (`:722-756`), the kill ladder, the budget reset, the `pending_delete` interaction — so this adds a *filter*, not a second respawn path. `restart_running` is delivered on a new `pub(crate) enum Msg` variant carrying a `ReplyKind::Info` sender (`Msg` is already `pub(crate)`, `supervisor.rs:107`), rather than a `Command` variant: `Command` is the public surface the RPC layer maps user verbs onto, and no user verb means "restart the running ones".
+The alternative an implementer reaches for once the filter is gone is a `list()` read followed by per-id restarts, to reimplement it locally. It is wrong twice over: it races a `shep stop` landing between the read and the restart, and it is the asynchronous-poll shape Task 3 already rules out for observing a value that changes under you. Do not rebuild the filter here in any form.
 
-The alternative an implementer reaches for first is a `list()` read followed by per-id restarts. It is wrong twice: it reintroduces the very race the decision closes — a `shep stop` landing between the read and the restart resurrects the instance anyway — and it is the asynchronous-poll shape Task 3 already rules out for observing a value that changes under you.
-
-Three consequences, all of which belong in the group loop's IR-31 `//` comment so nobody "fixes" them:
-
-- **`Starting` counts as running.** A readiness-gated app mid-start has a live process, and a save restarts it.
-- **`Errored` and `WaitingRestart` do not.** A `WaitingRestart` instance is already coming back on its own, so restarting it would only move the clock. An `Errored` one — restart budget exhausted — stays down until someone runs `shep restart`, which is the narrow reading of "only running instances" and the one this decision's wording takes.
-- **When every instance of a name is stopped the question never arises**, because Task 12 disarms the group's watch as the last instance goes terminal and there is no watcher left to fire. The filter is observable only for a name holding a mix of running and stopped instances, which is also why it needs its own test row rather than riding on an existing one.
-
-**Cron does not get this treatment, and the asymmetry is deliberate rather than an oversight.** Task 3's worker still calls `restart(ProcessSelector::Name(name))`, so a scheduled restart still reaches a stopped instance. The decision above is about a file save; extending it to a wall-clock schedule is a separate call and is item 3 in Still open, with "leave cron as it is" as the standing default so nothing here is blocked.
-
-It is also **not** the same guard Task 12 applies to a memory breach or a liveness failure. Those are stale-signal guards keyed on the pid, protecting against a report about a process that no longer exists. This one is keyed on status, and protects a live intention the user expressed. Two different problems, two different guards, and neither substitutes for the other.
+**This is not the same question as Task 12's pid guard, and the reversal does not touch that.** A memory breach or a liveness failure carries a stale-signal risk — a report about a process that no longer exists — and Task 12 guards those on the pid. That guard stays exactly as specified. Status-based reach and pid-based staleness are different problems; withdrawing one says nothing about the other.
 
 **The re-check needs no dirty flag, because the channel is the mechanism.** The loop is:
 
@@ -1637,7 +1723,7 @@ It is also **not** the same guard Task 12 applies to a memory breach or a livene
 loop {
     batch = rx.recv().await                        // None => the source is gone, return
     if !batch.iter().any(|p| filter.triggers(p)) { continue }
-    if let Err(err) = supervisor.restart_running(Name(name)).await { ... }  // cron.rs's three arms
+    if let Err(err) = supervisor.restart(Name(name)).await { ... }          // cron.rs's three arms
     // events that arrived during the restart are still queued in rx;
     // the next iteration drains and re-filters them
 }
@@ -1645,7 +1731,7 @@ loop {
 
 Spec §4's "Events during an in-flight restart are re-checked after it completes" falls out of the ordering: the restart is awaited, the receiver keeps buffering, and the next `recv` returns whatever accumulated. Nothing needs to remember that a restart happened. **Do not add a dirty flag or a state machine here** — the reason it is unnecessary is worth an IR-31 `//` comment, because it looks like a missing feature until someone traces the buffering.
 
-The awaiting is also what keeps the running-set filter honest: the set is read inside the actor while the loop is parked on the reply, so nothing the loop observed earlier can go stale before the restart uses it. `NotFound` on that call is the everything-is-stopped case and takes cron.rs's `debug!` arm — the loop keeps running, because the user may start the flock again without touching the Flockfile.
+`NotFound` on that call means the name matches nothing at all — the sheep was deleted and the registry has not disarmed this group yet — and it takes cron.rs's `debug!` arm. The loop keeps running rather than returning: it is a race with disarm, not a fault, and the disarm is moments away. Note the case it is *not*: a name whose instances are all stopped still matches by name, so `restart` reaches them and brings them back, which is the settled behaviour above and not an error path at all.
 
 **The consequence is a single-flight guarantee**, and it is the invariant the proptest in Task 13 checks: because the loop awaits its restart before reading the next batch, a WatchGroup can never have two restarts in flight.
 
@@ -1690,12 +1776,14 @@ Giving `run_group` a fifth `_source: WatchSource` parameter is also wrong, for a
 
 Cases with their "fails if" comments: a batch of only-ignored paths produces no restart; a batch with one triggering path produces exactly one restart; two batches sent before the first restart completes produce exactly two restarts, not three (the second batch is drained as one); a batch arriving *during* a restart is re-checked after it (the spec §4 requirement, asserted by observing the second restart); dropping the sender ends the task.
 
-Two more for the running-set filter, which no other case reaches:
+Two more for the group's reach and for the error arm, which no other case reaches:
 
 | Case | The broken implementation it catches |
 |---|---|
-| a name with two instances, one of them stopped: a triggering batch restarts the running one and the stopped one is still `Stopped` afterwards | a group restart through the plain `restart`, which resurrects it — assert the stopped instance's status and its unchanged `restarts` count, not merely that *a* restart happened |
-| a name whose every instance is stopped: a triggering batch produces no restart and the loop is still alive for the next batch | a loop that treats the resulting `NotFound` as fatal and returns, leaving the watch armed but deaf |
+| a name with two instances, one of them individually stopped: a triggering batch restarts both, and the stopped instance is `Online` afterwards with its `restarts` count up by one | a group loop that filters by status — the reach is the whole name-group, and this row is what pins it against a well-meaning reimplementation of the withdrawn filter |
+| a triggering batch for a name the engine no longer knows: the resulting `NotFound` leaves the loop alive and the next batch still restarts a name that does exist | a loop that treats `NotFound` as fatal and returns, leaving the watch armed but deaf |
+
+The first row is the one that would have gone the other way a draft ago, and it is worth saying why it is asserted so precisely: `Online` alone would pass against a group that never touched the stopped instance if something else had started it, so the `restarts` count is what makes the claim about *this* restart.
 
 Every `recv().await` in these tests — on the event channel used to observe restarts — is inside a `tokio::time::timeout` naming the restart that did not arrive.
 
@@ -1711,9 +1799,10 @@ Every `recv().await` in these tests — on the event channel used to observe res
 - Modify: `crates/shep-daemon/src/supervisor.rs` — pure
 - Modify: `crates/shep-daemon/src/boot.rs` — **unix tier**
 - Modify: `crates/shep-daemon/src/testing.rs`, `crates/shep-daemon/src/lib.rs` — pure
+- Modify: `crates/shep-cli/src/commands/daemon.rs` — **unix tier** (`boot_options` folds the configured `max_cron_sleep` into `BootOptions`, and `run_daemon`'s doc names the third `SHEP_*` variable)
 
 **Interfaces:**
-- Consumes: `crate::cron::{Clock, spawn_cron_worker}`, `crate::limits::{LimitEnforcer, LimitBreach}`, `crate::probes::{Prober, LivenessFailure, spawn_liveness_task}`, `crate::watch::{WatchFilter, spawn_watch_group, DEFAULT_WATCH_DELAY}`, `crate::entry::ProcessEntry`, `crate::supervisor::SupervisorHandle`, `crate::runner::ProcessRunner`, `shep_core::paths::ShepPaths`, `shep_core::protocol::BusEvent`, `shep_core::values::UpDuration::as_duration`
+- Consumes: `crate::cron::{Clock, spawn_cron_worker, DEFAULT_MAX_CRON_SLEEP}`, `crate::limits::{LimitEnforcer, LimitBreach}`, `crate::probes::{Prober, LivenessFailure, spawn_liveness_task}`, `crate::watch::{WatchFilter, spawn_watch_group, DEFAULT_WATCH_DELAY}`, `crate::entry::ProcessEntry`, `crate::supervisor::SupervisorHandle`, `crate::runner::ProcessRunner`, `shep_core::paths::ShepPaths`, `shep_core::protocol::BusEvent`, `shep_core::values::UpDuration::as_duration`
 - Produces:
 
 ```rust
@@ -1741,6 +1830,11 @@ pub struct Extras {
     pub enforcer: Box<dyn LimitEnforcer>,
     /// Probe transport for readiness and liveness.
     pub prober: Arc<dyn Prober>,
+    /// Longest a cron worker parks before re-reading the clock, from
+    /// `[daemon] max_cron_sleep`. Already defaulted: this is a value, not an
+    /// option, because the layer that knew whether the user set anything is
+    /// behind us.
+    pub max_cron_sleep: Duration,
     /// Cloned once per arming. The enforcer swallowed its own breach sender at
     /// construction; the liveness loops are free tasks and cannot, so the
     /// sender has to reach `arm` through here.
@@ -1754,7 +1848,7 @@ impl Extras {
     /// Must be called from within a Tokio runtime context: constructing the
     /// polling enforcer starts its sampling task immediately.
     #[must_use]
-    pub fn real(reports: ExtrasReports) -> Self;
+    pub fn real(reports: ExtrasReports, max_cron_sleep: Duration) -> Self;
 }
 
 /// Restarts each sheep reported over `breaches` or `liveness`, logging the
@@ -1780,8 +1874,14 @@ impl ExtrasRegistry {
     /// is what a respawn needs — the new process has a new pid.
     pub fn arm(&mut self, entry: &ProcessEntry, extras: &Extras, supervisor: &SupervisorHandle);
 
-    /// Aborts everything armed for `id`, and the name-group's watch when this
-    /// was its last armed instance.
+    /// Aborts everything armed for `id`, and both of the name-group's
+    /// per-name tasks — its watch and its cron worker — when this was the
+    /// last armed instance of the name.
+    ///
+    /// This is what stops a stopped sheep from being restarted by a file save
+    /// or a schedule: neither trigger filters by status, so a sheep stays down
+    /// because nothing is left armed for it, not because something declined
+    /// to restart it.
     ///
     /// Aborting the watch-group handle is sufficient to stop the OS watch:
     /// the debouncer guard rides inside the aborted future, so no second drop
@@ -1794,13 +1894,17 @@ impl ExtrasRegistry {
 
 ```rust
 impl fmt::Debug for Extras {
-    // Roles, not values: none of the three seams is Debug, and printing the
-    // report channels would say nothing a reader wants.
+    // Roles, not values, for the seams: none of the three is Debug, and
+    // printing the report channels would say nothing a reader wants. The
+    // sleep bound is the exception and prints for real — it is a tuning knob
+    // the user set, so a daemon log that dumps this struct should say what it
+    // ended up being.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Extras")
             .field("clock", &"<dyn Clock>")
             .field("enforcer", &"<dyn LimitEnforcer>")
             .field("prober", &"<dyn Prober>")
+            .field("max_cron_sleep", &self.max_cron_sleep)
             .finish_non_exhaustive()
     }
 }
@@ -1817,9 +1921,9 @@ impl fmt::Debug for Extras {
 | memory limit | sheep id | every time an instance goes online (new pid) | that instance leaves |
 | liveness probe | sheep id | ditto | ditto |
 
-Cron and watch are per-name because both select by `ProcessSelector::Name` and would otherwise fire N times for N instances. That is a statement about *arming*, not about reach: a cron worker restarts every instance of the name, while a watch group restarts only the running ones (Task 11). Memory and liveness are per-instance because each has its own pid and its own health.
+Cron and watch are per-name because both select by `ProcessSelector::Name` and would otherwise fire N times for N instances. Arming and reach agree here: both restart every instance of the name, and the per-name keying is exactly why one trigger produces one restart of the group rather than N of them. Memory and liveness are per-instance because each has its own pid and its own health.
 
-The watch group's disarm-on-last-instance rule is what makes Task 11's filter narrow rather than load-bearing in the common case: once the last instance of a name goes terminal — stopped, errored or deleted — the group's watch is aborted, so a name with nothing running has no watcher to fire. The filter earns its place on the mixed case, `shep stop web-1` with `web-2` still up.
+**Disarm is the whole of what keeps a stopped sheep down, and this is the one place that fact is mechanised.** Once the last instance of a name goes terminal — stopped, errored or deleted — the group's watch and its cron worker are both aborted, so nothing is left armed that could restart it. There is no status filter anywhere downstream (Task 11 records the withdrawn one and why); a triggering file save or a 03:00 occurrence reaches every instance of a name that still has *something* armed. The user-visible rule is therefore short enough to put in a changelog line: stopping a sheep stops its watch. The one case where that rule and the group-wide reach disagree is a partially stopped group — `shep stop web-1` with `web-2` still up keeps the watcher armed, and the next save brings `web-1` back with it. That is the accepted consequence of the settled decision, not a gap.
 
 **Where the watch's root, delay and filter come from.** No other task states this and `spawn_watch_group` takes all three as given, so `arm` is the only place they can be produced:
 
@@ -1827,6 +1931,8 @@ The watch group's disarm-on-last-instance rule is what makes Task 11's filter na
 - **Root** is `std::fs::canonicalize(entry.spec.config().cwd)`. `cwd` is `Some` by construction here, because Task 2's `normalize` rejects `watch = true` with no `cwd` — read that task for why the daemon's own cwd is not an acceptable fallback. Canonicalizing is not tidiness: Task 11 matches by stripping the root prefix off notify's absolute paths, and on macOS a `TempDir` under `/var/...` is delivered by FSEvents as `/private/var/...`, so without it `strip_prefix` fails for every event and Task 11's own treat-as-non-triggering rule makes the watch fire never. Task 11's real-filesystem case and Task 14's e2e case 1 both walk straight into this. A failed canonicalize — the directory does not exist — arms nothing and logs at `warn` naming the path.
 - **Delay** is `config.watch_delay.map(UpDuration::as_duration).unwrap_or(DEFAULT_WATCH_DELAY)`. `as_duration` is `const` and takes `self` (`crates/shep-core/src/values.rs:173`), so the `map` compiles as written.
 - **Filter** is `WatchFilter::new(&config.watch_options, &config.ignore_watch)`. On `Err` — a glob the user mistyped — arm no watch and log at `warn`; a bad glob must not take down the arm path for that app's cron worker, enforcer and probe.
+
+**The cron worker's fifth argument comes from the same place, and it is not per-app.** `arm` passes `extras.max_cron_sleep` straight through to `spawn_cron_worker`. It is a daemon-wide knob rather than a Flockfile field on purpose — it tunes how the shepherd wakes up, not how any one app behaves — so it rides on `Extras` beside the seams instead of being read off `entry.spec.config()` like the watch's three. Read it from `extras`, never re-derive it.
 
 **`SupervisorBuilder`, and why `spawn_supervisor` grows a builder rather than a parameter.** `spawn_supervisor(runner, paths, events)` (`crates/shep-daemon/src/supervisor.rs:287`) is called from `boot.rs:521`, from `crate::testing::harness`, and from this crate's own tests. Adding `extras` makes four positional parameters with two more subsystems visible on the roadmap (dogs, metrics), which is precisely the "many optional fields, call-site readability" case Rin's design rules name the builder pattern for. Add:
 
@@ -1905,7 +2011,7 @@ pub(crate) struct Harness {
 
 **The harness holds both receivers and spawns no reporter**, which is the whole reason it can hold them at all. A test asserts the report itself — the id and pid that arrived — rather than the restart a production reporter would have caused. The reporter's own behaviour is tested separately, below, by handing it receivers directly.
 
-`harness(scripts)` keeps its signature and wires scripted extras — a `ScriptedProber::new(vec![])` and a `ScriptedSampler::new(vec![])`, both of which are the neutral fixtures described in the roster, so a harness nobody configured arms nothing and reports nothing. A second constructor `harness_with_extras(scripts: Vec<ProcScript>, extras: Extras) -> Harness` takes a caller-built `Extras`. Both are declared here and nowhere else.
+`harness(scripts)` keeps its signature and wires scripted extras — a `ScriptedProber::new(vec![])` and a `ScriptedSampler::new(vec![])`, both of which are the neutral fixtures described in the roster, so a harness nobody configured arms nothing and reports nothing. Its `max_cron_sleep` is `DEFAULT_MAX_CRON_SLEEP`, because a fixture nobody configured should behave like a daemon nobody configured. A second constructor `harness_with_extras(scripts: Vec<ProcScript>, extras: Extras) -> Harness` takes a caller-built `Extras`. Both are declared here and nowhere else.
 
 - [ ] **Step 2: `ExtrasRegistry` and its tests**
 
@@ -1926,12 +2032,15 @@ The positive rows wrap their `recv().await` in `tokio::time::timeout` naming wha
 
 - [ ] **Step 3: `boot.rs` — construct `Extras::real` and hand it to the builder**
 
-One change at `crates/shep-daemon/src/boot.rs:521`, from `spawn_supervisor(runner, paths.clone(), events.clone())` to:
+`BootOptions` (`crates/shep-daemon/src/boot.rs:426`) gains a fourth field, `max_cron_sleep: Option<Duration>`, documented as "unset means the default" — the same `Option` shape `socket` already uses at the top of that struct (`:428`), and for the same reason. The three existing struct literals all spread `..BootOptions::default()` (`boot.rs:1320`, `:1377`, `tests/daemon_e2e.rs:67`) and so are unaffected; the CLI's `boot_options` builds one exhaustively and therefore will not compile until it is plumbed, which is the gate doing the work for us. Then one change at `:521`, from `spawn_supervisor(runner, paths.clone(), events.clone())` to:
 
 ```rust
 let (breach_tx, breach_rx) = mpsc::channel(...);
 let (live_tx, live_rx)     = mpsc::channel(...);
-let extras = Extras::real(ExtrasReports { breaches: breach_tx, liveness: live_tx });
+let extras = Extras::real(
+    ExtrasReports { breaches: breach_tx, liveness: live_tx },
+    options.max_cron_sleep.unwrap_or(DEFAULT_MAX_CRON_SLEEP),
+);
 let handle = SupervisorBuilder::new(runner, paths.clone(), events.clone())
     .extras(extras)
     .spawn();
@@ -1939,6 +2048,10 @@ spawn_extras_reporter(breach_rx, live_rx, handle.clone());
 ```
 
 The ordering is forced rather than stylistic: the reporter needs the handle the builder returns. `boot.rs` is the unix tier; `Extras::real` and `spawn_extras_reporter` are both pure, so the Windows leg still compiles and tests everything but this call.
+
+**This `unwrap_or` is the one place `DEFAULT_MAX_CRON_SLEEP` is applied**, and it must stay the only one. A second default — a `unwrap_or` in `boot_options`, or a serde default back in `shep-core` — is how two supposedly identical constants drift apart. `shep-core` carries the floor and never the default; the daemon carries the default and never the floor.
+
+On the CLI side, `boot_options` (`crates/shep-cli/src/commands/daemon.rs:125-131`) gains one line, `max_cron_sleep: config.daemon.max_cron_sleep.map(UpDuration::as_duration)` — the same `map(UpDuration::as_duration)` shape the watch delay uses, and `Option` all the way through so nothing invents a value on the way. Its existing test file gets one more case beside `boot_options_pass_ready_fd_none_and_the_configured_socket`: a config carrying `max_cron_sleep = "5m"` produces `Some(Duration::from_secs(300))`, and a config carrying none produces `None`. It fails if the field is dropped on the floor between the two structs, which is the entire failure mode of a knob nobody plumbed.
 
 - [ ] **Step 4: Run the full gate list from Global Constraints, each from its own exit code**
 - [ ] **Step 5: Commit** — `feat(daemon): arm and disarm lifecycle extras across the sheep lifecycle`
@@ -1968,12 +2081,14 @@ Cap the case count in CI through proptest's env var, as IR-37 requires, matching
 | `watch_options` empty; a glob matching nothing (never triggers rather than erroring); a watch root that does not exist, asserted as `WatchError::Watch` carrying that path rather than as a bare `is_err()` | `watch/mod.rs` |
 | `failure_threshold = 1`; `timeout` greater than `interval`; `interval` of zero | `probes/mod.rs` |
 | `max_memory` smaller than any plausible reading (immediate breach on the first tick); `max_memory` exactly equal to the observed tree (no breach) | `limits/mod.rs` |
-| a cron pattern that never fires again; `* * * * *`, whose next occurrence lands exactly on the `MAX_CRON_SLEEP` boundary of 60s | `cron.rs` |
+| a cron pattern that never fires again; `* * * * *`, whose next occurrence lands exactly on the `DEFAULT_MAX_CRON_SLEEP` boundary of 60s | `cron.rs` |
 | a name-group with zero online instances (arm and immediately disarm) | `extras.rs` |
 
-The cron row is a per-minute pattern, not a per-second one: the settled five-field dialect cannot express seconds at all, so "a pattern firing every second" — which an earlier draft asked for — is unwritable. Per-minute is the tightest granularity the dialect has, and it is also the more interesting boundary, because 60s is exactly `MAX_CRON_SLEEP`: the clamp and the true next occurrence coincide, which is where an off-by-one in the clamp shows up. Assert that the boundary neither drops an occurrence nor double-fires under the at-most-one-catch-up rule.
+The cron row is a per-minute pattern, not a per-second one: the settled five-field dialect cannot express seconds at all, so "a pattern firing every second" — which an earlier draft asked for — is unwritable. Per-minute is the tightest granularity the dialect has, and it is also the more interesting boundary, because 60s is exactly `DEFAULT_MAX_CRON_SLEEP`: the clamp and the true next occurrence coincide, which is where an off-by-one in the clamp shows up. Build this worker with the default rather than a custom `max_sleep`, so the coincidence is real. Assert that the boundary neither drops an occurrence nor double-fires under the at-most-one-catch-up rule.
 
-An `interval` of zero deserves a decision rather than a sweep result: a zero-interval probe is a spin loop. Either `normalize` rejects it (Task 2's territory, and the cheaper fix) or the loop floors it at a named minimum. Whichever the implementer picks, the sweep asserts the chosen behaviour and the choice goes in the report.
+The floor on `max_cron_sleep` is not swept here: it is a `shep-core` config rejection with its own rows at Task 3, and `daemon.rs` is not one of this task's files.
+
+An `interval` of zero deserves a decision rather than a sweep result: a zero-interval probe is a spin loop. Either `normalize` rejects it (Task 2's territory, and the cheaper fix) or the loop floors it at a named minimum. Whichever the implementer picks, the sweep asserts the chosen behaviour and the choice goes in the report. Task 3's `max_cron_sleep` floor is the same shape already resolved — a spin-prone duration, rejected at load rather than clamped — and the reasoning there is worth reading before choosing here. It does not settle this one: that is a daemon-wide knob in `shep.toml` and this is a per-app Flockfile field, and the argument for rejecting turned partly on where the resulting error text ends up.
 
 - [ ] **Step 1: Extend the supervisor proptest with the three new event kinds**
 - [ ] **Step 2: The `WatchGroup` single-flight property**
@@ -2011,16 +2126,18 @@ Cases 4 and 5 are the cheapest and the most valuable: they are the proof that sp
 Also record `limits/` and `probes/` being directories rather than files, and the three new seam traits, so map.md remains a module-level design a reader can navigate from.
 
 **Module docs (IR-27) are decision guides, not API dumps.** Each new module's `//!` header answers the question a user of that module actually has:
-- `cron.rs` — when a cron restart fires relative to wall-clock changes, and why a missed occurrence is not replayed.
+- `cron.rs` — when a cron restart fires relative to wall-clock changes, why a missed occurrence is not replayed, and what `max_cron_sleep` trades: shorter recovers faster from a suspend, longer wakes less often, and neither changes whether an occurrence fires.
 - `limits/` — what "the process tree" means and why it is not the root pid, with the pm2 deviation callout in spec §4's voice.
 - `probes/` — which readiness source wins when more than one is configured, and what a readiness timeout does versus a liveness failure.
-- `watch/` — what is ignored by default and how `watch_options` and `ignore_watch` compose.
+- `watch/` — what is ignored by default, how `watch_options` and `ignore_watch` compose, and **that a triggering change restarts every instance of the name while stopping a sheep disarms its watch**. That last clause is the one a user needs and the one this phase most nearly left as folklore; it belongs in the header, not in a comment three functions down.
 
 Each gets its links in a bottom reference block, and each names its honest caveats inline: no TLS, no redirects, polling granularity, real-time debounce.
 
 **Changelogs (IR-45).** `shep-core` gets the cron dialect change under both Additions and Changes, and the entry a user needs is the one Task 1 Step 6 spells out. It moves in both directions and the two must not be blurred into one bullet: under Changes, patterns that used to pass now fail (five tokens of garbage, and the `L`/`W`/`#`/`?` extensions) plus `@reboot`'s new message; under Additions, the seven vixie nicknames that the token-count stopgap rejected and shep now expands. Six-field and seconds-bearing patterns are in neither list — they were rejected before and are rejected now, only with a better sentence.
 
-`shep-daemon` gets the four subsystems, the `Online` timing change for readiness-gated apps (bus-visible even though no wire type changed), the new `watch = true` requires `cwd` rejection, and the watch group's running-only reach: a file save restarts the instances that are up and leaves a stopped one stopped.
+`shep-daemon` gets the four subsystems, the `Online` timing change for readiness-gated apps (bus-visible even though no wire type changed), and the new `watch = true` requires `cwd` rejection. It also gets the sentence a user needs about watch's reach, and it is worth writing carefully because it has two halves that sound contradictory until they are stated together: a triggering change restarts **every** instance of the name, and stopping a sheep disarms its watch. The consequence a partially stopped group sees — `shep stop web-1` with `web-2` still up, then a save brings `web-1` back — follows from both and should be spelled out rather than left for someone to discover.
+
+`shep-core` gets the cron dialect entry above plus the new `[daemon] max_cron_sleep` key: what it defaults to, that `SHEP_MAX_CRON_SLEEP` overrides it, and that a value under one second is rejected rather than clamped. Note the millisecond grammar in the entry itself — `"60"` is sixty milliseconds and `"60s"` is what the reader means — because a changelog is where someone reads about a new key for the first time. The `DaemonConfigError::BelowMinimum` variant goes under Changes rather than Additions: that enum carries no `#[non_exhaustive]`, so growing it breaks any downstream `match`, and IR-45 wants that said rather than filed as a feature.
 
 - [ ] **Step 1: Write the five e2e cases, run, confirm each fails against a stub before it passes**
 - [ ] **Step 2: map.md sync**
@@ -2044,23 +2161,24 @@ Each gets its links in a bottom reference block, and each names its honest cavea
      crates/shep-core/src/config/cron.rs crates/shep-core/src/config/probe.rs \
      crates/shep-daemon/src/{cron.rs,extras.rs,testing.rs} \
      crates/shep-daemon/src/{limits,probes,watch} \
-     crates/shep-daemon/tests/external_impls.rs
+     crates/shep-daemon/tests/external_impls.rs \
+     benches/Cargo.toml benches/benches/memory_sample.rs
    ```
 
-   returns nothing — those are the files this phase **creates**, and `testing.rs` is on the list because Task 3 moves two Phase 1-3 task references into it and then rewrites them. For files this phase only *modifies* (`supervisor.rs`, `lib.rs`, `boot.rs`, `normalize.rs`, `config/mod.rs`, `cli_e2e.rs`, `Cargo.toml`, the CHANGELOGs), rule 10 binds the lines this phase adds; check it in review of the diff.
+   returns nothing — those are the files this phase **creates**, and `testing.rs` is on the list because Task 3 moves two Phase 1-3 task references into it and then rewrites them. The two `benches/` paths are on it because the bench crate ships (settled below) and rule 10 binds a manifest as much as a source file; they were left off an earlier draft only while shipping was still an open question. For files this phase only *modifies* (`supervisor.rs`, `lib.rs`, `boot.rs`, `normalize.rs`, `config/daemon.rs`, `config/mod.rs`, `commands/daemon.rs`, `cli_e2e.rs`, `Cargo.toml`, the CHANGELOGs), rule 10 binds the lines this phase adds; check it in review of the diff.
 
-   **The 39 pre-existing Phase 1-3 task references on `main` are out of scope and must not be rewritten.** An unscoped `grep -rn "Phase 4\|Task [0-9]" crates/ Cargo.toml` returns 41 hits today, only two of which this phase retires — which is why the tree-wide form was replaced. `benches/` is off the path entirely: it does not exist yet and never will if Still open item 1 resolves to "defer", and grep on a missing path exits non-zero and fails the criterion for the wrong reason.
+   **The 39 pre-existing markers on `main` that survive this phase are out of scope and must not be rewritten.** An unscoped `grep -rn "Phase 4\|Task [0-9]" crates/ Cargo.toml` returns 41 hits today — 34 Phase 1-3 task references and 7 `Phase 4` promises, no overlap — of which this phase retires exactly two, both `Phase 4` markers on the readiness path. That leaves 34 task references plus the five `Phase 4` promises the paragraph below deals with, and it is why the tree-wide form was replaced.
 
    The two retirements are a positive requirement, since the scoped grep no longer reaches them: Task 9 removes both `Phase 4` markers on the readiness path — the `Msg::Ready` doc at `supervisor.rs:129` and the debug line at `supervisor.rs:432`. Verify both are gone.
 
    Five other `Phase 4` promises survive in code this phase does not touch (`boot.rs:763`, `:884` log flush/reopen; `supervisor.rs:1223`, `:1226` child metric and child action reply; `completions.rs:12`), all of them in the out-of-scope list at the top of this plan. After Phase 4 ships without delivering them those comments become false promises: re-point them at the phase that will, or say so in the report. Do not let a grep deputize an implementer to rewrite them silently.
 6. `grep -rn "assert_ne!" crates/shep-daemon/src crates/shep-core/src` returns nothing new.
-7. A report to Rin listing: every third-party API where the real documentation differed from `docs/research/phase4-lifecycle.md`; every judgement call made on her behalf; the bench numbers and the machine they came from; and the `interval = 0` decision from Task 13. Five items are already known to belong in it and should not have to be rediscovered — the sysinfo pin held at 0.38.x for MSRV rather than tracking 0.39, the bench crate's MSRV spelled literally in a second place because IR-5's own-`[workspace]` rule forbids inheriting it, the bracketed-IPv6 decision from Task 2, whether the cron worker was left restarting stopped instances (Still open item 3, whose default is yes), and whether the bench crate shipped (item 1).
+7. A report to Rin listing: every third-party API where the real documentation differed from `docs/research/phase4-lifecycle.md`; every judgement call made on her behalf; the bench numbers and the machine they came from; and the `interval = 0` decision from Task 13. Three items are already known to belong in it and should not have to be rediscovered — the sysinfo pin held at 0.38.x for MSRV rather than tracking 0.39, the bench crate's MSRV spelled literally in a second place because IR-5's own-`[workspace]` rule forbids inheriting it, and the bracketed-IPv6 decision from Task 2. Two items an earlier draft listed here are gone because they are no longer open questions: whether the cron worker restarts stopped instances (it does, and so does watch), and whether the bench crate shipped (it does).
 8. Every test added by this phase has its "fails if" comment. A reviewer spot-checking three of them at random should be able to break the implementation in the named way and watch the named test go red.
 
 ## Open questions for Rin
 
-**Eight are settled (Rin, 2026-08-08); three remain below.** The first four were settled when the plan was drafted. The other four close later questions — two from the original draft's open list, two the adversarial verification pass surfaced. Each remaining item carries a stated default, so no implementer is blocked on any of them.
+**All ten are settled (Rin, 2026-08-08); nothing here is open.** The first four were settled when the plan was drafted. The rest closed over three later rounds — some from the original draft's open list, some surfaced by the adversarial verification pass — and the last round of three closed the section. No implementer is blocked on anything below, and none of it is theirs to revisit.
 
 - **Cron dialect: five-field standard cron only.** Widening a grammar later is backwards-compatible, narrowing one is not, so the wide default was the expensive direction to guess. See Task 1 for the `Seconds::Disallowed` setting, the extension-character rejection, and the day/month-name trap it has to avoid.
 - **`https://` probe targets: rejected at config time**, with a typed error. A probe that silently fails every poll is indistinguishable from an app that is down, so failing loudly at config time is the honest option. A user with an HTTPS health endpoint cannot use a readiness probe in v1; that is the accepted cost of keeping a TLS stack out of the daemon (decision D1).
@@ -2069,14 +2187,10 @@ Each gets its links in a bottom reference block, and each names its honest cavea
 - **`watch = true` with no `cwd`: rejected at config time**, with a typed `NormalizeError::WatchWithoutCwd` naming the app. Both alternatives were rejected for named reasons. Arming nothing and logging a warning is the silent-failure shape this project keeps rooting out — the user learns their watch does nothing at the moment they wonder why saving a file changes nothing, which is the same fault the `https://` rejection exists to avoid. Defaulting to the daemon's own cwd is worse than quiet, it is dangerous: nothing in this workspace chdirs, so under a systemd unit with no `WorkingDirectory=` that default is `/` and shep would arm a recursive watch over the whole filesystem. Task 2 owns the variant and its three test rows; an app carrying `watch_options` with `watch = false` is deliberately left alone.
 - **Cron nicknames: the vixie set is accepted, `@reboot` is not.** `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily`, `@midnight` and `@hourly` are accepted and **shep expands each one itself, before the pattern reaches croner** — so croner never sees a nickname and the settled grammar stays literally five-field. These are textual sugar, not a wider dialect. The reason this does not reopen the five-field decision is that the vixie set is *closed*: it has been these seven spellings for decades and commits shep to nothing further, unlike croner's `L`/`W`/`#` extensions, which are that crate's own dialect and grow with it. Expanding ourselves is also what makes the set coherent — croner's own table has no `@midnight` arm, so delegating would accept `@daily` and reject `@midnight`. `@reboot` is refused with its own message: "run once at boot" has no meaning for a supervisor that already owns restart policy. Task 1 carries the expansion table and the rows in both directions.
 - **A readiness timeout on start takes the sheep online, with a warning.** Treating a slow start as a spawn failure produces exactly the restart loop `max_restarts` exists to contain, out of an app that is slow rather than broken. `errored` is the honest-but-brittle reading and is rejected on that basis; a dedicated `ReadinessTimeout` event is wire-additive and therefore out of this phase either way. Task 9 owns the behaviour and the warning.
-- **A watch-triggered restart reaches only the running instances.** A file save must not resurrect an instance the user explicitly stopped — `shep stop web-1` is a standing intention and a text editor is not where it gets overturned. The running set is read inside the actor at the moment the command is handled, using the `slot.ctl.is_some()` predicate `begin_manual` already computes, so nothing can go stale between deciding and acting; Task 11 owns the `restart_running` seam, the `ManualScope` parameter that implements it, and the two test rows. `Starting` counts as running; `Errored` and `WaitingRestart` do not.
+- **Watch and cron both restart the whole name-group, stopped instances included.** An earlier round settled the opposite for watch and left cron open; this reverses it and closes both at once. The deciding argument is that disarm-on-stop already covers the case anyone hits: a fully stopped sheep has no armed watcher and no armed cron worker, so neither trigger can reach it, and the filter would only ever have been visible for a *partially* stopped multi-instance group — some instances up keeping the watcher armed, one stopped by hand. Against that corner, the skip-stopped machinery was a scope parameter on the actor's manual-command path, a new `Msg` variant and a second public restart verb: engine surface, added by the phase whose whole shape is bolting subsystems on without reaching in. Group-wide also matches spec §4's own one-watcher-per-name-group wording, and it keeps watch and cron identical, which is what leaving cron alone always implied. **The protection users actually rely on is that stopping a sheep disarms its watch** — Task 12 mechanises it, Task 11 records the withdrawn filter so nobody rebuilds it, and Task 14 puts the sentence in the `watch/` module header and the changelog so it is not folklore.
 
-### Still open — do not resolve these unilaterally
+- **The bench crate ships in this phase.** Task 5 builds it as written. `MEMORY_POLL_INTERVAL`'s comment is required by IR-26 to be benchmark-backed, and the difference between "backed" and "asserted" is whether the next person can re-run the measurement: a committed criterion harness can be re-run on their machine, on a bigger flock, after a sysinfo upgrade, while a number somebody once measured and typed into a comment is unfalsifiable the day it lands. Yes, it is the only task shipping no user-visible behaviour. It is also the workspace's first bench harness, and IR-5 already specifies the shape, so the marginal cost is the run itself.
 
-1. **Does the bench crate land in this phase?** Task 5 builds it because IR-26 requires a benchmark-backed comment on `MEMORY_POLL_INTERVAL` and IR-5 specifies exactly what a bench crate should look like — but it is the phase's only task that ships no user-visible behaviour, and deferring it means the const's comment cites a one-off measurement instead of a committed harness. Default: build it. If the answer is "defer", say so before Task 4 finishes, because Task 6's const comment is written either way.
+- **`max_cron_sleep` is a daemon-config knob defaulting to 60s.** Sixty seconds stays the default and the reasoning is unchanged — a suspended laptop or an NTP step costs at most that much drift, and a dev machine suspending is the common case rather than the exotic one — but it stops being a hard `const`. It lives in `[daemon]` as `max_cron_sleep: Option<UpDuration>`, overridable by `SHEP_MAX_CRON_SLEEP`, with the default applied once in `boot.rs` so "unset" survives the whole file < env < flags layering. Values under one second are **rejected** at config load, not clamped: below that the loop stops being a scheduler and becomes a spin that still fires correctly, and clamping would announce itself only in a detached daemon's log file. There is no upper bound and no CLI flag, both for stated reasons at Task 3, which owns the knob, its floor and its tests; Task 12 owns the plumbing through `BootOptions` and `Extras`. The at-most-one-catch-up rule the old open item bundled with this one is unchanged and was never really the same question: it is about what a worker does on wake, not how often it wakes. Spec §5 describes `[daemon]` as "log policy, socket overrides" — illustrative rather than exhaustive, and the spec is Rin's to amend if she wants the third key named there.
 
-2. **`MAX_CRON_SLEEP = 60s`, and at-most-one catch-up.** A cron worker re-derives its next occurrence at least once a minute, so a suspended laptop or an NTP step costs at most a minute of drift; and a daemon that missed six occurrences fires once on wake rather than six times. Both are restart-storm guards and both are guesses at what a user wants. Sixty seconds is one wakeup per minute per cron-configured sheep, which is cheap but not free on a large flock. Default: as written.
-
-3. **Should a cron restart also skip stopped instances?** The settled watch decision says a file save must not resurrect an instance the user explicitly stopped. The identical argument reads across to a scheduled restart — `shep stop web-1` followed by 03:00 brings `web-1` back — but it was not the decision made, and the two are genuinely different in kind: a file save is a fresh intention the user just expressed, while a cron schedule is one they expressed once and left running. Leaving them different is defensible and leaving them the same is defensible; leaving it *undecided* is what is not, because the asymmetry is user-visible. The mechanism costs one call site if the answer is yes: Task 3's worker swaps `restart` for the `restart_running` Task 11 already builds, and gains a test row. Default: cron stays as written, restarting every instance of the name.
-
-**Two things this section no longer decides, recorded so nobody re-opens them from the old numbering.** Whether a watch should restart the group *rolling* rather than all at once was folded into the settled watch decision: a rolling restart keeps the app serving through a save, which is what reload is for, and reload is on this phase's out-of-scope list. And the `interval = 0` probe question is not here because it is not Rin's — Task 13 states it as the implementer's call between rejecting at `normalize` and flooring at a named minimum, with the choice going in the report either way.
+**Two things this section does not decide, recorded so nobody re-opens them from the old numbering.** Whether a watch should restart the group *rolling* rather than all at once is out of scope rather than undecided: a rolling restart keeps the app serving through a save, which is what reload is for, and reload is on this phase's out-of-scope list. And the `interval = 0` probe question is not here because it is not Rin's — Task 13 states it as the implementer's call between rejecting at `normalize` and flooring at a named minimum, with the choice going in the report either way.
