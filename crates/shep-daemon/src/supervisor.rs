@@ -871,6 +871,14 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.ready_tx = None;
                 let info = to_info(&slot.entry);
                 self.emit(ProcessEventKind::Errored, info.clone(), manually);
+                // The same terminal status `Decision::Errored` reaches, and it
+                // needs the same disarm: a respawn that fails to spawn (the
+                // binary replaced mid-deploy, `EAGAIN`, a cwd that is gone)
+                // would otherwise leave the name-group's cron worker and watch
+                // live, and the enforcer armed against a pid that no longer
+                // exists. Re-disarming an already-disarmed id is a no-op by
+                // construction, so this is safe from every caller.
+                self.disarm_extras(id, &info.name);
                 info
             }
         }
@@ -1109,11 +1117,17 @@ impl<R: ProcessRunner> Actor<R> {
             // `std::mem::take` above has already consumed both markers, so
             // a future change to WHEN `pending_delete` is set would drop a
             // Delete on the floor while telling its caller it succeeded.
+            //
+            // The disarm below is honoured for exactly the same reason and at
+            // the same price: deregistering without it would leave the name
+            // group's cron worker and watch firing at a name `list()` no
+            // longer knows.
             if manual == Some(ManualKind::Delete) || pending_delete {
                 let mut removed = self.sheep.remove(&id).expect("checked above");
                 removed.entry.status = ProcStatus::Stopped;
                 let info = to_info(&removed.entry);
                 self.emit(ProcessEventKind::Delete, info.clone(), true);
+                self.disarm_extras(id, &info.name);
                 return self.resolve_pending(id, info);
             }
             let info = to_info(&self.sheep.get(&id).expect("checked above").entry);

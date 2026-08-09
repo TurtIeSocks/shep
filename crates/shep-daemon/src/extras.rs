@@ -179,18 +179,24 @@ pub fn spawn_extras_reporter(
 /// way out.
 #[derive(Debug, Default)]
 pub struct ExtrasRegistry {
-    /// One name-group's per-name tasks. Present only while at least one of
-    /// them is armed, so a flock of apps configuring neither `cron_restart`
-    /// nor `watch` leaves this map empty.
+    /// One name-group's per-name tasks. Present only while at least one
+    /// instance whose *configuration* asks for a per-name extra is armed, so
+    /// a flock of apps configuring neither `cron_restart` nor `watch` leaves
+    /// this map empty. Keyed on the configuration rather than on what an
+    /// arming managed to build — see [`ExtrasRegistry::arm`].
     groups: HashMap<String, NameExtras>,
     /// One instance's per-pid extras, keyed by sheep id. Present only while
-    /// at least one of them is armed, for the same reason.
+    /// at least one of them is armed.
     instances: HashMap<u32, InstanceExtras>,
 }
 
 /// One name-group's per-name tasks, plus the armed instances keeping them
 /// alive.
-#[derive(Debug)]
+///
+/// Either task may be `None` while the group still exists: an app that
+/// configures a watch but whose watch could not be registered is a member of
+/// its group all the same, and the next arming of the name retries it.
+#[derive(Debug, Default)]
 struct NameExtras {
     /// The group's cron worker, when the app configures `cron_restart`.
     cron: Option<JoinHandle<()>>,
@@ -199,6 +205,19 @@ struct NameExtras {
     /// Ids of this name's instances that currently have anything armed. The
     /// last one leaving is what tears the two tasks above down.
     members: HashSet<u32>,
+}
+
+impl NameExtras {
+    /// Aborts both per-name tasks. Takes `self`: a group is torn down once
+    /// and then gone, so there is no half-aborted state to represent.
+    fn abort(self) {
+        if let Some(cron) = self.cron {
+            cron.abort();
+        }
+        if let Some(watch) = self.watch {
+            watch.abort();
+        }
+    }
 }
 
 /// One instance's per-pid extras.
@@ -216,6 +235,18 @@ impl InstanceExtras {
     /// Whether nothing at all was armed for this instance.
     fn is_empty(&self) -> bool {
         self.limit.is_none() && self.liveness.is_none()
+    }
+
+    /// Undoes this instance's arming: the memory limit against `id`, and the
+    /// liveness loop. Takes `self` for the same reason [`NameExtras::abort`]
+    /// does.
+    fn disarm(self, id: u32) {
+        if let Some(enforcer) = self.limit {
+            enforcer.disarm(id);
+        }
+        if let Some(liveness) = self.liveness {
+            liveness.abort();
+        }
     }
 }
 
@@ -239,11 +270,11 @@ impl ExtrasRegistry {
     ///
     /// Idempotent per id: arming an already-armed id disarms that id's own
     /// per-pid extras first, which is what a respawn needs — the new process
-    /// has a new pid. The name-group's two tasks are deliberately *not* torn
-    /// down and rebuilt on a re-arm: they are keyed on the name, they outlive
-    /// any one process, and rebuilding the watch on every restart would
-    /// re-register the OS watcher each time — a step that can fail, and whose
-    /// failure would silently cost an app the watch that restarted it.
+    /// has a new pid. A *live* name-group task is deliberately left alone on a
+    /// re-arm: it is keyed on the name, it outlives any one process, and
+    /// rebuilding the watch on every restart would re-register the OS watcher
+    /// each time — a step that can fail, and whose failure would silently cost
+    /// an app the watch that restarted it.
     pub fn arm(
         &mut self,
         entry: &ProcessEntry,
@@ -259,24 +290,33 @@ impl ExtrasRegistry {
             self.instances.insert(id, instance);
         }
 
-        // Per-name, and only for the FIRST instance of a name: a second
-        // instance joins the group rather than arming a second worker, since
-        // both triggers already reach every instance of the name.
-        if let Some(group) = self.groups.get_mut(&config.name) {
-            group.members.insert(id);
+        // Group membership is decided by the CONFIGURATION, never by whether
+        // this arming managed to build a task. An `arm_watch` that failed
+        // transiently — inotify's `max_user_watches` exhausted, say — would
+        // otherwise leave a still-online instance out of its own group, and
+        // stopping some LATER instance whose arm did succeed would tear the
+        // watch down while the earlier one is still running.
+        if config.cron_restart.is_none() && !config.watch {
             return;
         }
-        let cron = arm_cron(config, extras, supervisor);
-        let watch = arm_watch(config, supervisor);
-        if cron.is_some() || watch.is_some() {
-            self.groups.insert(
-                config.name.clone(),
-                NameExtras {
-                    cron,
-                    watch,
-                    members: HashSet::from([id]),
-                },
-            );
+        let group = self.groups.entry(config.name.clone()).or_default();
+        // A second instance of a name joins the group rather than arming a
+        // second worker, since both triggers already reach every instance of
+        // the name.
+        group.members.insert(id);
+        // Presence in the map is NOT the test, because a task can end on its
+        // own: a cron worker returns on a pattern with no further occurrence,
+        // and the watch loop returns when its `WatchSource` dies. Either
+        // leaves a finished handle behind, and without this the app would have
+        // silently lost its schedule or its watch with nothing left to rebuild
+        // it. `arm_cron`/`arm_watch` each return `None` for an app that asked
+        // for nothing, so the app that configured only one of the two pays
+        // nothing for the other's call.
+        if group.cron.as_ref().is_none_or(JoinHandle::is_finished) {
+            group.cron = arm_cron(config, extras, supervisor);
+        }
+        if group.watch.as_ref().is_none_or(JoinHandle::is_finished) {
+            group.watch = arm_watch(config, supervisor);
         }
     }
 
@@ -305,28 +345,46 @@ impl ExtrasRegistry {
         if !group.members.remove(&id) || !group.members.is_empty() {
             return;
         }
-        let Some(group) = self.groups.remove(name) else {
-            return;
-        };
-        if let Some(cron) = group.cron {
-            cron.abort();
-        }
-        if let Some(watch) = group.watch {
-            watch.abort();
+        if let Some(group) = self.groups.remove(name) {
+            group.abort();
         }
     }
 
     /// Undoes one instance's per-pid arming: the memory limit and the
     /// liveness loop. A no-op for an id that had neither.
     fn disarm_instance(&mut self, id: u32) {
-        let Some(instance) = self.instances.remove(&id) else {
-            return;
-        };
-        if let Some(enforcer) = instance.limit {
-            enforcer.disarm(id);
+        if let Some(instance) = self.instances.remove(&id) {
+            instance.disarm(id);
         }
-        if let Some(liveness) = instance.liveness {
-            liveness.abort();
+    }
+}
+
+impl Drop for ExtrasRegistry {
+    // Nothing armed outlives the registry. This is the teardown rather than a
+    // disarm loop in `begin_shutdown` because it covers BOTH ways the actor
+    // can end, and a future transition cannot forget it:
+    //
+    // - A graceful shutdown only kills sheep whose `ctl.is_some()`. A
+    //   `WaitingRestart` sheep has none, never exits, and so never reaches
+    //   `handle_exited`'s terminal branches — its liveness loop, its enforcer
+    //   arming and its name-group's cron worker and watch would all survive
+    //   the actor.
+    // - An actor that panics never runs `begin_shutdown` at all.
+    //
+    // A `JoinHandle` merely dropped DETACHES its task rather than cancelling
+    // it, so every one of them has to be aborted by hand. Cron and watch do
+    // eventually notice `EngineStopped` and return, but only at their next
+    // iteration: the watch parks on its debounce channel holding the OS
+    // watcher until some unrelated file changes, and a liveness loop keeps
+    // spawning a real `sh` per interval until its threshold — and while any
+    // one of them lives it holds a report sender, so the reporting task never
+    // ends either.
+    fn drop(&mut self) {
+        for (id, instance) in self.instances.drain() {
+            instance.disarm(id);
+        }
+        for (_name, group) in self.groups.drain() {
+            group.abort();
         }
     }
 }
@@ -592,6 +650,26 @@ mod tests {
     /// liveness probe but must still hand `arm` one.
     fn idle_prober() -> Arc<dyn Prober> {
         Arc::new(ScriptedProber::new(vec![]))
+    }
+
+    /// A prober that fails every probe — a liveness loop armed with one
+    /// reports as soon as it has taken `failure_threshold` samples, so a case
+    /// asserting SILENCE against one is asserting the loop is gone.
+    fn failing_prober() -> Arc<dyn Prober> {
+        Arc::new(ScriptedProber::new(vec![Err(ProbeFailure::Timeout)]))
+    }
+
+    /// Yields until `task` reports finished, panicking if it never does.
+    /// Yielding rather than advancing: a worker that ends does so on its
+    /// first poll, and an `advance` would resolve unrelated timers with it.
+    async fn settle_finished(task: &JoinHandle<()>) {
+        for _ in 0..100 {
+            if task.is_finished() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the task never finished");
     }
 
     /// Waits up to `window` for a `Restart` naming `name`, panicking if none
@@ -906,6 +984,218 @@ mod tests {
         assert_eq!(registry.groups["web"].members, HashSet::from([0]));
         cross_one_hour().await;
         expect_restart(&mut rx, "web", EVENT_WAIT).await;
+    }
+
+    // fails if `arm`'s per-name work keys on the group's map ENTRY existing
+    // rather than on its tasks being alive. A cron worker that ended on its
+    // own leaves a finished handle behind, and an `arm` that returns on map
+    // presence alone never rebuilds it — the app silently loses its schedule
+    // with nothing left to notice. The clock is what makes the claim: a fresh
+    // worker on this pattern reads it exactly once before returning, so a
+    // second reading means a second worker really was spawned.
+    #[tokio::test(start_paused = true)]
+    async fn a_cron_worker_that_ended_on_its_own_is_rebuilt_on_the_next_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        // 30 February: a pattern croner parses and then finds no occurrence
+        // for, which is the `Ok(None)` arm `spawn_cron_worker` returns on.
+        let app = app_with("web", |app| {
+            app.cron_restart = Some("0 0 30 2 *".to_string());
+        });
+
+        registry.arm(
+            &armed_entry(0, 0, 1000, app.clone(), &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+        settle_finished(
+            registry.groups["web"]
+                .cron
+                .as_ref()
+                .expect("the first arm spawns a worker"),
+        )
+        .await;
+        assert_eq!(
+            rig.clock.reads(),
+            1,
+            "a worker on a pattern with no occurrence reads the clock once and ends"
+        );
+
+        registry.arm(
+            &armed_entry(0, 0, 2000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+        settle_finished(
+            registry.groups["web"]
+                .cron
+                .as_ref()
+                .expect("the re-arm must leave a worker behind"),
+        )
+        .await;
+        assert_eq!(
+            rig.clock.reads(),
+            2,
+            "a re-arm must rebuild a name-group task that ended on its own"
+        );
+    }
+
+    // fails if group membership is recorded from what an arming managed to
+    // BUILD rather than from what the app CONFIGURED. This app asks for a
+    // watch and gets none — its cwd does not resolve — so under the
+    // build-keyed reading the group does not exist and this instance is in no
+    // group at all; a later instance of the same name whose watch DID arm
+    // would then own the group alone, and stopping it would tear the watch
+    // down with this one still online.
+    //
+    // The enforcer assertion is the other half: a watch that could not be
+    // armed costs this app its watch and nothing else.
+    #[tokio::test(start_paused = true)]
+    async fn an_instance_whose_watch_could_not_be_armed_still_joins_its_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let limit = MemSize::from_bytes(500);
+        // `normalize` rejects `watch = true` with no cwd, but never checks
+        // that the cwd it names resolves — so `canonicalize` failing is the
+        // one watch-arming failure a config that came through it can reach.
+        let missing = dir.path().join("no-such-directory");
+        let app = app_with("web", |app| {
+            app.watch = true;
+            app.cwd = Some(missing.display().to_string());
+            app.max_memory = Some(limit);
+        });
+
+        registry.arm(
+            &armed_entry(0, 0, 1000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+
+        let group = registry
+            .groups
+            .get("web")
+            .expect("a watched app is a member of its group whether or not the watch armed");
+        assert!(group.watch.is_none(), "this app's watch cannot have armed");
+        assert_eq!(group.members, HashSet::from([0]));
+        assert_eq!(
+            rig.enforcer.arms(),
+            vec![ArmCall {
+                id: 0,
+                root_pid: 1000,
+                limit,
+            }],
+            "a watch that could not be armed must not take the memory limit with it"
+        );
+    }
+
+    // fails if `ExtrasRegistry` has no `Drop` that aborts what it armed — the
+    // teardown a shutdown depends on, since `begin_shutdown` only kills sheep
+    // holding a live task and a `WaitingRestart` sheep holds none. A dropped
+    // `JoinHandle` detaches its task rather than cancelling it, so the loop
+    // would outlive the actor and keep probing.
+    //
+    // The kept registry is the control: it proves these loops really do
+    // report, so the silence demanded of the dropped one could have failed.
+    // Both orderings are caught — under a missing `Drop` BOTH report, and
+    // whichever lands first fails one of the two assertions.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_registry_stops_the_liveness_loop_it_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let mut rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let app = app_with("web", |app| {
+            app.liveness_probe = Some(ProbeConfig {
+                failure_threshold: 1,
+                ..probe_config(ProbeKind::Tcp, "localhost:5432")
+            });
+        });
+        let interval = app
+            .config()
+            .liveness_probe
+            .as_ref()
+            .expect("the fixture just set one")
+            .interval
+            .as_duration();
+
+        let mut kept = ExtrasRegistry::default();
+        kept.arm(
+            &armed_entry(8, 1, 5678, app.clone(), &paths),
+            failing_prober(),
+            &rig.extras,
+            &handle,
+        );
+        let mut discarded = ExtrasRegistry::default();
+        discarded.arm(
+            &armed_entry(7, 0, 1234, app, &paths),
+            failing_prober(),
+            &rig.extras,
+            &handle,
+        );
+        drop(discarded);
+
+        let failure = expect_liveness(&mut rig.liveness, EVENT_WAIT).await;
+        assert_eq!(
+            failure,
+            LivenessFailure { id: 8, pid: 5678 },
+            "only the registry that is still alive may report"
+        );
+        assert_no_liveness_within(&mut rig.liveness, interval * 3).await;
+    }
+
+    // fails if `disarm` does not abort the liveness loop it armed. A healthy
+    // loop never ends on its own — it returns only after reporting — so a
+    // stopped or deleted sheep would leak a task probing a pid that is gone.
+    // Same control-and-silence shape as the `Drop` case above, for the same
+    // reason: the sibling instance left armed proves the silence could fail.
+    #[tokio::test(start_paused = true)]
+    async fn disarming_an_id_stops_its_liveness_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let mut rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.instances = 2;
+            app.liveness_probe = Some(ProbeConfig {
+                failure_threshold: 1,
+                ..probe_config(ProbeKind::Tcp, "localhost:5432")
+            });
+        });
+        let interval = app
+            .config()
+            .liveness_probe
+            .as_ref()
+            .expect("the fixture just set one")
+            .interval
+            .as_duration();
+
+        for (id, instance, pid) in [(0, 0, 1000), (1, 1, 1001)] {
+            registry.arm(
+                &armed_entry(id, instance, pid, app.clone(), &paths),
+                failing_prober(),
+                &rig.extras,
+                &handle,
+            );
+        }
+        registry.disarm(0, "web");
+
+        let failure = expect_liveness(&mut rig.liveness, EVENT_WAIT).await;
+        assert_eq!(
+            failure,
+            LivenessFailure { id: 1, pid: 1001 },
+            "only the instance that is still armed may report"
+        );
+        assert_no_liveness_within(&mut rig.liveness, interval * 3).await;
     }
 
     // fails if `arm` wires the liveness loop to a throwaway channel of its
@@ -1259,6 +1549,50 @@ mod tests {
             clock.reads(),
             reads_after_delete,
             "a deleted sheep's cron worker must stop reading the clock, not merely stop finding sheep"
+        );
+    }
+
+    // fails if `respawn`'s Err arm does not disarm. It lands the sheep in the
+    // same `Errored` status `Decision::Errored` does, and is reachable in an
+    // ordinary deploy — a cron occurrence (or a crash-restart, or a manual
+    // one) whose respawn cannot spawn, because the binary was replaced
+    // mid-deploy or the cwd is gone. Without the disarm the name group's cron
+    // worker stays live against a sheep that will never come back.
+    //
+    // The clock is the observable claim, exactly as in the delete case above:
+    // a failed respawn emits `Errored`, never `Restart`, so a surviving worker
+    // leaves no bus event behind — only its every-`max_cron_sleep` reading.
+    #[tokio::test(start_paused = true)]
+    async fn a_respawn_that_cannot_spawn_stops_the_name_groups_cron_worker() {
+        let clock = Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z")));
+        // EXACTLY one script, and that is the point: the initial start
+        // consumes it, so the cron occurrence's respawn finds the script
+        // exhausted, `ScriptedRunner` reports `SpawnFailed`, and `respawn`
+        // takes its Err arm.
+        let h = harness_with_extras(vec![ProcScript::never_exits()], |reports| Extras {
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
+            enforcer: Arc::new(RecordingEnforcer::default()),
+            max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+            reports,
+        });
+        let mut rx = h.ctx.events.subscribe();
+        h.ctx
+            .supervisor
+            .start(vec![app_with("web", |app| {
+                app.cron_restart = Some("0 * * * *".to_string());
+            })])
+            .await
+            .unwrap();
+
+        cross_one_hour().await;
+        settle_into(&h.ctx.supervisor, 0, ProcStatus::Errored).await;
+
+        let reads_after_error = clock.reads();
+        assert_no_restart_within(&mut rx, "web", PAST_THE_NEXT_OCCURRENCE).await;
+        assert_eq!(
+            clock.reads(),
+            reads_after_error,
+            "an errored sheep's cron worker must stop reading the clock"
         );
     }
 
