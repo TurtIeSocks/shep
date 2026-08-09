@@ -3,8 +3,14 @@
 //! [`spawn_cron_worker`] runs one name-group's `cron_restart` schedule for
 //! as long as its [`tokio::task::JoinHandle`] lives, restarting every
 //! instance of the name — stopped ones included, per [`ProcessSelector::Name`]'s
-//! own reach — through the same [`SupervisorHandle::restart`] a manual
-//! `shep restart` uses. It never touches the actor directly.
+//! own reach — through [`SupervisorHandle::restart_automatic`]. It never
+//! touches the actor directly.
+//!
+//! An occurrence is not a person's `shep restart`, and goes in declaring that:
+//! an operator's `stop` arriving while a cron-triggered restart is still
+//! mid-kill-ladder takes the sheep back off it, rather than coming back
+//! `Online` because it lost a race nobody was waiting on. The restart is
+//! otherwise identical to a manual one, budget reset included.
 
 use core::time::Duration;
 use std::sync::Arc;
@@ -136,7 +142,7 @@ pub fn spawn_cron_worker(
             // for free. Do not "fix" this into a catch-up loop.
             if clock.now_utc() >= next {
                 match supervisor
-                    .restart(ProcessSelector::Name(name.clone()))
+                    .restart_automatic(ProcessSelector::Name(name.clone()))
                     .await
                 {
                     Ok(_) => {}
@@ -173,6 +179,7 @@ mod tests {
     use crate::testing::{TestClock, test_paths};
     use shep_core::config::{AppConfig, normalize};
     use shep_core::protocol::{BusEvent, ProcessEventKind, ProcessInfo};
+    use shep_core::status::ProcStatus;
 
     /// Dyn-compatibility smoke test (IR-10): fails to compile the moment
     /// somebody adds a generic (non-dyn-safe) method to `Clock`.
@@ -199,9 +206,22 @@ mod tests {
         broadcast::Receiver<BusEvent>,
         tempfile::TempDir,
     ) {
+        spawn_test_fixture_with(vec![ProcScript::never_exits(); 8])
+    }
+
+    /// [`spawn_test_fixture`] over a caller-chosen script pool, for the one
+    /// case that needs a sheep which sits out its whole kill ladder rather
+    /// than a merely long-lived one.
+    fn spawn_test_fixture_with(
+        scripts: Vec<ProcScript>,
+    ) -> (
+        SupervisorHandle,
+        broadcast::Receiver<BusEvent>,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let (events, rx) = broadcast::channel(64);
-        let runner = ScriptedRunner::new(vec![ProcScript::never_exits(); 8]);
+        let runner = ScriptedRunner::new(scripts);
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
         (handle, rx, dir)
     }
@@ -540,5 +560,90 @@ mod tests {
             clock.reads()
         );
         worker.abort();
+    }
+
+    // An operator's `stop` landing on a sheep whose kill ladder a cron
+    // occurrence already started. Nobody typed the occurrence, so the
+    // operator's intent wins: the sheep named ends `Stopped`, never
+    // respawned, and `stop()` reports that honestly.
+    //
+    // Two instances, because one could not tell a pass from a test whose
+    // occurrence never reached the actor at all — with a single sheep, a
+    // `stop` that simply arrived first produces the very same `Stopped`. The
+    // second instance is left alone precisely so its restart is observable:
+    // waiting on that restart is both the proof the occurrence fired and the
+    // barrier that puts it strictly before the `stop`, since one
+    // `begin_manual` claims both instances' markers in the same synchronous
+    // pass.
+    //
+    // fails if the cron worker declares `CommandOrigin::Operator` — calling
+    // `restart` rather than `restart_automatic`: `claim_manual` then keeps
+    // the occurrence's marker under plain first-command-wins, `handle_exited`
+    // respawns, and the `stop()` caller is handed an `Online` snapshot of a
+    // sheep that is genuinely back up with `restarts: 1`.
+    #[tokio::test(start_paused = true)]
+    async fn an_operators_stop_beats_a_cron_triggered_restart_mid_ladder() {
+        // Four procs, which is the most this test can demand: both instances'
+        // initial ones, the respawn the untouched instance legitimately
+        // performs, and the respawn a broken implementation performs behind
+        // the stop's back. A pool of three would answer that fourth spawn
+        // `SpawnFailed("script exhausted")` and land the bug in `Errored`
+        // rather than the `Online` that shows how bad it is.
+        let (handle, mut rx, _dir) = spawn_test_fixture_with(vec![
+            ProcScript::ignores_signals(), // held for the whole 1600ms ladder
+            ProcScript::never_exits(),     // exits the moment the ladder signals it
+            ProcScript::never_exits(),     // the untouched instance's respawn
+            ProcScript::never_exits(),     // the respawn a broken implementation performs
+        ]);
+        let name = "web";
+        let mut app = AppConfig::minimal(name, "./srv");
+        app.instances = 2;
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        let listed = handle.list().await;
+        let (held, released) = (listed[0].id, listed[1].id);
+
+        let clock = Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z")));
+        let schedule = CronSchedule::parse("0 * * * *", None).unwrap();
+        let worker =
+            spawn_worker_and_settle(name, schedule, clock, &handle, DEFAULT_MAX_CRON_SLEEP).await;
+
+        // The occurrence claims BOTH instances' next exit and starts both kill
+        // ladders. Only the second sheep's ladder can finish without the clock
+        // moving, so its restart lands while the first is still mid-ladder.
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        let restarted = expect_restart(&mut rx, name).await;
+        assert_eq!(
+            (restarted.id, restarted.restarts),
+            (released, 1),
+            "the occurrence never reached the actor, so the stop below would \
+             race nothing -- got {restarted:?}"
+        );
+        // Aborted before the stop so the worker cannot fire a SECOND
+        // occurrence into the assertions below once the paused clock
+        // auto-advances past the next top of the hour. Its restart is already
+        // in the actor's hands; the dropped reply receiver only means nobody
+        // reads the answer.
+        worker.abort();
+
+        let stopped = handle.stop(ProcessSelector::Id(held)).await.unwrap();
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(
+            (stopped[0].id, stopped[0].status, stopped[0].restarts),
+            (held, ProcStatus::Stopped, 0),
+            "an operator's stop was silently converted into the cron-triggered \
+             restart it raced -- got {stopped:?}"
+        );
+        let listed = handle.list().await;
+        assert_eq!(
+            (listed[0].id, listed[0].status, listed[0].pid),
+            (held, ProcStatus::Stopped, None),
+            "the sheep an operator stopped is running again -- got {listed:?}"
+        );
+        assert_eq!(
+            (listed[1].id, listed[1].status),
+            (released, ProcStatus::Online),
+            "the instance the operator did not name must still be up, \
+             restarted by the occurrence -- got {listed:?}"
+        );
     }
 }

@@ -77,9 +77,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Restart budget now errors at exactly `max_restarts`, not `max_restarts + 1`
   (spec §4).
 - Let a `stop` or `delete` override an automatic restart that is already
-  mid-kill-ladder. A memory breach or a liveness failure claimed the sheep's
-  next exit, so a `stop` arriving behind one was silently converted into a
-  restart: the sheep came back up with `restarts: 1` and the `stop` caller was
-  handed an `Online` snapshot of it. Two commands that each have a caller
-  waiting on an answer still resolve first-command-wins, and an automatic
-  restart still never displaces either.
+  mid-kill-ladder. A memory breach, a liveness failure, a cron occurrence or a
+  change under a watched tree claimed the sheep's next exit, so a `stop`
+  arriving behind one was silently converted into a restart: the sheep came
+  back up with `restarts: 1` and the `stop` caller was handed an `Online`
+  snapshot of it. Two commands that each have an operator waiting on an answer
+  still resolve first-command-wins, and an automatic restart still never
+  displaces either. What a restart *does* is unchanged either way — a cron- or
+  watch-triggered one resets the restart budget exactly as `shep restart` does.

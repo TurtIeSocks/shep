@@ -252,7 +252,10 @@ pub fn spawn_watch_group(
 }
 
 /// The group loop: filters each debounced batch and single-flights a
-/// group-wide restart through [`SupervisorHandle::restart`].
+/// group-wide restart through [`SupervisorHandle::restart_automatic`] — a
+/// file changing is not a person's `shep restart`, so an operator's `stop`
+/// landing while one is still mid-kill-ladder takes the sheep back off it
+/// instead of being converted into the restart it raced.
 ///
 /// No dirty flag, no state machine (IR-31): the channel's own buffering is
 /// the re-check mechanism. A batch that arrives while a restart is in
@@ -282,7 +285,7 @@ async fn run_group(
             continue;
         }
         match supervisor
-            .restart(ProcessSelector::Name(name.clone()))
+            .restart_automatic(ProcessSelector::Name(name.clone()))
             .await
         {
             Ok(_) => {}
@@ -776,6 +779,88 @@ mod tests {
         assert_eq!(stopped_info.restarts, 1);
 
         group.abort();
+    }
+
+    // An operator's `stop` landing on a sheep whose kill ladder a watched
+    // file already started. Nobody typed the file change, so the operator's
+    // intent wins: the sheep named ends `Stopped`, never respawned, and
+    // `stop()` reports that honestly.
+    //
+    // Two instances, because one could not tell a pass from a test whose
+    // batch never reached the actor at all — with a single sheep, a `stop`
+    // that simply arrived first produces the very same `Stopped`. The second
+    // instance is left alone precisely so its restart is observable: waiting
+    // on that restart is both the proof the batch fired and the barrier that
+    // puts it strictly before the `stop`, since one `begin_manual` claims
+    // both instances' markers in the same synchronous pass.
+    //
+    // fails if the group loop declares `CommandOrigin::Operator` — calling
+    // `restart` rather than `restart_automatic`: `claim_manual` then keeps
+    // the batch's marker under plain first-command-wins, `handle_exited`
+    // respawns, and the `stop()` caller is handed an `Online` snapshot of a
+    // sheep that is genuinely back up with `restarts: 1`.
+    #[tokio::test(start_paused = true)]
+    async fn an_operators_stop_beats_a_watch_triggered_restart_mid_ladder() {
+        // Four procs, which is the most this test can demand: both instances'
+        // initial ones, the respawn the untouched instance legitimately
+        // performs, and the respawn a broken implementation performs behind
+        // the stop's back. A pool of three would answer that fourth spawn
+        // `SpawnFailed("script exhausted")` and land the bug in `Errored`
+        // rather than the `Online` that shows how bad it is.
+        let (handle, mut rx, _dir) = spawn_test_fixture(vec![
+            ProcScript::ignores_signals(), // held for the whole 1600ms ladder
+            ProcScript::never_exits(),     // exits the moment the ladder signals it
+            ProcScript::never_exits(),     // the untouched instance's respawn
+            ProcScript::never_exits(),     // the respawn a broken implementation performs
+        ]);
+        let name = "web";
+        let infos = start_app(&handle, name, 2).await;
+        let (held, released) = (infos[0].id, infos[1].id);
+        let root = PathBuf::from("/watched");
+        let (tx, group_rx) = mpsc::unbounded_channel();
+        let group = tokio::spawn(run_group(
+            name.to_string(),
+            matches_everything(root.clone()),
+            group_rx,
+            handle.clone(),
+        ));
+
+        // The batch claims BOTH instances' next exit and starts both kill
+        // ladders. Only the second sheep's ladder can finish without the clock
+        // moving, so its restart lands while the first is still mid-ladder.
+        tx.send(vec![root.join("src/main.rs")]).unwrap();
+        let restarted = expect_restart(&mut rx, name, EVENT_WAIT).await;
+        assert_eq!(
+            (restarted.id, restarted.restarts),
+            (released, 1),
+            "the batch never reached the actor, so the stop below would race \
+             nothing -- got {restarted:?}"
+        );
+        // Aborted before the stop so no later batch can reach the assertions
+        // below. The restart is already in the actor's hands; the dropped
+        // reply receiver only means nobody reads the answer.
+        group.abort();
+
+        let stopped = handle.stop(ProcessSelector::Id(held)).await.unwrap();
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(
+            (stopped[0].id, stopped[0].status, stopped[0].restarts),
+            (held, ProcStatus::Stopped, 0),
+            "an operator's stop was silently converted into the watch-triggered \
+             restart it raced -- got {stopped:?}"
+        );
+        let listed = handle.list().await;
+        assert_eq!(
+            (listed[0].id, listed[0].status, listed[0].pid),
+            (held, ProcStatus::Stopped, None),
+            "the sheep an operator stopped is running again -- got {listed:?}"
+        );
+        assert_eq!(
+            (listed[1].id, listed[1].status),
+            (released, ProcStatus::Online),
+            "the instance the operator did not name must still be up, \
+             restarted by the batch -- got {listed:?}"
+        );
     }
 
     // fails if `NotFound` is treated as fatal and ends the loop, leaving

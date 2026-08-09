@@ -18,12 +18,12 @@
 //! # Deferred, aggregated replies
 //!
 //! [`SupervisorHandle::stop`]/[`restart`](SupervisorHandle::restart)/
+//! [`restart_automatic`](SupervisorHandle::restart_automatic)/
 //! [`delete`](SupervisorHandle::delete) and
 //! [`shutdown`](SupervisorHandle::shutdown) resolve their selector into a
 //! set of matched ids up front, then wait until every matched sheep is
-//! terminal before answering the caller. Automatic restarts internal to the
-//! crash loop go through the same exit path without ever registering a
-//! deferred reply.
+//! terminal before answering the caller. The crash loop's own restarts go
+//! through the same exit path without ever registering a deferred reply.
 
 use core::fmt;
 use core::time::Duration;
@@ -87,6 +87,11 @@ pub(crate) enum Command {
     Restart {
         /// Which sheep.
         selector: ProcessSelector,
+        /// Who asked: an operator off the control socket, or the daemon's own
+        /// cron or watch worker. Governs only whether this restart can be
+        /// displaced mid-kill-ladder (see `Actor::claim_manual`); it never
+        /// changes what the restart does, including its budget reset.
+        origin: CommandOrigin,
         /// Answers once every matched sheep is back online (or errored).
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     },
@@ -241,6 +246,11 @@ impl SupervisorHandle {
     /// Restarts every sheep matching `selector`, resetting its restart
     /// budget (spec §4: a manual action resets budget).
     ///
+    /// Declares `CommandOrigin::Operator`: a person typed this, so it is owed
+    /// an answer and nothing may take the sheep off it mid-kill-ladder. A
+    /// restart the daemon raised on its own goes through
+    /// [`Self::restart_automatic`] instead.
+    ///
     /// # Errors
     ///
     /// - [`SupervisorError::NotFound`] — nothing matched.
@@ -249,9 +259,47 @@ impl SupervisorHandle {
         &self,
         selector: ProcessSelector,
     ) -> Result<Vec<ProcessInfo>, SupervisorError> {
+        self.restart_with_origin(selector, CommandOrigin::Operator)
+            .await
+    }
+
+    /// Restarts every sheep matching `selector` on the daemon's own
+    /// initiative — a cron occurrence, or a change under a watched tree —
+    /// resetting its restart budget exactly as [`Self::restart`] does.
+    ///
+    /// Declares `CommandOrigin::Automatic`: nobody typed this, so an
+    /// operator's `stop` or `delete` landing while it is still mid-kill-ladder
+    /// takes the sheep back off it instead of being silently converted into
+    /// the restart it raced. The caller is still handed the same answer
+    /// [`Self::restart`] returns — a cron or watch worker reads it to log a
+    /// failed spawn and to notice the engine going away.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::NotFound`] — nothing matched.
+    /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    pub async fn restart_automatic(
+        &self,
+        selector: ProcessSelector,
+    ) -> Result<Vec<ProcessInfo>, SupervisorError> {
+        self.restart_with_origin(selector, CommandOrigin::Automatic)
+            .await
+    }
+
+    /// The body both restart methods share; they differ only in the origin
+    /// they declare.
+    async fn restart_with_origin(
+        &self,
+        selector: ProcessSelector,
+        origin: CommandOrigin,
+    ) -> Result<Vec<ProcessInfo>, SupervisorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Msg::Command(Command::Restart { selector, reply }))
+            .send(Msg::Command(Command::Restart {
+                selector,
+                origin,
+                reply,
+            }))
             .await
             .map_err(|_| SupervisorError::EngineStopped)?;
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
@@ -430,19 +478,21 @@ enum ManualKind {
 /// [`Actor::claim_manual`], to decide which of two racing commands owns a
 /// sheep's next exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommandOrigin {
-    /// Someone asked for it: a `Stop`, `Restart` or `Delete` off the control
-    /// socket, or the daemon-wide `Shutdown`. Somebody is waiting on the
-    /// reply.
-    ///
-    /// A cron- or watch-triggered restart arrives through the very same
-    /// `Command::Restart` an operator's does, so it counts as one here — the
-    /// actor has no way to tell them apart, and both have a caller awaiting an
+pub(crate) enum CommandOrigin {
+    /// A person asked for it: a `Stop`, `Restart` or `Delete` off the control
+    /// socket, or the daemon-wide `Shutdown`. An operator is waiting on the
     /// answer.
     Operator,
-    /// The daemon raised it itself: a memory breach or a liveness failure,
-    /// arriving through [`SupervisorHandle::extra_restart`]. Nobody is waiting
-    /// on the reply.
+    /// The daemon raised it itself: a memory breach or a liveness failure
+    /// (through [`SupervisorHandle::extra_restart`]), or a cron occurrence or
+    /// watched-file change firing its name-group's restart (through
+    /// [`SupervisorHandle::restart_automatic`]).
+    ///
+    /// Having a reply is not what separates these from an operator's command
+    /// — a cron or watch worker does read the `Result`, to log a failed spawn
+    /// and to notice the engine going away. What separates them is that
+    /// nobody is owed the answer, so an operator's `stop` may take the sheep
+    /// off one mid-ladder rather than be converted into it.
     Automatic,
 }
 
@@ -626,14 +676,18 @@ impl<R: ProcessRunner> Actor<R> {
             // begun, for the same reason as Start — its forced respawn
             // (handle_exited's manual-Restart branch, or apply_immediate's)
             // would spawn a child outside the shutdown aggregation.
-            Command::Restart { selector, reply } => {
+            Command::Restart {
+                selector,
+                origin,
+                reply,
+            } => {
                 if self.shutting_down {
                     send_reply(ReplyKind::Info(reply), Err(SupervisorError::EngineStopped));
                 } else {
                     self.begin_manual(
                         selector,
                         ManualKind::Restart,
-                        CommandOrigin::Operator,
+                        origin,
                         ReplyKind::Info(reply),
                     );
                 }
@@ -950,12 +1004,13 @@ impl<R: ProcessRunner> Actor<R> {
     ///
     /// With ONE carve-out, and it is not a fairness question: an operator's
     /// command takes the marker off an in-flight AUTOMATIC restart. First
-    /// command wins is fair between two callers who are each owed an answer,
-    /// and a memory breach or a liveness failure is not one — `extra_restart`
-    /// has no reply and nobody behind it, while the operator's `stop` is the
-    /// only party waiting. Without the carve-out that `stop` came back
-    /// `Online`, having been silently converted into the restart it raced,
-    /// which is precisely the lie the rule above exists to prevent.
+    /// command wins is fair between two operators who are each owed an
+    /// answer, and a memory breach, a liveness failure, a cron occurrence or
+    /// a watched file changing is not one — nobody is behind any of them,
+    /// while the operator's `stop` is the only party waiting. Without the
+    /// carve-out that `stop` came back `Online`, having been silently
+    /// converted into the restart it raced, which is precisely the lie the
+    /// rule above exists to prevent.
     ///
     /// Automatic-versus-automatic and operator-versus-operator both keep the
     /// plain first-command-wins dedupe, and an automatic restart never takes
@@ -2537,6 +2592,88 @@ mod tests {
         // Budget reset by the manual action: online, not errored.
         assert_eq!(handle.list().await[0].status, ProcStatus::Online);
         assert_eq!(handle.list().await[0].restarts, 3);
+    }
+
+    // The budget reset belongs to `ManualKind::Restart` and to nothing else:
+    // a restart the daemon raised itself — a cron occurrence, a watched file
+    // changing, a memory breach — resets it exactly as an operator's `shep
+    // restart` does. `CommandOrigin` governs only which of two racing
+    // commands owns a sheep's next exit (`claim_manual`), and classifying
+    // cron and watch as automatic must not make the budget depend on it.
+    //
+    // The sibling above makes the same claim through `restart`; the two
+    // differ in one call and in nothing else.
+    //
+    // fails if a budget reset is ever gated on origin — dropping
+    // `handle_exited`'s `slot.entry.budget.reset()` for an automatic restart
+    // leaves the two spent unstable exits on the books, so the very next
+    // crash is the third of three and errors the sheep out instead of
+    // restarting it.
+    #[tokio::test(start_paused = true)]
+    async fn an_automatic_restart_resets_the_budget_like_an_operators_does() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        // Five procs, which is the most this test can demand: two unstable
+        // crashes, the long-lived proc they land on, the respawn the
+        // automatic restart performs (unstable again, to spend the budget the
+        // reset just cleared), and the proc a still-solvent budget restarts
+        // onto. A pool of four would answer that last spawn
+        // `SpawnFailed("script exhausted")` and land the sheep in `Errored` —
+        // the very state a lost budget reset produces — so the assertion
+        // below would fail identically whether the reset worked or not.
+        let runner = ScriptedRunner::new(vec![
+            ProcScript::const_exit(1),
+            ProcScript::const_exit(1),
+            ProcScript::never_exits(),
+            ProcScript::const_exit(1),
+            ProcScript::never_exits(),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("svc", "./svc");
+        // Three rather than the default sixteen, so the two crashes below
+        // leave the budget one short of exhausted and a single further crash
+        // decides the test.
+        app.max_restarts = 3;
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        // Sync on state, not on the repeated Online event: immediate restarts
+        // mean restarts==2 once the never_exits proc is up.
+        loop {
+            let info = handle.list().await.remove(0);
+            if info.restarts == 2 && info.status == ProcStatus::Online {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        handle
+            .restart_automatic(ProcessSelector::Name("svc".to_string()))
+            .await
+            .unwrap();
+
+        // The proc that restart landed on is itself unstable. With the budget
+        // reset its exit is the FIRST of three again and the sheep restarts
+        // once more; without it, the third, and the sheep errors out.
+        // Bounded, unlike the sync loop above: the failing outcome here is a
+        // settled `Errored`, so an unbounded wait for the passing one would
+        // hang the test rather than fail it (rule 11). Every step in between
+        // is ready work — the restarts at this config are immediate — so the
+        // round trips below cannot be starved by the paused clock.
+        let mut settled = handle.list().await.remove(0);
+        for _ in 0..200 {
+            if settled.status == ProcStatus::Errored
+                || (settled.status == ProcStatus::Online && settled.restarts == 4)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+            settled = handle.list().await.remove(0);
+        }
+        assert_eq!(
+            (settled.status, settled.restarts),
+            (ProcStatus::Online, 4),
+            "an automatic restart left the two spent unstable exits on the \
+             books -- got {settled:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
