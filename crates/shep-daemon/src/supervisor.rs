@@ -121,7 +121,7 @@ pub(crate) enum Command {
     },
 }
 
-/// The actor's mailbox message: public [`Command`]s plus events the actor
+/// The actor's mailbox message: [`Command`]s plus events the actor
 /// generates for itself (sheep-task exits, restart timers, drained
 /// readiness signals).
 #[derive(Debug)]
@@ -1472,6 +1472,13 @@ impl<R: ProcessRunner> Actor<R> {
     /// 5. `handle_exited`'s `Decision::Errored`.
     /// 6. `handle_exited`'s `Decision::CleanStop` that deregisters.
     /// 7. `handle_exited`'s plain `Decision::CleanStop`.
+    ///
+    /// One further terminal transition reaches `Errored` and correctly does
+    /// NOT disarm: `spawn_fresh`'s `Err` arm. A spawn that never came up was
+    /// never armed — its id is fresh from `next_id` and has joined no name
+    /// group. It is named here so that an auditor who greps
+    /// `ProcStatus::Errored` finds that site already accounted for rather
+    /// than re-deriving why it is exempt.
     ///
     /// Nothing else disarms, and nothing needs to: a sheep on its way to
     /// `WaitingRestart` deliberately keeps its arming (its liveness loop is

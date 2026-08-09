@@ -315,6 +315,16 @@ impl ExtrasRegistry {
         if group.cron.as_ref().is_none_or(JoinHandle::is_finished) {
             group.cron = arm_cron(config, extras, supervisor);
         }
+        // An app whose watch can NEVER arm — a mistyped `ignore_watch` glob, a
+        // cwd that will never resolve — pays a fresh `canonicalize`, a fresh
+        // globset compile and a fresh `warn!` on every re-arm, where it used
+        // to be attempted once and then left alone. That is
+        // the price of retrying the transient failures (`max_user_watches`
+        // exhausted, a cwd not yet created) that the rebuild exists for, and
+        // it is bounded by `max_restarts`; permanent failure gets no dedupe on
+        // purpose, because telling the two apart means keeping per-name
+        // failure state that would then need its own invalidation. Deliberate,
+        // not an oversight.
         if group.watch.as_ref().is_none_or(JoinHandle::is_finished) {
             group.watch = arm_watch(config, supervisor);
         }

@@ -526,9 +526,9 @@ pub async fn boot<R: ProcessRunner>(
     //    is already an owned File adopted by the caller — see this fn's
     //    own doc and `BootOptions::ready_fd`'s doc — so this is nothing
     //    more than a write. TAKEN out of `options` rather than moved out of
-    //    it: a partial move would leave the struct unborrowable, and the
-    //    steps below hand it whole to `max_cron_sleep` precisely so no call
-    //    site here decides which field that default applies to.
+    //    it: a partial move leaves the struct unborrowable, and step 4 hands
+    //    it whole to `max_cron_sleep` — see that fn's own doc for why the
+    //    field is not picked out here.
     if let Some(pipe) = options.ready_fd.take() {
         let ready = DaemonReady {
             pid,
