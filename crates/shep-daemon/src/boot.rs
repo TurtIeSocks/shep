@@ -39,6 +39,7 @@
 //! `# Safety` section and rationale essay for the full contract.)
 
 use core::fmt;
+use core::time::Duration;
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -48,21 +49,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::BusEvent;
 
 use crate::bus::new_bus;
+use crate::cron::DEFAULT_MAX_CRON_SLEEP;
+use crate::extras::{Extras, ExtrasReports, spawn_extras_reporter};
 use crate::rpc::RpcContext;
 use crate::runner::ProcessRunner;
 use crate::server::RpcServer;
 use crate::snapshot::{self, FlockRegistry, SnapshotError, SnapshotWriter, spawn_snapshot_writer};
-use crate::supervisor::{SupervisorHandle, spawn_supervisor};
+use crate::supervisor::{SupervisorBuilder, SupervisorHandle};
 
 /// Mode for every directory shep creates (spec §10: no other user, at all)
 pub const DIR_MODE: u32 = 0o700;
+
+/// Capacity of each of the two lifecycle-extra report channels.
+///
+/// Bounded rather than unbounded on purpose: a report producer that outruns
+/// the reporting task should back-pressure (the enforcer's own send is
+/// awaited) rather than grow a queue of restarts nobody has performed yet.
+/// Generous enough that a whole flock breaching on one sampling pass fits.
+const EXTRAS_REPORT_CAPACITY: usize = 64;
 
 /// Creates `dir` (and any missing parents) at [`DIR_MODE`] directly, via
 /// [`DirBuilderExt::mode`] rather than the std default (`0o777`, narrowed
@@ -445,6 +456,12 @@ pub struct BootOptions {
     pub ready_fd: Option<std::fs::File>,
     /// Restore the muster roll if one exists (spec §9's `shep muster`).
     pub restore: bool,
+    /// Longest a cron worker parks before re-reading the wall clock, from
+    /// `[daemon] max_cron_sleep`. Unset means the default (`cron`'s
+    /// crate-private `DEFAULT_MAX_CRON_SLEEP`, applied by [`boot`] and
+    /// nowhere else) — the same `Option` shape [`Self::socket`] uses, so
+    /// nothing between `shep.toml` and here invents a value.
+    pub max_cron_sleep: Option<Duration>,
 }
 
 /// Brings the daemon up: signal handlers, layout, roll restore, bus,
@@ -519,7 +536,24 @@ pub async fn boot<R: ProcessRunner>(
 
     // 4. Bus, supervisor, muster restore, snapshot writer, context.
     let events = new_bus();
-    let supervisor = spawn_supervisor(runner, paths.clone(), events.clone());
+    let (breach_tx, breach_rx) = mpsc::channel(EXTRAS_REPORT_CAPACITY);
+    let (live_tx, live_rx) = mpsc::channel(EXTRAS_REPORT_CAPACITY);
+    let extras = Extras::real(
+        ExtrasReports {
+            breaches: breach_tx,
+            liveness: live_tx,
+        },
+        // The one place `DEFAULT_MAX_CRON_SLEEP` is applied — see its own doc
+        // for why a second application anywhere else is how two supposedly
+        // identical constants drift apart.
+        options.max_cron_sleep.unwrap_or(DEFAULT_MAX_CRON_SLEEP),
+    );
+    let supervisor = SupervisorBuilder::new(runner, paths.clone(), events.clone())
+        .extras(extras)
+        .spawn();
+    // Ordered, not stylistic: the reporter needs the handle the builder
+    // returns, and the actor must never own a receiver a subsystem feeds.
+    spawn_extras_reporter(breach_rx, live_rx, supervisor.clone());
     let registry = FlockRegistry::new();
 
     if options.restore {

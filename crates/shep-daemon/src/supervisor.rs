@@ -42,6 +42,7 @@ use crate::assemble::{assemble, instance_slots};
 use crate::brain::{Decision, decide_on_exit};
 use crate::channel::ChildMessage;
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
+use crate::extras::{Extras, ExtrasRegistry};
 use crate::kill::kill_process;
 use crate::privilege::{self, Credentials};
 use crate::probes::Prober;
@@ -83,6 +84,17 @@ pub enum Command {
         selector: ProcessSelector,
         /// Answers once every matched sheep is back online (or errored).
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
+    },
+    /// Restarts one sheep on behalf of a memory breach or a liveness failure,
+    /// if the process that produced the report is still the one running now.
+    ///
+    /// The only command with no `reply`: dropping a stale report is the
+    /// intended outcome, not an error its reporter could act on.
+    ExtraRestart {
+        /// The sheep's id.
+        id: u32,
+        /// The pid the report was raised against, used as a generation token.
+        pid: u32,
     },
     /// Stops + deregisters every sheep matching `selector`.
     Delete {
@@ -240,6 +252,19 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
     }
 
+    /// Restarts `id` on behalf of a memory breach or a liveness failure, if the
+    /// process that produced the report is still the process running now.
+    ///
+    /// Silently does nothing when the report is stale. There is no reply: a
+    /// dropped report is the intended outcome, not an error the reporter can act
+    /// on.
+    pub async fn extra_restart(&self, id: u32, pid: u32) {
+        let _ = self
+            .tx
+            .send(Msg::Command(Command::ExtraRestart { id, pid }))
+            .await;
+    }
+
     /// Stops + deregisters every sheep matching `selector`.
     ///
     /// # Errors
@@ -299,9 +324,65 @@ impl SupervisorHandle {
     }
 }
 
-/// Spawns the actor; `events` receives [`BusEvent::Process`] (+
-/// `LogOut`/`LogErr` forwarded from each sheep's `ProcIo::logs`) — Phase 2b
-/// plugs its bus straight in.
+/// Builds a supervisor actor.
+///
+/// Two subsystems beyond this phase's four (dogs, metrics) are already on the
+/// roadmap, so the optional wiring goes on a builder rather than growing
+/// [`spawn_supervisor`] a positional parameter each time.
+#[derive(Debug)]
+pub struct SupervisorBuilder<R: ProcessRunner> {
+    runner: R,
+    paths: ShepPaths,
+    events: broadcast::Sender<BusEvent>,
+    extras: Option<Extras>,
+}
+
+impl<R: ProcessRunner> SupervisorBuilder<R> {
+    /// A builder with no lifecycle extras: the engine spawns, restarts and
+    /// kills, and nothing watches, schedules or probes.
+    ///
+    /// `events` receives [`BusEvent::Process`] (+ `LogOut`/`LogErr` forwarded
+    /// from each sheep's `ProcIo::logs`).
+    pub fn new(runner: R, paths: ShepPaths, events: broadcast::Sender<BusEvent>) -> Self {
+        Self {
+            runner,
+            paths,
+            events,
+            extras: None,
+        }
+    }
+
+    /// Wires in the lifecycle extras.
+    #[must_use]
+    pub fn extras(mut self, extras: Extras) -> Self {
+        self.extras = Some(extras);
+        self
+    }
+
+    /// Spawns the actor.
+    ///
+    /// Must be called from within a Tokio runtime context.
+    pub fn spawn(self) -> SupervisorHandle {
+        let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
+        let actor = Actor {
+            runner: self.runner,
+            paths: self.paths,
+            events: self.events,
+            tx: tx.clone(),
+            sheep: HashMap::new(),
+            next_id: 0,
+            pending: Vec::new(),
+            shutting_down: false,
+            extras: self.extras,
+            registry: ExtrasRegistry::default(),
+        };
+        tokio::spawn(actor.run(rx));
+        SupervisorHandle { tx }
+    }
+}
+
+/// Spawns the actor with no lifecycle extras — shorthand for
+/// `SupervisorBuilder::new(runner, paths, events).spawn()` (IR-28).
 ///
 /// Must be called from within a Tokio runtime context: it spawns the actor
 /// task immediately.
@@ -310,19 +391,7 @@ pub fn spawn_supervisor<R: ProcessRunner>(
     paths: ShepPaths,
     events: broadcast::Sender<BusEvent>,
 ) -> SupervisorHandle {
-    let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
-    let actor = Actor {
-        runner,
-        paths,
-        events,
-        tx: tx.clone(),
-        sheep: HashMap::new(),
-        next_id: 0,
-        pending: Vec::new(),
-        shutting_down: false,
-    };
-    tokio::spawn(actor.run(rx));
-    SupervisorHandle { tx }
+    SupervisorBuilder::new(runner, paths, events).spawn()
 }
 
 // ---------------------------------------------------------------------
@@ -443,6 +512,13 @@ struct Actor<R: ProcessRunner> {
     /// nothing — nothing is allowed to spawn a child the shutdown
     /// aggregation (fixed at the moment it ran) doesn't know to kill.
     shutting_down: bool,
+    /// The lifecycle extras' seams and report wiring, or `None` for an engine
+    /// built without them (`spawn_supervisor`, and every test that exercises
+    /// no schedule, limit, probe or watch).
+    extras: Option<Extras>,
+    /// What is armed right now, per sheep and per name. Stays empty while
+    /// `extras` is `None`: there are no seams to arm anything on.
+    registry: ExtrasRegistry,
 }
 
 impl<R: ProcessRunner> Actor<R> {
@@ -515,6 +591,10 @@ impl<R: ProcessRunner> Actor<R> {
                 } else {
                     self.begin_manual(selector, ManualKind::Restart, ReplyKind::Info(reply));
                 }
+                false
+            }
+            Command::ExtraRestart { id, pid } => {
+                self.handle_extra_restart(id, pid);
                 false
             }
             Command::Delete { selector, reply } => {
@@ -632,7 +712,7 @@ impl<R: ProcessRunner> Actor<R> {
                         true,
                         source,
                         app.config().listen_timeout.as_duration(),
-                        readiness_prober(&spec),
+                        spec_prober(&spec),
                         self.tx.clone(),
                     ))
                 } else {
@@ -656,7 +736,7 @@ impl<R: ProcessRunner> Actor<R> {
                 // first word on this sheep, so a subscriber is never left
                 // silent for the whole readiness window.
                 if !gated {
-                    self.emit(ProcessEventKind::Online, info.clone(), true);
+                    self.went_online(id, info.clone(), true);
                 }
                 Ok(info)
             }
@@ -735,7 +815,7 @@ impl<R: ProcessRunner> Actor<R> {
                         manually,
                         source,
                         app.config().listen_timeout.as_duration(),
-                        readiness_prober(&spec),
+                        spec_prober(&spec),
                         self.tx.clone(),
                     ))
                 } else {
@@ -772,7 +852,7 @@ impl<R: ProcessRunner> Actor<R> {
                 // for a gated app `Online` fires later, from
                 // `handle_ready_result`, not here.
                 if !gated {
-                    self.emit(ProcessEventKind::Online, info.clone(), manually);
+                    self.went_online(id, info.clone(), manually);
                 }
                 info
             }
@@ -893,6 +973,16 @@ impl<R: ProcessRunner> Actor<R> {
 
     /// Applies a manual command synchronously to a matched sheep that has no
     /// live task right now (already `Stopped`/`Errored`/`WaitingRestart`).
+    ///
+    /// Two of these three arms are terminal transitions, and both disarm.
+    /// `handle_exited`'s branches cannot cover them: a sheep waiting out its
+    /// restart backoff still holds every extra its last `Online` armed (that
+    /// is deliberate — the respawn re-arms them, and the pid guard drops
+    /// anything reported in between), and its exit already happened, so
+    /// stopping or deleting it HERE is the moment it goes terminal. Without
+    /// this, `shep stop web` issued during a backoff leaves the group's
+    /// watcher and cron worker armed, and the next file save or occurrence
+    /// brings back a sheep the user stopped.
     fn apply_immediate(&mut self, id: u32, kind: ManualKind) -> Option<ProcessInfo> {
         match kind {
             ManualKind::Stop => {
@@ -912,6 +1002,7 @@ impl<R: ProcessRunner> Actor<R> {
                         slot.entry.status = ProcStatus::Stopped;
                         let info = to_info(&slot.entry);
                         self.emit(ProcessEventKind::Stop, info.clone(), true);
+                        self.disarm_extras(id, &info.name);
                         Some(info)
                     }
                     _ => Some(to_info(&slot.entry)),
@@ -921,6 +1012,7 @@ impl<R: ProcessRunner> Actor<R> {
                 let slot = self.sheep.remove(&id)?;
                 let info = to_info(&slot.entry);
                 self.emit(ProcessEventKind::Delete, info.clone(), true);
+                self.disarm_extras(id, &info.name);
                 Some(info)
             }
             ManualKind::Restart => {
@@ -1085,6 +1177,7 @@ impl<R: ProcessRunner> Actor<R> {
             Decision::Errored => {
                 let info = self.set_status(id, ProcStatus::Errored);
                 self.emit(ProcessEventKind::Errored, info.clone(), manual.is_some());
+                self.disarm_extras(id, &info.name);
                 info
             }
             Decision::CleanStop if manual == Some(ManualKind::Delete) || pending_delete => {
@@ -1092,10 +1185,12 @@ impl<R: ProcessRunner> Actor<R> {
                 removed.entry.status = ProcStatus::Stopped;
                 let info = to_info(&removed.entry);
                 self.emit(ProcessEventKind::Delete, info.clone(), true);
+                self.disarm_extras(id, &info.name);
                 info
             }
             Decision::CleanStop => {
                 let info = self.set_status(id, ProcStatus::Stopped);
+                self.disarm_extras(id, &info.name);
                 self.emit(
                     ProcessEventKind::Stop,
                     info.clone(),
@@ -1106,6 +1201,67 @@ impl<R: ProcessRunner> Actor<R> {
         };
 
         self.resolve_pending(id, info)
+    }
+
+    /// A memory breach or a liveness failure asked for a restart. Guarded the
+    /// same way `RestartDue` is, on the **pid** rather than the epoch — the
+    /// epoch lives on the private [`SheepSlot`], while the pid is already on
+    /// both reports and is just as good a generation token (`None` while not
+    /// running, different after every respawn):
+    ///
+    /// 1. NOT shutting down — a graceful shutdown forbids any new spawn.
+    /// 2. The slot still existing (a `Delete` may have removed it).
+    /// 3. The pid still being the one the report was raised against — a
+    ///    breach for the process a crash-and-restart already replaced would
+    ///    otherwise restart its healthy successor and reset its budget.
+    /// 4. The entry still being `Online`. The extras stay armed for the whole
+    ///    kill ladder (there is no `Stopping` transition to disarm at), so a
+    ///    report raised *during* a `shep stop` can arrive seconds after the
+    ///    sheep is `Stopped` — and `ProcessSelector::Id` matches regardless of
+    ///    status, so without this the daemon would resurrect a process the
+    ///    user explicitly stopped and report success.
+    ///
+    /// Delegates to `begin_manual` rather than `respawn`: that keeps the kill
+    /// ladder, the first-command-wins dedupe, the `pending_delete` interaction
+    /// and the budget reset intact. A breaching sheep is normally `Online`
+    /// with a live pid, so respawning it directly would put two live pids on
+    /// one instance.
+    fn handle_extra_restart(&mut self, id: u32, pid: u32) {
+        if self.shutting_down {
+            tracing::debug!(id, pid, "extra restart dropped: engine is shutting down");
+            return;
+        }
+        let Some(slot) = self.sheep.get(&id) else {
+            tracing::debug!(id, pid, "extra restart dropped: no such sheep");
+            return;
+        };
+        if slot.entry.pid != Some(pid) {
+            tracing::debug!(
+                id,
+                pid,
+                current = slot.entry.pid,
+                "extra restart dropped: the reported pid is no longer this sheep's"
+            );
+            return;
+        }
+        if slot.entry.status != ProcStatus::Online {
+            tracing::debug!(
+                id,
+                pid,
+                status = %slot.entry.status,
+                "extra restart dropped: the sheep is no longer online"
+            );
+            return;
+        }
+        // A throwaway reply: `send_reply` already ignores a closed receiver,
+        // and there is nobody to answer — the reporter is fire-and-forget by
+        // contract.
+        let (reply, _dropped) = oneshot::channel();
+        self.begin_manual(
+            ProcessSelector::Id(id),
+            ManualKind::Restart,
+            ReplyKind::Info(reply),
+        );
     }
 
     /// A scheduled restart's backoff elapsed. Guarded on:
@@ -1191,7 +1347,7 @@ impl<R: ProcessRunner> Actor<R> {
         // app changes only WHEN its `Online` fires, never what the event
         // says about who caused it: the same `shep start` reports the same
         // flag whether or not the app configures readiness.
-        self.emit(ProcessEventKind::Online, info, manually);
+        self.went_online(id, info, manually);
     }
 
     /// Spawns the backoff timer for a scheduled restart; `None` still hops
@@ -1229,6 +1385,60 @@ impl<R: ProcessRunner> Actor<R> {
             }
         }
         shutdown_completed
+    }
+
+    /// One sheep's transition to `Online`: emits the event, then arms every
+    /// lifecycle extra its configuration asks for.
+    ///
+    /// The single arming site, reached by all three transitions — the two
+    /// ungated spawn paths and, for a gated app, `handle_ready_result`.
+    /// Arming has to happen AT the transition rather than at the spawn: a
+    /// liveness probe armed against an app that has not finished starting
+    /// fails its threshold and restarts the app before it ever comes up.
+    fn went_online(&mut self, id: u32, info: ProcessInfo, manually: bool) {
+        self.emit(ProcessEventKind::Online, info, manually);
+        self.arm_extras(id);
+    }
+
+    /// Arms `id`'s lifecycle extras, re-assembling the spec the running
+    /// process was spawned from.
+    ///
+    /// Re-assembly is what makes one arming site possible: `handle_ready_result`
+    /// holds an id and nothing else, and `assemble` is the same pure function
+    /// both spawn paths already call over the same never-changing `spec`,
+    /// `instance` and `credentials`, so it returns that spawn's own spec
+    /// rather than a second derivation of it.
+    fn arm_extras(&mut self, id: u32) {
+        let Some(extras) = self.extras.as_ref() else {
+            return;
+        };
+        let Some(slot) = self.sheep.get(&id) else {
+            return;
+        };
+        let supervisor = SupervisorHandle {
+            tx: self.tx.clone(),
+        };
+        // `Credentials` is `Copy`, which is why this needs no clone.
+        let spec = assemble(
+            &slot.entry.spec,
+            slot.entry.instance,
+            &self.paths,
+            slot.entry.credentials,
+        );
+        self.registry
+            .arm(&slot.entry, spec_prober(&spec), extras, &supervisor);
+    }
+
+    /// Disarms `id`'s lifecycle extras, and its name-group's cron worker and
+    /// watch when `id` was the last armed instance of `name`.
+    ///
+    /// Called from the three terminal branches — errored, deleted, cleanly
+    /// stopped — and from nowhere else. A sheep on its way to `WaitingRestart`
+    /// deliberately keeps its arming: its liveness loop is replaced by the
+    /// re-arm the respawn performs, and any report it raises in between names
+    /// a pid `handle_extra_restart`'s guard no longer recognises.
+    fn disarm_extras(&mut self, id: u32, name: &str) {
+        self.registry.disarm(id, name);
     }
 
     /// Sets `id`'s status and returns its refreshed snapshot.
@@ -1301,10 +1511,10 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
     }
 }
 
-/// The prober a gated readiness task probes with: a fresh [`OsProber`]
-/// scoped to the ASSEMBLED spec's `cwd`/`env`, so an exec-kind readiness
-/// probe sees the same environment (its `PORT`, most commonly) its sheep
-/// does.
+/// The prober a gated readiness task — or a sheep's liveness loop — probes
+/// with: a fresh [`OsProber`] scoped to the ASSEMBLED spec's `cwd`/`env`, so
+/// an exec-kind probe sees the same environment (its `PORT`, most commonly)
+/// its sheep does.
 ///
 /// Taking the [`SpawnSpec`] rather than the [`ResolvedApp`] it was assembled
 /// from is the whole point, not a refactor. `probe_exec` runs
@@ -1316,7 +1526,7 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
 /// `&ResolvedApp` structurally cannot reach `instance`, so every instance of
 /// a clustered app would probe whatever the unexpanded variable left behind
 /// — the same port, every time.
-fn readiness_prober(spec: &SpawnSpec) -> Arc<dyn Prober> {
+fn spec_prober(spec: &SpawnSpec) -> Arc<dyn Prober> {
     Arc::new(OsProber::new(spec.cwd.clone(), spec.env.clone()))
 }
 

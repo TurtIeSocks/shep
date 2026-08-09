@@ -1,0 +1,1416 @@
+//! Lifecycle extras: what is armed when a sheep goes online, and what stops
+//! when it goes terminal (spec §4, §7).
+//!
+//! Four subsystems run as free tasks beside the supervisor actor — the cron
+//! worker ([`crate::cron`]), the memory-limit enforcer ([`crate::limits`]),
+//! the liveness prober ([`crate::probes`]) and the filesystem watch
+//! ([`crate::watch`]). [`ExtrasRegistry`] is what starts them and what stops
+//! them, keyed the way each subsystem's own reach demands: cron and watch per
+//! **name**, because both restart a whole name-group and would otherwise fire
+//! N times for N instances; the enforcer and the liveness loop per **id**,
+//! because each is armed against one pid.
+//!
+//! Disarming is the whole of what keeps a stopped sheep down. Neither a
+//! triggering file save nor a cron occurrence filters by status, so a sheep
+//! stays down because nothing is left armed for it — never because a trigger
+//! declined to fire. The user-visible rule is one line: stopping a sheep
+//! stops its watch.
+//!
+//! ## Reference
+//!
+//! - [`Extras`], [`ExtrasReports`] — the seams and the report wiring
+//! - [`ExtrasRegistry`] — arming and disarming
+//! - [`spawn_extras_reporter`] — turns a report into a guarded restart
+
+use core::fmt;
+use core::time::Duration;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+use shep_core::config::{AppConfig, CronSchedule, ProbeTarget};
+use shep_core::values::UpDuration;
+
+use crate::cron::{Clock, SystemClock, spawn_cron_worker};
+use crate::entry::ProcessEntry;
+use crate::limits::sample::SysinfoSampler;
+use crate::limits::{LimitBreach, LimitEnforcer, PollingEnforcer};
+use crate::probes::{LivenessFailure, Prober, spawn_liveness_task};
+use crate::supervisor::SupervisorHandle;
+use crate::watch::{DEFAULT_WATCH_DELAY, WatchFilter, spawn_watch_group};
+
+/// Where the lifecycle extras send the two out-of-band failure reports.
+///
+/// The matching receivers belong to the reporting task, never to the actor.
+#[derive(Debug, Clone)]
+pub struct ExtrasReports {
+    /// Memory-limit breaches, from the enforcer.
+    pub breaches: mpsc::Sender<LimitBreach>,
+    /// Sheep whose liveness probe hit `failure_threshold`.
+    pub liveness: mpsc::Sender<LivenessFailure>,
+}
+
+/// The four lifecycle extras, the seams they run on, and where their two
+/// failure reports go.
+///
+/// Constructed once at boot and handed to the supervisor. Every *seam* is a
+/// trait object so the engine's type does not grow a parameter per subsystem;
+/// `reports` is the exception and is wiring rather than a seam.
+pub struct Extras {
+    /// Wall clock the cron workers read.
+    pub clock: Arc<dyn Clock>,
+    /// Memory-limit mechanism.
+    ///
+    /// Shared rather than owned (`Arc`, not `Box`) because
+    /// [`ExtrasRegistry::disarm`] has to reach it too, and its signature
+    /// takes no [`Extras`]: the registry keeps a handle from the arming that
+    /// needs undoing, so arming and disarming an id's memory limit stay in
+    /// the one type that owns every other arm/disarm pair.
+    pub enforcer: Arc<dyn LimitEnforcer>,
+    /// Longest a cron worker parks before re-reading the clock, from
+    /// `[daemon] max_cron_sleep`. Already defaulted: this is a value, not an
+    /// option, because the layer that knew whether the user set anything is
+    /// behind us.
+    pub max_cron_sleep: Duration,
+    /// Cloned once per arming. The enforcer swallowed its own breach sender at
+    /// construction; the liveness loops are free tasks and cannot, so the
+    /// sender has to reach [`ExtrasRegistry::arm`] through here.
+    pub reports: ExtrasReports,
+}
+
+impl Extras {
+    /// The production wiring: system clock and polling enforcer over
+    /// sysinfo.
+    ///
+    /// No prober: one is scoped to a single sheep's assembled environment,
+    /// and boot has no sheep in scope.
+    ///
+    /// Must be called from within a Tokio runtime context: constructing the
+    /// polling enforcer starts its sampling task immediately.
+    #[must_use]
+    pub fn real(reports: ExtrasReports, max_cron_sleep: Duration) -> Self {
+        let enforcer =
+            PollingEnforcer::start(Arc::new(SysinfoSampler::new()), reports.breaches.clone());
+        Self {
+            clock: Arc::new(SystemClock),
+            enforcer: Arc::new(enforcer),
+            max_cron_sleep,
+            reports,
+        }
+    }
+}
+
+impl fmt::Debug for Extras {
+    // Roles, not values, for the seams: neither is Debug, and printing the
+    // report channels would say nothing a reader wants. The sleep bound is
+    // the exception and prints for real — it is a tuning knob the user set,
+    // so a daemon log that dumps this struct should say what it ended up
+    // being.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Extras")
+            .field("clock", &"<dyn Clock>")
+            .field("enforcer", &"<dyn LimitEnforcer>")
+            .field("max_cron_sleep", &self.max_cron_sleep)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Restarts each sheep reported over `breaches` or `liveness`, logging the
+/// observed figure at `warn`.
+///
+/// Ends when both senders have dropped. Owns both receivers: the actor must
+/// never block on anything a subsystem controls.
+///
+/// Restarts go through [`SupervisorHandle::extra_restart`], never the public
+/// `restart`: a report already queued when the user runs `shep stop` is
+/// delivered *after* the sheep is `Stopped`, and `restart` would resurrect a
+/// process the user explicitly stopped.
+///
+/// Must be called from within a Tokio runtime context: it spawns the
+/// reporting task immediately.
+pub fn spawn_extras_reporter(
+    mut breaches: mpsc::Receiver<LimitBreach>,
+    mut liveness: mpsc::Receiver<LivenessFailure>,
+    supervisor: SupervisorHandle,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // Per-channel open flags, and a `select!` branch guard on each: a
+        // closed `mpsc::Receiver` resolves to `None` on every subsequent
+        // poll, so a branch left in consideration after its channel ended
+        // would busy-spin the loop instead of falling out of it. Same shape,
+        // and same reason, as `run_sheep`'s channel guards.
+        let mut breaches_open = true;
+        let mut liveness_open = true;
+        while breaches_open || liveness_open {
+            tokio::select! {
+                maybe_breach = breaches.recv(), if breaches_open => match maybe_breach {
+                    Some(breach) => {
+                        tracing::warn!(
+                            id = breach.id,
+                            pid = breach.root_pid,
+                            observed = %breach.observed,
+                            limit = %breach.limit,
+                            "process tree exceeded its max_memory; restarting"
+                        );
+                        supervisor.extra_restart(breach.id, breach.root_pid).await;
+                    }
+                    None => breaches_open = false,
+                },
+                maybe_failure = liveness.recv(), if liveness_open => match maybe_failure {
+                    Some(failure) => {
+                        tracing::warn!(
+                            id = failure.id,
+                            pid = failure.pid,
+                            "liveness probe hit its failure_threshold; restarting"
+                        );
+                        supervisor.extra_restart(failure.id, failure.pid).await;
+                    }
+                    None => liveness_open = false,
+                },
+            }
+        }
+    })
+}
+
+/// Per-sheep and per-group task handles, armed on `online` and aborted on the
+/// way out.
+#[derive(Debug, Default)]
+pub struct ExtrasRegistry {
+    /// One name-group's per-name tasks. Present only while at least one of
+    /// them is armed, so a flock of apps configuring neither `cron_restart`
+    /// nor `watch` leaves this map empty.
+    groups: HashMap<String, NameExtras>,
+    /// One instance's per-pid extras, keyed by sheep id. Present only while
+    /// at least one of them is armed, for the same reason.
+    instances: HashMap<u32, InstanceExtras>,
+}
+
+/// One name-group's per-name tasks, plus the armed instances keeping them
+/// alive.
+#[derive(Debug)]
+struct NameExtras {
+    /// The group's cron worker, when the app configures `cron_restart`.
+    cron: Option<JoinHandle<()>>,
+    /// The group's filesystem watch, when the app configures `watch`.
+    watch: Option<JoinHandle<()>>,
+    /// Ids of this name's instances that currently have anything armed. The
+    /// last one leaving is what tears the two tasks above down.
+    members: HashSet<u32>,
+}
+
+/// One instance's per-pid extras.
+#[derive(Default)]
+struct InstanceExtras {
+    /// The enforcer this id's memory limit was armed against, so `disarm` can
+    /// undo that arming — see [`Extras::enforcer`] for why the registry holds
+    /// a handle rather than being handed one.
+    limit: Option<Arc<dyn LimitEnforcer>>,
+    /// The liveness loop, when the app configures `liveness_probe`.
+    liveness: Option<JoinHandle<()>>,
+}
+
+impl InstanceExtras {
+    /// Whether nothing at all was armed for this instance.
+    fn is_empty(&self) -> bool {
+        self.limit.is_none() && self.liveness.is_none()
+    }
+}
+
+impl fmt::Debug for InstanceExtras {
+    // `Arc<dyn LimitEnforcer>` is not Debug — and the useful fact about it
+    // here is that an arming exists, not which mechanism performed it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InstanceExtras")
+            .field("limit_armed", &self.limit.is_some())
+            .field("liveness", &self.liveness)
+            .finish()
+    }
+}
+
+impl ExtrasRegistry {
+    /// Arms everything an entry's configuration asks for.
+    ///
+    /// `prober` is scoped to this instance's assembled `SpawnSpec` and is
+    /// read only by the liveness loop; an entry configuring no
+    /// `liveness_probe` never touches it.
+    ///
+    /// Idempotent per id: arming an already-armed id disarms that id's own
+    /// per-pid extras first, which is what a respawn needs — the new process
+    /// has a new pid. The name-group's two tasks are deliberately *not* torn
+    /// down and rebuilt on a re-arm: they are keyed on the name, they outlive
+    /// any one process, and rebuilding the watch on every restart would
+    /// re-register the OS watcher each time — a step that can fail, and whose
+    /// failure would silently cost an app the watch that restarted it.
+    pub fn arm(
+        &mut self,
+        entry: &ProcessEntry,
+        prober: Arc<dyn Prober>,
+        extras: &Extras,
+        supervisor: &SupervisorHandle,
+    ) {
+        let config = entry.spec.config();
+        let id = entry.id;
+
+        self.disarm_instance(id);
+        if let Some(instance) = arm_instance(entry, prober, extras) {
+            self.instances.insert(id, instance);
+        }
+
+        // Per-name, and only for the FIRST instance of a name: a second
+        // instance joins the group rather than arming a second worker, since
+        // both triggers already reach every instance of the name.
+        if let Some(group) = self.groups.get_mut(&config.name) {
+            group.members.insert(id);
+            return;
+        }
+        let cron = arm_cron(config, extras, supervisor);
+        let watch = arm_watch(config, supervisor);
+        if cron.is_some() || watch.is_some() {
+            self.groups.insert(
+                config.name.clone(),
+                NameExtras {
+                    cron,
+                    watch,
+                    members: HashSet::from([id]),
+                },
+            );
+        }
+    }
+
+    /// Aborts everything armed for `id`, and both of the name-group's
+    /// per-name tasks — its watch and its cron worker — when this was the
+    /// last armed instance of the name.
+    ///
+    /// This is what stops a stopped sheep from being restarted by a file save
+    /// or a schedule: neither trigger filters by status, so a sheep stays down
+    /// because nothing is left armed for it, not because something declined
+    /// to restart it.
+    ///
+    /// Aborting the watch-group handle is sufficient to stop the OS watch:
+    /// the debouncer guard rides inside the aborted future, so no second drop
+    /// is needed and none is available.
+    pub fn disarm(&mut self, id: u32, name: &str) {
+        self.disarm_instance(id);
+
+        let Some(group) = self.groups.get_mut(name) else {
+            return;
+        };
+        // Both halves matter. An id that was never a member leaves the group
+        // untouched (disarming an unknown id is a no-op, not a teardown of
+        // somebody else's watcher), and a group with instances left standing
+        // keeps its tasks.
+        if !group.members.remove(&id) || !group.members.is_empty() {
+            return;
+        }
+        let Some(group) = self.groups.remove(name) else {
+            return;
+        };
+        if let Some(cron) = group.cron {
+            cron.abort();
+        }
+        if let Some(watch) = group.watch {
+            watch.abort();
+        }
+    }
+
+    /// Undoes one instance's per-pid arming: the memory limit and the
+    /// liveness loop. A no-op for an id that had neither.
+    fn disarm_instance(&mut self, id: u32) {
+        let Some(instance) = self.instances.remove(&id) else {
+            return;
+        };
+        if let Some(enforcer) = instance.limit {
+            enforcer.disarm(id);
+        }
+        if let Some(liveness) = instance.liveness {
+            liveness.abort();
+        }
+    }
+}
+
+/// Arms the two per-pid extras — memory limit and liveness loop — returning
+/// `None` when the app configures neither (or when the entry has no pid to
+/// arm them against).
+fn arm_instance(
+    entry: &ProcessEntry,
+    prober: Arc<dyn Prober>,
+    extras: &Extras,
+) -> Option<InstanceExtras> {
+    let config = entry.spec.config();
+    let wants_anything = config.max_memory.is_some() || config.liveness_probe.is_some();
+    let Some(pid) = entry.pid else {
+        if wants_anything {
+            // Not reachable from the transition this is called at (a sheep is
+            // Online only with a live pid), and not a panic either: both
+            // extras are armed against a pid, so there is nothing honest to
+            // arm without one.
+            tracing::warn!(
+                id = entry.id,
+                "arming a sheep with no pid; its memory limit and liveness probe stay disarmed"
+            );
+        }
+        return None;
+    };
+
+    let mut instance = InstanceExtras::default();
+    if let Some(limit) = config.max_memory {
+        extras.enforcer.arm(entry.id, pid, limit);
+        instance.limit = Some(Arc::clone(&extras.enforcer));
+    }
+    if let Some(probe) = config.liveness_probe.as_ref() {
+        match ProbeTarget::parse(probe) {
+            Ok(target) => {
+                instance.liveness = Some(spawn_liveness_task(
+                    entry.id,
+                    pid,
+                    probe.clone(),
+                    target,
+                    prober,
+                    extras.reports.liveness.clone(),
+                ));
+            }
+            Err(err) => {
+                // `normalize` already parses both probe targets, so a config
+                // that reached the daemon cannot land here — reported instead
+                // of `expect`-ed so a future path that skips normalization
+                // costs one app its liveness probe rather than the daemon.
+                tracing::warn!(
+                    id = entry.id,
+                    name = config.name.as_str(),
+                    %err,
+                    "liveness_probe target could not be parsed; arming no liveness probe"
+                );
+            }
+        }
+    }
+    (!instance.is_empty()).then_some(instance)
+}
+
+/// Spawns the name-group's cron worker, or `None` when the app configures no
+/// `cron_restart` (or names a pattern that will not parse).
+fn arm_cron(
+    config: &AppConfig,
+    extras: &Extras,
+    supervisor: &SupervisorHandle,
+) -> Option<JoinHandle<()>> {
+    let pattern = config.cron_restart.as_ref()?;
+    let schedule = match CronSchedule::parse(pattern, config.cron_timezone.as_deref()) {
+        Ok(schedule) => schedule,
+        Err(err) => {
+            tracing::warn!(
+                name = config.name.as_str(),
+                pattern = pattern.as_str(),
+                %err,
+                "cron_restart pattern could not be parsed; arming no cron worker"
+            );
+            return None;
+        }
+    };
+    // `max_cron_sleep` rides on `Extras` rather than being read off the app:
+    // it tunes how the shepherd wakes up, not how any one app behaves.
+    Some(spawn_cron_worker(
+        config.name.clone(),
+        schedule,
+        Arc::clone(&extras.clock),
+        supervisor.clone(),
+        extras.max_cron_sleep,
+    ))
+}
+
+/// Spawns the name-group's filesystem watch, or `None` when the app does not
+/// ask to be watched (or when its root or its globs will not resolve).
+///
+/// Every failure here arms no watch and logs at `warn` rather than
+/// propagating: a mistyped glob must not take down the same app's cron
+/// worker, enforcer and probe.
+fn arm_watch(config: &AppConfig, supervisor: &SupervisorHandle) -> Option<JoinHandle<()>> {
+    if !config.watch {
+        return None;
+    }
+    let Some(cwd) = config.cwd.as_deref() else {
+        // `normalize` rejects `watch = true` with no `cwd`, so this is
+        // unreachable for a config that came through it — and the daemon's
+        // own working directory is not an acceptable fallback (a systemd unit
+        // would watch `/`).
+        tracing::warn!(
+            name = config.name.as_str(),
+            "watch is on but the app names no cwd; arming no watch"
+        );
+        return None;
+    };
+    // Canonicalized, not merely absolute: the group loop matches by stripping
+    // this prefix off the absolute paths notify delivers, and on macOS a
+    // directory under `/var/...` arrives from FSEvents as `/private/var/...`.
+    // Without this, every strip fails and the watch fires never.
+    let root = match std::fs::canonicalize(cwd) {
+        Ok(root) => root,
+        Err(err) => {
+            tracing::warn!(
+                name = config.name.as_str(),
+                path = cwd,
+                %err,
+                "watch root could not be resolved; arming no watch"
+            );
+            return None;
+        }
+    };
+    let filter = match WatchFilter::new(&config.watch_options, &config.ignore_watch) {
+        Ok(filter) => filter,
+        Err(err) => {
+            tracing::warn!(
+                name = config.name.as_str(),
+                %err,
+                "watch globs could not be compiled; arming no watch"
+            );
+            return None;
+        }
+    };
+    let delay = config
+        .watch_delay
+        .map(UpDuration::as_duration)
+        .unwrap_or(DEFAULT_WATCH_DELAY);
+    match spawn_watch_group(config.name.clone(), root, filter, delay, supervisor.clone()) {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            tracing::warn!(
+                name = config.name.as_str(),
+                %err,
+                "the OS watch could not be started; arming no watch"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use chrono::{DateTime, Utc};
+    use tokio::sync::broadcast;
+
+    use super::*;
+    use crate::cron::DEFAULT_MAX_CRON_SLEEP;
+    use crate::fake::{ProcScript, ScriptedRunner};
+    use crate::limits::PollingEnforcer;
+    use crate::limits::sample::ProcessRss;
+    use crate::probes::ProbeFailure;
+    use crate::supervisor::spawn_supervisor;
+    use crate::testing::{
+        ArmCall, Harness, RecordingEnforcer, ScriptedProber, ScriptedSampler, TestClock, app_with,
+        armed_entry, harness, harness_with_extras, probe_config, test_paths, touch,
+    };
+    use crate::watch::real_time;
+    use shep_core::config::{ProbeConfig, ProbeKind};
+    use shep_core::protocol::{BusEvent, ProcessEventKind, ProcessInfo};
+    use shep_core::selector::ProcessSelector;
+    use shep_core::status::ProcStatus;
+    use shep_core::values::{MemSize, UpDuration};
+
+    /// Generous bound on how long a test may wait for something on the
+    /// (paused) tokio clock. Costs no real wall-clock time: the paused
+    /// runtime auto-advances to this deadline only if nothing else becomes
+    /// ready first.
+    const EVENT_WAIT: Duration = Duration::from_secs(120);
+
+    /// A window that spans a whole hourly cron occurrence and then some, for
+    /// the negative halves: crossing the occurrence and making the claim are
+    /// the same call, per Global Constraints rule 11. A `try_recv` after an
+    /// `advance` would read empty whether or not the worker was ever aborted.
+    const PAST_THE_NEXT_OCCURRENCE: Duration = Duration::from_secs(3_700);
+
+    /// How long a real-clock test waits for a liveness report that should
+    /// arrive. Generous enough that a loaded runner cannot turn a genuine
+    /// pass into a flake.
+    const LIVENESS_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// The shortest interval `spawn_liveness_task` honours — anything smaller
+    /// is floored there, so a fixture naming a smaller number would be a lie
+    /// about what its test waits for. Declared as a literal rather than
+    /// imported because `probes`' own floor is private to that module.
+    const PROBE_INTERVAL: UpDuration = UpDuration::from_millis(1_000);
+
+    fn dt(s: &str) -> DateTime<Utc> {
+        s.parse().expect("valid RFC3339 timestamp")
+    }
+
+    /// The registry-tier fixture: a paused-clock-driven wall clock, a
+    /// recording enforcer, and both report receivers held by the test rather
+    /// than by a reporter (there is none — a registry test asserts the report
+    /// itself, never a restart it did not trigger).
+    struct Rig {
+        extras: Extras,
+        enforcer: Arc<RecordingEnforcer>,
+        clock: Arc<TestClock>,
+        liveness: mpsc::Receiver<LivenessFailure>,
+        _breaches: mpsc::Receiver<LimitBreach>,
+    }
+
+    fn rig(max_cron_sleep: Duration) -> Rig {
+        let clock = Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z")));
+        let enforcer = Arc::new(RecordingEnforcer::default());
+        let (breach_tx, breaches) = mpsc::channel(8);
+        let (live_tx, liveness) = mpsc::channel(8);
+        Rig {
+            extras: Extras {
+                clock: Arc::clone(&clock) as Arc<dyn Clock>,
+                enforcer: Arc::clone(&enforcer) as Arc<dyn LimitEnforcer>,
+                max_cron_sleep,
+                reports: ExtrasReports {
+                    breaches: breach_tx,
+                    liveness: live_tx,
+                },
+            },
+            enforcer,
+            clock,
+            liveness,
+            _breaches: breaches,
+        }
+    }
+
+    /// One supervisor engine over a scripted runner with plenty of
+    /// `never_exits` procs — enough for the initial starts plus every restart
+    /// a *broken* implementation could produce, so no negative assertion here
+    /// can pass merely because the script ran out (an exhausted script makes
+    /// the supervisor emit `Errored`, not `Restart`).
+    fn spawn_test_fixture() -> (
+        SupervisorHandle,
+        broadcast::Receiver<BusEvent>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, rx) = broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits(); 12]);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        (handle, rx, dir)
+    }
+
+    /// A prober that never fails — the neutral value for a case that arms no
+    /// liveness probe but must still hand `arm` one.
+    fn idle_prober() -> Arc<dyn Prober> {
+        Arc::new(ScriptedProber::new(vec![]))
+    }
+
+    /// Waits up to `window` for a `Restart` naming `name`, panicking if none
+    /// arrives.
+    async fn expect_restart(
+        rx: &mut broadcast::Receiver<BusEvent>,
+        name: &str,
+        window: Duration,
+    ) -> ProcessInfo {
+        let restart = async {
+            loop {
+                match rx.recv().await {
+                    Ok(BusEvent::Process {
+                        event: ProcessEventKind::Restart,
+                        info,
+                        ..
+                    }) if info.name == name => return info,
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("event stream closed before a restart of {name}: {err}"),
+                }
+            }
+        };
+        match tokio::time::timeout(window, restart).await {
+            Ok(info) => info,
+            Err(_) => panic!("timed out waiting for a restart of {name}"),
+        }
+    }
+
+    /// Waits up to `window` for a `Restart` naming `name`, panicking if one
+    /// arrives.
+    ///
+    /// A bounded `timeout` + `recv`, never a bare `try_recv` (Global
+    /// Constraints rule 11): the window is what carries the paused clock past
+    /// the occurrence the abort was supposed to stop, so the same call both
+    /// crosses it and makes the claim.
+    async fn assert_no_restart_within(
+        rx: &mut broadcast::Receiver<BusEvent>,
+        name: &str,
+        window: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + window;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Err(_) => return, // window elapsed with nothing matching — expected
+                Ok(Ok(BusEvent::Process {
+                    event: ProcessEventKind::Restart,
+                    info,
+                    ..
+                })) if info.name == name => {
+                    panic!(
+                        "unexpected restart of {name} observed (restarts={})",
+                        info.restarts
+                    );
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(err)) => {
+                    panic!("event channel closed while checking for no restart of {name}: {err}")
+                }
+            }
+        }
+    }
+
+    async fn expect_liveness(
+        rx: &mut mpsc::Receiver<LivenessFailure>,
+        window: Duration,
+    ) -> LivenessFailure {
+        match tokio::time::timeout(window, rx.recv()).await {
+            Ok(Some(failure)) => failure,
+            Ok(None) => panic!("the liveness channel closed before a failure arrived"),
+            Err(_) => panic!("timed out waiting for a liveness failure"),
+        }
+    }
+
+    /// Waits up to `window` for a liveness failure, panicking if one arrives.
+    /// A bounded `timeout` + `recv` for the same reason as
+    /// [`assert_no_restart_within`].
+    async fn assert_no_liveness_within(rx: &mut mpsc::Receiver<LivenessFailure>, window: Duration) {
+        match tokio::time::timeout(window, rx.recv()).await {
+            Err(_) => {} // window elapsed with nothing arriving — expected
+            Ok(Some(failure)) => panic!("unexpected liveness failure observed: {failure:?}"),
+            Ok(None) => panic!("the liveness channel disconnected while checking for silence"),
+        }
+    }
+
+    /// Crosses one hourly occurrence in steps far finer than either sleep cap
+    /// under discussion, so the worker's own cadence — not the test's —
+    /// decides how often it wakes. A single `advance(3600s)` would resolve
+    /// whatever sleep is pending in one shot regardless.
+    async fn cross_one_hour() {
+        for _ in 0..120 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The registry: what gets armed, and what stops.
+    // ------------------------------------------------------------------
+
+    // `Extras`' Debug is hand-rolled because neither seam is Debug, and it
+    // deliberately prints ROLES for the seams while printing `max_cron_sleep`
+    // for real — that field is a knob the user set, so a daemon log dumping
+    // this struct should say what it ended up being. Pinned as an exact string
+    // (IR-41): fails if a later edit starts printing a channel's innards, or
+    // quietly stops printing the one field that carries a real value.
+    #[tokio::test(start_paused = true)]
+    async fn extras_debug_names_the_seams_by_role_and_the_sleep_bound_by_value() {
+        let rig = rig(Duration::from_secs(300));
+        assert_eq!(
+            format!("{:?}", rig.extras),
+            r#"Extras { clock: "<dyn Clock>", enforcer: "<dyn LimitEnforcer>", max_cron_sleep: 300s, .. }"#
+        );
+    }
+
+    // fails if `arm` spawns a watch, a cron worker or a liveness loop for an
+    // app that configured none — the shape that hands every app in the flock
+    // a watcher on its own cwd. The positive cases below are what make this
+    // assertion able to fail: they prove both maps really do fill.
+    #[tokio::test(start_paused = true)]
+    async fn an_app_configuring_no_extras_arms_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+
+        let entry = armed_entry(0, 0, 1000, app_with("web", |_| {}), &paths);
+        registry.arm(&entry, idle_prober(), &rig.extras, &handle);
+
+        assert!(
+            registry.groups.is_empty(),
+            "an app with neither cron_restart nor watch must arm no name-group tasks"
+        );
+        assert!(
+            registry.instances.is_empty(),
+            "an app with neither max_memory nor liveness_probe must arm no per-instance tasks"
+        );
+        assert!(
+            rig.enforcer.arms().is_empty(),
+            "an app with no max_memory must not reach the enforcer at all"
+        );
+    }
+
+    // fails if a cron worker is armed per instance rather than per name. Two
+    // workers on the same schedule read the wall clock about twice as often
+    // as one, which is the only trace a second worker leaves: the bus cannot
+    // tell them apart, because two `restart(Name)` commands racing the same
+    // sheep are collapsed into one by the actor's own first-command-wins
+    // dedupe. The bound matches `cron`'s own `ten_minute_cap` case, which
+    // pins a single worker on this exact configuration at well under 20.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_instance_of_a_name_arms_no_second_cron_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        let rig = rig(Duration::from_secs(600));
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.cron_restart = Some("0 * * * *".to_string());
+            app.instances = 2;
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+
+        for (id, instance, pid) in [(0, 0, 1000), (1, 1, 1001)] {
+            let entry = armed_entry(id, instance, pid, app.clone(), &paths);
+            registry.arm(&entry, idle_prober(), &rig.extras, &handle);
+            // Lets the worker commit to its first `next` while the clock still
+            // reads close to now — `advance` jumps first and polls after.
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(registry.groups.len(), 1, "one group, not one per instance");
+        assert_eq!(
+            registry.groups["web"].members,
+            HashSet::from([0, 1]),
+            "both instances must be recorded as keeping the group alive"
+        );
+
+        cross_one_hour().await;
+        expect_restart(&mut rx, "web", EVENT_WAIT).await;
+        assert!(
+            rig.clock.reads() < 20,
+            "one cron worker reads the clock ~13 times over this hour; two read ~26 (got {})",
+            rig.clock.reads()
+        );
+    }
+
+    // fails if `arm` hands the enforcer the sheep's id where its pid belongs,
+    // and fails if a re-arm keeps the first arming — the "arms once and never
+    // updates" bug, which leaves a respawned sheep's limit enforced against
+    // the process it replaced.
+    #[tokio::test(start_paused = true)]
+    async fn a_respawn_re_arms_the_enforcer_with_the_new_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let limit = MemSize::from_bytes(500);
+        let app = app_with("web", |app| app.max_memory = Some(limit));
+
+        registry.arm(
+            &armed_entry(4, 0, 1000, app.clone(), &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+        registry.arm(
+            &armed_entry(4, 0, 2000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+
+        assert_eq!(
+            rig.enforcer.arms(),
+            vec![
+                ArmCall {
+                    id: 4,
+                    root_pid: 1000,
+                    limit,
+                },
+                ArmCall {
+                    id: 4,
+                    root_pid: 2000,
+                    limit,
+                },
+            ]
+        );
+        assert_eq!(
+            rig.enforcer.disarms(),
+            vec![4],
+            "a re-arm must undo the previous arming rather than leaking it"
+        );
+    }
+
+    // fails two ways, and needs both halves to be able to fail at all: a
+    // disarm that tears the group down while another instance is still armed
+    // (no restart would arrive after the first disarm), and a disarm that
+    // leaves the worker running after the LAST instance leaves (a restart
+    // would arrive after the second). A bare "nothing after the last disarm"
+    // assertion passes just as happily against a worker that never fired.
+    #[tokio::test(start_paused = true)]
+    async fn only_the_last_instance_leaving_stops_the_name_groups_cron_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.cron_restart = Some("0 * * * *".to_string());
+            app.instances = 2;
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+        for (id, instance, pid) in [(0, 0, 1000), (1, 1, 1001)] {
+            let entry = armed_entry(id, instance, pid, app.clone(), &paths);
+            registry.arm(&entry, idle_prober(), &rig.extras, &handle);
+            tokio::task::yield_now().await;
+        }
+
+        registry.disarm(0, "web");
+        assert_eq!(
+            registry.groups["web"].members,
+            HashSet::from([1]),
+            "a non-last disarm drops only its own membership"
+        );
+        cross_one_hour().await;
+        // Two instances are online, and `ProcessSelector::Name` reaches both,
+        // so one occurrence produces two `Restart` events. Both are drained
+        // before the claim below: a leftover would be indistinguishable from
+        // a worker that outlived its disarm.
+        expect_restart(&mut rx, "web", EVENT_WAIT).await;
+        expect_restart(&mut rx, "web", EVENT_WAIT).await;
+
+        registry.disarm(1, "web");
+        assert!(
+            !registry.groups.contains_key("web"),
+            "the last instance leaving must take the group with it"
+        );
+        assert_no_restart_within(&mut rx, "web", PAST_THE_NEXT_OCCURRENCE).await;
+    }
+
+    // fails if `disarm` reads "this id was not a member" as "the last member
+    // just left" and tears down a group every one of whose instances is still
+    // armed — and fails if it panics on an id, or a name, it never saw. The
+    // restart at the end is what proves the group really survived, rather
+    // than merely still having a map entry.
+    #[tokio::test(start_paused = true)]
+    async fn disarming_an_id_that_was_never_armed_leaves_the_group_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.cron_restart = Some("0 * * * *".to_string())
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+        registry.arm(
+            &armed_entry(0, 0, 1000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+        tokio::task::yield_now().await;
+
+        registry.disarm(99, "web"); // a name that exists, an id that does not
+        registry.disarm(0, "other"); // an id that exists, a name that does not
+
+        assert_eq!(registry.groups["web"].members, HashSet::from([0]));
+        cross_one_hour().await;
+        expect_restart(&mut rx, "web", EVENT_WAIT).await;
+    }
+
+    // fails if `arm` wires the liveness loop to a throwaway channel of its
+    // own (`let (tx, _rx) = mpsc::channel(1)` — it compiles, probes forever,
+    // and reports into the void) instead of the shared sender on
+    // `Extras::reports`, and fails if it passes the id where the pid belongs.
+    #[tokio::test(start_paused = true)]
+    async fn a_liveness_threshold_reports_this_instances_id_and_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let mut rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.liveness_probe = Some(ProbeConfig {
+                failure_threshold: 2,
+                ..probe_config(ProbeKind::Tcp, "localhost:5432")
+            });
+        });
+        let interval = app
+            .config()
+            .liveness_probe
+            .as_ref()
+            .expect("the fixture just set one")
+            .interval
+            .as_duration();
+
+        registry.arm(
+            &armed_entry(7, 0, 1234, app, &paths),
+            Arc::new(ScriptedProber::new(vec![Err(ProbeFailure::Timeout)])),
+            &rig.extras,
+            &handle,
+        );
+
+        let failure = expect_liveness(&mut rig.liveness, EVENT_WAIT).await;
+        assert_eq!(failure, LivenessFailure { id: 7, pid: 1234 });
+        // The scripted prober repeats its last outcome forever, so a loop
+        // that kept probing after reporting would report again inside this
+        // window.
+        assert_no_liveness_within(&mut rig.liveness, interval * 3).await;
+    }
+
+    // fails if a watched app is never armed at all; if the root is not
+    // canonicalized (on macOS a tempdir under `/var/...` is delivered as
+    // `/private/var/...`, every `strip_prefix` fails, and the watch fires
+    // never); or if the last instance leaving does not abort the group —
+    // which is the whole of "stopping a sheep stops its watch".
+    //
+    // Real time and a real filesystem: notify's backend is the OS, and a
+    // paused clock does not move it.
+    #[tokio::test]
+    async fn a_watched_app_restarts_on_a_save_and_goes_quiet_once_disarmed() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = test_paths(&home);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+            // The one owner of this subsystem's real-time constants
+            // (`watch::real_time`), converted rather than re-declared.
+            app.watch_delay = Some(UpDuration::from_millis(
+                real_time::TEST_DELAY.as_millis() as u64
+            ));
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+        registry.arm(
+            &armed_entry(0, 0, 1000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+
+        touch(root.path(), "trigger.txt").unwrap();
+        let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
+        assert_eq!(info.restarts, 1);
+
+        registry.disarm(0, "web");
+        touch(root.path(), "after-disarm.txt").unwrap();
+        assert_no_restart_within(&mut rx, "web", real_time::NO_EVENT_WINDOW).await;
+    }
+
+    // ------------------------------------------------------------------
+    // The reporter: a report becomes a guarded restart, or nothing.
+    // ------------------------------------------------------------------
+
+    // fails if the reporter drops every report, or restarts something other
+    // than the id the breach names
+    #[tokio::test(start_paused = true)]
+    async fn a_breach_naming_the_running_pid_restarts_that_sheep() {
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        handle.start(vec![app_with("web", |_| {})]).await.unwrap();
+        let pid = handle.list().await[0].pid.expect("a live sheep has a pid");
+        let (breach_tx, breach_rx) = mpsc::channel(4);
+        let (_live_tx, live_rx) = mpsc::channel(4);
+        let _reporter = spawn_extras_reporter(breach_rx, live_rx, handle.clone());
+
+        breach_tx
+            .send(LimitBreach {
+                id: 0,
+                root_pid: pid,
+                observed: MemSize::from_bytes(900),
+                limit: MemSize::from_bytes(500),
+            })
+            .await
+            .unwrap();
+
+        let info = expect_restart(&mut rx, "web", EVENT_WAIT).await;
+        assert_eq!(info.id, 0);
+        assert_eq!(info.restarts, 1);
+    }
+
+    // fails against a reporter that calls the public `restart`:
+    // `ProcessSelector::Id` matches regardless of status, so `restart` on a
+    // stopped sheep falls to `apply_immediate` and respawns it
+    // unconditionally — resurrecting a process the user explicitly stopped,
+    // and reporting success. The runner is scripted with spare procs on
+    // purpose: that resurrection needs something to spawn from, and a fixture
+    // sized to the happy path would let this test pass against the broken
+    // implementation for the wrong reason (an exhausted script makes the
+    // supervisor emit `Errored`, which no assertion here is watching for).
+    #[tokio::test(start_paused = true)]
+    async fn a_breach_for_a_stopped_sheep_restarts_nothing() {
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        handle.start(vec![app_with("web", |_| {})]).await.unwrap();
+        let pid = handle.list().await[0].pid.expect("a live sheep has a pid");
+        let (breach_tx, breach_rx) = mpsc::channel(4);
+        let (_live_tx, live_rx) = mpsc::channel(4);
+        let _reporter = spawn_extras_reporter(breach_rx, live_rx, handle.clone());
+
+        handle
+            .stop(ProcessSelector::Id(0))
+            .await
+            .expect("the sheep stops");
+        breach_tx
+            .send(LimitBreach {
+                id: 0,
+                root_pid: pid,
+                observed: MemSize::from_bytes(900),
+                limit: MemSize::from_bytes(500),
+            })
+            .await
+            .unwrap();
+
+        assert_no_restart_within(&mut rx, "web", Duration::from_secs(30)).await;
+        let listing = handle.list().await;
+        assert_eq!(listing[0].status, ProcStatus::Stopped);
+        assert_eq!(listing[0].restarts, 0);
+    }
+
+    // fails against a guard that checks status but not pid: a breach raised
+    // for the process a restart already replaced would restart its healthy
+    // successor and reset that successor's budget. The control half at the
+    // end — the SAME reporter, fed the CURRENT pid, really does restart — is
+    // what proves the negative half could have failed.
+    #[tokio::test(start_paused = true)]
+    async fn a_breach_carrying_the_previous_pid_restarts_nothing() {
+        let (handle, mut rx, _fixture) = spawn_test_fixture();
+        handle.start(vec![app_with("web", |_| {})]).await.unwrap();
+        let stale_pid = handle.list().await[0].pid.expect("a live sheep has a pid");
+        let (breach_tx, breach_rx) = mpsc::channel(4);
+        let (_live_tx, live_rx) = mpsc::channel(4);
+        let _reporter = spawn_extras_reporter(breach_rx, live_rx, handle.clone());
+
+        handle
+            .restart(ProcessSelector::Id(0))
+            .await
+            .expect("the sheep restarts");
+        expect_restart(&mut rx, "web", EVENT_WAIT).await;
+        let live_pid = handle.list().await[0].pid.expect("a live sheep has a pid");
+        assert_ne!(stale_pid, live_pid, "the respawn must have a new pid");
+
+        let breach = |root_pid| LimitBreach {
+            id: 0,
+            root_pid,
+            observed: MemSize::from_bytes(900),
+            limit: MemSize::from_bytes(500),
+        };
+        breach_tx.send(breach(stale_pid)).await.unwrap();
+        assert_no_restart_within(&mut rx, "web", Duration::from_secs(30)).await;
+        assert_eq!(
+            handle.list().await[0].restarts,
+            1,
+            "a stale breach must not bump the restart count"
+        );
+
+        breach_tx.send(breach(live_pid)).await.unwrap();
+        let info = expect_restart(&mut rx, "web", EVENT_WAIT).await;
+        assert_eq!(
+            info.restarts, 2,
+            "the same reporter, fed the current pid, must restart"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The actor tier: that the engine really arms and disarms at the
+    // transitions, not just that the registry can.
+    // ------------------------------------------------------------------
+
+    // fails if the actor never disarms on a clean stop: the cron worker keeps
+    // its schedule, `ProcessSelector::Name` matches a stopped sheep too, and
+    // the next occurrence brings back a sheep the user stopped. The cron
+    // restart observed first is what makes the silence afterwards able to
+    // fail.
+    #[tokio::test(start_paused = true)]
+    async fn stopping_the_last_instance_stops_its_cron_worker() {
+        let clock = Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z")));
+        let h = harness_with_extras(vec![ProcScript::never_exits(); 12], |reports| Extras {
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
+            enforcer: Arc::new(RecordingEnforcer::default()),
+            max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+            reports,
+        });
+        let mut rx = h.ctx.events.subscribe();
+        h.ctx
+            .supervisor
+            .start(vec![app_with("web", |app| {
+                app.cron_restart = Some("0 * * * *".to_string());
+            })])
+            .await
+            .unwrap();
+
+        cross_one_hour().await;
+        expect_restart(&mut rx, "web", EVENT_WAIT).await;
+
+        h.ctx
+            .supervisor
+            .stop(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the sheep stops");
+        assert_no_restart_within(&mut rx, "web", PAST_THE_NEXT_OCCURRENCE).await;
+        assert_eq!(h.ctx.supervisor.list().await[0].status, ProcStatus::Stopped);
+    }
+
+    /// A harness whose scripted runner hands out one proc that exits at once
+    /// and then plenty that never do, plus a cron-restarting app that parks in
+    /// a long backoff after any exit.
+    ///
+    /// The two cases below both need a sheep sitting in `WaitingRestart` — the
+    /// one state that reaches a terminal transition through `apply_immediate`
+    /// rather than `handle_exited`, because its process is already gone.
+    fn backoff_harness(clock: &Arc<TestClock>) -> Harness {
+        harness_with_extras(
+            {
+                let mut scripts = vec![ProcScript::never_exits()];
+                scripts.push(ProcScript::const_exit(1));
+                // Spare procs so a BROKEN implementation has something to
+                // respawn from: without them the scripted runner reports
+                // "script exhausted", the supervisor emits `Errored` instead
+                // of `Restart`, and the negative assertions below would pass
+                // against a completely unarmed disarm.
+                scripts.extend([ProcScript::never_exits(); 8]);
+                scripts
+            },
+            |reports| Extras {
+                clock: Arc::clone(clock) as Arc<dyn Clock>,
+                enforcer: Arc::new(RecordingEnforcer::default()),
+                max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+                reports,
+            },
+        )
+    }
+
+    /// The cron-restarting app the two backoff cases start, parked in a
+    /// backoff far longer than either case's own window so its pending
+    /// `RestartDue` can never be what a restart came from.
+    fn backoff_app() -> shep_core::config::ResolvedApp {
+        app_with("web", |app| {
+            app.cron_restart = Some("0 * * * *".to_string());
+            app.restart_delay = Some(UpDuration::from_millis(3 * 60 * 60 * 1_000));
+        })
+    }
+
+    /// Drives the actor until `id` reports `status`, panicking if it never
+    /// does. Each `list()` is a full round trip through the actor's mailbox,
+    /// so this makes progress rather than merely observing it.
+    async fn settle_into(supervisor: &SupervisorHandle, id: u32, status: ProcStatus) {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            let listing = supervisor.list().await;
+            if listing
+                .iter()
+                .any(|info| info.id == id && info.status == status)
+            {
+                return;
+            }
+        }
+        panic!("id {id} never reached {status:?}");
+    }
+
+    // fails if `apply_immediate`'s Stop arm does not disarm. A sheep waiting
+    // out its restart backoff has no live task, so its stop never reaches
+    // `handle_exited`'s terminal branches at all — and `ProcessSelector::Name`
+    // matches a stopped sheep just as happily, so the next occurrence brings
+    // back a sheep the user stopped. The cron restart observed first (the one
+    // that lands the sheep in the backoff) is what makes the silence
+    // afterwards able to fail.
+    #[tokio::test(start_paused = true)]
+    async fn stopping_a_sheep_mid_backoff_still_stops_its_cron_worker() {
+        let clock = Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z")));
+        let h = backoff_harness(&clock);
+        let mut rx = h.ctx.events.subscribe();
+        h.ctx.supervisor.start(vec![backoff_app()]).await.unwrap();
+
+        // The cron occurrence restarts it onto the immediately-exiting proc,
+        // which lands it in its three-hour backoff.
+        cross_one_hour().await;
+        expect_restart(&mut rx, "web", EVENT_WAIT).await;
+        settle_into(&h.ctx.supervisor, 0, ProcStatus::WaitingRestart).await;
+
+        h.ctx
+            .supervisor
+            .stop(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the sheep stops");
+        assert_eq!(h.ctx.supervisor.list().await[0].status, ProcStatus::Stopped);
+        // Spans the next occurrence, and stays well inside the three-hour
+        // backoff, so a restart arriving here could only be the cron worker.
+        assert_no_restart_within(&mut rx, "web", PAST_THE_NEXT_OCCURRENCE).await;
+    }
+
+    // fails if `apply_immediate`'s Delete arm does not disarm: the slot is
+    // deregistered, but the name-group's cron worker keeps firing at a name
+    // that no longer exists — a task that outlives the flock it belonged to.
+    #[tokio::test(start_paused = true)]
+    async fn deleting_a_sheep_mid_backoff_takes_its_cron_worker_with_it() {
+        let clock = Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z")));
+        let h = backoff_harness(&clock);
+        let mut rx = h.ctx.events.subscribe();
+        h.ctx.supervisor.start(vec![backoff_app()]).await.unwrap();
+
+        cross_one_hour().await;
+        expect_restart(&mut rx, "web", EVENT_WAIT).await;
+        settle_into(&h.ctx.supervisor, 0, ProcStatus::WaitingRestart).await;
+
+        h.ctx
+            .supervisor
+            .delete(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the sheep is deleted");
+        assert!(h.ctx.supervisor.list().await.is_empty());
+        // A surviving worker would `restart(Name("web"))`, find nothing, and
+        // log at debug — no bus event. What it CAN still do is re-register
+        // nothing while running forever, so the observable claim is the
+        // clock: a live worker keeps reading it every `max_cron_sleep`.
+        let reads_after_delete = clock.reads();
+        assert_no_restart_within(&mut rx, "web", PAST_THE_NEXT_OCCURRENCE).await;
+        assert_eq!(
+            clock.reads(),
+            reads_after_delete,
+            "a deleted sheep's cron worker must stop reading the clock, not merely stop finding sheep"
+        );
+    }
+
+    // fails if the actor never arms the enforcer at the Online transition, or
+    // arms it with the sheep's id where its pid belongs: the scripted table
+    // holds exactly one process, the pid the scripted runner hands the first
+    // spawn, so an arming against any other number sums to zero and never
+    // breaches however long the test waits.
+    #[tokio::test(start_paused = true)]
+    async fn the_actor_arms_the_memory_limit_against_the_spawned_pid() {
+        let mut h = harness_with_extras(vec![ProcScript::never_exits(); 4], |reports| Extras {
+            clock: Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z"))),
+            enforcer: Arc::new(PollingEnforcer::start(
+                Arc::new(ScriptedSampler::new(vec![vec![ProcessRss {
+                    pid: 1000,
+                    parent: None,
+                    bytes: 900,
+                }]])),
+                reports.breaches.clone(),
+            )),
+            max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+            reports,
+        });
+        h.ctx
+            .supervisor
+            .start(vec![app_with("web", |app| {
+                app.max_memory = Some(MemSize::from_bytes(500));
+            })])
+            .await
+            .unwrap();
+        let pid = h.ctx.supervisor.list().await[0]
+            .pid
+            .expect("a live sheep has a pid");
+
+        let breach = match tokio::time::timeout(EVENT_WAIT, h.breaches.recv()).await {
+            Ok(Some(breach)) => breach,
+            Ok(None) => panic!("the breach channel closed before a breach arrived"),
+            Err(_) => panic!("timed out waiting for a breach"),
+        };
+
+        assert_eq!(breach.id, 0);
+        assert_eq!(
+            breach.root_pid, pid,
+            "the enforcer must be armed against the pid the sheep is actually running as"
+        );
+        assert_eq!(breach.observed.bytes(), 900);
+    }
+
+    // fails if the actor never arms the liveness loop at the Online
+    // transition, or arms it with the wrong id or pid.
+    //
+    // Real time and a real `OsProber`, because that is what the actor builds
+    // — the paused clock does not move a real TCP connect.
+    #[tokio::test]
+    async fn the_actor_arms_the_liveness_loop_against_the_spawned_pid() {
+        // Reserve a port, then release it: nothing ever listens there, so
+        // every probe fails with a connection refusal, with no listener to
+        // race and no port to reserve for real.
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let mut h = harness(vec![ProcScript::never_exits(); 4]);
+        h.ctx
+            .supervisor
+            .start(vec![app_with("web", |app| {
+                app.liveness_probe = Some(ProbeConfig {
+                    failure_threshold: 1,
+                    interval: PROBE_INTERVAL,
+                    timeout: UpDuration::from_millis(500),
+                    ..probe_config(ProbeKind::Tcp, &addr.to_string())
+                });
+            })])
+            .await
+            .unwrap();
+        let pid = h.ctx.supervisor.list().await[0]
+            .pid
+            .expect("a live sheep has a pid");
+
+        let failure = expect_liveness(&mut h.liveness, LIVENESS_DEADLINE).await;
+        assert_eq!(failure, LivenessFailure { id: 0, pid });
+    }
+
+    // fails if the prober handed to a liveness loop is built from the app's
+    // own `config.env` rather than the ASSEMBLED spec's, or built once at
+    // boot and shared: `probe_exec` runs `env_clear().envs(&self.env)`, and
+    // `SHEP_INSTANCE` is written by `assemble` and by nothing else, so under
+    // either bug the variable expands to nothing, `live-` matches no file,
+    // and BOTH instances report. Also fails if the actor assembles with a
+    // hardcoded instance 0, under which neither reports.
+    //
+    // A file, not a port: `test -f` flips fail->pass with no listener, no
+    // reserved port and no race, so the only thing this case can fail on is
+    // the environment the probe ran with. Real time, and `#[cfg(unix)]` on
+    // the test rather than on anything else, so the Windows leg still
+    // compiles and runs every case above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn each_instances_liveness_probe_runs_with_its_own_assembled_env() {
+        let markers = tempfile::tempdir().unwrap();
+        // Instance 0's marker exists; instance 1's never will.
+        std::fs::write(markers.path().join("live-0"), b"").unwrap();
+
+        let mut h = harness(vec![ProcScript::never_exits(); 4]);
+        h.ctx
+            .supervisor
+            .start(vec![app_with("web", |app| {
+                app.instances = 2;
+                app.liveness_probe = Some(ProbeConfig {
+                    failure_threshold: 1,
+                    interval: PROBE_INTERVAL,
+                    timeout: UpDuration::from_millis(5_000),
+                    ..probe_config(
+                        ProbeKind::Exec,
+                        &format!(
+                            r#"test -f "{}/live-$SHEP_INSTANCE""#,
+                            markers.path().display()
+                        ),
+                    )
+                });
+            })])
+            .await
+            .unwrap();
+
+        let listing = h.ctx.supervisor.list().await;
+        // `ProcessInfo` carries no instance number, but the assembler's log
+        // path does — and it is the same `assemble` call the prober's env
+        // came from, so this pins WHICH instance id 1 is rather than assuming
+        // the allocation order.
+        assert!(
+            listing[1]
+                .out_file
+                .as_ref()
+                .is_some_and(|path| path.ends_with("web-1-out.log")),
+            "id 1 must be instance 1: {:?}",
+            listing[1].out_file
+        );
+        let instance_one_pid = listing[1].pid.expect("a live sheep has a pid");
+
+        let failure = expect_liveness(&mut h.liveness, LIVENESS_DEADLINE).await;
+        assert_eq!(
+            failure,
+            LivenessFailure {
+                id: 1,
+                pid: instance_one_pid
+            },
+            "only the instance whose own marker is missing may report"
+        );
+        // Both orderings must fail against the broken implementations above:
+        // under them BOTH instances report and which arrives first is a race,
+        // so the window that catches the other one is not optional. A bounded
+        // `timeout` + `recv` spanning two further probe cycles, per rule 11.
+        assert_no_liveness_within(&mut h.liveness, PROBE_INTERVAL.as_duration() * 3).await;
+    }
+}

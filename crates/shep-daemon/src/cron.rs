@@ -46,11 +46,14 @@ impl Clock for SystemClock {
 /// Re-deriving at least this often bounds that error to one minute at the cost
 /// of one wakeup per minute per cron-configured sheep.
 ///
-/// Not read by any non-test code path yet: choosing between this default and
-/// a configured `max_cron_sleep` is the daemon's boot wiring's job, and this
-/// module only owns the worker and the constant, not the call site that
-/// starts one. `#[allow(dead_code)]` says so explicitly rather than
-/// inventing a call site nothing needs yet.
+/// Applied in exactly one place — `boot`'s `options.max_cron_sleep.unwrap_or`
+/// — and that must stay the only one: a second default (in the CLI's
+/// `boot_options`, or as a serde default back in `shep-core`) is how two
+/// supposedly identical constants drift apart. `shep-core` carries the floor
+/// and never the default; the daemon carries the default and never the floor.
+/// Because `boot` is unix-only, a non-unix build of this crate's library
+/// target still has no reader at all, which is what the `dead_code` allowance
+/// below is for.
 #[allow(dead_code)]
 pub(crate) const DEFAULT_MAX_CRON_SLEEP: Duration = Duration::from_secs(60);
 

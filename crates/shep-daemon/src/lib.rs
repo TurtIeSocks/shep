@@ -39,6 +39,10 @@
 //!   concrete hand-rolled HTTP/TCP/exec implementation
 //! - [`watch`]: the [`WatchSource`](watch::source::WatchSource) OS seam —
 //!   bridges notify's debounced filesystem events onto a tokio channel
+//! - [`extras`]: the [`ExtrasRegistry`](extras::ExtrasRegistry) that arms the
+//!   four subsystems above when a sheep goes online and disarms them when it
+//!   goes terminal, plus the reporting task that turns a memory breach or a
+//!   liveness failure into a guarded restart
 //!
 //! ##### Plane
 //!
@@ -203,6 +207,7 @@ pub mod bus;
 pub mod channel;
 pub mod cron;
 pub mod entry;
+pub mod extras;
 pub mod kill;
 pub mod limits;
 pub mod privilege;

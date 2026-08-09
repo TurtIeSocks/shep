@@ -39,12 +39,8 @@ use crate::watch::source::{WatchError, watch_tree};
 /// target, chmod), short enough that a save-to-restart round trip still
 /// feels immediate.
 ///
-/// Not read by any non-test code path yet: choosing between this default
-/// and a configured `watch_delay` is the extras registry's job — it only
-/// owns the constant, not the call site that picks between it and a
-/// configured value. `#[allow(dead_code)]` says so explicitly rather than
-/// inventing a call site nothing here needs yet.
-#[allow(dead_code)]
+/// Applied in exactly one place — [`crate::extras`]'s watch arming, where an
+/// app's own `watch_delay` is preferred whenever it set one.
 pub(crate) const DEFAULT_WATCH_DELAY: Duration = Duration::from_millis(500);
 
 /// Paths ignored by every watch, before `ignore_watch` is even consulted.
@@ -307,30 +303,29 @@ async fn run_group(
     }
 }
 
-/// The real-time constants shared by both of this subsystem's OS-seam test
-/// suites (IR-33): [`source`]'s smoke tests, and this module's own
-/// real-filesystem case for [`spawn_watch_group`].
+/// The real-time constants shared by every real-filesystem test suite in this
+/// crate (IR-33): [`source`]'s smoke tests, this module's own case for
+/// [`spawn_watch_group`], and the extras registry's arm/disarm case.
 ///
-/// One owner rather than a copy per suite. Both suites drive the same
+/// One owner rather than a copy per suite. Every one of them drives the same
 /// debouncer at the same delay, so a value tuned in one place and not the
-/// other silently weakens whichever copy was left behind — and the
+/// others silently weakens whichever copy was left behind — and the
 /// relationship between `TEST_DELAY` and `NO_EVENT_WINDOW` is load-bearing
 /// (see the assertion beside `dropping_the_source_stops_delivery`).
 #[cfg(test)]
-mod real_time {
+pub(crate) mod real_time {
     use core::time::Duration;
 
-    /// Debounce window for every real-filesystem test in this subsystem:
-    /// tens of milliseconds, so a real save-to-batch round trip finishes
-    /// fast without accidentally coalescing writes a test means to keep
-    /// distinct.
-    pub(super) const TEST_DELAY: Duration = Duration::from_millis(50);
+    /// Debounce window for every real-filesystem test in this crate: tens of
+    /// milliseconds, so a real save-to-batch round trip finishes fast without
+    /// accidentally coalescing writes a test means to keep distinct.
+    pub(crate) const TEST_DELAY: Duration = Duration::from_millis(50);
 
     /// How long a test waits for something that IS expected to arrive — a
     /// delivered batch, or a watch-triggered restart. Generous enough that
     /// a loaded CI runner's real inotify/FSEvents latency cannot turn a
     /// genuine pass into a flaky timeout.
-    pub(super) const SMOKE_DEADLINE: Duration = Duration::from_secs(5);
+    pub(crate) const SMOKE_DEADLINE: Duration = Duration::from_secs(5);
 
     /// How long a test waits for something that must NOT arrive. Short on
     /// purpose: this window is a cost every passing run of such a test pays
@@ -338,7 +333,7 @@ mod real_time {
     /// prove a negative — generous enough that a real event, if whatever
     /// was meant to stop did not, has time to land; short enough not to
     /// make a green suite slow.
-    pub(super) const NO_EVENT_WINDOW: Duration = Duration::from_millis(500);
+    pub(crate) const NO_EVENT_WINDOW: Duration = Duration::from_millis(500);
 }
 
 #[cfg(test)]

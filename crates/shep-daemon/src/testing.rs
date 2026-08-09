@@ -6,24 +6,29 @@ use core::time::Duration;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
-use shep_core::config::{ProbeConfig, ProbeKind, ProbeTarget};
+use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, ProbeTarget, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
-use shep_core::values::UpDuration;
+use shep_core::status::ProcStatus;
+use shep_core::values::{MemSize, UpDuration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::cron::Clock;
+use crate::assemble::assemble;
+use crate::cron::{Clock, DEFAULT_MAX_CRON_SLEEP};
+use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
+use crate::extras::{Extras, ExtrasReports};
 use crate::fake::{ProcScript, ScriptedRunner};
 use crate::limits::sample::{MemorySampler, ProcessRss};
-use crate::probes::{ProbeFailure, Prober};
+use crate::limits::{LimitBreach, LimitEnforcer};
+use crate::probes::{LivenessFailure, ProbeFailure, Prober};
 use crate::rpc::RpcContext;
 use crate::snapshot::FlockRegistry;
-use crate::supervisor::spawn_supervisor;
+use crate::supervisor::SupervisorBuilder;
 
 // `FD_REUSE_LOCK` lived here until 2026-08-08. It serialized the tests
 // that close a real descriptor and then re-probe that same number, to
@@ -86,15 +91,73 @@ pub(crate) struct Harness {
     // every future `events.send()` into a silent no-op.
     _events_rx: broadcast::Receiver<shep_core::protocol::BusEvent>,
     pub(crate) shutdown_rx: watch::Receiver<bool>,
+    /// Breach reports the supervisor's extras produce, for tests that assert
+    /// a memory limit fired.
+    pub(crate) breaches: mpsc::Receiver<LimitBreach>,
+    /// Liveness-failure reports, for tests that assert a probe threshold
+    /// tripped.
+    pub(crate) liveness: mpsc::Receiver<LivenessFailure>,
 }
 
+/// Capacity of the harness's two report channels — a test that needs more
+/// than this many unread reports is asserting on something else.
+const HARNESS_REPORT_CAPACITY: usize = 16;
+
 /// Builds one supervisor engine (a [`ScriptedRunner`] replaying `scripts`)
-/// plus a fresh [`RpcContext`] wired to it.
+/// plus a fresh [`RpcContext`] wired to it, with neutral lifecycle extras: a
+/// harness nobody configured arms nothing and reports nothing.
 pub(crate) fn harness(scripts: Vec<ProcScript>) -> Harness {
+    harness_with_extras(scripts, |reports| Extras {
+        clock: Arc::new(TestClock::starting_at(
+            "2026-01-01T00:00:00Z"
+                .parse()
+                .expect("a valid RFC3339 timestamp"),
+        )),
+        // A machine with no visible processes: nothing an app arms against
+        // can ever be found, so nothing breaches. NOT `ScriptedSampler::new
+        // (vec![])`, which is a fixture bug the constructor asserts on — the
+        // neutral value is one reading holding an empty table.
+        enforcer: Arc::new(crate::limits::PollingEnforcer::start(
+            Arc::new(ScriptedSampler::new(vec![vec![]])),
+            reports.breaches.clone(),
+        )),
+        // A fixture nobody configured behaves like a daemon nobody
+        // configured.
+        max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+        reports,
+    })
+}
+
+/// [`harness`], with the caller deciding the extras.
+///
+/// Takes a builder rather than a finished [`Extras`] — a deliberate departure
+/// from the brief, which declared `harness_with_extras(scripts, extras)`. The
+/// harness has to own both report RECEIVERS (that is the whole reason it can
+/// hold them: no reporter is spawned, so a test asserts the report itself
+/// rather than racing a restart it did not trigger), and a caller-built
+/// `Extras` already carries senders whose receivers the harness could not
+/// recover. Handing the caller the [`ExtrasReports`] the harness just made
+/// keeps one owner for each half — and it is load-bearing rather than
+/// cosmetic, since `PollingEnforcer` swallows its breach sender at
+/// construction, so a harness that overwrote `reports` afterwards would send
+/// breaches into a channel nobody reads.
+pub(crate) fn harness_with_extras(
+    scripts: Vec<ProcScript>,
+    build_extras: impl FnOnce(ExtrasReports) -> Extras,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let paths = test_paths(&dir);
     let (events, events_rx) = broadcast::channel(256);
-    let supervisor = spawn_supervisor(ScriptedRunner::new(scripts), paths.clone(), events.clone());
+    let (breach_tx, breaches) = mpsc::channel(HARNESS_REPORT_CAPACITY);
+    let (live_tx, liveness) = mpsc::channel(HARNESS_REPORT_CAPACITY);
+    let extras = build_extras(ExtrasReports {
+        breaches: breach_tx,
+        liveness: live_tx,
+    });
+    let supervisor =
+        SupervisorBuilder::new(ScriptedRunner::new(scripts), paths.clone(), events.clone())
+            .extras(extras)
+            .spawn();
     let (shutdown, shutdown_rx) = watch::channel(false);
     Harness {
         ctx: RpcContext {
@@ -109,6 +172,112 @@ pub(crate) fn harness(scripts: Vec<ProcScript>) -> Harness {
         _dir: dir,
         _events_rx: events_rx,
         shutdown_rx,
+        breaches,
+        liveness,
+    }
+}
+
+/// `AppConfig::minimal(name, "./srv")` with `mutate` applied, normalized.
+///
+/// The one place a fixture app is built for the lifecycle-extra tests, so a
+/// case that needs `cron_restart` or `watch` says only that (IR-33).
+///
+/// # Panics
+///
+/// Panics if the mutated config does not normalize — a fixture bug at the
+/// call site that wrote it, not a condition under test.
+#[track_caller]
+pub(crate) fn app_with(name: &str, mutate: impl FnOnce(&mut AppConfig)) -> ResolvedApp {
+    let mut app = AppConfig::minimal(name, "./srv");
+    mutate(&mut app);
+    normalize(app).expect("the fixture app must normalize")
+}
+
+/// An `Online` [`ProcessEntry`] shaped like one the actor really registered.
+///
+/// Its two log paths come from [`assemble`] rather than being invented, so a
+/// registry-tier test's entry cannot drift from what a spawn produces.
+pub(crate) fn armed_entry(
+    id: u32,
+    instance: u32,
+    pid: u32,
+    app: ResolvedApp,
+    paths: &ShepPaths,
+) -> ProcessEntry {
+    let spec = assemble(&app, instance, paths, None);
+    ProcessEntry {
+        id,
+        spec: app,
+        instance,
+        status: ProcStatus::Online,
+        pid: Some(pid),
+        restarts: 0,
+        started_at: None,
+        budget: RestartBudget::default(),
+        reload: ReloadState::None,
+        credentials: None,
+        out_file: spec.out_file,
+        err_file: spec.err_file,
+    }
+}
+
+/// One [`LimitEnforcer::arm`] call, exactly as the registry made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArmCall {
+    /// The sheep's id.
+    pub(crate) id: u32,
+    /// The pid the arming was made against.
+    pub(crate) root_pid: u32,
+    /// The ceiling it was armed with.
+    pub(crate) limit: MemSize,
+}
+
+// WHY a recording fake rather than a `PollingEnforcer` over a scripted
+// sampler: the registry tests assert on the ARGUMENTS an arming was made
+// with — the pid above all, since "arms once and never updates" is the bug
+// that shape exists to catch — and a real enforcer only ever reports the
+// consequence of a reading, never what it was armed with.
+#[derive(Debug, Default)]
+pub(crate) struct RecordingEnforcer {
+    arms: Mutex<Vec<ArmCall>>,
+    disarms: Mutex<Vec<u32>>,
+}
+
+impl RecordingEnforcer {
+    /// Every [`LimitEnforcer::arm`] call so far, in order.
+    pub(crate) fn arms(&self) -> Vec<ArmCall> {
+        self.arms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Every id [`LimitEnforcer::disarm`] was called with, in order.
+    pub(crate) fn disarms(&self) -> Vec<u32> {
+        self.disarms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl LimitEnforcer for RecordingEnforcer {
+    fn arm(&self, id: u32, root_pid: u32, limit: MemSize) {
+        self.arms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(ArmCall {
+                id,
+                root_pid,
+                limit,
+            });
+    }
+
+    fn disarm(&self, id: u32) {
+        self.disarms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(id);
     }
 }
 
