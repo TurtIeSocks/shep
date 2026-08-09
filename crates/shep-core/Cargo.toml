@@ -16,6 +16,9 @@ json5.workspace = true
 regex.workspace = true
 tokio-util.workspace = true
 bytes.workspace = true
+croner.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

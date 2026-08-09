@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `CronSchedule`, validating `cron_restart` against croner's dialect and
+  resolving `cron_timezone` against the IANA database, replacing the
+  5-token-count stopgap. Accepts the seven vixie `@nickname` shorthands,
+  expanded to five-field patterns before croner ever sees them: `@yearly`
+  and `@annually` -> `0 0 1 1 *`, `@monthly` -> `0 0 1 * *`, `@weekly` ->
+  `0 0 * * 0`, `@daily` and `@midnight` -> `0 0 * * *`, `@hourly` ->
+  `0 * * * *`.
 - Add wire protocol v1 types — `Request`, `Response`, `Envelope`, `Reply`,
   `RpcError`, `Hello`/`HelloAck`, `BusEvent` — with pinned insta snapshots of
   their serialized form.
@@ -56,6 +63,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changes
 
+- `cron_restart` validation moves in both directions. Tighter: patterns the
+  stopgap accepted purely on token count (e.g. `99 99 99 99 99`) now fail
+  with croner's own reason, and croner's `L`, `W`, `#` and `?` extensions are
+  newly rejected with the offending character named — six-field and
+  seconds-bearing patterns were already rejected by the token count and stay
+  rejected, but the error now says why instead of "not a 5-field pattern",
+  and `@reboot` is rejected with a message about what it means rather than
+  about field counts. Looser: `0 0 * JUL WED` and `0 0 * * MON-FRI` keep
+  working, and the seven vixie nicknames above are now accepted where the
+  token-count stopgap rejected them. `NormalizeError::InvalidCron` becomes a
+  struct variant (`{ pattern, reason }`) instead of a bare tuple, and gains a
+  sibling `InvalidTimezone { name }` for a `cron_timezone` that is not an
+  IANA zone — validated even when `cron_restart` is absent.
 - `encode_frame` now returns `Bytes` instead of `BytesMut`: it takes
   ownership of the serialized `Vec`'s buffer instead of copying it.
 - Swap the YAML backend from `serde_yml` to `serde-saphyr` (pure-Rust
