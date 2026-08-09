@@ -39,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `@annually` -> `0 0 1 1 *`, `@monthly` -> `0 0 1 * *`, `@weekly` ->
   `0 0 * * 0`, `@daily` and `@midnight` -> `0 0 * * *`, `@hourly` ->
   `0 * * * *`.
+- Add the `[daemon] max_cron_sleep` key: the longest a cron worker sleeps
+  before re-deriving its next occurrence, which bounds how far a cron restart
+  can drift after a laptop suspend or an NTP step. Defaults to 60s when unset,
+  and `SHEP_MAX_CRON_SLEEP` overrides the file value. Values below one second
+  are **rejected** rather than clamped — below that the loop stops scheduling
+  and starts spinning, and a clamp would announce itself only in a detached
+  daemon's log file. Mind the duration grammar, which is `UpDuration`'s and
+  counts **milliseconds** when no unit is given: `max_cron_sleep = "60"` is
+  sixty milliseconds and fails the floor, while `"60s"` is the minute most
+  people mean.
 - Add wire protocol v1 types — `Request`, `Response`, `Envelope`, `Reply`,
   `RpcError`, `Hello`/`HelloAck`, `BusEvent` — with pinned insta snapshots of
   their serialized form.
@@ -96,6 +106,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   struct variant (`{ pattern, reason }`) instead of a bare tuple, and gains a
   sibling `InvalidTimezone { name }` for a `cron_timezone` that is not an
   IANA zone — validated even when `cron_restart` is absent.
+- `DaemonConfigError` gains a `BelowMinimum { key, value, min }` variant, for
+  the `max_cron_sleep` floor above. This is filed as a change rather than an
+  addition because the enum carries no `#[non_exhaustive]`: any downstream
+  `match` over it stops compiling until it handles the new variant.
 - `encode_frame` now returns `Bytes` instead of `BytesMut`: it takes
   ownership of the serialized `Vec`'s buffer instead of copying it.
 - Swap the YAML backend from `serde_yml` to `serde-saphyr` (pure-Rust

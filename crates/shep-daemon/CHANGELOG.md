@@ -12,6 +12,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add the cron-restart worker: one worker per name-group, restarting every
+  instance of the name on its `cron_restart` schedule. The dialect is
+  five-field standard cron in the app's `cron_timezone`, and the next
+  occurrence is re-derived from the wall clock on every iteration rather than
+  tracked across one long sleep, so a suspend or an NTP step costs at most one
+  `max_cron_sleep` of drift. **A missed occurrence is not replayed**: a
+  machine that slept through six hourly occurrences restarts once, at the
+  next one, instead of firing six times in a burst on wake.
+- Add the memory-limit enforcer: an app's `max_memory` ceiling is polled every
+  15 seconds against the sheep's whole **process tree** — its own pid plus
+  every lamb — and a breach restarts it. This deviates from pm2, which
+  measures the root pid alone; an app that forks workers may therefore see
+  restarts pm2 never gave it. A breach restart does not count against
+  `max_restarts`, so a leaking app restarts indefinitely rather than reaching
+  `errored`.
+- Add liveness probes: `liveness_probe` polls a sheep over HTTP, TCP or a
+  command on its `interval`, and restarts it once `failure_threshold`
+  *consecutive* probes have failed. The HTTP client is hand-rolled and carries
+  no TLS stack and no redirect following — a `3xx` is a failed probe, and an
+  `https://` target is refused at config time by `shep-core` rather than
+  failing every poll, since a probe that always fails is indistinguishable
+  from an app that is down.
+- Add the filesystem watch: an app with `watch = true` gets one watcher over
+  its `cwd`, debounced by `watch_delay` (default 500ms), and a change under
+  that tree restarts the app. Dot-entries, `node_modules`, and shep's own
+  `logs/` and `pids/` are ignored before an app's `ignore_watch` is consulted,
+  and an app's list extends those defaults rather than replacing them.
+  `watch = true` without a `cwd` is refused at config time — see `shep-core`'s
+  entry for why arming nothing quietly, or defaulting to the daemon's cwd, was
+  worse.
+
+  Two halves of the reach are worth stating together, because either alone
+  misleads. **A triggering change restarts every instance of the name**,
+  stopped instances included. **Stopping a sheep disarms its watch.** For a
+  single-instance app that means total protection: `shep stop web` and no
+  later save brings `web` back. For one instance of a multi-instance app it
+  does not: `shep stop web-1` with `web-2` still running leaves the group's
+  one watcher armed, so the next save restarts the whole name and `web-1`
+  comes back up. Stop the group, or delete the instance.
+- Add the extras registry that arms all four of the above when a sheep goes
+  live and disarms them across every terminal transition, including the
+  `Drop` that aborts every armed task when the supervisor itself goes away —
+  covering both a graceful shutdown that never kills a `WaitingRestart` sheep
+  and a panicking actor.
 - Add the process-lifecycle engine: a `ProcessRunner` spawn seam with a real
   `tokio::process`-backed implementation (own process group, fd-3 shepherd
   channel, log capture) and a deterministic scripted fake for tests.
@@ -85,3 +129,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still resolve first-command-wins, and an automatic restart still never
   displaces either. What a restart *does* is unchanged either way — a cron- or
   watch-triggered one resets the restart budget exactly as `shep restart` does.
+
+### Changes
+
+- An app that configures `wait_ready` or a `readiness_probe` no longer reaches
+  `online` at spawn. It holds at `starting` until the shepherd channel
+  delivers `{"kind":"ready"}` or the first probe passes, whichever its config
+  selects — `wait_ready` wins when both are set, since the channel is the app
+  telling us directly and a probe is an outside guess at the same fact. Apps
+  configuring neither are unaffected and still go `online` at spawn.
+
+  No wire type changed, but the timing is visible to anything watching: a
+  `shep flock` or `shep describe` issued right after `shep start` now reports
+  `starting` for such an app, and the `online` transition arrives on the bus
+  later than it used to. Scripts that started an app and immediately asserted
+  `online` need to poll instead.
+
+  On `listen_timeout` elapsing without a signal, the sheep goes `online`
+  anyway, with a warning. Treating a slow start as a spawn failure would
+  produce exactly the restart loop `max_restarts` exists to contain, out of an
+  app that is slow rather than broken.
