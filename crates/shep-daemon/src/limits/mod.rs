@@ -50,7 +50,7 @@ use shep_core::values::MemSize;
 
 pub mod sample;
 
-use sample::{MemorySampler, tree_rss};
+use sample::{MemorySampler, TreeIndex};
 
 /// How often the polling enforcer samples the process table.
 ///
@@ -137,21 +137,33 @@ impl PollingEnforcer {
             loop {
                 tokio::time::sleep(MEMORY_POLL_INTERVAL).await;
 
-                // One sample pass serves every armed sheep: summing one tree
-                // per armed id out of a single table, rather than refreshing
-                // per sheep, keeps the syscall walk from multiplying by flock
-                // size.
+                // One sample pass serves every armed sheep: the syscall walk
+                // happens once per tick regardless of flock size. The table
+                // it returns still costs an index build to query — two
+                // `HashMap`s over every entry (`TreeIndex::build`) — so that
+                // build is hoisted out here too and done once per tick,
+                // shared by every armed id's walk below. Without this, a
+                // tick's cost is O(flock × table size): each armed id would
+                // pay its own index build over the *entire* host table, not
+                // just its own subtree, on top of the O(flock) walks that
+                // are unavoidable. With it, the tick pays that build once and
+                // each id only pays its own walk.
                 let table = sampler.sample();
+                let index = TreeIndex::build(&table);
 
                 // Computed and self-disarmed in the same locked section:
                 // `retain` sums each armed tree and drops the entries that
                 // just breached in one pass, so the very next tick can never
-                // see — and re-report — the same over-limit reading.
+                // see — and re-report — the same over-limit reading. This
+                // still holds the lock for the sum of every armed id's walk,
+                // not just one — `arm`/`disarm` block for that whole
+                // duration, which is the residual cost this hoist does not
+                // remove.
                 let mut breached = Vec::new();
                 {
                     let mut guard = loop_armed.lock().unwrap_or_else(PoisonError::into_inner);
                     guard.retain(|&id, entry| {
-                        let observed = tree_rss(&table, entry.root_pid);
+                        let observed = index.sum_from(entry.root_pid);
                         let over_limit = observed > entry.limit.bytes();
                         if over_limit {
                             breached.push(LimitBreach {
@@ -165,6 +177,12 @@ impl PollingEnforcer {
                     });
                 }
 
+                // Sent one at a time, awaiting each: a full `breaches`
+                // channel backpressures this loop, so a slow consumer stalls
+                // *every* armed id's next sample pass, not just the one whose
+                // breach is stuck — acceptable for this design (the consumer
+                // is expected to keep up), but worth knowing before it shows
+                // up as "breaches arriving late" in an incident.
                 for breach in breached {
                     if breaches.send(breach).await.is_err() {
                         // No receiver left to hear about a breach — the
@@ -441,5 +459,97 @@ mod tests {
 
         let breach = expect_breach(&mut rx, 6).await;
         assert_eq!(breach.observed.bytes(), 501);
+    }
+
+    // Spec §14.2 fixes this at 15s. `ticks()` above and the `Instant`
+    // assertion in `breach_arrives_on_exactly_the_third_tick` are both
+    // expressed as `MEMORY_POLL_INTERVAL * n`, so neither derives an
+    // expectation independent of the constant under test — a drift in the
+    // constant would drift both of them right along with it. Pin it
+    // literally so a change to the constant has to be a deliberate,
+    // visible diff here.
+    #[test]
+    fn memory_poll_interval_is_fifteen_seconds() {
+        assert_eq!(MEMORY_POLL_INTERVAL, Duration::from_secs(15));
+    }
+
+    // fails if the send loop keeps only the first breach of a tick (e.g.
+    // `breached.into_iter().take(1)`): with two ids each over their own
+    // limit on the same tick, a survivor of that mutation delivers one
+    // breach and then goes quiet for the id it dropped — this test demands
+    // both, rather than settling for "a breach arrived" the way a
+    // single-id test would.
+    #[tokio::test(start_paused = true)]
+    async fn two_ids_breaching_the_same_tick_both_deliver() {
+        let table = vec![rss(1, None, 900), rss(2, None, 900)];
+        let sampler = Arc::new(ScriptedSampler::new(vec![table]));
+        let (tx, mut rx) = mpsc::channel(8);
+        let enforcer = start_and_settle(Arc::clone(&sampler) as Arc<dyn MemorySampler>, tx).await;
+        enforcer.arm(21, 1, MemSize::from_bytes(500));
+        enforcer.arm(22, 2, MemSize::from_bytes(500));
+
+        let first = expect_breach(&mut rx, 21).await;
+        let second = expect_breach(&mut rx, 22).await;
+
+        let mut ids = [first.id, second.id];
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            [21, 22],
+            "both ids over their own limit on the same tick must be delivered, in either order"
+        );
+    }
+
+    // fails if `arm()` used `entry(id).or_insert(..)` instead of
+    // `insert(id, ..)`: re-arming an already-armed id would then keep the
+    // *first* arming's root_pid forever, silently ignoring every respawn's
+    // new pid, which contradicts `arm`'s own doc (replacing on re-arm).
+    #[tokio::test(start_paused = true)]
+    async fn rearming_an_already_armed_id_replaces_its_root_pid() {
+        // pid 10 (the first arming) never appears in the table, so a
+        // survivor of the `or_insert` mutation — which would keep root_pid
+        // at 10 — sums to 0 forever and never breaches. pid 20 (the second
+        // arming) is over the limit from the first tick.
+        let table = vec![rss(20, None, 900)];
+        let sampler = Arc::new(ScriptedSampler::new(vec![table]));
+        let (tx, mut rx) = mpsc::channel(8);
+        let enforcer = start_and_settle(Arc::clone(&sampler) as Arc<dyn MemorySampler>, tx).await;
+        enforcer.arm(30, 10, MemSize::from_bytes(500));
+        enforcer.arm(30, 20, MemSize::from_bytes(500));
+
+        let breach = expect_breach(&mut rx, 30).await;
+
+        assert_eq!(
+            breach.root_pid, 20,
+            "re-arming the same id must replace the previous root_pid, not keep it"
+        );
+    }
+
+    // fails if `Drop` stops aborting the task (e.g. an empty `drop` body):
+    // the loop would keep sampling on its own schedule forever, so
+    // `calls()` would keep climbing after the enforcer handle is gone and
+    // nothing else holds the task alive.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_enforcer_stops_further_sampling() {
+        let sampler = Arc::new(ScriptedSampler::new(vec![vec![rss(1, None, 100)]]));
+        let (tx, _rx) = mpsc::channel(8);
+        let enforcer = start_and_settle(Arc::clone(&sampler) as Arc<dyn MemorySampler>, tx).await;
+        enforcer.arm(40, 1, MemSize::from_bytes(1000)); // never breaches
+
+        tokio::time::sleep(ticks(1)).await;
+        let calls_before_drop = sampler.calls();
+        assert!(
+            calls_before_drop > 0,
+            "expected at least one sample before drop"
+        );
+
+        drop(enforcer);
+
+        tokio::time::sleep(ticks(3)).await;
+        assert_eq!(
+            sampler.calls(),
+            calls_before_drop,
+            "sample() must not be called again once the enforcer is dropped"
+        );
     }
 }

@@ -101,43 +101,85 @@ impl MemorySampler for SysinfoSampler {
     }
 }
 
+/// Shared index over one sampled `table`: a byte total and a child list per
+/// pid, built once and then walked as many times as needed.
+///
+/// [`tree_rss`] builds one of these and walks it exactly once — the right
+/// shape for a one-off sum. Summing *several* roots out of the same table
+/// (the polling enforcer's per-tick loop, one walk per armed id) is the
+/// wrong shape for that: rebuilding the index per id would multiply the
+/// per-tick cost by flock size on top of the syscall walk. Build one
+/// `TreeIndex` per table and call [`TreeIndex::sum_from`] per root instead,
+/// so the index — the expensive part, since it scans the whole table — is
+/// shared across every root's walk.
+#[derive(Debug)]
+pub(crate) struct TreeIndex {
+    bytes_by_pid: HashMap<u32, u64>,
+    children_of: HashMap<u32, Vec<u32>>,
+}
+
+impl TreeIndex {
+    /// Indexes `table`: a byte total and a child list per pid.
+    pub(crate) fn build(table: &[ProcessRss]) -> Self {
+        // Indexed once so `sum_from`'s cycle-safe walk never rescans `table`
+        // per node — the whole-machine table this feeds from can run to
+        // hundreds of entries, and a caller summing multiple roots (the
+        // polling enforcer, one root per armed id) builds this once and
+        // reuses it, rather than paying this scan again per root.
+        let mut bytes_by_pid: HashMap<u32, u64> = HashMap::with_capacity(table.len());
+        let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+        for entry in table {
+            bytes_by_pid.insert(entry.pid, entry.bytes);
+            if let Some(parent) = entry.parent {
+                children_of.entry(parent).or_default().push(entry.pid);
+            }
+        }
+        Self {
+            bytes_by_pid,
+            children_of,
+        }
+    }
+
+    /// Sums resident memory over `root` and every descendant this index
+    /// knows about.
+    ///
+    /// A pid absent from the index contributes nothing; a cycle in the
+    /// parent links (which the kernel does not produce but a fixture can)
+    /// terminates rather than recursing forever.
+    pub(crate) fn sum_from(&self, root: u32) -> u64 {
+        // A pid is summed the first time it is popped, never again — this is
+        // what turns a self-parenting pid or a parent-link cycle (neither of
+        // which the kernel produces, but a fixture can) into a terminating
+        // walk instead of an infinite one, without double-counting anything
+        // on the way.
+        let mut visited = HashSet::new();
+        let mut stack = vec![root];
+        let mut sum = 0u64;
+        while let Some(pid) = stack.pop() {
+            if !visited.insert(pid) {
+                continue;
+            }
+            sum = sum.saturating_add(self.bytes_by_pid.get(&pid).copied().unwrap_or(0));
+            if let Some(children) = self.children_of.get(&pid) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        sum
+    }
+}
+
 /// Sums resident memory over `root` and every descendant in `table`.
 ///
 /// A pid that appears in no reading contributes nothing; a cycle in the parent
 /// links (which the kernel does not produce but a fixture can) terminates
 /// rather than recursing forever.
+///
+/// Builds a fresh `TreeIndex` every call, so it is the right tool for a
+/// one-off sum (this bench, a single test assertion) but the wrong one for
+/// summing several roots out of the same table — see `TreeIndex`'s own doc.
 #[must_use]
 pub fn tree_rss(table: &[ProcessRss], root: u32) -> u64 {
-    // Indexed once so the cycle-safe walk below never rescans `table` per
-    // node — the whole-machine table this feeds from can run to hundreds of
-    // entries, and this sum runs once per armed sheep per poll.
-    let mut bytes_by_pid: HashMap<u32, u64> = HashMap::with_capacity(table.len());
-    let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
-    for entry in table {
-        bytes_by_pid.insert(entry.pid, entry.bytes);
-        if let Some(parent) = entry.parent {
-            children_of.entry(parent).or_default().push(entry.pid);
-        }
-    }
-
-    // A pid is summed the first time it is popped, never again — this is
-    // what turns a self-parenting pid or a parent-link cycle (neither of
-    // which the kernel produces, but a fixture can) into a terminating walk
-    // instead of an infinite one, without double-counting anything on the
-    // way.
-    let mut visited = HashSet::new();
-    let mut stack = vec![root];
-    let mut sum = 0u64;
-    while let Some(pid) = stack.pop() {
-        if !visited.insert(pid) {
-            continue;
-        }
-        sum = sum.saturating_add(bytes_by_pid.get(&pid).copied().unwrap_or(0));
-        if let Some(children) = children_of.get(&pid) {
-            stack.extend(children.iter().copied());
-        }
-    }
-    sum
+    TreeIndex::build(table).sum_from(root)
 }
 
 #[cfg(test)]
