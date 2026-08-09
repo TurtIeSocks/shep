@@ -5,6 +5,7 @@ use core::pin::Pin;
 use core::time::Duration;
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -53,6 +54,25 @@ pub(crate) fn test_paths(dir: &tempfile::TempDir) -> ShepPaths {
         &|key| (key == "SHEP_HOME").then(|| home.display().to_string()),
         std::path::Path::new("/nonexistent"),
     )
+}
+
+/// Creates `root.join(rel)`, making its parent directories first, and writes
+/// one byte so the file actually exists on disk. Returns the absolute path
+/// written.
+///
+/// One-byte writes are deliberate: watch tests care that a create/modify
+/// event fires, never about the file's contents.
+///
+/// # Errors
+///
+/// Whatever `std::fs::create_dir_all` or `std::fs::write` returns.
+pub(crate) fn touch(root: &Path, rel: &str) -> std::io::Result<PathBuf> {
+    let path = root.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, b"x")?;
+    Ok(path)
 }
 
 // IR-33: the dispatch tests and the connection-server's tests need the
