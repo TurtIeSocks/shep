@@ -12,6 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `ProbeTarget`, parsing a probe's `target` once, at config time, into the
+  form its kind promises: `http://host[:port][/path]` for `Http` (port
+  defaults to 80, path to `/`; a bracketed IPv6 host such as `[::1]` is
+  accepted with its brackets stripped), `host:port` for `Tcp`, and any
+  non-empty command line for `Exec`. `https://` targets are rejected with
+  their own error variant — the HTTP prober is a hand-rolled client with no
+  TLS, and a probe that silently failed every poll would look exactly like a
+  down app. `normalize` now validates `readiness_probe` and `liveness_probe`
+  targets (discarding the parsed value; the daemon re-parses when it arms
+  the probe), rejects an explicit `failure_threshold == 0` on either probe,
+  and rejects `watch = true` with no `cwd` — there is no directory to watch,
+  and defaulting to the daemon's own cwd risks recursively watching the
+  whole filesystem under a systemd unit with no `WorkingDirectory=`.
 - Add `CronSchedule`, validating `cron_restart` against croner's dialect and
   resolving `cron_timezone` against the IANA database, replacing the
   5-token-count stopgap. Accepts the seven vixie `@nickname` shorthands,

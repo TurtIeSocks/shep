@@ -7,7 +7,7 @@ use core::fmt;
 
 use std::collections::BTreeSet;
 
-use crate::config::{AppConfig, CronParseError, CronSchedule};
+use crate::config::{AppConfig, CronParseError, CronSchedule, ProbeConfig, ProbeTarget};
 
 /// A validated app config — only obtainable via [`normalize`]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +41,13 @@ impl ResolvedApp {
 ///   croner's dialect (carries the pattern and the rejection reason).
 /// - [`NormalizeError::InvalidTimezone`] — `cron_timezone` is not a name in
 ///   the IANA time-zone database.
+/// - [`NormalizeError::InvalidProbe`] — `readiness_probe` or `liveness_probe`
+///   has a target [`ProbeTarget::parse`] rejects (carries which probe and
+///   the rendered reason).
+/// - [`NormalizeError::ZeroFailureThreshold`] — a probe's `failure_threshold`
+///   is explicitly `0`.
+/// - [`NormalizeError::WatchWithoutCwd`] — `watch` is `true` with no `cwd`
+///   set.
 pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
     if app.name.is_empty() {
         return Err(NormalizeError::MissingName);
@@ -70,7 +77,38 @@ pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
             }
         })?;
     }
+    validate_probe(app.readiness_probe.as_ref(), "readiness_probe")?;
+    validate_probe(app.liveness_probe.as_ref(), "liveness_probe")?;
+    if app.watch && app.cwd.is_none() {
+        // `watch` asked for a feature the daemon has no directory to arm:
+        // there is no cwd in the Flockfile, and defaulting to the daemon's
+        // own cwd risks watching the whole filesystem under a systemd unit
+        // with no `WorkingDirectory=` (Rin, 2026-08-08).
+        return Err(NormalizeError::WatchWithoutCwd { name: app.name });
+    }
     Ok(ResolvedApp { config: app })
+}
+
+/// Validates one probe's target and `failure_threshold`, if the probe is
+/// configured. `probe` is the Flockfile field name (`"readiness_probe"` or
+/// `"liveness_probe"`), carried into any error so the user knows which
+/// field to edit. Its own parsed [`ProbeTarget`] is discarded — this
+/// function's job is rejection; the daemon re-parses when it arms the probe.
+fn validate_probe(probe: Option<&ProbeConfig>, name: &'static str) -> Result<(), NormalizeError> {
+    let Some(probe) = probe else {
+        return Ok(());
+    };
+    ProbeTarget::parse(probe).map_err(|reason| NormalizeError::InvalidProbe {
+        probe: name,
+        reason: reason.to_string(),
+    })?;
+    if probe.failure_threshold == 0 {
+        // Unhealthy before the first probe ever runs — not a configuration
+        // anybody wants, and it would make the liveness loop restart the
+        // sheep immediately and forever.
+        return Err(NormalizeError::ZeroFailureThreshold { probe: name });
+    }
+    Ok(())
 }
 
 /// Validates a whole flock, rejecting duplicate sheep names
@@ -119,6 +157,27 @@ pub enum NormalizeError {
     },
     /// Two apps in one flock share this name
     DuplicateName(String),
+    /// A `readiness_probe` or `liveness_probe` target is malformed. Carries
+    /// which probe and the rendered reason.
+    InvalidProbe {
+        /// `"readiness_probe"` or `"liveness_probe"` — the Flockfile field
+        /// name, so the error names the line the user has to edit.
+        probe: &'static str,
+        /// [`ProbeTarget::parse`]'s rendered rejection reason.
+        reason: String,
+    },
+    /// A `readiness_probe` or `liveness_probe` has `failure_threshold == 0`.
+    ZeroFailureThreshold {
+        /// `"readiness_probe"` or `"liveness_probe"` — the Flockfile field
+        /// name, so the error names the line the user has to edit.
+        probe: &'static str,
+    },
+    /// `watch` is enabled but the app sets no `cwd`, so there is no
+    /// directory to watch. Carries the app name.
+    WatchWithoutCwd {
+        /// The sheep name, so the error names which Flockfile entry to edit.
+        name: String,
+    },
 }
 
 impl fmt::Display for NormalizeError {
@@ -140,6 +199,13 @@ impl fmt::Display for NormalizeError {
                 write!(f, "`{name}` is not a recognized IANA timezone")
             }
             Self::DuplicateName(n) => write!(f, "duplicate sheep name `{n}`"),
+            Self::InvalidProbe { probe, reason } => write!(f, "{probe}: {reason}"),
+            Self::ZeroFailureThreshold { probe } => {
+                write!(f, "{probe}.failure_threshold must be at least 1")
+            }
+            Self::WatchWithoutCwd { name } => {
+                write!(f, "sheep `{name}` has watch = true but no cwd to watch")
+            }
         }
     }
 }
@@ -245,5 +311,110 @@ mod tests {
             normalize_all(apps).unwrap_err(),
             NormalizeError::DuplicateName("web".to_string())
         );
+    }
+
+    fn probe_config(target: &str) -> crate::config::ProbeConfig {
+        crate::config::ProbeConfig {
+            kind: crate::config::ProbeKind::Http,
+            target: target.to_string(),
+            interval: crate::values::UpDuration::from_millis(10_000),
+            timeout: crate::values::UpDuration::from_millis(5_000),
+            failure_threshold: 3,
+        }
+    }
+
+    #[test]
+    fn malformed_readiness_probe_target_rejected_naming_the_field() {
+        // fails if validate_probe is never called for readiness_probe, or if
+        // it drops which of the two probe fields the rejection came from
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.readiness_probe = Some(probe_config("not-a-url"));
+        match normalize(app).unwrap_err() {
+            NormalizeError::InvalidProbe { probe, reason } => {
+                assert_eq!(probe, "readiness_probe");
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected InvalidProbe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_liveness_probe_target_rejected_naming_the_field() {
+        // fails if only readiness_probe is ever validated, leaving a bad
+        // liveness_probe target to surface later at the daemon's first poll
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.liveness_probe = Some(probe_config("not-a-url"));
+        match normalize(app).unwrap_err() {
+            NormalizeError::InvalidProbe { probe, .. } => assert_eq!(probe, "liveness_probe"),
+            other => panic!("expected InvalidProbe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_probe_targets_accepted() {
+        // fails if validate_probe rejects a well-formed target outright
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.readiness_probe = Some(probe_config("http://127.0.0.1:8080/healthz"));
+        assert!(normalize(app).is_ok());
+    }
+
+    #[test]
+    fn zero_failure_threshold_rejected() {
+        // fails if failure_threshold is never inspected — a threshold of 0
+        // means "unhealthy before the first probe ever runs"
+        let mut app = AppConfig::minimal("web", "./srv");
+        let mut probe = probe_config("http://127.0.0.1:8080/healthz");
+        probe.failure_threshold = 0;
+        app.readiness_probe = Some(probe);
+        assert_eq!(
+            normalize(app).unwrap_err(),
+            NormalizeError::ZeroFailureThreshold {
+                probe: "readiness_probe"
+            }
+        );
+    }
+
+    #[test]
+    fn default_failure_threshold_of_three_accepted() {
+        // fails if the check fires on the ordinary default instead of only
+        // an explicit 0 (ProbeConfig::failure_threshold defaults to 3)
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.readiness_probe = Some(probe_config("http://127.0.0.1:8080/healthz"));
+        assert!(normalize(app).is_ok());
+    }
+
+    #[test]
+    fn watch_true_without_cwd_rejected_naming_the_app() {
+        // fails if a validator never looks at `watch`, or looks at it but
+        // carries no app name, leaving the user unable to tell which
+        // Flockfile entry to edit
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.watch = true;
+        assert_eq!(
+            normalize(app).unwrap_err(),
+            NormalizeError::WatchWithoutCwd {
+                name: "web".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn watch_true_with_cwd_accepted() {
+        // fails if the check fires on `watch` alone, ignoring that a cwd was
+        // actually provided
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.watch = true;
+        app.cwd = Some("/srv/web".to_string());
+        assert!(normalize(app).is_ok());
+    }
+
+    #[test]
+    fn watch_options_without_watch_or_cwd_accepted() {
+        // fails if the check is keyed on `watch_options` being non-empty
+        // rather than on `watch` being true — that would reject a Flockfile
+        // that never asked to be watched
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.watch_options = vec!["src/**".to_string()];
+        assert!(normalize(app).is_ok());
     }
 }
