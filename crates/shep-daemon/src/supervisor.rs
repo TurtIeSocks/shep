@@ -3002,6 +3002,64 @@ mod tests {
         );
     }
 
+    // CRITICAL-1: a readiness wait that resolves after a shutdown has begun
+    // must not mark its sheep online. The sibling guards on this handler are
+    // both pinned already — the epoch guard by
+    // `a_gated_app_restarted_while_starting_ignores_the_old_wait`, the
+    // `Starting` guard by `a_gated_app_stopped_while_starting_ignores_the_old_wait`
+    // — and neither reaches this one: the shutdown leaves the slot at the same
+    // epoch and in the same `Starting` status the wait was armed under, so
+    // this guard is the only thing standing between a mid-shutdown `TimedOut`
+    // and an `Online` for a sheep the daemon is in the middle of killing. That
+    // `Online` also arms every lifecycle extra the app configures, at the one
+    // moment nothing is left to disarm them.
+    //
+    // The timings: `listen_timeout` is 1000ms and the app ignores signals, so
+    // its own kill ladder runs the full 1600ms `kill_timeout` default — the
+    // readiness deadline elapses 600ms inside it, while the sheep is still
+    // `Starting` with a live pid. `shutdown()` is the call that carries the
+    // paused clock across both, and the actor is gone by the time it returns,
+    // so the drained stream below can no longer grow.
+    //
+    // ONE script, and one is right under both implementations: the mutated
+    // handler emits and sets status, it never spawns, so there is no ghost
+    // spawn to leave a script for. What an exhausted script COULD hide is the
+    // setup — a failed spawn leaves the sheep `Errored` with no readiness wait
+    // armed and so no `Online` to forbid — which is what the `Starting`
+    // assertion rules out before the shutdown, and the `Stop` assertion (the
+    // ladder really ran, past the deadline) after it.
+    //
+    // fails if `handle_ready_result` stops guarding on `shutting_down`.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_ignores_a_pending_readiness_wait() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(1024);
+        let runner = ScriptedRunner::new(vec![ProcScript::ignores_signals()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("gated", "./g");
+        app.wait_ready = true; // nobody ever signals ready
+        app.listen_timeout = UpDuration::from_millis(1_000);
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        assert_eq!(
+            handle.list().await[0].status,
+            ProcStatus::Starting,
+            "the readiness wait has to be armed for its result to be droppable"
+        );
+
+        handle.shutdown().await; // the ladder burns 1600ms of virtual time
+
+        let seen = drain_kinds(&mut rx).await;
+        assert!(
+            seen.contains(&(0, ProcessEventKind::Stop)),
+            "the kill ladder must have outlasted the readiness deadline: events = {seen:?}"
+        );
+        assert!(
+            !seen.contains(&(0, ProcessEventKind::Online)),
+            "a readiness wait resolved during shutdown marked a dying sheep online: \
+             events = {seen:?}"
+        );
+    }
+
     // CRITICAL-1 (probe H): a Start racing a concurrent Shutdown must never
     // leave an un-killed child — either the actor processes Shutdown first
     // (Start is then rejected outright) or Start lands first (Shutdown's
