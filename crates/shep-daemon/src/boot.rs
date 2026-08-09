@@ -1082,14 +1082,82 @@ mod tests {
         drop(listener);
     }
 
+    /// Fabricates exactly what a crashed daemon leaves behind: a socket file
+    /// at `socket` that nothing is listening on. Neither std nor tokio
+    /// unlinks a `UnixListener`'s path on drop, so binding and dropping is
+    /// the right shape — but it is NOT, on its own, enough to guarantee the
+    /// second half of that sentence inside this test binary.
+    ///
+    /// macOS has no atomic `SOCK_CLOEXEC` (the descriptor is marked
+    /// close-on-exec a moment AFTER `socket(2)` returns), and a `fork` copies
+    /// the whole descriptor table, so any child another test spawns
+    /// concurrently — the exec probes, the runner tests — can end up holding
+    /// a duplicate of the listener below. For as long as that duplicate lives
+    /// (until the child's `exec` or exit; measured at up to ~25ms) the socket
+    /// object is NOT destroyed, `connect` to the path SUCCEEDS, and any
+    /// prober is looking at a live socket. That is not a daemon bug — it is a
+    /// lying fixture, and it is what made
+    /// [`two_concurrent_boots_on_a_stale_socket_exactly_one_wins`] fail as
+    /// `[AlreadyRunning, AlreadyRunning]`, both racers refused, roughly 1 run
+    /// in 28 of this crate's suite under a saturated machine: the flock's
+    /// loser refused correctly, and the flock's WINNER then found this
+    /// leftover answering and refused too, exactly as `bind_socket` should.
+    ///
+    /// So establish the precondition instead of assuming it: don't return
+    /// until the path actually refuses a connection. That verdict is stable
+    /// once it lands — a refused socket is a destroyed socket, and only a
+    /// fresh `bind` can make the path answer again, which nothing but the
+    /// code under test does.
+    ///
+    /// Real sleeps, in a module whose default is a paused clock (IR-33): a
+    /// descriptor's lifetime in ANOTHER process is not on any clock tokio can
+    /// advance, and every caller of this helper is already a real-time test
+    /// for the same reason (real socket IO).
+    ///
+    /// # Panics
+    /// If the leftover never goes stale, or the probe fails for any reason
+    /// other than nobody listening.
+    #[track_caller]
+    fn stale_socket_leftover(socket: &Path) {
+        // Two nested loops for two different holders. The inner one waits out
+        // the common case, a child that copied the descriptor mid-spawn and
+        // drops it on `exec`. The outer one re-fabricates for the rarer one,
+        // a child that forked inside the socket(2)-to-close-on-exec window
+        // and therefore keeps the descriptor for its whole life: unlinking
+        // detaches that socket from this path for good, and the next bind
+        // starts clean.
+        for _ in 0..20 {
+            let _ = std::fs::remove_file(socket);
+            drop(std::os::unix::net::UnixListener::bind(socket).unwrap());
+            for _ in 0..40 {
+                match std::os::unix::net::UnixStream::connect(socket) {
+                    Err(refused)
+                        if matches!(
+                            refused.kind(),
+                            ErrorKind::ConnectionRefused | ErrorKind::NotFound
+                        ) =>
+                    {
+                        return;
+                    }
+                    Ok(_) => std::thread::sleep(Duration::from_millis(5)),
+                    Err(other) => {
+                        panic!("probing the fabricated leftover socket failed: {other}")
+                    }
+                }
+            }
+        }
+        panic!(
+            "{} never went stale: something kept answering on it",
+            socket.display()
+        );
+    }
+
     #[tokio::test]
     async fn a_socket_left_by_a_crash_is_unlinked_and_rebound() {
-        // Neither std nor tokio unlinks a UnixListener's path on drop, so this
-        // is exactly the file a killed daemon leaves behind.
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
-        drop(UnixListener::bind(&paths.socket).unwrap());
+        stale_socket_leftover(&paths.socket);
         assert!(paths.socket.exists(), "the stale file must still be there");
         let listener = bind_socket(&paths, &paths.socket).unwrap();
         assert!(paths.socket.exists());
@@ -1175,13 +1243,13 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let paths = test_paths(&dir);
             init_dirs(&paths).unwrap();
-            // The crashed predecessor's leftover: neither std nor tokio
-            // unlinks a UnixListener's path on drop (see
-            // `a_socket_left_by_a_crash_is_unlinked_and_rebound`). Plain
-            // `std::os::unix::net::UnixListener`, not tokio's: this outer
-            // fn has no runtime of its own (each racer below builds its
-            // own), and std's needs none to bind.
-            drop(std::os::unix::net::UnixListener::bind(&paths.socket).unwrap());
+            // The crashed predecessor's leftover, and it must really be
+            // leftover before the racers start: a socket another test's
+            // mid-spawn child is briefly keeping alive would make the flock's
+            // WINNER refuse too, for a reason that has nothing to do with the
+            // race under test. See `stale_socket_leftover`'s own doc — that
+            // exact false failure is why it exists.
+            stale_socket_leftover(&paths.socket);
 
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let handles: Vec<_> = (0..2)
