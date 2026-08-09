@@ -52,8 +52,13 @@ src/
                `cron_timezone` that is not an IANA name, checked even with no `cron_restart`
              - InvalidProbe — a `readiness_probe`/`liveness_probe` target ProbeTarget::parse
                rejects, `https://` included (no TLS in the prober — decision D1)
-             - ZeroFailureThreshold / ZeroInterval — a probe's `failure_threshold` or
-               `interval` explicitly `0`
+             - ZeroFailureThreshold — a probe's `failure_threshold` explicitly `0`
+             - IntervalBelowMinimum — a `liveness_probe.interval` under one second, which
+               would hot-spin an unbounded loop. A `readiness_probe.interval` is exempt:
+               that poll is bounded by `listen_timeout`
+             - ZeroMaxMemory / ZeroWatchDelay — `max_memory` of `0` (a ceiling every
+               process exceeds) or `watch_delay` of `0` (the debouncer's tick is
+               `delay / 4`, so zero pegs a core per watched app)
              - WatchWithoutCwd — `watch = true` with no `cwd` to arm a watcher over
              - InvalidWatchGlob — a `watch_options` or `ignore_watch` pattern globset will
                not compile; both lists are checked whether or not `watch` is on
