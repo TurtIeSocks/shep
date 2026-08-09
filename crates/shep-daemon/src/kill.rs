@@ -2,7 +2,7 @@
 //!
 //! [`kill_process`] runs inside the sheep task that owns the live [`RunningProcess`]
 //! (Task 9's per-sheep task). It is generic over [`RunningProcess`] so the same
-//! ladder drives both [`crate::fake::FakeProc`] in engine tests and the real
+//! ladder drives both `crate::fake::FakeProc` in engine tests and the real
 //! `tokio_runner` child in production — this module itself stays portable
 //! (no `cfg(unix)`) since it only touches the portable [`StopSignal`] enum and
 //! the [`RunningProcess`] trait, never OS signal APIs directly.

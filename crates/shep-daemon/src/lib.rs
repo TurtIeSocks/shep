@@ -24,7 +24,7 @@
 //! - [`assemble`]: process env, log paths, and spawn spec assembly
 //! - [`entry`]: process lifecycle state, restart budget, reload state machine
 //! - [`runner`]: [`ProcessRunner`](runner::ProcessRunner) spawn seam with two impls
-//! - [`fake`]: deterministic scripted [`ProcessRunner`](runner::ProcessRunner) (test-only, or test-fakes feature)
+//! - `fake`: deterministic scripted [`ProcessRunner`](runner::ProcessRunner) (test-only, or test-fakes feature — not linked here since it is absent from a default-features doc build)
 //! - [`kill`]: kill ladder — SIGTERM, SIGKILL escalation (portable, generic over [`RunningProcess`](runner::RunningProcess))
 //! - [`supervisor`]: the actor — owns registered entries, spawns per-sheep tasks, routes commands
 //! - [`channel`]: shepherd channel codec (child↔daemon messages, newline-JSON)
@@ -119,7 +119,7 @@
 //! [`ProcessRunner`](runner::ProcessRunner) spawns a child process and returns
 //! a [`RunningProcess`](runner::RunningProcess) handle plus a [`ProcIo`](runner::ProcIo)
 //! bundle with channels for logs and shepherd messages. The fake runner
-//! ([`ScriptedRunner`](fake::ScriptedRunner)) drives deterministic tests;
+//! (`ScriptedRunner`, in the test-only `fake` module) drives deterministic tests;
 //! [`spawn_supervisor`](supervisor::spawn_supervisor) wires these together into
 //! the core actor loop.
 //!
