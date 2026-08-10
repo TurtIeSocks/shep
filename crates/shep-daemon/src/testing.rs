@@ -7,7 +7,7 @@ use core::time::Duration;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
 use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, ProbeTarget, ResolvedApp, normalize};
@@ -27,6 +27,7 @@ use crate::limits::sample::{MemorySampler, ProcessRss};
 use crate::limits::{LimitBreach, LimitEnforcer};
 use crate::probes::{LivenessFailure, ProbeFailure, Prober};
 use crate::rpc::RpcContext;
+use crate::runner::{ProcIo, ProcessRunner, RunnerError, SpawnSpec};
 use crate::snapshot::FlockRegistry;
 use crate::supervisor::SupervisorBuilder;
 
@@ -49,6 +50,172 @@ use crate::supervisor::SupervisorBuilder;
 // will not hand back while lower numbers remain free. See
 // `a_closed_descriptor_is_refused_instead_of_adopted`.
 
+// The daemon's warn-and-continue arms — a watch that could not be armed, a
+// cron pattern that would not parse — leave no trace anywhere but their own
+// `tracing` record. `capture_logs` is what turns that record into something a
+// test can assert on, so "it warns and carries on" stops being a claim in a
+// doc comment and becomes a contract.
+//
+// A hand-rolled `MakeWriter` over one shared buffer (IR-33), not
+// `fmt::layer().with_test_writer()`: the test writer hands the output to
+// libtest's capture, where it is hidden from the terminal AND from the test
+// itself, and reading it back is the entire point here.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl LogCapture {
+    /// Everything rendered into this capture so far, as one string.
+    fn rendered(&self) -> String {
+        let buffer = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// A second [`tracing::Dispatch`], kept registered for the life of the
+/// process, so that a callsite's first registration is a union over every
+/// registered dispatcher instead of a read of one thread's default.
+///
+/// `tracing` caches each callsite's `Interest` process-wide the first time
+/// that line of code is reached, and how that first value is computed depends
+/// on a flag: `Dispatchers::has_just_one` is true whenever exactly one
+/// `Dispatch` is alive, and under it a registration resolves through
+/// `Rebuilder::JustOne` -> `dispatcher::get_default` — the default of whatever
+/// thread happened to register. In a test binary that is routinely a sibling
+/// test's thread, which has no subscriber at all, so the callsite caches
+/// `Interest::never()` for every thread and [`capture_logs`] comes back empty
+/// however right the subscriber inside it is. `extras`'
+/// `a_watch_root_that_will_not_resolve_costs_the_app_its_watch_and_nothing_else`
+/// reaches `arm_watch`'s `warn!` — the very callsite
+/// `a_watch_root_that_will_not_resolve_says_in_the_log_which_app_lost_its_watch`
+/// captures — in this same binary, so the two race for real.
+///
+/// A scoped subscriber does NOT sidestep that: `tracing::subscriber::with_default`
+/// is `dispatcher::with_default(&Dispatch::new(subscriber), f)`, and
+/// `Dispatch::new` already rebuilds the cache. What it cannot do is decide
+/// what a callsite registered on some *other* thread, a moment later, caches
+/// — and neither can an explicit `rebuild_interest_cache()`, which only
+/// narrows that window.
+///
+/// Keeping this dispatcher alive closes it: the flag goes false at the first
+/// [`capture_logs`] and stays false, registrations union over the registered
+/// dispatchers, and this one's `Interest::never()` unioned with a capture's
+/// gives `Interest::sometimes()` — the value that routes every event through a
+/// per-thread `enabled()`, which is the per-thread answer a scoped subscriber
+/// needs.
+///
+/// [`tracing::Dispatch::none`] would not do: it is a `'static` no-op that
+/// never registers itself, so it does not count towards the flag at all.
+static SECOND_DISPATCH: LazyLock<tracing::Dispatch> =
+    LazyLock::new(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
+/// Runs `f` with a subscriber scoped to THIS thread, returning everything the
+/// records it wrote rendered to.
+///
+/// Scoped (`tracing::subscriber::with_default`) rather than global: a global
+/// subscriber can be installed once per process, and this crate's test binary
+/// runs hundreds of tests in one. `f` must therefore be synchronous and stay
+/// on this thread — a record written by a `tokio::spawn`ed task is NOT
+/// captured, because a spawned task carries no thread-local dispatcher.
+///
+/// Forcing [`SECOND_DISPATCH`] before the scope opens is load-bearing rather
+/// than tidiness — its own doc carries why, and what an empty capture looks
+/// like without it. Nothing further is needed to refresh the interest cache:
+/// building the `Dispatch` that `with_default` installs re-registers every
+/// callsite already known, against every dispatcher then alive.
+///
+/// ANSI is off so an assertion matches the text and not the escape codes
+/// around it, and the level is `TRACE` so nothing under test is filtered out
+/// by the harness itself.
+pub(crate) fn capture_logs(f: impl FnOnce()) -> String {
+    LazyLock::force(&SECOND_DISPATCH);
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    capture.rendered()
+}
+
+/// The one `warn!` [`a_sibling_thread_reaching_a_callsite_first_cannot_empty_the_capture`]
+/// races over, in a helper of its own so that exactly two threads share one
+/// callsite and nothing else in this binary can register it first.
+fn racing_warn() {
+    tracing::warn!("a callsite two threads reach");
+}
+
+/// The race [`SECOND_DISPATCH`] exists for, run deterministically: a sibling
+/// thread with no subscriber registers a callsite *inside* a capture's scope,
+/// after the scope opened and before the captured emit.
+///
+/// The two channels are the whole point. Without them this is a sleep-shaped
+/// hope; with them the sibling cannot register before the scope opens (it
+/// waits to be told the scope is open) and the capture cannot emit before the
+/// sibling has registered (it waits to be told registration is done), so the
+/// window is entered every run rather than on a coin toss.
+///
+/// fails if [`SECOND_DISPATCH`] stops being forced — verified by removing that
+/// line, which reddens this case with an empty capture while leaving the rest
+/// of the suite green. Run alone it is deterministic; under the full binary's
+/// parallelism another live capture can make `has_just_one` false anyway and
+/// let a broken build through, which is why the negative control is run with
+/// `--exact`.
+#[test]
+fn a_sibling_thread_reaching_a_callsite_first_cannot_empty_the_capture() {
+    let (scope_open, await_scope) = std::sync::mpsc::channel();
+    let (registered, await_registration) = std::sync::mpsc::channel();
+
+    let sibling = std::thread::spawn(move || {
+        await_scope.recv().expect("the capture must open its scope");
+        // No subscriber on this thread: this is the registration that decides
+        // the callsite's cached `Interest` for the whole process.
+        racing_warn();
+        registered
+            .send(())
+            .expect("the capture must still be waiting");
+    });
+
+    let rendered = capture_logs(|| {
+        scope_open
+            .send(())
+            .expect("the sibling must still be waiting");
+        await_registration
+            .recv()
+            .expect("the sibling must register before this emit");
+        racing_warn();
+    });
+
+    sibling.join().expect("the sibling thread must not panic");
+    assert!(
+        rendered.contains("a callsite two threads reach"),
+        "a sibling thread registering first must not disable the callsite for \
+         this capture: {rendered:?}"
+    );
+}
+
 // WHY a shallow home: later tasks bind a UDS under `run/`, and sun_path
 // caps a socket path near 104 bytes. Using the tempdir root as
 // $SHEP_HOME (no extra nesting) keeps every test in this crate under the
@@ -59,6 +226,23 @@ pub(crate) fn test_paths(dir: &tempfile::TempDir) -> ShepPaths {
         &|key| (key == "SHEP_HOME").then(|| home.display().to_string()),
         std::path::Path::new("/nonexistent"),
     )
+}
+
+/// A [`ScriptedRunner`] a test can still read after the engine has taken
+/// ownership of it. [`ProcessRunner::spawn`] takes `&self`, so sharing one
+/// costs nothing but this forwarding impl.
+///
+/// IR-33: the supervisor's own tests and `boot`'s both hand a runner away and
+/// then assert on its counters — one wrapper, not two.
+#[derive(Debug)]
+pub(crate) struct SharedRunner(pub(crate) Arc<ScriptedRunner>);
+
+impl ProcessRunner for SharedRunner {
+    type Proc = crate::fake::FakeProc;
+
+    fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
+        self.0.spawn(spec)
+    }
 }
 
 /// A proptest configuration running `local_cases` by default, and whatever

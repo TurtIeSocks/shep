@@ -18,9 +18,16 @@ repository = "https://github.com/TurtIeSocks/shep"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-shep-core = { path = "crates/shep-core" }
-shep-daemon = { path = "crates/shep-daemon" }
-shep-client = { path = "crates/shep-client" }
+# `cargo publish` strips `path` from a dependency and needs a version to put
+# in its place, so these three need one even though every consumer in this
+# workspace resolves them by path. There is no `version.workspace = true`
+# form inside a dependency entry — Cargo only supports that shorthand for
+# the `[package]` table — so this literal is not sourced from
+# `workspace.package.version` above and a release bump has to touch both
+# places by hand. If that drifts, `cargo-release` is the mechanical fix.
+shep-core = { path = "crates/shep-core", version = "0.1.0" }
+shep-daemon = { path = "crates/shep-daemon", version = "0.1.0" }
+shep-client = { path = "crates/shep-client", version = "0.1.0" }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
@@ -54,7 +61,12 @@ json5 = { version = "0.4", default-features = false }
 # huge pattern slip under the 1 MiB `size_limit`; 1.9+ rejects it. Floor to 1.9 so the
 # selector-bridge test holds under `-Z minimal-versions`.
 regex = { version = "1.9", default-features = false, features = ["std", "unicode-perl"] }
-globset = { version = "0.4", default-features = false }
+# Floor 0.4.11: `watch/mod.rs`'s `own_log_ignores` builds an ignore glob out of a real
+# path and calls `globset::escape` to neutralize the metacharacters a tempdir or a user's
+# directory name can contain. That function does not exist before 0.4.11 — `-Z
+# minimal-versions` picks 0.4.0 without this and fails with `cannot find function escape
+# in crate globset`.
+globset = { version = "0.4.11", default-features = false }
 # `tokio::task::JoinHandle::is_finished` (shep-daemon's fake.rs cancel-safety test uses
 # it to assert a `wait()` future is genuinely still pending before dropping it) landed in
 # tokio 1.19.0, but shep-daemon's tokio_runner.rs (the real `ProcessRunner`, already
@@ -83,6 +95,18 @@ tracing = { version = "0.1", default-features = false, features = ["std", "attri
 # (a Phase 2a call site, also caught by Task 2's minimal-versions rehearsal). Missing in
 # 0.1.26/0.1.27; present from 0.1.28.
 tracing-core = { version = "0.1.28", default-features = false }
+# Option: the daemon's own diagnostics. `env-filter` costs exactly one crate
+# (matchers) and `json` exactly one (tracing-serde); the rest of the tree is
+# already present via regex/globset/serde. The default `tracing-log` bridge is
+# dropped because nothing here uses the `log` crate.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json"] }
+# Transitive floor pin: `sharded-slab` (tracing-subscriber's span registry) imports
+# `lazy_static!` by path — `use lazy_static::lazy_static;` — while declaring only
+# `lazy_static = "1"`. That expansion names `__lazy_static_internal`, which a path import
+# can only resolve once the macro is exported `#[macro_export(local_inner_macros)]`. 1.0.0
+# and 1.0.1 export it plainly and fail with `cannot find macro __lazy_static_internal in
+# this scope`; present from 1.0.2.
+lazy_static = { version = "1.0.2", default-features = false }
 # Our `insta::assert_json_snapshot!` calls in shep-core (protocol::request,
 # protocol::events) snapshot newtype/tuple enum variants (the Result-shaped reply
 # payload); 1.18.0 has a JSON-serialization regression with exactly that shape, fixed

@@ -103,10 +103,26 @@ terminate. Exit code + signal recorded exactly (owning-parent `waitpid`).
 `SpawnNew → AwaitReady → DrainOld → ReapOld`. AwaitReady = readiness signal
 (§7) or `listen_timeout` (default 3000ms). DrainOld = stop ladder with
 `graceful_timeout` (default 8000ms) cap. Socket sharing via SO_REUSEPORT
-(`reuse_port = true` app option); without it, reload degrades to
-rolling-restart (documented, one instance at a time). Reload proceeds
-instance-by-instance; failure of the new instance aborts the rest and keeps
-old instances running.
+(`reuse_port = true` app option) — shep never binds a listen socket itself,
+so the app must set the option before its own `bind()`; shep's role is
+granting the old and new instance permission to overlap, not performing the
+mechanism. An app that does not actually set the option gets `EADDRINUSE`
+at the replacement spawn, on every reload, and shep cannot detect the
+misconfiguration in advance; `SO_REUSEADDR`, which far more frameworks set
+by default, is not sufficient, and a mixed pair (one process with
+`SO_REUSEPORT` set, one without) is refused by the kernel on both tier-1
+platforms. Without `reuse_port`, reload degrades to rolling-restart
+(documented, one instance at a time). Reload proceeds instance-by-instance;
+failure of the new instance aborts the rest and keeps old instances running.
+
+> macOS caveat: `SO_REUSEPORT` there is last-binder-wins, not
+> load-balancing — measured cross-process over 40 connections, macOS sent
+> 40/40 to the newest binder while Linux split 20/20. That is favorable for
+> reload (the new instance takes over 100% of new connections immediately;
+> the old one only drains what it already had) and unfavorable for the
+> "cluster" instance model (N instances of one app sharing a socket):
+> steady-state load does not spread across sibling instances on macOS the
+> way it does on Linux. See §11.
 
 **Watch:** `notify` + debounce (`watch_delay`, default 500ms per trace
 semantics), one watcher per app name-group, default ignores (dot-entries,
@@ -282,6 +298,12 @@ daemon memory (explicit non-goal).
 ## 11. Platform support
 
 - **Tier 1 (v1 e2e green):** Linux (gnu + musl static artifact), macOS.
+  macOS's `SO_REUSEPORT` is last-binder-wins, not load-balancing (§4): the
+  "cluster" instance model does not spread steady-state connections across
+  sibling instances on macOS the way it does on Linux, even though it is
+  tier 1. Zero-downtime reload is unaffected by this — the new instance
+  taking over 100% of new connections is the desired reload behavior on
+  either platform.
 - **Windows v1 functional tier:** compiles + unit tests in CI from day one;
   named-pipe RPC + Job Objects kill; start/stop/flock/bleats work. Typed
   `StopSignal` keeps unix-isms out of core. Service + graceful ctrl-event +

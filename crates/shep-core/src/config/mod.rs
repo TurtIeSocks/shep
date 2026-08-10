@@ -10,7 +10,7 @@ pub mod probe;
 
 pub use app::{AppConfig, ProbeConfig, ProbeKind};
 pub use cron::{CronParseError, CronSchedule, CronScheduleError};
-pub use daemon::{DaemonConfig, DaemonConfigError};
+pub use daemon::{DaemonConfig, DaemonConfigError, LogLevel};
 pub use flockfile::{FlockFormat, Flockfile, FlockfileError, discover};
 pub use normalize::{NormalizeError, ResolvedApp, normalize, normalize_all};
 pub use probe::{ProbeTarget, ProbeTargetError};

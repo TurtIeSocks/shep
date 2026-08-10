@@ -83,7 +83,7 @@ fn base_env() -> BTreeMap<String, String> {
 ///
 /// Resolves the program/args from the interpreter config, merges env with the
 /// instance slot var, computes log file paths respecting `merge_logs`, and sets
-/// the shepherd-channel flag from `wait_ready || shutdown_with_message`.
+/// the shepherd-channel flag from `channel || wait_ready || shutdown_with_message`.
 ///
 /// `credentials` is resolved by the caller (passwd/group lookups are real
 /// I/O, so they stay out of this otherwise-pure function — see
@@ -161,8 +161,11 @@ pub fn assemble(
         paths.logs.join(format!("{}err.log", log_stem))
     };
 
-    // Shepherd channel: enabled if wait_ready or shutdown_with_message
-    let channel = config.wait_ready || config.shutdown_with_message;
+    // Shepherd channel: enabled by its own field, or implied by either
+    // readiness flag — widening this gate must keep every existing term,
+    // since dropping one silently stops opening fd 3 for whatever app relied
+    // on it implying the channel.
+    let channel = config.channel || config.wait_ready || config.shutdown_with_message;
 
     SpawnSpec {
         name,
@@ -369,12 +372,34 @@ mod tests {
         );
     }
 
+    // fails if the gate drops the `channel` term from the disjunction
+    #[test]
+    fn channel_enabled_by_its_own_field() {
+        let app_config = AppConfig {
+            name: "app".to_string(),
+            script: "app".to_string(),
+            args: vec![],
+            channel: true,
+            wait_ready: false,
+            shutdown_with_message: false,
+            ..Default::default()
+        };
+        let app = normalize(app_config).unwrap();
+        let paths = test_paths();
+
+        let spec = assemble(&app, 0, &paths, None);
+
+        assert!(spec.channel);
+    }
+
+    // fails if the gate drops the `wait_ready` term from the disjunction
     #[test]
     fn channel_enabled_by_wait_ready() {
         let app_config = AppConfig {
             name: "app".to_string(),
             script: "app".to_string(),
             args: vec![],
+            channel: false,
             wait_ready: true,
             shutdown_with_message: false,
             ..Default::default()
@@ -387,12 +412,15 @@ mod tests {
         assert!(spec.channel);
     }
 
+    // fails if the gate drops the `shutdown_with_message` term from the
+    // disjunction
     #[test]
     fn channel_enabled_by_shutdown_with_message() {
         let app_config = AppConfig {
             name: "app".to_string(),
             script: "app".to_string(),
             args: vec![],
+            channel: false,
             wait_ready: false,
             shutdown_with_message: true,
             ..Default::default()
@@ -403,6 +431,29 @@ mod tests {
         let spec = assemble(&app, 0, &paths, None);
 
         assert!(spec.channel);
+    }
+
+    // fails if any term is stuck open regardless of config (e.g. an
+    // accidental `|| true`, or a term that defaults on) — every one of the
+    // three flags is explicitly false here, so this is the counterpart the
+    // three positive tests above can't cover on their own.
+    #[test]
+    fn channel_disabled_when_all_three_flags_are_false() {
+        let app_config = AppConfig {
+            name: "app".to_string(),
+            script: "app".to_string(),
+            args: vec![],
+            channel: false,
+            wait_ready: false,
+            shutdown_with_message: false,
+            ..Default::default()
+        };
+        let app = normalize(app_config).unwrap();
+        let paths = test_paths();
+
+        let spec = assemble(&app, 0, &paths, None);
+
+        assert!(!spec.channel);
     }
 
     #[test]

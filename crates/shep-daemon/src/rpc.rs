@@ -220,6 +220,18 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
             )
             .await
         }
+        Request::Reopen { selector } => {
+            selector_call(
+                id,
+                selector,
+                |s| ctx.supervisor.reopen(s),
+                Response::Reopened,
+            )
+            .await
+        }
+        Request::Flush { selector } => {
+            selector_call(id, selector, |s| ctx.supervisor.flush(s), Response::Flushed).await
+        }
         Request::Delete { selector } => match selector_of(selector) {
             Err(err) => reply(Err(err)),
             Ok(selector) => match ctx.supervisor.delete(selector).await {
@@ -260,6 +272,19 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
             code: RpcErrorCode::SpawnFailed,
             message: msg.clone(),
         },
+        // `Internal` — an "unexpected daemon-side failure", which a log path
+        // the daemon can no longer open, or can no longer empty, both are.
+        // No code of its own: the wire enum is versioned, and a client that
+        // predates a new code cannot decode the reply at all, which would
+        // cost the operator the message as well. The message names every
+        // path that failed either way, and `err.to_string()` rather than the
+        // bare payload so the reader is told which of the two it is —
+        // `SupervisorError`'s `Display` is the only thing that still
+        // distinguishes them once they share a code.
+        SupervisorError::ReopenFailed(_) | SupervisorError::FlushFailed(_) => RpcError {
+            code: RpcErrorCode::Internal,
+            message: err.to_string(),
+        },
         SupervisorError::EngineStopped => RpcError {
             code: RpcErrorCode::Internal,
             message: "the supervisor engine has stopped".to_string(),
@@ -281,8 +306,9 @@ fn selector_of(spec: SelectorSpec) -> Result<ProcessSelector, RpcError> {
     })
 }
 
-/// The helper Stop and Restart share: convert the selector, call the
-/// supervisor, map the hits through the passed `Response` constructor.
+/// The helper every selector-in, flock-out verb shares: convert the selector,
+/// call the supervisor, map the hits through the passed `Response`
+/// constructor.
 ///
 /// The future bound is stated, not inferred, because the whole chain is
 /// awaited inside the per-connection `tokio::spawn`.
@@ -455,6 +481,109 @@ mod tests {
         };
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "api");
+    }
+
+    /// Fails if `Reopen` is left to the catch-all arm at the bottom of
+    /// `run` — a verb this daemon has never heard of — which answers
+    /// `Internal` for a request it in fact implements. Also fails if it is
+    /// routed to another verb's supervisor call: `Stop` would answer
+    /// `Response::Stopped` and, worse, stop the sheep.
+    #[tokio::test(start_paused = true)]
+    async fn reopen_routes_to_the_supervisor_and_leaves_the_sheep_running() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        dispatch(
+            envelope(
+                1,
+                Request::Start {
+                    apps: vec![AppConfig::minimal("web", "./srv")],
+                },
+            ),
+            &h.ctx,
+        )
+        .await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::Reopen {
+                        selector: SelectorSpec::Name("web".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Response::Reopened(infos) = reply.result.unwrap() else {
+            panic!("expected reopened")
+        };
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].status, ProcStatus::Online);
+
+        let listed = reply_of(dispatch(envelope(3, Request::ListFlock), &h.ctx).await);
+        let Response::Flock(flock) = listed.result.unwrap() else {
+            panic!("expected flock")
+        };
+        assert_eq!(
+            flock[0].status,
+            ProcStatus::Online,
+            "a reopen must not disturb the sheep it reopens"
+        );
+    }
+
+    /// Fails if `Reopen` skips the selector conversion, or converts it
+    /// without reporting the failure: a peer regex the daemon cannot compile
+    /// is the client's usage error, not an internal one.
+    #[tokio::test(start_paused = true)]
+    async fn a_bad_reopen_selector_is_invalid_config() {
+        let h = harness(vec![]);
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Reopen {
+                        selector: SelectorSpec::Regex("((".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
+    }
+
+    /// The whole of an operator's feedback loop for a rotation that failed:
+    /// the daemon's code becomes the CLI's exit status (`Internal` is 9), and
+    /// the daemon's message is the only thing printed about which path went
+    /// wrong.
+    ///
+    /// Fails if the `ReopenFailed | FlushFailed` arm answers any other code —
+    /// `SpawnFailed` exits 7 and reads as "could not start it", which is a
+    /// different call to whoever is paged. Fails too if that arm sends the
+    /// bare payload instead of `err.to_string()`: once the two share one wire
+    /// code, `SupervisorError`'s `Display` is the only thing left telling a
+    /// reader which half of the log plane failed, and both payloads are just
+    /// paths and reasons.
+    #[test]
+    fn a_log_plane_failure_is_internal_and_says_which_half_failed() {
+        let reopen = rpc_error(&SupervisorError::ReopenFailed(
+            "web (id 0): could not reopen /logs/web-out.log: Permission denied".to_string(),
+        ));
+        assert_eq!(reopen.code, RpcErrorCode::Internal);
+        assert_eq!(
+            reopen.message,
+            "log reopen failed: web (id 0): could not reopen \
+             /logs/web-out.log: Permission denied"
+        );
+
+        let flush = rpc_error(&SupervisorError::FlushFailed(
+            "/logs/web-out.log: Permission denied".to_string(),
+        ));
+        assert_eq!(flush.code, RpcErrorCode::Internal);
+        assert_eq!(
+            flush.message,
+            "log flush failed: /logs/web-out.log: Permission denied"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -14,7 +14,7 @@
 //! `std::os::unix::fs::PermissionsExt` usage) on the Windows CI leg too.
 //! Global Constraints names this file explicitly for that reason.
 //!
-//! The last two cases are the file's slow ones and the reason it no longer
+//! Cases 14 and 15 are the file's slow ones and the reason it no longer
 //! finishes in about eleven seconds: a cron occurrence and a memory-limit
 //! breach are both events on *real* wall clock — a minute boundary and a
 //! 15-second sampling tick — with no seam this tier could pause. Each names
@@ -175,6 +175,34 @@ const BALLOON_BYTES: u64 = 16 * 1024 * 1024;
 /// margin rather than on a coin toss.
 const BREACH_LIMIT: &str = "8M";
 
+/// The `listen_timeout` [`write_never_ready_flockfile`] gives its sheep.
+///
+/// Short because the two log-plane cases wait it out twice over, and safe to
+/// be short because nothing races it: the sheep never signals at all, so this
+/// is a delay before a certainty rather than a window some slower machine
+/// could close first. The daemon takes a timed-out `wait_ready` sheep `Online`
+/// anyway, which is what makes the elapse observable through `shep flock`
+/// rather than only through the record under test.
+const NEVER_READY_TIMEOUT: &str = "1s";
+
+/// What [`write_rotating_script`]'s sheep prints before the rotation, and
+/// what must end up in the renamed archive rather than in the recreated log.
+const ROTATE_BEFORE: &str = "before-the-rotation";
+
+/// What the same sheep prints after it, once the reopen has returned. Its
+/// arrival in the recreated file is the whole assertion.
+const ROTATE_AFTER: &str = "after-the-rotation";
+
+/// The daemon record the two log-plane cases provoke and then read out of
+/// `$SHEP_HOME/logs/shepd.err.log`.
+///
+/// One owner for the string, because the two cases assert opposite things
+/// about the same record — present at the default level, absent above it —
+/// and a pair that drifted apart would keep passing while proving nothing.
+/// It is `shep-daemon`'s `Actor::handle_ready_result` (`supervisor.rs`) that
+/// writes it, at `WARN`.
+const READINESS_RECORD: &str = "readiness deadline elapsed";
+
 // --- Fixture helpers ---------------------------------------------------
 
 /// The path of the committed `--format json` fixture named `name`.
@@ -326,6 +354,33 @@ fn write_logging_script(dir: &TempDir, out_marker: &str, err_marker: Option<&str
     write_script(dir, "logging.sh", &script)
 }
 
+/// Writes a script that prints [`ROTATE_BEFORE`], blocks until `gate`
+/// exists, prints [`ROTATE_AFTER`], and sleeps.
+///
+/// One script, and it has to have both halves: a rotation is only observable
+/// in what happens to a line written AFTER the rename, and a script that
+/// wrote everything up front would leave a reopen that did nothing looking
+/// exactly like one that worked. The gate is what makes "after" a fact
+/// rather than a timing bet — the test creates it once the reopen has
+/// already returned.
+///
+/// Same `sleep 0.1` as [`write_ready_script`], for the reason given there:
+/// POSIX requires only whole seconds, and a `/bin/sleep` that refused the
+/// fraction degrades this into a busy-wait rather than a hang.
+fn write_rotating_script(dir: &TempDir, gate: &Path) -> PathBuf {
+    write_script(
+        dir,
+        "rotating.sh",
+        &format!(
+            "#!/bin/sh\n{}echo '{ROTATE_BEFORE}'\n\
+             until [ -e \"{}\" ]; do sleep 0.1; done\n\
+             echo '{ROTATE_AFTER}'\nsleep {SCRIPT_SLEEP_SECS}\n",
+            record_pid_line(dir),
+            gate.display(),
+        ),
+    )
+}
+
 /// Writes a script that blocks until `sentinel` exists, then announces
 /// readiness on the shepherd channel and sleeps.
 ///
@@ -366,6 +421,34 @@ fn write_script(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).unwrap();
     path
+}
+
+/// Writes a Flockfile whose one app asks for a readiness handshake it never
+/// performs, so [`NEVER_READY_TIMEOUT`] elapses and the daemon writes
+/// [`READINESS_RECORD`] about it.
+///
+/// The provocation the two log-plane cases needed, chosen because it was the
+/// one actually observed doing the job. The obvious alternative — an
+/// unresolvable `watch` root, whose `arm_watch` warning is the record
+/// `shep-daemon`'s own unit tier captures — does **not** work from this tier:
+/// `assemble` passes an app's `cwd` through to `Command::current_dir`
+/// unchanged, so a `cwd` that cannot be canonicalized is a `cwd` the child
+/// cannot chdir into, and the sheep comes up `errored` having logged nothing.
+///
+/// A plain [`write_test_script`] sheep is enough here: `wait_ready` opens the
+/// shepherd channel on fd 3 and the script simply never writes to it, which is
+/// exactly a real app that was configured for a handshake it does not
+/// implement.
+fn write_never_ready_flockfile(dir: &TempDir) -> PathBuf {
+    let script = write_test_script(dir);
+    write_flockfile(
+        dir,
+        &format!(
+            "[[app]]\nname = \"gated\"\nscript = \"{}\"\n\
+             wait_ready = true\nlisten_timeout = \"{NEVER_READY_TIMEOUT}\"\n",
+            script.display(),
+        ),
+    )
 }
 
 /// Writes `Flockfile.toml` into `dir` and returns its path. The `.toml`
@@ -418,6 +501,49 @@ fn assert_success(output: &Output) {
 /// source, and has been reverted (see [`write_test_script`]).
 fn graceful_kill(home: &Path) {
     let _ = shep(home).arg("kill").output();
+}
+
+/// Boots a daemon on `dir`'s `$SHEP_HOME` with `env` set on the `shep start`
+/// that autostarts it, waits for [`write_never_ready_flockfile`]'s sheep to
+/// give up waiting, and hands back the daemon's own log.
+///
+/// The environment reaches the daemon because `launch::launch_command`
+/// deliberately does not `.env_clear()` the re-exec, so `SHEP_LOG_JSON` and
+/// `SHEP_LOG_LEVEL` are read by the child that installs the subscriber, not by
+/// the parent that spawns it.
+///
+/// Waiting for `online` is what orders the read: `handle_ready_result` writes
+/// [`READINESS_RECORD`] *before* it sets the status, so a sheep observed
+/// `online` has already had its record written and there is nothing to poll
+/// for — the same ordering argument [`a_real_memory_breach_restarts_a_sheep`]
+/// makes about its own record.
+///
+/// The daemon is killed before the log is returned, so a caller's assertion
+/// can panic without leaking a supervisor; its own [`DaemonGuard`] covers a
+/// panic inside this helper, before the kill.
+fn daemon_log_after_a_missed_handshake(dir: &TempDir, env: &[(&str, &str)]) -> String {
+    let home = dir.path();
+    let flockfile = write_never_ready_flockfile(dir);
+    let mut guard = DaemonGuard::default();
+
+    let mut start = shep(home);
+    for (key, value) in env {
+        start.env(key, value);
+    }
+    let boot = start.arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    let online = poll_flock(home, |info| info["status"] == "online");
+    assert_eq!(
+        online["status"], "online",
+        "a wait_ready sheep that never signals must still be taken online once \
+         its listen_timeout elapses, which is the record's own trigger: {online}"
+    );
+
+    let log = std::fs::read_to_string(home.join("logs").join("shepd.err.log")).unwrap();
+    graceful_kill(home);
+    log
 }
 
 /// A `$SHEP_HOME` whose daemon *and whole flock* this test is responsible
@@ -1303,6 +1429,617 @@ fn bleats_no_follow_prints_what_a_sheep_actually_wrote() {
     graceful_kill(home);
 }
 
+/// `create`-mode rotation through the real binary: rename the live log, run
+/// `shep reopen`, and the sheep's next line reaches the recreated path where
+/// `shep bleats --no-follow` can print it.
+///
+/// This is the symptom the verb was built for, end to end. Before it, a
+/// rotation left the pump filling the renamed inode: the live path was never
+/// recreated, `bleats --no-follow` printed nothing, and it exited 0 while
+/// doing so. `daemon_e2e` proves the same swap over the daemon's own socket,
+/// but nothing there runs the binary an operator's `postrotate` stanza
+/// actually invokes — the argv, the default selector, the exit code and the
+/// reading verb are all this tier's to prove.
+///
+/// Both directions are asserted. That the second line appears rules out a
+/// reopen that did nothing; that the first one does NOT rules out a `bleats`
+/// that found the archive instead, or a pump that never let go of the old
+/// inode — either of which would print both lines and pass a
+/// contains-the-marker check on its own.
+///
+/// The log path is read off `shep flock --format json` rather than derived
+/// here, so the test cannot disagree with the daemon about which file it is
+/// renaming.
+#[test]
+fn reopen_puts_a_rotated_log_back_where_bleats_can_read_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let gate = home.join("rotated");
+    let script = write_rotating_script(&dir, &gate);
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("rotator")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    // Through the reading verb rather than the file, so the precondition is
+    // the same observation the assertion at the bottom makes.
+    let before = bleats_no_follow_until_written(home, &["all"]);
+    let printed = String::from_utf8_lossy(&before.stdout);
+    assert!(
+        printed.contains(ROTATE_BEFORE),
+        "precondition: the sheep's first line must be readable before the \
+         rotation: stdout={printed}"
+    );
+
+    let online = poll_flock(home, |info| info["status"] == "online");
+    let out_file = PathBuf::from(
+        online["out_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the daemon reports its own log paths: {online}")),
+    );
+    let archive = out_file.with_extension("log.1");
+    std::fs::rename(&out_file, &archive).unwrap();
+    assert!(!out_file.exists(), "sanity: the rename really moved it");
+
+    // The `postrotate` stanza itself: no selector, which is the verb's
+    // default and the whole-flock case an operator writes. `--format json`
+    // is the one addition, so the envelope's own `command` label is asserted
+    // rather than taken on trust: `reopen` and `flush` render an identical
+    // `FlockRows` table, so their two labels are swappable with no table, no
+    // exit code and no wire request moving at all.
+    let reopened = shep(home)
+        .arg("reopen")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert_success(&reopened);
+    let envelope: serde_json::Value = serde_json::from_slice(&reopened.stdout).unwrap();
+    assert_eq!(
+        envelope["command"], "reopen",
+        "a reopen's envelope must say so: {envelope}"
+    );
+
+    // Only now is the gate opened, so the line below cannot predate the
+    // reopen that had to happen for it to land anywhere readable.
+    std::fs::write(&gate, "").unwrap();
+
+    let after = bleats_no_follow_until_written(home, &["all"]);
+    assert_eq!(
+        after.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&after.stdout);
+    assert!(
+        stdout.contains(ROTATE_AFTER),
+        "a rotated sheep's next line must reach the recreated path: stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains(ROTATE_BEFORE),
+        "the recreated log starts empty — the first line belongs to the \
+         archive now: stdout={stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&archive).unwrap(),
+        format!("{ROTATE_BEFORE}\n"),
+        "the renamed file must stop growing the moment the handle is swapped"
+    );
+
+    graceful_kill(home);
+}
+
+/// A rotation that fails, end to end: the whole feedback loop an operator
+/// has when `shep reopen` cannot do what it was asked.
+///
+/// Every other case in this file drives the log plane's happy path. This one
+/// drives the chain nothing else touches — a pump that could not open a path
+/// again, `SupervisorError::ReopenFailed`, `rpc_error`'s `Internal`, and
+/// `ExitCode::Internal`'s 9 — and it is the chain that matters most, because
+/// a `postrotate` stanza is a shell script: exit 9 is the entire signal it
+/// gets, and a rotation reported as a success leaves that sheep writing one
+/// of its streams nowhere while logrotate goes on to compress the archive.
+///
+/// A directory in stdout's place is the failure with no permission games in
+/// it: `open(2)` on a directory fails for every uid, root included, so this
+/// cannot pass for the wrong reason on a privileged CI runner. The daemon's
+/// own tiers use the same construction one and two layers down.
+///
+/// stderr's path is left alone, so the message must name stdout's path and
+/// only stdout's — a daemon that reported the whole flock, or the wrong
+/// path, would still exit 9 and pass a bare status check.
+///
+// fails if any link in that chain stops carrying the failure: a
+// `spawn_reopen_task` that reported a refusing pump as a success, an
+// `rpc_error` arm answering a code other than `Internal`, or an
+// `ExitCode::from(RpcErrorCode)` that no longer sends `Internal` to 9.
+#[test]
+fn a_reopen_that_cannot_open_a_path_again_exits_internal() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_logging_script(&dir, "blocked-out-marker", None);
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("blocked")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    // Read off the daemon's own snapshot rather than derived here, so the
+    // test cannot disagree with it about which file it is blocking.
+    let online = poll_flock(home, |info| info["status"] == "online");
+    let out_file = PathBuf::from(
+        online["out_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the daemon reports its own log paths: {online}")),
+    );
+
+    // The rotator's rename, and then something in the recreated path's way.
+    // Renamed rather than deleted so the pump is in the state a real
+    // rotation leaves it in: holding a handle on an inode that answers to a
+    // different name, with the live path unopenable.
+    std::fs::rename(&out_file, out_file.with_extension("log.1")).unwrap();
+    std::fs::create_dir(&out_file).unwrap();
+
+    let refused = shep(home)
+        .arg("reopen")
+        .arg("blocked")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert_json_error(&refused, 9, "internal");
+    let err: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+    let message = err["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(out_file.to_str().unwrap()),
+        "the operator's one message must name the path that failed: {err}"
+    );
+    // Taken from the daemon's own answer rather than assumed to be 0, and
+    // asserted as the whole `<name> (id <id>)` prefix — the log path already
+    // contains the name, so a bare name check would hold against a message
+    // that named no sheep at all.
+    assert!(
+        message.contains(&format!("blocked (id {})", online["id"])),
+        "and the sheep it belongs to: {err}"
+    );
+
+    // Out of the daemon's way before the shutdown that follows, so nothing
+    // downstream trips over a directory where a log file belongs.
+    std::fs::remove_dir(&out_file).unwrap();
+    graceful_kill(home);
+}
+
+/// `copytruncate`-mode rotation through the real binary: an external rotator
+/// copies the live log aside and empties it in place — no `shep` verb, no
+/// signal, nothing that tells the daemon it happened — and the sheep's next
+/// line lands at offset 0 of that same file.
+///
+/// The half of external rotation shep does nothing for, which is exactly why
+/// it is worth a case: it works only because a log file is opened `O_APPEND`
+/// (`shep-daemon`'s `open_append`), so every write seeks to end-of-file
+/// atomically and an external truncation moves the next one back to the
+/// start without the daemon being told. A handle carrying its own offset
+/// instead would put that line past a sparse hole the size of what was
+/// emptied, and a weekly rotation would turn a busy sheep's log into a file
+/// whose apparent size only ever grows.
+///
+/// The daemon's unit tier pins the same property against a pump harness, over
+/// a handle it reopened. What this adds is the stack an operator actually has
+/// — a real daemon, a real spawned sheep, the handle it has held since spawn,
+/// and a rotator acting on the file behind both of their backs.
+///
+/// The file's LENGTH is the whole assertion, for the reason
+/// [`flush_empties_a_log_the_sheep_goes_on_appending_to`] gives about its own:
+/// `bleats` prints the line either way, since a hole reads back as NUL bytes
+/// in front of it, and only the byte count tells an appending handle from a
+/// positional one.
+// fails if `open_append` stops asking for `.append(true)` — verified by
+// replacing it with `.write(true)`, under which this case reports 39 bytes
+// where 19 were expected: the hole the first line left, and then the second
+// line behind it. Blast radius, measured with `--no-fail-fast`: three cases,
+// this one plus `flush_empties_a_log_the_sheep_goes_on_appending_to` in this
+// file and `tokio_runner`'s
+// `a_reopened_handle_still_appends_so_a_truncation_leaves_no_hole`; every
+// other test in the workspace stays green, because a file nobody truncates
+// cannot tell the two handles apart.
+#[test]
+fn an_external_copytruncate_leaves_the_next_line_at_offset_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let gate = home.join("copied");
+    let script = write_rotating_script(&dir, &gate);
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("truncated")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    // Through the reading verb rather than the file, so the first line is
+    // known to be on disk before the rotator below copies it.
+    let before = bleats_no_follow_until_written(home, &["all"]);
+    let printed = String::from_utf8_lossy(&before.stdout);
+    assert!(
+        printed.contains(ROTATE_BEFORE),
+        "precondition: the sheep's first line must be readable before the \
+         rotation: stdout={printed}"
+    );
+
+    // Read off the daemon's own snapshot rather than derived here, so the
+    // test cannot disagree with it about which file this is.
+    let online = poll_flock(home, |info| info["status"] == "online");
+    let out_file = PathBuf::from(
+        online["out_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the daemon reports its own log paths: {online}")),
+    );
+
+    // `logrotate copytruncate`, spelled out: copy the file aside, then empty
+    // the original in place. Nothing here is a shep verb — the daemon is
+    // never told, and the pump goes on holding the same inode at size zero.
+    let archive = out_file.with_extension("log.1");
+    std::fs::copy(&out_file, &archive).unwrap();
+    std::fs::File::create(&out_file).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&archive).unwrap(),
+        format!("{ROTATE_BEFORE}\n"),
+        "sanity: the copy really took the line the truncate is about to drop"
+    );
+    assert_eq!(
+        std::fs::metadata(&out_file).unwrap().len(),
+        0,
+        "sanity: the truncate really emptied it"
+    );
+
+    // Only now is the gate opened, so the line below cannot predate the
+    // truncation it has to land after.
+    std::fs::write(&gate, "").unwrap();
+
+    let after = bleats_no_follow_until_written(home, &["all"]);
+    assert_eq!(
+        after.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&after.stdout);
+    assert!(
+        stdout.contains(ROTATE_AFTER),
+        "a truncated sheep must go on logging into the same file: stdout={stdout}"
+    );
+    // The line above is the only thing the sheep wrote after the truncation,
+    // and the loop that read it back has already waited for it to be on disk.
+    assert_eq!(
+        std::fs::metadata(&out_file).unwrap().len(),
+        (ROTATE_AFTER.len() + 1) as u64,
+        "the sheep's next line must land at offset 0 of the emptied file: a \
+         handle that kept its offset across an external truncation would \
+         leave a hole the size of what was emptied in front of it, and \
+         `bleats` would print the line just the same"
+    );
+
+    graceful_kill(home);
+}
+
+/// `shep flush` through the real binary: empty a running sheep's log, and
+/// watch it keep logging into the same file afterwards.
+///
+/// Two properties, and the second is why this reuses the rotating script
+/// rather than a simpler one. That [`ROTATE_BEFORE`] is gone proves the
+/// truncate happened. That [`ROTATE_AFTER`] — written by the same process,
+/// through the same handle the daemon never touched — arrives and is readable
+/// proves the handle survived it.
+///
+/// The file's LENGTH is what proves where that line landed. `O_APPEND` seeks
+/// to the end before every write, so an emptied file takes the next line at
+/// offset 0; a handle writing at its own preserved offset would put the same
+/// line past a sparse hole the size of what was truncated, and the reading
+/// verb would print it either way. Only the byte count tells the two apart —
+/// as a `contains` check cannot, and as reading the tail cannot, since the
+/// hole is behind the bytes it returns.
+///
+/// `daemon_e2e` proves the path-not-inode rule over the daemon's own socket,
+/// but nothing there runs the binary an operator actually types — the argv,
+/// the exit code and the reading verb are this tier's to prove.
+#[test]
+fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let gate = home.join("flushed");
+    let script = write_rotating_script(&dir, &gate);
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("flusher")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    // Through the reading verb rather than the file, so the precondition is
+    // the same observation the assertions below make.
+    let before = bleats_no_follow_until_written(home, &["all"]);
+    let printed = String::from_utf8_lossy(&before.stdout);
+    assert!(
+        printed.contains(ROTATE_BEFORE),
+        "precondition: the sheep's first line must be readable before the \
+         flush: stdout={printed}"
+    );
+
+    // Read off the daemon's own snapshot rather than derived here, so the
+    // test cannot disagree with it about which file this is.
+    let online = poll_flock(home, |info| info["status"] == "online");
+    let out_file = PathBuf::from(
+        online["out_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the daemon reports its own log paths: {online}")),
+    );
+
+    // The selector is explicit because the verb requires one — a bare `shep
+    // flush` is a usage error, which the case below pins. `--format json`
+    // for the reason the reopen case gives about its own label: the two
+    // verbs render the same table, so nothing else here would notice them
+    // swapped.
+    let flushed = shep(home)
+        .arg("flush")
+        .arg("all")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert_success(&flushed);
+    let envelope: serde_json::Value = serde_json::from_slice(&flushed.stdout).unwrap();
+    assert_eq!(
+        envelope["command"], "flush",
+        "a flush's envelope must say so: {envelope}"
+    );
+
+    // Only now is the gate opened, so the line below cannot predate the
+    // flush it has to survive.
+    std::fs::write(&gate, "").unwrap();
+
+    let after = bleats_no_follow_until_written(home, &["all"]);
+    assert_eq!(
+        after.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&after.stdout);
+    assert!(
+        stdout.contains(ROTATE_AFTER),
+        "a flushed sheep must go on logging into the same file: stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains(ROTATE_BEFORE),
+        "everything written before the flush is gone: stdout={stdout}"
+    );
+    // The line above is the only thing the sheep wrote after the flush, and
+    // the loop that read it back has already waited for it to be on disk.
+    assert_eq!(
+        std::fs::metadata(&out_file).unwrap().len(),
+        (ROTATE_AFTER.len() + 1) as u64,
+        "the sheep's next line must land at offset 0 of the emptied file: a \
+         handle that kept its offset across the truncate would leave a hole \
+         the size of what was emptied in front of it, and `bleats` would \
+         print the line just the same"
+    );
+
+    graceful_kill(home);
+}
+
+/// The two halves of `shep flush` reach exactly one target each, asserted in
+/// the order that makes both facts stand: the flock half first, while the
+/// shepherd's own logs still hold a marker only this test wrote.
+///
+/// Rin's requirement was that a flock flush never reach the shepherd's own
+/// logs without being named. That already held by construction — the daemon
+/// inherits those two files as fds 1 and 2 and has no path for a selector to
+/// match — but "by construction" is exactly the kind of claim a later
+/// refactor falsifies quietly, and `--daemon` is the door it now has to stay
+/// on the other side of. So both directions are pinned: `flush all` leaves
+/// the marker byte-for-byte, and `flush --daemon` leaves the sheep's own log
+/// untouched.
+///
+/// The marker is written through a handle of the test's own. The daemon holds
+/// fd 1 open on the same inode and writes nothing to stdout, so nothing races
+/// this — and after the `--daemon` flush that descriptor is `O_APPEND`, so
+/// whatever it writes next lands at offset 0 rather than past a hole (pinned
+/// directly, without a daemon, in `launch.rs`'s own case).
+#[test]
+fn a_daemon_flush_and_a_flock_flush_never_reach_each_others_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let gate = home.join("flushed");
+    let script = write_rotating_script(&dir, &gate);
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("flusher")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    let online = poll_flock(home, |info| info["status"] == "online");
+    let out_file = PathBuf::from(
+        online["out_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the daemon reports its own log paths: {online}")),
+    );
+    // Read back rather than assumed: this is the precondition both halves of
+    // the case are measured against.
+    let before = bleats_no_follow_until_written(home, &["all"]);
+    assert!(
+        String::from_utf8_lossy(&before.stdout).contains(ROTATE_BEFORE),
+        "precondition: the sheep must have logged something to lose"
+    );
+
+    const MARKER: &[u8] = b"a line only the shepherd's own log holds\n";
+    let shepd_out = home.join("logs/shepd.out.log");
+    let shepd_err = home.join("logs/shepd.err.log");
+    std::fs::write(&shepd_out, MARKER).unwrap();
+    std::fs::write(&shepd_err, MARKER).unwrap();
+
+    let flock_half = shep(home).arg("flush").arg("all").output().unwrap();
+    assert_success(&flock_half);
+    assert_eq!(
+        std::fs::metadata(&out_file).unwrap().len(),
+        0,
+        "the flock half must still empty the sheep it named"
+    );
+    // Table mode, deliberately: the paths ride the JSON whatever the table
+    // does, so only the default rendering can show this regressing. An
+    // operator who ran a flush and was handed STATUS/PID/UPTIME was told
+    // nothing about the files it destroyed — which matters most exactly when
+    // an `out_file` was mistyped and the emptied path is not a log at all.
+    let printed = String::from_utf8_lossy(&flock_half.stdout);
+    assert!(
+        printed.contains(&out_file.display().to_string()),
+        "a flush table must name the files it emptied: {printed}"
+    );
+    assert_eq!(
+        std::fs::read(&shepd_out).unwrap(),
+        MARKER,
+        "a flock flush must not reach the shepherd's own stdout log"
+    );
+    assert_eq!(
+        std::fs::read(&shepd_err).unwrap(),
+        MARKER,
+        "a flock flush must not reach the shepherd's own stderr log"
+    );
+
+    // Now the other direction. The sheep is gated shut and has written
+    // nothing since the truncate above, so its log staying empty is not what
+    // is asserted — its log is refilled first, so "untouched" is a fact with
+    // bytes behind it.
+    std::fs::write(&gate, "").unwrap();
+    let after = bleats_no_follow_until_written(home, &["all"]);
+    assert!(
+        String::from_utf8_lossy(&after.stdout).contains(ROTATE_AFTER),
+        "the sheep must have written again before the --daemon flush"
+    );
+    let sheep_len = std::fs::metadata(&out_file).unwrap().len();
+    assert!(sheep_len > 0, "precondition: the sheep's log is not empty");
+
+    let daemon_half = shep(home)
+        .arg("flush")
+        .arg("--daemon")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert_success(&daemon_half);
+    let envelope: serde_json::Value = serde_json::from_slice(&daemon_half.stdout).unwrap();
+    assert_eq!(envelope["command"], "flush", "{envelope}");
+    let files: Vec<&str> = envelope["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["file"].as_str().unwrap())
+        .collect();
+    assert!(
+        files.contains(&shepd_out.display().to_string().as_str())
+            && files.contains(&shepd_err.display().to_string().as_str()),
+        "the answer must name both files it emptied: {envelope}"
+    );
+
+    assert_eq!(std::fs::metadata(&shepd_out).unwrap().len(), 0);
+    assert_eq!(std::fs::metadata(&shepd_err).unwrap().len(), 0);
+    assert_eq!(
+        std::fs::metadata(&out_file).unwrap().len(),
+        sheep_len,
+        "a --daemon flush must not reach any sheep's log"
+    );
+
+    graceful_kill(home);
+}
+
+/// Fails if `shep flush --daemon` grows a daemon round trip — a
+/// `connect_client` on its dispatch arm, or a `Request` of its own.
+///
+/// Emptying the shepherd's own logs is the one flush that must work while the
+/// shepherd is down, which is when an operator most often reaches for it: a
+/// daemon that filled a disk with its own diagnostics is not answering. The
+/// files belong to the CLI (`launch::launch_command` creates them), so there
+/// is nothing to ask. That no socket appears is asserted as well as the exit
+/// code, because a `connect_or_spawn` on this arm would autostart a daemon in
+/// order to be told to do nothing.
+#[test]
+fn a_daemon_flush_needs_no_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let logs = home.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("shepd.out.log"),
+        b"left behind by a dead shepherd",
+    )
+    .unwrap();
+
+    let flushed = shep(home).arg("flush").arg("--daemon").output().unwrap();
+
+    assert_success(&flushed);
+    assert_eq!(
+        std::fs::metadata(logs.join("shepd.out.log")).unwrap().len(),
+        0
+    );
+    assert!(
+        !home.join("run/shep.sock").exists(),
+        "this verb must not autostart a daemon to empty files the CLI owns"
+    );
+}
+
+/// Fails if `shep flush` ever runs without a selector.
+///
+/// The one command in this CLI whose slip of the finger cannot be undone, so
+/// it is pinned through the real binary and not only in clap's unit tests: a
+/// `default_value` added to the verb would make a bare `shep flush` empty
+/// every log file in the flock and exit 0. No daemon is started, because
+/// none is needed — clap refuses this before anything connects, and that it
+/// never reaches the socket is part of what is being asserted.
+#[test]
+fn flush_without_a_selector_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let bare = shep(dir.path()).arg("flush").output().unwrap();
+
+    assert_eq!(
+        bare.status.code(),
+        Some(2),
+        "clap's usage exit code; stdout={}",
+        String::from_utf8_lossy(&bare.stdout)
+    );
+    assert!(
+        !dir.path().join("run/shep.sock").exists(),
+        "a usage error must not have autostarted a daemon"
+    );
+}
+
 // --- Case 8 --------------------------------------------------------------
 
 /// `shep --home <tmp> start <script>` autostarts a daemon whose socket is
@@ -1776,13 +2513,21 @@ fn a_cron_occurrence_restarts_a_sheep_on_the_real_clock() {
 /// after it, and the cron case above has never been observed finishing
 /// sooner, so it has yet to be what any run of this file waited on.
 ///
+/// It reads the daemon's own log, as cases 16 and 17 do — but it is the only
+/// one that reads a record for its *contents* rather than for its presence,
+/// and the only one whose record is a consequence of the behaviour under test
+/// rather than a provocation staged to produce it. The breach record carries
+/// the observed RSS and the ceiling it crossed, which no bus event does, and
+/// it is written on this very restart.
+///
 /// What a broken implementation this would catch: a `SysinfoSampler` that
 /// stopped reading the real process table; an `arm_instance` that never
 /// reached the real enforcer from the real `Online` transition; a breach that
 /// reached the reporter and was logged rather than restarted; an enforcer
 /// armed against the sheep's id where its pid belongs, which
 /// `extra_restart`'s own pid guard would then silently drop for the whole
-/// life of the daemon.
+/// life of the daemon; and a daemon that renders none of its own records,
+/// because no subscriber was installed or its sink was not stderr.
 // fails if `SysinfoSampler::sample` stops reading the machine's process table
 // — verified by replacing its body with `Vec::new()`, which reddens this case
 // plus two unit tests: the sampler's own smoke test, and `extras`'
@@ -1840,5 +2585,181 @@ fn a_real_memory_breach_restarts_a_sheep() {
          share is the script dying, not its ceiling being enforced: {after}"
     );
 
+    // The daemon's own log, end to end: `commands::daemon` installs the
+    // subscriber on stderr, `launch.rs` redirects the re-exec'd daemon's
+    // stderr into this file, and the breach record is the ONLY place the
+    // observed RSS and the ceiling it crossed are ever stated — the bus event
+    // says `restart` and never why.
+    //
+    // Read rather than polled: `spawn_extras_reporter` writes the record
+    // BEFORE it asks for the restart, so the counter above reaching 1 has
+    // already ordered the write ahead of this read.
+    //
+    // fails if no subscriber is installed at all — a user watching a sheep
+    // restart over and over then has nothing, anywhere, telling them it is
+    // memory — and fails if the daemon's records stop going to stderr, which
+    // is the one sink `launch.rs` captures.
+    //
+    // It also fails if `main::run`'s `daemon` arm goes back to holding a
+    // `stderr().lock()` guard for the daemon's whole life. That guard makes
+    // this very record block forever on a worker thread and wedges the
+    // daemon, which this case sees as the *next* `shep flock` failing its
+    // handshake rather than as an empty file — the wedge is what turned an
+    // empty log into a dead supervisor.
+    let daemon_log = std::fs::read_to_string(home.join("logs").join("shepd.err.log")).unwrap();
+    assert!(
+        daemon_log.contains("exceeded its max_memory"),
+        "the daemon's own log must say why the sheep was restarted: {daemon_log:?}"
+    );
+    assert!(
+        daemon_log.contains("limit="),
+        "the record must carry the ceiling that was crossed: {daemon_log:?}"
+    );
+
     graceful_kill(home);
+}
+
+// --- Case 16 -------------------------------------------------------------
+
+/// `SHEP_LOG_JSON=1` renders the daemon's own records as JSON — one object per
+/// line, in the file `launch.rs` redirects the daemon's stderr into.
+///
+/// `shep-core` already pins that `SHEP_LOG_JSON` *parses* into
+/// `DaemonConfig::daemon::log_json`, and [`a_real_memory_breach_restarts_a_sheep`]
+/// already pins that a record reaches `shepd.err.log` at all. Between the two
+/// sat the knob's actual job — choosing a renderer — which nothing asserted:
+/// dropping the `.json()` call left the whole workspace green while the flag
+/// silently did nothing.
+///
+/// Every non-empty line is parsed, not only the one under test. `log_json`
+/// exists so `shepd.err.log` can be read by a machine, and a file where one
+/// line in twenty is prose is not that file — the assertion has to be about
+/// the stream, not about a record that happens to be well-formed.
+///
+/// What a broken implementation this would catch: a `log_json` branch that
+/// selects the human renderer anyway (no line parses); a subscriber whose
+/// records go somewhere other than the stderr `launch.rs` captures (the file
+/// is empty); and a `--format json` error envelope torn in half by a record
+/// written from a worker thread mid-write, which is the one way this file
+/// could gain a line that is *almost* JSON.
+// fails if `install_log_subscriber` stops selecting the JSON renderer for
+// `log_json` — verified by replacing `builder.json().try_init()` with
+// `builder.try_init()`, which reddens this case, and only this case, across
+// `cargo test --workspace --all-features`.
+#[test]
+fn shep_log_json_makes_the_daemons_own_records_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = daemon_log_after_a_missed_handshake(&dir, &[("SHEP_LOG_JSON", "1")]);
+
+    let lines: Vec<&str> = log.lines().filter(|line| !line.trim().is_empty()).collect();
+    assert!(
+        !lines.is_empty(),
+        "the daemon must have written something to read: {log:?}"
+    );
+    let records: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|err| {
+                panic!("every line of shepd.err.log must be JSON under log_json: {line:?} ({err})")
+            })
+        })
+        .collect();
+    assert!(
+        records.iter().any(|record| {
+            record["level"] == "WARN"
+                && record["fields"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(READINESS_RECORD))
+        }),
+        "the readiness record must survive as a JSON object with its level and \
+         message intact: {records:?}"
+    );
+}
+
+// --- Case 17 -------------------------------------------------------------
+
+/// The daemon's own records reach `shepd.err.log` with no ANSI escapes in
+/// them.
+///
+/// `install_log_subscriber` passes `.with_ansi(ansi_enabled(..))`, and
+/// `tracing_subscriber`'s own default is colour ON whenever its `ansi`
+/// feature is compiled in — it does not consult the terminal by itself. So
+/// deleting that one call, or handing it a `true`, fills the daemon's log
+/// with escape sequences: unreadable in `less`, and a trap for every
+/// substring assertion in this file, since an escape can land in the middle
+/// of a field name.
+///
+/// Asserted on purpose here because it is otherwise pinned only by accident.
+/// `a_real_memory_breach_restarts_a_sheep` checks its log for `limit=`, which
+/// escapes happen to break — an incidental guard, one rewritten assertion
+/// away from being gone, and one that names colour nowhere.
+///
+// fails if `install_log_subscriber` drops its `.with_ansi(..)` call, or
+// passes a constant `true` in place of `ansi_enabled`.
+#[test]
+fn the_daemons_own_log_carries_no_ansi_escapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = daemon_log_after_a_missed_handshake(&dir, &[]);
+
+    assert!(
+        log.contains(READINESS_RECORD),
+        "precondition: the daemon must have written a record to colour: {log:?}"
+    );
+    assert!(
+        !log.contains('\x1b'),
+        "a log file is not a terminal: {log:?}"
+    );
+}
+
+/// `SHEP_LOG_LEVEL` decides which of the daemon's records survive: the same
+/// `WARN` is written at the default level and filtered out at `error`.
+///
+/// The env variable, not the `[daemon] log_level` file key it overrides —
+/// that is all this body sets, and it is all this file can set: no case here
+/// writes a `shep.toml` at all, so every `[daemon]` key reaches the daemon
+/// through `SHEP_*` layering or not at all. What that leaves uncovered end to
+/// end is the file half of `DaemonConfig` — discovery, parse, and the
+/// precedence between a file value and the variable that overrides it — which
+/// is pinned in `shep-core`'s own tests and nowhere above them.
+///
+/// Both halves provoke the identical record on identical configuration, so the
+/// only thing that differs between them is the knob — which is what makes the
+/// absent half mean "filtered" rather than "never happened". A one-sided case
+/// asserting only the absence would pass just as well against a daemon that
+/// had stopped writing the record at all, and one asserting only the presence
+/// would pass against a hard-coded filter.
+///
+/// `error` rather than `off` on purpose: `off` also happens to be what an
+/// `EnvFilter` built from an empty or unparseable directive degrades toward,
+/// so a half that only proved silence would be consistent with the level never
+/// having been read. `error` is a level with records above and below it, and
+/// the record under test sits on the far side.
+///
+/// What a broken implementation this would catch: a filter built from a
+/// literal instead of from the configured level (the `error` half still logs);
+/// a `SHEP_LOG_LEVEL` parsed into config and then never handed to the
+/// subscriber, which is the same silent-knob shape `log_json` had (same
+/// observable); and a subscriber installed with no filter at all (both halves
+/// log, plus every `debug!` in the daemon).
+// fails if `install_log_subscriber` stops building its filter from
+// `config.daemon.log_level` — verified by replacing
+// `EnvFilter::new(config.daemon.log_level.as_str())` with
+// `EnvFilter::new("warn")`, which reddens this case, and only this case,
+// across `cargo test --workspace --all-features`.
+#[test]
+fn shep_log_level_decides_which_of_the_daemons_records_survive() {
+    let at_default = tempfile::tempdir().unwrap();
+    let default_log = daemon_log_after_a_missed_handshake(&at_default, &[]);
+    assert!(
+        default_log.contains(READINESS_RECORD),
+        "a warn-level record must reach the log at the default level: {default_log:?}"
+    );
+
+    let at_error = tempfile::tempdir().unwrap();
+    let error_log = daemon_log_after_a_missed_handshake(&at_error, &[("SHEP_LOG_LEVEL", "error")]);
+    assert!(
+        !error_log.contains(READINESS_RECORD),
+        "SHEP_LOG_LEVEL=error must filter out the same warn-level record the \
+         default level lets through: {error_log:?}"
+    );
 }

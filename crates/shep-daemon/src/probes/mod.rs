@@ -37,9 +37,10 @@
 //! | Budget | untouched | **reset** — a liveness restart is a restart command, and every one of those resets it |
 //!
 //! The readiness timeout does log a `warn!` before going online, and that
-//! record currently reaches nobody: this workspace wires no
-//! `tracing-subscriber`, so a sheep that came up only because its deadline
-//! elapsed is indistinguishable, from outside, from one that answered.
+//! record is the only thing telling the two apart: a sheep that came up
+//! because its deadline elapsed reaches the same `online` status, and emits
+//! the same bus event, as one that answered. The binary renders it into
+//! `$SHEP_HOME/logs/shepd.err.log` at the default `warn` level.
 //!
 //! Treating a slow start as a failure produces exactly the restart loop
 //! `max_restarts` exists to contain, out of an app that is merely slow, so

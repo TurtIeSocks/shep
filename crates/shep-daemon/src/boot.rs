@@ -44,16 +44,16 @@ use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::BusEvent;
+use shep_core::selector::ProcessSelector;
 
 use crate::bus::new_bus;
 use crate::cron::DEFAULT_MAX_CRON_SLEEP;
@@ -62,7 +62,7 @@ use crate::rpc::RpcContext;
 use crate::runner::ProcessRunner;
 use crate::server::RpcServer;
 use crate::snapshot::{self, FlockRegistry, SnapshotError, SnapshotWriter, spawn_snapshot_writer};
-use crate::supervisor::{SupervisorBuilder, SupervisorHandle};
+use crate::supervisor::{SupervisorBuilder, SupervisorError, SupervisorHandle};
 
 /// Mode for every directory shep creates (spec §10: no other user, at all)
 pub const DIR_MODE: u32 = 0o700;
@@ -501,7 +501,12 @@ pub struct BootOptions {
 ///    an owned [`std::fs::File`] the CALLER adopted before ever
 ///    constructing [`BootOptions`] (see that field's own doc) — this step
 ///    is a plain write, no fd adoption happens inside `boot` itself;
-/// 4. bus, supervisor, muster restore, snapshot writer, `RpcContext`.
+/// 4. bus, supervisor, muster restore, snapshot writer, `RpcContext` — and
+///    the point where step 1's SIGUSR2 listener is handed the supervisor it
+///    reopens through, this being the first moment one exists. See
+///    `install_signals`'s own doc, next to its definition in this file, for
+///    why that seam is a channel rather than an argument, and why the gap
+///    between the two steps drops no signal.
 ///
 /// # Errors
 /// - [`BootError::Io`] — a boot filesystem step failed, or the OS refused
@@ -522,7 +527,7 @@ pub async fn boot<R: ProcessRunner>(
     //    observable) exists — see this fn's own doc.
     let (shutdown, shutdown_rx) = watch::channel(false);
     let shutdown = Arc::new(shutdown);
-    let signals = install_signals(Arc::clone(&shutdown), paths.clone())?;
+    let (signals, connect_supervisor) = install_signals(Arc::clone(&shutdown), paths.clone())?;
 
     // 2. Layout, then claim exclusive ownership of $SHEP_HOME BEFORE
     //    touching the socket at all — see `PidfileLock`'s own doc for why
@@ -582,6 +587,16 @@ pub async fn boot<R: ProcessRunner>(
     // is named after; a future teardown that relied on senders going away
     // would hang here instead.
     spawn_extras_reporter(breach_rx, live_rx, supervisor.clone());
+
+    // The other half of step 1's SIGUSR2 listener, which has been parked on
+    // this since before the socket existed, waiting for the handle it reopens
+    // through — see `install_signals`'s own doc for why the wait is what the
+    // step order forces and why it drops no signal. An `Err` would mean that
+    // listener is already gone, which cannot happen while `signals` — moved
+    // into the `RunningDaemon` below, and the only thing that aborts it — is
+    // still alive.
+    let _ = connect_supervisor.send(supervisor.clone());
+
     let registry = FlockRegistry::new();
 
     if options.restore {
@@ -845,17 +860,10 @@ fn unlink_if_present(path: &Path) -> Result<(), BootError> {
 /// a LATER step inside `boot` itself (a failed `bind_socket` after signals
 /// were already installed, say): dropping the partially-built value in that
 /// path must not leak a task per boot attempt, which is exactly what
-/// happened before this type existed (a bare `Arc<AtomicU64>` return value
-/// with the actual `JoinHandle`s discarded at the spawn site).
+/// happened before this type existed (a bare counter returned by value, with
+/// the actual `JoinHandle`s discarded at the spawn site).
 #[derive(Debug)]
 struct SignalTasks {
-    // SIGUSR2 reopen requests observed since boot. Write-only today by
-    // design, not by oversight: the per-sheep log `flush`/`reopen` work
-    // (spec §5) is the reader this is waiting for, and it has not been
-    // built. `#[allow(dead_code)]` says so explicitly rather than
-    // inventing an accessor nothing calls yet.
-    #[allow(dead_code)]
-    reopens: Arc<AtomicU64>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -878,10 +886,30 @@ impl Drop for SignalTasks {
 ///
 /// SIGUSR2's DEFAULT disposition is to terminate the process, so installing
 /// this handler is load-bearing on its own: without it, an operator's
-/// `kill -USR2` (or `shep reopen`) kills the daemon instead of rotating
-/// logs. Full per-sheep handle reopening lands with `flush`/`reopen` (Phase
-/// 4); today this only re-creates a missing log dir, counts the request,
-/// and logs it.
+/// `kill -USR2` — or a logrotate `postrotate` stanza — kills the daemon
+/// instead of rotating logs. A signal carries no selector, so it can only
+/// mean [`ProcessSelector::All`], and that is exactly what it asks the
+/// supervisor for: every sheep's log pump swaps both of its file handles,
+/// the same work `shep reopen all` does. There is no reply channel either,
+/// so the outcome is logged rather than reported to anyone.
+///
+/// # The supervisor arrives after the handler does
+///
+/// Returned alongside the tasks: the sender that hands the SIGUSR2 listener
+/// the [`SupervisorHandle`] it reopens through. This function runs at
+/// [`boot`]'s step 1, deliberately before the socket — or anything else —
+/// exists, and the supervisor is not built until step 4, so no handle can be
+/// passed in here. The listener parks on the matching receiver instead, and
+/// `boot` connects the two once it has a handle to give.
+///
+/// That wait costs no delivery. The `signal()` call below is what replaces
+/// SIGUSR2's disposition, and it has already done so by the time this
+/// function returns; tokio coalesces every notification arriving before the
+/// first `poll` into one item that the first `recv()` then yields. A SIGUSR2
+/// raced into the window between step 1 and step 4 is therefore served late,
+/// never dropped. A `boot` that FAILS before step 4 drops the sender instead
+/// and the listener ends — with the libc disposition still replaced, which
+/// is the half that matters for a process on its way out.
 ///
 /// **Each listener stays armed for the rest of the process's life
 /// (Decision 3, 2026-08-08).** A signal handler, once installed, is
@@ -909,9 +937,8 @@ impl Drop for SignalTasks {
 fn install_signals(
     shutdown: Arc<watch::Sender<bool>>,
     paths: ShepPaths,
-) -> Result<SignalTasks, BootError> {
+) -> Result<(SignalTasks, oneshot::Sender<SupervisorHandle>), BootError> {
     let mut signals = SignalTasks {
-        reopens: Arc::new(AtomicU64::new(0)),
         tasks: Vec::with_capacity(4),
     };
 
@@ -963,21 +990,38 @@ fn install_signals(
         path: paths.home.clone(),
         source,
     })?;
-    let task_reopens = Arc::clone(&signals.reopens);
-    let logs = paths.logs.clone();
+    let (connect_supervisor, supervisor_rx) = oneshot::channel::<SupervisorHandle>();
     signals.tasks.push(tokio::spawn(async move {
+        // Parked until `boot` reaches step 4 — see this fn's own doc for why
+        // the wait loses no signal, and for what an `Err` here means.
+        let Ok(supervisor) = supervisor_rx.await else {
+            return;
+        };
         while usr2.recv().await.is_some() {
-            task_reopens.fetch_add(1, Ordering::SeqCst);
-            if let Err(err) = create_dir_at_dir_mode(&logs) {
-                tracing::warn!(%err, path = %logs.display(), "SIGUSR2: could not recreate log dir");
+            // A rotator that moved the whole log DIRECTORY needs it back at
+            // `DIR_MODE`, and the pump this reaches is what puts it there —
+            // its own open asks `mkdir` for the mode (see `open_append`).
+            // Recreating it here as well would be a second owner of the same
+            // guarantee, differing from the pump's for any sheep logging
+            // outside the layout.
+            match supervisor.reopen(ProcessSelector::All).await {
+                Ok(reopened) => tracing::info!(
+                    reopened = reopened.len(),
+                    "SIGUSR2: every sheep's log files reopened"
+                ),
+                // An empty flock is an idle daemon's ordinary state, not
+                // something a nightly `postrotate` should warn about.
+                Err(SupervisorError::NotFound) => {
+                    tracing::info!("SIGUSR2: no sheep to reopen");
+                }
+                // A signal carries no reply channel, so this log is the whole
+                // report — nobody is waiting to be told.
+                Err(err) => tracing::warn!(%err, "SIGUSR2: log reopen failed"),
             }
-            tracing::info!(
-                "SIGUSR2 received: log reopen requested (per-sheep reopening is not built yet)"
-            );
         }
     }));
 
-    Ok(signals)
+    Ok((signals, connect_supervisor))
 }
 
 /// Error type returned from this module's boot steps
@@ -1047,7 +1091,8 @@ mod tests {
     use super::*;
     use crate::fake::{ProcScript, ScriptedRunner};
     use crate::snapshot::{FlockSnapshot, SNAPSHOT_VERSION, SavedApp};
-    use crate::testing::test_paths; // the one crate-root fixture (IR-33)
+    // the one crate-root fixture (IR-33)
+    use crate::testing::{SharedRunner, test_paths};
     use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, normalize};
     use shep_core::protocol::ProcessEventKind;
     use shep_core::values::UpDuration;
@@ -1619,7 +1664,11 @@ mod tests {
         let paths = test_paths(&dir);
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let shutdown = Arc::new(shutdown);
-        let signals = install_signals(shutdown, paths).unwrap();
+        // The SIGUSR2 half of the return is dropped unused: this case drives
+        // the shutdown listeners only, and a dropped sender simply ends the
+        // SIGUSR2 listener that is parked on its receiver (see
+        // `install_signals`'s own doc) without disturbing the three below.
+        let (signals, _connect_supervisor) = install_signals(shutdown, paths).unwrap();
 
         // First SIGTERM: starts shutdown, exactly as before this decision.
         nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
@@ -1767,6 +1816,89 @@ mod tests {
             .expect("a failing liveness probe must restart its sheep");
         assert_eq!(info.id, 0);
         assert_eq!(info.restarts, 1);
+
+        ctx.shutdown();
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    // fails if SIGUSR2 stops meaning `reopen all`: a listener that logs the
+    // signal and reaches no pump, one wired to a narrower selector, or a
+    // `boot` that never hands the listener the supervisor it reopens through
+    // (the step-1/step-4 seam). Nothing else in this workspace drives that
+    // seam — `shep reopen` reaches the same supervisor over the socket
+    // instead, so every RPC-tier reopen test stays green with the signal path
+    // dead.
+    //
+    // Both instances are asserted, not just one: `All` is the whole claim,
+    // and a listener that reopened the first sheep it found would satisfy
+    // half of it.
+    #[tokio::test]
+    async fn sigusr2_reopens_every_sheeps_log_files() {
+        // Real time + a real signal, so it takes the lock like every other
+        // successful `boot()` here — see SIGNAL_TEST_LOCK's own doc: this
+        // raise() is process-wide. Raising SIGUSR2 is safe only because
+        // `boot` below has already returned, having replaced a default
+        // disposition that would otherwise kill the test binary outright.
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+
+        // TWO scripts for two instances, counted against what a BROKEN
+        // implementation demands rather than a working one: `ScriptedRunner`
+        // answers `SpawnFailed("script exhausted")` once it runs out, which
+        // lands that sheep `Errored` with no log pump at all — a state this
+        // case could not tell apart from the pump nobody asked to reopen.
+        // The `log_ctl_live` assertions below are the other half of that
+        // guard: they say a pump is there to be reached before the signal is
+        // ever raised.
+        let runner = Arc::new(ScriptedRunner::new(vec![ProcScript::never_exits(); 2]));
+        let daemon = boot(
+            SharedRunner(Arc::clone(&runner)),
+            paths.clone(),
+            BootOptions::default(),
+        )
+        .await
+        .unwrap();
+        let ctx = daemon.context();
+        let run = tokio::spawn(daemon.run());
+
+        let mut web = AppConfig::minimal("web", "./srv");
+        web.instances = 2;
+        ctx.supervisor
+            .start(vec![normalize(web).unwrap()])
+            .await
+            .unwrap();
+        for instance in 0..2 {
+            assert!(
+                runner.log_ctl_live(instance),
+                "instance {instance} must have a live log pump before the signal, or this \
+                 case proves nothing"
+            );
+            assert_eq!(
+                runner.reopens(instance),
+                0,
+                "instance {instance} must not have been reopened before the signal"
+            );
+        }
+
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGUSR2).unwrap();
+
+        // Polled rather than awaited: a signal has no reply channel, so
+        // there is nothing to await on — the counters are the only place the
+        // reopen becomes visible. Bounded, so a listener that never reaches a
+        // pump fails here instead of hanging.
+        let both_reopened = async {
+            while runner.reopens(0) == 0 || runner.reopens(1) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), both_reopened)
+            .await
+            .expect("SIGUSR2 must reopen every sheep's log files");
 
         ctx.shutdown();
         tokio::time::timeout(Duration::from_secs(10), run)

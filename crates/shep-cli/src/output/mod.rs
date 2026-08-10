@@ -31,7 +31,7 @@ use crate::exit::ExitCode;
 // name-resolution lint, unlike `dead_code`'s reachability one) still flags
 // it there — narrowed to that target rather than dropped.
 #[cfg_attr(windows, allow(unused_imports))]
-pub use rows::{DeletedIds, FlockRows, KillRow, PingRow};
+pub use rows::{DeletedIds, EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, KillRow, PingRow};
 pub use table::{human_duration, render_table};
 
 use crate::cli::Format;

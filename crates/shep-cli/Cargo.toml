@@ -32,12 +32,18 @@ clap = { version = "4", default-features = false, features = ["std", "derive", "
 # 4.0.0 without this pin and fails with "cannot find `aot` in `clap_complete`".
 clap_complete = { version = "4.6.0", default-features = false }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
-# `EventStream` implements `futures_util::Stream`; the `.next()` method comes
-# from `futures_util::StreamExt`, which nothing else in this crate's
-# dependency graph re-exports (tokio dropped its own `StreamExt` at 1.0, and
-# shep-client's transitive futures-util is not nameable from here). The
-# Ctrl-C wiring (`tokio::signal::ctrl_c().map(|_| ())`) needs `FutureExt`
-# from the same crate.
+# The one GLOBAL subscriber install in the workspace, in `commands::daemon`
+# (shep-daemon's own `testing::capture_logs` installs a scoped one per test).
+# Every feature the workspace entry names is live there: `fmt` renders,
+# `env-filter` turns `[daemon] log_level` into a filter, `json` is the
+# `log_json` branch, and `ansi` is colour when stderr is a terminal and
+# `NO_COLOR` says nothing to the contrary.
+tracing-subscriber.workspace = true
+# `bleats.rs`'s `stream.next()` now comes from `EventStream::next`, an
+# inherent method shep-client provides directly — no `StreamExt` import
+# needed here any more. This dependency stays for `FutureExt`: the Ctrl-C
+# wiring (`tokio::signal::ctrl_c().map(|_| ())`) still needs it, and
+# nothing else in this crate's dependency graph exposes it.
 futures-util.workspace = true
 # `Render: Serialize` needs the trait and its derive, not just the
 # serializer — `serde_json` alone does not bring either.
@@ -66,3 +72,13 @@ nix.workspace = true
 
 [lints]
 workspace = true
+
+# `cfg(any())` never matches any target, so nothing here is ever compiled into any real
+# build — but Cargo's resolver still walks these entries when computing the dependency
+# graph, including under `-Z minimal-versions`. Same mechanism shep-daemon uses for its
+# own two floor pins. Here it forces `lazy_static` past the versions whose plainly
+# exported `lazy_static!` breaks `sharded-slab`'s path import (root Cargo.toml's comment
+# on the entry has the exact mechanism). Safe to drop once `sharded-slab` corrects its
+# own declared floor.
+[target.'cfg(any())'.dependencies]
+lazy_static.workspace = true

@@ -70,9 +70,10 @@ type Frames = FramedRead<OwnedReadHalf, LengthDelimitedCodec>;
 /// unbounded work compiling it: a `Subscribe`'s topic-glob *count* (not the
 /// byte length of any individual pattern, which is unbounded short of
 /// `MAX_FRAME_BYTES`) is capped at [`crate::bus::MAX_TOPIC_PATTERNS`], and a
-/// `/regex/` [`shep_core::protocol::SelectorSpec`] on `Start`/`Stop`/
-/// `Restart`/`Delete` is capped at a 1 MiB compiled size by
-/// [`shep_core::selector::ProcessSelector`]'s `TryFrom<SelectorSpec>` impl.
+/// `/regex/` [`shep_core::protocol::SelectorSpec`] — on every verb that
+/// carries one, without exception — is capped at a 1 MiB compiled size by
+/// [`shep_core::selector::ProcessSelector`]'s `TryFrom<SelectorSpec>` impl,
+/// which is the single door from the wire type to the matcher.
 /// Every call carries
 /// a clamped deadline ([`crate::rpc::budget`]). The one place this daemon
 /// writes secrets to disk — an app's `env`, verbatim, so a muster restore

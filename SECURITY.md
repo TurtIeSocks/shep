@@ -25,7 +25,10 @@ credentials (`SO_PEERCRED` / `getpeereid`), THEN:
 
 These properties hold only while the preconditions hold. A daemon started as
 root, a runtime directory created with looser permissions, or a socket
-reachable by other uids invalidates them.
+reachable by other uids invalidates them. Running as root is not entirely
+unhandled: the log plane refuses paths a privileged shepherd should not be
+writing below (see Log files). Nothing it does there restores the premises
+above.
 
 ## Per-component
 
@@ -57,8 +60,99 @@ managed process writes to its own standard streams. If a sheep prints a
 secret to stdout, that secret lands in its log file — the daemon does not
 scan or redact application output. Daemon-authored log lines (startup,
 lifecycle events, RPC errors) follow the redaction rule above and do not
-include env values or tokens. Log files inherit the permissions of
-`$SHEP_HOME`; they are not independently access-controlled.
+include env values or tokens.
+
+Inside the default layout, a log file is not independently access-controlled.
+It sits in `$SHEP_HOME/logs/`, which is created `0700` at `mkdir` time, and
+that directory is the whole of its protection; the file's own mode is
+whatever the umask allows.
+
+Outside the layout, no such directory stands between the file and anyone
+else. An app's `out_file`/`err_file` are free-form config taken verbatim,
+pointing a sheep's logs at `/var/log/myapp.log` is supported, and shep
+neither moves such a path into the layout nor tightens a directory it did not
+create. A log file under a directory anyone can write to is readable, and
+replaceable, by anyone who can write there. Naming a path outside
+`$SHEP_HOME/logs/` means taking that directory's access control instead of
+shep's.
+
+What shep does guarantee about a log path, wherever it points:
+
+- **Every directory it creates on the way is created `0700`**, with the mode
+  asked for at `mkdir` time rather than chmod'd afterwards, so the directory
+  never exists at the umask's wider mode. A directory that already existed is
+  left exactly as it was, permissions included.
+- **It will not follow a symlink standing at the log path itself.** Both
+  openers pass `O_NOFOLLOW` (the log pump's appending handle, and the one
+  `shep flush` opens to truncate), so a symlink planted where the log file
+  was going to be fails the open instead of redirecting the write. The
+  symlink and its target are left alone, and the failure names the path and
+  says the word symlink, since an operator may have put that symlink there on
+  purpose.
+- **It will not open a log file below an ancestry another local user could
+  redirect, when the daemon is running as root.** An ancestor counts as
+  loose when it is owned by neither the daemon's uid nor root, or when it is
+  a world-writable directory. Components are judged as themselves, so a
+  symlinked intermediate directory is caught by its own owner.
+
+What that does not cover:
+
+- `O_NOFOLLOW` guards only the final path component. A symlinked parent
+  directory still resolves. The ancestry check above is what covers that
+  case, and only for a privileged daemon.
+- The ancestry check is a check, not an atomic resolve, so a TOCTOU window
+  remains between it and the open. Closing it needs
+  `openat2(RESOLVE_NO_SYMLINKS)`, which is Linux-only, and macOS is a tier-1
+  platform here.
+- **An unprivileged daemon warns rather than refuses.** A loose ancestry is
+  an escalation only when the daemon is privileged; a shepherd running as an
+  ordinary user that logs into a shared directory has handed nobody anything
+  they could not already do as that user. It is a footgun, and shep says so
+  once per path at the default log level, but it is not blocked. Refusing
+  would break logging to `/tmp` as yourself, which is legitimate.
+- **Dropping privileges does not move any of this.** An app's `user`/`group`
+  changes what the child runs as, and the child never sees its log file. Log
+  I/O is the daemon's, on the far side of a pipe, and happens with the
+  daemon's own privileges regardless.
+
+`shep flush` empties exactly the paths the Flockfile named, so a mistyped
+`out_file` makes it truncate that file. Its table names every path it emptied
+for that reason. The shepherd's own `shepd.out.log`/`shepd.err.log` are not
+reachable by any selector; `shep flush --daemon` is the only thing that
+empties those.
+
+### Rotating logs from outside shep
+
+A rotator that renames or copy-truncates a log file has to tell the daemon,
+or the pump keeps filling the inode it renamed away. Two forms do that, and
+they are not equivalent. Prefer the command:
+
+```
+postrotate
+    shep reopen all
+endscript
+```
+
+`shep reopen` waits until every matched pump has closed both handles and
+opened both paths again, and it reports what came of that: exit `0` means
+nothing is still holding what the rotator renamed, and exit `9` names every
+sheep and path that could not be opened again, on stderr.
+That is the whole reason to spend a process on it. A sheep writing its stream
+nowhere is exactly the failure a nightly rotation must not swallow, and a
+rotator that checks the exit code catches it the same night.
+
+`kill -USR2 <shepherd pid>` does the same work at the `all` selector and is
+the fire-and-forget form: a signal carries no reply, so there is nothing to
+wait on and nothing to check. It gives the operator nothing on failure. The
+daemon logs the outcome instead, a failed reopen at `warn` so it is visible
+at the default level, but a successful one at `info`, which the default
+`log_level = "warn"` filters out. Confirming a signal-driven rotation worked
+therefore means setting `log_level = "info"` and reading `shepd.err.log`. The
+success line stays at `info` because a routine success is not a warning, and
+promoting it would misreport its severity.
+
+Either form leaves the sheep's own handle `O_APPEND`, so a `copytruncate`
+rotator's next line lands at offset 0 rather than past a hole.
 
 ### Muster roll (`flock.json`)
 

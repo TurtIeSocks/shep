@@ -6,15 +6,16 @@
 
 use core::fmt;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Duration, Instant, sleep_until};
 
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::runner::{
-    ExitOutcome, LogLine, ProcIo, ProcessRunner, RunnerError, RunningProcess, SpawnSpec, StopSignal,
+    ExitOutcome, LogCtl, LogLine, ProcIo, ProcessRunner, RunnerError, RunningProcess, SpawnSpec,
+    StopSignal,
 };
 
 /// Capacity of every channel the fake wires up — generous enough that no
@@ -37,6 +38,10 @@ pub struct ProcScript {
     pub outcome: ExitOutcome,
     /// Whether the process honors `signal()`/`Shutdown` by exiting early
     pub obeys_signal: bool,
+    /// Whether a forked lamb keeps the child's stdout and stderr open past
+    /// the child's own exit, so neither stream ever reaches EOF. See
+    /// [`ProcScript::with_a_lamb_holding_the_pipe`].
+    pub lamb_holds_the_pipe: bool,
 }
 
 impl ProcScript {
@@ -50,6 +55,7 @@ impl ProcScript {
                 signal: None,
             },
             obeys_signal: true,
+            lamb_holds_the_pipe: false,
         }
     }
 
@@ -63,6 +69,7 @@ impl ProcScript {
                 signal: None,
             },
             obeys_signal: true,
+            lamb_holds_the_pipe: false,
         }
     }
 
@@ -76,6 +83,7 @@ impl ProcScript {
                 signal: None,
             },
             obeys_signal: true,
+            lamb_holds_the_pipe: false,
         }
     }
 
@@ -85,6 +93,24 @@ impl ProcScript {
         Self {
             obeys_signal: false,
             ..Self::never_exits()
+        }
+    }
+
+    /// This script, with a forked lamb holding the child's stdout and stderr
+    /// open past the child's own exit.
+    ///
+    /// A scripted proc's log-control task otherwise ends with the proc,
+    /// which models the ordinary sheep: both streams reach EOF when the
+    /// child does, and that retires the real runner's pump. A lamb that
+    /// inherited those pipes retires nothing, and the pump is then left to
+    /// end on one of its other conditions — its `logs` receiver going away,
+    /// or the last control sender dropping. This is the only way to put a
+    /// test on that path from the fake tier.
+    #[must_use]
+    pub fn with_a_lamb_holding_the_pipe(self) -> Self {
+        Self {
+            lamb_holds_the_pipe: true,
+            ..self
         }
     }
 }
@@ -134,6 +160,17 @@ struct ProcState {
     /// it instead of racing the notify/sleep branches again — matches
     /// `tokio::process::Child::wait`'s documented repeat-call behavior.
     resolved: Mutex<Option<ExitOutcome>>,
+    /// Flipped to `true` when `wait()` latches an outcome, and watched by
+    /// this proc's log-control task so that task ends with the proc — unless
+    /// [`ProcScript::lamb_holds_the_pipe`] says the streams outlive it.
+    ///
+    /// Without it the fake would answer a reopen aimed at a proc that exited
+    /// long ago, while the real runner's pump — and with it the receiving
+    /// end of [`ProcIo::log_ctl`] — is gone once the child's streams reach
+    /// EOF. A caller's "the pump is already gone" branch would then be
+    /// unreachable from this tier, and a test for it would pass whether or
+    /// not that branch existed.
+    exited: watch::Sender<bool>,
 }
 
 impl ProcState {
@@ -212,6 +249,10 @@ impl RunningProcess for FakeProc {
             }
         };
         *self.state.resolved.lock().unwrap() = Some(outcome);
+        // Ends this proc's log-control task; see `ProcState::exited`.
+        // `send_replace` rather than `send` because the task may already be
+        // gone, and a proc having exited is not news the fake can fail on.
+        self.state.exited.send_replace(true);
         outcome
     }
 
@@ -237,6 +278,15 @@ impl RunningProcess for FakeProc {
 struct SpawnedProc {
     state: Arc<ProcState>,
     io: Option<FakeIo>,
+    /// `false` once this spawn's log-control task has ended — read back via
+    /// [`ScriptedRunner::log_ctl_live`].
+    log_ctl_live: Arc<AtomicBool>,
+    /// How many [`LogCtl::Reopen`] requests this spawn's log-control task has
+    /// answered — read back via [`ScriptedRunner::reopens`].
+    reopens: Arc<AtomicU32>,
+    /// How many [`LogCtl::Flush`] requests it has answered — read back via
+    /// [`ScriptedRunner::flushes`].
+    flushes: Arc<AtomicU32>,
 }
 
 /// Deterministic fake [`ProcessRunner`] driven by a pre-scripted [`ProcScript`] per spawn.
@@ -297,6 +347,71 @@ impl ScriptedRunner {
             .clone()
     }
 
+    /// Whether the log-control task for the proc spawned at `spawn_index` is
+    /// still running.
+    ///
+    /// It runs while something still holds a [`ProcIo::log_ctl`] sender AND
+    /// something still holds the [`ProcIo::logs`] receiver AND the proc has
+    /// not exited (that last one only while no lamb holds the pipe —
+    /// [`ProcScript::with_a_lamb_holding_the_pipe`]). Those are the three
+    /// facts that keep a real runner's log pump alive, and this is how an
+    /// engine test pins them: the fake writes no files, so a pump left
+    /// running by mistake costs its tests nothing otherwise.
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[must_use]
+    pub fn log_ctl_live(&self, spawn_index: usize) -> bool {
+        self.spawned.lock().unwrap()[spawn_index]
+            .log_ctl_live
+            .load(Ordering::SeqCst)
+    }
+
+    /// How many [`LogCtl::Reopen`] requests the proc spawned at `spawn_index`
+    /// has been sent.
+    ///
+    /// The fake writes no files, so this is the only thing an engine-tier
+    /// test can assert about a reopen: that the request reached this spawn's
+    /// end of [`ProcIo::log_ctl`] at all. Whether a reopened handle really
+    /// lands on a recreated inode is `tests/real_runner.rs`'s question.
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[must_use]
+    pub fn reopens(&self, spawn_index: usize) -> u32 {
+        self.spawned.lock().unwrap()[spawn_index]
+            .reopens
+            .load(Ordering::SeqCst)
+    }
+
+    /// How many [`LogCtl::Flush`] requests the proc spawned at `spawn_index`
+    /// has been sent.
+    ///
+    /// A separate counter from [`Self::reopens`] rather than one shared
+    /// "control requests" total, because the two verbs differ only in which
+    /// variant they push: a `flush` wired to send `LogCtl::Reopen` would
+    /// reopen the flock's handles and truncate nothing, and a single counter
+    /// would read the same either way.
+    ///
+    /// Note what this can and cannot show. The fake writes no files, so it
+    /// proves only that the request reached this spawn's end of
+    /// [`ProcIo::log_ctl`]. That the truncate happens AFTER the answer is
+    /// `supervisor.rs`'s own `LateWritingPumpRunner`, and that a real
+    /// handle's pending bytes land where they should is
+    /// `tests/real_runner.rs`.
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[must_use]
+    pub fn flushes(&self, spawn_index: usize) -> u32 {
+        self.spawned.lock().unwrap()[spawn_index]
+            .flushes
+            .load(Ordering::SeqCst)
+    }
+
     /// Takes the [`FakeIo`] test-side handles for the proc spawned at `spawn_index`
     ///
     /// # Panics
@@ -324,6 +439,7 @@ impl ProcessRunner for ScriptedRunner {
             .pop_front()
             .ok_or_else(|| RunnerError::SpawnFailed("script exhausted".to_string()))?;
 
+        let (exited_tx, mut exited_rx) = watch::channel(false);
         let state = Arc::new(ProcState {
             exit_deadline: Instant::now() + Duration::from_millis(script.delay_ms),
             outcome: script.outcome,
@@ -334,12 +450,80 @@ impl ProcessRunner for ScriptedRunner {
             kill_notify: Notify::new(),
             kill_count: AtomicU32::new(0),
             resolved: Mutex::new(None),
+            exited: exited_tx,
         });
 
         let (logs_tx, logs_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (from_child_tx, from_child_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (to_child_tx, raw_to_child_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (relay_tx, relay_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (log_ctl_tx, mut log_ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
+
+        // The fake ignores `spec.out_file`/`err_file` and writes no files, so
+        // there is no handle here to swap and nothing about a reopen this
+        // tier can prove — `tests/real_runner.rs` is where a reopened handle
+        // meets a real inode. What the fake must not do is leave the
+        // acknowledgement unanswered: a caller awaiting one would hang
+        // against every scripted proc, so this answers each request as a
+        // live pump would.
+        //
+        // What it must ALSO not do is answer forever. A real pump ends when
+        // the child's streams reach EOF, so a reopen aimed at a sheep that
+        // has stopped fails to send; a fake that kept answering past its
+        // proc's exit would make that branch unreachable from this tier and
+        // every test of it vacuous. So this task ends on each of the three
+        // conditions that end a real pump, and on nothing else.
+        let log_ctl_live = Arc::new(AtomicBool::new(true));
+        let ctl_live = Arc::clone(&log_ctl_live);
+        let reopens = Arc::new(AtomicU32::new(0));
+        let reopen_count = Arc::clone(&reopens);
+        let flushes = Arc::new(AtomicU32::new(0));
+        let flush_count = Arc::clone(&flushes);
+        let lamb_holds_the_pipe = script.lamb_holds_the_pipe;
+        let logs_for_pump = logs_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    ctl = log_ctl_rx.recv() => match ctl {
+                        // Both arms count BEFORE they answer, so a test that
+                        // observes the acknowledgement can read the count
+                        // without racing this task.
+                        Some(LogCtl::Reopen { done }) => {
+                            reopen_count.fetch_add(1, Ordering::SeqCst);
+                            // Always `Ok`: the fake writes no files, so it
+                            // has no open that could fail. A pump that
+                            // cannot reopen a path is `tokio_runner`'s
+                            // tier, and a caller's handling of that answer
+                            // is tested against a runner written for it
+                            // (`supervisor`'s `FailingPumpRunner`).
+                            let _ = done.send(Ok(()));
+                        }
+                        Some(LogCtl::Flush { done }) => {
+                            flush_count.fetch_add(1, Ordering::SeqCst);
+                            // Always `Ok`, for the same reason: with no
+                            // handle there is nothing queued that could
+                            // fail to land.
+                            let _ = done.send(Ok(()));
+                        }
+                        None => break, // nothing holds ProcIo::log_ctl
+                    },
+                    // The owner dropped ProcIo::logs. A real pump ends on
+                    // this whether or not a line is flowing, and it is the
+                    // only thing that ends one whose streams a lamb is
+                    // holding open.
+                    () = logs_for_pump.closed() => break,
+                    // Resolves when `wait()` latches an outcome, and errors
+                    // once nothing holds this proc's state any more. Either
+                    // way the proc is over — which reaches the pump as both
+                    // streams hitting EOF, unless a lamb inherited them.
+                    _ = exited_rx.changed(), if !lamb_holds_the_pipe => break,
+                }
+            }
+            // Stored before this task returns, so the flag is already false
+            // by the time `log_ctl_rx` drops and closes the channel: a test
+            // that waits on the close never then reads a stale `true`.
+            ctl_live.store(false, Ordering::SeqCst);
+        });
 
         // Relay task: the fake watches its own to_child stream so a `Shutdown`
         // message resolves an obeys_signal wait (falling back to Term) exactly
@@ -369,6 +553,9 @@ impl ProcessRunner for ScriptedRunner {
                 from_child_tx,
                 to_child_rx: relay_rx,
             }),
+            log_ctl_live,
+            reopens,
+            flushes,
         });
         drop(spawned);
 
@@ -376,6 +563,7 @@ impl ProcessRunner for ScriptedRunner {
             logs: logs_rx,
             from_child: from_child_rx,
             to_child: to_child_tx,
+            log_ctl: log_ctl_tx,
         };
         // Arbitrary but deterministic — real pids come from the OS in the real runner.
         let pid = 1000 + u32::try_from(index).unwrap_or(u32::MAX);
@@ -576,6 +764,76 @@ mod tests {
         io.to_child.send(sent.clone()).await.unwrap();
         let observed = fake_io.to_child_rx.recv().await.unwrap();
         assert_eq!(observed, sent);
+    }
+
+    /// Fails if the fake drops its control receiver instead of answering:
+    /// the send fails, or the acknowledgement resolves `Err` because the
+    /// `oneshot` sender was dropped unanswered. Either way a caller that
+    /// awaits a reopen would hang against every scripted proc.
+    ///
+    /// This tier proves the acknowledgement and nothing else — the fake
+    /// ignores `spec.out_file`/`err_file` and writes no files, so it has no
+    /// handle to swap. What a reopened handle does to a real inode is
+    /// `tokio_runner`'s own tests.
+    #[tokio::test(start_paused = true)]
+    async fn a_reopen_is_acknowledged_by_the_scripted_runner() {
+        // One script for one spawn. A second spawn would answer
+        // `SpawnFailed("script exhausted")`, which is why the count is
+        // stated rather than left generous.
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let (_proc, io) = runner.spawn(&spec()).unwrap();
+
+        let (done, ack) = tokio::sync::oneshot::channel();
+        io.log_ctl.send(LogCtl::Reopen { done }).await.unwrap();
+
+        // Bounded rather than a bare await: an unanswered reopen must fail
+        // this test, not hang it. Under the paused clock the deadline fires
+        // as soon as the runtime is idle, so a passing run costs nothing.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), ack)
+            .await
+            .expect("a reopen must be acknowledged")
+            .expect("the fake must answer rather than drop the acknowledgement");
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "a fake with no files to open has nothing that can fail"
+        );
+    }
+
+    /// Fails if the fake's control task outlives its proc: `log_ctl.send`
+    /// would keep succeeding against a proc that exited long ago, and the
+    /// "the pump is already gone" branch every caller of
+    /// [`ProcIo::log_ctl`] is told to take would be unreachable from this
+    /// tier. A test for reopening a stopped sheep would then pass whether or
+    /// not the code handled one.
+    #[tokio::test(start_paused = true)]
+    async fn a_proc_that_has_exited_closes_its_control_channel() {
+        // One script for one spawn. A second spawn would answer
+        // `SpawnFailed("script exhausted")` and never reach the channel at
+        // all, which is why the count is stated rather than left generous.
+        let runner = ScriptedRunner::new(vec![ProcScript::const_exit(0)]);
+        let (mut proc, io) = runner.spawn(&spec()).unwrap();
+        assert!(runner.log_ctl_live(0), "sanity: live before the proc exits");
+
+        proc.wait().await;
+
+        // Bounded rather than an immediate assertion: the control task ends
+        // on its own schedule, so this waits for the close instead of
+        // requiring it to have already happened.
+        tokio::time::timeout(Duration::from_secs(5), io.log_ctl.closed())
+            .await
+            .expect("a proc that has exited must close its control channel");
+        assert!(!runner.log_ctl_live(0));
+
+        let (done, ack) = tokio::sync::oneshot::channel();
+        assert!(
+            io.log_ctl.send(LogCtl::Reopen { done }).await.is_err(),
+            "a reopen aimed at an exited proc must fail to send"
+        );
+        // And a request that never reaches a pump resolves the caller's
+        // acknowledgement as an error rather than leaving it pending — the
+        // same no-op, observed a moment later.
+        assert!(ack.await.is_err());
     }
 
     #[tokio::test(start_paused = true)]

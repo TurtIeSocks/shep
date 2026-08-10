@@ -59,12 +59,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add wire protocol v1 types — `Request`, `Response`, `Envelope`, `Reply`,
   `RpcError`, `Hello`/`HelloAck`, `BusEvent` — with pinned insta snapshots of
   their serialized form.
+- Add `Request::Reopen` and `Response::Reopened`, asking a daemon to reopen
+  the log files of every matched sheep after an external rotator has renamed
+  them. Both enums are `#[non_exhaustive]` and no existing variant changes,
+  so `PROTOCOL_VERSION` stays **1**: the committed v1 byte fixtures still
+  deserialize. A new *variant* buys no graceful answer from an older daemon,
+  though, and this one does not either: `Request` is internally tagged
+  (`#[serde(tag = "kind")]`) with no `#[serde(other)]` catch-all, so a daemon
+  whose `Request` predates the variant fails to decode the frame at all and
+  ends the connection. The `Internal` wildcard in the daemon's dispatch fires
+  only where its own `shep-core` already knows the variant — which, for a
+  shipped daemon, means it implements it too. (The additive-*field* reasoning
+  under `ProcessInfo::out_file` below is sound and simply does not extend to
+  variants.) `Reopened` carries `ProcessInfo`s like `Stopped` and `Restarted`
+  do — every matched sheep, including any that was not running and so had
+  nothing to reopen.
+- Add `Request::Flush` and `Response::Flushed`, asking a daemon to empty the
+  log files of every matched sheep. Additive under `#[non_exhaustive]` on the
+  same terms as `Reopen` above — `PROTOCOL_VERSION` stays **1**, and an older
+  daemon fails to decode the verb rather than answering it. `Flush`
+  carries a `SelectorSpec` with no default anywhere in the stack — the verb
+  destroys log data, so the operator names its target. `Flushed` carries one
+  `ProcessInfo` per matched SHEEP, not one per file emptied: several sheep
+  can share a log path (`merge_logs`, or an explicit `out_file` on a
+  multi-instance app) and the daemon truncates each distinct path once, but
+  the selector names sheep and so does the answer.
 - Add `MemSize` and `UpDuration` config value newtypes, parsing the strict
   Flockfile grammars `^\d+(G|M|K)?$` and `^\d+(h|m|s)?$`.
 - Add `ProcStatus` with stable wire strings for the process lifecycle states.
 - Add `ShepPaths` to resolve the `$SHEP_HOME` runtime directory layout.
 - Add `AppConfig` with the v1 Flockfile field set, plus `normalize` and
   `normalize_all`, which produce a proof-token `ResolvedApp`.
+- Add `AppConfig::channel`, opening the shepherd channel on fd 3 for an app
+  on its own rather than only as a side effect of `wait_ready` or
+  `shutdown_with_message`. Defaults to `false`: a socketpair plus two pump
+  tasks per sheep is real cost against spec §14.11's single-digit-MB
+  idle-RSS goal, so the channel now opens only when something asks for one.
+  `wait_ready` and `shutdown_with_message` keep opening it on their own,
+  unaffected by the new field.
 - Add `Flockfile` discovery (`discover`) and TOML/YAML/JSON/JSON5 parsing.
 - Add `DaemonConfig`, parsing `shep.toml` with `SHEP_*` env-variable
   layering.
@@ -87,9 +119,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PROTOCOL_VERSION` stays 1: the fields are additive, they decode to `None`
   from pre-existing bytes (pinned by a committed byte fixture), and a peer
   that predates them ignores them.
+- Add `[daemon] log_level`, overridable by `SHEP_LOG_LEVEL`, deciding how
+  much of the daemon's own diagnostics is rendered. Its type is the new
+  `LogLevel` — `off`, `error`, `warn`, `info`, `debug`, `trace`, lowercase
+  and nothing else — and the default is `warn`, which is where the daemon's
+  warn-and-continue arms live: a watch it could not arm, a cron pattern it
+  could not parse, a memory ceiling a process tree crossed. `debug` fires
+  per dropped restart and per child metric sample, so it is a firehose on a
+  busy flock rather than a slightly noisier log. A name outside the six is a
+  startup error (`DaemonConfigError::Toml` from the file,
+  `DaemonConfigError::BadEnvValue` from the environment), never a silent
+  fallback to the default. `DaemonSection` gains the field, so a struct
+  literal naming every field must name this one too; `..Default::default()`
+  is unaffected.
 
 ### Fixes
 
+- Give the workspace's path dependencies (`shep-core`, `shep-daemon`,
+  `shep-client`) a version alongside their `path`, which `cargo publish`
+  requires — it strips `path` from a dependency at publish time and refuses
+  to publish anything left with no version to put there. One cosmetic side
+  effect for this crate specifically: its `[target.'cfg(any())'.dependencies]`
+  floor-pin block (see that block's own comment) publishes as real manifest
+  entries, so crates.io and docs.rs list all six of `annotate-snippets`,
+  `anstyle`, `encoding_rs_io`, `pest`, `quote` and `syn` as dependencies of
+  `shep-core`, even though `cfg(any())` never matches and not one of them
+  ever builds into it. `shep-daemon` and `shep-cli` publish the same way, for
+  the two and the one floor pin their own blocks carry.
 - Reject a `watch_options` or `ignore_watch` pattern globset will not compile,
   with `NormalizeError::InvalidWatchGlob`, naming the sheep, which of the two
   lists the pattern came from, the pattern as written and globset's reason.
@@ -130,3 +186,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parser), keeping the crate's `forbid(unsafe_code)` guarantee.
 - Rename `ConfigError` -> `NormalizeError`, matching the per-construction-site
   naming convention used by the crate's other error enums.
+- Rewrite `AppConfig::reuse_port`'s doc. It previously read "Bind listen
+  sockets with SO_REUSEPORT", first person, as though shep does the
+  binding — it doesn't. The child binds after `exec`, and a socket option
+  has to be set before `bind()` by the process that binds, so `reuse_port
+  = true` has only ever meant the operator asserting that the app sets the
+  option itself (Node ≥22's `reusePort`, Go's `Control` hook, nginx's
+  `reuseport`); shep's contribution is permission for the old and new
+  instance to overlap during reload, not the mechanism. The doc now also
+  names the failure mode: an app that does not set the option gets
+  `EADDRINUSE` at the replacement spawn on every reload, undetectable in
+  advance, and `SO_REUSEADDR` — which far more frameworks set by default —
+  is not sufficient. No behavior changed; the field's meaning was always
+  this, only the doc claimed otherwise.

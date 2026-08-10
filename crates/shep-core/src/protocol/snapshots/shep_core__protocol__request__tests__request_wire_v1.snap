@@ -1,6 +1,5 @@
 ---
 source: crates/shep-core/src/protocol/request.rs
-assertion_line: 232
 expression: requests
 ---
 [
@@ -66,6 +65,7 @@ expression: requests
           "out_file": null,
           "err_file": null,
           "merge_logs": false,
+          "channel": false,
           "wait_ready": false,
           "reuse_port": false,
           "readiness_probe": null,
@@ -75,6 +75,26 @@ expression: requests
           "increment_var": null
         }
       ]
+    }
+  },
+  {
+    "id": 5,
+    "deadline_ms": null,
+    "body": {
+      "kind": "reopen",
+      "selector": {
+        "kind": "all"
+      }
+    }
+  },
+  {
+    "id": 6,
+    "deadline_ms": null,
+    "body": {
+      "kind": "flush",
+      "selector": {
+        "kind": "all"
+      }
     }
   }
 ]

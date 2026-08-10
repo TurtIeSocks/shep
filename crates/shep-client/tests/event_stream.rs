@@ -9,8 +9,6 @@
 
 use std::time::Duration;
 
-use futures_util::StreamExt;
-
 use shep_client::Lagged;
 use shep_client::testing::{fake_client_with_push, sample_info};
 use shep_core::protocol::{BusEvent, ProcessEventKind, Response};

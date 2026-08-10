@@ -81,6 +81,19 @@ pub enum Request {
         /// Which sheep
         selector: SelectorSpec,
     },
+    /// Reopen every matched sheep's log files, for an external rotator that
+    /// has renamed them (`create`-mode rotation)
+    Reopen {
+        /// Which sheep
+        selector: SelectorSpec,
+    },
+    /// Empty every matched sheep's log files: flush what is still pending,
+    /// then truncate the recorded paths
+    Flush {
+        /// Which sheep. No default anywhere in the stack — this destroys
+        /// log data, so the operator names the target (see `shep flush`).
+        selector: SelectorSpec,
+    },
     /// Graceful daemon shutdown
     KillDaemon,
     /// Subscribe this connection to bus topics (glob patterns)
@@ -160,6 +173,19 @@ pub enum Response {
     Restarted(Vec<ProcessInfo>),
     /// Answer to `Delete` — ids removed
     Deleted(Vec<u32>),
+    /// Answer to `Reopen` — every matched sheep, running or not. A sheep with
+    /// no live log pump has nothing to reopen and is reported as a success,
+    /// so this carries the same matches `Describe` would.
+    Reopened(Vec<ProcessInfo>),
+    /// Answer to `Flush` — one row per matched sheep, running or not, exactly
+    /// as [`Self::Reopened`].
+    ///
+    /// One row per SHEEP, not per file emptied. Several sheep can share one
+    /// log path (`merge_logs`, or an explicit `out_file` on a multi-instance
+    /// app), and the daemon truncates each distinct path once — but the
+    /// selector names sheep, so the answer names sheep, and the count here
+    /// matches what `Describe` would return for the same selector.
+    Flushed(Vec<ProcessInfo>),
     /// Answer to `Subscribe`
     Subscribed,
     /// Answer to `KillDaemon`
@@ -319,6 +345,31 @@ mod tests {
                 deadline_ms: None,
                 body: Request::Start {
                     apps: vec![AppConfig::minimal("web", "./srv")],
+                },
+            },
+            // `All` rather than a named sheep: it is the selector `shep
+            // reopen` sends when given no argument, and the one a signal can
+            // ever mean, so it is the row worth pinning.
+            Envelope {
+                id: 5,
+                deadline_ms: None,
+                body: Request::Reopen {
+                    selector: SelectorSpec::All,
+                },
+            },
+            // Deliberately the same selector as the row above, so the two
+            // log-plane rows differ by their `kind` and by nothing else: a
+            // `Flush` that serialized under `reopen`'s tag — the shape a
+            // copy-pasted variant takes — shows up here as two identical
+            // objects rather than as a diff a reader has to compare field by
+            // field. `shep flush` demands an explicit selector, so `all` is
+            // not a default here the way it is for `reopen`; it is simply the
+            // widest thing an operator can type.
+            Envelope {
+                id: 6,
+                deadline_ms: None,
+                body: Request::Flush {
+                    selector: SelectorSpec::All,
                 },
             },
         ];

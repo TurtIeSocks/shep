@@ -9,6 +9,7 @@
 
 #![cfg(unix)]
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -27,7 +28,7 @@ use shep_core::protocol::{
 use shep_core::status::ProcStatus;
 use shep_core::values::UpDuration;
 
-use shep_daemon::boot::{BootError, BootOptions, boot};
+use shep_daemon::boot::{BootError, BootOptions, DIR_MODE, boot};
 use shep_daemon::rpc::RpcContext;
 use shep_daemon::tokio_runner::TokioRunner;
 
@@ -308,7 +309,9 @@ fn track_spawned(spawned: &std::sync::Arc<std::sync::Mutex<Vec<i32>>>, reply: &R
         | Response::Described(infos)
         | Response::Started(infos)
         | Response::Stopped(infos)
-        | Response::Restarted(infos) => infos,
+        | Response::Restarted(infos)
+        | Response::Reopened(infos)
+        | Response::Flushed(infos) => infos,
         _ => return,
     };
     let mut spawned = spawned
@@ -414,6 +417,319 @@ async fn log_lines_reach_a_log_subscriber() {
     fixture.shutdown().await;
 }
 
+/// Waits for `path` to hold exactly `expected`, failing at [`RECV_TIMEOUT`].
+///
+/// Polls rather than sleeping a fixed guess. A line observed on the bus has
+/// had its file write ISSUED, not necessarily completed — `tokio::fs`
+/// dispatches the real `write(2)` to the blocking pool — so this waits for
+/// the write to land instead of assuming it already has. Duplicated from
+/// `real_runner.rs` rather than shared: integration binaries are separate
+/// crates, as that file's own helpers already note.
+async fn await_file_contents(path: &std::path::Path, expected: &str) {
+    let settled = tokio::time::timeout(RECV_TIMEOUT, async {
+        while std::fs::read_to_string(path).unwrap_or_default() != expected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "{}: expected {expected:?}, found {:?}",
+        path.display(),
+        std::fs::read_to_string(path)
+    );
+}
+
+/// `create`-mode rotation, end to end: rename the live log, ask the daemon
+/// over its own socket, and watch the sheep's next line land on the
+/// recreated path.
+///
+/// Fails if the request never reaches the sheep's log pump — which is the
+/// whole of this verb, and which the engine tier cannot show: the scripted
+/// fake writes no files, so there every wiring that answers `Ok` looks
+/// alike. Here a `Reopen` that resolved the selector and pushed nothing
+/// leaves the pump on the renamed inode, the live path missing, and the
+/// second line invisible to anything reading the log.
+///
+/// Both halves are asserted for the reason `real_runner.rs`'s own reopen
+/// case gives: a pump that opened a second handle without dropping the
+/// first would grow the new file too, and only the archive standing still
+/// rules that out.
+///
+/// The sheep's own log path is read off the `Started` reply rather than
+/// derived here, so the test cannot disagree with the daemon about which
+/// file it is looking at.
+#[tokio::test]
+async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+
+    // Subscribe BEFORE starting: a connection gets no forwarder task, and so
+    // no events at all, until it does.
+    let subscribed = client
+        .request(Request::Subscribe {
+            topics: vec!["log.*".to_string()],
+        })
+        .await;
+    assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
+
+    // The marker lets the test decide when the second line happens, so
+    // "after the reopen" is a fact rather than a timing bet. `sleep`'s only
+    // portable argument is a whole number of seconds (POSIX), which is why
+    // the poll is that coarse.
+    let marker = fixture.paths.home.join("go");
+    let mut app = AppConfig::minimal("rotator", "/bin/sh");
+    app.interpreter = Some("none".to_string());
+    app.args = vec![
+        "-c".to_string(),
+        format!(
+            "echo before; while [ ! -f {} ]; do sleep 1; done; echo after; sleep 5",
+            marker.display()
+        ),
+    ];
+    let started = client.request(Request::Start { apps: vec![app] }).await;
+    let Response::Started(infos) = started.result.unwrap() else {
+        panic!("expected started")
+    };
+    let id = infos[0].id;
+    let out_file = std::path::PathBuf::from(
+        infos[0]
+            .out_file
+            .clone()
+            .expect("this daemon reports its own resolved log paths"),
+    );
+
+    assert_eq!(client.await_log_line(id).await, "before");
+    await_file_contents(&out_file, "before\n").await;
+
+    let archive = out_file.with_extension("log.1");
+    std::fs::rename(&out_file, &archive).unwrap();
+    assert!(!out_file.exists(), "sanity: the rename really moved it");
+
+    let reopened = client
+        .request(Request::Reopen {
+            selector: SelectorSpec::All,
+        })
+        .await;
+    let Response::Reopened(matched) = reopened.result.unwrap() else {
+        panic!("expected reopened")
+    };
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].id, id);
+
+    // The reply is the barrier: it lands only after the pump has flushed
+    // the old handle and opened the path again, so neither of these polls.
+    assert_eq!(std::fs::read_to_string(&out_file).unwrap(), "");
+    assert_eq!(std::fs::read_to_string(&archive).unwrap(), "before\n");
+
+    std::fs::write(&marker, "").unwrap();
+    assert_eq!(client.await_log_line(id).await, "after");
+    await_file_contents(&out_file, "after\n").await;
+    assert_eq!(
+        std::fs::read_to_string(&archive).unwrap(),
+        "before\n",
+        "the renamed file must stop growing the moment the handle is swapped"
+    );
+
+    fixture.shutdown().await;
+}
+
+/// A reopen asked for over the socket puts a REMOVED log directory back at
+/// [`DIR_MODE`], the mode every directory shep creates is worth — the case a
+/// rotator that moves the directory aside rather than the files produces.
+///
+/// Fails if the pump's own directory creation stops asking `mkdir` for the
+/// mode: swapping `open_append`'s `DirBuilder::new().mode(DIR_MODE)` back to
+/// a plain `create_dir_all` recreates the directory at `0o777` narrowed by
+/// whatever the ambient umask strips — `0o755` under the common `umask 022` —
+/// and the mode assertion below reddens on the difference. Dropping the
+/// creation altogether reddens the assertions around it instead: the reopen
+/// answers `ReopenFailed` for a path whose parent is gone, and the sheep's
+/// next line has nowhere to land.
+///
+/// One umask cannot be distinguished. Under `umask 0o077` a plain
+/// `create_dir_all` lands `0o700` unaided and both implementations look
+/// alike here. That is a property of the ambient umask rather than of the
+/// code, and the only way to remove it is for the test to set a process-wide
+/// umask — `unsafe`, and it would leak into every other case in this binary.
+///
+/// The mode assertion needs no `#[cfg]` of its own: this file is
+/// `#![cfg(unix)]` at its root, so `DIR_MODE` and `PermissionsExt` are only
+/// ever compiled where they mean something and `--all-targets` never builds
+/// this binary on the Windows leg.
+///
+/// No `ScriptedRunner`, so there are no scripts to size — this tier runs the
+/// real runner, and the fixture is ONE sheep needing ONE real spawn. The
+/// scripted fake is not merely awkward here but blind: it writes no files, so
+/// its pump answers a reopen `Ok` whether or not any directory exists.
+#[tokio::test]
+async fn reopen_recreates_a_removed_log_directory_owner_only() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+
+    // The marker lives beside the log directory, not inside it, so removing
+    // that directory below cannot disturb it. `sleep`'s only portable
+    // argument is a whole number of seconds (POSIX), which is why the sheep's
+    // own poll is that coarse.
+    let marker = fixture.paths.home.join("go");
+    let mut app = AppConfig::minimal("rotator", "/bin/sh");
+    app.interpreter = Some("none".to_string());
+    app.args = vec![
+        "-c".to_string(),
+        format!(
+            "echo before; while [ ! -f {} ]; do sleep 1; done; echo after; sleep 5",
+            marker.display()
+        ),
+    ];
+    let started = client.request(Request::Start { apps: vec![app] }).await;
+    let Response::Started(infos) = started.result.unwrap() else {
+        panic!("expected started")
+    };
+    let id = infos[0].id;
+    let out_file = std::path::PathBuf::from(
+        infos[0]
+            .out_file
+            .clone()
+            .expect("this daemon reports its own resolved log paths"),
+    );
+    await_file_contents(&out_file, "before\n").await;
+
+    // The whole directory, not the file. That is what a rotator moving
+    // `logs/` aside leaves behind, and it is the only shape in which the mode
+    // of a freshly created directory is observable at all — `mkdir`'s mode
+    // governs the directories a call creates, never one already there.
+    std::fs::remove_dir_all(&fixture.paths.logs).unwrap();
+    assert!(
+        !fixture.paths.logs.exists(),
+        "sanity: the log directory really is gone"
+    );
+
+    let reopened = client
+        .request(Request::Reopen {
+            selector: SelectorSpec::All,
+        })
+        .await;
+    let Response::Reopened(matched) = reopened.result.unwrap() else {
+        panic!("expected reopened")
+    };
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].id, id);
+
+    let mode = std::fs::metadata(&fixture.paths.logs)
+        .expect("a reopen must put the log directory back")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, DIR_MODE,
+        "the recreated log directory must be {DIR_MODE:o}, found {mode:o}"
+    );
+
+    // The reply is the barrier — both handles are open on the recreated path
+    // by the time it lands — so the sheep's next line is what says the
+    // directory is usable and not merely present.
+    std::fs::write(&marker, "").unwrap();
+    await_file_contents(&out_file, "after\n").await;
+
+    fixture.shutdown().await;
+}
+
+/// What the flush case writes at the live log path after renaming the real
+/// one away — standing in for the file a `create`-mode rotator leaves behind,
+/// and the thing that must be gone afterwards.
+///
+/// One owner: the case asserts both that this is gone from one file and that
+/// it never reached the other, and a second copy could drift between them.
+const STRAY_CONTENT: &str = "what the recreated log holds\n";
+
+/// `flush` resolves to the RECORDED PATH, never to the inode the pump is
+/// holding — the one thing about this verb that only a real pump on a real
+/// file can show.
+///
+/// The rename is what separates the two. Afterwards the sheep's log pump
+/// still has the archive open (nothing reopened it), while the path the
+/// daemon recorded at registration now names a different file. An
+/// implementation that emptied the pump's own handle — by `set_len(0)` on it,
+/// or by asking the pump to truncate what it holds — would empty the ARCHIVE
+/// and leave the live log untouched: the exact opposite of what was asked,
+/// exiting 0 while doing it. That is the shape of failure this case exists
+/// for, and both assertions are needed to catch it, since either one alone
+/// still passes under the inversion.
+///
+/// The stray content is written at the live path deliberately. Without it the
+/// live path would simply be missing after the rename, the truncate would be
+/// the documented no-op, and an inode-chasing implementation would look
+/// identical from the outside.
+///
+/// The paths are read off the `Started` reply rather than derived here, so
+/// the test cannot disagree with the daemon about which file it is renaming.
+#[tokio::test]
+async fn flush_empties_the_recorded_path_and_leaves_a_renamed_archive_alone() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+
+    // Subscribe BEFORE starting: a connection gets no forwarder task, and so
+    // no events at all, until it does.
+    let subscribed = client
+        .request(Request::Subscribe {
+            topics: vec!["log.*".to_string()],
+        })
+        .await;
+    assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
+
+    let mut app = AppConfig::minimal("noisy", "/bin/sh");
+    app.interpreter = Some("none".to_string());
+    app.args = vec!["-c".to_string(), "echo before; sleep 5".to_string()];
+    let started = client.request(Request::Start { apps: vec![app] }).await;
+    let Response::Started(infos) = started.result.unwrap() else {
+        panic!("expected started")
+    };
+    let id = infos[0].id;
+    let out_file = std::path::PathBuf::from(
+        infos[0]
+            .out_file
+            .clone()
+            .expect("this daemon reports its own resolved log paths"),
+    );
+
+    assert_eq!(client.await_log_line(id).await, "before");
+    await_file_contents(&out_file, "before\n").await;
+
+    // From here the pump's handle and the recorded path name different
+    // files, which is the whole point of the case.
+    let archive = out_file.with_extension("log.1");
+    std::fs::rename(&out_file, &archive).unwrap();
+    std::fs::write(&out_file, STRAY_CONTENT).unwrap();
+
+    let flushed = client
+        .request(Request::Flush {
+            selector: SelectorSpec::All,
+        })
+        .await;
+    let Response::Flushed(matched) = flushed.result.unwrap() else {
+        panic!("expected flushed")
+    };
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].id, id);
+
+    // The reply is the barrier: it lands only once every matched pump has
+    // answered and every recorded path has been truncated, so neither of
+    // these polls.
+    assert_eq!(
+        std::fs::read_to_string(&out_file).unwrap(),
+        "",
+        "the recorded path is what a flush empties"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&archive).unwrap(),
+        "before\n",
+        "the renamed file is not the daemon's to empty — a flush that chased \
+         the pump's inode would have emptied this one instead"
+    );
+
+    fixture.shutdown().await;
+}
+
 /// How long this test waits for the gated sheep's `Online`. Generous for a
 /// loaded runner, but a small fraction of the `listen_timeout` below — the
 /// gap between the two is the whole assertion.
@@ -434,9 +750,10 @@ const READY_DEADLINE: Duration = Duration::from_secs(5);
 /// elapsed readiness deadline brings the sheep online rather than failing it —
 /// see the supervisor's `handle_ready_result`), so only an `Online` that
 /// arrives EARLY can tell a forwarded ready message apart from an expired one.
-/// Nothing else can: the deadline's own `warn!` reaches nobody while this
-/// workspace wires no `tracing-subscriber`, and the two paths produce the same
-/// event and the same status.
+/// Nothing else can, in this tier: the deadline's own `warn!` is rendered only
+/// by the subscriber `shep-cli`'s `daemon` subcommand installs, and this file
+/// boots the library directly, so the two paths produce the same event, the
+/// same status, and no output either way.
 #[tokio::test]
 async fn a_wait_ready_sheep_goes_online_on_its_own_channel_message() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;

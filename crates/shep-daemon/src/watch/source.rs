@@ -3,7 +3,7 @@
 //!
 //! The debouncer's own handler runs on its own OS thread, never on a tokio
 //! one. [`watch_tree`] wraps that handler in a plain closure that forwards
-//! each non-empty batch through an unbounded [`mpsc`] sender — non-blocking
+//! each debounced batch through an unbounded [`mpsc`] sender — non-blocking
 //! and callable from any thread, which is exactly what a foreign-thread
 //! callback needs. A bounded sender's `blocking_send` would park the very
 //! thread that owns the watch; `try_send` would silently drop batches the
@@ -57,11 +57,11 @@ pub struct WatchSource {
 
 /// Begins watching `root` recursively, debounced by `delay`.
 ///
-/// Batches of changed paths arrive on the returned receiver. A batch is
-/// whatever the debouncer coalesced within `delay`; it is never empty — a
-/// `need_rescan` marker (notify dropped events and wants the tree re-read)
-/// carries no paths of its own, so it is forwarded as `vec![root]` rather
-/// than dropped.
+/// Batches arrive on the returned receiver. A batch is whatever the debouncer
+/// coalesced within `delay`: the paths it saw change, plus
+/// [`WatchBatch::rescan`] for whether notify lost events along the way. The
+/// two travel together rather than one standing in for the other — see that
+/// field for why a rescan cannot be spelled as a path.
 ///
 /// **Delivered paths are resolved, not literal.** If `root` is, or passes
 /// through, a symlink, every path in every batch still comes back through
@@ -79,7 +79,7 @@ pub struct WatchSource {
 pub fn watch_tree(
     root: &Path,
     delay: Duration,
-) -> Result<(WatchSource, mpsc::UnboundedReceiver<Vec<PathBuf>>), WatchError> {
+) -> Result<(WatchSource, mpsc::UnboundedReceiver<WatchBatch>), WatchError> {
     let (tx, rx) = mpsc::unbounded_channel();
     // Cloned into the handler closure below, which outlives this call: the
     // closure runs on the debouncer's own thread for as long as it lives,
@@ -109,45 +109,60 @@ pub fn watch_tree(
     ))
 }
 
+/// One debounced delivery: what changed, and whether notify lost events on
+/// the way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchBatch {
+    /// The changed paths, exactly as notify delivered them — absolute, and
+    /// resolved rather than literal (see [`watch_tree`]).
+    ///
+    /// May be empty on a rescan, and on some platforms may not be: macOS
+    /// attaches the watched path to its `MustScanSubDirs` marker where Linux
+    /// leaves an inotify overflow path-less. Neither shape says anything the
+    /// caller can act on, which is what [`Self::rescan`] is for.
+    pub paths: Vec<PathBuf>,
+    /// Whether notify flagged this delivery for a rescan: it dropped events
+    /// and wants the tree re-read.
+    ///
+    /// Carried as its own field rather than inferred, because the two things
+    /// a caller might infer it from are both wrong. An empty path list is
+    /// inotify's shape for it and not macOS's. A path equal to the watch root
+    /// is macOS's shape for it *and* an ordinary event the OS delivers for
+    /// the root's own inode — so reading one as a rescan restarts an app for
+    /// a `chmod` no glob set was ever asked about.
+    ///
+    /// Not a path, and no glob set can be matched against it: the paths that
+    /// changed during the gap are exactly what nobody knows.
+    pub rescan: bool,
+}
+
 /// Shapes one debounced result into a batch and forwards it — the body of
 /// the handler [`watch_tree`] installs, and so the code that runs on the
 /// debouncer's own OS thread rather than on a tokio one.
 ///
 /// A function rather than an inline closure because the batch it produces
-/// for a path-less result is the only signal an inotify overflow leaves, and
-/// a real overflow is not something a test can ask an OS for: named here,
-/// the shaping can be driven directly.
-fn forward_batch(
-    result: DebounceEventResult,
-    root: &Path,
-    tx: &mpsc::UnboundedSender<Vec<PathBuf>>,
-) {
+/// for a rescan is the only signal an inotify overflow leaves, and a real
+/// overflow is not something a test can ask an OS for: named here, the
+/// shaping can be driven directly.
+fn forward_batch(result: DebounceEventResult, root: &Path, tx: &mpsc::UnboundedSender<WatchBatch>) {
     match result {
         Ok(events) => {
-            // `.event.paths`, not `.paths` through the `Deref`: moving
-            // out of a deref target does not compile, and `DebouncedEvent`
-            // exposes its wrapped `Event` as a plain owned field for
-            // exactly this.
-            let paths: Vec<PathBuf> = events
-                .into_iter()
-                .flat_map(|debounced| debounced.event.paths)
-                .collect();
-            // A `need_rescan` marker event carries no paths of its own —
-            // notify dropped events (e.g. an inotify queue overflow) and
-            // wants the whole tree re-read. Silently eating it here would
-            // produce no batch and therefore no restart precisely when
-            // the watch most needs to fire. Forwarding the root itself
-            // keeps [`watch_tree`]'s "a batch is never empty" doc promise
-            // and still gives the caller something to act on.
-            let paths = if paths.is_empty() {
-                vec![root.to_path_buf()]
-            } else {
-                paths
-            };
+            let mut paths: Vec<PathBuf> = Vec::new();
+            let mut rescan = false;
+            for debounced in events {
+                // notify's own accessor for the `Rescan` flag, read before
+                // the paths below move out of the same event. `.event.paths`
+                // rather than `.paths` through the `Deref`: moving out of a
+                // deref target does not compile, and `DebouncedEvent`
+                // exposes its wrapped `Event` as a plain owned field for
+                // exactly this.
+                rescan |= debounced.event.need_rescan();
+                paths.extend(debounced.event.paths);
+            }
             // An `Err` here means the receiver (and `WatchSource`)
             // has already been dropped. Nothing to do: this thread
             // keeps running until its own `Drop` stops it.
-            let _ = tx.send(paths);
+            let _ = tx.send(WatchBatch { paths, rescan });
         }
         Err(errors) => {
             for err in errors {
@@ -275,36 +290,33 @@ mod tests {
     }
 
     /// Waits up to [`SMOKE_DEADLINE`] for the next batch.
-    async fn expect_batch(rx: &mut UnboundedReceiver<Vec<PathBuf>>) -> Vec<PathBuf> {
+    async fn expect_batch(rx: &mut UnboundedReceiver<WatchBatch>) -> WatchBatch {
         timeout(SMOKE_DEADLINE, rx.recv())
             .await
             .expect("no batch arrived within the deadline")
             .expect("watch source ended before a batch arrived")
     }
 
-    // fails if [`forward_batch`] stops substituting the root for a path-less
-    // batch — `let paths = paths;` in place of the `vec![root.to_path_buf()]`
-    // arm. A `need_rescan` marker carries no paths of its own, so under that
-    // mutation an overflow forwards an empty batch instead: `RootedFilter`
-    // is asked about nothing, no restart follows, and the watch goes quiet
-    // exactly when notify has already dropped events.
+    // fails if [`forward_batch`] stops reading notify's own `Rescan` flag —
+    // `let rescan = false;`, or a rescan inferred from `paths.is_empty()`.
+    // A rescan means notify dropped events and wants the tree re-read, and it
+    // is the one signal the group loop must act on without consulting a glob
+    // set; losing it leaves the watch quiet exactly when it knows least.
     //
-    // The one case that enters the code PRODUCING that marker. Both existing
-    // rescan cases fabricate it downstream — `run_group` is handed
-    // `vec![root]` on a channel, and `RootedFilter::triggers` is asked about
-    // the root directly — so they pin the consumer and leave this side of
-    // the contract free to change.
+    // The one case that enters the code PRODUCING that marker. The rescan case
+    // in `watch`'s own tests fabricates a flagged batch downstream, so it pins
+    // the consumer and leaves this side of the contract free to change.
     //
     // Driven directly rather than through a real watcher because the OS is
     // what emits a rescan (an inotify queue overflow, an FSEvents drop), and
     // no test can ask it for one.
     #[test]
-    fn a_path_less_batch_is_forwarded_as_the_root_itself() {
+    fn a_rescan_marker_is_forwarded_as_a_rescan_rather_than_as_a_path() {
         let root = PathBuf::from("/watched");
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        // A marker exactly as notify delivers one: the `Rescan` flag, and no
-        // path of its own.
+        // A marker exactly as notify delivers one on Linux: the `Rescan`
+        // flag, and no path of its own.
         let rescan = Event::new(EventKind::Other).set_flag(Flag::Rescan);
         forward_batch(
             Ok(vec![DebouncedEvent::new(rescan, Instant::now())]),
@@ -313,12 +325,15 @@ mod tests {
         );
         assert_eq!(
             rx.try_recv().expect("a rescan marker must produce a batch"),
-            vec![root.clone()]
+            WatchBatch {
+                paths: Vec::new(),
+                rescan: true,
+            }
         );
 
-        // Control: a batch that does carry paths is forwarded as itself, so
-        // the substitution above belongs to the path-less case alone and is
-        // not a root standing in for every change.
+        // Control: an ordinary batch carries its paths and is NOT a rescan,
+        // so the flag above belongs to the marker alone rather than being set
+        // for every delivery.
         let changed = root.join("src/main.rs");
         let modified = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(changed.clone());
         forward_batch(
@@ -328,7 +343,48 @@ mod tests {
         );
         assert_eq!(
             rx.try_recv().expect("a path batch must be forwarded"),
-            vec![changed]
+            WatchBatch {
+                paths: vec![changed],
+                rescan: false,
+            }
+        );
+    }
+
+    // fails if the rescan flag is inferred from an empty path list rather than
+    // read from notify. macOS attaches the watched path to its
+    // `MustScanSubDirs` marker, so on that platform an inference from emptiness
+    // reports every real rescan as an ordinary event on the root, and the tree
+    // is never re-read.
+    //
+    // Also fails if a mixed batch loses the flag: the debouncer coalesces
+    // whatever landed inside one `delay`, so a marker very often arrives
+    // alongside the paths notify did manage to keep.
+    #[test]
+    fn a_rescan_marker_that_carries_a_path_is_still_a_rescan() {
+        let root = PathBuf::from("/watched");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // macOS's shape: the flag, with the watched root attached to it.
+        let rescan = Event::new(EventKind::Other)
+            .add_path(root.clone())
+            .set_flag(Flag::Rescan);
+        let changed = root.join("src/main.rs");
+        let modified = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(changed.clone());
+        forward_batch(
+            Ok(vec![
+                DebouncedEvent::new(modified, Instant::now()),
+                DebouncedEvent::new(rescan, Instant::now()),
+            ]),
+            &root,
+            &tx,
+        );
+
+        assert_eq!(
+            rx.try_recv().expect("a rescan marker must produce a batch"),
+            WatchBatch {
+                paths: vec![changed, root],
+                rescan: true,
+            }
         );
     }
 
@@ -345,7 +401,7 @@ mod tests {
 
         let batch = expect_batch(&mut rx).await;
         assert!(
-            batch.contains(&file),
+            batch.paths.contains(&file),
             "expected {file:?} in the batch, got {batch:?}"
         );
     }
@@ -364,7 +420,7 @@ mod tests {
 
         let batch = expect_batch(&mut rx).await;
         assert!(
-            batch.contains(&file),
+            batch.paths.contains(&file),
             "expected {file:?} in the batch, got {batch:?}"
         );
     }
@@ -419,18 +475,18 @@ mod tests {
 
         let batch_one = expect_batch(&mut rx).await;
         assert!(
-            batch_one.contains(&first),
+            batch_one.paths.contains(&first),
             "expected {first:?} in the first batch, got {batch_one:?}"
         );
         assert!(
-            !batch_one.contains(&second),
+            !batch_one.paths.contains(&second),
             "the two writes coalesced into one batch despite the gap \
              exceeding `delay` — got {batch_one:?}"
         );
 
         let batch_two = expect_batch(&mut rx).await;
         assert!(
-            batch_two.contains(&second),
+            batch_two.paths.contains(&second),
             "expected {second:?} in a batch of its own, got {batch_two:?}"
         );
     }
@@ -463,9 +519,12 @@ mod tests {
         let second = crate::testing::touch(&root, "second.txt").unwrap();
 
         let batch = expect_batch(&mut rx).await;
-        assert!(batch.contains(&first), "expected {first:?} in {batch:?}");
         assert!(
-            batch.contains(&second),
+            batch.paths.contains(&first),
+            "expected {first:?} in {batch:?}"
+        );
+        assert!(
+            batch.paths.contains(&second),
             "writes inside `delay` must land in one batch, got {batch:?}"
         );
 
@@ -539,7 +598,7 @@ mod tests {
 
         let batch = expect_batch(&mut rx).await;
         assert!(
-            batch.contains(&file),
+            batch.paths.contains(&file),
             "expected the deleted path {file:?} in the batch, got {batch:?}"
         );
     }
@@ -563,11 +622,11 @@ mod tests {
         let batch = expect_batch(&mut rx).await;
         let resolved_file = resolved_target.join("through-the-link.txt");
         assert!(
-            batch.contains(&resolved_file),
+            batch.paths.contains(&resolved_file),
             "expected the resolved path {resolved_file:?} in {batch:?}"
         );
         assert!(
-            !batch.iter().any(|p| p.starts_with(&link)),
+            !batch.paths.iter().any(|p| p.starts_with(&link)),
             "expected no path under the symlink itself, got {batch:?}"
         );
     }

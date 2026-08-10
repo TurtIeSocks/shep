@@ -31,6 +31,8 @@ use commands::daemon::{daemon_exit_code, run_daemon};
 #[cfg(unix)]
 use commands::lifecycle;
 #[cfg(unix)]
+use commands::logs;
+#[cfg(unix)]
 use commands::query;
 use exit::ExitCode;
 #[cfg(unix)]
@@ -106,35 +108,81 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
 /// a resolvable home for either was a bug, not a deliberate restriction.
 #[cfg(unix)]
 async fn run(cli: Cli) -> ExitCode {
-    let mut out = std::io::stdout().lock();
-    let mut err = std::io::stderr().lock();
-    let mut streams = Streams {
-        out: &mut out,
-        err: &mut err,
-    };
     let fmt = cli.global.format;
 
+    // `StdoutLock`/`StderrLock` are process-wide and are held for as long as
+    // the guard lives, so the locked pair further down is right for exactly
+    // one shape of verb: one that finishes in milliseconds. For those, holding
+    // both across the dispatch buys one lock acquisition instead of one per
+    // write, and no interleaving with anything.
+    //
+    // Two verbs are not that shape. `daemon` runs until a signal, with
+    // `commands::daemon::install_log_subscriber` rendering the daemon's own
+    // records to `std::io::stderr()` from tokio worker threads; `bleats`
+    // without `--no-follow` follows until Ctrl-C. Neither may hold a guard
+    // across that, so `bleats` takes unlocked handles and `daemon` takes none
+    // at all. (`completions` is dispatched early as well, for the unrelated
+    // reason this function's own doc gives — it must work where no `$HOME`
+    // resolves — and is a millisecond verb like the rest.)
+    //
+    // `Stderr`'s lock is re-entrant only for the thread that took it, so a
+    // guard held here — on the runtime's main thread, for one of those
+    // lifetimes — blocks the first record written by any other thread,
+    // forever, taking the task that wrote it with it. That is not a
+    // hypothetical: it wedged the daemon on its first warning, silently, with
+    // an empty `shepd.err.log` (2026-08-09). `bleats` has not been wedged,
+    // because nothing in that process writes to stderr off-thread today; the
+    // shape is the same one, and the default panic hook — which writes through
+    // this very handle — is enough to make it live. Unlocked handles take the
+    // lock per write and release it.
+    //
+    // Only the `daemon` half of that fix is under test. `a_real_memory_breach_
+    // restarts_a_sheep` reddens if this function's `daemon` arm takes a guard
+    // again, because it reads the record that would be blocked. Nothing
+    // covers the `bleats` arm below: every e2e `bleats` call passes
+    // `--no-follow`, so no test has ever held that arm open long enough for a
+    // guard to matter, and re-locking its handles would go unnoticed here.
+    // Following mode is what a case would have to drive — a `bleats` that
+    // stays up until it is signalled — and there is no such case today.
     match cli.command {
         Commands::Completions(ref args) => {
-            return completions::completions(&mut *streams.out, args);
+            let mut out = std::io::stdout().lock();
+            return completions::completions(&mut out, args);
         }
-        Commands::Daemon(ref args) => {
-            return run_daemon_command(&mut streams, fmt, &cli.global, args).await;
-        }
+        Commands::Daemon(ref args) => return run_daemon_command(fmt, &cli.global, args).await,
         _ => {}
     }
 
     let paths = match resolve_paths(&cli.global) {
         Ok(paths) => paths,
         Err(code) => {
-            let _ = output::emit_error(
-                &mut *streams.err,
-                fmt,
-                code.code_str(),
-                "none of --home, $SHEP_HOME, or $HOME resolves a root directory",
-            );
+            emit_error_locked(fmt, code, UNRESOLVED_HOME);
             return code;
         }
+    };
+
+    // Split out of the dispatch below only to keep its handles unlocked, for
+    // the reason the block comment above gives; it is otherwise an arm like
+    // any other, and the `unreachable!` at the bottom of that dispatch is what
+    // keeps the two from drifting apart.
+    if let Commands::Bleats(ref args) = cli.command {
+        let mut out = std::io::stdout();
+        let mut err = std::io::stderr();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+        };
+        return match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => bleats::bleats(&client, &mut streams, fmt, cli.global.quiet, args).await,
+            Err(code) => code,
+        };
+    }
+
+    let mut out = std::io::stdout().lock();
+    let mut err = std::io::stderr().lock();
+    let mut streams = Streams {
+        out: &mut out,
+        err: &mut err,
     };
 
     match cli.command {
@@ -170,22 +218,56 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => query::fold(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
-        Commands::Bleats(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => bleats::bleats(&client, &mut streams, fmt, cli.global.quiet, args).await,
-            Err(code) => code,
-        },
         Commands::Ping => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => query::ping(&client, &mut streams, fmt).await,
+            Err(code) => code,
+        },
+        Commands::Reopen(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => logs::reopen(&client, &mut streams, fmt, args).await,
+            Err(code) => code,
+        },
+        // The one verb with two targets, and the only arm that can finish
+        // without a client: `--daemon` empties files this binary created and
+        // the daemon merely inherited (`launch::launch_command`), so there is
+        // nothing to ask the socket. Not connecting is the feature rather
+        // than an optimisation — a wedged or stopped shepherd is exactly when
+        // an operator reaches for this, and `connect_client` never autostarts
+        // one to be told to do nothing.
+        Commands::Flush(ref args) if args.daemon => logs::flush_daemon(&mut streams, fmt, &paths),
+        Commands::Flush(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => logs::flush(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
         Commands::Kill => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => admin::kill(client, &mut streams, fmt).await,
             Err(code) => code,
         },
-        Commands::Completions(_) | Commands::Daemon(_) => {
-            unreachable!("handled above, before resolve_paths runs")
+        Commands::Completions(_) | Commands::Daemon(_) | Commands::Bleats(_) => {
+            unreachable!("handled above, on unlocked handles")
         }
     }
+}
+
+/// What both [`resolve_paths`] call sites report when nothing resolves a root.
+#[cfg(unix)]
+const UNRESOLVED_HOME: &str = "none of --home, $SHEP_HOME, or $HOME resolves a root directory";
+
+/// Emits one error envelope to stderr under a lock taken for just that write.
+///
+/// The lock is what keeps the envelope whole. Under `--format json`,
+/// [`output::emit_error`] writes it with `serde_json::to_writer` — many small
+/// writes on an unbuffered `Stderr` — and then a newline. A record from a
+/// still-live worker thread landing between two of those writes tears the
+/// envelope in half, and with `log_json = true` that also breaks line-oriented
+/// parsing of `shepd.err.log`, where both end up.
+///
+/// Short-lived is the entire distinction from the guard [`run`]'s own comment
+/// warns about: it is a guard held for a whole process lifetime that wedges
+/// the daemon, never one held across a single write.
+#[cfg(unix)]
+fn emit_error_locked(fmt: Format, code: ExitCode, message: &str) {
+    let mut err = std::io::stderr().lock();
+    let _ = output::emit_error(&mut err, fmt, code.code_str(), message);
 }
 
 /// Connects to the daemon at `paths.socket`, autostarting one via
@@ -244,25 +326,22 @@ async fn connect_client(
 /// re-exec target resolves its own paths instead, independently of that
 /// gate.
 ///
+/// Takes no [`Streams`] of its own, unlike every other arm: the supervisor
+/// writes its own diagnostics through the subscriber
+/// `commands::daemon::install_log_subscriber` installs, and the only two
+/// writes left for this function are the error envelopes below — each under
+/// its own short-lived lock ([`emit_error_locked`]), which is the opposite of
+/// the guard held for a process lifetime that wedged the daemon.
+///
 /// `#[cfg(unix)]`: the only caller is `run`'s unix arm — the hidden
 /// `daemon` subcommand is the re-exec target `launch::launch_daemon`
 /// spawns, and that launcher itself only exists on this tier.
 #[cfg(unix)]
-async fn run_daemon_command(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    global: &GlobalArgs,
-    args: &DaemonArgs,
-) -> ExitCode {
+async fn run_daemon_command(fmt: Format, global: &GlobalArgs, args: &DaemonArgs) -> ExitCode {
     let paths = match resolve_paths(global) {
         Ok(paths) => paths,
         Err(code) => {
-            let _ = output::emit_error(
-                &mut *streams.err,
-                fmt,
-                code.code_str(),
-                "none of --home, $SHEP_HOME, or $HOME resolves a root directory",
-            );
+            emit_error_locked(fmt, code, UNRESOLVED_HOME);
             return code;
         }
     };
@@ -270,8 +349,7 @@ async fn run_daemon_command(
         Ok(()) => ExitCode::Success,
         Err(err) => {
             let code = daemon_exit_code(&err);
-            let message = format!("{err}");
-            let _ = output::emit_error(&mut *streams.err, fmt, code.code_str(), &message);
+            emit_error_locked(fmt, code, &err.to_string());
             code
         }
     }

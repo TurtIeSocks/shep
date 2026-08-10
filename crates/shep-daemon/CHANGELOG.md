@@ -10,6 +10,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security and unsafe
+
+- Refuse, under a shepherd running as root, to open a log file whose ancestry
+  another local user could redirect — and warn about it, once per path, under
+  any other. An ancestor is loose when it is owned by neither the daemon's own
+  uid nor root, or when it is a world-writable directory. Ownership is the
+  load-bearing half: it catches an intermediate component swapped for a
+  symlink, which `O_NOFOLLOW` on the final component structurally cannot see,
+  and it catches an ordinary `0755` directory owned by an app's own
+  dropped-privilege `user`, which a write-bit test alone waves through. The
+  split by uid is deliberate — a loose ancestry is an escalation only for a
+  privileged daemon, and a developer logging to `/tmp` as themselves has
+  handed nobody anything they could not already do, so refusing there would
+  break a legitimate setup to no one's benefit. The sticky bit does not change
+  the answer: it restricts unlinking and renaming entries you do not own, not
+  creating new ones, and the attack plants a NEW entry at a path shep has not
+  created yet. A TOCTOU window remains between the check and the open, and
+  there is no portable way to close it while macOS is tier-1. The check costs
+  one `lstat(2)` per path component (7.8 µs for a nine-component path,
+  measured).
+- Open every log file with `O_NOFOLLOW`, in both halves of the log plane:
+  the pump's appending handle and the truncating one `shep flush` opens. An
+  app's `out_file`/`err_file` are free-form config, so a log path can name a
+  pre-existing directory shep neither created nor tightens — and there
+  another local user could plant a symlink where the log file was going to
+  be, have a root shepherd append the sheep's stdout through it, and have
+  `shep flush` empty its target. Dropping privileges with `user`/`group`
+  never helped, because log I/O never leaves the daemon, and the peer-cred
+  check was never in the path, because the attacker never touches the socket.
+  Both opens now fail instead, leaving the symlink and its target alone. The
+  guard covers only the FINAL path component: a symlinked parent directory
+  still resolves, and closing that needs `openat2(RESOLVE_NO_SYMLINKS)`,
+  which is Linux-only and so out of scope while macOS is tier-1. `O_APPEND`
+  rides alongside the new flag rather than being replaced by it — losing it
+  brings back the sparse hole after every rotation. An operator whose log
+  path legitimately IS a symlink is told so in those words, on the failure
+  path each verb already has: `ELOOP`'s own wording ("too many levels of
+  symbolic links") describes a loop they do not have.
+
 ### Additions
 
 - Add the cron-restart worker: one worker per name-group, restarting every
@@ -47,13 +86,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing quietly — see `shep-core`'s entry for why defaulting to the daemon's
   own cwd was the worse of the two remaining options.
 
-  **One path escapes the globs entirely.** A change reported *at the watch
-  root itself* triggers a restart before either set is consulted, so
-  `ignore_watch` cannot suppress it. That is the rescan signal an inotify
-  queue overflow produces — it means "unknown paths under here changed", not
-  "this path changed", and no user pattern can be matched against it
-  meaningfully. Restarting on it is the conservative reading; the alternative
-  is a watch that goes quiet exactly when it knows least.
+  **One thing escapes the globs entirely, and it is not a path.** When notify
+  reports a *rescan* — it dropped events (an inotify queue overflow, an
+  FSEvents `MustScanSubDirs`) and wants the tree re-read — the group restarts
+  whatever either list says. A rescan means "unknown paths under here
+  changed", not "this path changed", so no user pattern can be matched
+  against it meaningfully; restarting is the conservative reading, and the
+  alternative is a watch that goes quiet exactly when it knows least. It
+  travels alongside the changed paths as notify's own flag rather than being
+  inferred from them, because both available inferences are wrong: an empty
+  path list is inotify's shape for a rescan and not macOS's, and a path equal
+  to the watch root is macOS's shape for one *and* an ordinary event on that
+  directory's own inode. A change reported at the watch root itself is
+  therefore an ordinary event, filtered like any other — it changed nothing
+  under the tree, so it restarts nothing.
 
   Two halves of the reach are worth stating together, because either alone
   misleads. **A triggering change restarts every instance of the name**,
@@ -95,10 +141,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add the daemon boot sequence: `0700` runtime layout (created at that mode
   directly, never chmod'ed after), an atomically-written pidfile, control-
   socket bind with stale-socket recovery, a readiness-pipe handshake for the
-  CLI's `daemon` subcommand, SIGTERM/SIGINT/SIGQUIT graceful shutdown and a
-  SIGUSR2 log-reopen stub, and a load-bearing ordered teardown (roll saved
-  before the flock is killed, or `shep muster` after a reboot restores
-  nothing).
+  CLI's `daemon` subcommand, SIGTERM/SIGINT/SIGQUIT graceful shutdown and
+  SIGUSR2 log reopening (see below), and a load-bearing ordered teardown
+  (roll saved before the flock is killed, or `shep muster` after a reboot
+  restores nothing).
 - The pure decision tiers (brain, backoff, assemble, entry, the `runner`
   trait and its fake) compile and test on every platform; the OS tier
   (real spawning, signals, the kill ladder, the socket itself) is unix-only.
@@ -108,6 +154,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second time, so the reported paths are by construction the ones the child
   is writing to — including when the app configured an explicit `out_file`
   pointing outside the log directory entirely.
+- This crate's fifty-six `tracing` records now reach a reader. Nothing here
+  installs a subscriber — that belongs to the binary, once per process, and a
+  library that installed one would fail every test after the first — but the
+  `shep` binary now does, at `warn` by default, so every warn-and-continue arm
+  in this crate is output rather than a comment claiming output. The arms
+  worth knowing about: `extras` reports a watch, a cron worker or a liveness
+  probe it could not arm and lets the sheep come up `online` regardless;
+  `supervisor`'s `Actor::handle_ready_result` reports a readiness deadline
+  that elapsed, which is otherwise indistinguishable from a sheep that
+  answered; and `boot`'s SIGUSR2 listener reports what a signal-driven reopen
+  did, a signal having no reply channel to report it through. The count lives
+  here and nowhere else: a copy of it in another crate's changelog goes stale
+  on this crate's next commit, which is what happened to the one it replaces.
+- Add `runner::LogCtl`, the request type a sheep's log pump takes mid-flight,
+  and the first way anything has been able to reach the file handle that pump
+  writes to. `Reopen` makes the pump flush, close and
+  re-open both of a sheep's log files, then answer on a `oneshot`. That
+  acknowledgement is the point of the shape rather than a nicety: a flag the
+  pump would notice before its next write promises nothing about a sheep that
+  has gone quiet, and an external rotator needs to know the swap has happened
+  before it compresses or deletes what it renamed. The acknowledgement
+  carries a `Result`: `Ok` means both old handles were flushed and closed AND
+  both paths were opened again, while `runner::ReopenError` names the paths
+  that could not be opened. Either answer clears the rotator to act on its
+  rename, since the old handles are closed regardless — what the error adds
+  is that the sheep has no file left to log that stream to. The child is not
+  involved and never notices: it holds a pipe, and the daemon does the file
+  I/O on the far side of it. Reaching a pump means holding the `ProcIo` field
+  below.
+
+  `Flush` is the second variant: it waits for every write already handed to
+  the blocking pool to reach the file and keeps the handle, which is the
+  half of `shep flush` that runs before anything is truncated. It answers
+  with a `Result` too, where `LogFile::reopen` logs a flush failure and moves
+  on because the handle it belongs to is being replaced by a working one.
+  That result does not hold up the truncate — `poll_flush` drives the write
+  already in flight to completion either way, so bytes it reports are bytes
+  that errored, not bytes still racing anything — it changes the answer the
+  operator gets, which is that a sheep could not write its log.
+  `runner::FlushError` names the files either half of the verb could not
+  deal with.
+- Answer `Request::Reopen`: the supervisor keeps a clone of every running
+  sheep's log-control sender and pushes a `LogCtl::Reopen` at each sheep the
+  selector matches, which is what makes `create`-mode rotation — rename the
+  file, then ask — work at all. Until now the pump kept filling the renamed
+  inode and the live path was never recreated, so `shep bleats --no-follow`
+  printed nothing and exited 0 with no diagnostic; a restart was the only
+  working reopen. The reply lands only once every matched pump has swapped
+  both handles, so a `postrotate` stanza that waits for it knows nothing is
+  still holding what it renamed. A matched sheep with no live pump is
+  reported as a success rather than an error: there was nothing to reopen,
+  which is not a failure worth failing `reopen all` over. A pump that
+  answered and could not open a path again is the opposite case and fails
+  the request (`SupervisorError::ReopenFailed`, `RpcErrorCode::Internal` on
+  the wire), naming every such sheep and path — every matched sheep is
+  visited first, so one sheep whose log directory is gone neither stops the
+  rest being reopened nor goes unreported. The
+  acknowledgements are awaited on a task of their own and never inside the
+  actor loop — an actor parked on one stops draining its mailbox, which
+  stops the sheep task draining its logs, which stops the pump answering.
+  Holding that clone costs the pump no life of its own: a pump ends when its
+  `logs` receiver goes away as readily as when its last control sender does,
+  and the sheep task lets go of both together. That is what retires the pump
+  of a sheep whose child forked a lamb and left it holding the pipe — with
+  neither stream ever reaching EOF, nothing else would.
+- **SIGUSR2 now reopens every sheep's log files** — the same work
+  `shep reopen all` does, reached without a socket. A signal carries no
+  selector, so `all` is the only thing it can mean, and a `postrotate`
+  stanza that would rather send a signal than run a client gets the same
+  swap: every live pump closes both handles and opens both paths again.
+  Installing the handler was already load-bearing on its own, because
+  SIGUSR2's default disposition is to terminate — an unhandled `kill -USR2`
+  kills the daemon instead of rotating it — and it is installed before the
+  socket is bound, so there is no window where the daemon is reachable but
+  the signal is still fatal. Two things the socket form gives that this one
+  cannot: a signal has no reply, so the result is logged rather than
+  reported and nothing can wait for the swap to finish; and it reaches the
+  whole flock or nothing. The logged result is asymmetric on purpose — a
+  failed reopen is a `warn` and so visible at the default level, while a
+  successful one is an `info` the default `log_level = "warn"` filters out,
+  since a routine success is not a warning. Confirming a signal-driven
+  rotation worked therefore means running at `log_level = "info"`, which is
+  why `SECURITY.md` recommends `shep reopen` in a `postrotate` stanza over
+  `kill -USR2`: the command exits 9 naming the sheep and path, and the signal
+  cannot report anything. A rotation that moved the log directory rather than
+  the files is handled the same way it is for the socket form — by the pump,
+  see the directory-mode entry below.
+- Answer `Request::Flush`: every pump writing to a matched log path is sent a
+  `LogCtl::Flush` and answers, and only then is each distinct recorded log
+  path truncated. Both halves of that sentence are load-bearing. The flush
+  comes first because `write_all` on a `tokio::fs::File` returns as soon as
+  the real `write(2)` is queued, so a line already in flight would otherwise
+  land at offset 0 of a file that had just been emptied — the one line that
+  survives a flush, in the log its operator was told is empty. The barrier is
+  drawn around the FILE and not around the selection, which is why a sheep
+  the selector skipped is still flushed when it shares a path with one that
+  matched: `shep flush 0` on a `merge_logs` app empties instance 1's live
+  file, and an unflushed instance 1 is exactly the in-flight line above. The
+  reply stays keyed by the selector — a row there means "a sheep you named",
+  and what happened to the sibling is a fact about a path. And it is the
+  RECORDED PATH that is truncated, never the inode the pump currently holds:
+  after an external rotator's rename those name different files, and a flush
+  that chased the handle would empty the archive and leave the live log
+  untouched. Being path-based is also what lets a stopped sheep, which has no
+  pump at all, be flushed — its logs are still readable with
+  `shep bleats --no-follow`, so they are still worth emptying. Paths are
+  deduplicated, so instances sharing one file under `merge_logs` truncate it
+  once: one truncate empties the file for every `O_APPEND` handle open on it,
+  and a second would only repeat work already done. A pump that could not
+  land what it owed, or a path that could not be truncated, fails the request
+  (`SupervisorError::FlushFailed`, `RpcErrorCode::Internal` on the wire)
+  naming every such path — keyed by path rather than by sheep, since a shared
+  path belongs to no single one. Every pump and path is visited first, so one
+  unwritable file neither stops the rest being emptied nor goes unreported. A
+  missing path is not a failure: a log file that is not there is
+  already empty, and it is deliberately not created, which would otherwise
+  leave a stray empty log wherever a rotator had just renamed one away. Like
+  the reopen above, every await lives on a task of its own and never inside
+  the actor loop.
 
 ### Fixes
 
@@ -136,7 +301,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Create every runtime directory at `0700` directly via `DirBuilder::mode`
   instead of creating then `chmod`-ing, closing a TOCTOU window where a
   freshly created directory briefly sat at its umask-derived (potentially
-  world-writable) mode.
+  world-writable) mode. A sheep's log pump asks `mkdir` for the same mode
+  when it opens or reopens a log file, so a rotation that moved the log
+  DIRECTORY aside rather than the files gets it back at `0700` however the
+  reopen was asked for — `shep reopen`, `SIGUSR2`, or the next spawn — rather
+  than at whatever the umask allows. The pump is the only owner of that
+  guarantee, which is also why an app whose `out_file` points outside the
+  layout gets `0700` on any parent directory shep has to create for it.
 - Adopt the CLI's inherited readiness descriptor as the first fd-touching
   statement in `boot`, before anything else opens or closes one of its own —
   closes an IO-safety hazard where a stale `SHEP_READY_FD` could land on a
@@ -174,9 +345,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `online` need to poll instead.
 
   On `listen_timeout` elapsing without a signal, the sheep goes `online`
-  anyway, and silently: the daemon logs a warning, but no `tracing-subscriber`
-  is wired yet, so nothing renders it and a `starting` that ran long is
-  indistinguishable from one that answered. Treating a slow start as a spawn
+  anyway: the daemon logs a warning, and that warning is the only thing
+  telling a `starting` that ran long from one that answered — the status and
+  the bus event are the same either way. Treating a slow start as a spawn
   failure would produce exactly the restart loop `max_restarts` exists to
   contain, out of an app that is slow rather than broken.
 - `BootOptions` gains a `max_cron_sleep: Option<Duration>` field, carrying
@@ -202,8 +373,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MEMORY_POLL_INTERVAL`, `PollingEnforcer`, `LimitBreach`,
   `LivenessFailure`, `spawn_liveness_task`, `probes::os`, `probes::ready`
   (`ReadinessSource`, `Readiness`, `await_ready`), `privilege::resolve` and
-  `PrivilegeError`, `SupervisorBuilder`, six of `SupervisorHandle`'s nine
-  public methods, `dispatch`/`Outcome`/`budget` and both deadline constants,
+  `PrivilegeError`, `SupervisorBuilder`, every `SupervisorHandle` method
+  except `start`, `list` and `shutdown`,
+  `dispatch`/`Outcome`/`budget` and both deadline constants,
   `RpcContext`'s fields, `FlockRegistry`, `write_atomic`, `restorable`,
   `SnapshotWriter` with both snapshot constants, and `boot`'s `init_dirs`,
   `read_pidfile`, `socket_path`, `bind_socket` and `DaemonReady`.
@@ -230,3 +402,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Doc links to the newly-private names became plain code spans rather than
   being deleted; in the crate-root taxonomy, a linked module name now means
   public and a backticked one means internal.
+- `ProcIo` gains a `log_ctl: mpsc::Sender<LogCtl>` field: the control channel
+  into a sheep's log pump, carrying the requests described under Additions
+  above. Filed here rather than there because the struct carries no
+  `#[non_exhaustive]`: any downstream `ProcIo` literal, or destructuring that
+  names every field, stops compiling until it names this one too.
+
+  Dropping the sender ends the pump, so a holder must keep it for as long as
+  the child is alive. Ending the pump drops the read ends of the child's
+  stdout and stderr along with it, and the child's next write to either then
+  gets `EPIPE`/`SIGPIPE` — a dropped sender kills children, it does not
+  merely stop collecting from them. A send that fails means the pump is
+  already gone, which makes a reopen or a flush a no-op rather than an error.
+
+  The real runner also spawns one pump task per sheep now instead of one per
+  stream, so a single request covers both files and answers once.

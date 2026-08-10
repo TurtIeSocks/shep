@@ -227,6 +227,15 @@ pub fn spawn_cron_worker(
                         // the next iteration re-derives the following one.
                         tracing::warn!(name, %err, "cron-triggered restart failed to spawn");
                     }
+                    Err(
+                        err @ (SupervisorError::ReopenFailed(_) | SupervisorError::FlushFailed(_)),
+                    ) => {
+                        // A restart touches no log files, so neither can
+                        // arrive. Named rather than swept into a catch-all,
+                        // so a variant this path CAN produce still fails to
+                        // compile here.
+                        tracing::warn!(name, %err, "cron-triggered restart reported a log-plane failure");
+                    }
                     Err(err @ SupervisorError::EngineStopped) => {
                         tracing::warn!(name, %err, "supervisor engine has shut down; cron worker ending");
                         return;
