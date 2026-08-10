@@ -281,7 +281,14 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
         // bare payload so the reader is told which of the two it is —
         // `SupervisorError`'s `Display` is the only thing that still
         // distinguishes them once they share a code.
-        SupervisorError::ReopenFailed(_) | SupervisorError::FlushFailed(_) => RpcError {
+        // Same `Internal` code, same reason: the wire enum is versioned, and
+        // a refusal is worth less to an operator with the message stripped
+        // off it than with a less precise code on it. `Display` carries the
+        // app's name, which is the part that says what to do about it —
+        // wait, or reload something else.
+        SupervisorError::ReopenFailed(_)
+        | SupervisorError::FlushFailed(_)
+        | SupervisorError::ReloadInFlight(_) => RpcError {
             code: RpcErrorCode::Internal,
             message: err.to_string(),
         },

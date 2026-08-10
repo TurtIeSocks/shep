@@ -51,6 +51,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add the reload state machine: the supervisor can replace each instance of an
+  app with a fresh one, one instance at a time, so the app has a window in
+  which it can stay reachable across the swap. A replacement registers under a
+  **new id in the drainee's instance slot**, so an app deriving its port from
+  `SHEP_INSTANCE` binds the same one; both entries coexist until the drainee
+  exits, and the drainee's registration is removed with it rather than left
+  behind as a dead row. The old instance is marked `stopping` before the
+  replacement is spawned, which gives `ProcStatus::Stopping` its first writer
+  and keeps a one-instance app from ever counting as two.
+
+  **This is an overlap, not zero downtime, and the difference is the
+  application's to close.** The old listener's accept backlog is reset when it
+  closes — on both tier-1 platforms — so whatever was queued and not yet
+  accepted is lost unless the app stops accepting, drains, and exits inside
+  `graceful_timeout`. An app that ignores its stop signal until shep's
+  `SIGKILL` drops that backlog on every single reload, and nothing shep does
+  prevents it.
+
+  Readiness is always gated for a replacement, even for an app that configures
+  neither `wait_ready` nor `readiness_probe` — the heuristic wait exists for
+  exactly this caller. A replacement that does not become ready inside
+  `listen_timeout` **abandons the reload**: the instance being replaced goes
+  back to serving, the instances the reload had not reached yet are left
+  alone, and the replacement is killed through the stop ladder and
+  deregistered. The drain itself runs under `graceful_timeout` (default
+  8000ms) rather than `kill_timeout` (default 1600ms), which gives both of
+  those app options their first reader in the daemon.
+
+  Not yet reachable from the control socket: the wire verb and the CLI are
+  separate work.
+- Add `SupervisorError::ReloadInFlight`, carrying an app's name — a reload
+  that reaches an app whose reload has not finished is refused whole rather
+  than queued or partly accepted. **Breaking for anything matching
+  exhaustively on `SupervisorError`**, which is not `#[non_exhaustive]` by
+  deliberate choice.
 - Add the cron-restart worker: one worker per name-group, restarting every
   instance of the name — stopped instances included — on its `cron_restart`
   schedule, the same reach the watch below has. The dialect is five-field

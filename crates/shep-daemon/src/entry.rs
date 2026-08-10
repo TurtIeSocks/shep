@@ -26,16 +26,13 @@ pub struct ProcessEntry {
     pub started_at: Option<tokio::time::Instant>,
     /// Restart budget and stability tracking
     pub budget: RestartBudget,
-    /// Reload state machine (None, SpawningReplacement, or Draining)
+    /// Which half of a reload this entry is, if any.
     ///
-    /// Written at registration and never read: reload execution is deferred,
-    /// and this field is the data half landing ahead of it. The expectation
-    /// below is what keeps that honest rather than silent — it fires the day
-    /// a reload path reads this, and the attribute goes with it.
-    #[expect(
-        dead_code,
-        reason = "data-only ahead of reload execution; the reader lands with it"
-    )]
+    /// `None` for an ordinary instance, which is every entry outside the few
+    /// seconds a reload of its app is in flight. The supervisor reads this on
+    /// two paths that would otherwise get a reload's entries badly wrong — a
+    /// readiness wait resolving, and an exit being decided — so the variant
+    /// docs below are what those paths are keying on.
     pub reload: ReloadState,
     /// Resolved once at the initial `Start` and reused for every later
     /// respawn — never re-resolved, so a restart never re-touches the
@@ -117,15 +114,6 @@ impl RestartBudget {
 /// navigable in both directions: from the drainee, `new_id` says who is
 /// replacing it; from the replacement, `old_pid` says who it must outlive.
 /// See the two variants for the full split.
-///
-/// Data only: nothing constructs the two non-`None` variants yet, because
-/// reload execution is deferred. `allow` rather than `expect` because this
-/// module's own tests do construct them, so the expectation would be
-/// fulfilled in the lib build and unfulfilled in the test build.
-#[allow(
-    dead_code,
-    reason = "data-only ahead of reload execution; the constructors land with it"
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadState {
     /// Not in a reload sequence
@@ -161,7 +149,6 @@ pub enum ReloadState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{app_with, armed_entry, test_paths};
 
     #[test]
     fn budget_stable_exit_resets_counter() {
@@ -211,93 +198,5 @@ mod tests {
 
         budget.reset();
         assert_eq!(budget.unstable_count(), 0);
-    }
-
-    #[test]
-    fn reload_state_is_data_only() {
-        let none = ReloadState::None;
-        let spawning = ReloadState::SpawningReplacement { new_id: 42 };
-        let draining = ReloadState::Draining { old_pid: 1234 };
-
-        assert_eq!(none, ReloadState::None);
-        assert_eq!(spawning, ReloadState::SpawningReplacement { new_id: 42 });
-        assert_eq!(draining, ReloadState::Draining { old_pid: 1234 });
-    }
-
-    /// Computes the drainee/replacement pairing exactly the way settled
-    /// decision 3 requires, and hands back the two `ReloadState` values
-    /// rather than assigning them into `ProcessEntry::reload` itself.
-    ///
-    /// That field is `#[expect(dead_code)]`-guarded specifically because
-    /// nothing reads it yet — the reader lands with the state machine in
-    /// Task 5, not here. The guard turns out to be stricter than "nothing
-    /// reads it": even a field *write* through `entry.reload = ...`
-    /// assignment (as opposed to a struct-literal initializer, which is how
-    /// every existing call site sets it) is enough to flip the lint
-    /// expectation and break the guard Step 2 confirmed is still needed —
-    /// confirmed empirically while writing this test. So this helper
-    /// touches only `status`, which already has other readers, and leaves
-    /// `.reload` alone entirely.
-    ///
-    /// Not the reload state machine — this task does not implement one —
-    /// but a rehearsal, local to the test module, of the one invariant that
-    /// machine must respect: which entry gets which variant, and that the
-    /// two are not the same entry.
-    fn pair_for_reload(
-        drainee: &mut ProcessEntry,
-        replacement: &ProcessEntry,
-    ) -> (ReloadState, ReloadState) {
-        drainee.status = ProcStatus::Stopping;
-        let names_replacement = ReloadState::SpawningReplacement {
-            new_id: replacement.id,
-        };
-        let names_drainee = ReloadState::Draining {
-            old_pid: drainee
-                .pid
-                .expect("drainee must carry a pid to be worth draining"),
-        };
-        (names_replacement, names_drainee)
-    }
-
-    /// Fails if `pair_for_reload` is mutated to swap which entry gets
-    /// `SpawningReplacement` vs. `Draining` (settled decision 3 inverted:
-    /// the drainee names its replacement, the replacement points back at
-    /// what it must outlive), or if it is mutated to also set the
-    /// replacement's `status` to `Stopping` — the exact bug the earlier,
-    /// wrong `Draining` doc encoded, claiming that variant pairs with
-    /// `Stopping` on the same entry. It does not: `Stopping` lives on the
-    /// drainee, `Draining` lives on the replacement, and those are two
-    /// different [`ProcessEntry`] records.
-    #[test]
-    fn reload_state_pairs_the_drainee_and_its_replacement() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let paths = test_paths(&dir);
-        let app = app_with("web", |_| {});
-
-        let mut drainee = armed_entry(1, 0, 1111, app.clone(), &paths);
-        let replacement = armed_entry(2, 0, 2222, app, &paths);
-
-        let (names_replacement, names_drainee) = pair_for_reload(&mut drainee, &replacement);
-
-        // The drainee carries the status every guard that only reads
-        // `status` sees, and names the entry replacing it.
-        assert_eq!(drainee.status, ProcStatus::Stopping);
-        assert_eq!(
-            names_replacement,
-            ReloadState::SpawningReplacement {
-                new_id: replacement.id
-            }
-        );
-
-        // The replacement is not `Stopping` -- `Draining` lives on a
-        // different entry than the one carrying `Stopping` -- and it points
-        // back at the drainee's OS pid, the thing it must outlive.
-        assert_ne!(replacement.status, ProcStatus::Stopping);
-        assert_eq!(
-            names_drainee,
-            ReloadState::Draining {
-                old_pid: drainee.pid.expect("drainee must carry a pid")
-            }
-        );
     }
 }
