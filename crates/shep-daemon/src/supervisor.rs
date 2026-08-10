@@ -608,7 +608,15 @@ pub fn spawn_supervisor<R: ProcessRunner>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SheepCtl {
     /// Run the kill ladder and report the resulting exit.
-    Kill,
+    Kill {
+        /// How long the ladder's polite rung gets before it escalates to
+        /// `SIGKILL`. Carried on the message rather than read off the app
+        /// inside [`kill_process`] because an app configures two such caps —
+        /// `kill_timeout` for an ordinary stop, `graceful_timeout` for the
+        /// one stop that asks the instance to finish work in hand first —
+        /// and only the sender knows which of the two it is asking for.
+        grace: Duration,
+    },
 }
 
 /// Which manual command is pending against a sheep, cleared the moment its
@@ -1241,7 +1249,8 @@ impl<R: ProcessRunner> Actor<R> {
                 // exited and its own `Msg::Exited` is already in flight (or
                 // about to be).
                 if let Some(ctl) = &slot.ctl {
-                    let _ = ctl.try_send(SheepCtl::Kill);
+                    let grace = slot.entry.spec.config().kill_timeout.as_duration();
+                    let _ = ctl.try_send(SheepCtl::Kill { grace });
                 }
             }
             // The carve-out: take the marker, and leave the ladder the
@@ -2467,8 +2476,9 @@ async fn run_sheep<P: RunningProcess>(
             }
             maybe_ctl = ctl_rx.recv(), if ctl_open => {
                 match maybe_ctl {
-                    Some(SheepCtl::Kill) => {
-                        let outcome = kill_process(&mut proc, app.config(), Some(&to_child)).await;
+                    Some(SheepCtl::Kill { grace }) => {
+                        let outcome =
+                            kill_process(&mut proc, app.config(), Some(&to_child), grace).await;
                         let _ = actor_tx.send(Msg::Exited { id, outcome }).await;
                         break;
                     }
