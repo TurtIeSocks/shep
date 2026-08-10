@@ -61,6 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement is spawned, which gives `ProcStatus::Stopping` its first writer
   and keeps a one-instance app from ever counting as two.
 
+  An instance that is no longer replaceable when its turn comes is skipped and
+  the reload carries on to the rest: one that is not `online`, and one already
+  on its way out under a `stop`, a `restart` or a memory breach that claimed
+  it before the reload arrived. The second kind still reads `online` — a kill
+  ladder does not change the status while it runs — but a swap against it
+  cannot survive, because the exit that ladder is about to produce would
+  abandon the reload it was accepted into.
+
   **This is an overlap, not zero downtime, and the difference is the
   application's to close.** The old listener's accept backlog is reset when it
   closes — on both tier-1 platforms — so whatever was queued and not yet
