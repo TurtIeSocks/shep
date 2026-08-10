@@ -5878,12 +5878,17 @@ mod tests {
         expect_event(&mut rx, 1, ProcessEventKind::Start).await;
         handle.extra_restart(0, pid).await;
 
-        // Shorter than `listen_timeout`, so the only thing that could end
-        // the drainee inside this window is the report.
+        // `Restart`, not `Delete`, and the difference is the whole assertion:
+        // the bug kills the drainee and RESPAWNS it into a slot its
+        // replacement already holds, which never emits a `Delete` for this id.
+        // Watching for one would be watching for something the bug does not
+        // do. The window is shorter than `listen_timeout`, so nothing but the
+        // report can move the drainee inside it, and the drainee's real
+        // deregistration is asserted below where it belongs.
         assert_no_event_within(
             &mut rx,
             0,
-            ProcessEventKind::Delete,
+            ProcessEventKind::Restart,
             Duration::from_millis(1_000),
         )
         .await;
