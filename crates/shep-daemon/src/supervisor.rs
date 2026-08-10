@@ -219,11 +219,18 @@ pub enum SupervisorError {
     /// again, so that stream has no file to write to. Carries one
     /// `"<name> (id <id>): <paths and reasons>"` entry per such sheep,
     /// joined by `"; "`. Every other matched sheep was reopened.
+    ///
+    /// One sheep's own two paths arrive joined by `", "` — see
+    /// [`ReopenError::message`](crate::runner::ReopenError::message) — so
+    /// the two levels stay tellable apart in one flat string.
     ReopenFailed(String),
     /// At least one matched log file could not be flushed or truncated: a
     /// pump could not land what it owed that file, or the path itself could
     /// not be truncated. Carries one `"<path>: <reason>"` entry per such
-    /// file, joined by `"; "`. Every other matched path was emptied.
+    /// file, joined by `"; "` — where a single pump that failed on both of
+    /// its streams contributes one entry with the two paths joined by `", "`,
+    /// so the nesting stays readable.
+    /// Every other matched path was emptied.
     ///
     /// Says nothing about what those files hold afterwards, because the two
     /// halves differ there and neither is knowable from here. A truncate that

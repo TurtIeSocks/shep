@@ -437,6 +437,12 @@ impl LogFiles {
     /// stderr's queued bytes racing a truncate that stdout's failure never
     /// stopped. Both failures then travel together, so an operator is told
     /// about both paths at once rather than one per rotation.
+    ///
+    /// Those two travel joined by `", "`, and the separator is chosen against
+    /// the level above rather than for its own sake: the supervisor joins ONE
+    /// OF THESE PER SHEEP (reopen) or PER PATH (flush) with `"; "`, so one
+    /// separator at both levels would punctuate a single sheep that failed on
+    /// both streams exactly like two that failed on one each.
     async fn serve(&mut self, ctl: LogCtl) {
         match ctl {
             LogCtl::Reopen { done } => {
@@ -451,7 +457,7 @@ impl LogFiles {
                     Ok(())
                 } else {
                     Err(ReopenError {
-                        message: failures.join("; "),
+                        message: failures.join(", "),
                     })
                 };
                 // A caller that stopped waiting is not a failure: the reopen
@@ -470,7 +476,7 @@ impl LogFiles {
                     Ok(())
                 } else {
                     Err(FlushError {
-                        message: failures.join("; "),
+                        message: failures.join(", "),
                     })
                 };
                 // Same as above: the flush happened either way. A caller that

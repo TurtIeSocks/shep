@@ -135,6 +135,15 @@ async fn run(cli: Cli) -> ExitCode {
     // shape is the same one, and the default panic hook — which writes through
     // this very handle — is enough to make it live. Unlocked handles take the
     // lock per write and release it.
+    //
+    // Only the `daemon` half of that fix is under test. `a_real_memory_breach_
+    // restarts_a_sheep` reddens if this function's `daemon` arm takes a guard
+    // again, because it reads the record that would be blocked. Nothing
+    // covers the `bleats` arm below: every e2e `bleats` call passes
+    // `--no-follow`, so no test has ever held that arm open long enough for a
+    // guard to matter, and re-locking its handles would go unnoticed here.
+    // Following mode is what a case would have to drive — a `bleats` that
+    // stays up until it is signalled — and there is no such case today.
     match cli.command {
         Commands::Completions(ref args) => {
             let mut out = std::io::stdout().lock();

@@ -17,10 +17,18 @@ test-support = []
 # This crate's own fake-driven tests are integration tests, so they link the
 # ordinary (not `--cfg test`) library and need the feature switched on —
 # `cfg(test)` alone does not reach them. Declared per target rather than left
-# to fail: a bare `cargo test -p shep-client` skips these three instead of
+# to fail: a bare `cargo test -p shep-client` skips all four below instead of
 # failing to compile. `cargo test --workspace` runs them, because shep-cli's
 # dev-dependency turns the feature on for the whole workspace build; so does
 # any `--all-features` leg.
+#
+# Cargo skips a target whose required features are off in SILENCE — no line,
+# no count, no warning — so a bare per-crate run reports a fraction of this
+# crate's cases and reads as the whole. Nobody measuring coverage or a blast
+# radius opens this file first, so the warning also lives where the
+# measurement is taken: `lib.rs`'s
+# `heads_up_four_integration_binaries_need_test_support_and_are_not_running`
+# compiles only when the feature is off, and says so in the test output.
 [[test]]
 name = "request_reply"
 required-features = ["test-support"]

@@ -166,9 +166,17 @@ pub enum LogCtl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReopenError {
     /// Every log file the reopen could not open again, as
-    /// `"<path>: <what the open reported>"`, joined by `"; "` when both
+    /// `"<path>: <what the open reported>"`, joined by `", "` when both
     /// streams failed. Never empty: a reopen that opened both files answers
     /// `Ok`.
+    ///
+    /// `", "` and not `"; "` because this list gets nested inside another
+    /// one: [`SupervisorError::ReopenFailed`] joins one of these per sheep
+    /// with `"; "`, and a single separator at both levels would punctuate one
+    /// sheep that failed on both streams exactly like two sheep that failed
+    /// on one each.
+    ///
+    /// [`SupervisorError::ReopenFailed`]: crate::supervisor::SupervisorError::ReopenFailed
     pub message: String,
 }
 
@@ -196,9 +204,14 @@ impl core::error::Error for ReopenError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushError {
     /// Every log file the flush could not empty, as
-    /// `"<path>: <what the failing call reported>"`, joined by `"; "` when
-    /// more than one did. Never empty: a flush that emptied every file
-    /// answers `Ok`.
+    /// `"<path>: <what the failing call reported>"`, joined by `", "` when
+    /// both of a pump's streams did. Never empty: a flush that emptied every
+    /// file answers `Ok`.
+    ///
+    /// `", "` for the reason [`ReopenError::message`] gives about its own
+    /// separator: [`SupervisorError::FlushFailed`] joins one of these per
+    /// failing path with `"; "`, and one separator at both levels would make
+    /// the nesting unreadable.
     ///
     /// Keyed by path and never by sheep, unlike [`SupervisorError`]'s
     /// reopen failures: several sheep can share one log path (`merge_logs`,
@@ -207,6 +220,7 @@ pub struct FlushError {
     /// the reader actually needs.
     ///
     /// [`SupervisorError`]: crate::supervisor::SupervisorError
+    /// [`SupervisorError::FlushFailed`]: crate::supervisor::SupervisorError::FlushFailed
     pub message: String,
 }
 

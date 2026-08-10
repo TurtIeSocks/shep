@@ -2513,8 +2513,49 @@ fn shep_log_json_makes_the_daemons_own_records_json() {
 
 // --- Case 17 -------------------------------------------------------------
 
-/// `[daemon] log_level` decides which of the daemon's records survive: the
-/// same `WARN` is written at the default level and filtered out at `error`.
+/// The daemon's own records reach `shepd.err.log` with no ANSI escapes in
+/// them.
+///
+/// `install_log_subscriber` passes `.with_ansi(ansi_enabled(..))`, and
+/// `tracing_subscriber`'s own default is colour ON whenever its `ansi`
+/// feature is compiled in — it does not consult the terminal by itself. So
+/// deleting that one call, or handing it a `true`, fills the daemon's log
+/// with escape sequences: unreadable in `less`, and a trap for every
+/// substring assertion in this file, since an escape can land in the middle
+/// of a field name.
+///
+/// Asserted on purpose here because it is otherwise pinned only by accident.
+/// `a_real_memory_breach_restarts_a_sheep` checks its log for `limit=`, which
+/// escapes happen to break — an incidental guard, one rewritten assertion
+/// away from being gone, and one that names colour nowhere.
+///
+// fails if `install_log_subscriber` drops its `.with_ansi(..)` call, or
+// passes a constant `true` in place of `ansi_enabled`.
+#[test]
+fn the_daemons_own_log_carries_no_ansi_escapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = daemon_log_after_a_missed_handshake(&dir, &[]);
+
+    assert!(
+        log.contains(READINESS_RECORD),
+        "precondition: the daemon must have written a record to colour: {log:?}"
+    );
+    assert!(
+        !log.contains('\x1b'),
+        "a log file is not a terminal: {log:?}"
+    );
+}
+
+/// `SHEP_LOG_LEVEL` decides which of the daemon's records survive: the same
+/// `WARN` is written at the default level and filtered out at `error`.
+///
+/// The env variable, not the `[daemon] log_level` file key it overrides —
+/// that is all this body sets, and it is all this file can set: no case here
+/// writes a `shep.toml` at all, so every `[daemon]` key reaches the daemon
+/// through `SHEP_*` layering or not at all. What that leaves uncovered end to
+/// end is the file half of `DaemonConfig` — discovery, parse, and the
+/// precedence between a file value and the variable that overrides it — which
+/// is pinned in `shep-core`'s own tests and nowhere above them.
 ///
 /// Both halves provoke the identical record on identical configuration, so the
 /// only thing that differs between them is the knob — which is what makes the
