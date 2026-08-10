@@ -1476,6 +1476,35 @@ impl<R: ProcessRunner> Actor<R> {
         let mut results = Vec::new();
 
         for id in matched {
+            // An automatic restart is held off BOTH halves of an in-flight
+            // swap. A reload's whole point is the overlap, and a cron
+            // occurrence or a watched file landing inside it destroys that
+            // from either side: killing the drainee abandons the reload, and
+            // killing the replacement abandons it just as surely — the deploy
+            // becomes the ordinary hard restart the feature exists to avoid.
+            // For a `watch` app, the archetypal reload-often one, any save
+            // inside the readiness window did it.
+            //
+            // Dropping the trigger costs nobody an answer, which is
+            // `claim_manual`'s own carve-out argument applied one step
+            // earlier: an operator's command is the only one with a party
+            // waiting behind it. And the replacement is a process spawned
+            // moments ago, so it already carries whatever the trigger wanted
+            // picked up. Instances of the app the reload has not reached yet
+            // are not half of any swap and restart as usual.
+            //
+            // The other two automatic triggers — a memory breach and a
+            // liveness failure — need nothing here: they arrive through
+            // `Msg::ExtraRestart`, whose guard rejects anything that is not
+            // `Online`, and neither half of a swap is.
+            let held_off_by_a_swap = origin == CommandOrigin::Automatic
+                && self
+                    .sheep
+                    .get(&id)
+                    .is_some_and(|slot| slot.entry.reload != ReloadState::None);
+            if held_off_by_a_swap {
+                continue;
+            }
             let is_running = self.sheep.get(&id).is_some_and(|slot| slot.ctl.is_some());
             if is_running {
                 // Whoever ends up owning the marker (see `claim_manual`), this
@@ -1777,9 +1806,14 @@ impl<R: ProcessRunner> Actor<R> {
     ///   RESTART the instance shep is in the middle of replacing. Claiming
     ///   the marker early is not the fix: `claim_manual` sends the `Kill`
     ///   along with the marker, which would end the drainee before its
-    ///   replacement is ready. The status is: `handle_extra_restart`'s guard
-    ///   rejects anything that is not `Online`, so the transition that the
-    ///   roll needs closes the liveness window in the same stroke.
+    ///   replacement is ready. The status is, for the two automatic triggers
+    ///   that arrive through `Msg::ExtraRestart` — a memory breach and a
+    ///   liveness failure — because `handle_extra_restart`'s guard rejects
+    ///   anything that is not `Online`. So the transition the roll needs
+    ///   closes those two in the same stroke. It closes neither of the other
+    ///   two: a cron occurrence and a watched file reach `begin_manual`,
+    ///   which reads no status at all, so they are held off by that
+    ///   function's own carve-out on the `reload` marker instead.
     ///
     /// The mark is undone if the spawn fails, and nothing can observe it in
     /// between — the actor is synchronous here and emits no event.
@@ -2376,6 +2410,12 @@ impl<R: ProcessRunner> Actor<R> {
                 // no command behind it (`kind` is `None`) is the reload's
                 // business either way, and must not be restarted into a slot
                 // its replacement already holds.
+                //
+                // An operator's is the only command that can be here.
+                // `begin_manual` holds every automatic restart off both
+                // halves of a swap, and `handle_extra_restart`'s `Online`
+                // guard rejects the two triggers that do not come through it,
+                // so the warning below can name the operator without hedging.
                 let name = self.reload_of(id);
                 let abandonable = name
                     .as_deref()
@@ -5795,6 +5835,62 @@ mod tests {
         assert_eq!(after[0].id, 1);
         assert_eq!(after[0].status, ProcStatus::Online);
         assert_eq!(runner.kill_counts(), vec![0, 0], "neither was SIGKILLed");
+    }
+
+    // fails if an automatic restart is allowed to land on either half of an
+    // in-flight swap. A cron occurrence and a watched file reach
+    // `begin_manual`, which reads no status, so the `Stopping` transition
+    // that holds off the other two automatic triggers does nothing for these
+    // two. Killing either half abandons the reload and turns the deploy into
+    // an ordinary hard restart — for a `watch` app, on any save inside the
+    // readiness window, which is the app most likely to be reloaded at all.
+    #[tokio::test(start_paused = true)]
+    async fn an_automatic_restart_never_lands_on_either_half_of_a_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppConfig::minimal("web", "./srv");
+        // Both halves are signalled by hand, so the restart below lands
+        // squarely inside `AwaitReady` rather than racing a deadline.
+        app.wait_ready = true;
+        let (handle, runner, mut rx) = started(
+            &dir,
+            app,
+            vec![ProcScript::never_exits(), ProcScript::never_exits()],
+        )
+        .await;
+        handle.tx.send(Msg::Ready { id: 0 }).await.unwrap();
+        expect_event(&mut rx, 0, ProcessEventKind::Online).await;
+
+        handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the reload is accepted");
+        expect_event(&mut rx, 1, ProcessEventKind::Start).await;
+
+        let restarted = handle
+            .restart_automatic(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the selector matches both halves of the swap");
+        assert!(
+            restarted.is_empty(),
+            "neither half of a swap is an automatic restart's to take"
+        );
+
+        // The overlap survives, so the swap finishes the way it would have
+        // with nothing firing at all.
+        handle.tx.send(Msg::Ready { id: 1 }).await.unwrap();
+        expect_event(&mut rx, 1, ProcessEventKind::Online).await;
+        expect_event(&mut rx, 0, ProcessEventKind::Delete).await;
+
+        let after = handle.list().await;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, 1, "the replacement, not a restarted drainee");
+        assert_eq!(after[0].status, ProcStatus::Online);
+        assert_eq!(after[0].restarts, 0, "nothing counted a restart");
+        assert_eq!(
+            runner.kill_counts().len(),
+            2,
+            "one original and one replacement, and nothing else"
+        );
     }
 
     // fails if a swap committed by the drainee's OWN death outlives both of

@@ -79,6 +79,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   8000ms) rather than `kill_timeout` (default 1600ms), which gives both of
   those app options their first reader in the daemon.
 
+  **An automatic restart is held off both halves of an in-flight swap.** A
+  cron occurrence, a change under a watched tree, a memory breach or a
+  liveness failure all restart an app on the daemon's own initiative, and one
+  landing on the instance being replaced — or on its replacement — abandons
+  the reload and turns the deploy into the ordinary hard restart the overlap
+  exists to avoid. For an app with `watch = true`, the one most likely to be
+  reloaded at all, that was any save inside the readiness window. Instances of
+  the app the reload has not reached yet are not half of any swap and are
+  restarted as usual, and an operator's own `stop`/`restart`/`delete` still
+  reaches either half and still wins — a reload is not a lock on the app.
+
   Not yet reachable from the control socket: the wire verb and the CLI are
   separate work.
 - Add `SupervisorError::ReloadInFlight`, carrying an app's name — a reload
