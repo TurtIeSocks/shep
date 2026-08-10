@@ -14,11 +14,12 @@
 //! `std::os::unix::fs::PermissionsExt` usage) on the Windows CI leg too.
 //! Global Constraints names this file explicitly for that reason.
 //!
-//! The last case is the file's slow one and the reason it no longer finishes
-//! in about eleven seconds: a cron occurrence fires on a *real* wall-clock
-//! minute boundary, and there is no seam this tier could pause. It names its
-//! own measured cost; [`CRON_DEADLINE`] carries the argument for spending it
-//! rather than marking it `#[ignore]`.
+//! The last two cases are the file's slow ones and the reason it no longer
+//! finishes in about eleven seconds: a cron occurrence and a memory-limit
+//! breach are both events on *real* wall clock — a minute boundary and a
+//! 15-second sampling tick — with no seam this tier could pause. Each names
+//! its own measured cost; [`CRON_DEADLINE`] carries the argument for spending
+//! it rather than marking them `#[ignore]`.
 //!
 //! Every case's command chain carries `.timeout(CMD_TIMEOUT)` before
 //! `.output()`, so a regression that hangs (case 7's `--no-follow`
@@ -69,17 +70,17 @@ const BLEATS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// work); short enough that a sheep the [`DaemonGuard`] sweep somehow missed
 /// self-terminates quickly rather than lingering for the rest of a CI job.
 ///
-/// The real-clock case at the bottom of this file is the exception — it waits
-/// on a wall-clock schedule measured in tens of seconds — and uses
+/// The two real-clock cases at the bottom of this file are the exception —
+/// they wait on wall-clock schedules measured in tens of seconds — and use
 /// [`SLOW_SCRIPT_SLEEP_SECS`] instead.
 const SCRIPT_SLEEP_SECS: u32 = 60;
 
-/// [`SCRIPT_SLEEP_SECS`] for the real-clock cases, whose own deadlines run to
-/// [`CRON_DEADLINE`].
+/// [`SCRIPT_SLEEP_SECS`] for the two real-clock cases, whose own deadlines
+/// run to [`CRON_DEADLINE`].
 ///
 /// Sized to outlast the longest of those deadlines by a wide margin, and that
-/// margin is load-bearing rather than slack: it is what lets such a case
-/// claim the restart it observed came from the trigger under test. A
+/// margin is load-bearing rather than slack: it is what lets each of those
+/// cases claim the restart it observed came from the trigger under test. A
 /// script that could reach its own exit inside the observation window would
 /// make "the sheep restarted" equally consistent with a crash loop, and no
 /// assertion on the count could tell the two apart. Every second of it is
@@ -146,6 +147,33 @@ const FLOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// file's wall clock now — see
 /// [`a_cron_occurrence_restarts_a_sheep_on_the_real_clock`] for the numbers.
 const CRON_DEADLINE: Duration = Duration::from_secs(150);
+
+/// How long [`a_real_memory_breach_restarts_a_sheep`] waits for its breach.
+///
+/// The real enforcer samples every `shep_daemon::limits::MEMORY_POLL_INTERVAL`
+/// (15s) and its ticks are phased off daemon boot rather than off the sheep,
+/// so the worst honest wait is one whole interval after the sheep's resident
+/// set crosses its ceiling, plus a kill ladder and a respawn. Four times that
+/// is headroom for a loaded runner, not a second schedule.
+const BREACH_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a string [`write_ballooning_script`] grows, in bytes.
+///
+/// Measured rather than guessed (macOS, `/bin/sh`): a bare `/bin/sh` sitting
+/// in `sleep` holds about 1.2 MB resident, and growing a 16 MiB string takes
+/// it to about 166 MB, because the doubling loop's intermediate allocations
+/// stay in the shell's heap. The case does not lean on that slack, though —
+/// the string *alone* is twice [`BREACH_LIMIT`], so a thriftier `/bin/sh` on
+/// some other unix that held the string and nothing else would still breach.
+const BALLOON_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The `max_memory` the ballooning sheep is given.
+///
+/// Well above any plausible bare-shell resident set (1.2 MB measured, see
+/// [`BALLOON_BYTES`]) and half the string that script grows, so both halves
+/// of the claim — under the ceiling before, over it after — hold with a wide
+/// margin rather than on a coin toss.
+const BREACH_LIMIT: &str = "8M";
 
 // --- Fixture helpers ---------------------------------------------------
 
@@ -231,13 +259,47 @@ fn record_pid_line(dir: &TempDir) -> String {
 /// That case runs one of these twice over — once as the sheep under test and
 /// once as the control beside it — so what it has to be is unremarkable and
 /// very long-lived. See [`SLOW_SCRIPT_SLEEP_SECS`] for why the length is what
-/// makes the control mean anything.
+/// makes the control mean anything. The memory case's control is its own
+/// ballooning script rather than this one, for the reason
+/// [`write_ballooning_script`] gives.
 fn write_slow_script(dir: &TempDir) -> PathBuf {
     write_script(
         dir,
         "slow.sh",
         &format!(
             "#!/bin/sh\n{}sleep {SLOW_SCRIPT_SLEEP_SECS}\n",
+            record_pid_line(dir)
+        ),
+    )
+}
+
+/// Writes a script that grows its own resident set past [`BALLOON_BYTES`] and
+/// then sleeps for [`SLOW_SCRIPT_SLEEP_SECS`].
+///
+/// [`a_real_memory_breach_restarts_a_sheep`] runs this as *both* its subject
+/// and its control, where the cron case's two sheep share
+/// [`write_slow_script`]: a control that did not balloon would leave "the
+/// allocation itself killed the shell" as a live alternative explanation for
+/// the subject's restart, and ruling that out is the control's whole job.
+///
+/// The growth is a shell string doubled in place, not a child process that
+/// allocates: `$$` — the pid the daemon tracks, arms the enforcer against,
+/// and records through [`record_pid_line`] — is the process whose resident
+/// set actually moves, so the case exercises the enforcer's reading of a real
+/// process table without also depending on its ppid walk finding a lamb.
+/// (`shep-daemon`'s `limits::sample` unit tier already owns that walk.)
+///
+/// Pure shell arithmetic, no `head`/`dd`/`/dev/zero`: `${#s}` and `"$s$s"`
+/// are POSIX, so the growth does not vary with which coreutils a platform
+/// ships. It costs about a quarter of a second, which is well inside the gap
+/// before the enforcer's first sampling tick.
+fn write_ballooning_script(dir: &TempDir) -> PathBuf {
+    write_script(
+        dir,
+        "balloon.sh",
+        &format!(
+            "#!/bin/sh\n{}s=x\nwhile [ ${{#s}} -lt {BALLOON_BYTES} ]; do s=\"$s$s\"; done\n\
+             sleep {SLOW_SCRIPT_SLEEP_SECS}\n",
             record_pid_line(dir)
         ),
     )
@@ -608,8 +670,9 @@ fn bleats_no_follow_until_written(home: &Path, args: &[&str]) -> Output {
 /// value it wanted and the value it got.
 ///
 /// The deadline is a parameter rather than [`FLOCK_DEADLINE`] outright
-/// because the real-clock case waits on a wall-clock minute boundary that it
-/// is an order of magnitude too short for. It stays a *named* deadline per caller either way: no case in
+/// because the two real-clock cases wait on wall-clock schedules — a minute
+/// boundary, a 15-second sampling tick — that it is an order of magnitude too
+/// short for. It stays a *named* deadline per caller either way: no case in
 /// this file sleeps once and asserts.
 ///
 /// Each attempt carries the same [`CMD_TIMEOUT`] every other command here
@@ -645,8 +708,8 @@ fn poll_flock(home: &Path, done: impl Fn(&serde_json::Value) -> bool) -> serde_j
     poll_flock_data(home, FLOCK_DEADLINE, |data| done(&data[0]))[0].clone()
 }
 
-/// The `data[]` element named `name`, for the cases that run a control sheep
-/// beside the one under test.
+/// The `data[]` element named `name`, for the two cases that run a control
+/// sheep beside the one under test.
 ///
 /// By name rather than by index: the control exists to be read in the same
 /// observation as the subject, and `data[0]`/`data[1]` would quietly swap
@@ -1678,6 +1741,103 @@ fn a_cron_occurrence_restarts_a_sheep_on_the_real_clock() {
         0,
         "the same script with no cron_restart must not have moved: a restart both sheep \
          share is the script exiting, not an occurrence firing: {after}"
+    );
+
+    graceful_kill(home);
+}
+
+// --- Case 15 -------------------------------------------------------------
+
+/// A real RSS breach restarts a real sheep: a script that grows its resident
+/// set past its app's `max_memory` is restarted by the real `PollingEnforcer`
+/// sampling the real process table.
+///
+/// The only place `PollingEnforcer` and `SysinfoSampler` run together on real
+/// time against a real spawned process. The enforcer's own tier drives it
+/// through a `ScriptedSampler` on a paused clock; the registry's tier drives
+/// arming through a `RecordingEnforcer` that measures nothing. Neither can
+/// see the chain this case does: the actor arming the real enforcer at the
+/// `Online` transition, a 15-second sampling tick landing on a process whose
+/// resident set really moved, the breach reaching the reporter, and
+/// `extra_restart`'s guards letting it through to a real kill ladder and a
+/// real respawn.
+///
+/// `unlimited` is the control, and it is what makes the restart attributable.
+/// It runs the *same ballooning script* under the same daemon, grows the same
+/// resident set, and differs only in naming no `max_memory` — so a restart
+/// caused by the script exiting, or by the shell dying under its own
+/// allocation, would move both counters. Only a breach moves exactly one. The
+/// script's [`SLOW_SCRIPT_SLEEP_SECS`] sleep is the other half: it outlasts
+/// [`BREACH_DEADLINE`] five times over, so neither sheep can reach its own
+/// exit inside the window.
+///
+/// Measured cost: 16s — one `MEMORY_POLL_INTERVAL` plus a restart — bounded
+/// by [`BREACH_DEADLINE`]. It runs beside the rest of this tier rather than
+/// after it, and the cron case above has never been observed finishing
+/// sooner, so it has yet to be what any run of this file waited on.
+///
+/// What a broken implementation this would catch: a `SysinfoSampler` that
+/// stopped reading the real process table; an `arm_instance` that never
+/// reached the real enforcer from the real `Online` transition; a breach that
+/// reached the reporter and was logged rather than restarted; an enforcer
+/// armed against the sheep's id where its pid belongs, which
+/// `extra_restart`'s own pid guard would then silently drop for the whole
+/// life of the daemon.
+// fails if `SysinfoSampler::sample` stops reading the machine's process table
+// — verified by replacing its body with `Vec::new()`, which reddens this case
+// plus two unit tests: the sampler's own smoke test, and `extras`'
+// `real_extras_wire_the_enforcer_to_the_reports_channel`. Those two are why
+// this is the narrower of the two gaps this file closes — the real sampler and
+// the real breach channel each already had a unit-tier claim on them. What
+// neither asserts, and what nothing asserted before this case, is that a
+// breach restarts anything.
+#[test]
+fn a_real_memory_breach_restarts_a_sheep() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_ballooning_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"greedy\"\nscript = \"{script}\"\nmax_memory = \"{BREACH_LIMIT}\"\n\n\
+             [[app]]\nname = \"unlimited\"\nscript = \"{script}\"\n",
+            script = script.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    let before = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        sheep_named(data, "greedy")["status"] == "online"
+            && sheep_named(data, "unlimited")["status"] == "online"
+    });
+    assert_eq!(
+        sheep_named(&before, "greedy")["restarts"],
+        0,
+        "precondition: {before}"
+    );
+    assert_eq!(
+        sheep_named(&before, "unlimited")["restarts"],
+        0,
+        "precondition: {before}"
+    );
+
+    let after = poll_flock_data(home, BREACH_DEADLINE, |data| {
+        sheep_named(data, "greedy")["restarts"] == 1
+    });
+    assert_eq!(
+        sheep_named(&after, "greedy")["restarts"],
+        1,
+        "a process tree over its max_memory must be restarted by the real enforcer: {after}"
+    );
+    assert_eq!(
+        sheep_named(&after, "unlimited")["restarts"],
+        0,
+        "the same script with no max_memory must not have moved: a restart both sheep \
+         share is the script dying, not its ceiling being enforced: {after}"
     );
 
     graceful_kill(home);
