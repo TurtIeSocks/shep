@@ -1814,7 +1814,7 @@ impl<R: ProcessRunner> Actor<R> {
     ///   closes those two in the same stroke. It closes neither of the other
     ///   two: a cron occurrence and a watched file reach `begin_manual`,
     ///   which reads no status at all, so they are held off by that
-    ///   function's own carve-out on the `reload` marker instead.
+    ///   function's own carve-out on the swap's phase instead.
     ///
     /// The mark is undone if the spawn fails, and nothing can observe it in
     /// between — the actor is synchronous here and emits no event.
@@ -2457,9 +2457,11 @@ impl<R: ProcessRunner> Actor<R> {
                 //
                 // An operator's is the only command that can be here.
                 // `begin_manual` holds every automatic restart off both
-                // halves of a swap, and `handle_extra_restart`'s `Online`
-                // guard rejects the two triggers that do not come through it,
-                // so the warning below can name the operator without hedging.
+                // halves of a swap that has not committed — which is the only
+                // phase the branch below runs in — and
+                // `handle_extra_restart`'s `Online` guard rejects the two
+                // triggers a second time, so the warning can name the
+                // operator without hedging.
                 let name = self.reload_of(id);
                 let abandonable = name
                     .as_deref()
