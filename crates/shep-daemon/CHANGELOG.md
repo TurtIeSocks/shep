@@ -168,13 +168,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the sheep task lets go of both together. That is what retires the pump
   of a sheep whose child forked a lamb and left it holding the pipe — with
   neither stream ever reaching EOF, nothing else would.
-- Answer `Request::Flush`: every matched sheep's pump is sent a
+- Answer `Request::Flush`: every pump writing to a matched log path is sent a
   `LogCtl::Flush` and answers, and only then is each distinct recorded log
   path truncated. Both halves of that sentence are load-bearing. The flush
   comes first because `write_all` on a `tokio::fs::File` returns as soon as
   the real `write(2)` is queued, so a line already in flight would otherwise
   land at offset 0 of a file that had just been emptied — the one line that
-  survives a flush, in the log its operator was told is empty. And it is the
+  survives a flush, in the log its operator was told is empty. The barrier is
+  drawn around the FILE and not around the selection, which is why a sheep
+  the selector skipped is still flushed when it shares a path with one that
+  matched: `shep flush 0` on a `merge_logs` app empties instance 1's live
+  file, and an unflushed instance 1 is exactly the in-flight line above. The
+  reply stays keyed by the selector — a row there means "a sheep you named",
+  and what happened to the sibling is a fact about a path. And it is the
   RECORDED PATH that is truncated, never the inode the pump currently holds:
   after an external rotator's rename those name different files, and a flush
   that chased the handle would empty the archive and leave the live log
@@ -188,9 +194,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path that could not be truncated, fails the request
   (`SupervisorError::FlushFailed`, `RpcErrorCode::Internal` on the wire)
   naming every such path — keyed by path rather than by sheep, since a shared
-  path belongs to no single one. Every matched sheep and path is visited
-  first, so one unwritable file neither stops the rest being emptied nor goes
-  unreported. A missing path is not a failure: a log file that is not there is
+  path belongs to no single one. Every pump and path is visited first, so one
+  unwritable file neither stops the rest being emptied nor goes unreported. A missing path is not a failure: a log file that is not there is
   already empty, and it is deliberately not created, which would otherwise
   leave a stray empty log wherever a rotator had just renamed one away. Like
   the reopen above, every await lives on a task of its own and never inside
