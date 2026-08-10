@@ -191,3 +191,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new subsystem's command was a semver break on a surface nobody consumes.
   `SupervisorHandle` is the only door into the actor, and nothing outside this
   crate names the enum.
+- Most of this crate becomes `pub(crate)`, generalizing that one narrowing to
+  the whole surface. The modules `backoff`, `brain`, `bus`, `cron`, `entry`,
+  `extras`, `kill`, `server` and `watch` are no longer public at all, taking
+  with them `Clock`/`SystemClock`/`spawn_cron_worker`, the entire `extras`
+  surface, `WatchFilter`/`WatchSource`/`watch_tree` and their errors,
+  `RpcServer`/`check_peer`/`daemon_uid`, `TopicFilter`/`spawn_forwarder`,
+  `restart_delay`, `decide_on_exit`, `kill_process`, and `ProcessEntry` with
+  its budget and reload types. Inside the modules that stay public, so do
+  `MEMORY_POLL_INTERVAL`, `PollingEnforcer`, `LimitBreach`,
+  `LivenessFailure`, `spawn_liveness_task`, `probes::os`, `probes::ready`
+  (`ReadinessSource`, `Readiness`, `await_ready`), `privilege::resolve` and
+  `PrivilegeError`, `SupervisorBuilder`, six of `SupervisorHandle`'s nine
+  public methods, `dispatch`/`Outcome`/`budget` and both deadline constants,
+  `RpcContext`'s fields, `FlockRegistry`, `write_atomic`, `restorable`,
+  `SnapshotWriter` with both snapshot constants, and `boot`'s `init_dirs`,
+  `read_pidfile`, `socket_path`, `bind_socket` and `DaemonReady`.
+
+  The rule behind it: a dog is a separate process speaking the protocol, so
+  what a dog author builds against is `shep-core`. Nothing needs to link this
+  crate, and a `pub` item nobody links is not API — it is a semver
+  obligation taken on by accident.
+
+  What is left public is small, and each item now says in its own doc which
+  consumer holds it open. `boot`, `tokio_runner` and `boot::DIR_MODE` are
+  `shep-cli`'s; `runner`'s whole surface follows from `ProcessRunner` being
+  the bound on `boot`. `limits::sample`, `LimitEnforcer` and `Prober` are held
+  by the bench crate and by the external-implementor test that keeps those
+  seams honest. `assemble`, `channel::ChildMessage`, `privilege::Credentials`,
+  `snapshot::read`, `boot::pidfile` and `RunningDaemon::context` are held by
+  integration tests, and `supervisor`'s remaining surface by the crate-root
+  doc example, which rustdoc compiles as its own crate. `sys` and
+  `READY_FD_ENV` stay public with no caller at all: both halves of the
+  readiness handshake belong to a `shep-cli` `main` that is not written yet,
+  and `adopt_fd`'s ordering precondition cannot be discharged from inside
+  this crate.
+
+  Doc links to the newly-private names became plain code spans rather than
+  being deleted; in the crate-root taxonomy, a linked module name now means
+  public and a backticked one means internal.
