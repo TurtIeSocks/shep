@@ -459,7 +459,13 @@ impl ProcessRunner for ScriptedRunner {
                             // observes the acknowledgement can read the
                             // count without racing this task.
                             reopen_count.fetch_add(1, Ordering::SeqCst);
-                            let _ = done.send(());
+                            // Always `Ok`: the fake writes no files, so it
+                            // has no open that could fail. A pump that
+                            // cannot reopen a path is `tokio_runner`'s
+                            // tier, and a caller's handling of that answer
+                            // is tested against a runner written for it
+                            // (`supervisor`'s `FailingPumpRunner`).
+                            let _ = done.send(Ok(()));
                         }
                         None => break, // nothing holds ProcIo::log_ctl
                     },
@@ -744,10 +750,15 @@ mod tests {
         // Bounded rather than a bare await: an unanswered reopen must fail
         // this test, not hang it. Under the paused clock the deadline fires
         // as soon as the runtime is idle, so a passing run costs nothing.
-        tokio::time::timeout(Duration::from_secs(5), ack)
+        let outcome = tokio::time::timeout(Duration::from_secs(5), ack)
             .await
             .expect("a reopen must be acknowledged")
             .expect("the fake must answer rather than drop the acknowledgement");
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "a fake with no files to open has nothing that can fail"
+        );
     }
 
     /// Fails if the fake's control task outlives its proc: `log_ctl.send`

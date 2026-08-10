@@ -269,6 +269,17 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
             code: RpcErrorCode::SpawnFailed,
             message: msg.clone(),
         },
+        // `Internal` — an "unexpected daemon-side failure", which a log path
+        // the daemon can no longer open is. No code of its own: the wire
+        // enum is versioned, and a client that predates a new code cannot
+        // decode the reply at all, which would cost the operator the message
+        // as well. The message carries the sheep and the path either way,
+        // and `err.to_string()` rather than the bare payload so the reader
+        // is told what kind of failure it is.
+        SupervisorError::ReopenFailed(_) => RpcError {
+            code: RpcErrorCode::Internal,
+            message: err.to_string(),
+        },
         SupervisorError::EngineStopped => RpcError {
             code: RpcErrorCode::Internal,
             message: "the supervisor engine has stopped".to_string(),

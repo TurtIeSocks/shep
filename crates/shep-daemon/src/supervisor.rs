@@ -46,7 +46,9 @@ use crate::privilege::{self, Credentials};
 use crate::probes::Prober;
 use crate::probes::os::OsProber;
 use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
-use crate::runner::{ExitOutcome, LogCtl, ProcIo, ProcessRunner, RunningProcess, SpawnSpec};
+use crate::runner::{
+    ExitOutcome, LogCtl, ProcIo, ProcessRunner, ReopenError, RunningProcess, SpawnSpec,
+};
 
 /// Capacity of the actor's own mailbox (commands + internal events).
 const MAILBOX_CAPACITY: usize = 256;
@@ -192,6 +194,11 @@ pub enum SupervisorError {
     NotFound,
     /// Spawn failed (carries the runner's message).
     SpawnFailed(String),
+    /// At least one matched sheep's log pump could not open a log path
+    /// again, so that stream has no file to write to. Carries one
+    /// `"<name> (id <id>): <paths and reasons>"` entry per such sheep,
+    /// joined by `"; "`. Every other matched sheep was reopened.
+    ReopenFailed(String),
     /// The actor has shut down; its mailbox is closed.
     EngineStopped,
 }
@@ -201,6 +208,7 @@ impl fmt::Display for SupervisorError {
         match self {
             Self::NotFound => f.write_str("selector matched no registered sheep"),
             Self::SpawnFailed(msg) => write!(f, "spawn failed: {msg}"),
+            Self::ReopenFailed(msg) => write!(f, "log reopen failed: {msg}"),
             Self::EngineStopped => f.write_str("supervisor engine has shut down"),
         }
     }
@@ -378,6 +386,10 @@ impl SupervisorHandle {
     /// # Errors
     ///
     /// - [`SupervisorError::NotFound`] — nothing matched.
+    /// - [`SupervisorError::ReopenFailed`] — every matched pump answered,
+    ///   but at least one could not open a log path again. The old handles
+    ///   are closed either way, so the rename is safe to act on; what
+    ///   failed is the sheep getting a file back.
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
     pub(crate) async fn reopen(
         &self,
@@ -1987,13 +1999,26 @@ fn spawn_reopen_task(
 ) {
     tokio::spawn(async move {
         let mut reopened = Vec::with_capacity(matched.len());
+        let mut failures = Vec::new();
         for (info, log_ctl) in matched {
-            if let Some(log_ctl) = log_ctl {
-                reopen_logs(&log_ctl).await;
+            if let Some(log_ctl) = log_ctl
+                && let Err(error) = reopen_logs(&log_ctl).await
+            {
+                // Named and id'd, because the reply that would have said
+                // which sheep these are is the one being replaced.
+                failures.push(format!("{} (id {}): {error}", info.name, info.id));
             }
             reopened.push(info);
         }
-        let _ = reply.send(Ok(reopened));
+        // Every sheep is visited before anything is reported: one sheep
+        // whose log directory is gone must not stop the rest of the flock
+        // being reopened, and an operator wants every failing path in one
+        // answer rather than one per rotation.
+        let _ = reply.send(if failures.is_empty() {
+            Ok(reopened)
+        } else {
+            Err(SupervisorError::ReopenFailed(failures.join("; ")))
+        });
     });
 }
 
@@ -2001,21 +2026,29 @@ fn spawn_reopen_task(
 /// acknowledgement.
 ///
 /// Returns once the pump has answered, or as soon as it is clear no pump
-/// will. Both failures mean the same thing operationally — there was nothing
-/// left to reopen — and neither is worth reporting to whoever asked:
+/// will.
+///
+/// # Errors
+///
+/// [`ReopenError`] — a pump answered, and at least one of its two paths
+/// could not be opened again. That sheep is now writing one or both of its
+/// streams nowhere, which is worth failing the caller's request over.
+///
+/// Not reaching a pump at all is a success, not an error. Both shapes of it
+/// mean the same thing — there was nothing left to reopen:
 ///
 /// - the send fails when the pump is already gone (a sheep that is not
 ///   running), which is exactly what [`ProcIo::log_ctl`] promises callers;
 /// - the acknowledgement resolves `Err` when the pump ended between
-///   accepting the request and answering it, at both-EOF or with its `logs`
-///   receiver dropped. A request still sitting in the channel is dropped
-///   with it.
-async fn reopen_logs(log_ctl: &mpsc::Sender<LogCtl>) {
+///   accepting the request and answering it, at both-EOF, with its `logs`
+///   receiver dropped, or with its last control sender gone. A request still
+///   sitting in the channel is dropped with it.
+async fn reopen_logs(log_ctl: &mpsc::Sender<LogCtl>) -> Result<(), ReopenError> {
     let (done, ack) = oneshot::channel();
     if log_ctl.send(LogCtl::Reopen { done }).await.is_err() {
-        return;
+        return Ok(());
     }
-    let _ = ack.await;
+    ack.await.unwrap_or(Ok(()))
 }
 
 /// Spawns the per-sheep task and returns its control sender.
@@ -4041,9 +4074,15 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         drop(rx); // the pump ended before the request was made
 
-        tokio::time::timeout(Duration::from_secs(5), reopen_logs(&tx))
+        let outcome = tokio::time::timeout(Duration::from_secs(5), reopen_logs(&tx))
             .await
             .expect("a failed send must end the reopen, not leave it waiting");
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "a pump that was never reached reopened nothing, which is a no-op \
+             success rather than a reopen that failed"
+        );
     }
 
     /// Fails if [`reopen_logs`] treats a dropped acknowledgement as
@@ -4059,9 +4098,122 @@ mod tests {
             drop(request); // ends without answering, exactly as a closing pump does
         });
 
-        tokio::time::timeout(Duration::from_secs(5), reopen_logs(&tx))
+        let outcome = tokio::time::timeout(Duration::from_secs(5), reopen_logs(&tx))
             .await
             .expect("a dropped acknowledgement must end the reopen, not leave it waiting");
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "a pump that ended mid-request reopened nothing, which is the same \
+             no-op success a failed send is"
+        );
+    }
+
+    /// What [`FailingPumpRunner`]'s pump answers every reopen with. One
+    /// owner for the string, because the case below asserts the whole error
+    /// it ends up inside — a copy per site could drift and keep passing.
+    const PUMP_REFUSAL: &str = "/gone/web-out.log: No such file or directory";
+
+    /// The sheep [`FailingPumpRunner`] gives a failing pump to.
+    const REFUSING_SHEEP: &str = "web";
+
+    /// A [`ScriptedRunner`] whose spawn of [`REFUSING_SHEEP`] gets a pump
+    /// that answers every reopen with a failure, the way a real one does
+    /// when it cannot open a log path again — the rotator took the directory
+    /// with it, the mode changed, the disk filled. Every other sheep keeps
+    /// the scripted fake's own answering pump.
+    ///
+    /// By name rather than by spawn order, so one case can hold both halves
+    /// — the sheep whose reopen failed and a healthy one beside it — without
+    /// either half depending on which was spawned first.
+    #[derive(Debug)]
+    struct FailingPumpRunner {
+        inner: Arc<ScriptedRunner>,
+    }
+
+    impl FailingPumpRunner {
+        fn new(inner: Arc<ScriptedRunner>) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl ProcessRunner for FailingPumpRunner {
+        type Proc = crate::fake::FakeProc;
+
+        fn spawn(
+            &self,
+            spec: &SpawnSpec,
+        ) -> Result<(Self::Proc, ProcIo), crate::runner::RunnerError> {
+            let (proc, mut io) = self.inner.spawn(spec)?;
+            if spec.name != REFUSING_SHEEP {
+                return Ok((proc, io));
+            }
+            let (tx, mut rx) = mpsc::channel(SHEEP_CTL_CAPACITY);
+            // Replacing the sender drops the fake's own, which ends the
+            // control task it spawned. This pump answers in its place.
+            io.log_ctl = tx;
+            tokio::spawn(async move {
+                while let Some(LogCtl::Reopen { done }) = rx.recv().await {
+                    let _ = done.send(Err(ReopenError {
+                        message: PUMP_REFUSAL.to_string(),
+                    }));
+                }
+            });
+            Ok((proc, io))
+        }
+    }
+
+    /// Fails if a pump that could not reopen its files is reported as a
+    /// success. That sheep is then writing a stream nowhere while `shep
+    /// reopen` exits 0 and prints it in the table alongside the sheep that
+    /// really were reopened — the silent failure this verb exists to end,
+    /// moved one layer up.
+    ///
+    /// The healthy sheep is the second half of the case: a failure must
+    /// name the sheep it belongs to and no other, and must not stop the
+    /// rest of the flock being reopened. A `reopen` that gave up at the
+    /// first failure would leave `api`'s pump on its renamed inode and
+    /// nothing here would say so — except that count.
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_that_could_not_reopen_fails_the_request_and_names_its_sheep() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        // Two scripts for two instances, counted: a third spawn would answer
+        // `SpawnFailed("script exhausted")` and land that sheep in `Errored`
+        // with no pump at all.
+        let scripted = Arc::new(ScriptedRunner::new(vec![
+            ProcScript::never_exits(),
+            ProcScript::never_exits(),
+        ]));
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(
+            FailingPumpRunner::new(Arc::clone(&scripted)),
+            test_paths(&dir),
+            events,
+        );
+        handle
+            .start(vec![
+                normalize(AppConfig::minimal("web", "./srv")).unwrap(),
+                normalize(AppConfig::minimal("api", "./api")).unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(5), handle.reopen(ProcessSelector::All))
+                .await
+                .expect("a pump that answers must not leave the reopen waiting")
+                .expect_err("a reopen a pump could not carry out must not answer Ok");
+
+        assert_eq!(
+            error,
+            SupervisorError::ReopenFailed(format!("web (id 0): could not reopen {PUMP_REFUSAL}")),
+            "the failure must carry the sheep and the path, and only the sheep that failed"
+        );
+        assert_eq!(
+            scripted.reopens(1),
+            1,
+            "the healthy sheep must still have been reopened"
+        );
     }
 
     /// A [`ScriptedRunner`] a test can still read after the engine has taken

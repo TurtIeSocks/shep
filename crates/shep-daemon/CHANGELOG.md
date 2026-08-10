@@ -125,12 +125,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   acknowledgement is the point of the shape rather than a nicety: a flag the
   pump would notice before its next write promises nothing about a sheep that
   has gone quiet, and an external rotator needs to know the swap has happened
-  before it compresses or deletes what it renamed. The acknowledgement is a
-  barrier, not a success report — it fires whether or not either open worked,
-  and what a caller may conclude from it is that both old handles are flushed
-  and closed. The child is not involved and never notices: it holds a pipe,
-  and the daemon does the file I/O on the far side of it. Reaching a pump
-  means holding the `ProcIo` field below.
+  before it compresses or deletes what it renamed. The acknowledgement
+  carries a `Result`: `Ok` means both old handles were flushed and closed AND
+  both paths were opened again, while `runner::ReopenError` names the paths
+  that could not be opened. Either answer clears the rotator to act on its
+  rename, since the old handles are closed regardless — what the error adds
+  is that the sheep has no file left to log that stream to. The child is not
+  involved and never notices: it holds a pipe, and the daemon does the file
+  I/O on the far side of it. Reaching a pump means holding the `ProcIo` field
+  below.
 - Answer `Request::Reopen`: the supervisor keeps a clone of every running
   sheep's log-control sender and pushes a `LogCtl::Reopen` at each sheep the
   selector matches, which is what makes `create`-mode rotation — rename the
@@ -141,7 +144,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both handles, so a `postrotate` stanza that waits for it knows nothing is
   still holding what it renamed. A matched sheep with no live pump is
   reported as a success rather than an error: there was nothing to reopen,
-  which is not a failure worth failing `reopen all` over. The
+  which is not a failure worth failing `reopen all` over. A pump that
+  answered and could not open a path again is the opposite case and fails
+  the request (`SupervisorError::ReopenFailed`, `RpcErrorCode::Internal` on
+  the wire), naming every such sheep and path — every matched sheep is
+  visited first, so one sheep whose log directory is gone neither stops the
+  rest being reopened nor goes unreported. The
   acknowledgements are awaited on a task of their own and never inside the
   actor loop — an actor parked on one stops draining its mailbox, which
   stops the sheep task draining its logs, which stops the pump answering.

@@ -37,8 +37,8 @@ use tokio::sync::mpsc;
 
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::runner::{
-    ExitOutcome, LogCtl, LogLine, ProcIo, ProcessRunner, RunnerError, RunningProcess, SpawnSpec,
-    StopSignal,
+    ExitOutcome, LogCtl, LogLine, ProcIo, ProcessRunner, ReopenError, RunnerError, RunningProcess,
+    SpawnSpec, StopSignal,
 };
 
 /// Capacity of every channel a spawn wires up — generous enough that a
@@ -306,8 +306,13 @@ struct LogFile {
 
 impl LogFile {
     /// Opens `path` for appending, keeping the path for later reopens.
+    ///
+    /// A failed open is not fatal here — it is already logged, and the pump
+    /// must still drain the child's streams whether or not it can write
+    /// them anywhere. [`LogFile::reopen`] is the one that reports, because
+    /// there a caller is waiting to hear.
     async fn open(path: PathBuf) -> Self {
-        let handle = open_append(&path).await;
+        let handle = open_append(&path).await.ok();
         Self { path, handle }
     }
 
@@ -338,7 +343,17 @@ impl LogFile {
     /// Reopening goes through [`open_append`] rather than opening the path
     /// here, so the new handle is an appending one exactly like the original
     /// — see that function for why `O_APPEND` is load-bearing.
-    async fn reopen(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// The path could not be opened again — a directory that no longer
+    /// exists, a mode the daemon cannot write, a full disk. The old handle
+    /// is closed regardless, so the rotator's rename is safe to act on; what
+    /// is lost is this stream's file, and every line it would have taken
+    /// until something reopens it successfully. A flush that fails does NOT
+    /// error: it is logged, and the handle it belongs to is being replaced
+    /// by a working one, so the sheep keeps logging.
+    async fn reopen(&mut self) -> Result<(), ReopenError> {
         if let Some(handle) = self.handle.as_mut()
             && let Err(error) = handle.flush().await
         {
@@ -347,7 +362,15 @@ impl LogFile {
         // Closed before the reopen, so the pump never holds two descriptors
         // on one log at the same time.
         drop(self.handle.take());
-        self.handle = open_append(&self.path).await;
+        match open_append(&self.path).await {
+            Ok(handle) => {
+                self.handle = Some(handle);
+                Ok(())
+            }
+            Err(error) => Err(ReopenError {
+                message: format!("{}: {error}", self.path.display()),
+            }),
+        }
     }
 }
 
@@ -370,14 +393,33 @@ impl LogFiles {
     /// reopens: a caller that has heard back knows both handles were
     /// swapped, which is what a rotator that renamed both files is waiting
     /// on. One request, one answer — nothing here can send twice.
+    ///
+    /// stderr is reopened even when stdout's open just failed. The two files
+    /// are independent, and the stream that CAN come back is no less owed
+    /// its handle because the other one cannot; short-circuiting would take
+    /// a sheep's working half offline over the broken one. Both failures
+    /// then travel together, so an operator is told about both paths at
+    /// once rather than one per rotation.
     async fn serve(&mut self, ctl: LogCtl) {
         match ctl {
             LogCtl::Reopen { done } => {
-                self.out.reopen().await;
-                self.err.reopen().await;
+                let mut failures = Vec::new();
+                if let Err(error) = self.out.reopen().await {
+                    failures.push(error.message);
+                }
+                if let Err(error) = self.err.reopen().await {
+                    failures.push(error.message);
+                }
+                let result = if failures.is_empty() {
+                    Ok(())
+                } else {
+                    Err(ReopenError {
+                        message: failures.join("; "),
+                    })
+                };
                 // A caller that stopped waiting is not a failure: the reopen
                 // happened either way.
-                let _ = done.send(());
+                let _ = done.send(result);
             }
         }
     }
@@ -607,10 +649,17 @@ fn spawn_log_pump<O, E>(
 
 /// Opens `path` for appending, creating its parent directory first.
 ///
-/// Returns `None` on any I/O failure instead of erroring the whole pump: a
-/// log file we can't create shouldn't stop us draining the child's
-/// stdout/stderr — leaving that unread risks the child stalling on a full
-/// pipe once its own stdout buffer backs up.
+/// Every failure is logged here, where the two causes can still be told
+/// apart, and returned as well: [`LogFile::open`] discards it (a log file we
+/// cannot create must not stop us draining the child's stdout/stderr —
+/// leaving that unread risks the child stalling on a full pipe once its own
+/// buffer backs up), while [`LogFile::reopen`] has a caller waiting to hear
+/// whether the rotated path came back.
+///
+/// # Errors
+///
+/// The parent directory could not be created, or the file itself could not
+/// be opened.
 ///
 /// `.append(true)` is load-bearing rather than a convenience. `O_APPEND`
 /// makes every write seek to end atomically, which is what lets a
@@ -621,27 +670,21 @@ fn spawn_log_pump<O, E>(
 /// files would grow without bound. This holds for a reopened handle as much
 /// as for the first one, which is why [`LogFile::reopen`] comes back through
 /// here.
-async fn open_append(path: &Path) -> Option<tokio::fs::File> {
+async fn open_append(path: &Path) -> io::Result<tokio::fs::File> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
         && let Err(error) = tokio::fs::create_dir_all(parent).await
     {
         tracing::error!(?path, %error, "log directory create failed");
-        return None;
+        return Err(error);
     }
 
-    match tokio::fs::OpenOptions::new()
+    tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .await
-    {
-        Ok(file) => Some(file),
-        Err(error) => {
-            tracing::error!(?path, %error, "log file open failed");
-            None
-        }
-    }
+        .inspect_err(|error| tracing::error!(?path, %error, "log file open failed"))
 }
 
 /// Wires the daemon side of the shepherd channel: a reader task decodes
@@ -795,8 +838,17 @@ mod tests {
             );
         }
 
-        /// Sends a [`LogCtl::Reopen`] and waits for its acknowledgement.
+        /// Sends a [`LogCtl::Reopen`], waits for its acknowledgement, and
+        /// requires that it reports success — every caller of this reopens
+        /// paths the pump can open.
         async fn reopen(&self) {
+            let outcome = self.reopen_for_answer().await;
+            assert_eq!(outcome, Ok(()), "this reopen must have worked");
+        }
+
+        /// [`PumpHarness::reopen`] for the case where the answer itself is
+        /// the assertion.
+        async fn reopen_for_answer(&self) -> Result<(), ReopenError> {
             let (done, ack) = oneshot::channel();
             self.ctl
                 .send(LogCtl::Reopen { done })
@@ -805,7 +857,7 @@ mod tests {
             timeout(PUMP_DEADLINE, ack)
                 .await
                 .expect("a reopen must be acknowledged")
-                .expect("the pump must answer rather than drop the acknowledgement");
+                .expect("the pump must answer rather than drop the acknowledgement")
         }
     }
 
@@ -1019,10 +1071,15 @@ mod tests {
             .send(LogCtl::Reopen { done })
             .await
             .expect("a pump with one live stream still reads its control channel");
-        timeout(PUMP_DEADLINE, ack)
+        let outcome = timeout(PUMP_DEADLINE, ack)
             .await
             .expect("a reopen must be acknowledged")
             .expect("the pump must answer rather than drop the acknowledgement");
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "an ended stream's path is as openable as a live one's"
+        );
 
         assert!(
             pump.out_path.exists(),
@@ -1067,6 +1124,54 @@ mod tests {
         // caller that had already started awaiting one is told the same
         // thing rather than left pending.
         assert!(ack.await.is_err());
+    }
+
+    /// Fails if the pump acknowledges a reopen it could not carry out.
+    ///
+    /// A path the pump cannot open leaves that stream with no file at all
+    /// and every later line dropped, so answering `Ok` tells a rotator its
+    /// rotation worked while the sheep logs into nothing — the same silent
+    /// failure a reopen exists to end, moved one layer up.
+    ///
+    /// A directory in the log's place is the failure with no permission
+    /// games in it: `open(2)` on a directory fails for every uid, root
+    /// included, so this cannot pass for the wrong reason on a privileged
+    /// runner.
+    #[tokio::test]
+    async fn a_reopen_that_cannot_open_a_path_again_answers_with_the_failure() {
+        let pump = PumpHarness::start();
+        // A barrier proving both initial opens are done, so what follows
+        // cannot race them.
+        pump.reopen().await;
+
+        // The rotator's rename, and then something in stdout's way. stderr
+        // is merely deleted, so its own reopen is the only thing that can
+        // put it back.
+        fs::rename(&pump.out_path, pump.dir.path().join("out.log.1")).unwrap();
+        fs::create_dir(&pump.out_path).unwrap();
+        fs::remove_file(&pump.err_path).unwrap();
+
+        let error = pump
+            .reopen_for_answer()
+            .await
+            .expect_err("a reopen that could not open stdout's path must say so");
+        assert!(
+            error.message.contains(pump.out_path.to_str().unwrap()),
+            "the failure must name the path it could not open: {error}"
+        );
+        assert!(
+            !error.message.contains(pump.err_path.to_str().unwrap()),
+            "stderr's path opened fine and must not be reported: {error}"
+        );
+
+        // The other half of the answer: a failed open on one stream must not
+        // cost the other its handle. Without this the case would pass
+        // against a `serve` that gave up at the first failure, taking a
+        // sheep's working stream offline over its broken one.
+        assert!(
+            pump.err_path.exists(),
+            "stderr must be reopened even though stdout's open failed"
+        );
     }
 
     /// Fails if the pump can only notice a departed `logs` receiver from

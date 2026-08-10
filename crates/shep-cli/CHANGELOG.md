@@ -78,15 +78,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bus event carries at all.
 - Add `shep reopen [selector]`, which tells the daemon to reopen the log
   files of the sheep the selector matches — the half of `create`-mode
-  rotation that runs after the rotator's rename. The command returns only
-  once every matched sheep's log pump holds a handle on the recreated path,
-  so a logrotate `postrotate` stanza can wait for it. The selector is
+  rotation that runs after the rotator's rename. A zero exit means every
+  matched sheep's log pump holds a handle on the recreated path, so a
+  logrotate `postrotate` stanza can wait for it. The selector is
   optional and defaults to `all`, matching `bleats` rather than
   `stop`/`restart`/`delete`: those destroy something and this destroys
   nothing, and rotating the whole flock at once is the ordinary case. A
   matched sheep that is not running has nothing to reopen and is listed in
-  the output rather than failing the command. Output is the same table of
-  matched sheep `stop` and `restart` print.
+  the output rather than failing the command. A pump that could not open a
+  path again does fail it, naming the sheep and the path: the rename is
+  still safe to act on, but that sheep is writing a stream nowhere, and
+  exiting 0 there would be the silent failure this verb exists to end.
+  Output is the same table of matched sheep `stop` and `restart` print.
 
 ### Fixes
 

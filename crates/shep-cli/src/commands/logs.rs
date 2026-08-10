@@ -99,11 +99,17 @@ fn parse_selector(
 /// Reopens the log files of the sheep matching `args.selector`, for an
 /// external rotator that has renamed them.
 ///
-/// The daemon answers only once every matched sheep's log pump holds a
-/// handle on the recreated path, so a `postrotate` stanza that waits for
-/// this command knows no live pump is still filling the archive it just
-/// renamed. A matched sheep that is not running has no pump and nothing to
-/// reopen; it is reported alongside the rest rather than as a failure.
+/// A zero exit means every matched sheep's log pump holds a handle on the
+/// recreated path, so a `postrotate` stanza that waits for this command
+/// knows no live pump is still filling the archive it just renamed. A
+/// matched sheep that is not running has no pump and nothing to reopen; it
+/// is reported alongside the rest rather than as a failure.
+///
+/// A pump that could not open a path again fails the command instead, with
+/// the sheep and the path on stderr. The rename is still safe to act on —
+/// the old handle was closed either way — but that sheep is writing a
+/// stream nowhere until the path can be opened, and exiting 0 there would
+/// be the silent failure this verb exists to end.
 ///
 /// Renders the matched sheep as [`FlockRows`], the same table `stop` and
 /// `restart` answer with — the useful thing to show is which sheep the

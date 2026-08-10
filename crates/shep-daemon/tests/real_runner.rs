@@ -193,10 +193,15 @@ async fn a_reopen_moves_a_real_childs_output_onto_the_recreated_path() {
         .send(shep_daemon::runner::LogCtl::Reopen { done })
         .await
         .expect("a running sheep's pump must still be reachable");
-    tokio::time::timeout(LOG_WRITE_DEADLINE, ack)
+    let outcome = tokio::time::timeout(LOG_WRITE_DEADLINE, ack)
         .await
         .expect("the reopen must be acknowledged")
         .expect("the pump must answer rather than drop the acknowledgement");
+    assert_eq!(
+        outcome,
+        Ok(()),
+        "the live path is there to be opened: the rename moved the inode, not the directory"
+    );
 
     // No polling: the acknowledgement is a real barrier, since the reopen
     // flushes the old handle before dropping it.

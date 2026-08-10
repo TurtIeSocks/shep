@@ -450,6 +450,12 @@ async fn run_group(
             Err(err @ SupervisorError::SpawnFailed(_)) => {
                 tracing::warn!(name, %err, "watch-triggered restart failed to spawn");
             }
+            Err(err @ SupervisorError::ReopenFailed(_)) => {
+                // A restart reopens no log files, so this cannot arrive.
+                // Named rather than swept into a catch-all, so a variant
+                // this path CAN produce still fails to compile here.
+                tracing::warn!(name, %err, "watch-triggered restart reported a reopen failure");
+            }
             Err(err @ SupervisorError::EngineStopped) => {
                 tracing::warn!(name, %err, "supervisor engine has shut down; watch worker ending");
                 return;

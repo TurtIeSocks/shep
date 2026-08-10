@@ -91,15 +91,18 @@ pub enum LogCtl {
     /// Drop the current handle and open the path again, then acknowledge.
     /// Sent when an external rotator has renamed the file.
     Reopen {
-        /// Fires once the pump has finished acting on this request — a
-        /// barrier, not a success report.
+        /// Fires once the pump has finished acting on this request, carrying
+        /// what came of it.
         ///
-        /// It fires whether or not either open succeeded: a path that cannot
-        /// be opened leaves the pump holding no file for that stream
-        /// (logged, and still draining the child's streams), exactly as a
-        /// failed open at spawn time does. What a caller may conclude is
-        /// that both old handles have been flushed and closed, which is what
-        /// a rotator needs before it compresses or deletes what it renamed.
+        /// `Ok` says both old handles were flushed and closed AND both paths
+        /// were opened again — everything a rotator needs before it
+        /// compresses or deletes what it renamed, and everything the sheep
+        /// needs to keep logging. [`ReopenError`] says at least one path
+        /// could not be opened: the old handle is closed either way, so the
+        /// rename is safe to act on, but that stream now has no file at all
+        /// and its lines are dropped until something reopens it. Answering
+        /// `Ok` there would leave a sheep logging into nothing with nobody
+        /// told, which is the failure a reopen exists to end.
         ///
         /// # When it never fires
         ///
@@ -107,14 +110,39 @@ pub enum LogCtl {
         /// this sender, and the caller's `await` resolves
         /// [`Err`](oneshot::error::RecvError). The channel buffers several
         /// requests, so a send that succeeded is not a request that will be
-        /// served: both ways a pump ends — both streams reaching EOF, or the
-        /// `logs` receiver going away — retire it with whatever is still
-        /// queued. Treat that error as the same stopped-sheep no-op a failed
-        /// send means (see [`ProcIo::log_ctl`]); the two describe one
-        /// situation observed a moment apart.
-        done: oneshot::Sender<()>,
+        /// served: every way a pump ends — both streams reaching EOF, the
+        /// `logs` receiver going away, or the last control sender dropping —
+        /// retires it with whatever is still queued. Treat that error as the
+        /// same stopped-sheep no-op a failed send means (see
+        /// [`ProcIo::log_ctl`]); the two describe one situation observed a
+        /// moment apart, and neither is a reopen that failed.
+        done: oneshot::Sender<Result<(), ReopenError>>,
     },
 }
+
+/// A [`LogCtl::Reopen`] that could not open one or both of a sheep's log
+/// files again.
+///
+/// Carries a rendered message rather than the `io::Error`s behind it, the
+/// same way [`RunnerError`] does: it crosses a channel, ends up in an RPC
+/// error message, and every layer between only ever prints it. Keeping it a
+/// `String` is also what keeps this `Clone`/`Eq`, which `io::Error` is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReopenError {
+    /// Every log file the reopen could not open again, as
+    /// `"<path>: <what the open reported>"`, joined by `"; "` when both
+    /// streams failed. Never empty: a reopen that opened both files answers
+    /// `Ok`.
+    pub message: String,
+}
+
+impl fmt::Display for ReopenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "could not reopen {}", self.message)
+    }
+}
+
+impl core::error::Error for ReopenError {}
 
 /// IO endpoints handed back by spawn — the runner pumps internally.
 ///
