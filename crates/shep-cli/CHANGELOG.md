@@ -95,15 +95,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still running. Output is the same table of matched sheep `stop` and
   `restart` print.
 - Add `shep flush <selector>`, which empties the log files of the sheep the
-  selector matches: the daemon flushes what each matched pump still owes its
-  files, then truncates the paths those sheep were registered with. **The
-  selector is required**, where `bleats` and `reopen` both default to `all` —
-  this is the one command in the CLI whose slip of the finger cannot be
-  undone, so it follows `stop`/`restart`/`delete` and makes the operator name
-  a target. `shep flush all` is still short to type when it is meant. A
-  matched sheep that is not running is emptied like any other, since the
-  operation addresses paths rather than open handles and a stopped sheep's
-  logs are still readable with `shep bleats --no-follow`. The sheep goes on
+  selector matches: the daemon flushes what every pump writing to one of
+  those files still owes it, then truncates the paths those sheep were
+  registered with. **The selector is required**, where `bleats` and `reopen`
+  both default to `all` — this is the one command in the CLI whose slip of
+  the finger cannot be undone, so it follows `stop`/`restart`/`delete` and
+  makes the operator name a target. `shep flush all` is still short to type
+  when it is meant. What it empties is exactly the paths the Flockfile
+  named: `out_file`/`err_file` are taken verbatim and never checked against
+  the log directory, so an app pointing one of them at a file that is not a
+  log has that file emptied too, with the shepherd's privileges. A matched
+  sheep that is not running is emptied like any other, since the operation
+  addresses paths rather than open handles and a stopped sheep's logs are
+  still readable with `shep bleats --no-follow`. The sheep goes on
   logging into the same file afterwards, at offset 0 — its handle is
   `O_APPEND` and the daemon never touches it. A file that could not be
   emptied fails the command and is named on stderr; exiting 0 there would
@@ -114,7 +118,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   today) and the daemon inherits them as plain fds 1 and 2, so it holds no
   handle to flush and no path to truncate. Restarting the shepherd is what
   empties them. Output is the same table of matched sheep `stop`, `restart`
-  and `reopen` print — one row per sheep, not per file emptied.
+  and `reopen` print — one row per sheep, not per file emptied. A sheep
+  sharing a log path with a matched one has that file emptied under it as
+  well, its pump flushed first like any other writer to that path, and no row
+  of its own: the selector names sheep, and so does the table.
 
 ### Fixes
 

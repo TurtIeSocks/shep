@@ -132,12 +132,12 @@ pub(crate) enum Command {
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     },
     /// Empties the log files of every sheep matching `selector`: flushes
-    /// every matched pump, then truncates the recorded paths.
+    /// every pump writing to one of those paths, then truncates them.
     Flush {
         /// Which sheep.
         selector: ProcessSelector,
-        /// Answers once every path is empty — off a task of its own, never
-        /// the actor loop (see [`Actor::handle_flush`]).
+        /// Answers once every path has been truncated — off a task of its
+        /// own, never the actor loop (see [`Actor::handle_flush`]).
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     },
     /// Graceful engine shutdown: kill ladder on every online sheep, then stop.
@@ -210,10 +210,17 @@ pub enum SupervisorError {
     /// `"<name> (id <id>): <paths and reasons>"` entry per such sheep,
     /// joined by `"; "`. Every other matched sheep was reopened.
     ReopenFailed(String),
-    /// At least one matched log file is not empty after a `Flush`, because
-    /// its pump still owed it bytes or because the path could not be
-    /// truncated. Carries one `"<path>: <reason>"` entry per such file,
-    /// joined by `"; "`. Every other matched path was emptied.
+    /// At least one matched log file could not be flushed or truncated: a
+    /// pump could not land what it owed that file, or the path itself could
+    /// not be truncated. Carries one `"<path>: <reason>"` entry per such
+    /// file, joined by `"; "`. Every other matched path was emptied.
+    ///
+    /// Says nothing about what those files hold afterwards, because the two
+    /// halves differ there and neither is knowable from here. A truncate that
+    /// failed leaves its file as it was; a flush that failed does not stop
+    /// the truncate — the bytes it reports are bytes that errored, not bytes
+    /// still in flight — so that file is empty, and what the operator is
+    /// being told is that the lines it held are gone unwritten.
     ///
     /// Keyed by path where [`Self::ReopenFailed`] is keyed by sheep, and
     /// deliberately: a reopen's unit of work is one sheep's pump, while a
@@ -426,20 +433,24 @@ impl SupervisorHandle {
     }
 
     /// Empties the log files of every sheep matching `selector`: flushes
-    /// every matched pump, then truncates the paths those sheep were
-    /// registered with.
+    /// every pump writing to one of the paths those sheep were registered
+    /// with, then truncates those paths.
     ///
-    /// Answers only once every matched path is empty. A matched sheep that is
-    /// not running has no pump to flush, and its files are truncated all the
-    /// same — the operation addresses paths, and a stopped sheep's logs are
-    /// readable (`shep bleats --no-follow`) and so worth being able to empty.
+    /// Answers once every one of those paths has been truncated — or, on the
+    /// error below, once every one has been attempted. A matched sheep that
+    /// is not running has no pump to flush, and its files are truncated all
+    /// the same — the operation addresses paths, and a stopped sheep's logs
+    /// are readable (`shep bleats --no-follow`) and so worth being able to
+    /// empty.
     ///
     /// # Errors
     ///
     /// - [`SupervisorError::NotFound`] — nothing matched.
-    /// - [`SupervisorError::FlushFailed`] — at least one matched file is not
-    ///   empty: a pump could not land what it still owed, or a path could not
-    ///   be truncated. Every other matched path was emptied.
+    /// - [`SupervisorError::FlushFailed`] — at least one matched file could
+    ///   not be flushed or truncated: a pump could not land what it still
+    ///   owed, or a path could not be truncated. Every other matched path was
+    ///   emptied. The variant's own doc says why this claims nothing about
+    ///   what the named files hold afterwards.
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
     pub(crate) async fn flush(
         &self,
@@ -640,8 +651,8 @@ struct SheepSlot {
     /// Sender for this sheep's control mailbox; `None` when not running.
     ctl: Option<mpsc::Sender<SheepCtl>>,
     /// A clone of the [`ProcIo::log_ctl`] the most recent successful spawn
-    /// handed out, which is how a `Reopen` reaches this sheep's log pump.
-    /// `None` only for a slot whose spawn never succeeded at all.
+    /// handed out, which is how a `Reopen` or a `Flush` reaches this sheep's
+    /// log pump. `None` only for a slot whose spawn never succeeded at all.
     ///
     /// Written on every successful spawn and never cleared, unlike `ctl`.
     /// Whether a pump is still there is a fact the channel already answers —
@@ -1460,10 +1471,12 @@ impl<R: ProcessRunner> Actor<R> {
     /// Several matched sheep can name one path — `merge_logs`, or an
     /// explicit `out_file` on a multi-instance app — and under `O_APPEND` one
     /// truncate empties the file for every handle open on it. Truncating once
-    /// per sheep would repeat completed work and, worse, reopen the window:
-    /// each extra truncate can discard a line a sibling instance wrote after
-    /// the flush barrier. Deduplicating here is what makes "flush, then
-    /// truncate" a single barrier rather than N interleaved ones.
+    /// per sheep would repeat completed work, and — with every flush already
+    /// ahead of every truncate — a second truncate of a path could only
+    /// discard what was written between the two truncates, which is a window
+    /// this verb makes no promise about in either shape. Deduplicating buys
+    /// the work that is not repeated and a failure message that reads the
+    /// same every run. The barrier is the phase order below, not this set.
     ///
     /// # Why more pumps are flushed than the reply names
     ///
@@ -2267,9 +2280,11 @@ fn spawn_flush_task(
 ///
 /// # Errors
 ///
-/// [`FlushError`] — a pump answered, and at least one stream still has bytes
-/// that never reached its file. Those bytes are what the truncate about to
-/// follow would race, so this is worth failing the caller's request over.
+/// [`FlushError`] — a pump answered, and at least one stream's owed bytes
+/// never reached its file. The truncate that follows runs regardless: those
+/// bytes errored rather than remaining in flight, so nothing is left to race
+/// it. It fails the caller's request because a sheep that cannot write its
+/// log is news, not because the file is about to be wrong.
 ///
 /// Not reaching a pump at all is a success, exactly as in [`reopen_logs`],
 /// and for a reason that is if anything plainer here: a pump that is gone —
@@ -2286,6 +2301,23 @@ async fn flush_logs(log_ctl: &mpsc::Sender<LogCtl>) -> Result<(), FlushError> {
 }
 
 /// Truncates the log file at `path` to zero length.
+///
+/// # What ends up being truncated
+///
+/// Exactly the paths the Flockfile named, for every registered sheep the
+/// selector matched, run or not. `out_file`/`err_file` are free-form config
+/// that the assembler takes verbatim, a registered slot carries its paths
+/// from the moment it exists (so a sheep that has never been spawned still
+/// contributes two), and nothing on this route checks either against the log
+/// directory. An app pointing `out_file` at something that is not a log file
+/// therefore makes `shep flush` empty that file, with whatever privileges the
+/// daemon runs under. Before this verb existed, the worst a mistaken
+/// `out_file` bought was log lines appended to it by a running sheep.
+///
+/// There is no path check here because there is no rule that separates a
+/// hostile `out_file` from a legitimate one outside the log directory, and
+/// pointing a sheep's logs at `/var/log/myapp.log` is a supported thing to
+/// configure.
 ///
 /// Opened write-only with `O_TRUNC` and dropped straight away — this handle
 /// never writes, so it is not the exception to `open_append` being the only

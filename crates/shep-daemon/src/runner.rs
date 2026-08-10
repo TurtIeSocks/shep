@@ -81,11 +81,13 @@ pub struct LogLine {
 ///
 /// A counter the pump re-read before each write would only ever promise
 /// "before the next line", and **a quiet sheep never writes a next line** —
-/// so a rotator could rename a file and be told nothing about when, or
-/// whether, the daemon caught up. The [`oneshot`] acknowledgement below is
-/// the whole point of the shape: once it resolves, every live pump provably
-/// holds the new handle, which is the answer a logrotate `postrotate` stanza
-/// actually needs before it compresses or deletes the renamed file.
+/// so a caller could ask for a rotation, or for the pending writes to land,
+/// and be told nothing about when or whether the daemon caught up. The
+/// [`oneshot`] on each variant below is the whole point of the shape: once it
+/// resolves, every live pump has provably done the thing, which is what makes
+/// either variant usable as a barrier. A logrotate `postrotate` stanza needs
+/// that of [`Self::Reopen`] before it compresses or deletes the file it
+/// renamed; `shep flush` needs it of [`Self::Flush`] before it truncates.
 #[derive(Debug)]
 pub enum LogCtl {
     /// Drop the current handle and open the path again, then acknowledge.
@@ -132,12 +134,16 @@ pub enum LogCtl {
         /// it was emptied — the one line that survives a flush, in the file
         /// the operator was told is now empty.
         ///
-        /// [`FlushError`] says at least one stream still has bytes owed to
-        /// it. That is exactly the condition the ordering above exists to
-        /// rule out, so it is reported rather than logged — where
-        /// `LogFile::reopen` can log its own flush failure and move on
-        /// (the handle it belongs to is being replaced by a working one),
-        /// nothing here is replaced, and the bytes race the truncate.
+        /// [`FlushError`] says at least one stream's owed bytes never
+        /// reached its file. It does not hold up the truncate that follows,
+        /// and cannot: `poll_flush` drives the write already in flight to
+        /// completion either way, so bytes reported here are bytes that
+        /// errored rather than bytes still racing anything. What it changes
+        /// is the answer the operator gets — that sheep could not write its
+        /// log, which is worth a non-zero exit even though the file does end
+        /// up empty. `LogFile::reopen` logs its own flush failure and moves
+        /// on instead, because the handle it belongs to is about to be
+        /// replaced by a working one and the sheep keeps logging either way.
         ///
         /// # When it never fires
         ///

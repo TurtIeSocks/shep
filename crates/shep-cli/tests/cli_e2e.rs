@@ -1529,12 +1529,16 @@ fn reopen_puts_a_rotated_log_back_where_bleats_can_read_it() {
 /// Two properties, and the second is why this reuses the rotating script
 /// rather than a simpler one. That [`ROTATE_BEFORE`] is gone proves the
 /// truncate happened. That [`ROTATE_AFTER`] — written by the same process,
-/// through the same handle the daemon never touched — arrives and is
-/// readable proves the handle survived it, and lands at offset 0 rather than
-/// past a sparse hole the size of what was emptied. That second half is
-/// `O_APPEND` doing its job, and a `flush` that reopened or replaced the
-/// handle instead of leaving it alone would still pass the first assertion
-/// on its own.
+/// through the same handle the daemon never touched — arrives and is readable
+/// proves the handle survived it.
+///
+/// The file's LENGTH is what proves where that line landed. `O_APPEND` seeks
+/// to the end before every write, so an emptied file takes the next line at
+/// offset 0; a handle writing at its own preserved offset would put the same
+/// line past a sparse hole the size of what was truncated, and the reading
+/// verb would print it either way. Only the byte count tells the two apart —
+/// as a `contains` check cannot, and as reading the tail cannot, since the
+/// hole is behind the bytes it returns.
 ///
 /// `daemon_e2e` proves the path-not-inode rule over the daemon's own socket,
 /// but nothing there runs the binary an operator actually types — the argv,
@@ -1567,6 +1571,15 @@ fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
          flush: stdout={printed}"
     );
 
+    // Read off the daemon's own snapshot rather than derived here, so the
+    // test cannot disagree with it about which file this is.
+    let online = poll_flock(home, |info| info["status"] == "online");
+    let out_file = PathBuf::from(
+        online["out_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the daemon reports its own log paths: {online}")),
+    );
+
     // The selector is explicit because the verb requires one — a bare `shep
     // flush` is a usage error, which the case below pins.
     let flushed = shep(home).arg("flush").arg("all").output().unwrap();
@@ -1591,6 +1604,16 @@ fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
     assert!(
         !stdout.contains(ROTATE_BEFORE),
         "everything written before the flush is gone: stdout={stdout}"
+    );
+    // The line above is the only thing the sheep wrote after the flush, and
+    // the loop that read it back has already waited for it to be on disk.
+    assert_eq!(
+        std::fs::metadata(&out_file).unwrap().len(),
+        (ROTATE_AFTER.len() + 1) as u64,
+        "the sheep's next line must land at offset 0 of the emptied file: a \
+         handle that kept its offset across the truncate would leave a hole \
+         the size of what was emptied in front of it, and `bleats` would \
+         print the line just the same"
     );
 
     graceful_kill(home);

@@ -138,12 +138,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Flush` is the second variant: it waits for every write already handed to
   the blocking pool to reach the file and keeps the handle, which is the
   half of `shep flush` that runs before anything is truncated. It answers
-  with a `Result` too, and for a sharper reason than `Reopen` does —
-  `LogFile::reopen` can log a flush failure and move on because the handle
-  it belongs to is being replaced by a working one, while nothing here is
-  replaced and the bytes still owed are exactly what the truncate is racing.
-  `runner::FlushError` names the paths that are not empty, from either half
-  of the verb.
+  with a `Result` too, where `LogFile::reopen` logs a flush failure and moves
+  on because the handle it belongs to is being replaced by a working one.
+  That result does not hold up the truncate — `poll_flush` drives the write
+  already in flight to completion either way, so bytes it reports are bytes
+  that errored, not bytes still racing anything — it changes the answer the
+  operator gets, which is that a sheep could not write its log.
+  `runner::FlushError` names the files either half of the verb could not
+  deal with.
 - Answer `Request::Reopen`: the supervisor keeps a clone of every running
   sheep's log-control sender and pushes a `LogCtl::Reopen` at each sheep the
   selector matches, which is what makes `create`-mode rotation — rename the
@@ -189,13 +191,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `shep bleats --no-follow`, so they are still worth emptying. Paths are
   deduplicated, so instances sharing one file under `merge_logs` truncate it
   once: one truncate empties the file for every `O_APPEND` handle open on it,
-  and a second would only widen the window in which a sibling's freshly
-  flushed line can be wiped. A pump that could not land what it owed, or a
-  path that could not be truncated, fails the request
+  and a second would only repeat work already done. A pump that could not
+  land what it owed, or a path that could not be truncated, fails the request
   (`SupervisorError::FlushFailed`, `RpcErrorCode::Internal` on the wire)
   naming every such path — keyed by path rather than by sheep, since a shared
   path belongs to no single one. Every pump and path is visited first, so one
-  unwritable file neither stops the rest being emptied nor goes unreported. A missing path is not a failure: a log file that is not there is
+  unwritable file neither stops the rest being emptied nor goes unreported. A
+  missing path is not a failure: a log file that is not there is
   already empty, and it is deliberately not created, which would otherwise
   leave a stray empty log wherever a rotator had just renamed one away. Like
   the reopen above, every await lives on a task of its own and never inside

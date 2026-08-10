@@ -152,8 +152,17 @@ pub async fn reopen(
 }
 
 /// Empties the log files of the sheep matching `args.selector`: the daemon
-/// flushes what each matched pump still owes its files, then truncates the
-/// paths those sheep were registered with.
+/// flushes what every pump writing to one of those files still owes it, then
+/// truncates the paths those sheep were registered with.
+///
+/// # What gets emptied
+///
+/// Exactly the paths the Flockfile names — `out_file` and `err_file` as the
+/// daemon resolved them — for every registered sheep the selector matches,
+/// whether or not it has ever run. Those are ordinary config values, taken
+/// verbatim and never checked against the log directory, so an app pointing
+/// `out_file` at something that is not a log file makes this verb empty that
+/// file too, with the shepherd's privileges.
 ///
 /// # Why the selector is required
 ///
@@ -186,6 +195,10 @@ pub async fn reopen(
 /// file emptied. Several sheep can share one log path (`merge_logs`, or an
 /// explicit `out_file` on a multi-instance app) and the daemon truncates each
 /// distinct path once, but the selector names sheep and so does the answer.
+/// A sharing sheep the selector skipped has that file emptied under it all
+/// the same, with its pump flushed first so none of its pending lines lands
+/// in the file afterwards — it is not a row here, because it is not a sheep
+/// the operator named.
 ///
 /// Sent with [`LOG_PLANE_DEADLINE`] for the reason [`reopen`] gives: the
 /// daemon walks the matched flock file by file with no per-sheep bound.
