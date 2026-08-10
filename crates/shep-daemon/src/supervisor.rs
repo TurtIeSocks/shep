@@ -2393,9 +2393,8 @@ impl<R: ProcessRunner> Actor<R> {
                 // Still `AwaitReady` and the replacement never proved it could
                 // take over, so the reload is abandoned and the drainee kept.
                 // Past that and the swap is committed: this is an ordinary
-                // instance now, its exit is its own restart policy's business,
-                // and the drain it set going finishes on the drainee's exit
-                // regardless.
+                // instance now, and its exit is its own restart policy's
+                // business.
                 let name = self.reload_of(id);
                 let abandoning = name
                     .as_deref()
@@ -2405,6 +2404,33 @@ impl<R: ProcessRunner> Actor<R> {
                     let name = name.expect("a phase was just read off this job");
                     self.abort_reload(&name, "the replacement exited before it was ready");
                     return self.deregister_on_exit(id);
+                }
+                // A committed swap normally ends on the drainee's exit, which
+                // `reap_drainee` turns into `finish_swap` — but only while
+                // there is still a drainee to produce one. A swap `reap_drainee`
+                // itself committed has none: it was the drainee's death that
+                // committed it, and the deregistration went with it. That left
+                // this replacement's readiness result as the last event able to
+                // end the job, and clearing its `Draining` marker a line above
+                // cancels that too, because `handle_ready_result` routes on the
+                // marker. So the job ends here or never, and a job nothing can
+                // end refuses every later reload of the app for as long as the
+                // daemon runs.
+                //
+                // The queue goes with it rather than carrying on, per spec §4:
+                // this replacement exited before it was ever `Online`, which is
+                // a failure of the new instance, and that aborts the rest.
+                if let Some(name) = name {
+                    let old_id = self.reloads[&name].swap.old_id;
+                    if !self.sheep.contains_key(&old_id) {
+                        tracing::warn!(
+                            name,
+                            new_id = id,
+                            "reload abandoned: the replacement exited before it was ready, with \
+                             the instance it replaced already gone"
+                        );
+                        self.reloads.remove(&name);
+                    }
                 }
             }
             ReloadState::None => {}
@@ -5769,6 +5795,60 @@ mod tests {
         assert_eq!(after[0].id, 1);
         assert_eq!(after[0].status, ProcStatus::Online);
         assert_eq!(runner.kill_counts(), vec![0, 0], "neither was SIGKILLed");
+    }
+
+    // fails if a swap committed by the drainee's OWN death outlives both of
+    // its ids. That commit happens in `reap_drainee`, which leaves the job at
+    // `DrainOld` with the drainee already deregistered — so no second exit is
+    // coming for it, and the replacement's readiness result is the last event
+    // that could end the job. When the replacement goes first, clearing its
+    // `Draining` marker cancels that event too (`handle_ready_result` routes
+    // on the marker), and nothing is left that can reach `finish_swap`. The
+    // job then refuses every later reload of the app for as long as the
+    // daemon runs, and drops the rest of a clustered reload's queue after the
+    // caller was already told `Ok`.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_ends_when_its_replacement_goes_with_the_drainee_already_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.wait_ready = true; // nobody ever signals the replacement
+        // Two scripts: the original — which ends 1000ms in, inside the
+        // replacement's 3000ms readiness window, so the swap commits on its
+        // death rather than on a drain — and the replacement itself.
+        let (handle, _runner, mut rx) = started(
+            &dir,
+            app,
+            vec![
+                ProcScript::stable_then_exit(1_000, 1),
+                ProcScript::never_exits(),
+            ],
+        )
+        .await;
+        handle.tx.send(Msg::Ready { id: 0 }).await.unwrap();
+        expect_event(&mut rx, 0, ProcessEventKind::Online).await;
+
+        handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the reload is accepted");
+        expect_event(&mut rx, 0, ProcessEventKind::Delete).await;
+
+        // The cheapest reachable form of the second half: no crash needed,
+        // just an operator's `stop` landing before the replacement is ready.
+        handle
+            .stop(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the stop reaches the replacement");
+
+        let again = handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .map(|infos| infos.iter().map(|info| info.id).collect::<Vec<_>>());
+        assert_eq!(
+            again,
+            Ok(vec![1]),
+            "the reload is over, so the app is reloadable again"
+        );
     }
 
     // fails if a replacement starts its restart count at zero. A reload is
