@@ -2042,6 +2042,18 @@ impl<R: ProcessRunner> Actor<R> {
         let Some(job) = self.reloads.remove(name) else {
             return;
         };
+        // The doc above claims `AwaitReady`, and every caller does check —
+        // but the weakest of the three checks it indirectly, by asking
+        // whether the drainee is still registered rather than by reading the
+        // phase. This turns that argument into something the suite has to
+        // keep true. It guards the restore below and nothing else: a job
+        // outliving both of its ids is a different failure, and lives in
+        // `handle_exited`.
+        debug_assert_eq!(
+            job.swap.phase,
+            ReloadPhase::AwaitReady,
+            "abort_reload: a committed swap has no old instance to go back to"
+        );
         tracing::warn!(
             name,
             old_id = job.swap.old_id,
