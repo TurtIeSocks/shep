@@ -14,6 +14,12 @@
 //! `std::os::unix::fs::PermissionsExt` usage) on the Windows CI leg too.
 //! Global Constraints names this file explicitly for that reason.
 //!
+//! The last case is the file's slow one and the reason it no longer finishes
+//! in about eleven seconds: a cron occurrence fires on a *real* wall-clock
+//! minute boundary, and there is no seam this tier could pause. It names its
+//! own measured cost; [`CRON_DEADLINE`] carries the argument for spending it
+//! rather than marking it `#[ignore]`.
+//!
 //! Every case's command chain carries `.timeout(CMD_TIMEOUT)` before
 //! `.output()`, so a regression that hangs (case 7's `--no-follow`
 //! following forever being the live hazard) fails as a named assertion
@@ -58,11 +64,28 @@ const BLEATS_DEADLINE: Duration = Duration::from_secs(10);
 const BLEATS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// How long a fixture sheep's script sleeps after writing whatever it
-/// writes. Long enough that no case in this file could plausibly outlast it
-/// (every case finishes in well under a second of real daemon/sheep work);
-/// short enough that a sheep the [`DaemonGuard`] sweep somehow missed
+/// writes. Long enough that none of the cases using it could plausibly
+/// outlast it (each finishes in well under a second of real daemon/sheep
+/// work); short enough that a sheep the [`DaemonGuard`] sweep somehow missed
 /// self-terminates quickly rather than lingering for the rest of a CI job.
+///
+/// The real-clock case at the bottom of this file is the exception — it waits
+/// on a wall-clock schedule measured in tens of seconds — and uses
+/// [`SLOW_SCRIPT_SLEEP_SECS`] instead.
 const SCRIPT_SLEEP_SECS: u32 = 60;
+
+/// [`SCRIPT_SLEEP_SECS`] for the real-clock cases, whose own deadlines run to
+/// [`CRON_DEADLINE`].
+///
+/// Sized to outlast the longest of those deadlines by a wide margin, and that
+/// margin is load-bearing rather than slack: it is what lets such a case
+/// claim the restart it observed came from the trigger under test. A
+/// script that could reach its own exit inside the observation window would
+/// make "the sheep restarted" equally consistent with a crash loop, and no
+/// assertion on the count could tell the two apart. Every second of it is
+/// also the exposure a sheep the [`DaemonGuard`] sweep missed would linger
+/// for, so it is twice the deadline rather than ten times it.
+const SLOW_SCRIPT_SLEEP_SECS: u32 = 300;
 
 /// Basename, under a case's own `$SHEP_HOME`, of the file every fixture
 /// script appends its own pid to. See [`record_pid_line`] for why, and
@@ -104,6 +127,25 @@ const FLOCK_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Gap between [`poll_flock`]'s attempts.
 const FLOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long [`a_cron_occurrence_restarts_a_sheep_on_the_real_clock`] waits
+/// for its occurrence.
+///
+/// Five-field cron cannot express anything finer than a minute, so a
+/// `* * * * *` pattern armed at an arbitrary moment is up to a full 60s of
+/// *real* wall clock from its first occurrence — there is no seam to shorten
+/// that, which is the whole point of the case. Two and a half minutes covers
+/// two successive occurrences, so a runner loaded enough to miss the first
+/// one still has a second to answer with.
+///
+/// This is the most expensive constant in the file and it is deliberately not
+/// hidden behind `#[ignore]`: an ignored test closes no gap. Measured over
+/// five runs the case cost 26s to 61s, and the variance is entirely where in
+/// the minute the daemon happened to boot. It runs concurrently with the rest
+/// of this tier, which finishes in about 11s without it, so it *is* this
+/// file's wall clock now — see
+/// [`a_cron_occurrence_restarts_a_sheep_on_the_real_clock`] for the numbers.
+const CRON_DEADLINE: Duration = Duration::from_secs(150);
 
 // --- Fixture helpers ---------------------------------------------------
 
@@ -179,6 +221,25 @@ fn record_pid_line(dir: &TempDir) -> String {
     format!(
         "echo $$ >> \"{}\"\n",
         dir.path().join(FIXTURE_PIDS).display()
+    )
+}
+
+/// [`write_test_script`] with [`SLOW_SCRIPT_SLEEP_SECS`]' sleep instead of
+/// [`SCRIPT_SLEEP_SECS`]', for
+/// [`a_cron_occurrence_restarts_a_sheep_on_the_real_clock`].
+///
+/// That case runs one of these twice over — once as the sheep under test and
+/// once as the control beside it — so what it has to be is unremarkable and
+/// very long-lived. See [`SLOW_SCRIPT_SLEEP_SECS`] for why the length is what
+/// makes the control mean anything.
+fn write_slow_script(dir: &TempDir) -> PathBuf {
+    write_script(
+        dir,
+        "slow.sh",
+        &format!(
+            "#!/bin/sh\n{}sleep {SLOW_SCRIPT_SLEEP_SECS}\n",
+            record_pid_line(dir)
+        ),
     )
 }
 
@@ -537,9 +598,8 @@ fn bleats_no_follow_until_written(home: &Path, args: &[&str]) -> Output {
     }
 }
 
-/// Runs `shep flock --format json` until `done` accepts the single sheep's
-/// `ProcessInfo`, or [`FLOCK_DEADLINE`] expires, and returns the last
-/// observation either way.
+/// Runs `shep flock --format json` until `done` accepts the whole `data`
+/// array, or `deadline` expires, and returns the last observation either way.
 ///
 /// Polls rather than sleeping once: nothing in this tier is synchronous with
 /// the daemon's own work, and every deadline in it is sized for a loaded
@@ -547,9 +607,18 @@ fn bleats_no_follow_until_written(home: &Path, args: &[&str]) -> Output {
 /// keeps the failure that reaches CI the caller's own assertion, naming the
 /// value it wanted and the value it got.
 ///
+/// The deadline is a parameter rather than [`FLOCK_DEADLINE`] outright
+/// because the real-clock case waits on a wall-clock minute boundary that it
+/// is an order of magnitude too short for. It stays a *named* deadline per caller either way: no case in
+/// this file sleeps once and asserts.
+///
 /// Each attempt carries the same [`CMD_TIMEOUT`] every other command here
 /// does, so nothing in the loop can block unbounded.
-fn poll_flock(home: &Path, done: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+fn poll_flock_data(
+    home: &Path,
+    deadline: Duration,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
     let start = Instant::now();
     loop {
         let output = shep(home)
@@ -561,12 +630,34 @@ fn poll_flock(home: &Path, done: impl Fn(&serde_json::Value) -> bool) -> serde_j
         assert_success(&output);
         let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|e| panic!("flock stdout was not JSON: {e}"));
-        let info = envelope["data"][0].clone();
-        if done(&info) || start.elapsed() >= FLOCK_DEADLINE {
-            return info;
+        let data = envelope["data"].clone();
+        if done(&data) || start.elapsed() >= deadline {
+            return data;
         }
         std::thread::sleep(FLOCK_POLL_INTERVAL);
     }
+}
+
+/// [`poll_flock_data`] for the single-sheep cases: waits [`FLOCK_DEADLINE`]
+/// and hands `done` — and the caller — that one sheep's `ProcessInfo` rather
+/// than the array around it.
+fn poll_flock(home: &Path, done: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+    poll_flock_data(home, FLOCK_DEADLINE, |data| done(&data[0]))[0].clone()
+}
+
+/// The `data[]` element named `name`, for the cases that run a control sheep
+/// beside the one under test.
+///
+/// By name rather than by index: the control exists to be read in the same
+/// observation as the subject, and `data[0]`/`data[1]` would quietly swap
+/// meanings if the daemon's id ordering or a Flockfile's app order ever
+/// moved.
+fn sheep_named<'a>(data: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    data.as_array()
+        .unwrap_or_else(|| panic!("flock data must be an array: {data}"))
+        .iter()
+        .find(|info| info["name"] == name)
+        .unwrap_or_else(|| panic!("no sheep named {name} in the flock: {data}"))
 }
 
 // --- JSON fixture helpers -------------------------------------------------
@@ -1495,6 +1586,98 @@ fn an_https_probe_target_is_a_config_error() {
     assert!(
         message.contains("https://localhost:8443/health"),
         "the rejection must name the offending target: {err}"
+    );
+
+    graceful_kill(home);
+}
+
+// --- Case 14 -------------------------------------------------------------
+
+/// A `* * * * *` occurrence restarts a real sheep on the real system clock:
+/// `restarts` goes from 0 to 1 at a wall-clock minute boundary.
+///
+/// The only place the cron subsystem ever runs on `SystemClock`. Every other
+/// cron test drives `TestClock` over a paused runtime, and `SystemClock`
+/// itself appears in exactly one dyn-compatibility smoke test that constructs
+/// one and never reads it — so "an occurrence fires against real wall time"
+/// was, before this case, a claim spec §4 makes and no tier proved. The
+/// nearest existing e2e case, [`a_bad_cron_pattern_is_a_config_error`], only
+/// ever asserts that a *bad* pattern is rejected, which says nothing about a
+/// good one firing.
+///
+/// `unscheduled` is the control, and it is what rules out the competing
+/// explanation. It runs the same script under the same daemon and differs
+/// only in configuring no `cron_restart`, so a restart that came from the
+/// script exiting and being brought back — a crash loop, not an occurrence —
+/// would move both counters rather than one. The script's
+/// [`SLOW_SCRIPT_SLEEP_SECS`] sleep is the other half of that argument:
+/// it outlasts [`CRON_DEADLINE`] twice over, so neither sheep can reach its
+/// own exit inside the window at all.
+///
+/// Measured cost: 26s, 34s, 42s, 54s and 61s over five runs — a `* * * * *`
+/// pattern armed at an arbitrary moment is a uniform draw on the minute it
+/// lands in, so the only bound worth stating is the upper one: a minute plus
+/// the restart's own round trip. See [`CRON_DEADLINE`] for why that is spent
+/// rather than `#[ignore]`d.
+///
+/// What a broken implementation this would catch: a `SystemClock` that
+/// returned a fixed instant instead of reading the clock — the worker parks,
+/// wakes, finds `now` still short of `next`, and loops forever while
+/// `restarts` stays 0; an `arm_cron` never reached from the real `Online`
+/// transition, which no unit tier can see because every one of them arms the
+/// registry by hand; a `cron_restart` accepted by `normalize` and then
+/// dropped on the way to the daemon (the config-error case above passes
+/// either way, since it never gets as far as a schedule that runs).
+// fails if `SystemClock::now_utc` stops reading the real clock — verified by
+// replacing its body with `DateTime::UNIX_EPOCH`, which reddens this case and
+// nothing else in the workspace.
+#[test]
+fn a_cron_occurrence_restarts_a_sheep_on_the_real_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_slow_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"minutely\"\nscript = \"{script}\"\ncron_restart = \"* * * * *\"\n\n\
+             [[app]]\nname = \"unscheduled\"\nscript = \"{script}\"\n",
+            script = script.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    let before = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        sheep_named(data, "minutely")["status"] == "online"
+            && sheep_named(data, "unscheduled")["status"] == "online"
+    });
+    assert_eq!(
+        sheep_named(&before, "minutely")["restarts"],
+        0,
+        "precondition: {before}"
+    );
+    assert_eq!(
+        sheep_named(&before, "unscheduled")["restarts"],
+        0,
+        "precondition: {before}"
+    );
+
+    let after = poll_flock_data(home, CRON_DEADLINE, |data| {
+        sheep_named(data, "minutely")["restarts"] == 1
+    });
+    assert_eq!(
+        sheep_named(&after, "minutely")["restarts"],
+        1,
+        "a `* * * * *` occurrence must restart the sheep within one real minute: {after}"
+    );
+    assert_eq!(
+        sheep_named(&after, "unscheduled")["restarts"],
+        0,
+        "the same script with no cron_restart must not have moved: a restart both sheep \
+         share is the script exiting, not an occurrence firing: {after}"
     );
 
     graceful_kill(home);
