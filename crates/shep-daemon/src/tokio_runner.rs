@@ -43,7 +43,7 @@ use crate::boot::DIR_MODE;
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::runner::{
     ExitOutcome, FlushError, LogCtl, LogLine, ProcIo, ProcessRunner, ReopenError, RunnerError,
-    RunningProcess, SpawnSpec, StopSignal,
+    RunningProcess, SpawnSpec, StopSignal, open_log_path,
 };
 
 /// Capacity of every channel a spawn wires up — generous enough that a
@@ -762,6 +762,15 @@ fn spawn_log_pump<O, E>(
 /// files would grow without bound. This holds for a reopened handle as much
 /// as for the first one, which is why [`LogFile::reopen`] comes back through
 /// here.
+///
+/// # Security
+///
+/// The open itself is [`open_log_path`]'s, which adds `O_NOFOLLOW` — so a
+/// symlink planted at `path` is refused rather than appended through. That
+/// flag rides ALONGSIDE `.append(true)`, never in place of it: dropping
+/// `O_APPEND` brings back the sparse hole the paragraph above exists to
+/// prevent. See [`open_log_path`] for what `O_NOFOLLOW` does and does not
+/// cover.
 async fn open_append(path: &Path) -> io::Result<tokio::fs::File> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -775,10 +784,9 @@ async fn open_append(path: &Path) -> io::Result<tokio::fs::File> {
         return Err(error);
     }
 
-    tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).append(true);
+    open_log_path(&mut options, path)
         .await
         .inspect_err(|error| tracing::error!(?path, %error, "log file open failed"))
 }
@@ -1067,6 +1075,46 @@ mod tests {
 
         pump.feed(false, "third").await;
         assert_file_settles(&pump.out_path, "third\n").await;
+    }
+
+    /// Fails if [`open_append`] stops opening through
+    /// [`open_log_path`] — without the `O_NOFOLLOW` it adds, a symlink planted
+    /// where a sheep's `out_file` will be is opened and appended through, and
+    /// every log line the sheep writes lands in whatever it points at. Nothing
+    /// else in this module can see that: every other case here opens a real
+    /// file, where following a symlink and refusing to are the same open.
+    ///
+    /// The target's bytes are the assertion that matters — a `create(true)`
+    /// open that followed the link would leave them and add to them, so
+    /// "unchanged" is what separates a refusal from a successful follow. The
+    /// message is asserted too, because [`LogFile::reopen`] hands it to an
+    /// operator who is waiting to hear which path failed and why.
+    ///
+    /// `#[cfg(unix)]`: this whole module is, and so are `O_NOFOLLOW` and
+    /// `std::os::unix::fs::symlink`.
+    #[tokio::test]
+    async fn opening_a_symlinked_log_path_is_refused_rather_than_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("someone-elses.conf");
+        let link = dir.path().join("web-out.log");
+        fs::write(&target, b"original").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = open_append(&link)
+            .await
+            .expect_err("a symlinked log path must not be opened for appending");
+
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"original",
+            "a refused open must not have reached the symlink's target at all"
+        );
+        assert_eq!(
+            error.to_string(),
+            crate::runner::SYMLINK_REFUSED,
+            "the operator who reads this needs the word symlink, not ELOOP's \
+             own wording about levels of them"
+        );
     }
 
     /// Fails if the control channel is only consulted after a line arrives

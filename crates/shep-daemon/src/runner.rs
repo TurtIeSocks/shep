@@ -10,6 +10,12 @@
 //! test-only `fake` module, `ScriptedRunner`) for engine tests, and a real
 //! runner over OS processes (a later task) for production.
 //!
+//! It also owns the log plane's shared vocabulary — [`LogCtl`] and the two
+//! errors its requests answer with — and, with it, [`open_log_path`]: the
+//! one function in this crate that opens a sheep's log file, for the log
+//! pump and for `shep flush` alike, so neither half can drift from the other
+//! on what it is willing to open.
+//!
 //! This whole module is public and stays that way: [`ProcessRunner`] is the
 //! bound on [`boot`](crate::boot::boot), which `shep-cli` calls, so a caller
 //! outside this crate has to be able to name it — and naming it drags in every
@@ -18,7 +24,8 @@
 
 use core::fmt;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -231,6 +238,90 @@ impl fmt::Display for FlushError {
 }
 
 impl core::error::Error for FlushError {}
+
+/// What an operator is told when a log path turns out to be a symlink.
+///
+/// One owner for the sentence, cited by [`open_log_path`]'s doc and by both
+/// openers' tests: an operator who legitimately keeps `/var/log/app` as a
+/// symlink to another filesystem reads this, not a bare `ELOOP`, and the
+/// remedy is in the sentence itself. The path is NOT in here — every caller
+/// already prefixes one (`"<path>: <what the open reported>"`, see
+/// [`ReopenError::message`] and [`FlushError::message`]), and repeating it
+/// would print it twice.
+pub(crate) const SYMLINK_REFUSED: &str = "refusing to follow a symlink at this log path; shep \
+     opens log files with O_NOFOLLOW, so point out_file/err_file at the real file";
+
+/// Opens `path` through `options`, refusing to follow a symlink standing at
+/// the path itself.
+///
+/// The one opener of a log file in this crate, in both directions: the log
+/// pump's append handle (`tokio_runner`'s `open_append`) and `shep flush`'s
+/// truncating one (`supervisor`'s `truncate_log`) both come through here, so
+/// the two halves of the log plane cannot drift on what they will open.
+///
+/// # Security
+///
+/// An app's `out_file`/`err_file` are free-form config the assembler takes
+/// verbatim, so a log path can name anywhere the daemon can write. Under a
+/// root daemon that turns a pre-existing loose directory into a
+/// write-and-truncate primitive: another local user plants a symlink where
+/// the log file will be, the pump appends through it, and `shep flush`
+/// empties whatever it points at. `O_NOFOLLOW` closes that: the open fails
+/// with `ELOOP` instead, the symlink is left alone, and its target is
+/// untouched.
+///
+/// What it does NOT cover, stated plainly because the gap is real:
+/// `O_NOFOLLOW` guards only the FINAL path component. A symlinked *parent*
+/// directory still resolves, so `logs -> /elsewhere` followed by
+/// `logs/app.log` reaches `/elsewhere/app.log` exactly as before. Closing
+/// that needs `openat2(RESOLVE_NO_SYMLINKS)`, which is Linux-only and so out
+/// of scope for a project with macOS as a tier-1 platform (spec §11). This
+/// stops the realistic attack — a symlink planted at the log path — not
+/// every theoretical one.
+///
+/// `custom_flags` is safe, so none of this is the exception to
+/// `shep-daemon/src/sys.rs` owning every `unsafe` block in this crate
+/// (IR-22).
+///
+/// # Errors
+///
+/// Whatever the open reported. An `ELOOP` — the refusal above — is relabelled
+/// to [`SYMLINK_REFUSED`] on the way out, because `ELOOP`'s own strerror
+/// ("too many levels of symbolic links") reads as a symlink *loop* and tells
+/// an operator with one perfectly ordinary symlink neither what shep did nor
+/// what to change. Every other error is passed through untouched, `NotFound`
+/// included — `truncate_log` still recognises it.
+pub(crate) async fn open_log_path(
+    options: &mut tokio::fs::OpenOptions,
+    path: &Path,
+) -> io::Result<tokio::fs::File> {
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_NOFOLLOW);
+    options.open(path).await.map_err(name_the_symlink)
+}
+
+/// Relabels the `ELOOP` an `O_NOFOLLOW` open answers with, leaving every
+/// other error exactly as the OS reported it.
+///
+/// Both platforms shep supports report the refusal the same way — POSIX
+/// specifies `ELOOP`, and Darwin's `open(2)` matches it (measured, not
+/// assumed) — so one errno covers the tier rather than a per-platform list.
+/// The kind is carried over rather than invented: only the message changes.
+#[cfg(unix)]
+fn name_the_symlink(error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(nix::libc::ELOOP) {
+        io::Error::new(error.kind(), SYMLINK_REFUSED)
+    } else {
+        error
+    }
+}
+
+/// The non-unix arm of [`name_the_symlink`]: there is no `O_NOFOLLOW` to
+/// apply on this tier, so there is no refusal to relabel either.
+#[cfg(not(unix))]
+fn name_the_symlink(error: io::Error) -> io::Error {
+    error
+}
 
 /// IO endpoints handed back by spawn — the runner pumps internally.
 ///

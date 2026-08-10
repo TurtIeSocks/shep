@@ -60,6 +60,7 @@ use crate::probes::os::OsProber;
 use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
 use crate::runner::{
     ExitOutcome, FlushError, LogCtl, ProcIo, ProcessRunner, ReopenError, RunningProcess, SpawnSpec,
+    open_log_path,
 };
 
 /// Capacity of the actor's own mailbox (commands + internal events).
@@ -2331,10 +2332,14 @@ async fn flush_logs(log_ctl: &mpsc::Sender<LogCtl>) -> Result<(), FlushError> {
 /// daemon runs under. Before this verb existed, the worst a mistaken
 /// `out_file` bought was log lines appended to it by a running sheep.
 ///
-/// There is no path check here because there is no rule that separates a
-/// hostile `out_file` from a legitimate one outside the log directory, and
-/// pointing a sheep's logs at `/var/log/myapp.log` is a supported thing to
-/// configure.
+/// There is no check on WHERE the path points, because there is no rule that
+/// separates a hostile `out_file` from a legitimate one outside the log
+/// directory, and pointing a sheep's logs at `/var/log/myapp.log` is a
+/// supported thing to configure. What is checked is WHAT stands at it: the
+/// open goes through [`open_log_path`], so a symlink at the path is refused
+/// rather than truncated through. See that function for the whole of what
+/// `O_NOFOLLOW` does and does not cover — its guarantee is the same one the
+/// log pump's own opens get, which is the point of both coming through it.
 ///
 /// Opened write-only with `O_TRUNC` and dropped straight away — this handle
 /// never writes, so it is not the exception to `open_append` being the only
@@ -2353,14 +2358,12 @@ async fn flush_logs(log_ctl: &mpsc::Sender<LogCtl>) -> Result<(), FlushError> {
 /// # Errors
 ///
 /// [`FlushError`] — the path exists and could not be opened for truncation: a
-/// mode the daemon cannot write, a read-only filesystem, an IO error.
+/// symlink standing at it ([`SYMLINK_REFUSED`](crate::runner::SYMLINK_REFUSED)),
+/// a mode the daemon cannot write, a read-only filesystem, an IO error.
 async fn truncate_log(path: &Path) -> Result<(), FlushError> {
-    match tokio::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .await
-    {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).truncate(true);
+    match open_log_path(&mut options, path).await {
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(FlushError {
@@ -5202,6 +5205,55 @@ mod tests {
                 .message
                 .starts_with(&format!("{}: ", blocked.display())),
             "the failure must name the path it could not empty: {error}"
+        );
+    }
+
+    /// Fails if [`truncate_log`] stops opening through
+    /// [`open_log_path`] — drop the `O_NOFOLLOW` it adds (or open the path
+    /// directly again) and `shep flush` empties whatever the symlink points
+    /// at, with the daemon's privileges. That is the write-and-truncate
+    /// primitive the flag exists to close, and no other case here can see it:
+    /// every one of them truncates a real file, where following a symlink and
+    /// not following one look identical.
+    ///
+    /// Three assertions because a fix could be wrong in three ways. The
+    /// target's bytes prove nothing was emptied; the link still BEING a link
+    /// proves the open did not replace it with a regular file; and the message
+    /// proves an operator with a legitimately symlinked log path is told what
+    /// happened rather than being handed `ELOOP`'s own "too many levels of
+    /// symbolic links", which reads as a loop they do not have.
+    ///
+    /// `#[cfg(unix)]`: `O_NOFOLLOW` and `std::os::unix::fs::symlink` are both
+    /// unix-only, and so is the refusal being asserted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn truncating_a_symlinked_log_path_refuses_and_leaves_its_target_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("precious.txt");
+        let link = dir.path().join("web-out.log");
+        std::fs::write(&target, b"do not empty me").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = truncate_log(&link)
+            .await
+            .expect_err("a symlinked log path must not be truncated through");
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"do not empty me",
+            "the symlink's target must still hold every byte it did"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the refusal must leave the symlink itself in place, not replace it"
+        );
+        assert_eq!(
+            error.message,
+            format!("{}: {}", link.display(), crate::runner::SYMLINK_REFUSED),
+            "the failure must name the path and say the word symlink: {error}"
         );
     }
 

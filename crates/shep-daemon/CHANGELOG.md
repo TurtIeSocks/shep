@@ -10,6 +10,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security and unsafe
+
+- Open every log file with `O_NOFOLLOW`, in both halves of the log plane:
+  the pump's appending handle and the truncating one `shep flush` opens. An
+  app's `out_file`/`err_file` are free-form config, so a log path can name a
+  pre-existing directory shep neither created nor tightens — and there
+  another local user could plant a symlink where the log file was going to
+  be, have a root shepherd append the sheep's stdout through it, and have
+  `shep flush` empty its target. Dropping privileges with `user`/`group`
+  never helped, because log I/O never leaves the daemon, and the peer-cred
+  check was never in the path, because the attacker never touches the socket.
+  Both opens now fail instead, leaving the symlink and its target alone. The
+  guard covers only the FINAL path component: a symlinked parent directory
+  still resolves, and closing that needs `openat2(RESOLVE_NO_SYMLINKS)`,
+  which is Linux-only and so out of scope while macOS is tier-1. `O_APPEND`
+  rides alongside the new flag rather than being replaced by it — losing it
+  brings back the sparse hole after every rotation. An operator whose log
+  path legitimately IS a symlink is told so in those words, on the failure
+  path each verb already has: `ELOOP`'s own wording ("too many levels of
+  symbolic links") describes a loop they do not have.
+
 ### Additions
 
 - Add the cron-restart worker: one worker per name-group, restarting every
