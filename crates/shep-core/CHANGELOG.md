@@ -90,6 +90,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixes
 
+- Give the workspace's path dependencies (`shep-core`, `shep-daemon`,
+  `shep-client`) a version alongside their `path`, which `cargo publish`
+  requires — it strips `path` from a dependency at publish time and refuses
+  to publish anything left with no version to put there. One cosmetic side
+  effect for this crate specifically: its `[target.'cfg(any())'.dependencies]`
+  floor-pin block (see that block's own comment) publishes as real manifest
+  entries, so crates.io and docs.rs list `annotate-snippets`, `pest`, `quote`
+  and `syn` as dependencies of `shep-core`, even though `cfg(any())` never
+  matches and none of the four ever builds into it.
 - Reject a `watch_options` or `ignore_watch` pattern globset will not compile,
   with `NormalizeError::InvalidWatchGlob`, naming the sheep, which of the two
   lists the pattern came from, the pattern as written and globset's reason.
