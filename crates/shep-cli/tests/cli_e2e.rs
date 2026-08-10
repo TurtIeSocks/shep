@@ -1913,6 +1913,16 @@ fn a_daemon_flush_and_a_flock_flush_never_reach_each_others_files() {
         0,
         "the flock half must still empty the sheep it named"
     );
+    // Table mode, deliberately: the paths ride the JSON whatever the table
+    // does, so only the default rendering can show this regressing. An
+    // operator who ran a flush and was handed STATUS/PID/UPTIME was told
+    // nothing about the files it destroyed — which matters most exactly when
+    // an `out_file` was mistyped and the emptied path is not a log at all.
+    let printed = String::from_utf8_lossy(&flock_half.stdout);
+    assert!(
+        printed.contains(&out_file.display().to_string()),
+        "a flush table must name the files it emptied: {printed}"
+    );
     assert_eq!(
         std::fs::read(&shepd_out).unwrap(),
         MARKER,

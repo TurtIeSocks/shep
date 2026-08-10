@@ -31,9 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discovering it.
 - Carry `ProcessInfo`'s new `out_file`/`err_file` in every `--json` payload
   built from `FlockRows` (`flock`, `describe`, `fold`, `start`, `stop`,
-  `restart`). They are `JSON_ONLY`, not columns: absolute log paths are
-  routinely longer than the rest of the row put together and would wreck the
-  table those verbs exist to print.
+  `restart`, `reopen`). They are `JSON_ONLY` on those verbs, not columns:
+  absolute log paths are routinely longer than the rest of the row put
+  together and would wreck the table they exist to print. `flush` is the one
+  exception and renders them — see its own entry below.
 - Add the end-to-end test tier (`tests/cli_e2e.rs`): the real `shep` binary
   against a real daemon, a real socket, and real spawned sheep, each on a
   fresh `$SHEP_HOME`. Five groups of cases. **Daemon lifecycle**:
@@ -135,11 +136,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `shepd.out.log`/`shepd.err.log`: the CLI's launcher creates those before the
   daemon exists and the daemon inherits them as plain fds 1 and 2, so it holds
   no handle to flush and no path to truncate — they are `--daemon`'s, below.
-  Output is the same table of matched sheep `stop`, `restart` and `reopen`
-  print — one row per sheep, not per file emptied. A sheep sharing a log path
-  with a matched one has that file emptied under it as well, its pump flushed
-  first like any other writer to that path, and no row of its own: the
-  selector names sheep, and so does the table.
+  Output is one row per matched SHEEP, not per file emptied, carrying that
+  sheep's two log paths: `ID`, `NAME`, `OUT_FILE`, `ERR_FILE`. `flush` is the
+  only flock-shaped verb that renders the paths rather than keeping them to
+  `--format json`, and it is the only one whose subject is the files — a verb
+  that empties something an operator may have mistyped and then reports
+  `STATUS`/`PID`/`UPTIME` has said nothing about what it destroyed. The
+  lifecycle fields stay in the JSON, which is byte-identical to what the other
+  verbs answer with, so nothing consuming `--format json` has to special-case
+  this command. A sheep sharing a log path with a matched one has that file
+  emptied under it as well, its pump flushed first like any other writer to
+  that path, and no row of its own: the selector names sheep, and so does the
+  table.
 - Add `shep flush --daemon`, the only way to empty the shepherd's own
   `shepd.out.log`/`shepd.err.log`. It **replaces** the selector rather than
   composing with it — `shep flush all --daemon` is a usage error — because the

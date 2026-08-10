@@ -30,7 +30,8 @@ use crate::cli::{FlushArgs, Format, ReopenArgs};
 use crate::exit::ExitCode;
 use crate::launch;
 use crate::output::{
-    EmptiedFile, EmptiedFiles, FlockRows, Render, Streams, emit, emit_error, write_outcome,
+    EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, Render, Streams, emit, emit_error,
+    write_outcome,
 };
 
 /// Sends `body` with `deadline` (`None` defers to the client's own default),
@@ -195,14 +196,21 @@ pub async fn reopen(
 /// path it could truncate, so no selector can reach them and none ever will:
 /// they are [`flush_daemon`]'s, reached only by naming `--daemon`.
 ///
-/// Renders the matched sheep as [`FlockRows`] — one row per SHEEP, not per
-/// file emptied. Several sheep can share one log path (`merge_logs`, or an
-/// explicit `out_file` on a multi-instance app) and the daemon truncates each
-/// distinct path once, but the selector names sheep and so does the answer.
-/// A sharing sheep the selector skipped has that file emptied under it all
-/// the same, with its pump flushed first so none of its pending lines lands
-/// in the file afterwards — it is not a row here, because it is not a sheep
-/// the operator named.
+/// Renders the matched sheep as [`FlushedRows`] — one row per SHEEP, and the
+/// two paths that sheep contributed. Not [`FlockRows`], which every other
+/// flock-shaped verb answers with: those keep `out_file`/`err_file` out of the
+/// table for being too wide, and here they are the answer. A verb that empties
+/// files an operator may have mistyped, and then reports lifecycle columns it
+/// did not touch, has told them nothing about what it destroyed. The JSON is
+/// unchanged either way — the paths were always in it.
+///
+/// Several sheep can share one log path (`merge_logs`, or an explicit
+/// `out_file` on a multi-instance app) and the daemon truncates each distinct
+/// path once, so the same path can appear in two rows. A sharing sheep the
+/// selector skipped has that file emptied under it all the same, with its pump
+/// flushed first so none of its pending lines lands in the file afterwards —
+/// it is not a row here, because it is not a sheep the operator named, and
+/// that is the one thing this table cannot show.
 ///
 /// Sent with [`LOG_PLANE_DEADLINE`] for the reason [`reopen`] gives: the
 /// daemon walks the matched flock file by file with no per-sheep bound.
@@ -242,7 +250,7 @@ pub async fn flush(
         Request::Flush { selector },
         Some(LOG_PLANE_DEADLINE),
         |response| match response {
-            Response::Flushed(procs) => Some(FlockRows(procs)),
+            Response::Flushed(procs) => Some(FlushedRows(procs)),
             _ => None,
         },
     )

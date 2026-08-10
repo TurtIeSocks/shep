@@ -78,6 +78,87 @@ impl Render for FlockRows {
     ];
 }
 
+/// `Response::Flushed(Vec<ProcessInfo>)` — the sheep a `shep flush` matched,
+/// rendered by the FILES it emptied rather than by their lifecycle.
+///
+/// Constructed by `commands/logs.rs`'s `flush`. Serializes exactly as
+/// [`FlockRows`] does, over the same `Vec<ProcessInfo>` and the same
+/// `transparent` newtype, so `--format json` is byte-identical to what it
+/// answered before this type existed — the paths were always in the JSON.
+/// Only the table differs.
+///
+/// # Why flush gets its own columns
+///
+/// `flush` is the one verb in the flock-shaped family whose subject is a set
+/// of FILES. `out_file`/`err_file` are free-form config taken verbatim, so a
+/// mistyped one makes this verb empty something that is not a log at all —
+/// and until now the table answered with `STATUS`, `PID`, `RESTARTS`,
+/// `UPTIME` and `FOLD`, none of which say what was destroyed. An operator
+/// reading a `flush` table wants the blast radius, which is exactly the two
+/// columns [`FlockRows`] keeps out of its own table for being too wide.
+///
+/// The lifecycle fields are still in the JSON (see [`Self::JSON_ONLY`]) —
+/// nothing was removed from the payload, only from this verb's columns.
+///
+/// One row per SHEEP, as `Response::Flushed` is: several sheep can share a
+/// log path and the daemon truncates each distinct path once, so the same
+/// path can appear twice here. That is honest about what the selector
+/// matched, which is what the reply is keyed on.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct FlushedRows(pub Vec<ProcessInfo>);
+
+impl Render for FlushedRows {
+    fn headers() -> &'static [&'static str] {
+        &["ID", "NAME", "OUT_FILE", "ERR_FILE"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|p| {
+                vec![
+                    p.id.to_string(),
+                    p.name.clone(),
+                    // `-` for the same reason `FlockRows` uses it: an empty
+                    // cell in a padded table reads as a rendering bug. Here
+                    // it means a peer daemon that predates the field, never
+                    // a sheep with no log file.
+                    p.out_file.clone().unwrap_or_else(|| "-".to_string()),
+                    p.err_file.clone().unwrap_or_else(|| "-".to_string()),
+                ]
+            })
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "ID" => "id",
+            "NAME" => "name",
+            "OUT_FILE" => "out_file",
+            "ERR_FILE" => "err_file",
+            other => panic!("FlushedRows::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[
+        // A sheep's lifecycle, which a flush neither reads nor changes. They
+        // stay in the JSON because `Response::Flushed` carries the same
+        // `ProcessInfo` every other verb answers with, and a consumer
+        // switching on the envelope's `command` should not find the record
+        // shape switching with it — but four columns of it would push the two
+        // paths this verb exists to report off the side of a terminal.
+        "status",
+        "pid",
+        "restarts",
+        "uptime_ms",
+        "fold",
+    ];
+}
+
 /// One of the shepherd's own log files, and what `shep flush --daemon` made
 /// of it.
 ///
@@ -387,6 +468,34 @@ pub(crate) mod tests {
             },
             |j| j,
             &[],
+        );
+    }
+
+    /// Fails if a `ProcessInfo` field goes missing from both the columns and
+    /// [`FlushedRows::JSON_ONLY`] — the same gate every other payload has.
+    /// The lifecycle keys are only allowed off the table because they are
+    /// named there, with a reason, rather than silently dropped.
+    #[test]
+    fn flushed_rows_do_not_drift() {
+        assert_no_drift(&FlushedRows(sample_flock().0), |j| &j[0], &[]);
+    }
+
+    /// Fails if `flush` and the other flock-shaped verbs stop agreeing on the
+    /// record, which is what would make an operator's `--format json` parser
+    /// need a special case keyed on the envelope's `command`.
+    ///
+    /// Two payload types over one `Vec<ProcessInfo>` is a shape that invites
+    /// exactly that drift: a field added to one impl's `Serialize` and not
+    /// the other, or a `transparent` dropped from one of them, changes the
+    /// JSON for `flush` alone. Each type's own drift test would still pass —
+    /// they check a type against itself. Only comparing the two catches it.
+    #[test]
+    fn a_flush_serializes_the_same_record_the_other_flock_verbs_do() {
+        let flock = serde_json::to_value(sample_flock()).unwrap();
+        let flushed = serde_json::to_value(FlushedRows(sample_flock().0)).unwrap();
+        assert_eq!(
+            flock, flushed,
+            "the table may differ between these two verbs; the JSON payload may not"
         );
     }
 
