@@ -306,8 +306,9 @@ fn selector_of(spec: SelectorSpec) -> Result<ProcessSelector, RpcError> {
     })
 }
 
-/// The helper Stop and Restart share: convert the selector, call the
-/// supervisor, map the hits through the passed `Response` constructor.
+/// The helper every selector-in, flock-out verb shares: convert the selector,
+/// call the supervisor, map the hits through the passed `Response`
+/// constructor.
 ///
 /// The future bound is stated, not inferred, because the whole chain is
 /// awaited inside the per-connection `tokio::spawn`.

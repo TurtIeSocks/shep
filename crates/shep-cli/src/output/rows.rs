@@ -15,14 +15,16 @@ use shep_core::protocol::ProcessInfo;
 
 use super::Render;
 
-/// `Vec<ProcessInfo>` for `flock`, `describe`, `fold`, `start`, `stop`,
-/// `restart`. A newtype because `ProcessInfo` is shep-core's and the orphan
+/// `Vec<ProcessInfo>` for every verb whose reply carries one: `flock`,
+/// `describe`, `fold`, `start`, `stop`, `restart`, `reopen`, `flush`. A
+/// newtype because `ProcessInfo` is shep-core's and the orphan
 /// rule forbids implementing our `Render` on it directly. `transparent` so
 /// the JSON is a plain array of `ProcessInfo`, not a wrapper object.
 ///
-/// Constructed by `commands/query.rs`'s `flock`/`describe_selector` and
-/// `commands/lifecycle.rs`'s `start`/`stop`/`restart`, each from a real
-/// `Response`.
+/// Constructed from a real `Response` under `commands/`, by `query.rs`,
+/// `lifecycle.rs` and `logs.rs`. The rule is the authority on both lists,
+/// not the lists: a new flock-shaped verb joins them without touching this
+/// type, and neither one is a bound on what renders here.
 #[derive(Debug, Serialize)]
 #[serde(transparent)]
 pub struct FlockRows(pub Vec<ProcessInfo>);

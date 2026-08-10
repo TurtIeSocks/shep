@@ -3,8 +3,9 @@
 //!
 //! Owned by the daemon: spawns processes via [`ProcessRunner`](runner::ProcessRunner),
 //! orchestrates restart policy, tracks logs and shepherd-channel traffic, and
-//! gates lifecycle commands (start, stop, restart, delete, shutdown) through a
-//! single [`SupervisorHandle`](supervisor::SupervisorHandle). Pure decision logic
+//! gates every command that reaches the flock — start, stop, restart, delete,
+//! reopen, flush, shutdown — through a single
+//! [`SupervisorHandle`](supervisor::SupervisorHandle). Pure decision logic
 //! (brain, backoff, entry assembly) is IO-free for deterministic testing under a
 //! paused tokio clock. `RpcServer` exposes that engine to a CLI client over
 //! `$SHEP_HOME/run/shep.sock`, and [`boot`] assembles both into one running

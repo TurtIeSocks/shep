@@ -327,8 +327,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MEMORY_POLL_INTERVAL`, `PollingEnforcer`, `LimitBreach`,
   `LivenessFailure`, `spawn_liveness_task`, `probes::os`, `probes::ready`
   (`ReadinessSource`, `Readiness`, `await_ready`), `privilege::resolve` and
-  `PrivilegeError`, `SupervisorBuilder`, six of `SupervisorHandle`'s nine
-  public methods, `dispatch`/`Outcome`/`budget` and both deadline constants,
+  `PrivilegeError`, `SupervisorBuilder`, every `SupervisorHandle` method
+  except `start`, `list` and `shutdown`,
+  `dispatch`/`Outcome`/`budget` and both deadline constants,
   `RpcContext`'s fields, `FlockRegistry`, `write_atomic`, `restorable`,
   `SnapshotWriter` with both snapshot constants, and `boot`'s `init_dirs`,
   `read_pidfile`, `socket_path`, `bind_socket` and `DaemonReady`.

@@ -6,14 +6,24 @@
 //! `(proc, ProcIo)` pair for that instance's whole lifetime and forwards its
 //! logs/shepherd-channel traffic — the actor itself never touches a live
 //! process directly, only [`RunningProcess`] handles held by those tasks and
-//! a fire-and-forget control sender per sheep.
+//! two senders per sheep: a fire-and-forget control sender, and a [`LogCtl`]
+//! sender to that sheep's log pump, whose every message carries an
+//! acknowledgement back.
 //!
 //! # One exit path
 //!
 //! Every sheep, however it ends — a natural exit or a kill request — reaches
 //! the actor as exactly one `Msg::Exited`. The actor's map never holds a
-//! `proc`; it holds one lifecycle entry plus a control sender per id, so the
-//! actor loop never awaits process I/O and never blocks.
+//! `proc`; it holds one lifecycle entry plus those two senders per id, so the
+//! actor loop never awaits process I/O.
+//!
+//! Nor does it ever await an acknowledgement, and with a sender that has one
+//! to give, that is a rule the code keeps rather than a shape that enforces
+//! itself. Awaiting one from inside the loop would stop the mailbox draining,
+//! and the pump that owes the answer is downstream of exactly that mailbox —
+//! so every handler that sends a [`LogCtl`] is synchronous and hands the
+//! awaiting to a task it spawns. `Actor::handle_reopen` makes the argument in
+//! full.
 //!
 //! # Deferred, aggregated replies
 //!

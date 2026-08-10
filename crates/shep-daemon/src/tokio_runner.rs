@@ -8,8 +8,12 @@
 //! socketpair as the shepherd channel, and spawns background pump tasks that
 //! drain stdout/stderr into the `logs` channel (and append them to the
 //! spec's log files) and shuttle shepherd-channel JSON both ways. The log
-//! pump also takes [`LogCtl`](crate::runner::LogCtl) messages, which is how
-//! a rotated log file gets reopened without restarting the sheep.
+//! pump also takes [`LogCtl`](crate::runner::LogCtl) messages, one per thing
+//! `shep` can ask of a live log file without restarting the sheep:
+//! [`Reopen`](crate::runner::LogCtl::Reopen) drops both handles and opens the
+//! paths again, which is how an externally rotated file gets picked up, and
+//! [`Flush`](crate::runner::LogCtl::Flush) waits for the writes already in
+//! flight to land, which is the barrier `shep flush` truncates behind.
 //!
 //! # Shepherd-channel fd lifecycle
 //!
