@@ -552,6 +552,40 @@ mod tests {
         assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
     }
 
+    /// The whole of an operator's feedback loop for a rotation that failed:
+    /// the daemon's code becomes the CLI's exit status (`Internal` is 9), and
+    /// the daemon's message is the only thing printed about which path went
+    /// wrong.
+    ///
+    /// Fails if the `ReopenFailed | FlushFailed` arm answers any other code —
+    /// `SpawnFailed` exits 7 and reads as "could not start it", which is a
+    /// different call to whoever is paged. Fails too if that arm sends the
+    /// bare payload instead of `err.to_string()`: once the two share one wire
+    /// code, `SupervisorError`'s `Display` is the only thing left telling a
+    /// reader which half of the log plane failed, and both payloads are just
+    /// paths and reasons.
+    #[test]
+    fn a_log_plane_failure_is_internal_and_says_which_half_failed() {
+        let reopen = rpc_error(&SupervisorError::ReopenFailed(
+            "web (id 0): could not reopen /logs/web-out.log: Permission denied".to_string(),
+        ));
+        assert_eq!(reopen.code, RpcErrorCode::Internal);
+        assert_eq!(
+            reopen.message,
+            "log reopen failed: web (id 0): could not reopen \
+             /logs/web-out.log: Permission denied"
+        );
+
+        let flush = rpc_error(&SupervisorError::FlushFailed(
+            "/logs/web-out.log: Permission denied".to_string(),
+        ));
+        assert_eq!(flush.code, RpcErrorCode::Internal);
+        assert_eq!(
+            flush.message,
+            "log flush failed: /logs/web-out.log: Permission denied"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn subscribe_hands_back_a_compiled_filter() {
         let h = harness(vec![]);

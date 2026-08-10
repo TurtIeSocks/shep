@@ -841,8 +841,13 @@ mod tests {
     // What needs a real OS child lives in `tests/real_runner.rs`; what is
     // reachable with no process at all belongs here (IR-38). The log pump is
     // the second kind: it reads an `AsyncRead`, and a `tokio::io::duplex`
-    // half is one, so its whole control surface can be driven from this tier
+    // half is one, so both `LogCtl` variants can be driven from this tier
     // against real files and with no child to reap.
+    //
+    // One thing cannot: a write that fails. The pump opens its own handles,
+    // so making one unwritable means reaching past it — which is why
+    // `a_flush_reports_the_write_its_file_never_took` drives a `LogFile`
+    // directly instead of a whole pump.
     //
     // These cases run on the REAL clock rather than this crate's usual paused
     // one (IR-33): they wait on actual file I/O dispatched to the blocking
@@ -948,6 +953,22 @@ mod tests {
                 .await
                 .expect("a reopen must be acknowledged")
                 .expect("the pump must answer rather than drop the acknowledgement")
+        }
+
+        /// Sends a [`LogCtl::Flush`], waits for its acknowledgement, and
+        /// requires that it reports success — every caller of this flushes
+        /// handles the pump can write.
+        async fn flush(&self) {
+            let (done, ack) = oneshot::channel();
+            self.ctl
+                .send(LogCtl::Flush { done })
+                .await
+                .expect("the pump must still be reading its control channel");
+            let outcome = timeout(PUMP_DEADLINE, ack)
+                .await
+                .expect("a flush must be acknowledged")
+                .expect("the pump must answer rather than drop the acknowledgement");
+            assert_eq!(outcome, Ok(()), "this flush must have worked");
         }
     }
 
@@ -1261,6 +1282,85 @@ mod tests {
         assert!(
             pump.err_path.exists(),
             "stderr must be reopened even though stdout's open failed"
+        );
+    }
+
+    /// Fails if the `Flush` arm never reaches the files, never answers, or
+    /// lets go of a handle the way the `Reopen` arm deliberately does.
+    ///
+    /// Nothing polls for the content: a flush that has answered is a flush
+    /// whose files hold every line already handed to them — the same barrier
+    /// the reopen cases lean on, from the variant that keeps its handle
+    /// instead of replacing it. A `Flush` arm that dropped a handle would
+    /// leave the last feed with nowhere to go: the pump would go on reading
+    /// the stream and forwarding it while writing it nowhere, which is the
+    /// quietest way this module can be wrong.
+    ///
+    /// What this case does NOT catch is a [`LogFile::flush`] that answers
+    /// without asking its file. Nothing here would fail — it would only leave
+    /// the content assertion racing the blocking pool, which on a write this
+    /// small it wins. That leg needs a write that fails, which needs a handle
+    /// the pump would never open;
+    /// [`a_flush_reports_the_write_its_file_never_took`] is where it is
+    /// pinned, and it is pinned deterministically.
+    #[tokio::test]
+    async fn a_flush_lands_both_streams_and_keeps_writing_afterwards() {
+        let mut pump = PumpHarness::start();
+        pump.feed(false, "out-before").await;
+        pump.feed(true, "err-before").await;
+
+        pump.flush().await;
+
+        // No polling: the acknowledgement is the barrier this half of `shep
+        // flush` exists to provide, and a test that polled for the content
+        // would pass against a pump that never provided it.
+        assert_eq!(fs::read_to_string(&pump.out_path).unwrap(), "out-before\n");
+        assert_eq!(fs::read_to_string(&pump.err_path).unwrap(), "err-before\n");
+
+        // A flush keeps the handle, where a reopen replaces it — so the next
+        // line appends to what is already there rather than starting a file.
+        pump.feed(false, "out-after").await;
+        assert_file_settles(&pump.out_path, "out-before\nout-after\n").await;
+    }
+
+    /// Fails if [`LogFile::flush`] stops asking the file anything — an early
+    /// `return Ok(())`, or a `map_err` traded for `.ok()`.
+    ///
+    /// A `tokio::fs::File` reports a failed write on the NEXT operation
+    /// rather than the one that failed: `write_all` returns as soon as the
+    /// real `write(2)` is queued on the blocking pool, so that write's error
+    /// is owed to whoever asks next. `flush` is who asks. This is the whole
+    /// reason the flush half of `shep flush` reports where
+    /// [`LogFile::reopen`]'s own flush logs — and a flush that answered
+    /// without asking would swallow the only signal there is that a sheep's
+    /// log went unwritten.
+    ///
+    /// Driven against a [`LogFile`] rather than through [`PumpHarness`]
+    /// because the pump opens its own handles: a read-only one is the
+    /// deterministic way to make a write fail, since `write(2)` on an
+    /// `O_RDONLY` descriptor is `EBADF` for every uid, with no disk to fill
+    /// and no mode to race.
+    #[tokio::test]
+    async fn a_flush_reports_the_write_its_file_never_took() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.log");
+        fs::write(&path, "").unwrap();
+        let mut log = LogFile {
+            path: path.clone(),
+            handle: Some(tokio::fs::File::open(&path).await.unwrap()),
+        };
+
+        // Swallowed by design — the pump must keep draining a child whose
+        // log it cannot write — so the failure is still owed at the flush.
+        log.append("never-lands").await;
+
+        let error = log
+            .flush()
+            .await
+            .expect_err("a write that never reached the file must fail the flush");
+        assert!(
+            error.message.starts_with(&format!("{}: ", path.display())),
+            "the failure must name the file it belongs to: {error}"
         );
     }
 

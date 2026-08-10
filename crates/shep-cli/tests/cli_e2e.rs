@@ -1489,9 +1489,23 @@ fn reopen_puts_a_rotated_log_back_where_bleats_can_read_it() {
     assert!(!out_file.exists(), "sanity: the rename really moved it");
 
     // The `postrotate` stanza itself: no selector, which is the verb's
-    // default and the whole-flock case an operator writes.
-    let reopened = shep(home).arg("reopen").output().unwrap();
+    // default and the whole-flock case an operator writes. `--format json`
+    // is the one addition, so the envelope's own `command` label is asserted
+    // rather than taken on trust: `reopen` and `flush` render an identical
+    // `FlockRows` table, so their two labels are swappable with no table, no
+    // exit code and no wire request moving at all.
+    let reopened = shep(home)
+        .arg("reopen")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
     assert_success(&reopened);
+    let envelope: serde_json::Value = serde_json::from_slice(&reopened.stdout).unwrap();
+    assert_eq!(
+        envelope["command"], "reopen",
+        "a reopen's envelope must say so: {envelope}"
+    );
 
     // Only now is the gate opened, so the line below cannot predate the
     // reopen that had to happen for it to land anywhere readable.
@@ -1520,6 +1534,92 @@ fn reopen_puts_a_rotated_log_back_where_bleats_can_read_it() {
         "the renamed file must stop growing the moment the handle is swapped"
     );
 
+    graceful_kill(home);
+}
+
+/// A rotation that fails, end to end: the whole feedback loop an operator
+/// has when `shep reopen` cannot do what it was asked.
+///
+/// Every other case in this file drives the log plane's happy path. This one
+/// drives the chain nothing else touches — a pump that could not open a path
+/// again, `SupervisorError::ReopenFailed`, `rpc_error`'s `Internal`, and
+/// `ExitCode::Internal`'s 9 — and it is the chain that matters most, because
+/// a `postrotate` stanza is a shell script: exit 9 is the entire signal it
+/// gets, and a rotation reported as a success leaves that sheep writing one
+/// of its streams nowhere while logrotate goes on to compress the archive.
+///
+/// A directory in stdout's place is the failure with no permission games in
+/// it: `open(2)` on a directory fails for every uid, root included, so this
+/// cannot pass for the wrong reason on a privileged CI runner. The daemon's
+/// own tiers use the same construction one and two layers down.
+///
+/// stderr's path is left alone, so the message must name stdout's path and
+/// only stdout's — a daemon that reported the whole flock, or the wrong
+/// path, would still exit 9 and pass a bare status check.
+///
+// fails if any link in that chain stops carrying the failure: a
+// `spawn_reopen_task` that reported a refusing pump as a success, an
+// `rpc_error` arm answering a code other than `Internal`, or an
+// `ExitCode::from(RpcErrorCode)` that no longer sends `Internal` to 9.
+#[test]
+fn a_reopen_that_cannot_open_a_path_again_exits_internal() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_logging_script(&dir, "blocked-out-marker", None);
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("blocked")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    // Read off the daemon's own snapshot rather than derived here, so the
+    // test cannot disagree with it about which file it is blocking.
+    let online = poll_flock(home, |info| info["status"] == "online");
+    let out_file = PathBuf::from(
+        online["out_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the daemon reports its own log paths: {online}")),
+    );
+
+    // The rotator's rename, and then something in the recreated path's way.
+    // Renamed rather than deleted so the pump is in the state a real
+    // rotation leaves it in: holding a handle on an inode that answers to a
+    // different name, with the live path unopenable.
+    std::fs::rename(&out_file, out_file.with_extension("log.1")).unwrap();
+    std::fs::create_dir(&out_file).unwrap();
+
+    let refused = shep(home)
+        .arg("reopen")
+        .arg("blocked")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert_json_error(&refused, 9, "internal");
+    let err: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+    let message = err["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(out_file.to_str().unwrap()),
+        "the operator's one message must name the path that failed: {err}"
+    );
+    // Taken from the daemon's own answer rather than assumed to be 0, and
+    // asserted as the whole `<name> (id <id>)` prefix — the log path already
+    // contains the name, so a bare name check would hold against a message
+    // that named no sheep at all.
+    assert!(
+        message.contains(&format!("blocked (id {})", online["id"])),
+        "and the sheep it belongs to: {err}"
+    );
+
+    // Out of the daemon's way before the shutdown that follows, so nothing
+    // downstream trips over a directory where a log file belongs.
+    std::fs::remove_dir(&out_file).unwrap();
     graceful_kill(home);
 }
 
@@ -1698,9 +1798,23 @@ fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
     );
 
     // The selector is explicit because the verb requires one — a bare `shep
-    // flush` is a usage error, which the case below pins.
-    let flushed = shep(home).arg("flush").arg("all").output().unwrap();
+    // flush` is a usage error, which the case below pins. `--format json`
+    // for the reason the reopen case gives about its own label: the two
+    // verbs render the same table, so nothing else here would notice them
+    // swapped.
+    let flushed = shep(home)
+        .arg("flush")
+        .arg("all")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
     assert_success(&flushed);
+    let envelope: serde_json::Value = serde_json::from_slice(&flushed.stdout).unwrap();
+    assert_eq!(
+        envelope["command"], "flush",
+        "a flush's envelope must say so: {envelope}"
+    );
 
     // Only now is the gate opened, so the line below cannot predate the
     // flush it has to survive.

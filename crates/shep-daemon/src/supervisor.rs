@@ -4489,6 +4489,37 @@ mod tests {
         );
     }
 
+    /// The flush half of
+    /// [`a_pump_that_ends_mid_request_still_ends_the_reopen`], and the leg
+    /// [`flush_logs`] gets wrong most expensively.
+    ///
+    /// Fails if that function's `ack.await.unwrap_or(Ok(()))` becomes
+    /// `unwrap_or(Err(..))`, or waits on an acknowledgement nobody is left to
+    /// send. A pump that ended between accepting the request and answering it
+    /// holds no handle and so owes no bytes to anything — but the truncate
+    /// still has to run, because that is exactly how a sheep which stopped
+    /// mid-flush gets its logs emptied. Turning that into a failure would
+    /// fail `shep flush all` over any sheep that happened to exit while the
+    /// verb was walking the flock.
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_that_ends_mid_request_still_ends_the_flush() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let request = rx.recv().await.expect("the flush must reach the pump");
+            drop(request); // ends without answering, exactly as a closing pump does
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), flush_logs(&tx))
+            .await
+            .expect("a dropped acknowledgement must end the flush, not leave it waiting");
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "a pump that ended mid-request owes no bytes, which is the same \
+             no-op success a failed send is"
+        );
+    }
+
     /// What [`FailingPumpRunner`]'s pump answers every reopen with. One
     /// owner for the string, because the case below asserts the whole error
     /// it ends up inside — a copy per site could drift and keep passing.
@@ -5134,6 +5165,36 @@ mod tests {
         assert!(
             !missing.exists(),
             "a flush must not create the log file it did not find"
+        );
+    }
+
+    /// Fails if [`truncate_log`]'s last arm swallows its error — a `_ =>
+    /// Ok(())` beside the `NotFound` one, or a `NotFound` guard widened to
+    /// every kind. `shep flush` would then exit 0 over a log holding
+    /// everything it did before, which is the silent failure the verb's whole
+    /// error path exists to end, and the neighbouring case above cannot see
+    /// it: a missing path answers `Ok` legitimately.
+    ///
+    /// A directory in the log's place is the failure with no permission games
+    /// in it, the same construction
+    /// `a_reopen_that_cannot_open_a_path_again_answers_with_the_failure` uses
+    /// one tier down: `open(2)` for writing on a directory fails for every
+    /// uid, root included, so this cannot pass for the wrong reason on a
+    /// privileged runner.
+    #[tokio::test]
+    async fn truncating_a_path_that_is_a_directory_reports_the_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("web-out.log");
+        std::fs::create_dir(&blocked).unwrap();
+
+        let error = truncate_log(&blocked)
+            .await
+            .expect_err("a path that could not be truncated must not answer Ok");
+        assert!(
+            error
+                .message
+                .starts_with(&format!("{}: ", blocked.display())),
+            "the failure must name the path it could not empty: {error}"
         );
     }
 

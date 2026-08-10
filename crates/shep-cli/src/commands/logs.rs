@@ -291,6 +291,14 @@ mod tests {
     /// what the daemon actually budgets from, and `request_with_deadline`
     /// never leaves it unset — `None` would travel as
     /// `DEFAULT_DEADLINE`'s 5s, which is exactly the regression.
+    ///
+    /// The literal `30_000` is here and only here. Comparing against
+    /// [`LOG_PLANE_DEADLINE`] alone is the assert-X-equals-X shape: it holds
+    /// whatever the constant says, so the constant could be cut back to the
+    /// 5s this verb is meant to escape and every deadline assertion in this
+    /// module would still pass. One test names the number so that change has
+    /// to be deliberate; the flush case below keeps comparing against the
+    /// constant, which is what pins the two verbs to the same budget.
     #[tokio::test]
     async fn a_reopen_asks_for_the_longer_deadline() {
         let dir = tempfile::tempdir().unwrap();
@@ -309,6 +317,12 @@ mod tests {
         assert_eq!(
             sent.deadline_ms,
             Some(u64::try_from(LOG_PLANE_DEADLINE.as_millis()).unwrap())
+        );
+        assert_eq!(
+            sent.deadline_ms,
+            Some(30_000),
+            "the log plane's budget is 30s; a shorter one is the regression \
+             this verb exists to avoid, not a tuning choice"
         );
     }
 
@@ -459,13 +473,20 @@ mod tests {
 
     /// Fails if the verb swallows a daemon-side refusal and exits 0.
     ///
-    /// This is the one exit code `flush` cannot afford to get wrong. An
-    /// operator who ran `shep flush` and saw 0 believes those files are
-    /// empty; `Internal` is what the daemon answers when a path could not be
-    /// truncated, and a zero exit over it is the silent failure in its purest
-    /// form — the log still holds everything it did before, and nothing said
-    /// so. `NotFound` is the refusal driven here because a selector matching
-    /// nothing is the one this verb can provoke on its own.
+    /// A zero exit over a refusal is the silent failure in its purest form:
+    /// an operator who ran `shep flush` and saw 0 believes those files are
+    /// empty. The refusal driven here is `NotFound`, which is what the daemon
+    /// answers a selector that matched nothing — the one refusal this tier
+    /// can produce, since a fake client answers whatever it is armed with and
+    /// no real path is ever truncated behind it.
+    ///
+    /// The refusal that costs the most, a path the daemon could not truncate,
+    /// answers `Internal` and exits 9. Nothing here can provoke it, so it is
+    /// pinned where it can be: `rpc::tests`'s
+    /// `a_log_plane_failure_is_internal_and_says_which_half_failed` for the
+    /// code and the message, and `cli_e2e`'s
+    /// `a_reopen_that_cannot_open_a_path_again_exits_internal` for the exit
+    /// status an operator's shell actually sees.
     #[tokio::test]
     async fn a_refused_flush_never_exits_zero() {
         let dir = tempfile::tempdir().unwrap();
