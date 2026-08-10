@@ -11,10 +11,11 @@
 //! runner over OS processes (a later task) for production.
 //!
 //! It also owns the log plane's shared vocabulary — [`LogCtl`] and the two
-//! errors its requests answer with — and, with it, [`open_log_path`]: the
-//! one function in this crate that opens a sheep's log file, for the log
-//! pump and for `shep flush` alike, so neither half can drift from the other
-//! on what it is willing to open.
+//! errors its requests answer with — and, with them, this crate's only
+//! opener of a sheep's log file (`open_log_path`, crate-private) plus the
+//! ancestry guard that runs ahead of it. The log pump and `shep flush` both
+//! go through that pair, so neither half can drift from the other on what it
+//! is willing to open.
 //!
 //! This whole module is public and stays that way: [`ProcessRunner`] is the
 //! bound on [`boot`](crate::boot::boot), which `shep-cli` calls, so a caller
@@ -259,6 +260,12 @@ pub(crate) const SYMLINK_REFUSED: &str = "refusing to follow a symlink at this l
 /// truncating one (`supervisor`'s `truncate_log`) both come through here, so
 /// the two halves of the log plane cannot drift on what they will open.
 ///
+/// [`check_log_ancestry`] is this function's other half and runs BEFORE it at
+/// both call sites — before `open_append`'s `mkdir` in particular, so no
+/// directory is created down an ancestry that is about to be refused. The two
+/// are split rather than nested for exactly that ordering; neither is
+/// meaningful without the other.
+///
 /// # Security
 ///
 /// An app's `out_file`/`err_file` are free-form config the assembler takes
@@ -274,10 +281,13 @@ pub(crate) const SYMLINK_REFUSED: &str = "refusing to follow a symlink at this l
 /// `O_NOFOLLOW` guards only the FINAL path component. A symlinked *parent*
 /// directory still resolves, so `logs -> /elsewhere` followed by
 /// `logs/app.log` reaches `/elsewhere/app.log` exactly as before. Closing
-/// that needs `openat2(RESOLVE_NO_SYMLINKS)`, which is Linux-only and so out
-/// of scope for a project with macOS as a tier-1 platform (spec §11). This
-/// stops the realistic attack — a symlink planted at the log path — not
-/// every theoretical one.
+/// that in the open itself needs `openat2(RESOLVE_NO_SYMLINKS)`, which is
+/// Linux-only and so out of scope for a project with macOS as a tier-1
+/// platform (spec §11). [`check_log_ancestry`] covers that case from the
+/// other side — by refusing an ancestry a privileged daemon should not be
+/// writing below at all — but it checks rather than resolves, so a TOCTOU
+/// window remains between the two. This stops the realistic attack; it does
+/// not make the operation atomic.
 ///
 /// `custom_flags` is safe, so none of this is the exception to
 /// `shep-daemon/src/sys.rs` owning every `unsafe` block in this crate
@@ -321,6 +331,221 @@ fn name_the_symlink(error: io::Error) -> io::Error {
 #[cfg(not(unix))]
 fn name_the_symlink(error: io::Error) -> io::Error {
     error
+}
+
+/// Refuses — under a privileged shepherd — to open a log file whose ancestry
+/// another local user could redirect, and warns about it under any other.
+///
+/// [`open_log_path`]'s other half, run before it (and before any `mkdir`) at
+/// both of that function's call sites.
+///
+/// # Why the split by uid
+///
+/// The chain is an ESCALATION only when the daemon is privileged. A shepherd
+/// running as an ordinary user that logs into a shared directory has handed
+/// nobody anything they could not already do as themselves — it is a footgun,
+/// not a vulnerability — and refusing it outright would break a developer
+/// logging to `/tmp`, which is a legitimate thing to do. So root refuses and
+/// everyone else is warned, once per path. The warning costs nothing at the
+/// default level: the subscriber ships at `warn`.
+///
+/// # What counts as loose
+///
+/// See [`loose_ancestor`]. Two things, both about the components of the path
+/// itself rather than about where it points: an ancestor owned by neither the
+/// daemon's uid nor root, and a world-writable ancestor DIRECTORY. Ownership
+/// is the load-bearing half — it is what catches an intermediate component
+/// swapped for a symlink, which `O_NOFOLLOW` on the final component cannot
+/// see, and it catches a plain `0755` directory owned by the app's own
+/// dropped-privilege user, which the write bit alone would wave through.
+///
+/// # What remains
+///
+/// A TOCTOU window, and there is no portable way to close it: this checks the
+/// ancestry and then opens the path, with no atomic tie between the two, and
+/// the syscall that would provide one (`openat2(RESOLVE_NO_SYMLINKS)`) is
+/// Linux-only while macOS is tier-1 (spec §11). An attacker who can rearrange
+/// a directory between the check and the open still wins that race. The bar
+/// is raised substantially; the operation is not atomic.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::PermissionDenied`], naming the offending ancestor and
+/// why, when the daemon's effective uid is root and an ancestor is loose. The
+/// message carries no path of its own — every caller prefixes the log path
+/// already.
+pub(crate) fn check_log_ancestry(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        check_log_ancestry_as(path, crate::server::daemon_uid())
+    }
+    // Windows has neither the uid model this reads nor the `shep flush`
+    // surface that reaches it (spec §11's functional tier is unbuilt), so
+    // there is nothing here to check and nothing to warn about yet.
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// The effective uid a shepherd has to be running as for a loose ancestor to
+/// be an escalation rather than a footgun.
+#[cfg(unix)]
+const ROOT_UID: u32 = 0;
+
+/// The permission bit that lets every local user create entries in a
+/// directory. Narrower on purpose than `boot`'s socket-directory check, which
+/// tests `0o022` (group OR world): a group-writable log directory names a
+/// specific set of accounts an operator chose, while this bit names everyone.
+#[cfg(unix)]
+const WORLD_WRITABLE: u32 = 0o002;
+
+/// Log paths whose loose ancestry has already been reported, so an
+/// unprivileged shepherd says it once rather than on every respawn, every
+/// reopen and every flush of the same file.
+///
+/// Keyed by the LOG path, not by the offending ancestor: the warning names
+/// both, and an operator asking "which of my apps is this about?" is asking
+/// about the one this set is keyed on. Bounded by the number of distinct log
+/// paths in the flock.
+#[cfg(unix)]
+static WARNED_LOOSE_LOG_PATHS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// [`check_log_ancestry`] with the daemon's effective uid supplied, so the
+/// privileged arm is reachable from a test that is not running as root.
+///
+/// # Errors
+///
+/// [`check_log_ancestry`]'s.
+#[cfg(unix)]
+fn check_log_ancestry_as(path: &Path, daemon_uid: u32) -> io::Result<()> {
+    let Some(loose) = loose_ancestor(path, daemon_uid) else {
+        return Ok(());
+    };
+    if daemon_uid == ROOT_UID {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to open a log file below {}, which {}; a shepherd running as root \
+                 writes only below directories its own user owns",
+                loose.path.display(),
+                loose.reason,
+            ),
+        ));
+    }
+    let first_time = WARNED_LOOSE_LOG_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf());
+    if first_time {
+        tracing::warn!(
+            path = %path.display(),
+            ancestor = %loose.path.display(),
+            reason = %loose.reason,
+            "log path sits below a directory another local user could redirect; a shepherd \
+             running as root would refuse to open it"
+        );
+    }
+    Ok(())
+}
+
+/// An ancestor of a log path that another local user could use to redirect
+/// where that path lands.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LooseAncestor {
+    /// The offending component, as it appears in the log path.
+    path: PathBuf,
+    /// Why it offends — reads as the predicate in `"<path> <reason>"`.
+    reason: LooseReason,
+}
+
+/// Why an ancestor of a log path counts as loose.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LooseReason {
+    /// Owned by a uid that is neither the daemon's own nor root's, so its
+    /// owner can replace or redirect it under the daemon (carries that uid).
+    /// Also how a symlinked component is caught: the link's own owner is the
+    /// user who planted it.
+    ForeignOwner(u32),
+    /// A directory every local user can create entries in, so anyone can put
+    /// a symlink where the next component is about to be resolved.
+    WorldWritable,
+}
+
+#[cfg(unix)]
+impl fmt::Display for LooseReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ForeignOwner(uid) => write!(f, "is owned by uid {uid}"),
+            Self::WorldWritable => f.write_str("is world-writable"),
+        }
+    }
+}
+
+/// The nearest ancestor of `path` that another local user could use to
+/// redirect it, or `None` when every one of them is already the daemon's to
+/// trust.
+///
+/// Walks the path's own textual components from its parent upwards and stops
+/// at the first offender, so the ancestor reported is the one closest to the
+/// log file — the one an operator can actually do something about, and the
+/// one a test can pin without knowing what `/tmp` looks like on the runner.
+///
+/// `symlink_metadata`, never `metadata`: a symlinked component must be read
+/// as the link it is (owned by whoever planted it) rather than as whatever it
+/// resolves to. That is the whole reason ownership is checked at all —
+/// `O_NOFOLLOW` on the final component cannot see a redirect one level up.
+///
+/// An ancestor that does not exist is skipped rather than trusted or blamed:
+/// `open_append` is about to create it, and every directory shep creates it
+/// creates at `boot::DIR_MODE` (`0700`) as the daemon's own user, which is
+/// exactly what this function would then wave through. An ancestor that
+/// cannot be stat'd at all is skipped for the same reason it cannot be
+/// judged.
+///
+/// # Cost
+///
+/// One `lstat(2)` per component of the path, once per log-file open — so
+/// every spawn, every respawn, every reopen, and once per distinct path in a
+/// flush. The syscalls hit the kernel's dentry cache after the first, and the
+/// walk stops early on the first offender, which on a loose ancestry is
+/// usually the first component it looks at.
+///
+/// Measured on macOS (release, warm cache, no offender so the walk runs to
+/// the root): **7.8 µs** for a nine-component path — the shape
+/// `$SHEP_HOME/logs/<name>-<n>-out.log` has under a home directory — and
+/// **26 µs** for a twenty-four-component one, so about 1.1 µs per component.
+/// That is against an `open(2)` this crate already dispatches to the blocking
+/// pool, and against the process spawn a pump's first open belongs to, which
+/// costs milliseconds. It is run inline rather than on the blocking pool
+/// because a few microseconds is well inside what a runtime worker may do
+/// between yields, and a `spawn_blocking` hop per open would cost more than
+/// the walk.
+#[cfg(unix)]
+fn loose_ancestor(path: &Path, daemon_uid: u32) -> Option<LooseAncestor> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    path.parent()?
+        .ancestors()
+        .filter_map(|ancestor| Some((ancestor, std::fs::symlink_metadata(ancestor).ok()?)))
+        .find_map(|(ancestor, meta)| {
+            let reason = if meta.uid() != daemon_uid && meta.uid() != ROOT_UID {
+                LooseReason::ForeignOwner(meta.uid())
+            } else if meta.is_dir() && meta.mode() & WORLD_WRITABLE != 0 {
+                LooseReason::WorldWritable
+            } else {
+                return None;
+            };
+            Some(LooseAncestor {
+                path: ancestor.to_path_buf(),
+                reason,
+            })
+        })
 }
 
 /// IO endpoints handed back by spawn — the runner pumps internally.
@@ -481,3 +706,157 @@ impl fmt::Display for RunnerError {
 }
 
 impl core::error::Error for RunnerError {}
+
+// Every case here is `#[cfg(unix)]`, as is everything they exercise: the uid
+// model `loose_ancestor` reads, the mode bits it tests, and
+// `std::os::unix::fs::symlink`. On Windows this module compiles to nothing,
+// which matches `check_log_ancestry`'s own non-unix arm having nothing to do.
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+    use crate::testing::capture_logs;
+
+    /// A uid no fixture in this module creates anything as. Only reached on a
+    /// root test runner, where `chown` is available and everything the test
+    /// creates would otherwise be root-owned — and root is exempt by
+    /// construction, so a self-owned fixture could not be foreign there.
+    const FOREIGN_UID: u32 = 65_432;
+
+    /// This process's effective uid — what every fixture directory below is
+    /// owned by, and what the cases move the *daemon's* uid relative to
+    /// rather than trying to chown their way around.
+    fn me() -> u32 {
+        nix::unistd::geteuid().as_raw()
+    }
+
+    /// A log path two components below `dir`, with its parent created and
+    /// left at `mode`.
+    fn log_path_under(dir: &tempfile::TempDir, mode: u32) -> (PathBuf, PathBuf) {
+        let parent = dir.path().join("logs");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+        let log = parent.join("web-0-out.log");
+        (parent, log)
+    }
+
+    /// Fails if the walk stops reporting the NEAREST offender — an
+    /// implementation that walked to the filesystem root and kept the last
+    /// hit, or that returned an arbitrary one, would blame `/tmp` on a Linux
+    /// runner (mode `1777`) instead of the directory the operator configured
+    /// and can actually fix. Also the only case pinning the world-writable
+    /// arm on its own: drop that arm and this reddens with `None` while the
+    /// ownership cases below stay green.
+    #[test]
+    fn the_nearest_loose_ancestor_is_the_one_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, log) = log_path_under(&dir, 0o777);
+
+        assert_eq!(
+            loose_ancestor(&log, me()),
+            Some(LooseAncestor {
+                path: parent,
+                reason: LooseReason::WorldWritable,
+            })
+        );
+    }
+
+    /// Fails if the check tests only the write bit — the shape the guard was
+    /// first specified as. This parent is `0700`, so a world-writable test
+    /// waves it through; its OWNER can still replace it under a root
+    /// shepherd, which is the whole point of widening the predicate. A `0755`
+    /// directory owned by an app's own dropped-privilege `user` is the same
+    /// case wearing ordinary clothes.
+    #[test]
+    fn an_ancestor_owned_by_another_user_is_loose_however_tight_its_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, log) = log_path_under(&dir, 0o700);
+
+        // The predicate is symmetric in the two uids, so an unprivileged
+        // runner moves the daemon's rather than the directory's — it cannot
+        // chown. A root runner must move the directory's instead: everything
+        // it creates is root-owned, and root is exempt whatever the daemon's
+        // uid is.
+        let (daemon_uid, owner) = if me() == ROOT_UID {
+            std::os::unix::fs::chown(&parent, Some(FOREIGN_UID), None).unwrap();
+            (ROOT_UID, FOREIGN_UID)
+        } else {
+            (me() + 1, me())
+        };
+
+        assert_eq!(
+            loose_ancestor(&log, daemon_uid),
+            Some(LooseAncestor {
+                path: parent,
+                reason: LooseReason::ForeignOwner(owner),
+            })
+        );
+    }
+
+    /// Fails if the walk reads each component with `metadata` instead of
+    /// `symlink_metadata`. The link below is owned by this user and points at
+    /// a root-owned, non-world-writable directory, so following it reports a
+    /// component that is NOT loose and the walk moves on to blame the
+    /// tempdir; reading the link itself blames the link. Only the path in the
+    /// answer tells the two apart, which is why this asserts on it.
+    ///
+    /// This is the case `O_NOFOLLOW` structurally cannot cover: it guards the
+    /// final component, and the redirect here is one level up.
+    #[test]
+    fn a_symlinked_component_is_judged_as_the_link_not_as_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("logs");
+        // `/usr` exists and is root-owned `0755` on both tier-1 platforms —
+        // an ancestor the walk would wave through if it followed the link.
+        std::os::unix::fs::symlink("/usr", &link).unwrap();
+        let log = link.join("web-0-out.log");
+
+        let loose = loose_ancestor(&log, me() + 1).expect("a foreign-owned component is loose");
+        assert_eq!(
+            loose.path,
+            link,
+            "the link itself must be judged, not what it resolves to: blaming {} means the \
+             walk followed it",
+            loose.path.display()
+        );
+    }
+
+    /// Fails if the two uid arms are collapsed either way round.
+    ///
+    /// Refusing everywhere would break a developer logging to `/tmp` as
+    /// themselves — a footgun, not an escalation, since they have handed
+    /// nobody anything they could not already do. Warning everywhere would
+    /// leave the root case, the one that IS an escalation, exiting zero.
+    ///
+    /// The warn-once half is asserted in the same case because it is the same
+    /// call: a count of two means the dedup set is gone, and a pump that
+    /// reopens on every respawn would then repeat the line forever.
+    #[test]
+    fn a_root_shepherd_refuses_where_an_unprivileged_one_warns_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, log) = log_path_under(&dir, 0o777);
+
+        let refused = check_log_ancestry_as(&log, ROOT_UID)
+            .expect_err("a root shepherd must not open a log below a loose ancestor");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            refused.to_string().contains(&parent.display().to_string()),
+            "the refusal must name the ancestor an operator has to fix: {refused}"
+        );
+
+        // Never `me()`: a root test runner would take the arm above instead.
+        // `me() + 1` is non-root by construction and owns nothing here, so
+        // the fixture is loose to it whichever uid this process has.
+        let unprivileged = me() + 1;
+        let rendered = capture_logs(|| {
+            assert_eq!(check_log_ancestry_as(&log, unprivileged).ok(), Some(()));
+            assert_eq!(check_log_ancestry_as(&log, unprivileged).ok(), Some(()));
+        });
+        assert_eq!(
+            rendered.matches("log path sits below").count(),
+            1,
+            "an unprivileged shepherd warns once per path, not once per open: {rendered}"
+        );
+    }
+}

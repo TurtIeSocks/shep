@@ -12,6 +12,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security and unsafe
 
+- Refuse, under a shepherd running as root, to open a log file whose ancestry
+  another local user could redirect — and warn about it, once per path, under
+  any other. An ancestor is loose when it is owned by neither the daemon's own
+  uid nor root, or when it is a world-writable directory. Ownership is the
+  load-bearing half: it catches an intermediate component swapped for a
+  symlink, which `O_NOFOLLOW` on the final component structurally cannot see,
+  and it catches an ordinary `0755` directory owned by an app's own
+  dropped-privilege `user`, which a write-bit test alone waves through. The
+  split by uid is deliberate — a loose ancestry is an escalation only for a
+  privileged daemon, and a developer logging to `/tmp` as themselves has
+  handed nobody anything they could not already do, so refusing there would
+  break a legitimate setup to no one's benefit. The sticky bit does not change
+  the answer: it restricts unlinking and renaming entries you do not own, not
+  creating new ones, and the attack plants a NEW entry at a path shep has not
+  created yet. A TOCTOU window remains between the check and the open, and
+  there is no portable way to close it while macOS is tier-1. The check costs
+  one `lstat(2)` per path component (7.8 µs for a nine-component path,
+  measured).
 - Open every log file with `O_NOFOLLOW`, in both halves of the log plane:
   the pump's appending handle and the truncating one `shep flush` opens. An
   app's `out_file`/`err_file` are free-form config, so a log path can name a

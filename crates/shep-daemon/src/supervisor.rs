@@ -60,7 +60,7 @@ use crate::probes::os::OsProber;
 use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
 use crate::runner::{
     ExitOutcome, FlushError, LogCtl, ProcIo, ProcessRunner, ReopenError, RunningProcess, SpawnSpec,
-    open_log_path,
+    check_log_ancestry, open_log_path,
 };
 
 /// Capacity of the actor's own mailbox (commands + internal events).
@@ -2357,18 +2357,26 @@ async fn flush_logs(log_ctl: &mpsc::Sender<LogCtl>) -> Result<(), FlushError> {
 ///
 /// # Errors
 ///
-/// [`FlushError`] — the path exists and could not be opened for truncation: a
-/// symlink standing at it ([`SYMLINK_REFUSED`](crate::runner::SYMLINK_REFUSED)),
-/// a mode the daemon cannot write, a read-only filesystem, an IO error.
+/// [`FlushError`] — the path could not be opened for truncation: an ancestry a
+/// privileged shepherd will not write below
+/// ([`check_log_ancestry`](crate::runner::check_log_ancestry)), a symlink
+/// standing at the path itself
+/// ([`SYMLINK_REFUSED`](crate::runner::SYMLINK_REFUSED)), a mode the daemon
+/// cannot write, a read-only filesystem, an IO error.
 async fn truncate_log(path: &Path) -> Result<(), FlushError> {
+    let refused = |error: &dyn fmt::Display| FlushError {
+        message: format!("{}: {error}", path.display()),
+    };
+    if let Err(error) = check_log_ancestry(path) {
+        return Err(refused(&error));
+    }
+
     let mut options = tokio::fs::OpenOptions::new();
     options.write(true).truncate(true);
     match open_log_path(&mut options, path).await {
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(FlushError {
-            message: format!("{}: {error}", path.display()),
-        }),
+        Err(error) => Err(refused(&error)),
     }
 }
 

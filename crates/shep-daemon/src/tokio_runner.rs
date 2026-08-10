@@ -43,7 +43,7 @@ use crate::boot::DIR_MODE;
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::runner::{
     ExitOutcome, FlushError, LogCtl, LogLine, ProcIo, ProcessRunner, ReopenError, RunnerError,
-    RunningProcess, SpawnSpec, StopSignal, open_log_path,
+    RunningProcess, SpawnSpec, StopSignal, check_log_ancestry, open_log_path,
 };
 
 /// Capacity of every channel a spawn wires up — generous enough that a
@@ -771,7 +771,16 @@ fn spawn_log_pump<O, E>(
 /// `O_APPEND` brings back the sparse hole the paragraph above exists to
 /// prevent. See [`open_log_path`] for what `O_NOFOLLOW` does and does not
 /// cover.
+///
+/// [`check_log_ancestry`] runs FIRST, ahead of the `mkdir` below and not
+/// merely ahead of the open. Ordering is the point: `create_dir_all` treats
+/// an existing symlink-to-a-directory as a directory and walks straight
+/// through it, so a check that ran after it would leave a root shepherd
+/// having created `0700` directories at a path someone else chose before
+/// refusing to write the log file there.
 async fn open_append(path: &Path) -> io::Result<tokio::fs::File> {
+    check_log_ancestry(path)?;
+
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
         && let Err(error) = tokio::fs::DirBuilder::new()
