@@ -185,6 +185,14 @@ const BREACH_LIMIT: &str = "8M";
 /// rather than only through the record under test.
 const NEVER_READY_TIMEOUT: &str = "1s";
 
+/// What [`write_rotating_script`]'s sheep prints before the rotation, and
+/// what must end up in the renamed archive rather than in the recreated log.
+const ROTATE_BEFORE: &str = "before-the-rotation";
+
+/// What the same sheep prints after it, once the reopen has returned. Its
+/// arrival in the recreated file is the whole assertion.
+const ROTATE_AFTER: &str = "after-the-rotation";
+
 /// The daemon record the two log-plane cases provoke and then read out of
 /// `$SHEP_HOME/logs/shepd.err.log`.
 ///
@@ -344,6 +352,33 @@ fn write_logging_script(dir: &TempDir, out_marker: &str, err_marker: Option<&str
     }
     script.push_str(&format!("sleep {SCRIPT_SLEEP_SECS}\n"));
     write_script(dir, "logging.sh", &script)
+}
+
+/// Writes a script that prints [`ROTATE_BEFORE`], blocks until `gate`
+/// exists, prints [`ROTATE_AFTER`], and sleeps.
+///
+/// One script, and it has to have both halves: a rotation is only observable
+/// in what happens to a line written AFTER the rename, and a script that
+/// wrote everything up front would leave a reopen that did nothing looking
+/// exactly like one that worked. The gate is what makes "after" a fact
+/// rather than a timing bet — the test creates it once the reopen has
+/// already returned.
+///
+/// Same `sleep 0.1` as [`write_ready_script`], for the reason given there:
+/// POSIX requires only whole seconds, and a `/bin/sleep` that refused the
+/// fraction degrades this into a busy-wait rather than a hang.
+fn write_rotating_script(dir: &TempDir, gate: &Path) -> PathBuf {
+    write_script(
+        dir,
+        "rotating.sh",
+        &format!(
+            "#!/bin/sh\n{}echo '{ROTATE_BEFORE}'\n\
+             until [ -e \"{}\" ]; do sleep 0.1; done\n\
+             echo '{ROTATE_AFTER}'\nsleep {SCRIPT_SLEEP_SECS}\n",
+            record_pid_line(dir),
+            gate.display(),
+        ),
+    )
 }
 
 /// Writes a script that blocks until `sentinel` exists, then announces
@@ -1389,6 +1424,100 @@ fn bleats_no_follow_prints_what_a_sheep_actually_wrote() {
     assert!(
         !stdout_only.contains("bleater-err-marker"),
         "--out must select the out file only: stdout={stdout_only}"
+    );
+
+    graceful_kill(home);
+}
+
+/// `create`-mode rotation through the real binary: rename the live log, run
+/// `shep reopen`, and the sheep's next line reaches the recreated path where
+/// `shep bleats --no-follow` can print it.
+///
+/// This is the symptom the verb was built for, end to end. Before it, a
+/// rotation left the pump filling the renamed inode: the live path was never
+/// recreated, `bleats --no-follow` printed nothing, and it exited 0 while
+/// doing so. `daemon_e2e` proves the same swap over the daemon's own socket,
+/// but nothing there runs the binary an operator's `postrotate` stanza
+/// actually invokes — the argv, the default selector, the exit code and the
+/// reading verb are all this tier's to prove.
+///
+/// Both directions are asserted. That the second line appears rules out a
+/// reopen that did nothing; that the first one does NOT rules out a `bleats`
+/// that found the archive instead, or a pump that never let go of the old
+/// inode — either of which would print both lines and pass a
+/// contains-the-marker check on its own.
+///
+/// The log path is read off `shep flock --format json` rather than derived
+/// here, so the test cannot disagree with the daemon about which file it is
+/// renaming.
+#[test]
+fn reopen_puts_a_rotated_log_back_where_bleats_can_read_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let gate = home.join("rotated");
+    let script = write_rotating_script(&dir, &gate);
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("rotator")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    // Through the reading verb rather than the file, so the precondition is
+    // the same observation the assertion at the bottom makes.
+    let before = bleats_no_follow_until_written(home, &["all"]);
+    let printed = String::from_utf8_lossy(&before.stdout);
+    assert!(
+        printed.contains(ROTATE_BEFORE),
+        "precondition: the sheep's first line must be readable before the \
+         rotation: stdout={printed}"
+    );
+
+    let online = poll_flock(home, |info| info["status"] == "online");
+    let out_file = PathBuf::from(
+        online["out_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the daemon reports its own log paths: {online}")),
+    );
+    let archive = out_file.with_extension("log.1");
+    std::fs::rename(&out_file, &archive).unwrap();
+    assert!(!out_file.exists(), "sanity: the rename really moved it");
+
+    // The `postrotate` stanza itself: no selector, which is the verb's
+    // default and the whole-flock case an operator writes.
+    let reopened = shep(home).arg("reopen").output().unwrap();
+    assert_success(&reopened);
+
+    // Only now is the gate opened, so the line below cannot predate the
+    // reopen that had to happen for it to land anywhere readable.
+    std::fs::write(&gate, "").unwrap();
+
+    let after = bleats_no_follow_until_written(home, &["all"]);
+    assert_eq!(
+        after.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&after.stdout);
+    assert!(
+        stdout.contains(ROTATE_AFTER),
+        "a rotated sheep's next line must reach the recreated path: stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains(ROTATE_BEFORE),
+        "the recreated log starts empty — the first line belongs to the \
+         archive now: stdout={stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&archive).unwrap(),
+        format!("{ROTATE_BEFORE}\n"),
+        "the renamed file must stop growing the moment the handle is swapped"
     );
 
     graceful_kill(home);

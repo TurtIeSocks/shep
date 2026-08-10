@@ -17,7 +17,9 @@
 //! pipe. Nothing child-side is needed to rotate a sheep's logs, so nothing
 //! here asks anything of the child.
 
-use shep_client::Client;
+use std::time::Duration;
+
+use shep_client::{Client, REOPEN_DEADLINE};
 use shep_core::protocol::{Request, Response, SelectorSpec};
 use shep_core::selector::ProcessSelector;
 
@@ -25,8 +27,9 @@ use crate::cli::{Format, ReopenArgs};
 use crate::exit::ExitCode;
 use crate::output::{FlockRows, Render, Streams, emit, emit_error, write_outcome};
 
-/// Sends `body`, renders whatever the daemon answers through [`emit`], and
-/// maps every way that can go wrong to its exit code.
+/// Sends `body` with `deadline` (`None` defers to the client's own default),
+/// renders whatever the daemon answers through [`emit`], and maps every way
+/// that can go wrong to its exit code.
 ///
 /// `extract` pulls the verb's own payload out of `Response`; `Response` is
 /// `#[non_exhaustive]` (Global Constraints), so an answer `extract` does not
@@ -35,23 +38,24 @@ use crate::output::{FlockRows, Render, Streams, emit, emit_error, write_outcome}
 ///
 /// The third per-module copy of this helper, after `commands::lifecycle`'s
 /// and `commands::query`'s. They are one refactor rather than three: this
-/// one and `query`'s are identical, and `lifecycle`'s differs only by the
-/// deadline parameter `start` needs. Kept a copy here because pulling all
-/// three into a shared home rewrites two modules this change otherwise does
-/// not touch.
+/// one and `lifecycle`'s are now identical, and `query`'s differs only by
+/// the deadline parameter it has no verb to use. Kept a copy here because
+/// pulling all three into a shared home rewrites two modules this change
+/// otherwise does not touch.
 async fn request_and_render<T, F>(
     client: &Client,
     streams: &mut Streams<'_>,
     fmt: Format,
     command: &str,
     body: Request,
+    deadline: Option<Duration>,
     extract: F,
 ) -> ExitCode
 where
     T: Render,
     F: FnOnce(Response) -> Option<T>,
 {
-    match client.request(body).await {
+    match client.request_with_deadline(body, deadline).await {
         Ok(response) => match extract(response) {
             Some(payload) => write_outcome(emit(&mut *streams.out, fmt, command, payload)),
             None => {
@@ -114,6 +118,12 @@ fn parse_selector(
 /// Renders the matched sheep as [`FlockRows`], the same table `stop` and
 /// `restart` answer with — the useful thing to show is which sheep the
 /// selector reached.
+///
+/// Sent with [`REOPEN_DEADLINE`] rather than the client's default, the way
+/// `lifecycle::start` sends its own: the daemon visits matched sheep one at
+/// a time with no per-sheep bound, so on a slow log directory the 5s default
+/// would hand a `postrotate` stanza a `DeadlineExceeded` for a reopen that
+/// was still running.
 pub async fn reopen(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -130,6 +140,7 @@ pub async fn reopen(
         fmt,
         "reopen",
         Request::Reopen { selector },
+        Some(REOPEN_DEADLINE),
         |response| match response {
             Response::Reopened(procs) => Some(FlockRows(procs)),
             _ => None,
@@ -183,6 +194,38 @@ mod tests {
                 "input={input}"
             );
         }
+    }
+
+    /// Fails if `reopen` leaves the deadline to the client's default. The
+    /// daemon visits matched sheep serially with no per-sheep bound, so on a
+    /// slow or NFS-backed log directory a 5s budget expires while the reopen
+    /// is still running — and the one caller the docs invite to wait for
+    /// this, a logrotate `postrotate` stanza, gets both a non-zero exit and
+    /// pumps still holding the inodes it renamed.
+    ///
+    /// Asserted on the wire rather than on the constant: `deadline_ms` is
+    /// what the daemon actually budgets from, and `request_with_deadline`
+    /// never leaves it unset — `None` would travel as
+    /// `DEFAULT_DEADLINE`'s 5s, which is exactly the regression.
+    #[tokio::test]
+    async fn a_reopen_asks_for_the_longer_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+        };
+
+        let _ = reopen(&client, &mut streams, Format::Table, &args("all")).await;
+
+        let sent = envelopes.recv().await.unwrap();
+        assert_eq!(
+            sent.deadline_ms,
+            Some(u64::try_from(REOPEN_DEADLINE.as_millis()).unwrap())
+        );
     }
 
     /// `"/[/"` is one of the only three inputs the selector grammar

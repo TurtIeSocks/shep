@@ -41,7 +41,9 @@ mod events;
 #[cfg(unix)]
 pub mod spawn;
 #[cfg(unix)]
-pub use client::{Client, DEADLINE_GRACE, DEFAULT_DEADLINE, RequestError, START_DEADLINE};
+pub use client::{
+    Client, DEADLINE_GRACE, DEFAULT_DEADLINE, REOPEN_DEADLINE, RequestError, START_DEADLINE,
+};
 #[cfg(unix)]
 pub use connection::{ConnectError, HANDSHAKE_TIMEOUT};
 #[cfg(unix)]

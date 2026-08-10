@@ -1328,6 +1328,11 @@ impl<R: ProcessRunner> Actor<R> {
     /// the caller — so a return trip through the mailbox would buy nothing
     /// but a second hop and an epoch check with nothing to guard.
     ///
+    /// `&self` is that argument made structural: a handler that took `&mut
+    /// self` could grow a state change without anything noticing, and the
+    /// epoch check waved off above would quietly start being needed. The
+    /// compiler re-checks the claim on every build.
+    ///
     /// Staleness needs no guard for the same reason. A respawn between this
     /// handler and the send leaves the task holding the previous run's
     /// sender: that pump is already ending, so the send or the acknowledgement
@@ -1345,7 +1350,7 @@ impl<R: ProcessRunner> Actor<R> {
     /// because the pump has ended, which is how a stopped sheep normally
     /// presents.
     fn handle_reopen(
-        &mut self,
+        &self,
         selector: &ProcessSelector,
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     ) {

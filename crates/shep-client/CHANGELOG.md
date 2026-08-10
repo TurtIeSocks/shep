@@ -59,8 +59,11 @@ change to any of it is a `[Unreleased]` entry of its own, not a silent diff.
 - Add the timing constants every retry/deadline in this crate reads from,
   each named rather than an inline magic number (IR-26): `DEFAULT_DEADLINE`,
   `START_DEADLINE` (longer — a cold spawn plus a readiness probe routinely
-  outruns the default), `DEADLINE_GRACE`, `HANDSHAKE_TIMEOUT`,
-  `SPAWN_DEADLINE`, `BACKOFF_START`, `BACKOFF_CAP`.
+  outruns the default), `REOPEN_DEADLINE` (longer for its own reason — the
+  daemon visits matched sheep one at a time and each reopen is two `open(2)`s
+  behind a `flush`, with no bound of its own on a wedged or NFS-backed log
+  directory), `DEADLINE_GRACE`, `HANDSHAKE_TIMEOUT`, `SPAWN_DEADLINE`,
+  `BACKOFF_START`, `BACKOFF_CAP`.
 - Add the `test-support` feature: `pub mod testing`, the one home for every
   hand-rolled fake this crate and `shep-cli` share (`FakeDaemon` and its
   scripting methods, `fake_client_*` constructors), the same

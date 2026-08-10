@@ -31,6 +31,17 @@ pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(5);
 /// inside what the daemon will honour.
 pub const START_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Budget for `Request::Reopen`. The daemon visits matched sheep one after
+/// another and each visit is two `open(2)`s behind a `flush`, with no bound
+/// of its own — microseconds per sheep on a healthy filesystem, and as long
+/// as the kernel takes on a wedged or NFS-backed log directory. The 5s
+/// default would report failure to the one caller the docs invite to wait
+/// for this (a logrotate `postrotate` stanza) while the reopen it asked for
+/// was still running, leaving that caller both a non-zero exit and pumps
+/// still on the renamed inodes. Same 30s as [`START_DEADLINE`], and for the
+/// same reason: comfortably inside the daemon's own clamp.
+pub const REOPEN_DEADLINE: Duration = Duration::from_secs(30);
+
 /// How much longer the client waits than the deadline it asked the daemon to
 /// honour. Without a gap the client abandons a request the daemon is still
 /// legitimately working on, and the user sees a timeout for work that
