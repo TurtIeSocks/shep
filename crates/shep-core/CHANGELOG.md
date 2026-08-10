@@ -133,9 +133,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to publish anything left with no version to put there. One cosmetic side
   effect for this crate specifically: its `[target.'cfg(any())'.dependencies]`
   floor-pin block (see that block's own comment) publishes as real manifest
-  entries, so crates.io and docs.rs list `annotate-snippets`, `pest`, `quote`
-  and `syn` as dependencies of `shep-core`, even though `cfg(any())` never
-  matches and none of the four ever builds into it.
+  entries, so crates.io and docs.rs list all six of `annotate-snippets`,
+  `anstyle`, `encoding_rs_io`, `pest`, `quote` and `syn` as dependencies of
+  `shep-core`, even though `cfg(any())` never matches and not one of them
+  ever builds into it. `shep-daemon` and `shep-cli` publish the same way, for
+  the two and the one floor pin their own blocks carry.
 - Reject a `watch_options` or `ignore_watch` pattern globset will not compile,
   with `NormalizeError::InvalidWatchGlob`, naming the sheep, which of the two
   lists the pattern came from, the pattern as written and globset's reason.

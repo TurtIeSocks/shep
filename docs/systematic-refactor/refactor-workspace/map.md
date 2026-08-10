@@ -31,9 +31,13 @@ src/
              Duration ("30s") newtypes via FromStr, ExecMode enum, env_* flatten map,
              shlex string→args. schemars JSON-schema export for docs. THE compat contract —
              every key ported; APM knobs (trace/v8/pmx/io/...) dropped.
+             `channel` (Phase 5) is the one key with no pm2 ancestor: it opens the fd-3 shepherd
+             channel for an app that wants one without also wanting `wait_ready` or
+             `shutdown_with_message`, which were previously the only ways to get one. Defaults
+             to false — see spawn.rs for the per-sheep cost that default is protecting.
     ecosystem.rs     ← was lib/Common.js (parseConfig + file detection)
       Action: port + redesign
-      Notes: serde_json strict (NOT JS-eval — kills code-exec-on-parse), json5, serde_yml.
+      Notes: serde_json strict (NOT JS-eval — kills code-exec-on-parse), json5, serde-saphyr.
              .config.js/.cjs/.mjs → spawn `node -p JSON.stringify(require(p))` (documented:
              JS configs need node on PATH). Extension match by endsWith (fixes substring bug).
     normalize.rs     ← was lib/Common.js (prepareAppConf/verifyConfs/mergeEnvironmentVariables)
@@ -70,6 +74,13 @@ src/
       Notes: daemon-level config file (TOML): metrics on/off+port, webhook targets, alert
              thresholds, log policy. Layered: file < env < CLI flags (figment or hand-rolled).
              pm2 had nothing here — env-var soup only.
+      Log policy so far (Phase 5): `[daemon] log_level` (`SHEP_LOG_LEVEL`), a `LogLevel` of
+             exactly off/error/warn/info/debug/trace, lowercase and nothing else, defaulting to
+             `warn` — where the daemon's warn-and-continue arms live. A name outside the six is
+             a startup ERROR, never a silent fallback. `[daemon] log_json` (`SHEP_LOG_JSON`) had
+             been parsed and ignored since it was added; it now picks the renderer. Both are
+             read by shep-cli's `install_log_subscriber` (see main.rs, below) — this crate only
+             parses them.
     kv.rs            ← was lib/Configuration.js
       Action: port
       Notes: pm2 set/get/unset store; dotted/colon key parse w/ quotes, `all` wipe,
@@ -123,14 +134,66 @@ src/
              window, backoff ×1.5 cap 15s, stop_exit_codes. Instance expansion 0/-N→numCPUs.
              NODE_APP_INSTANCE slot algorithm + increment_var kept. _old_<id> string-key hack →
              explicit ReloadState enum on entry. executeApp 220-line pyramid → sequential async fn.
+      Log plane (Phase 5): the actor keeps a clone of every running sheep's `ProcIo::log_ctl`,
+             which is what lets `handle_reopen`/`handle_flush` reach a pump without a restart.
+             Neither awaits inside the actor loop — `spawn_reopen_task`/`spawn_flush_task` own
+             the awaits, because an actor parked on an acknowledgement stops draining its
+             mailbox, which stops the sheep task draining its logs, which stops the pump
+             answering. Every matched sheep is visited before anything is reported, so one
+             broken log directory neither stops the rest nor goes unreported
+             (`SupervisorError::ReopenFailed` / `FlushFailed`, `RpcErrorCode::Internal` on the
+             wire). A matched sheep with no live pump is a success for reopen (nothing to
+             reopen) and still flushable (a flush truncates PATHS).
+             Flush's barrier is drawn around the FILE, not the selection: `paths` is a
+             `BTreeSet<PathBuf>` of every matched sheep's recorded out/err file, and every pump
+             writing to one of those paths is flushed first — including a sheep the selector
+             skipped that shares a path under `merge_logs`, whose in-flight line would otherwise
+             be the one line surviving the emptying. Then each DISTINCT path is truncated once.
+             It is the RECORDED path that is truncated, never the inode the pump holds: after an
+             external rename those name different files, and chasing the handle would empty the
+             archive and leave the live log alone. A missing path is not a failure and is
+             deliberately not created.
   spawn.rs           ← was lib/God/ForkMode.js + ClusterMode.js (unified — ONE spawn path)
       Action: port + merge
+      Drift (Phase 3, recorded in Phase 5): shipped as a PAIR — `runner.rs` (portable: the
+             `ProcessRunner` seam, `ProcIo`, the log-control types, and the scripted fake that
+             makes the supervisor's tests deterministic) and `tokio_runner.rs` (unix: the real
+             `tokio::process` spawn, the log pump, `open_append`). A seam whose trait and whose
+             OS implementation share a file cannot compile without the OS half.
       Notes: tokio::process::Command, process_group(0), uid/gid via CommandExt, piped stdio +
-             extra IPC pipe fd (newline-JSON — carries 'shutdown', log:reload, process:*, axm:*;
-             keeps pm2-io shim compat). Cluster mode = N fork instances (Node cluster injection
-             dies — see reload.rs for the load-balancing story). Log pipeline: BufReader lines →
-             framing (raw/date-prefix/json) → broadcast + append files; /dev/null skip;
-             reopen-on-reload kept for logrotate.
+             the shepherd channel on fd 3 (a socketpair, newline-JSON both ways: `ChildMessage`
+             = ready/metric/action-reply up, `ShepherdMessage` = shutdown/action down; keeps a
+             future shim's compat). Opened when `assemble` sees
+             `channel || wait_ready || shutdown_with_message` and not otherwise: a socketpair
+             plus two pump tasks per sheep is real cost against spec §14.11's idle-RSS goal.
+             NOTE the channel does NOT carry a log:reload of pm2's kind — see the log plane
+             below, where the child is not a participant at all.
+             Cluster mode = N fork instances (Node cluster injection dies — see reload.rs for
+             the load-balancing story). Log pipeline: BufReader lines → broadcast + append
+             files. Framing (raw/date-prefix/json) and the /dev/null skip are still ahead.
+      Log plane (Phase 5): ONE `spawn_log_pump` task per SHEEP, not one per stream, so a single
+             request covers both files and answers once. `open_append` opens each `LogFile` with
+             `.append(true)` and that is load-bearing rather than a convenience: `O_APPEND` seeks
+             to end-of-file per write, which is the whole reason an external `copytruncate`
+             rotator works with no cooperation from shep — a handle carrying its own offset would
+             put the next line past a sparse hole the size of what was emptied. `open_append`
+             also creates any parent directory it needs at `boot::DIR_MODE` (0700), which is what
+             puts a log DIRECTORY back at that mode after a rotator moved it aside, and which is
+             also what an app whose `out_file` points outside the layout gets. The pump is the
+             only owner of that guarantee.
+             Reaching a live pump is `ProcIo::log_ctl`, an mpsc sender of `LogCtl`: `Reopen`
+             flushes, closes and re-opens both files (`create`-mode rotation); `Flush` lands what
+             is already in flight and KEEPS the handle (the half of `shep flush` that runs before
+             anything is truncated). Each answers on a oneshot carrying a Result —
+             `ReopenError`/`FlushError` name the paths — because an external rotator has to know
+             the swap happened before it compresses what it renamed, and a flag the pump would
+             notice "before its next write" promises nothing about a sheep that has gone quiet.
+             The CHILD is never involved and never notices: it holds a pipe, the daemon does the
+             file I/O on the far side, so no signal, no fd surgery and no restart is needed to
+             rotate or empty a sheep's logs. A pump ends when its `logs` receiver goes away as
+             readily as when its last control sender does — which is what retires the pump of a
+             sheep whose child forked a lamb and left it holding the pipe, where neither stream
+             ever reaches EOF.
   kill.rs            ← was lib/God/Methods.js (kill ladder) + lib/TreeKill.js
       Action: port semantics + rewrite mechanism
       Notes: ladder exact: SIGINT(configurable)/shutdown-msg → timeout(kill_timeout 1600ms) on
@@ -194,11 +257,26 @@ src/
              Resurrect (= muster) diff-by-name, spawn missing.
   rpc_server.rs      ← was lib/Daemon.js (RPC surface + boot)
       Action: port + redesign
+      Drift (Phase 3/5, recorded in Phase 5): split three ways — `boot.rs` (the ritual and the
+             signal handlers), `server.rs` (the unix socket and its per-connection tasks) and
+             `rpc.rs` (the portable dispatcher, which never touches a socket or a byte).
       Notes: boot ritual kept (pidfile, both-sockets-bound readiness handshake via pipe,
-             SIGTERM/INT/QUIT graceful dump+exit, SIGUSR2 reload logs). Per-conn task: read
-             frame → dispatch → reply. Peer-cred check (SO_PEERCRED/getpeereid) — pm2 had
-             NONE. Per-call deadlines default 5s. Drop: domain resurrection, $_ env hack,
-             inspector self-profiling.
+             SIGTERM/INT/QUIT graceful dump+exit). Per-conn task: read frame → dispatch →
+             reply. Peer-cred check (SO_PEERCRED/getpeereid) — pm2 had NONE. Per-call
+             deadlines default 5s. Drop: domain resurrection, $_ env hack, inspector
+             self-profiling.
+      SIGUSR2 = REOPEN, not reload (Phase 5): `boot::install_signals` installs it, and it means
+             exactly `shep reopen all` — a signal carries no selector, so `all` is the only
+             thing it can mean. Installing it is load-bearing on its own, since SIGUSR2's
+             default disposition is to terminate: an unhandled `kill -USR2` would kill the
+             shepherd rather than rotate it, so the handler goes in at boot step 1, before the
+             socket is bound. The supervisor it reopens through does not exist until step 4, so
+             `install_signals` returns a `oneshot::Sender<SupervisorHandle>` that `boot` sends
+             on once it has one; the listener parks on the receiver. The disposition is already
+             replaced when `install_signals` returns, so a SIGUSR2 raced into the step-1/step-4
+             gap is served LATE, never dropped. What the signal form gives up against the
+             socket form: no reply, so the result is logged and nothing can wait for the swap,
+             and no selector narrower than the whole flock.
   bus.rs             ← was God.bus (EventEmitter2) + axon pub/sub
       Action: rewrite
       Notes: tokio::sync::broadcast<BusEvent>; wire side: subscribe-with-topic-globs on connect,
@@ -276,7 +354,11 @@ src/
              Module-restart-only rule, --update-env immutability kept.
   events.rs          ← was API launchBus path
       Action: rewrite
-      Notes: subscribe(topic globs) → stream of BusEvent.
+      Notes: subscribe(topic globs) → stream of BusEvent. `EventStream::next` is an INHERENT
+             method, so pulling one event needs no `futures-util` in the consumer's own manifest
+             (pinned by a test that imports none); the `Stream` trait is re-exported from the
+             crate root for callers who need it nameable in a bound. Same one-dependency rule
+             lib.rs's shep_core re-export follows.
   lib.rs             re-exports shep_core (rand: one-dep consumers) + prelude module.
 ```
 
@@ -289,6 +371,21 @@ src/
       Notes: multi-call binary (argv[0] dispatch) + [[bin]] aliases pm2-runtime/pm2-dev.
              Hidden `daemon` subcommand = daemonization target. Lazy daemon connection
              (kills --no-daemon argv-scan + startup 100ms hacks).
+      The daemon's own diagnostics live HERE, not in shep-daemon (Phase 5 decision):
+             `commands/daemon.rs`'s `install_log_subscriber` is called by `run_daemon` and
+             deliberately NOT by `shep_daemon::boot`. A global subscriber installs once per
+             process; `boot` is called many times over by a single test binary, so a subscriber
+             inside it would fail every test after the first. `run_daemon` is called once, by
+             `main`, and the e2e tier reaches it as a subprocess — which is the only way to
+             exercise it. It writes to STDERR and names no file: a hand-run daemon logs to its
+             terminal, and a launched one logs to $SHEP_HOME/logs/shepd.err.log because
+             `launch.rs` already redirects that stream there. `[daemon] log_level`
+             (`SHEP_LOG_LEVEL`, default `warn`) picks the level and `[daemon] log_json`
+             (`SHEP_LOG_JSON`) picks the renderer. `RUST_LOG` is deliberately IGNORED — it would
+             be a second way to configure shep, competing with our own knob over one decision,
+             which is what the SHEP_ prefix rule exists to prevent. `NO_COLOR` is honoured, on
+             the opposite reasoning: it is a cross-ecosystem convention about the terminal
+             rather than a shep knob, so it is not ours to opt out of.
   commands/*.rs      ← was lib/binaries/CLI.js command definitions + lib/API/Extra.js keepers
       Action: port surface
       Notes: every command+flag from the trace enum; global opts via #[arg(global)];
@@ -316,8 +413,30 @@ src/
              usage pane (sysinfo), search/filter, OOB-selection crash fixed. One TUI, not two.
   logs.rs            ← was lib/API/Log.js + LogManagement.js
       Action: port + redesign
+      Drift (Phase 4/5, recorded in Phase 5): split by what the verb ACTS ON, not by its old
+             file. `commands/bleats.rs` READS a sheep's output (it is what `shep logs` aliases);
+             `commands/logs.rs` acts on the log FILES — `reopen` and `flush`, and nothing else.
       Notes: LogFormat enum {Pretty,Raw,Json,Logfmt}; reverse block reader for tail (lines×200-
-             bytes guess dies); flush truncate; printLogs/streamLogs 90-line copy-paste merged.
+             bytes guess dies); printLogs/streamLogs 90-line copy-paste merged.
+      Log-plane verbs (Phase 5): `shep reopen [selector]` — selector OPTIONAL, defaulting to
+             `all` like `bleats`, since it destroys nothing and rotating the whole flock at once
+             is the ordinary case; it is the half of `create`-mode rotation that runs after the
+             rotator's rename, and a zero exit is what a logrotate `postrotate` stanza waits on.
+             `shep flush <selector>` — selector REQUIRED, following `stop`/`restart`/`delete`:
+             this is the one verb whose slip of the finger cannot be undone, and `shep flush
+             all` is short to type when it is meant. Both send `LOG_PLANE_DEADLINE` (30s, from
+             shep-client) rather than the 5s default, because the daemon walks the matched flock
+             file by file with no per-sheep bound. Both render the matched sheep as the same
+             table `stop` and `restart` answer with — ONE ROW PER SHEEP, never per file emptied.
+             What `flush` empties is exactly the paths the Flockfile names, taken verbatim and
+             never checked against the log directory, for every registered sheep the selector
+             matches whether or not it ever ran. Out of reach by construction: the shepherd's
+             own shepd.out.log/shepd.err.log, which the CLI's launcher creates before the daemon
+             exists and the daemon inherits as plain fds 1 and 2 — it holds no handle to flush
+             and no recorded path to truncate, so restarting the shepherd is what empties those.
+      KNOWN DUPLICATION: `request_and_render` + `parse_selector` are a third per-module copy,
+             after `commands/lifecycle.rs`'s and `commands/query.rs`'s. Extraction is deferred,
+             not decided against.
   startup.rs         ← was lib/API/Startup.js + lib/templates/
       Action: port (reduced platforms)
       Notes: systemd (Type=notify + sd_notify — upgrade from Type=forking), launchd, openrc,
@@ -395,8 +514,8 @@ CI: fmt+clippy+nextest × {ubuntu,macos,windows} × {stable,MSRV}; llvm-cov; doc
 | eventemitter2 | tokio::sync::broadcast + typed enum | |
 | croner (JS) | croner (Rust, same lineage) | five-field subset only; croner's own `L`/`W`/`#`/`?` rejected |
 | dayjs | jiff/chrono + moment-token translator | log_date_format compat needs shim |
-| debug | tracing + EnvFilter (DEBUG=pm2:* mapped) | |
-| js-yaml | serde_yml | serde_yaml archived |
+| debug | tracing + tracing-subscriber + EnvFilter | no `DEBUG=pm2:*` mapping and no `RUST_LOG` — `[daemon] log_level`/`SHEP_LOG_LEVEL` is the one knob (decision 7) |
+| js-yaml | serde-saphyr | serde_yaml archived; serde_yml (its fork) swapped out for a pure-Rust parser that keeps `forbid(unsafe_code)` |
 | semver (node ranges) | node-semver crate | `^ ~ \|\|` ≠ cargo semver |
 | ws / proxy-agent / fast-json-patch / @pm2/js-api | — | die with SaaS agent |
 | amp / amp-message | tokio_util LengthDelimitedCodec | |

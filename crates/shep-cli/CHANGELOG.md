@@ -36,12 +36,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table those verbs exist to print.
 - Add the end-to-end test tier (`tests/cli_e2e.rs`): the real `shep` binary
   against a real daemon, a real socket, and real spawned sheep, each on a
-  fresh `$SHEP_HOME`. Covers autostart from cold, daemon reuse across
-  commands, the concurrent cold-start race, exit codes and stdout/stderr
-  stream discipline under `--format json`, `kill`'s socket teardown,
+  fresh `$SHEP_HOME`. Five groups of cases. **Daemon lifecycle**:
+  autostart from cold, daemon reuse across commands, the concurrent
+  cold-start race, `kill`'s socket teardown, and that an autostarted daemon
+  binds under the `--home` it was given rather than an ambient `$SHEP_HOME`.
+  **Output contract**: exit codes and stdout/stderr stream discipline under
+  `--format json`, and the committed fixtures below. **The log plane**:
   `bleats --no-follow` against real log files (both default and `--out`),
-  and that an autostarted daemon binds under the `--home` it was given
-  rather than an ambient `$SHEP_HOME`. Unix-only (`#![cfg(unix)]`): an
+  `reopen` after an external rename, an external `copytruncate` with no shep
+  verb involved at all, `flush` and its refusal to run without a selector, and
+  the two `[daemon]` log knobs deciding the renderer and the level of the
+  daemon's own records. **Restart triggers on their real clocks**: a write
+  under a watched tree and a dot-file write that must trigger nothing, a cron
+  occurrence, and a memory ceiling a process tree really crosses — the last
+  two on wall time, not a paused one, which is what makes them the slowest
+  cases in the workspace and the reason they are not `#[ignore]`d (an ignored
+  test closes no gap). **Config-time refusals and the readiness gate**: a bad
+  cron pattern and an `https://` probe target, each failing at parse rather
+  than three seconds into a sheep's life, and a `wait_ready` sheep that holds
+  at `starting` until it signals. Unix-only (`#![cfg(unix)]`): an
   integration test file is its own compilation unit, so without the gate
   `--all-targets` would build it — with its unix-only `nix` dev-dependency —
   on the Windows CI leg too.
@@ -72,10 +85,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NO_COLOR` is unset or empty — that one is a cross-ecosystem convention
   about the terminal rather than a shep knob, which is why it is honoured
   where `RUST_LOG` is deliberately ignored.
-  Fifty-one log sites in `shep-daemon` reached nobody before this: a watch
+  Every `tracing` record in `shep-daemon` reached nobody before this: a watch
   that could not be armed, a cron pattern that would not parse, and the
   observed RSS and ceiling behind a memory restart — the last of which no
-  bus event carries at all.
+  bus event carries at all. `shep-daemon`'s own changelog carries the count;
+  repeating it here is what let it go stale.
 - Add `shep reopen [selector]`, which tells the daemon to reopen the log
   files of the sheep the selector matches — the half of `create`-mode
   rotation that runs after the rotator's rename. A zero exit means every

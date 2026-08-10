@@ -108,16 +108,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second time, so the reported paths are by construction the ones the child
   is writing to — including when the app configured an explicit `out_file`
   pointing outside the log directory entirely.
-- This crate's fifty-one `tracing` records now reach a reader. Nothing here
-  changed and nothing here installs a subscriber — that belongs to the
-  binary, once per process, and a library that installed one would fail
-  every test after the first — but the `shep` binary now does, at `warn` by
-  default, so every warn-and-continue arm in this crate is output rather
-  than a comment claiming output. The arms worth knowing about: `extras`
-  reports a watch, a cron worker or a liveness probe it could not arm and
-  lets the sheep come up `online` regardless, and `supervisor`'s
-  `Actor::handle_ready_result` reports a readiness deadline that elapsed,
-  which is otherwise indistinguishable from a sheep that answered.
+- This crate's fifty-six `tracing` records now reach a reader. Nothing here
+  installs a subscriber — that belongs to the binary, once per process, and a
+  library that installed one would fail every test after the first — but the
+  `shep` binary now does, at `warn` by default, so every warn-and-continue arm
+  in this crate is output rather than a comment claiming output. The arms
+  worth knowing about: `extras` reports a watch, a cron worker or a liveness
+  probe it could not arm and lets the sheep come up `online` regardless;
+  `supervisor`'s `Actor::handle_ready_result` reports a readiness deadline
+  that elapsed, which is otherwise indistinguishable from a sheep that
+  answered; and `boot`'s SIGUSR2 listener reports what a signal-driven reopen
+  did, a signal having no reply channel to report it through. The count lives
+  here and nowhere else: a copy of it in another crate's changelog goes stale
+  on this crate's next commit, which is what happened to the one it replaces.
 - Add `runner::LogCtl`, the request type a sheep's log pump takes mid-flight,
   and the first way anything has been able to reach the file handle that pump
   writes to. `Reopen` makes the pump flush, close and
