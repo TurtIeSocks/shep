@@ -1,7 +1,8 @@
 //! Portable RPC dispatch: verb routing, typed errors, per-call deadlines
 //!
-//! `dispatch` is the one function the connection layer (Task 5's unix
-//! socket / named-pipe server) calls per request envelope. Everything here
+//! `dispatch` is the one function the connection layer (the unix-socket /
+//! named-pipe server in this crate's private `server` module) calls per
+//! request envelope. Everything here
 //! compiles and tests on every platform — no `cfg(unix)`, no sockets, no
 //! bytes on a wire. [`RpcContext`] bundles the daemon-wide handles a request
 //! handler may touch; `Outcome` tells the caller what to do next (reply,

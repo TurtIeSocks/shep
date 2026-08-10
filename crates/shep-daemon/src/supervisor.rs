@@ -4060,7 +4060,8 @@ mod tests {
         app.exp_backoff_restart_delay = Some("100".parse().unwrap());
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Park on the event stream; auto-advance drives through all pending
-        // backoff delays (pinned Task 4 sequence). The budget check itself
+        // backoff delays, which the `exp_backoff_restart_delay` above pins to
+        // one fixed sequence rather than the default's. The budget check itself
         // (spec §4: reaching max_restarts=16 unstable exits errors) fires on
         // the 16th exit, using the script's 16th and final entry — the
         // script is exactly, not incidentally, exhausted at that point.
@@ -4837,7 +4838,7 @@ mod tests {
         );
     }
 
-    // Adversarial finding #2 (whole-branch review, Task 9): a `Delete` that
+    // Adversarial finding from a whole-branch review: a `Delete` that
     // lands on an id AFTER `begin_shutdown` already claimed it (set
     // `manual = Some(Stop)`, first-command-wins per IMPORTANT-4) used to hit
     // `claim_manual`'s already-claimed path and only join `remaining`
@@ -4856,9 +4857,9 @@ mod tests {
     // the LAST thing Shutdown is waiting on too, and resolving it would
     // synchronously complete Shutdown and close the actor's mailbox in the
     // same poll -- leaving no window in which `list()` could ever observe
-    // anything (a real trap in the brief's original single-sheep sketch of
-    // this test: `handle.list()` after `shutter.await` always hit `EngineStopped`,
-    // whether or not the fix was applied).
+    // anything. That is a real trap, not a hypothetical one: the single-sheep
+    // version of this case had `handle.list()` after `shutter.await` always
+    // hit `EngineStopped`, whether or not the fix was applied.
     #[tokio::test(start_paused = true)]
     async fn delete_racing_shutdown_still_deregisters_the_sheep() {
         let (events, _rx) = tokio::sync::broadcast::channel(1024);
@@ -4902,7 +4903,7 @@ mod tests {
         drop(shutter);
     }
 
-    // Fix-round regression (reviewer finding, Task 9): a Delete racing a
+    // Regression for a reviewer's finding: a Delete racing a
     // RESTART, not a Shutdown. `handle_exited`'s manual-Restart branch is
     // the ONE path that resolves an exit without ever consulting
     // `decide_on_exit` -- every other path reaches the
@@ -7453,7 +7454,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // IR-37: supervisor proptest (Task 9, Step 2). A command script (what
+    // IR-37: supervisor proptest. A command script (what
     // the operator does) and a process script (how each spawned child
     // behaves) are generated independently; their interleaving emerges from
     // the runtime itself instead of being hand-derived. Invariants are read
@@ -7599,9 +7600,9 @@ mod tests {
     const EVENT_BUDGET: usize = 3 * SCRIPT_POOL;
 
     proptest::proptest! {
-        // 128, not the 24 originally sketched for this task: an injected-bug
+        // 128, and the number is measured rather than picked: an injected-bug
         // trial (a Delete on an already-terminal sheep that forgets to
-        // deregister -- see the task report) minimizes to the 3-step
+        // deregister) minimizes to the 3-step
         // sequence `[StartOne, StopAll, DeleteFirst]`, which only 4 of the 5
         // equally-weighted `Step` variants touch, so a run needs a handful
         // of lucky draws to land it. Empirically that meant occasional
