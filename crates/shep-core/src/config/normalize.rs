@@ -608,9 +608,9 @@ mod tests {
         // floor. A 500ms interval survives an equality check and is then
         // rounded UP to a full second by `spawn_liveness_task`'s own
         // `MIN_PROBE_INTERVAL` — an app polled at half the rate its
-        // Flockfile asks for, with nothing anywhere to say so (this
-        // workspace wires no `tracing-subscriber`, so the daemon's log would
-        // not say so either). Also fails if the rejection drops the value
+        // Flockfile asks for, with nothing anywhere to say so: that clamp
+        // writes no record at all, so not even the daemon's own log names
+        // it. Also fails if the rejection drops the value
         // the user wrote, which is the one number that tells them what to
         // edit.
         let mut app = AppConfig::minimal("web", "./srv");

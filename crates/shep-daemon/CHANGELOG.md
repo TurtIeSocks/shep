@@ -108,6 +108,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second time, so the reported paths are by construction the ones the child
   is writing to — including when the app configured an explicit `out_file`
   pointing outside the log directory entirely.
+- This crate's fifty-one `tracing` records now reach a reader. Nothing here
+  changed and nothing here installs a subscriber — that belongs to the
+  binary, once per process, and a library that installed one would fail
+  every test after the first — but the `shep` binary now does, at `warn` by
+  default, so every warn-and-continue arm in this crate is output rather
+  than a comment claiming output. The arms worth knowing about: `extras`
+  reports a watch, a cron worker or a liveness probe it could not arm and
+  lets the sheep come up `online` regardless, and `probes` reports a
+  readiness deadline that elapsed, which is otherwise indistinguishable
+  from a sheep that answered.
 
 ### Fixes
 
@@ -174,9 +184,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `online` need to poll instead.
 
   On `listen_timeout` elapsing without a signal, the sheep goes `online`
-  anyway, and silently: the daemon logs a warning, but no `tracing-subscriber`
-  is wired yet, so nothing renders it and a `starting` that ran long is
-  indistinguishable from one that answered. Treating a slow start as a spawn
+  anyway: the daemon logs a warning, and that warning is the only thing
+  telling a `starting` that ran long from one that answered — the status and
+  the bus event are the same either way. Treating a slow start as a spawn
   failure would produce exactly the restart loop `max_restarts` exists to
   contain, out of an app that is slow rather than broken.
 - `BootOptions` gains a `max_cron_sleep: Option<Duration>` field, carrying

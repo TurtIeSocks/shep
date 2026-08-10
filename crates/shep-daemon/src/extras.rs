@@ -136,10 +136,11 @@ impl fmt::Debug for Extras {
 ///
 /// Both arms write a `warn!` on the way past, and for a breach that record is
 /// the ONLY place the observed RSS and the limit it crossed are ever stated —
-/// the bus event says `restart` and never why. Today it states them to nobody:
-/// this workspace wires no `tracing-subscriber`, so the daemon's log file is
-/// empty after a full run. Until one is wired, a user watching a process get
-/// restarted over and over has nothing anywhere telling them it is memory.
+/// the bus event says `restart` and never why. Both reach a reader: the
+/// binary installs a subscriber whose default level is `warn`, so a user
+/// watching a process get restarted over and over finds the reason in
+/// `$SHEP_HOME/logs/shepd.err.log`. `[daemon] log_level = "error"` is what
+/// takes that away again.
 ///
 /// Must be called from within a Tokio runtime context: it spawns the
 /// reporting task immediately.
@@ -456,10 +457,9 @@ fn arm_instance(
                 // that reached the daemon cannot land here — swallowed instead
                 // of `expect`-ed so a future path that skips normalization
                 // costs one app its liveness probe rather than the daemon.
-                // "Swallowed" is the honest word: the `warn!` below reaches
-                // nobody while this workspace wires no `tracing-subscriber`,
-                // so the app comes up online with no liveness probe and no
-                // visible sign that it asked for one.
+                // The `warn!` below is the whole of the visible sign: the app
+                // still comes up online with no liveness probe, and nothing
+                // in its status or on the bus says it ever asked for one.
                 tracing::warn!(
                     id = entry.id,
                     name = config.name.as_str(),
@@ -475,9 +475,9 @@ fn arm_instance(
 /// Spawns the name-group's cron worker, or `None` when the app configures no
 /// `cron_restart` (or names a pattern that will not parse).
 ///
-/// An unparseable pattern costs the app its schedule silently: the `warn!`
-/// below reaches nobody while this workspace wires no `tracing-subscriber`,
-/// and nothing else records that a `cron_restart` was asked for and dropped.
+/// An unparseable pattern costs the app its schedule, and the `warn!` below is
+/// the only record that a `cron_restart` was asked for and dropped — the app
+/// comes up `online` either way, and no status or bus event carries it.
 fn arm_cron(
     config: &AppConfig,
     extras: &Extras,
@@ -512,10 +512,11 @@ fn arm_cron(
 ///
 /// Every failure here arms no watch rather than propagating: a watch root that
 /// will not resolve must not take down the same app's cron worker, enforcer
-/// and probe. Each one writes a `warn!` on the way out, and nothing subscribes
-/// to those records yet, so the observable outcome is an app that comes up
-/// `online` with no watch and no signal at all. Read the `warn!`s below as the
-/// failure being *swallowed*, not as it being reported.
+/// and probe. Each one writes a `warn!` on the way out, and that record is the
+/// entire signal: the app comes up `online` with no watch, and neither its
+/// status nor the bus says a watch was ever asked for. See
+/// `a_watch_root_that_will_not_resolve_says_in_the_log_which_app_lost_its_watch`
+/// for the arm that is pinned as a contract rather than a promise.
 ///
 /// Takes the whole [`ProcessEntry`] rather than its config because the
 /// assembled `out_file`/`err_file` are what `own_log_ignores` needs, and the
@@ -627,7 +628,7 @@ mod tests {
     use crate::supervisor::spawn_supervisor;
     use crate::testing::{
         ArmCall, Harness, RecordingEnforcer, ScriptedProber, ScriptedSampler, TestClock, app_with,
-        armed_entry, harness, harness_with_extras, probe_config, test_paths, touch,
+        armed_entry, capture_logs, harness, harness_with_extras, probe_config, test_paths, touch,
     };
     use crate::watch::real_time;
     use shep_core::config::{ProbeConfig, ProbeKind};
@@ -1100,6 +1101,56 @@ mod tests {
         assert!(
             group.cron.is_some(),
             "an unresolvable watch root must not cost this app its cron worker too"
+        );
+    }
+
+    // `arm_watch` arms nothing on every failure and lets the sheep go `online`
+    // regardless, so its `warn!` is the ENTIRE observable difference between
+    // an app that is being watched and one that asked to be and is not. The
+    // case above pins that the watch is absent; this one pins that the daemon
+    // says so, which is the half an operator can actually act on.
+    //
+    // The app's name is deliberately unlike anything else in the record — the
+    // message, the target and the rendered `io::Error` all lack it — so
+    // `name="unwatchable"` can only have come from the field.
+    //
+    // fails if the unresolvable-root arm stops writing its record (the app
+    // comes back to being unwatched in silence), and fails if the record drops
+    // the `name` field, which on a flock of twelve is the difference between a
+    // fault an operator can fix and one they can only observe.
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_root_that_will_not_resolve_says_in_the_log_which_app_lost_its_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("unwatchable", |app| {
+            app.watch = true;
+            app.cwd = Some(root.path().join("no-such-directory").display().to_string());
+        });
+        let entry = armed_entry(0, 0, 1000, app, &paths);
+
+        let records = capture_logs(|| {
+            registry.arm(&entry, idle_prober(), &rig.extras, &handle);
+        });
+
+        assert!(
+            registry.groups["unwatchable"].watch.is_none(),
+            "precondition: the watch root cannot have resolved"
+        );
+        assert!(
+            records.contains("watch root could not be resolved"),
+            "arming no watch must be reported, not swallowed: {records:?}"
+        );
+        assert!(
+            records.contains("WARN"),
+            "an app silently losing its watch is a warning, not a debug detail: {records:?}"
+        );
+        assert!(
+            records.contains(r#"name="unwatchable""#),
+            "the record must name the app that lost its watch: {records:?}"
         );
     }
 

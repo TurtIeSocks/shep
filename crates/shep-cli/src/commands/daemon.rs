@@ -6,11 +6,14 @@
 //! `shep.toml`, boots `shep_daemon::boot`'s supervisor, and blocks in
 //! `RunningDaemon::run` until a signal or `KillDaemon` tears it down.
 
+use std::io::IsTerminal;
+
 use shep_core::config::{DaemonConfig, DaemonConfigError};
 use shep_core::paths::ShepPaths;
 use shep_core::values::UpDuration;
 use shep_daemon::boot::{BootError, BootOptions, boot};
 use shep_daemon::tokio_runner::TokioRunner;
+use tracing_subscriber::EnvFilter;
 
 use crate::cli::DaemonArgs;
 use crate::exit::ExitCode;
@@ -85,15 +88,69 @@ fn read_daemon_config_source(paths: &ShepPaths) -> Result<Option<String>, Daemon
     }
 }
 
+/// Installs the subscriber that renders the daemon's own records, for the
+/// remaining life of this process.
+///
+/// Everything the daemon has to say about itself — a watch that could not be
+/// registered, a cron pattern that would not parse, the observed RSS behind a
+/// memory restart — goes through `tracing`, and a `tracing` record with no
+/// subscriber is discarded where it is written. This is the only install site
+/// in the workspace.
+///
+/// The sink is **stderr**, never a file this function opens: `launch.rs`
+/// already redirects the re-exec'd daemon's stderr into
+/// `$SHEP_HOME/logs/shepd.err.log`, so naming a file here would duplicate the
+/// launcher's job and diverge the moment a daemon is run by hand — where the
+/// parent's terminal is exactly where its records belong. Colour follows the
+/// sink for the same reason: escape codes are noise in `shepd.err.log` and
+/// what a terminal is for.
+///
+/// Records are written from tokio worker threads, so `main::run`'s `daemon`
+/// arm must not be holding a `stderr().lock()` guard while this process runs.
+/// Its own comment carries why, and what happens when it does.
+///
+/// `EnvFilter::new` documents a panic on an unparseable directive and cannot
+/// reach it here — its input is [`LogLevel::as_str`], a closed set of six
+/// literals, each of them a valid directive on its own.
+///
+/// A failed install is reported on the same stderr rather than failing the
+/// boot. It means a subscriber is already installed, which the shipped binary
+/// cannot do: `main` reaches [`run_daemon`] once per process and nothing else
+/// installs one. A supervisor that refused to supervise because its
+/// diagnostics could not be wired would be the worse of the two outcomes.
+///
+/// [`LogLevel::as_str`]: shep_core::config::LogLevel::as_str
+fn install_log_subscriber(config: &DaemonConfig) {
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(config.daemon.log_level.as_str()))
+        .with_writer(std::io::stderr);
+    let installed = if config.daemon.log_json {
+        builder.json().try_init()
+    } else {
+        builder
+            .with_ansi(std::io::stderr().is_terminal())
+            .try_init()
+    };
+    if let Err(err) = installed {
+        eprintln!("shep: the daemon's own logs are not being rendered: {err}");
+    }
+}
+
 /// Runs the supervisor in this process until a signal or `KillDaemon`.
 ///
 /// Loads `shep.toml` (a missing file is not an error — see
-/// [`read_daemon_config_source`]) plus `SHEP_*` environment overrides, folds
-/// `args` in via [`boot_options`], then boots and serves. The re-exec'd
-/// child inherits a real environment on purpose (`launch::launch_command`
-/// deliberately does not `.env_clear()`), so `SHEP_LOG_JSON`,
-/// `SHEP_SOCKET`, and `SHEP_MAX_CRON_SLEEP` are read straight from
-/// `std::env::var`.
+/// [`read_daemon_config_source`]) plus `SHEP_*` environment overrides, installs
+/// the log subscriber those two knobs configure (see
+/// [`install_log_subscriber`]), folds `args` in via [`boot_options`], then
+/// boots and serves. The re-exec'd child inherits a real environment on
+/// purpose (`launch::launch_command` deliberately does not `.env_clear()`), so
+/// `SHEP_LOG_JSON`, `SHEP_LOG_LEVEL`, `SHEP_SOCKET`, and
+/// `SHEP_MAX_CRON_SLEEP` are read straight from `std::env::var`.
+///
+/// The subscriber goes in *here* and never in `shep_daemon::boot`: a global
+/// subscriber can be installed once per process, and `boot` is called many
+/// times over by one test binary. This function is called once, by `main`, and
+/// the e2e tier reaches it as a subprocess.
 ///
 /// # Errors
 /// - [`DaemonRunError::Config`] — `shep.toml` failed to parse, or a
@@ -108,6 +165,7 @@ pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), Daemo
     let file_source = read_daemon_config_source(&paths)?;
     let config =
         DaemonConfig::load(file_source.as_deref(), &env).map_err(DaemonRunError::Config)?;
+    install_log_subscriber(&config);
     let options = boot_options(&config, args);
     boot(TokioRunner::new(), paths, options)
         .await

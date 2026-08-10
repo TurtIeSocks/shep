@@ -87,6 +87,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PROTOCOL_VERSION` stays 1: the fields are additive, they decode to `None`
   from pre-existing bytes (pinned by a committed byte fixture), and a peer
   that predates them ignores them.
+- Add `[daemon] log_level`, overridable by `SHEP_LOG_LEVEL`, deciding how
+  much of the daemon's own diagnostics is rendered. Its type is the new
+  `LogLevel` — `off`, `error`, `warn`, `info`, `debug`, `trace`, lowercase
+  and nothing else — and the default is `warn`, which is where the daemon's
+  warn-and-continue arms live: a watch it could not arm, a cron pattern it
+  could not parse, a memory ceiling a process tree crossed. `debug` fires
+  per dropped restart and per child metric sample, so it is a firehose on a
+  busy flock rather than a slightly noisier log. A name outside the six is a
+  startup error (`DaemonConfigError::Toml` from the file,
+  `DaemonConfigError::BadEnvValue` from the environment), never a silent
+  fallback to the default. `DaemonSection` gains the field, so a struct
+  literal naming every field must name this one too; `..Default::default()`
+  is unaffected.
 
 ### Fixes
 

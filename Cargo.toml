@@ -95,6 +95,18 @@ tracing = { version = "0.1", default-features = false, features = ["std", "attri
 # (a Phase 2a call site, also caught by Task 2's minimal-versions rehearsal). Missing in
 # 0.1.26/0.1.27; present from 0.1.28.
 tracing-core = { version = "0.1.28", default-features = false }
+# Option: the daemon's own diagnostics. `env-filter` costs exactly one crate
+# (matchers) and `json` exactly one (tracing-serde); the rest of the tree is
+# already present via regex/globset/serde. The default `tracing-log` bridge is
+# dropped because nothing here uses the `log` crate.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json"] }
+# Transitive floor pin: `sharded-slab` (tracing-subscriber's span registry) imports
+# `lazy_static!` by path — `use lazy_static::lazy_static;` — while declaring only
+# `lazy_static = "1"`. That expansion names `__lazy_static_internal`, which a path import
+# can only resolve once the macro is exported `#[macro_export(local_inner_macros)]`. 1.0.0
+# and 1.0.1 export it plainly and fail with `cannot find macro __lazy_static_internal in
+# this scope`; present from 1.0.2.
+lazy_static = { version = "1.0.2", default-features = false }
 # Our `insta::assert_json_snapshot!` calls in shep-core (protocol::request,
 # protocol::events) snapshot newtype/tuple enum variants (the Result-shaped reply
 # payload); 1.18.0 has a JSON-serialization regression with exactly that shape, fixed

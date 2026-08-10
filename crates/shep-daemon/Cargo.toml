@@ -72,6 +72,12 @@ fsevent-sys.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 proptest.workspace = true
+# The scoped, per-test subscriber `testing::capture_logs` installs, so a
+# warn-and-continue arm's record is something a test can assert on instead of
+# something that vanishes at the macro. Dev-only: the daemon library installs
+# no subscriber of its own — `shep-cli`'s `daemon` subcommand owns the one
+# global install.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

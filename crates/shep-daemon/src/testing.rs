@@ -49,6 +49,90 @@ use crate::supervisor::SupervisorBuilder;
 // will not hand back while lower numbers remain free. See
 // `a_closed_descriptor_is_refused_instead_of_adopted`.
 
+// The daemon's warn-and-continue arms — a watch that could not be armed, a
+// cron pattern that would not parse — leave no trace anywhere but their own
+// `tracing` record. `capture_logs` is what turns that record into something a
+// test can assert on, so "it warns and carries on" stops being a claim in a
+// doc comment and becomes a contract.
+//
+// A hand-rolled `MakeWriter` over one shared buffer (IR-33), not
+// `fmt::layer().with_test_writer()`: the test writer hands the output to
+// libtest's capture, where it is hidden from the terminal AND from the test
+// itself, and reading it back is the entire point here.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl LogCapture {
+    /// Everything rendered into this capture so far, as one string.
+    fn rendered(&self) -> String {
+        let buffer = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Runs `f` with a subscriber scoped to THIS thread, returning everything the
+/// records it wrote rendered to.
+///
+/// Scoped (`tracing::subscriber::with_default`) rather than global: a global
+/// subscriber can be installed once per process, and this crate's test binary
+/// runs hundreds of tests in one. `f` must therefore be synchronous and stay
+/// on this thread — a record written by a `tokio::spawn`ed task is NOT
+/// captured, because a spawned task carries no thread-local dispatcher.
+///
+/// ANSI is off so an assertion matches the text and not the escape codes
+/// around it, and the level is `TRACE` so nothing under test is filtered out
+/// by the harness itself.
+pub(crate) fn capture_logs(f: impl FnOnce()) -> String {
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        // `tracing` caches each callsite's `Interest` process-wide the first
+        // time that line of code is reached, and a SCOPED subscriber does not
+        // invalidate it (`tracing_core::dispatcher::set_default` bumps a
+        // counter and stops there). So whichever test in this binary reaches a
+        // `warn!` first decides for every test after it: reached with no
+        // subscriber anywhere, the callsite caches `Interest::never()` and
+        // stays disabled, and this capture comes back empty no matter what is
+        // installed here.
+        //
+        // That is not theoretical. This harness's first case passed alone and
+        // failed under `--workspace` (2026-08-09), because a sibling test
+        // exercising the same `arm_watch` failure arm happened to run first.
+        //
+        // The rebuild re-registers every callsite against the dispatcher this
+        // thread can currently see, which inside this scope is the one above.
+        tracing::callsite::rebuild_interest_cache();
+        f();
+    });
+    capture.rendered()
+}
+
 // WHY a shallow home: later tasks bind a UDS under `run/`, and sun_path
 // caps a socket path near 104 bytes. Using the tempdir root as
 // $SHEP_HOME (no extra nesting) keeps every test in this crate under the

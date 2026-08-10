@@ -61,6 +61,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (Task 12's end-to-end tier proves this against two real, genuinely
   concurrent invocations). Changing either side without the other
   reintroduces the race — `exit.rs`'s own test pins the two constants equal.
+- Render the daemon's own diagnostics. The hidden `daemon` subcommand now
+  installs a `tracing-subscriber` on **stderr**, which `launch.rs` already
+  redirects into `$SHEP_HOME/logs/shepd.err.log` — so a hand-run daemon logs
+  to the terminal it was run from, and a launched one logs to that file,
+  without either path naming a file here. `[daemon] log_level`
+  (`SHEP_LOG_LEVEL`) picks the level, default `warn`; the long-parsed
+  `[daemon] log_json` (`SHEP_LOG_JSON`) finally does something and switches
+  the renderer to JSON lines. Colour is on only when stderr is a terminal.
+  Fifty-one log sites in `shep-daemon` reached nobody before this: a watch
+  that could not be armed, a cron pattern that would not parse, and the
+  observed RSS and ceiling behind a memory restart — the last of which no
+  bus event carries at all.
 
 ### Fixes
 

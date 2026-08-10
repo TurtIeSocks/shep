@@ -179,9 +179,9 @@ src/
                      spawn (the Heuristic source is reload's, not start's). A readiness TIMEOUT
                      takes the sheep online SILENTLY — never `errored`, which would be the
                      restart loop max_restarts exists to contain, out of an app that is merely
-                     slow. `Actor::handle_ready_result` does emit a `tracing::warn!` on that path,
-                     but no `tracing-subscriber` is wired anywhere in the workspace yet, so
-                     nothing renders it and the operator sees only the `online` transition.
+                     slow. `Actor::handle_ready_result` emits a `tracing::warn!` on that path,
+                     which shep-cli's `install_log_subscriber` renders into shepd.err.log at the
+                     default `warn` level; the bus still shows only the `online` transition.
   actions.rs         ← was lib/God/ActionMethods.js
       Action: port + redesign
       Notes: each RPC verb = async handler on Request enum arm (string dispatch dies).

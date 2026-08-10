@@ -1776,13 +1776,20 @@ fn a_cron_occurrence_restarts_a_sheep_on_the_real_clock() {
 /// after it, and the cron case above has never been observed finishing
 /// sooner, so it has yet to be what any run of this file waited on.
 ///
+/// It is also the only case that reads the daemon's own log. Nothing else in
+/// the workspace exercises the whole chain from a `tracing::warn!` in
+/// `shep-daemon` to a line in `$SHEP_HOME/logs/shepd.err.log`, and the breach
+/// record is the natural one to read: it is written on this very restart, and
+/// it carries the observed RSS and the ceiling, which no bus event does.
+///
 /// What a broken implementation this would catch: a `SysinfoSampler` that
 /// stopped reading the real process table; an `arm_instance` that never
 /// reached the real enforcer from the real `Online` transition; a breach that
 /// reached the reporter and was logged rather than restarted; an enforcer
 /// armed against the sheep's id where its pid belongs, which
 /// `extra_restart`'s own pid guard would then silently drop for the whole
-/// life of the daemon.
+/// life of the daemon; and a daemon that renders none of its own records,
+/// because no subscriber was installed or its sink was not stderr.
 // fails if `SysinfoSampler::sample` stops reading the machine's process table
 // — verified by replacing its body with `Vec::new()`, which reddens this case
 // plus two unit tests: the sampler's own smoke test, and `extras`'
@@ -1838,6 +1845,37 @@ fn a_real_memory_breach_restarts_a_sheep() {
         0,
         "the same script with no max_memory must not have moved: a restart both sheep \
          share is the script dying, not its ceiling being enforced: {after}"
+    );
+
+    // The daemon's own log, end to end: `commands::daemon` installs the
+    // subscriber on stderr, `launch.rs` redirects the re-exec'd daemon's
+    // stderr into this file, and the breach record is the ONLY place the
+    // observed RSS and the ceiling it crossed are ever stated — the bus event
+    // says `restart` and never why.
+    //
+    // Read rather than polled: `spawn_extras_reporter` writes the record
+    // BEFORE it asks for the restart, so the counter above reaching 1 has
+    // already ordered the write ahead of this read.
+    //
+    // fails if no subscriber is installed at all — a user watching a sheep
+    // restart over and over then has nothing, anywhere, telling them it is
+    // memory — and fails if the daemon's records stop going to stderr, which
+    // is the one sink `launch.rs` captures.
+    //
+    // It also fails if `main::run`'s `daemon` arm goes back to holding a
+    // `stderr().lock()` guard for the daemon's whole life. That guard makes
+    // this very record block forever on a worker thread and wedges the
+    // daemon, which this case sees as the *next* `shep flock` failing its
+    // handshake rather than as an empty file — the wedge is what turned an
+    // empty log into a dead supervisor.
+    let daemon_log = std::fs::read_to_string(home.join("logs").join("shepd.err.log")).unwrap();
+    assert!(
+        daemon_log.contains("exceeded its max_memory"),
+        "the daemon's own log must say why the sheep was restarted: {daemon_log:?}"
+    );
+    assert!(
+        daemon_log.contains("limit="),
+        "the record must carry the ceiling that was crossed: {daemon_log:?}"
     );
 
     graceful_kill(home);
