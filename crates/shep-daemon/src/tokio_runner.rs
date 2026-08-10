@@ -351,6 +351,38 @@ impl LogFile {
     }
 }
 
+/// Both of a sheep's log files — the pair one [`LogCtl::Reopen`] swaps.
+#[derive(Debug)]
+struct LogFiles {
+    out: LogFile,
+    err: LogFile,
+}
+
+impl LogFiles {
+    /// The file a line from this stream is appended to (`err` picks stderr).
+    fn stream(&mut self, err: bool) -> &mut LogFile {
+        if err { &mut self.err } else { &mut self.out }
+    }
+
+    /// Carries out one control request and then answers it.
+    ///
+    /// The acknowledgement is the last statement by construction, after BOTH
+    /// reopens: a caller that has heard back knows both handles were
+    /// swapped, which is what a rotator that renamed both files is waiting
+    /// on. One request, one answer — nothing here can send twice.
+    async fn serve(&mut self, ctl: LogCtl) {
+        match ctl {
+            LogCtl::Reopen { done } => {
+                self.out.reopen().await;
+                self.err.reopen().await;
+                // A caller that stopped waiting is not a failure: the reopen
+                // happened either way.
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
 /// What the pump does after handling one line result.
 enum AfterLine {
     /// The stream is live; keep reading it.
@@ -361,26 +393,70 @@ enum AfterLine {
     LogsClosed,
 }
 
-/// Handles one line read from a stream: appends it to that stream's `file`,
+/// Handles one line read from a stream: appends it to that stream's file,
 /// forwards it on `logs_tx`, and reports what the pump should do next.
+///
+/// The wait for room on `logs_tx` keeps serving `ctl_rx` — see
+/// [`reserve_slot`] for the cycle that would otherwise close.
 async fn deliver_line(
     result: io::Result<Option<String>>,
     err: bool,
-    file: &mut LogFile,
+    files: &mut LogFiles,
     logs_tx: &mpsc::Sender<LogLine>,
+    ctl_rx: &mut mpsc::Receiver<LogCtl>,
 ) -> AfterLine {
     match result {
         Ok(Some(line)) => {
-            file.append(&line).await;
-            if logs_tx.send(LogLine { err, line }).await.is_err() {
+            files.stream(err).append(&line).await;
+            let Some(slot) = reserve_slot(logs_tx, files, ctl_rx).await else {
                 return AfterLine::LogsClosed;
-            }
+            };
+            slot.send(LogLine { err, line });
             AfterLine::KeepReading
         }
         Ok(None) => AfterLine::StreamEnded, // normally the child exiting
         Err(error) => {
-            tracing::error!(path = ?file.path, %error, "log stream read failed");
+            tracing::error!(path = ?files.stream(err).path, %error, "log stream read failed");
             AfterLine::StreamEnded
+        }
+    }
+}
+
+/// Waits for room on `logs_tx`, serving control requests while it waits.
+///
+/// Returns `None` once the `logs` receiver is gone.
+///
+/// # Why not a bare `send().await`
+///
+/// A `select!` handler is not cancellable, so anything awaited inside one
+/// stops the pump polling its control channel for as long as the await
+/// lasts. A wait for room on `logs` is unbounded, and the party that makes
+/// that room is the sheep task — the same party a reopen's acknowledgement
+/// travels back to. Sending from inside the handler therefore lets a full
+/// `logs` channel close a cycle: nothing drains `logs` until the sheep task
+/// runs, the sheep task waits on the acknowledgement, and the pump cannot
+/// look at the request that would produce it. Serving control requests from
+/// inside the wait breaks that cycle by construction rather than by timing.
+async fn reserve_slot<'tx>(
+    logs_tx: &'tx mpsc::Sender<LogLine>,
+    files: &mut LogFiles,
+    ctl_rx: &mut mpsc::Receiver<LogCtl>,
+) -> Option<mpsc::Permit<'tx, LogLine>> {
+    loop {
+        // Both branches are documented cancel-safe, as `select!` requires: a
+        // `reserve` that loses the race has taken no slot, and a `recv` that
+        // loses it has taken no message.
+        tokio::select! {
+            slot = logs_tx.reserve() => return slot.ok(),
+            ctl = ctl_rx.recv() => match ctl {
+                Some(ctl) => files.serve(ctl).await,
+                // Nothing can reach the pump any more, but the line in hand
+                // is still owed to the receiver. Waiting for it outside the
+                // `select!` rather than looping avoids spinning on a closed
+                // receiver, which is ready on every poll; the pump's own
+                // loop then sees the same closed channel and ends.
+                None => return logs_tx.reserve().await.ok(),
+            },
         }
     }
 }
@@ -412,9 +488,23 @@ where
 ///
 /// Every line is appended to its stream's file (parent directories created
 /// as needed) and then forwarded on `logs_tx`. A [`LogCtl`] message is
-/// served between lines — and, the point of the `select!`, while no line is
-/// flowing at all: a sheep that has been quiet for hours reopens exactly as
-/// promptly as a chatty one.
+/// served between lines; while no line is flowing at all, which is the point
+/// of the `select!`, since a sheep that has been quiet for hours has no next
+/// line for a request to ride along with; and while the pump is waiting for
+/// room on `logs_tx`, which is [`reserve_slot`]'s reason for existing.
+///
+/// # What still bounds a reopen
+///
+/// Not the party draining `logs`, deliberately — that is the cycle
+/// [`reserve_slot`] exists to rule out. What does bound it is the pump's own
+/// file I/O, because a request is only looked at between awaits: a reopen
+/// waits behind the line append in flight, and behind any earlier reopen's
+/// `create_dir_all` and `open`. Those are the same syscalls every spawn
+/// already trusts, but a reopen repeats them mid-flight and on demand, and
+/// it runs them while the pump is reading neither pipe. On a wedged
+/// filesystem that stalls the acknowledgement, and the child's stdout and
+/// stderr with it, for as long as the kernel takes; neither side has a
+/// timeout.
 ///
 /// # Why the reopen never disturbs the child
 ///
@@ -460,22 +550,24 @@ fn spawn_log_pump<O, E>(
     E: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut out = LogFile::open(out_path).await;
-        let mut err = LogFile::open(err_path).await;
+        let mut files = LogFiles {
+            out: LogFile::open(out_path).await,
+            err: LogFile::open(err_path).await,
+        };
         let mut out_lines = stdout.map(|reader| BufReader::new(reader).lines());
         let mut err_lines = stderr.map(|reader| BufReader::new(reader).lines());
 
         while out_lines.is_some() || err_lines.is_some() {
             tokio::select! {
                 result = next_line(&mut out_lines) => {
-                    match deliver_line(result, false, &mut out, &logs_tx).await {
+                    match deliver_line(result, false, &mut files, &logs_tx, &mut ctl_rx).await {
                         AfterLine::KeepReading => {}
                         AfterLine::StreamEnded => out_lines = None,
                         AfterLine::LogsClosed => break,
                     }
                 }
                 result = next_line(&mut err_lines) => {
-                    match deliver_line(result, true, &mut err, &logs_tx).await {
+                    match deliver_line(result, true, &mut files, &logs_tx, &mut ctl_rx).await {
                         AfterLine::KeepReading => {}
                         AfterLine::StreamEnded => err_lines = None,
                         AfterLine::LogsClosed => break,
@@ -483,13 +575,7 @@ fn spawn_log_pump<O, E>(
                 }
                 ctl = ctl_rx.recv() => {
                     match ctl {
-                        Some(LogCtl::Reopen { done }) => {
-                            out.reopen().await;
-                            err.reopen().await;
-                            // A caller that stopped waiting is not a
-                            // failure: the reopen happened either way.
-                            let _ = done.send(());
-                        }
+                        Some(ctl) => files.serve(ctl).await,
                         None => break, // owning sheep task dropped log_ctl
                     }
                 }
@@ -613,6 +699,14 @@ mod tests {
     /// runner, not an expected duration.
     const PUMP_DEADLINE: Duration = Duration::from_secs(5);
 
+    /// Room in each in-memory pipe standing in for a child's stdout/stderr.
+    ///
+    /// Sized so a case can hand the pump more lines than `logs` will hold
+    /// without the writing side parking first — with a buffer that small,
+    /// "the pump stopped reading" and "the test stopped writing" become the
+    /// same observation.
+    const STREAM_BUFFER: usize = 4096;
+
     /// One pump over two in-memory streams and two real files — everything
     /// [`spawn_log_pump`] takes, with no child process involved.
     struct PumpHarness {
@@ -630,8 +724,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let out_path = dir.path().join("out.log");
             let err_path = dir.path().join("err.log");
-            let (out_writer, out_reader) = tokio::io::duplex(256);
-            let (err_writer, err_reader) = tokio::io::duplex(256);
+            let (out_writer, out_reader) = tokio::io::duplex(STREAM_BUFFER);
+            let (err_writer, err_reader) = tokio::io::duplex(STREAM_BUFFER);
             let (logs_tx, logs) = mpsc::channel(CHANNEL_CAPACITY);
             let (ctl, ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
             spawn_log_pump(
@@ -808,6 +902,58 @@ mod tests {
 
         assert!(pump.out_path.exists(), "stdout's path must be back");
         assert!(pump.err_path.exists(), "stderr's path must be back");
+    }
+
+    /// Fails if the pump waits for room on `logs` with a bare
+    /// `logs_tx.send(...).await` inside the `select!` handler: a handler is
+    /// not cancellable, so the control channel goes unpolled for as long as
+    /// that wait lasts, and with nothing draining `logs` it lasts forever.
+    ///
+    /// One layer up this is the cycle `Actor::claim_manual` documents: the
+    /// party that drains `logs` is the sheep task, so anything that makes
+    /// the sheep task wait on an acknowledgement closes the loop — actor
+    /// waiting on the ack, sheep task waiting on the actor, pump waiting on
+    /// the sheep task.
+    #[tokio::test]
+    async fn a_reopen_is_answered_while_the_logs_channel_is_full() {
+        let mut pump = PumpHarness::start();
+
+        // One line more than `logs` can hold, and nothing here drains it:
+        // the pump appends every line to the file, hands CHANNEL_CAPACITY of
+        // them to the channel, and is left waiting for room for the last.
+        let flooded = CHANNEL_CAPACITY + 1;
+        let mut written = String::new();
+        for n in 0..flooded {
+            let line = format!("line-{n}\n");
+            pump.out_writer.write_all(line.as_bytes()).await.unwrap();
+            written.push_str(&line);
+        }
+
+        // The append comes before the send, so a file holding every line is
+        // proof the pump has read the last one and is parked on its send —
+        // which is what makes the reopen below land on a pump that is
+        // already waiting rather than one that merely might.
+        assert_file_settles(&pump.out_path, &written).await;
+
+        // Deleted rather than renamed, so the reopen under test is the only
+        // thing that could put these paths back.
+        fs::remove_file(&pump.out_path).unwrap();
+        fs::remove_file(&pump.err_path).unwrap();
+
+        pump.reopen().await;
+
+        assert!(pump.out_path.exists(), "stdout's path must be back");
+        assert!(pump.err_path.exists(), "stderr's path must be back");
+
+        // The line the pump was holding is owed to the receiver, not
+        // dropped: serving the reopen must not have cost the send its place.
+        for n in 0..flooded {
+            let observed = timeout(PUMP_DEADLINE, pump.logs.recv())
+                .await
+                .expect("the pump must resume once `logs` has room")
+                .expect("the pump must not end while its streams are open");
+            assert_eq!(observed.line, format!("line-{n}"));
+        }
     }
 
     /// Fails if the pump treats a closed control channel as nothing to do:
