@@ -64,6 +64,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixes
 
+- Stop holding `std::io::stderr().lock()` for the daemon's entire lifetime.
+  `run` took the process-wide stdout and stderr guards before dispatching,
+  which is right for verbs that last milliseconds and wrong for the one that
+  runs until a signal: `Stderr`'s lock is re-entrant only for the thread
+  holding it, so the first record any tokio worker wrote blocked forever and
+  took the supervisor down with it — silently, leaving an empty
+  `shepd.err.log` and a daemon that still accepted connections but answered
+  no handshake. The `daemon` arm now uses unlocked handles, which take the
+  lock per write. The guard had been held harmlessly since this crate's first
+  day, because nothing wrote to stderr off the main thread until the daemon
+  grew a subscriber for its own records.
 - Give the workspace's path dependencies a version alongside their `path`,
   which `cargo publish` requires. The package here is `shep-cli`, but the
   `[[bin]]` it produces is named `shep`, so once published the install

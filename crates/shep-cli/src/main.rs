@@ -106,23 +106,48 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
 /// a resolvable home for either was a bug, not a deliberate restriction.
 #[cfg(unix)]
 async fn run(cli: Cli) -> ExitCode {
+    let fmt = cli.global.format;
+
+    // Both early arms take their own handles rather than sharing the locked
+    // pair below, because neither wants what that pair is for.
+    //
+    // `StdoutLock`/`StderrLock` are process-wide and are held for as long as
+    // the guard lives. Every verb under the dispatch below is milliseconds
+    // long, so holding both across it is exactly right: one lock acquisition
+    // instead of one per write, and no interleaving with anything.
+    //
+    // `daemon` is the opposite shape. It runs until a signal, and
+    // `commands::daemon::install_log_subscriber` renders the daemon's own
+    // records to `std::io::stderr()` from tokio worker threads. `Stderr`'s
+    // lock is re-entrant only for the thread that took it, so a guard held
+    // here — on the runtime's main thread, for the daemon's whole life —
+    // blocks the first record written by any worker, forever, taking the
+    // task that wrote it with it. That is not a hypothetical: it wedged the
+    // daemon on its first warning, silently, with an empty `shepd.err.log`
+    // (2026-08-09). Unlocked handles take the lock per write and release it.
+    match cli.command {
+        Commands::Completions(ref args) => {
+            let mut out = std::io::stdout().lock();
+            return completions::completions(&mut out, args);
+        }
+        Commands::Daemon(ref args) => {
+            let mut out = std::io::stdout();
+            let mut err = std::io::stderr();
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            return run_daemon_command(&mut streams, fmt, &cli.global, args).await;
+        }
+        _ => {}
+    }
+
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
     let mut streams = Streams {
         out: &mut out,
         err: &mut err,
     };
-    let fmt = cli.global.format;
-
-    match cli.command {
-        Commands::Completions(ref args) => {
-            return completions::completions(&mut *streams.out, args);
-        }
-        Commands::Daemon(ref args) => {
-            return run_daemon_command(&mut streams, fmt, &cli.global, args).await;
-        }
-        _ => {}
-    }
 
     let paths = match resolve_paths(&cli.global) {
         Ok(paths) => paths,
