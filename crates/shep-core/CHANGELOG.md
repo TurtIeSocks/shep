@@ -63,13 +63,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the log files of every matched sheep after an external rotator has renamed
   them. Both enums are `#[non_exhaustive]` and no existing variant changes,
   so `PROTOCOL_VERSION` stays **1**: the committed v1 byte fixtures still
-  deserialize, and an older daemon answers the new verb with
-  `RpcErrorCode::Internal` rather than failing to decode it. `Reopened`
-  carries `ProcessInfo`s like `Stopped` and `Restarted` do — every matched
-  sheep, including any that was not running and so had nothing to reopen.
+  deserialize. A new *variant* buys no graceful answer from an older daemon,
+  though, and this one does not either: `Request` is internally tagged
+  (`#[serde(tag = "kind")]`) with no `#[serde(other)]` catch-all, so a daemon
+  whose `Request` predates the variant fails to decode the frame at all and
+  ends the connection. The `Internal` wildcard in the daemon's dispatch fires
+  only where its own `shep-core` already knows the variant — which, for a
+  shipped daemon, means it implements it too. (The additive-*field* reasoning
+  under `ProcessInfo::out_file` below is sound and simply does not extend to
+  variants.) `Reopened` carries `ProcessInfo`s like `Stopped` and `Restarted`
+  do — every matched sheep, including any that was not running and so had
+  nothing to reopen.
 - Add `Request::Flush` and `Response::Flushed`, asking a daemon to empty the
   log files of every matched sheep. Additive under `#[non_exhaustive]` on the
-  same terms as `Reopen` above, so `PROTOCOL_VERSION` stays **1**. `Flush`
+  same terms as `Reopen` above — `PROTOCOL_VERSION` stays **1**, and an older
+  daemon fails to decode the verb rather than answering it. `Flush`
   carries a `SelectorSpec` with no default anywhere in the stack — the verb
   destroys log data, so the operator names its target. `Flushed` carries one
   `ProcessInfo` per matched SHEEP, not one per file emptied: several sheep

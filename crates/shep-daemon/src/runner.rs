@@ -186,9 +186,13 @@ impl core::error::Error for ReopenError {}
 /// they had.
 ///
 /// One type for both halves because an operator is owed one answer about one
-/// file, and because either half failing means the same thing to them — that
-/// file is not empty, whatever they were told. Carries a rendered message for
-/// the reasons [`ReopenError`] gives.
+/// file, and because either half failing costs them the same non-zero exit.
+/// What it leaves behind differs, and this type says nothing about which: a
+/// truncate that failed leaves its file as it was, while a flush that failed
+/// does not hold up the truncate — the bytes it reports are bytes that
+/// errored, not bytes still in flight — so that file does end up empty and
+/// the lines it held are gone unwritten. Carries a rendered message for the
+/// reasons [`ReopenError`] gives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushError {
     /// Every log file the flush could not empty, as
