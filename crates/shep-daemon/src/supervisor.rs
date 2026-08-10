@@ -2479,7 +2479,8 @@ mod tests {
 
     use super::*;
     use crate::fake::{ProcScript, ScriptedRunner};
-    use crate::testing::{probe_config, test_paths}; // the one crate-root fixture (IR-33)
+    // the one crate-root fixture (IR-33)
+    use crate::testing::{SharedRunner, probe_config, test_paths};
     // Test-only: `SilentPumpRunner` counts the requests its pumps receive so
     // a case can order itself against the actor. Imported here rather than
     // beside the module's other `tokio::sync` uses, which do not need it.
@@ -5056,23 +5057,6 @@ mod tests {
             !missing.exists(),
             "a flush must not create the log file it did not find"
         );
-    }
-
-    /// A [`ScriptedRunner`] a test can still read after the engine has taken
-    /// ownership of it. [`ProcessRunner::spawn`] takes `&self`, so sharing
-    /// one costs nothing but this forwarding impl.
-    #[derive(Debug)]
-    struct SharedRunner(Arc<ScriptedRunner>);
-
-    impl ProcessRunner for SharedRunner {
-        type Proc = crate::fake::FakeProc;
-
-        fn spawn(
-            &self,
-            spec: &SpawnSpec,
-        ) -> Result<(Self::Proc, ProcIo), crate::runner::RunnerError> {
-            self.0.spawn(spec)
-        }
     }
 
     /// A spawn spec for the cases that drive [`run_sheep`] directly. The

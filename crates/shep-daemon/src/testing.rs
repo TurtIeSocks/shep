@@ -27,6 +27,7 @@ use crate::limits::sample::{MemorySampler, ProcessRss};
 use crate::limits::{LimitBreach, LimitEnforcer};
 use crate::probes::{LivenessFailure, ProbeFailure, Prober};
 use crate::rpc::RpcContext;
+use crate::runner::{ProcIo, ProcessRunner, RunnerError, SpawnSpec};
 use crate::snapshot::FlockRegistry;
 use crate::supervisor::SupervisorBuilder;
 
@@ -225,6 +226,23 @@ pub(crate) fn test_paths(dir: &tempfile::TempDir) -> ShepPaths {
         &|key| (key == "SHEP_HOME").then(|| home.display().to_string()),
         std::path::Path::new("/nonexistent"),
     )
+}
+
+/// A [`ScriptedRunner`] a test can still read after the engine has taken
+/// ownership of it. [`ProcessRunner::spawn`] takes `&self`, so sharing one
+/// costs nothing but this forwarding impl.
+///
+/// IR-33: the supervisor's own tests and `boot`'s both hand a runner away and
+/// then assert on its counters — one wrapper, not two.
+#[derive(Debug)]
+pub(crate) struct SharedRunner(pub(crate) Arc<ScriptedRunner>);
+
+impl ProcessRunner for SharedRunner {
+    type Proc = crate::fake::FakeProc;
+
+    fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
+        self.0.spawn(spec)
+    }
 }
 
 /// A proptest configuration running `local_cases` by default, and whatever

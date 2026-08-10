@@ -93,7 +93,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since the daemon visits matched sheep serially with no per-sheep bound —
   the default would report failure to a `postrotate` stanza whose reopen was
   still running. Output is the same table of matched sheep `stop` and
-  `restart` print.
+  `restart` print. A rotator that would rather signal a pid than run a client
+  can send the daemon `SIGUSR2` instead, which does the same work at the
+  `all` selector — see `shep-daemon`'s entry for what that form gives up: no
+  reply to wait on, and no narrower selector.
 - Add `shep flush <selector>`, which empties the log files of the sheep the
   selector matches: the daemon flushes what every pump writing to one of
   those files still owes it, then truncates the paths those sheep were

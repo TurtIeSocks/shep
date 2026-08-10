@@ -95,10 +95,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add the daemon boot sequence: `0700` runtime layout (created at that mode
   directly, never chmod'ed after), an atomically-written pidfile, control-
   socket bind with stale-socket recovery, a readiness-pipe handshake for the
-  CLI's `daemon` subcommand, SIGTERM/SIGINT/SIGQUIT graceful shutdown and a
-  SIGUSR2 log-reopen stub, and a load-bearing ordered teardown (roll saved
-  before the flock is killed, or `shep muster` after a reboot restores
-  nothing).
+  CLI's `daemon` subcommand, SIGTERM/SIGINT/SIGQUIT graceful shutdown and
+  SIGUSR2 log reopening (see below), and a load-bearing ordered teardown
+  (roll saved before the flock is killed, or `shep muster` after a reboot
+  restores nothing).
 - The pure decision tiers (brain, backoff, assemble, entry, the `runner`
   trait and its fake) compile and test on every platform; the OS tier
   (real spawning, signals, the kill ladder, the socket itself) is unix-only.
@@ -170,6 +170,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the sheep task lets go of both together. That is what retires the pump
   of a sheep whose child forked a lamb and left it holding the pipe — with
   neither stream ever reaching EOF, nothing else would.
+- **SIGUSR2 now reopens every sheep's log files** — the same work
+  `shep reopen all` does, reached without a socket. A signal carries no
+  selector, so `all` is the only thing it can mean, and a `postrotate`
+  stanza that would rather send a signal than run a client gets the same
+  swap: every live pump closes both handles and opens both paths again.
+  Installing the handler was already load-bearing on its own, because
+  SIGUSR2's default disposition is to terminate — an unhandled `kill -USR2`
+  kills the daemon instead of rotating it — and it is installed before the
+  socket is bound, so there is no window where the daemon is reachable but
+  the signal is still fatal. Two things the socket form gives that this one
+  cannot: a signal has no reply, so the result is logged rather than
+  reported and nothing can wait for the swap to finish; and it reaches the
+  whole flock or nothing. The log directory is recreated at `0700` first, so
+  a rotation that moved the directory rather than the files does not leave
+  the daemon's own layout at whatever the umask allows.
 - Answer `Request::Flush`: every pump writing to a matched log path is sent a
   `LogCtl::Flush` and answers, and only then is each distinct recorded log
   path truncated. Both halves of that sentence are load-bearing. The flush
