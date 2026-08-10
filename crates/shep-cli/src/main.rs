@@ -226,6 +226,14 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => logs::reopen(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
+        // The one verb with two targets, and the only arm that can finish
+        // without a client: `--daemon` empties files this binary created and
+        // the daemon merely inherited (`launch::launch_command`), so there is
+        // nothing to ask the socket. Not connecting is the feature rather
+        // than an optimisation — a wedged or stopped shepherd is exactly when
+        // an operator reaches for this, and `connect_client` never autostarts
+        // one to be told to do nothing.
+        Commands::Flush(ref args) if args.daemon => logs::flush_daemon(&mut streams, fmt, &paths),
         Commands::Flush(ref args) => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => logs::flush(&client, &mut streams, fmt, args).await,
             Err(code) => code,

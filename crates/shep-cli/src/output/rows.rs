@@ -78,6 +78,65 @@ impl Render for FlockRows {
     ];
 }
 
+/// One of the shepherd's own log files, and what `shep flush --daemon` made
+/// of it.
+///
+/// Not a `ProcessInfo` and not derived from one: these two files belong to no
+/// sheep, have no id and no name, and never travel over the wire — the CLI
+/// owns them, empties them itself, and reports what it did. That is the whole
+/// reason `--daemon` renders its own payload instead of joining
+/// [`FlockRows`].
+#[derive(Debug, Serialize)]
+pub struct EmptiedFile {
+    /// Which of the shepherd's streams this file takes: `stdout` or `stderr`.
+    pub stream: &'static str,
+    /// The file's absolute path, as this invocation resolved `$SHEP_HOME`.
+    pub file: String,
+    /// `emptied` when the file was truncated, `absent` when there was no such
+    /// file — already empty, and not created just to say so.
+    pub result: &'static str,
+}
+
+/// `shep flush --daemon`: one row per file the shepherd logs into.
+///
+/// Constructed by `commands/logs.rs`'s `flush`, from the files it truncated.
+/// `transparent` so the JSON is a plain array, matching every other payload
+/// that reports a list.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct EmptiedFiles(pub Vec<EmptiedFile>);
+
+impl Render for EmptiedFiles {
+    fn headers() -> &'static [&'static str] {
+        &["STREAM", "FILE", "RESULT"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|f| vec![f.stream.to_string(), f.file.clone(), f.result.to_string()])
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "STREAM" => "stream",
+            "FILE" => "file",
+            "RESULT" => "result",
+            other => panic!("EmptiedFiles::headers() does not include {other:?}"),
+        }
+    }
+
+    // Every field is a column. The paths are long, which is the objection
+    // `FlockRows` answers by keeping its own two out of the table — but here
+    // the path IS the answer: a verb that emptied a file and would not say
+    // which one has reported nothing.
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
 /// `Response::Deleted(Vec<u32>)` — the ids that were removed.
 ///
 /// Constructed by `commands/lifecycle.rs`'s `delete`, from a real
@@ -327,6 +386,26 @@ pub(crate) mod tests {
                 pid: 4242,
             },
             |j| j,
+            &[],
+        );
+    }
+
+    #[test]
+    fn emptied_files_do_not_drift() {
+        assert_no_drift(
+            &EmptiedFiles(vec![
+                EmptiedFile {
+                    stream: "stdout",
+                    file: "/home/x/.shep/logs/shepd.out.log".to_string(),
+                    result: "emptied",
+                },
+                EmptiedFile {
+                    stream: "stderr",
+                    file: "/home/x/.shep/logs/shepd.err.log".to_string(),
+                    result: "absent",
+                },
+            ]),
+            |j| &j[0],
             &[],
         );
     }

@@ -22,12 +22,16 @@
 use std::time::Duration;
 
 use shep_client::{Client, LOG_PLANE_DEADLINE};
+use shep_core::paths::ShepPaths;
 use shep_core::protocol::{Request, Response, SelectorSpec};
 use shep_core::selector::ProcessSelector;
 
-use crate::cli::{Format, ReopenArgs, SelectorArgs};
+use crate::cli::{FlushArgs, Format, ReopenArgs};
 use crate::exit::ExitCode;
-use crate::output::{FlockRows, Render, Streams, emit, emit_error, write_outcome};
+use crate::launch;
+use crate::output::{
+    EmptiedFile, EmptiedFiles, FlockRows, Render, Streams, emit, emit_error, write_outcome,
+};
 
 /// Sends `body` with `deadline` (`None` defers to the client's own default),
 /// renders whatever the daemon answers through [`emit`], and maps every way
@@ -166,12 +170,14 @@ pub async fn reopen(
 ///
 /// # Why the selector is required
 ///
-/// This destroys log data, so it takes [`SelectorArgs`] and follows
-/// `stop`/`restart`/`delete` in demanding a target — where `bleats` and
-/// `reopen` default to `all` because neither destroys anything. `shep flush`
-/// with no argument is a usage error, not "empty every log in the flock":
-/// that is the one command here whose slip of the finger cannot be undone,
-/// and `shep flush all` is a short thing to type when it is meant.
+/// This destroys log data, so it follows `stop`/`restart`/`delete` in
+/// demanding a target — where `bleats` and `reopen` default to `all` because
+/// neither destroys anything. `shep flush` with no argument is a usage error,
+/// not "empty every log in the flock": that is the one command here whose
+/// slip of the finger cannot be undone, and `shep flush all` is a short thing
+/// to type when it is meant. [`FlushArgs`] carries the selector as an
+/// `Option` only because `--daemon` names a target that is not a selection at
+/// all; clap still refuses a `flush` that names neither.
 ///
 /// # A stopped sheep is emptied too
 ///
@@ -184,12 +190,10 @@ pub async fn reopen(
 /// # What this does NOT touch
 ///
 /// The shepherd's own `shepd.out.log`/`shepd.err.log`. Those are opened by
-/// the CLI's launcher with `File::create` before the daemon exists — which
-/// truncates them on every launch, and is the whole of their rotation story
-/// today — and the daemon inherits them as plain fds 1 and 2. It holds no
-/// handle it could flush and no recorded path it could truncate, so they are
-/// out of this verb's reach by construction. Restarting the shepherd is what
-/// empties them.
+/// the CLI's launcher before the daemon exists, and the daemon inherits them
+/// as plain fds 1 and 2. It holds no handle it could flush and no recorded
+/// path it could truncate, so no selector can reach them and none ever will:
+/// they are [`flush_daemon`]'s, reached only by naming `--daemon`.
 ///
 /// Renders the matched sheep as [`FlockRows`] — one row per SHEEP, not per
 /// file emptied. Several sheep can share one log path (`merge_logs`, or an
@@ -202,13 +206,31 @@ pub async fn reopen(
 ///
 /// Sent with [`LOG_PLANE_DEADLINE`] for the reason [`reopen`] gives: the
 /// daemon walks the matched flock file by file with no per-sheep bound.
+///
+/// # A selector-less call
+///
+/// `main` routes `--daemon` to [`flush_daemon`] before reaching here, and
+/// clap's `required_unless_present` covers everything else, so no real
+/// invocation arrives without a selector. The `None` arm below answers with
+/// the usage error clap itself would rather than an `expect`: a panicking
+/// convenience would abort the process over a bug in the dispatch above, and
+/// buy an operator nothing that one branch does not.
 pub async fn flush(
     client: &Client,
     streams: &mut Streams<'_>,
     fmt: Format,
-    args: &SelectorArgs,
+    args: &FlushArgs,
 ) -> ExitCode {
-    let selector = match parse_selector(streams, fmt, &args.selector) {
+    let Some(raw) = args.selector.as_deref() else {
+        let _ = emit_error(
+            &mut *streams.err,
+            fmt,
+            ExitCode::Usage.code_str(),
+            "flush needs a selector, or --daemon for the shepherd's own logs",
+        );
+        return ExitCode::Usage;
+    };
+    let selector = match parse_selector(streams, fmt, raw) {
         Ok(selector) => selector,
         Err(code) => return code,
     };
@@ -227,6 +249,85 @@ pub async fn flush(
     .await
 }
 
+/// Empties the shepherd's own two log files: `shep flush --daemon`.
+///
+/// # Why the CLI does this and not the daemon
+///
+/// It is the CLI that owns these files. `launch::launch_command` creates them
+/// before the daemon exists and hands them over as fds 1 and 2; the daemon
+/// never learns their paths, holds no `LogFile` for them, and has nothing to
+/// answer a `Request::Flush` about. Truncating them here needs no new wire
+/// variant, and — the useful consequence — needs no daemon either: this is
+/// the one flush that works while the shepherd is down, which is when an
+/// operator most often wants it.
+///
+/// # Why there is no flush barrier
+///
+/// The flock half exists in two phases because a pump's `write_all` returns
+/// with the real `write(2)` still queued on the blocking pool, so a truncate
+/// can outrun a line already dispatched. Nothing here is queued: the daemon's
+/// records go through its `tracing` subscriber straight to fd 2, synchronously
+/// on the thread that emitted them. There is no in-flight write to wait for,
+/// and no channel to wait on it with.
+///
+/// # Where the next line lands
+///
+/// At offset 0, because [`launch::launch_command`] opens both files
+/// `O_APPEND` — see `launch`'s own `emptied_appending` for the measurement,
+/// and for why `File::create` (which is what this used to be) would instead
+/// leave the daemon writing past a `NUL` hole the size of everything emptied. A
+/// daemon launched by an older `shep` binary, or run in the foreground with
+/// the operator's own shell redirection, keeps whatever descriptor it was
+/// given: this verb still empties the file and still frees the disk blocks,
+/// but that daemon's next line lands at its own remembered offset.
+///
+/// # A missing file is a success
+///
+/// The same rule the flock half applies to a sheep that has never run: a log
+/// file that is not there is already empty. It is reported as `absent` rather
+/// than created, so an operator can tell "emptied 4 MB" from "there was
+/// nothing here" — and a `shep flush --daemon` against a cold `$SHEP_HOME`
+/// exits 0 rather than complaining about a daemon that has never started.
+pub fn flush_daemon(streams: &mut Streams<'_>, fmt: Format, paths: &ShepPaths) -> ExitCode {
+    let mut emptied = Vec::new();
+    let mut failures = Vec::new();
+
+    for (stream, name) in [
+        ("stdout", launch::DAEMON_STDOUT_LOG),
+        ("stderr", launch::DAEMON_STDERR_LOG),
+    ] {
+        let path = paths.logs.join(name);
+        let result = match std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+        {
+            Ok(_) => "emptied",
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "absent",
+            Err(error) => {
+                failures.push(format!("{}: {error}", path.display()));
+                continue;
+            }
+        };
+        emptied.push(EmptiedFile {
+            stream,
+            file: path.display().to_string(),
+            result,
+        });
+    }
+
+    if !failures.is_empty() {
+        let _ = emit_error(
+            &mut *streams.err,
+            fmt,
+            ExitCode::Failure.code_str(),
+            &failures.join("; "),
+        );
+        return ExitCode::Failure;
+    }
+    write_outcome(emit(&mut *streams.out, fmt, "flush", EmptiedFiles(emptied)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,9 +340,10 @@ mod tests {
         }
     }
 
-    fn flush_args(selector: &str) -> SelectorArgs {
-        SelectorArgs {
-            selector: selector.to_string(),
+    fn flush_args(selector: &str) -> FlushArgs {
+        FlushArgs {
+            selector: Some(selector.to_string()),
+            daemon: false,
         }
     }
 
@@ -501,5 +603,128 @@ mod tests {
         };
         let code = flush(&client, &mut streams, Format::Table, &flush_args("ghost")).await;
         assert_eq!(code, ExitCode::NotFound);
+    }
+
+    /// A `$SHEP_HOME` under `dir` with both shepherd log files present and
+    /// holding `contents`.
+    fn home_with_daemon_logs(dir: &tempfile::TempDir, contents: &[u8]) -> ShepPaths {
+        let paths = ShepPaths::resolve(
+            &|k| (k == "SHEP_HOME").then(|| dir.path().to_string_lossy().into_owned()),
+            std::path::Path::new("/nonexistent"),
+        );
+        std::fs::create_dir_all(&paths.logs).unwrap();
+        for name in [launch::DAEMON_STDOUT_LOG, launch::DAEMON_STDERR_LOG] {
+            std::fs::write(paths.logs.join(name), contents).unwrap();
+        }
+        paths
+    }
+
+    /// Fails if `--daemon` stops emptying both of the shepherd's files, or
+    /// stops naming them.
+    ///
+    /// The naming half is not decoration. The whole reason this verb reports
+    /// paths at all is that an operator cannot otherwise tell WHAT a flush
+    /// emptied, and for `--daemon` the two files are the entire answer — a
+    /// table that said only "ok" would be indistinguishable from one that
+    /// truncated the wrong `$SHEP_HOME`.
+    #[test]
+    fn a_daemon_flush_empties_both_shepherd_logs_and_names_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = home_with_daemon_logs(&dir, b"old shepherd output");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+        };
+
+        let code = flush_daemon(&mut streams, Format::Json, &paths);
+
+        assert_eq!(code, ExitCode::Success);
+        for name in [launch::DAEMON_STDOUT_LOG, launch::DAEMON_STDERR_LOG] {
+            let path = paths.logs.join(name);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0, "{name}");
+            assert!(
+                String::from_utf8_lossy(&out).contains(&path.display().to_string()),
+                "the answer must name every file it emptied: {}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+    }
+
+    /// Fails if a missing shepherd log becomes an error, or is created to
+    /// make the row look tidy.
+    ///
+    /// A cold `$SHEP_HOME` has never had a daemon in it, so neither file
+    /// exists — and a `shep flush --daemon` that exited non-zero there would
+    /// be complaining that there was nothing to do. `absent` rather than
+    /// `emptied` because the two are different facts: an operator chasing a
+    /// full disk needs to know which files this actually truncated. The same
+    /// rule the flock half applies to a sheep that has never run.
+    #[test]
+    fn a_daemon_flush_reports_a_missing_log_as_absent_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(
+            &|k| (k == "SHEP_HOME").then(|| dir.path().to_string_lossy().into_owned()),
+            std::path::Path::new("/nonexistent"),
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+        };
+
+        let code = flush_daemon(&mut streams, Format::Json, &paths);
+
+        assert_eq!(code, ExitCode::Success);
+        let envelope: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let rows = envelope["data"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "both streams are reported either way: {envelope}"
+        );
+        assert!(
+            rows.iter().all(|row| row["result"] == "absent"),
+            "a log that is not there is already empty: {envelope}"
+        );
+        assert!(
+            !paths.logs.join(launch::DAEMON_STDOUT_LOG).exists(),
+            "a flush must not create the log file it did not find"
+        );
+    }
+
+    /// Fails if a file that could not be truncated is reported as emptied —
+    /// the silent failure `a_refused_flush_never_exits_zero` pins for the
+    /// flock half, in the half that never touches the socket. An operator who
+    /// ran this to reclaim a full disk and saw 0 believes the space is back.
+    ///
+    /// A directory in the log's place is the failure with no permission games
+    /// in it: `open(2)` for writing on a directory fails for every uid, root
+    /// included, so this cannot pass for the wrong reason on a privileged
+    /// runner.
+    #[test]
+    fn a_daemon_flush_that_could_not_empty_a_file_never_exits_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = home_with_daemon_logs(&dir, b"");
+        let blocked = paths.logs.join(launch::DAEMON_STDERR_LOG);
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+        };
+
+        let code = flush_daemon(&mut streams, Format::Table, &paths);
+
+        assert_eq!(code, ExitCode::Failure);
+        assert!(
+            String::from_utf8_lossy(&err).contains(&blocked.display().to_string()),
+            "the failure must name the file it could not empty: {}",
+            String::from_utf8_lossy(&err)
+        );
     }
 }

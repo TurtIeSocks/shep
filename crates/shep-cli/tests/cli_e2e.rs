@@ -1850,6 +1850,161 @@ fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
     graceful_kill(home);
 }
 
+/// The two halves of `shep flush` reach exactly one target each, asserted in
+/// the order that makes both facts stand: the flock half first, while the
+/// shepherd's own logs still hold a marker only this test wrote.
+///
+/// Rin's requirement was that a flock flush never reach the shepherd's own
+/// logs without being named. That already held by construction — the daemon
+/// inherits those two files as fds 1 and 2 and has no path for a selector to
+/// match — but "by construction" is exactly the kind of claim a later
+/// refactor falsifies quietly, and `--daemon` is the door it now has to stay
+/// on the other side of. So both directions are pinned: `flush all` leaves
+/// the marker byte-for-byte, and `flush --daemon` leaves the sheep's own log
+/// untouched.
+///
+/// The marker is written through a handle of the test's own. The daemon holds
+/// fd 1 open on the same inode and writes nothing to stdout, so nothing races
+/// this — and after the `--daemon` flush that descriptor is `O_APPEND`, so
+/// whatever it writes next lands at offset 0 rather than past a hole (pinned
+/// directly, without a daemon, in `launch.rs`'s own case).
+#[test]
+fn a_daemon_flush_and_a_flock_flush_never_reach_each_others_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let gate = home.join("flushed");
+    let script = write_rotating_script(&dir, &gate);
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("flusher")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    let online = poll_flock(home, |info| info["status"] == "online");
+    let out_file = PathBuf::from(
+        online["out_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the daemon reports its own log paths: {online}")),
+    );
+    // Read back rather than assumed: this is the precondition both halves of
+    // the case are measured against.
+    let before = bleats_no_follow_until_written(home, &["all"]);
+    assert!(
+        String::from_utf8_lossy(&before.stdout).contains(ROTATE_BEFORE),
+        "precondition: the sheep must have logged something to lose"
+    );
+
+    const MARKER: &[u8] = b"a line only the shepherd's own log holds\n";
+    let shepd_out = home.join("logs/shepd.out.log");
+    let shepd_err = home.join("logs/shepd.err.log");
+    std::fs::write(&shepd_out, MARKER).unwrap();
+    std::fs::write(&shepd_err, MARKER).unwrap();
+
+    let flock_half = shep(home).arg("flush").arg("all").output().unwrap();
+    assert_success(&flock_half);
+    assert_eq!(
+        std::fs::metadata(&out_file).unwrap().len(),
+        0,
+        "the flock half must still empty the sheep it named"
+    );
+    assert_eq!(
+        std::fs::read(&shepd_out).unwrap(),
+        MARKER,
+        "a flock flush must not reach the shepherd's own stdout log"
+    );
+    assert_eq!(
+        std::fs::read(&shepd_err).unwrap(),
+        MARKER,
+        "a flock flush must not reach the shepherd's own stderr log"
+    );
+
+    // Now the other direction. The sheep is gated shut and has written
+    // nothing since the truncate above, so its log staying empty is not what
+    // is asserted — its log is refilled first, so "untouched" is a fact with
+    // bytes behind it.
+    std::fs::write(&gate, "").unwrap();
+    let after = bleats_no_follow_until_written(home, &["all"]);
+    assert!(
+        String::from_utf8_lossy(&after.stdout).contains(ROTATE_AFTER),
+        "the sheep must have written again before the --daemon flush"
+    );
+    let sheep_len = std::fs::metadata(&out_file).unwrap().len();
+    assert!(sheep_len > 0, "precondition: the sheep's log is not empty");
+
+    let daemon_half = shep(home)
+        .arg("flush")
+        .arg("--daemon")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert_success(&daemon_half);
+    let envelope: serde_json::Value = serde_json::from_slice(&daemon_half.stdout).unwrap();
+    assert_eq!(envelope["command"], "flush", "{envelope}");
+    let files: Vec<&str> = envelope["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["file"].as_str().unwrap())
+        .collect();
+    assert!(
+        files.contains(&shepd_out.display().to_string().as_str())
+            && files.contains(&shepd_err.display().to_string().as_str()),
+        "the answer must name both files it emptied: {envelope}"
+    );
+
+    assert_eq!(std::fs::metadata(&shepd_out).unwrap().len(), 0);
+    assert_eq!(std::fs::metadata(&shepd_err).unwrap().len(), 0);
+    assert_eq!(
+        std::fs::metadata(&out_file).unwrap().len(),
+        sheep_len,
+        "a --daemon flush must not reach any sheep's log"
+    );
+
+    graceful_kill(home);
+}
+
+/// Fails if `shep flush --daemon` grows a daemon round trip — a
+/// `connect_client` on its dispatch arm, or a `Request` of its own.
+///
+/// Emptying the shepherd's own logs is the one flush that must work while the
+/// shepherd is down, which is when an operator most often reaches for it: a
+/// daemon that filled a disk with its own diagnostics is not answering. The
+/// files belong to the CLI (`launch::launch_command` creates them), so there
+/// is nothing to ask. That no socket appears is asserted as well as the exit
+/// code, because a `connect_or_spawn` on this arm would autostart a daemon in
+/// order to be told to do nothing.
+#[test]
+fn a_daemon_flush_needs_no_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let logs = home.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("shepd.out.log"),
+        b"left behind by a dead shepherd",
+    )
+    .unwrap();
+
+    let flushed = shep(home).arg("flush").arg("--daemon").output().unwrap();
+
+    assert_success(&flushed);
+    assert_eq!(
+        std::fs::metadata(logs.join("shepd.out.log")).unwrap().len(),
+        0
+    );
+    assert!(
+        !home.join("run/shep.sock").exists(),
+        "this verb must not autostart a daemon to empty files the CLI owns"
+    );
+}
+
 /// Fails if `shep flush` ever runs without a selector.
 ///
 /// The one command in this CLI whose slip of the finger cannot be undone, so

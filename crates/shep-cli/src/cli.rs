@@ -73,8 +73,8 @@ pub enum Commands {
     Bleats(BleatsArgs),
     /// Reopen log files after an external rotator has renamed them.
     Reopen(ReopenArgs),
-    /// Empty the log files of one or more sheep.
-    Flush(SelectorArgs),
+    /// Empty the log files of one or more sheep, or the shepherd's own.
+    Flush(FlushArgs),
     /// Check whether the shepherd answers.
     Ping,
     /// Shut the shepherd down.
@@ -106,15 +106,53 @@ pub struct StartArgs {
 }
 
 /// Arguments shared by every verb that targets an existing selection of the
-/// flock (`stop`, `restart`, `delete`, `describe`, `flush`, `thatlldo`).
+/// flock (`stop`, `restart`, `delete`, `describe`, `thatlldo`).
 ///
-/// The selector is required, which is the whole reason `flush` takes this
-/// rather than an optional-selector struct of its own: see
-/// [`Commands::Flush`]'s handler in `commands::logs`.
+/// The selector is required on every one of them, because every one of them
+/// acts on something. `flush` has the same rule and its own struct
+/// ([`FlushArgs`]) only because it has a second target that is not a
+/// selection at all.
 #[derive(Debug, clap::Args)]
 pub struct SelectorArgs {
     /// name, id, `all`, `/regex/`, or `fold:<name>`
     pub selector: String,
+}
+
+/// Arguments to `shep flush`.
+///
+/// # Why a flag and not a reserved selector name
+///
+/// The shepherd's own `shepd.out.log`/`shepd.err.log` are the second thing
+/// this verb can empty, and they are NOT a sheep — nothing about them is
+/// expressible as a selector. Spelling them `shep flush shep` would make one
+/// name mean something different depending on the Flockfile, since nothing
+/// stops an app being called `shep`, and an operator who named one that would
+/// find `shep flush shep` quietly emptying the wrong files. A flag cannot
+/// collide with anything.
+///
+/// # Why it replaces the selector rather than composing with it
+///
+/// `--daemon` conflicts with the selector, so `shep flush all --daemon` is a
+/// usage error rather than "both". Three reasons, in order of weight: the two
+/// halves answer with different shapes — sheep against files — and one
+/// invocation renders one payload into one envelope; the daemon's own logs
+/// are the one target Rin asked never to be reached without being named, and
+/// a flag that rode along with `all` would be reached by every operator who
+/// ever typed `shep flush all --daemon` out of habit; and the shepherd's logs
+/// are not a sheep's, so folding them into a flock answer would mean
+/// inventing a row for something with no id and no name.
+///
+/// The selector stays required in every other case — `required_unless_present`
+/// rather than a `default_value`, so a bare `shep flush` is still the usage
+/// error it has always been, never "empty every log in the flock".
+#[derive(Debug, clap::Args)]
+pub struct FlushArgs {
+    /// name, id, `all`, `/regex/`, or `fold:<name>` (required unless --daemon)
+    #[arg(required_unless_present = "daemon", conflicts_with = "daemon")]
+    pub selector: Option<String>,
+    /// Empty the shepherd's own logs instead of any sheep's
+    #[arg(long)]
+    pub daemon: bool,
 }
 
 /// Arguments to `shep fold`.
@@ -249,6 +287,10 @@ mod tests {
     /// into "empty every log file in the flock" with nothing to undo it. The
     /// explicit form is asserted alongside, so a verb that rejected every
     /// selector could not pass the first half alone.
+    ///
+    /// `required_unless_present = "daemon"` is what keeps the first half true
+    /// now that the selector is an `Option`: without it, a bare `shep flush`
+    /// parses to `selector: None` and reaches the handler.
     #[test]
     fn flush_refuses_to_run_without_a_selector() {
         use clap::Parser;
@@ -264,7 +306,40 @@ mod tests {
         let Commands::Flush(args) = named else {
             panic!("expected flush")
         };
-        assert_eq!(args.selector, "all");
+        assert_eq!(args.selector.as_deref(), Some("all"));
+        assert!(
+            !args.daemon,
+            "a plain flush must not reach the shepherd's own logs"
+        );
+    }
+
+    /// Fails if `--daemon` stops replacing the selector — either by gaining a
+    /// selector of its own (the bare form stops parsing) or by losing
+    /// `conflicts_with` (the combined form starts parsing).
+    ///
+    /// Both halves are the decision [`FlushArgs`]'s doc argues for. The bare
+    /// form must work, because it is the only spelling of "empty the
+    /// shepherd's own logs" and requiring a sheep selector alongside it would
+    /// be nonsense. The combined form must NOT, because an operator typing
+    /// `shep flush all --daemon` out of habit is exactly the accident that
+    /// keeping the two targets apart exists to prevent.
+    #[test]
+    fn the_daemon_flag_replaces_the_selector_rather_than_riding_along_with_it() {
+        use clap::Parser;
+        let bare = Cli::try_parse_from(["shep", "flush", "--daemon"])
+            .expect("`shep flush --daemon` is the only spelling there is")
+            .command;
+        let Commands::Flush(args) = bare else {
+            panic!("expected flush")
+        };
+        assert!(args.daemon);
+        assert_eq!(args.selector, None);
+
+        assert!(
+            Cli::try_parse_from(["shep", "flush", "all", "--daemon"]).is_err(),
+            "the shepherd's own logs are a separate act, never a rider on a \
+             flock-wide flush"
+        );
     }
 
     #[test]

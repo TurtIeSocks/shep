@@ -131,19 +131,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `O_APPEND` and the daemon never touches it. A file that could not be
   emptied fails the command and is named on stderr; exiting 0 there would
   leave an operator believing a log is empty when it holds everything it did
-  before. The shepherd's own `shepd.out.log`/`shepd.err.log` are out of
-  reach: the CLI's launcher creates those before the daemon exists (which
-  truncates them on every launch, and is the whole of their rotation story
-  today) and the daemon inherits them as plain fds 1 and 2, so it holds no
-  handle to flush and no path to truncate. Restarting the shepherd is what
-  empties them. Output is the same table of matched sheep `stop`, `restart`
-  and `reopen` print — one row per sheep, not per file emptied. A sheep
-  sharing a log path with a matched one has that file emptied under it as
-  well, its pump flushed first like any other writer to that path, and no row
-  of its own: the selector names sheep, and so does the table.
+  before. No selector reaches the shepherd's own
+  `shepd.out.log`/`shepd.err.log`: the CLI's launcher creates those before the
+  daemon exists and the daemon inherits them as plain fds 1 and 2, so it holds
+  no handle to flush and no path to truncate — they are `--daemon`'s, below.
+  Output is the same table of matched sheep `stop`, `restart` and `reopen`
+  print — one row per sheep, not per file emptied. A sheep sharing a log path
+  with a matched one has that file emptied under it as well, its pump flushed
+  first like any other writer to that path, and no row of its own: the
+  selector names sheep, and so does the table.
+- Add `shep flush --daemon`, the only way to empty the shepherd's own
+  `shepd.out.log`/`shepd.err.log`. It **replaces** the selector rather than
+  composing with it — `shep flush all --daemon` is a usage error — because the
+  two halves answer with different shapes, because one invocation renders one
+  payload, and because the shepherd's logs are meant to be reached only by
+  being named rather than by riding along with a flock-wide flush. A flag and
+  not a reserved `shep` selector: nothing stops an app being named `shep`, and
+  a selector that meant something different depending on the Flockfile would
+  be a trap. The CLI empties these two itself and asks the daemon nothing —
+  they are the CLI's files, and it needs no socket, so this is the one flush
+  that works while the shepherd is down, which is when an operator most often
+  wants it. No flush barrier is needed or possible: the daemon's records go
+  through its subscriber straight to fd 2, synchronously, with nothing queued
+  to outrun a truncate. Output is a table of the files themselves — stream,
+  path, and whether each was `emptied` or `absent` — because for this half the
+  paths ARE the answer. A file that is not there is already empty and is
+  reported rather than created, so `shep flush --daemon` on a cold
+  `$SHEP_HOME` exits 0.
 
 ### Fixes
 
+- Open the shepherd's own `shepd.out.log`/`shepd.err.log` `O_APPEND` in the
+  launcher. The daemon inherits both as fds 1 and 2 and never opens them
+  itself, so `File::create`'s plain `O_WRONLY|O_CREAT|O_TRUNC` left both
+  descriptors tracking their own offset for the daemon's whole life — and a
+  descriptor tracking its own offset writes PAST an external truncation rather
+  than at offset 0 of the emptied file. Measured: ten bytes, an external
+  truncate, three more bytes, and the file is thirteen bytes of which the
+  first ten are `NUL`; under `O_APPEND` the same sequence leaves three. This
+  is the sparse hole `shep-daemon`'s `open_append` argues about for a sheep's
+  logs, in the one place shep opens a log file that is not a sheep's, and
+  `shep flush --daemon` is the truncation that would have walked into it. The
+  launch-time emptying is kept — `std` refuses `append` together with
+  `truncate`, so it is a `set_len(0)` on the appending handle — and reusing one
+  `$SHEP_HOME` across relaunches still starts both files empty. A daemon
+  launched by an older `shep`, or run in the foreground behind the operator's
+  own shell redirection, keeps whatever descriptor it was given.
 - Stop holding `std::io::stderr().lock()` for the daemon's entire lifetime.
   `run` took the process-wide stdout and stderr guards before dispatching,
   which is right for verbs that last milliseconds and wrong for the one that
