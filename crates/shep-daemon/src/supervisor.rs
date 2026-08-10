@@ -5237,13 +5237,23 @@ mod tests {
     // fails if a reload is accepted once a graceful shutdown has begun
     // (CRITICAL-1): its replacement would be a child outside the shutdown
     // aggregation's `online` snapshot, fixed at the moment that ran, and so
-    // orphaned when the actor exits. The runner carries NO scripts on
-    // purpose — an accepted reload's first act is a spawn, so a broken guard
-    // shows up as a registered extra entry rather than as nothing at all.
+    // orphaned when the actor exits.
+    //
+    // Two guards stand between a shutdown and that child, and the case has to
+    // reach each separately, because the first stops anything getting to the
+    // second. The REPLY is the only witness `Command::Reload`'s own guard
+    // has: `advance_reload` refuses the spawn on its own re-check, so with
+    // the command guard deleted the actor's state is identical either way and
+    // no assertion on it can move. The direct `advance_reload` call below is
+    // what puts that second, defence-in-depth guard under test — delete it
+    // and the four state assertions all move, because the runner carries a
+    // script and the spawn a broken guard performs really does register a
+    // replacement in the drainee's slot.
     #[tokio::test(start_paused = true)]
     async fn a_reload_is_refused_once_a_shutdown_has_begun() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut actor, _mailbox) = actor_with_one_online_sheep(&dir, vec![]);
+        let (mut actor, _mailbox) =
+            actor_with_one_online_sheep(&dir, vec![ProcScript::never_exits()]);
         actor.shutting_down = true;
 
         let (reply, rx) = oneshot::channel();
@@ -5251,10 +5261,15 @@ mod tests {
             selector: ProcessSelector::All,
             reply,
         });
-
         assert_eq!(rx.await, Ok(Err(SupervisorError::EngineStopped)));
+
+        // `advance_reload` is the one door into `SpawnNew`, reached here as
+        // a job that somehow survived into a shutdown would reach it.
+        actor.advance_reload("web", VecDeque::from([0]));
+
         assert_eq!(actor.sheep.len(), 1, "nothing new was registered");
         assert_eq!(actor.sheep[&0].entry.status, ProcStatus::Online);
+        assert_eq!(actor.sheep[&0].entry.reload, ReloadState::None);
         assert!(actor.reloads.is_empty(), "no job was started");
     }
 
