@@ -281,14 +281,22 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
         // bare payload so the reader is told which of the two it is —
         // `SupervisorError`'s `Display` is the only thing that still
         // distinguishes them once they share a code.
-        // Same `Internal` code, same reason: the wire enum is versioned, and
-        // a refusal is worth less to an operator with the message stripped
-        // off it than with a less precise code on it. `Display` carries the
-        // app's name, which is the part that says what to do about it —
-        // wait, or reload something else.
-        SupervisorError::ReopenFailed(_)
-        | SupervisorError::FlushFailed(_)
-        | SupervisorError::ReloadInFlight(_) => RpcError {
+        SupervisorError::ReopenFailed(_) | SupervisorError::FlushFailed(_) => RpcError {
+            code: RpcErrorCode::Internal,
+            message: err.to_string(),
+        },
+        // `Internal` under protest, and the wire verb should revisit it
+        // rather than inherit it: an app already being reloaded is a CONFLICT
+        // the caller can act on — wait, or reload something else — and not an
+        // unexpected daemon-side failure at all. A code of its own is the
+        // right answer and is a wire change, not a mapping change:
+        // `RpcErrorCode` is versioned, `RpcErrorCode::ALL` and shep-cli's
+        // exit-code mapping both grow with it, and a client predating a new
+        // code cannot decode the reply. Until that is deliberate, a less
+        // precise code carrying the message beats a refusal an operator
+        // cannot read — `Display` names the app, which is the part that says
+        // what to do about it.
+        SupervisorError::ReloadInFlight(_) => RpcError {
             code: RpcErrorCode::Internal,
             message: err.to_string(),
         },
