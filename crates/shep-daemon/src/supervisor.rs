@@ -2023,8 +2023,9 @@ impl<R: ProcessRunner> Actor<R> {
     }
 
     /// Abandons `name`'s reload: the instance it was replacing goes back to
-    /// serving, the instances it had not reached yet are left alone, and the
-    /// replacement is killed and deregistered.
+    /// serving where that is still available to it, the instances it had not
+    /// reached yet are left alone, and the replacement is killed and
+    /// deregistered.
     ///
     /// Spec §4: failure of a new instance aborts the rest and keeps the old
     /// instances running. The replacement goes through the kill ladder rather
@@ -2050,8 +2051,20 @@ impl<R: ProcessRunner> Actor<R> {
         );
 
         if let Some(drainee) = self.sheep.get_mut(&job.swap.old_id) {
-            drainee.entry.status = ProcStatus::Online;
             drainee.entry.reload = ReloadState::None;
+            // `Online` only where going back to serving is actually true.
+            // Two abandonments reach a drainee for which it is not. When the
+            // drainee's OWN exit is what triggered this, its task is already
+            // gone and the ordinary decision path is about to set the status
+            // anyway. When an operator's `stop` matched both halves and the
+            // replacement's exit landed first, the drainee is mid-kill-ladder
+            // with that command holding its marker. `Stopping` is the honest
+            // status for both, and writing `Online` over it hands an operator
+            // a live pid for a process on its way out — and starts
+            // `handle_extra_restart`'s `Online` guard passing for it again.
+            if drainee.ctl.is_some() && drainee.manual.is_none() {
+                drainee.entry.status = ProcStatus::Online;
+            }
         }
 
         let new_id = job.swap.new_id;
@@ -5850,6 +5863,64 @@ mod tests {
         assert_eq!(after[0].id, 1);
         assert_eq!(after[0].status, ProcStatus::Online);
         assert_eq!(runner.kill_counts(), vec![0, 0], "neither was SIGKILLed");
+    }
+
+    // fails if abandoning a reload reports a drainee that is itself dying as
+    // `Online`. The restore exists for the drainee that goes back to serving;
+    // one an operator's `stop` already claimed is going nowhere but away, and
+    // saying `Online` of it hands `shep flock` a live pid for a process on
+    // its way out and re-opens `handle_extra_restart`'s `Online` guard for
+    // the length of the ladder.
+    //
+    // The scripts are asymmetric the other way round from
+    // `an_operators_stop_mid_reload_leaves_the_app_stopped_and_registered`,
+    // and for the same reason: the `stop` claims both halves at once, and it
+    // is the REPLACEMENT's exit landing first that routes the abandonment
+    // through a drainee that is still alive. A drainee defying its signal is
+    // what pins that order.
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_reload_never_reports_a_dying_drainee_as_online() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppConfig::minimal("web", "./srv");
+        // Nobody signals the replacement, so the swap is still `AwaitReady`
+        // when the stop lands and the abandonment is reachable at all.
+        app.wait_ready = true;
+        let (handle, _runner, mut rx) = started(
+            &dir,
+            app,
+            vec![ProcScript::ignores_signals(), ProcScript::never_exits()],
+        )
+        .await;
+        handle.tx.send(Msg::Ready { id: 0 }).await.unwrap();
+        expect_event(&mut rx, 0, ProcessEventKind::Online).await;
+
+        handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the reload is accepted");
+        expect_event(&mut rx, 1, ProcessEventKind::Start).await;
+
+        // Not awaited here: the drainee defies its signal, so the stop's own
+        // reply is a whole `kill_timeout` away and the window under test is
+        // before that.
+        let stopper = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.stop(ProcessSelector::Name("web".to_string())).await })
+        };
+        expect_event(&mut rx, 1, ProcessEventKind::Delete).await;
+
+        let mid = handle.list().await;
+        assert_eq!(mid.len(), 1, "only the abandoned replacement has gone");
+        assert_eq!(mid[0].id, 0);
+        assert_eq!(
+            mid[0].status,
+            ProcStatus::Stopping,
+            "a drainee an operator already claimed is not back to serving"
+        );
+
+        let stopped = stopper.await.unwrap().expect("the stop is answered");
+        assert_eq!(stopped.len(), 2, "a stop answers for every id it matched");
+        assert_eq!(handle.list().await[0].status, ProcStatus::Stopped);
     }
 
     // fails if an automatic restart is allowed to land on either half of an
