@@ -1476,14 +1476,14 @@ impl<R: ProcessRunner> Actor<R> {
         let mut results = Vec::new();
 
         for id in matched {
-            // An automatic restart is held off BOTH halves of an in-flight
-            // swap. A reload's whole point is the overlap, and a cron
-            // occurrence or a watched file landing inside it destroys that
-            // from either side: killing the drainee abandons the reload, and
-            // killing the replacement abandons it just as surely — the deploy
-            // becomes the ordinary hard restart the feature exists to avoid.
-            // For a `watch` app, the archetypal reload-often one, any save
-            // inside the readiness window did it.
+            // An automatic restart is held off BOTH halves of a swap that has
+            // not committed yet. A reload's whole point is the overlap, and a
+            // cron occurrence or a watched file landing inside it destroys
+            // that from either side: killing the drainee abandons the reload,
+            // and killing the replacement abandons it just as surely — the
+            // deploy becomes the ordinary hard restart the feature exists to
+            // avoid. For a `watch` app, the archetypal reload-often one, any
+            // save inside the readiness window did it.
             //
             // Dropping the trigger costs nobody an answer, which is
             // `claim_manual`'s own carve-out argument applied one step
@@ -1493,15 +1493,16 @@ impl<R: ProcessRunner> Actor<R> {
             // picked up. Instances of the app the reload has not reached yet
             // are not half of any swap and restart as usual.
             //
-            // The other two automatic triggers — a memory breach and a
-            // liveness failure — need nothing here: they arrive through
-            // `Msg::ExtraRestart`, whose guard rejects anything that is not
-            // `Online`, and neither half of a swap is.
-            let held_off_by_a_swap = origin == CommandOrigin::Automatic
-                && self
-                    .sheep
-                    .get(&id)
-                    .is_some_and(|slot| slot.entry.reload != ReloadState::None);
+            // It stops at the commit rather than running to the end of the
+            // job, and that boundary is the point: past `AwaitReady` the
+            // replacement IS the app's live instance, and a memory breach or
+            // liveness failure against it deserves the same restart it would
+            // get an hour later. The drainee needs nothing from here by then
+            // — the drain holds its marker, and `claim_manual` drops an
+            // automatic restart against a marker an operator's command
+            // already owns.
+            let held_off_by_a_swap =
+                origin == CommandOrigin::Automatic && self.in_an_uncommitted_swap(id);
             if held_off_by_a_swap {
                 continue;
             }
@@ -2150,6 +2151,15 @@ impl<R: ProcessRunner> Actor<R> {
         self.resolve_pending(id, info)
     }
 
+    /// Whether `id` is half of a swap that has not committed yet — the window
+    /// in which ending either half loses the overlap the reload exists for.
+    fn in_an_uncommitted_swap(&self, id: u32) -> bool {
+        self.reloads.values().any(|job| {
+            job.swap.phase == ReloadPhase::AwaitReady
+                && (job.swap.old_id == id || job.swap.new_id == id)
+        })
+    }
+
     /// The app whose in-flight reload names `id`, in either role.
     fn reload_of(&self, id: u32) -> Option<String> {
         self.reloads
@@ -2675,11 +2685,16 @@ impl<R: ProcessRunner> Actor<R> {
     ///    arrive seconds after the sheep is `Stopped` — and
     ///    `ProcessSelector::Id` matches regardless of status, so without this
     ///    the daemon would resurrect a process the user explicitly stopped
-    ///    and report success. The same check is what rejects a report against
-    ///    a reload's drainee, the one entry [`ProcStatus::Stopping`] actually
+    ///    and report success. The same check also rejects a report against a
+    ///    reload's drainee, the one entry [`ProcStatus::Stopping`] otherwise
     ///    reaches: a liveness failure or memory breach raised against it must
     ///    ride out to the drainee's own exit, never claim its manual marker
-    ///    and kill it a second time.
+    ///    and kill it a second time. For that one case this is now the first
+    ///    of two rejections — `begin_manual`, which every automatic restart
+    ///    goes through including this one, holds them off both halves of an
+    ///    uncommitted swap on its own. The stopped-sheep case above is this
+    ///    guard's alone, so it is not redundant; and a report against a
+    ///    drainee being dropped twice over is the right amount.
     ///
     /// Delegates to `begin_manual` rather than `respawn`: that keeps the kill
     /// ladder, the marker rule, the `pending_delete` interaction and the budget
@@ -5714,21 +5729,34 @@ mod tests {
         assert_eq!(runner.kill_counts().len(), 1, "nothing was spawned");
     }
 
-    // fails if the drainee is left `Online` through the `AwaitReady` window.
-    // A liveness failure or memory breach raised against it would then pass
-    // `handle_extra_restart`'s status guard, claim its marker and kill it —
-    // ending the instance shep is in the middle of replacing before the
-    // replacement can serve, which is the outage a reload exists to avoid.
+    // A liveness failure or memory breach raised against a drainee must ride
+    // out to that drainee's own exit: claiming its marker kills the instance
+    // shep is in the middle of replacing, before the replacement can serve,
+    // which is the outage a reload exists to avoid.
+    //
+    // Two independent checks stop it, so this case fails only when BOTH are
+    // gone, and the honest reading is that it pins the OUTCOME rather than
+    // either mechanism. `handle_extra_restart`'s guard 4 rejects a status
+    // that is not `Online`, and `begin_manual` drops an automatic restart
+    // against either half of an uncommitted swap. Each has its own case that
+    // reddens on a single line — `a_stopping_sheep_rejects_an_extra_restart`
+    // for the guard, `an_automatic_restart_never_lands_on_either_half_of_a_swap`
+    // for the drop — and neither of those drives a real report through a real
+    // reload, which is what this one is for.
     #[tokio::test(start_paused = true)]
     async fn a_report_raised_against_a_drainee_never_takes_it_off_the_reload() {
         let dir = tempfile::tempdir().unwrap();
-        // Two scripts: original and replacement. A report that wrongly
-        // restarted the drainee would take a third and find the pool empty,
-        // so the count below reads that as well as the kill.
+        // Three scripts, of which a correct run uses two. `kill_counts`
+        // collects one entry per SUCCESSFUL spawn, so with a pool of two a
+        // report that wrongly restarted the drainee would be invisible to it:
+        // the respawn would find the pool empty, fail, and leave the drainee
+        // `Errored` rather than the live process the bug really produces. The
+        // third script lets that respawn succeed, so the count below reads
+        // the extra spawn and the status reads what it left behind.
         let (handle, runner, mut rx) = started(
             &dir,
             AppConfig::minimal("web", "./srv"),
-            vec![ProcScript::never_exits(), ProcScript::never_exits()],
+            vec![ProcScript::never_exits(); 3],
         )
         .await;
         let pid = handle.list().await[0].pid.expect("a live sheep has a pid");
