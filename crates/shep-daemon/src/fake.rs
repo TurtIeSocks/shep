@@ -38,6 +38,10 @@ pub struct ProcScript {
     pub outcome: ExitOutcome,
     /// Whether the process honors `signal()`/`Shutdown` by exiting early
     pub obeys_signal: bool,
+    /// Whether a forked lamb keeps the child's stdout and stderr open past
+    /// the child's own exit, so neither stream ever reaches EOF. See
+    /// [`ProcScript::with_a_lamb_holding_the_pipe`].
+    pub lamb_holds_the_pipe: bool,
 }
 
 impl ProcScript {
@@ -51,6 +55,7 @@ impl ProcScript {
                 signal: None,
             },
             obeys_signal: true,
+            lamb_holds_the_pipe: false,
         }
     }
 
@@ -64,6 +69,7 @@ impl ProcScript {
                 signal: None,
             },
             obeys_signal: true,
+            lamb_holds_the_pipe: false,
         }
     }
 
@@ -77,6 +83,7 @@ impl ProcScript {
                 signal: None,
             },
             obeys_signal: true,
+            lamb_holds_the_pipe: false,
         }
     }
 
@@ -86,6 +93,24 @@ impl ProcScript {
         Self {
             obeys_signal: false,
             ..Self::never_exits()
+        }
+    }
+
+    /// This script, with a forked lamb holding the child's stdout and stderr
+    /// open past the child's own exit.
+    ///
+    /// A scripted proc's log-control task otherwise ends with the proc,
+    /// which models the ordinary sheep: both streams reach EOF when the
+    /// child does, and that retires the real runner's pump. A lamb that
+    /// inherited those pipes retires nothing, and the pump is then left to
+    /// end on one of its other conditions — its `logs` receiver going away,
+    /// or the last control sender dropping. This is the only way to put a
+    /// test on that path from the fake tier.
+    #[must_use]
+    pub fn with_a_lamb_holding_the_pipe(self) -> Self {
+        Self {
+            lamb_holds_the_pipe: true,
+            ..self
         }
     }
 }
@@ -136,7 +161,8 @@ struct ProcState {
     /// `tokio::process::Child::wait`'s documented repeat-call behavior.
     resolved: Mutex<Option<ExitOutcome>>,
     /// Flipped to `true` when `wait()` latches an outcome, and watched by
-    /// this proc's log-control task so that task ends with the proc.
+    /// this proc's log-control task so that task ends with the proc — unless
+    /// [`ProcScript::lamb_holds_the_pipe`] says the streams outlive it.
     ///
     /// Without it the fake would answer a reopen aimed at a proc that exited
     /// long ago, while the real runner's pump — and with it the receiving
@@ -321,12 +347,13 @@ impl ScriptedRunner {
     /// Whether the log-control task for the proc spawned at `spawn_index` is
     /// still running.
     ///
-    /// It runs while someone still holds the [`ProcIo::log_ctl`] sender that
-    /// spawn handed out AND the proc has not exited — the two facts that
-    /// keep a real runner's log pump alive. This is how an engine test pins
-    /// that a live sheep is still holding its end of that channel, which
-    /// nothing else in the fake can show: the fake writes no files, so a
-    /// sender dropped by mistake costs its tests nothing.
+    /// It runs while something still holds a [`ProcIo::log_ctl`] sender AND
+    /// something still holds the [`ProcIo::logs`] receiver AND the proc has
+    /// not exited (that last one only while no lamb holds the pipe —
+    /// [`ProcScript::with_a_lamb_holding_the_pipe`]). Those are the three
+    /// facts that keep a real runner's log pump alive, and this is how an
+    /// engine test pins them: the fake writes no files, so a pump left
+    /// running by mistake costs its tests nothing otherwise.
     ///
     /// # Panics
     ///
@@ -415,12 +442,14 @@ impl ProcessRunner for ScriptedRunner {
         // the child's streams reach EOF, so a reopen aimed at a sheep that
         // has stopped fails to send; a fake that kept answering past its
         // proc's exit would make that branch unreachable from this tier and
-        // every test of it vacuous. So this task ends with the proc as well
-        // as with the sender.
+        // every test of it vacuous. So this task ends on each of the three
+        // conditions that end a real pump, and on nothing else.
         let log_ctl_live = Arc::new(AtomicBool::new(true));
         let ctl_live = Arc::clone(&log_ctl_live);
         let reopens = Arc::new(AtomicU32::new(0));
         let reopen_count = Arc::clone(&reopens);
+        let lamb_holds_the_pipe = script.lamb_holds_the_pipe;
+        let logs_for_pump = logs_tx.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -432,12 +461,18 @@ impl ProcessRunner for ScriptedRunner {
                             reopen_count.fetch_add(1, Ordering::SeqCst);
                             let _ = done.send(());
                         }
-                        None => break, // the holder dropped ProcIo::log_ctl
+                        None => break, // nothing holds ProcIo::log_ctl
                     },
+                    // The owner dropped ProcIo::logs. A real pump ends on
+                    // this whether or not a line is flowing, and it is the
+                    // only thing that ends one whose streams a lamb is
+                    // holding open.
+                    () = logs_for_pump.closed() => break,
                     // Resolves when `wait()` latches an outcome, and errors
                     // once nothing holds this proc's state any more. Either
-                    // way the proc is over, and so is its pump.
-                    _ = exited_rx.changed() => break,
+                    // way the proc is over — which reaches the pump as both
+                    // streams hitting EOF, unless a lamb inherited them.
+                    _ = exited_rx.changed(), if !lamb_holds_the_pipe => break,
                 }
             }
             // Stored before this task returns, so the flag is already false

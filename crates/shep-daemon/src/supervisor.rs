@@ -583,17 +583,19 @@ struct SheepSlot {
     ///
     /// Written on every successful spawn and never cleared, unlike `ctl`.
     /// Whether a pump is still there is a fact the channel already answers —
-    /// a send fails the moment the pump ends — and recording it here as well
-    /// would be a second copy of it, free to disagree with the first. The two
-    /// are not even the same question: a sheep's pump outlives its process
-    /// whenever a forked lamb inherited the pipe and is still writing, and
-    /// rotating THAT log is worth doing precisely because something is still
-    /// filling it.
+    /// a send fails the moment the pump ends — and clearing this field
+    /// alongside `ctl` would be a second copy of that fact, free to disagree
+    /// with the first.
     ///
-    /// The sheep task holds the original for the whole run (see `run_sheep`),
-    /// so this clone never shortens the pump's life. It does not lengthen it
-    /// either: a pump ends at both-EOF or when its `logs` receiver goes, and
-    /// both follow the child's exit regardless of who still holds a sender.
+    /// Holding it costs the pump no extra life. A pump ends when its `logs`
+    /// receiver goes as readily as when its last control sender does
+    /// (`spawn_log_pump`'s own `select!` has a branch for each), and the
+    /// sheep task holds that receiver for exactly as long as it holds the
+    /// original sender — so this clone can delay nothing. Without that
+    /// branch it could: a lamb that inherited the child's pipe holds both
+    /// streams open past the child's exit, and a clone kept here would then
+    /// be the only thing left deciding when the pump — and its two files and
+    /// two pipe read ends — got to end.
     log_ctl: Option<mpsc::Sender<LogCtl>>,
     /// Which manual command (if any) is waiting on this sheep's next exit,
     /// and who asked for it. Claimed through [`Actor::claim_manual`].
@@ -2059,31 +2061,25 @@ async fn run_sheep<P: RunningProcess>(
     actor_tx: mpsc::Sender<Msg>,
 ) {
     // `io` is destructured here, in the task's own body, and that placement
-    // is load-bearing rather than stylistic. The log pump ends the moment
-    // `log_ctl` drops, taking the read ends of the child's stdout and stderr
-    // with it, so the child's next write to either gets `EPIPE`/`SIGPIPE`:
-    // letting go of that sender early kills children rather than merely
-    // stopping their logs.
+    // is load-bearing rather than stylistic. The log pump ends when its
+    // `logs` receiver goes as readily as when the last `log_ctl` sender does
+    // (`tokio_runner`'s `spawn_log_pump`), and ending it drops the read ends
+    // of the child's stdout and stderr, so the child's next write to either
+    // gets `EPIPE`/`SIGPIPE`: letting go of ANY of these fields early kills
+    // children rather than merely stopping their logs.
     //
-    // Naming the field says so out loud, though `log_ctl: _` or a `..` would
-    // survive too — neither moves the field, so it rides `io` to the end of
-    // this function either way. What does NOT survive is `io` being taken
-    // apart in a scope shorter than the task: a helper that returns the three
-    // receivers, or a `let (a, b, c) = { ... };` block, drops the leftover
-    // field at its own closing brace and stops every child in the flock.
-    // `_log_ctl` is bound and never read on purpose. The log pump ends the
-    // moment that sender drops, taking the read ends of the child's stdout
-    // and stderr with it, so the child's next write to either gets
-    // `EPIPE`/`SIGPIPE`: letting go of it early kills children rather than
-    // merely stopping their logs. It has to outlive the sheep, and it does.
+    // `_log_ctl` is bound and never read on purpose, to say that out loud —
+    // but the binding is documentation, not the mechanism. `io` is this
+    // function's own parameter, so a field the pattern leaves unbound
+    // (`log_ctl: _`, or a `..`, even inside a narrower inner block) is not
+    // moved anywhere and drops when `run_sheep` returns, exactly as a named
+    // binding does. Both were tried against the case below and neither
+    // shortens the sender's life.
     //
-    // The binding is documentation, not the mechanism. `io` is this
-    // function's own parameter, so a field the pattern leaves unbound —
-    // `log_ctl: _`, or a `..`, even inside a narrower inner block — is not
-    // moved anywhere and drops when `run_sheep` returns, exactly as this
-    // does. Both were tried against the case below and neither shortens the
-    // sender's life. What does is moving it: an explicit `drop`, or handing
-    // it to a helper that returns before the sheep exits.
+    // What does NOT survive is `io` being taken apart in a scope shorter
+    // than the task: a helper that returns the three receivers, or a
+    // `let (a, b, c) = { ... };` block, drops whatever the pattern left
+    // behind at its own closing brace and stops every child in the flock.
     let ProcIo {
         mut logs,
         mut from_child,
@@ -2790,6 +2786,7 @@ mod tests {
                 signal: None,
             },
             obeys_signal: true,
+            lamb_holds_the_pipe: false,
         }]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -3763,6 +3760,62 @@ mod tests {
             "run_sheep dropped ProcIo::log_ctl while its sheep was still \
              running: against the real runner that closes the read ends of \
              the child's stdout and stderr"
+        );
+    }
+
+    /// Fails if a sheep's log pump is left running once its sheep task is
+    /// over, in the one case the sheep's own exit cannot end it: a lamb that
+    /// inherited the child's pipes holds both streams open past that exit,
+    /// and [`SheepSlot::log_ctl`] keeps a control sender for as long as the
+    /// sheep stays registered. What is left to reap the pump is its `logs`
+    /// receiver going away with the sheep task — so a pump that noticed that
+    /// only when a line arrived would hold its two log files and both pipe
+    /// read ends until a `Delete`, or until the daemon exited.
+    ///
+    /// The slot is deliberately not cleared to fix this, and this case is
+    /// what makes keeping the clone free rather than merely convenient. See
+    /// [`SheepSlot::log_ctl`] for why the field has one writer and no
+    /// second copy of "is the pump still there".
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_is_reaped_when_its_sheep_ends_even_with_a_lamb_on_the_pipe() {
+        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        // One script for one spawn: `autorestart = false` below means the
+        // supervisor never asks for a second.
+        let runner = Arc::new(ScriptedRunner::new(vec![
+            ProcScript::stable_then_exit(1_000, 0).with_a_lamb_holding_the_pipe(),
+        ]));
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(SharedRunner(Arc::clone(&runner)), test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.autorestart = false;
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        assert!(
+            runner.log_ctl_live(0),
+            "sanity: a running sheep has a live pump"
+        );
+
+        // `Stop`, not `Exit`: with `autorestart` off a clean exit is a clean
+        // stop, and `Exit` is the event that announces a pending restart.
+        await_event(&mut rx, 0, ProcessEventKind::Stop).await;
+        assert_eq!(
+            handle.list().await.len(),
+            1,
+            "sanity: the sheep is still registered, so its slot still holds a \
+             clone of the control sender"
+        );
+
+        // A bounded poll rather than one read: the pump ends on its own
+        // task's schedule, which is after the exit event this woke on.
+        let reaped = tokio::time::timeout(Duration::from_secs(5), async {
+            while runner.log_ctl_live(0) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            reaped.is_ok(),
+            "the pump outlived its sheep task, holding both log files and \
+             both pipe read ends open"
         );
     }
 

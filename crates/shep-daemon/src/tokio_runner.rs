@@ -535,9 +535,18 @@ where
 /// The barrier that can be relied on is [`LogCtl::Reopen`]'s
 /// acknowledgement, which flushes before swapping handles.
 ///
-/// Runs until both streams reach EOF (normally the child exiting), the
-/// owning sheep task drops its `logs` receiver, or that task drops its
-/// `log_ctl` sender.
+/// # When a pump ends
+///
+/// At both streams reaching EOF (normally the child exiting), when the
+/// owning sheep task drops its `logs` receiver, or when the last `log_ctl`
+/// sender anywhere drops. Each is a branch of its own, so none of them needs
+/// a line to arrive before it is noticed.
+///
+/// The `logs` receiver is the one that reaps a pump whose child has forked a
+/// lamb that inherited the pipe: neither stream reaches EOF while the lamb
+/// lives, and the supervisor holds a `log_ctl` clone for as long as the
+/// sheep is registered (`SheepSlot::log_ctl`), so the other two conditions
+/// can wait indefinitely.
 fn spawn_log_pump<O, E>(
     stdout: Option<O>,
     stderr: Option<E>,
@@ -576,9 +585,21 @@ fn spawn_log_pump<O, E>(
                 ctl = ctl_rx.recv() => {
                     match ctl {
                         Some(ctl) => files.serve(ctl).await,
-                        None => break, // owning sheep task dropped log_ctl
+                        None => break, // nothing holds a `log_ctl` sender
                     }
                 }
+                // The owning sheep task dropped its `logs` receiver. Its own
+                // branch rather than a check folded into the line handling,
+                // because a pump whose child writes nothing has no next line
+                // to notice it on — a forked lamb holding the pipe open past
+                // the child's exit is exactly that pump, and without this it
+                // would keep two files and two pipe read ends open until the
+                // sheep is deleted or the daemon exits.
+                //
+                // Documented cancel-safe, as a `select!` branch must be: a
+                // closed channel stays closed, so losing the race loses
+                // nothing.
+                () = logs_tx.closed() => break,
             }
         }
     });
@@ -1046,6 +1067,38 @@ mod tests {
         // caller that had already started awaiting one is told the same
         // thing rather than left pending.
         assert!(ack.await.is_err());
+    }
+
+    /// Fails if the pump can only notice a departed `logs` receiver from
+    /// inside `deliver_line` — that is, if it has no `select!` branch of its
+    /// own for it.
+    ///
+    /// Without that branch a pump ends on a line it cannot deliver, on both
+    /// streams reaching EOF, or on its last control sender dropping. A child
+    /// that forked a lamb holding its pipes open satisfies none of the
+    /// three: the lamb keeps both streams from EOF whether or not it ever
+    /// writes, and the supervisor keeps a control sender for as long as the
+    /// sheep stays registered (`SheepSlot::log_ctl`). The pump task, both
+    /// `LogFile` handles and both pipe read ends would then live until that
+    /// sheep was deleted or the daemon exited.
+    #[tokio::test]
+    async fn dropping_the_logs_receiver_ends_a_pump_with_no_line_to_carry_the_news() {
+        let pump = PumpHarness::start();
+        // A barrier proving the pump is up and serving control requests, so
+        // the drop below cannot race its initial open.
+        pump.reopen().await;
+
+        drop(pump.logs); // the sheep task returning
+
+        // Both stream writers are still held, so neither stream is at EOF,
+        // and `pump.ctl` is still alive, so the control channel is still
+        // open from this side: the receiver above is the only thing that can
+        // end this pump. `closed()` resolves when the pump's own `ctl_rx`
+        // drops with its task, so this is a bounded wait for that rather
+        // than a guess that it already happened.
+        timeout(PUMP_DEADLINE, pump.ctl.closed())
+            .await
+            .expect("a pump whose `logs` receiver is gone must end");
     }
 
     /// Fails if the pump treats a closed control channel as nothing to do:

@@ -145,6 +145,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   acknowledgements are awaited on a task of their own and never inside the
   actor loop — an actor parked on one stops draining its mailbox, which
   stops the sheep task draining its logs, which stops the pump answering.
+  Holding that clone costs the pump no life of its own: a pump ends when its
+  `logs` receiver goes away as readily as when its last control sender does,
+  and the sheep task lets go of both together. That is what retires the pump
+  of a sheep whose child forked a lamb and left it holding the pipe — with
+  neither stream ever reaching EOF, nothing else would.
 
 ### Fixes
 

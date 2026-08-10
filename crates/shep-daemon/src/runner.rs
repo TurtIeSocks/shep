@@ -131,18 +131,25 @@ pub struct ProcIo {
     pub to_child: mpsc::Sender<ShepherdMessage>,
     /// Control channel into this sheep's log pump
     ///
-    /// The pump is the only reader of the child's stdout and stderr, so
-    /// **dropping this sender ends it** — hold it for as long as the child
-    /// is alive. Ending the pump drops the read ends of those two pipes
-    /// along with it, and the child's next write to either then gets
-    /// `EPIPE`/`SIGPIPE`: the child typically dies on the spot rather than
-    /// stalling on a pipe nobody drains.
+    /// The pump is the only reader of the child's stdout and stderr, and it
+    /// ends when the last of these senders drops — so hold this for as long
+    /// as the child is alive. Ending the pump drops the read ends of those
+    /// two pipes along with it, and the child's next write to either then
+    /// gets `EPIPE`/`SIGPIPE`: the child typically dies on the spot rather
+    /// than stalling on a pipe nobody drains.
     ///
-    /// A send that fails means the pump is already gone (both streams
-    /// reached EOF, normally the child exiting), which makes a reopen a
-    /// no-op rather than an error. [`LogCtl::Reopen`]'s acknowledgement
-    /// resolving `Err` says the same thing about a request that was accepted
-    /// and then never served.
+    /// Cloning it is therefore not free of consequence, and the supervisor
+    /// does clone it (`SheepSlot::log_ctl`, so a `Reopen` can reach a pump
+    /// without going through the sheep task). What keeps a clone from
+    /// stretching a pump's life is the pump's own exit on the `logs`
+    /// receiver going away — see `tokio_runner`'s `spawn_log_pump` — which
+    /// the owner of this bundle drops when it drops the bundle.
+    ///
+    /// A send that fails means the pump is already gone (its `logs` receiver
+    /// dropped, or both streams reached EOF — normally the child exiting),
+    /// which makes a reopen a no-op rather than an error.
+    /// [`LogCtl::Reopen`]'s acknowledgement resolving `Err` says the same
+    /// thing about a request that was accepted and then never served.
     pub log_ctl: mpsc::Sender<LogCtl>,
 }
 
