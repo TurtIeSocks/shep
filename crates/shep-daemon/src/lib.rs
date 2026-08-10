@@ -6,43 +6,47 @@
 //! gates lifecycle commands (start, stop, restart, delete, shutdown) through a
 //! single [`SupervisorHandle`](supervisor::SupervisorHandle). Pure decision logic
 //! (brain, backoff, entry assembly) is IO-free for deterministic testing under a
-//! paused tokio clock. [`RpcServer`](server::RpcServer) exposes that engine to a
-//! CLI client over `$SHEP_HOME/run/shep.sock`, and [`boot`] assembles both into
-//! one running daemon. The OS tier (real spawning, signal delivery, the kill
-//! ladder, the socket itself) is unix-only. Production daemon embeds this
-//! crate; the CLI re-executes itself with a hidden `daemon` subcommand to
-//! daemonize.
+//! paused tokio clock. `RpcServer` exposes that engine to a CLI client over
+//! `$SHEP_HOME/run/shep.sock`, and [`boot`] assembles both into one running
+//! daemon. The OS tier (real spawning, signal delivery, the kill ladder, the
+//! socket itself) is unix-only. Production daemon embeds this crate; the CLI
+//! re-executes itself with a hidden `daemon` subcommand to daemonize.
 //!
 //! ## Module taxonomy
+//!
+//! A linked name below is public; a name in plain backticks is crate-private
+//! and has no rendered page to link to. The split is the crate's API boundary,
+//! not a formatting accident — see the two commented blocks of module
+//! declarations for which consumer holds each public one open.
 //!
 //! ##### Engine
 //!
 //! Process-lifecycle decision logic and the actor that runs it (2a).
 //!
-//! - [`brain`]: restart decision tree given exit outcome, uptime, and budget
-//! - [`backoff`]: restart delay computation per the spec's exponential backoff rule
+//! - `brain`: restart decision tree given exit outcome, uptime, and budget
+//! - `backoff`: restart delay computation per the spec's exponential backoff rule
 //! - [`assemble`]: process env, log paths, and spawn spec assembly
-//! - [`entry`]: process lifecycle state, restart budget, reload state machine
+//! - `entry`: process lifecycle state, restart budget, reload state machine
 //! - [`runner`]: [`ProcessRunner`](runner::ProcessRunner) spawn seam with two impls
 //! - `fake`: deterministic scripted [`ProcessRunner`](runner::ProcessRunner) (test-only, or test-fakes feature — not linked here since it is absent from a default-features doc build)
-//! - [`kill`]: kill ladder — SIGTERM, SIGKILL escalation (portable, generic over [`RunningProcess`](runner::RunningProcess))
+//! - `kill`: kill ladder — SIGTERM, SIGKILL escalation (portable, generic over [`RunningProcess`](runner::RunningProcess))
 //! - [`supervisor`]: the actor — owns registered entries, spawns per-sheep tasks, routes commands
 //! - [`channel`]: shepherd channel codec (child↔daemon messages, newline-JSON)
-//! - [`cron`]: the [`Clock`](cron::Clock) seam and the worker that restarts a
-//!   name-group on its `cron_restart` schedule
+//! - `cron`: the `Clock` seam and the worker that restarts a name-group on
+//!   its `cron_restart` schedule
 //! - [`limits`]: the [`MemorySampler`](limits::sample::MemorySampler) seam
 //!   over a sheep's process tree, and the polling enforcer that consumes it —
 //!   reports a breach once a sheep's tree exceeds its `max_memory`
 //! - [`probes`]: the [`Prober`](probes::Prober) seam and the liveness probe
 //!   loop — reports a sheep's health once `failure_threshold` consecutive
-//!   probes have failed; [`os::OsProber`](probes::os::OsProber) is the
-//!   concrete hand-rolled HTTP/TCP/exec implementation
-//! - [`watch`]: the [`WatchSource`](watch::source::WatchSource) OS seam —
-//!   bridges notify's debounced filesystem events onto a tokio channel
-//! - [`extras`]: the [`ExtrasRegistry`](extras::ExtrasRegistry) that arms the
-//!   four subsystems above when a sheep goes online and disarms them when it
-//!   goes terminal, plus the reporting task that turns a memory breach or a
-//!   liveness failure into a guarded restart
+//!   probes have failed; `os::OsProber` is the concrete hand-rolled
+//!   HTTP/TCP/exec implementation
+//! - `watch`: the `WatchSource` OS seam — bridges notify's debounced
+//!   filesystem events onto a tokio channel
+//! - `extras`: the `ExtrasRegistry` that arms the four subsystems above when
+//!   a sheep goes online and disarms them when it goes terminal, plus the
+//!   reporting task that turns a memory breach or a liveness failure into a
+//!   guarded restart
 //!
 //! ##### Plane
 //!
@@ -50,9 +54,9 @@
 //! the socket itself, the persisted muster roll, and the boot sequence that
 //! wires all of the above (plus the engine above) into one daemon.
 //!
-//! - [`bus`]: the daemon-wide event bus — topic-glob filtering, per-subscriber forwarder tasks
+//! - `bus`: the daemon-wide event bus — topic-glob filtering, per-subscriber forwarder tasks
 //! - [`rpc`]: request dispatch — verb routing onto [`SupervisorHandle`](supervisor::SupervisorHandle), typed errors, per-call deadlines
-//! - [`server`]: the unix-socket connection layer — peer-cred auth, handshake, subscriptions (unix-only)
+//! - `server`: the unix-socket connection layer — peer-cred auth, handshake, subscriptions (unix-only)
 //! - [`snapshot`]: the muster roll — debounced atomic `flock.json` writes, restart-survival restore
 //! - [`boot`]: daemon boot — `0700` layout dirs, pidfile, socket bind with stale-socket
 //!   recovery, the readiness pipe, signal handlers, and the ordered teardown sequence (unix-only)
@@ -139,9 +143,9 @@
 //! via [`boot`] — on a temporary `$SHEP_HOME`, using the same scripted fake
 //! runner as the example above so it stays hermetic (no real child
 //! processes), then connects a raw client to the control socket and
-//! round-trips one `Ping` over the same wire codec [`server`] itself speaks.
+//! round-trips one `Ping` over the same wire codec `server` itself speaks.
 //! Compile with `--all-features` on a unix target (`test-fakes` for the fake
-//! runner, plus the unix-only [`boot`]/[`server`] modules this example needs).
+//! runner, plus the unix-only [`boot`]/`server` modules this example needs).
 //!
 //! ```no_run
 //! # #[cfg(all(unix, feature = "test-fakes"))]
@@ -200,15 +204,28 @@
 #![doc(test(attr(deny(warnings))))]
 #![deny(unsafe_code)]
 
+// Internal tier: nothing outside this crate's own `src` names these, so they
+// are not API. A dog is a separate process that speaks the protocol rather
+// than linking this crate, so what a dog author builds against is
+// `shep-core`; this crate's supervision internals are not part of that
+// contract. Widening one back to `pub` is a deliberate API decision, and the
+// module's own header says what would justify it where the question is live.
+pub(crate) mod backoff;
+pub(crate) mod brain;
+pub(crate) mod bus;
+pub(crate) mod cron;
+pub(crate) mod entry;
+pub(crate) mod extras;
+pub(crate) mod kill;
+pub(crate) mod watch;
+
+// Reachable tier: each of these is named from outside this crate's `src` —
+// by `shep-cli`, by an integration test under `tests/`, by the bench crate,
+// or by a doc example (which rustdoc compiles as its own crate). Every
+// module here carries a note in its own header saying which consumer holds
+// it open.
 pub mod assemble;
-pub mod backoff;
-pub mod brain;
-pub mod bus;
 pub mod channel;
-pub mod cron;
-pub mod entry;
-pub mod extras;
-pub mod kill;
 pub mod limits;
 pub mod privilege;
 pub mod probes;
@@ -216,7 +233,6 @@ pub mod rpc;
 pub mod runner;
 pub mod snapshot;
 pub mod supervisor;
-pub mod watch;
 
 use std::time::SystemTime;
 
@@ -239,6 +255,9 @@ pub(crate) mod testing;
 // bits) and `tokio::net::UnixListener`. Doc lives inside boot.rs's own
 // `//!` header (not here) — see the comment on `server` below for why an
 // outer `///` here would be the wrong place for it.
+//
+// Reachable tier: `shep-cli`'s hidden `daemon` subcommand calls `boot` and
+// `RunningDaemon::run`, and `launch.rs` reads `DIR_MODE`.
 #[cfg(unix)]
 pub mod boot;
 
@@ -249,6 +268,15 @@ pub mod boot;
 // have no portable equivalent. Doc lives inside sys.rs's own `//!` header
 // (IR-24's rationale essay), not here — same reasoning as `server`'s note
 // below.
+//
+// Reachable tier, and the one entry here whose consumer is not written yet:
+// `boot` deliberately does not call `adopt_fd` (that is what removed the
+// fd-recycling hazard sys.rs's scenario (c) describes), so the ordering
+// precondition can only be discharged by a caller that runs before any
+// runtime exists — `shep-cli`'s `main`. `pub(crate)` compiles but leaves the
+// whole module dead outside its own tests, which is a worse signal than
+// this note: it would read as unused code rather than as a seam waiting on
+// its documented caller.
 #[cfg(unix)]
 pub mod sys;
 
@@ -258,6 +286,9 @@ pub mod sys;
 /// (fd-3 passing), both `#[cfg(unix)]` deps (see this crate's `Cargo.toml`).
 /// The pure tier above (types, traits, the scripted fake) compiles on every
 /// platform; only this OS tier is gated out on Windows.
+///
+/// Public because `shep-cli` hands [`TokioRunner`](tokio_runner::TokioRunner)
+/// to [`boot`], and `tests/real_runner.rs` drives it against real children.
 #[cfg(unix)]
 pub mod tokio_runner;
 
@@ -270,10 +301,16 @@ pub mod tokio_runner;
 // intra-doc links against this file's scope, breaking every bare
 // same-module link inside server.rs's own header (confirmed by a minimal
 // repro during Task 5's docs gate).
+//
+// Internal tier: `boot` constructs and runs the server; nothing outside this
+// crate names it.
 #[cfg(unix)]
-pub mod server;
+pub(crate) mod server;
 
 /// Deterministic scripted [`ProcessRunner`](runner::ProcessRunner), reused by
-/// this crate's own tests and (behind `test-fakes`) by Phase 2b's tests.
+/// this crate's own tests and, behind `test-fakes`, by any other crate's.
+///
+/// Public because both doc examples above build one, and rustdoc compiles a
+/// doc example as its own crate — not because anything ships against it.
 #[cfg(any(test, feature = "test-fakes"))]
 pub mod fake;

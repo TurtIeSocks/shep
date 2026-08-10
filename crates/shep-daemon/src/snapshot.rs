@@ -1,11 +1,11 @@
 //! The muster roll: persisted flock state for restart-survival (`shep muster`)
 //!
-//! [`FlockRegistry`] tracks each registered sheep's [`AppConfig`] in memory;
-//! [`FlockRegistry::roll`] turns it plus a live [`ProcessInfo`] listing into
-//! a [`FlockSnapshot`], written to `flock.json` by [`write_atomic`]. A
-//! [`SnapshotWriter`] task ([`spawn_snapshot_writer`]) debounces lifecycle
+//! `FlockRegistry` tracks each registered sheep's [`AppConfig`] in memory;
+//! `FlockRegistry::roll` turns it plus a live [`ProcessInfo`] listing into
+//! a [`FlockSnapshot`], written to `flock.json` by `write_atomic`. A
+//! `SnapshotWriter` task (`spawn_snapshot_writer`) debounces lifecycle
 //! events off the bus so a whole restart storm produces one write, not one
-//! per event. [`restorable`] turns a loaded snapshot back into apps a
+//! per event. `restorable` turns a loaded snapshot back into apps a
 //! `muster` should start, re-validating every entry (the file is
 //! human-editable) and collecting failures instead of aborting the whole
 //! muster.
@@ -37,7 +37,7 @@ use shep_core::status::ProcStatus;
 use crate::supervisor::SupervisorHandle;
 
 /// Schema version of `flock.json`
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub(crate) const SNAPSHOT_VERSION: u32 = 1;
 
 /// How long the writer lets a burst of lifecycle events settle before it
 /// rewrites the roll.
@@ -46,12 +46,12 @@ pub const SNAPSHOT_VERSION: u32 = 1;
 /// 250 ms folds a whole restart storm into a single atomic write while still
 /// landing the roll orders of magnitude faster than the reboot it protects
 /// against (spec §13.4).
-pub const SNAPSHOT_DEBOUNCE_MS: u64 = 250;
+pub(crate) const SNAPSHOT_DEBOUNCE_MS: u64 = 250;
 
 /// The muster roll: which apps were registered, and how many were up
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlockSnapshot {
-    /// Schema version this roll was written under ([`SNAPSHOT_VERSION`])
+    /// Schema version this roll was written under (`SNAPSHOT_VERSION`)
     pub version: u32,
     /// Wall-clock milliseconds since the Unix epoch when this roll was built
     pub saved_at_ms: u64,
@@ -75,19 +75,19 @@ pub struct SavedApp {
 /// reproduce the `AppConfig` a sheep came from, which is exactly what a roll
 /// needs. Cheap to clone (one `Arc`).
 #[derive(Debug, Clone, Default)]
-pub struct FlockRegistry {
+pub(crate) struct FlockRegistry {
     apps: Arc<Mutex<BTreeMap<String, AppConfig>>>,
 }
 
 impl FlockRegistry {
     /// Builds an empty registry
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Records (or re-records) each app's config, keyed by name.
-    pub fn record(&self, apps: &[ResolvedApp]) {
+    pub(crate) fn record(&self, apps: &[ResolvedApp]) {
         let mut map = self.apps.lock().unwrap_or_else(PoisonError::into_inner);
         for app in apps {
             map.insert(app.config().name.clone(), app.config().clone());
@@ -97,7 +97,7 @@ impl FlockRegistry {
     /// Builds the roll from the live listing, pruning names the flock no
     /// longer has (a deleted sheep must not resurrect).
     #[must_use]
-    pub fn roll(&self, infos: &[ProcessInfo], now_ms: u64) -> FlockSnapshot {
+    pub(crate) fn roll(&self, infos: &[ProcessInfo], now_ms: u64) -> FlockSnapshot {
         // A poisoned lock recovers instead of panicking: the map is a plain
         // BTreeMap, so a panic elsewhere cannot leave it inconsistent, and
         // taking the daemon down over it would be the worse failure.
@@ -132,7 +132,7 @@ fn is_running(status: ProcStatus) -> bool {
     )
 }
 
-/// Error type returned from [`write_atomic`] and [`read`]
+/// Error type returned from `write_atomic` and [`read`]
 ///
 /// Wraps `io::Error`/`serde_json::Error` directly rather than stringifying
 /// them (contrast [`WireError`](shep_core::protocol::WireError)) so callers
@@ -190,7 +190,7 @@ impl core::error::Error for SnapshotError {
 /// - [`SnapshotError::NoParent`] — the roll path has no directory to write into.
 /// - [`SnapshotError::Encode`] — the roll failed to serialize.
 /// - [`SnapshotError::Io`] — the temp file, fsync, or rename failed.
-pub fn write_atomic(path: &Path, snapshot: &FlockSnapshot) -> Result<(), SnapshotError> {
+pub(crate) fn write_atomic(path: &Path, snapshot: &FlockSnapshot) -> Result<(), SnapshotError> {
     use std::io::Write;
 
     let parent = path
@@ -206,7 +206,12 @@ pub fn write_atomic(path: &Path, snapshot: &FlockSnapshot) -> Result<(), Snapsho
     Ok(())
 }
 
-/// Reads and validates a muster roll written by [`write_atomic`].
+/// Reads and validates a muster roll written by `write_atomic`.
+///
+/// Public only for `tests/daemon_e2e.rs`, which reads the roll a live daemon
+/// wrote and asserts on its contents; [`FlockSnapshot`], [`SavedApp`] and
+/// [`SnapshotError`] are public because they are what this returns. The
+/// daemon's own restore path calls this from inside `boot`.
 ///
 /// # Errors
 /// - [`SnapshotError::Io`] — the roll could not be read.
@@ -227,11 +232,11 @@ pub fn read(path: &Path) -> Result<FlockSnapshot, SnapshotError> {
 
 /// Apps a `muster` should start, plus the ones the roll can no longer justify
 #[derive(Debug)]
-pub struct Restorable {
+pub(crate) struct Restorable {
     /// Apps that were running and still opt into `autostart`, re-validated
-    pub apps: Vec<ResolvedApp>,
+    pub(crate) apps: Vec<ResolvedApp>,
     /// Sheep name + the reason its saved config no longer normalizes
-    pub rejected: Vec<(String, NormalizeError)>,
+    pub(crate) rejected: Vec<(String, NormalizeError)>,
 }
 
 /// Splits a loaded [`FlockSnapshot`] into apps to restart and apps rejected
@@ -247,7 +252,7 @@ pub struct Restorable {
 /// MUST re-normalize" rule) — a bad entry is collected into `rejected`
 /// instead of aborting the whole muster.
 #[must_use]
-pub fn restorable(snapshot: FlockSnapshot) -> Restorable {
+pub(crate) fn restorable(snapshot: FlockSnapshot) -> Restorable {
     let mut apps = Vec::new();
     let mut rejected = Vec::new();
     for saved in snapshot.apps {
@@ -271,23 +276,32 @@ fn is_state_change(event: &BusEvent) -> bool {
 
 /// Handle to the debounced writer task
 #[derive(Debug)]
-pub struct SnapshotWriter {
+pub(crate) struct SnapshotWriter {
     handle: JoinHandle<()>,
+    /// Read only by [`Self::writes`]; see that method for why both carry an
+    /// `allow` rather than an `expect`.
+    #[allow(dead_code, reason = "read by this crate's own tests through `writes`")]
     writes: Arc<AtomicU64>,
 }
 
 impl SnapshotWriter {
     /// Completed roll writes since boot — the number the metrics dog reports
-    // IR-25: trivial atomic load, no branch — inline across the crate
-    // boundary. Not per-frame hot, so `#[inline]`, never `#[inline(always)]`.
+    ///
+    /// The dog reads that number off the wire, not off this handle, so this
+    /// accessor's only callers today are this module's own tests, and it is
+    /// dead in a non-test build. `allow` rather than `expect` because the
+    /// expectation would go unfulfilled in the test build.
+    // IR-25: trivial atomic load, no branch — inline across codegen units.
+    // Not per-frame hot, so `#[inline]`, never `#[inline(always)]`.
     #[inline]
     #[must_use]
-    pub fn writes(&self) -> u64 {
+    #[allow(dead_code, reason = "called by this module's own tests")]
+    pub(crate) fn writes(&self) -> u64 {
         self.writes.load(Ordering::SeqCst)
     }
 
     /// Stops the writer and waits for it (the caller then owns roll timing)
-    pub async fn stop(self) {
+    pub(crate) async fn stop(self) {
         self.handle.abort();
         let _ = self.handle.await;
     }
@@ -298,7 +312,7 @@ impl SnapshotWriter {
 /// Coalesces bursts of lifecycle events (spec §13.4: one restart storm, one
 /// write) into a single [`write_atomic`] call per [`SNAPSHOT_DEBOUNCE_MS`]
 /// window. Log traffic never resets or starts the debounce timer.
-pub fn spawn_snapshot_writer(
+pub(crate) fn spawn_snapshot_writer(
     path: PathBuf,
     supervisor: SupervisorHandle,
     registry: FlockRegistry,

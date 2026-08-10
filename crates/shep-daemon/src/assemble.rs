@@ -4,6 +4,10 @@
 //! [`SpawnSpec`] ready for [`ProcessRunner::spawn`](crate::runner::ProcessRunner::spawn).
 //! No I/O here — all defaults, env vars, and paths are pre-resolved by the
 //! daemon before assembler is called (environment comes in via `ResolvedApp`).
+//!
+//! Public for its two out-of-crate readers and nothing else: `tests/real_runner.rs`
+//! calls [`assemble`] to build a spec it then spawns for real, and
+//! [`instance_slots`]'s doc example is compiled as its own crate.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -83,7 +87,7 @@ fn base_env() -> BTreeMap<String, String> {
 ///
 /// `credentials` is resolved by the caller (passwd/group lookups are real
 /// I/O, so they stay out of this otherwise-pure function — see
-/// [`crate::privilege::resolve`]) and threaded straight onto the spec.
+/// `crate::privilege::resolve`) and threaded straight onto the spec.
 ///
 /// # Interpreter logic
 ///

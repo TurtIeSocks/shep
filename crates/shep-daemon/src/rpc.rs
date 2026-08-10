@@ -1,17 +1,17 @@
 //! Portable RPC dispatch: verb routing, typed errors, per-call deadlines
 //!
-//! [`dispatch`] is the one function the connection layer (Task 5's unix
+//! `dispatch` is the one function the connection layer (Task 5's unix
 //! socket / named-pipe server) calls per request envelope. Everything here
 //! compiles and tests on every platform — no `cfg(unix)`, no sockets, no
 //! bytes on a wire. [`RpcContext`] bundles the daemon-wide handles a request
-//! handler may touch; [`Outcome`] tells the caller what to do next (reply,
+//! handler may touch; `Outcome` tells the caller what to do next (reply,
 //! start forwarding bus events, or begin shutdown).
 //!
 //! ## Deadlines
 //!
-//! Every envelope gets a [`budget`]: its own `deadline_ms` (clamped to
-//! [`MAX_DEADLINE_MS`] — a peer cannot pin a daemon task open forever), or
-//! [`DEFAULT_DEADLINE_MS`] if it sent none. [`dispatch`]'s own doc explains
+//! Every envelope gets a `budget`: its own `deadline_ms` (clamped to
+//! `MAX_DEADLINE_MS` — a peer cannot pin a daemon task open forever), or
+//! `DEFAULT_DEADLINE_MS` if it sent none. `dispatch`'s own doc explains
 //! exactly what expiring a budget does and does not undo.
 
 use core::future::Future;
@@ -33,33 +33,38 @@ use crate::snapshot::{FlockRegistry, SnapshotError, write_atomic};
 use crate::supervisor::{SupervisorError, SupervisorHandle};
 
 /// Deadline applied when a client sends none (spec §6: 5s default).
-pub const DEFAULT_DEADLINE_MS: u64 = 5_000;
+pub(crate) const DEFAULT_DEADLINE_MS: u64 = 5_000;
 /// Ceiling on a client-supplied deadline — a peer cannot pin a daemon task open.
-pub const MAX_DEADLINE_MS: u64 = 60_000;
+pub(crate) const MAX_DEADLINE_MS: u64 = 60_000;
 
 /// Everything a request handler may touch — one clone per connection.
 ///
 /// Every clone shares the same supervisor engine, event bus sender, flock
 /// registry, and shutdown signal; the connection layer builds one from the
-/// daemon's shared state and hands it to [`dispatch`] once per envelope.
+/// daemon's shared state and hands it to `dispatch` once per envelope.
+///
+/// The type is public because `tests/daemon_e2e.rs` holds one to drive
+/// [`Self::shutdown`] and [`Self::snapshot_now`] without going through the
+/// socket. Its fields are not: every one of them is filled in by `boot` and
+/// read by `dispatch`, both in this crate.
 #[derive(Clone, Debug)]
 pub struct RpcContext {
     /// The supervisor engine this daemon is running.
-    pub supervisor: SupervisorHandle,
+    pub(crate) supervisor: SupervisorHandle,
     /// The daemon-wide event bus; `Subscribe` compiles a [`TopicFilter`] the
     /// connection layer hands to [`crate::bus::spawn_forwarder`] alongside a
     /// receiver off this sender.
-    pub events: broadcast::Sender<BusEvent>,
+    pub(crate) events: broadcast::Sender<BusEvent>,
     /// The muster roll's in-memory app registry — `Start` records into it.
-    pub registry: FlockRegistry,
+    pub(crate) registry: FlockRegistry,
     /// Where [`Self::snapshot_now`] writes the muster roll.
-    pub snapshot_path: PathBuf,
+    pub(crate) snapshot_path: PathBuf,
     /// This daemon's crate version, echoed in the handshake.
-    pub daemon_version: String,
+    pub(crate) daemon_version: String,
     /// This daemon's OS pid, echoed in the handshake.
-    pub pid: u32,
+    pub(crate) pid: u32,
     /// Flips to `true` to start graceful daemon shutdown; see [`Self::shutdown`].
-    pub shutdown: Arc<watch::Sender<bool>>,
+    pub(crate) shutdown: Arc<watch::Sender<bool>>,
 }
 
 impl RpcContext {
@@ -67,8 +72,8 @@ impl RpcContext {
     ///
     /// Only flips the watch signal — the connection/server layer is what
     /// actually runs the kill ladder and closes listeners once it observes
-    /// this go `true`. [`dispatch`] never calls this itself: `KillDaemon`
-    /// only reports the intent via [`Outcome::Shutdown`], leaving the caller
+    /// this go `true`. `dispatch` never calls this itself: `KillDaemon`
+    /// only reports the intent via `Outcome::Shutdown`, leaving the caller
     /// to trigger it after the reply is on the wire.
     pub fn shutdown(&self) {
         let _ = self.shutdown.send(true);
@@ -81,7 +86,7 @@ impl RpcContext {
     /// final roll.
     ///
     /// # Errors
-    /// - [`SnapshotError`] — as [`write_atomic`].
+    /// - [`SnapshotError`] — as `write_atomic`.
     pub async fn snapshot_now(&self) -> Result<(), SnapshotError> {
         let Ok(infos) = self.supervisor.list_checked().await else {
             return Ok(());
@@ -93,7 +98,7 @@ impl RpcContext {
 
 /// What the connection layer must do with a dispatched request.
 #[derive(Debug)]
-pub enum Outcome {
+pub(crate) enum Outcome {
     /// Send this reply and keep reading.
     Reply(Reply),
     /// Send this reply, then start forwarding events through `filter`.
@@ -109,7 +114,7 @@ pub enum Outcome {
 
 /// The deadline this envelope gets: its own, clamped, or the default.
 #[must_use]
-pub fn budget(deadline_ms: Option<u64>) -> Duration {
+pub(crate) fn budget(deadline_ms: Option<u64>) -> Duration {
     // clamp's lower bound is 1ms so a literal `0` means "expire immediately"
     // rather than silently becoming "no deadline at all".
     Duration::from_millis(
@@ -132,7 +137,7 @@ pub fn budget(deadline_ms: Option<u64>) -> Duration {
 /// stronger would need per-command cancellation inside the actor, which the
 /// supervisor's locked `Command` surface (Phase 2a) deliberately does not
 /// have.
-pub async fn dispatch(envelope: Envelope, ctx: &RpcContext) -> Outcome {
+pub(crate) async fn dispatch(envelope: Envelope, ctx: &RpcContext) -> Outcome {
     let id = envelope.id;
     with_deadline(
         id,

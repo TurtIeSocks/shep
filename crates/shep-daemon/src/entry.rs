@@ -27,6 +27,15 @@ pub struct ProcessEntry {
     /// Restart budget and stability tracking
     pub budget: RestartBudget,
     /// Reload state machine (None, SpawningReplacement, or Draining)
+    ///
+    /// Written at registration and never read: reload execution is deferred,
+    /// and this field is the data half landing ahead of it. The expectation
+    /// below is what keeps that honest rather than silent — it fires the day
+    /// a reload path reads this, and the attribute goes with it.
+    #[expect(
+        dead_code,
+        reason = "data-only ahead of reload execution; the reader lands with it"
+    )]
     pub reload: ReloadState,
     /// Resolved once at the initial `Start` and reused for every later
     /// respawn — never re-resolved, so a restart never re-touches the
@@ -99,6 +108,15 @@ impl RestartBudget {
 }
 
 /// Reload state machine for graceful reload scenarios
+///
+/// Data only: nothing constructs the two non-`None` variants yet, because
+/// reload execution is deferred. `allow` rather than `expect` because this
+/// module's own tests do construct them, so the expectation would be
+/// fulfilled in the lib build and unfulfilled in the test build.
+#[allow(
+    dead_code,
+    reason = "data-only ahead of reload execution; the constructors land with it"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadState {
     /// Not in a reload sequence

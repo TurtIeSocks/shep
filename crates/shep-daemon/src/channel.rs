@@ -5,6 +5,11 @@
 //! replies); [`ShepherdMessage`] flows daemon -> child (shutdown request,
 //! custom actions). Framing (newline-JSON over `BufReader::lines()`) is
 //! wired by the real runner; this module only pins the message shapes.
+//!
+//! Public for two reasons, neither of them a shipped API: `tests/real_runner.rs`
+//! reads [`ChildMessage`] back off a real child's fd 3, and [`ShepherdMessage`]
+//! is the payload type of [`ProcIo::to_child`](crate::runner::ProcIo::to_child),
+//! so it has to be nameable wherever that field is.
 
 use serde::{Deserialize, Serialize};
 

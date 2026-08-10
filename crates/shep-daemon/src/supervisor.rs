@@ -17,9 +17,7 @@
 //!
 //! # Deferred, aggregated replies
 //!
-//! [`SupervisorHandle::stop`]/[`restart`](SupervisorHandle::restart)/
-//! [`restart_automatic`](SupervisorHandle::restart_automatic)/
-//! [`delete`](SupervisorHandle::delete) and
+//! `SupervisorHandle::stop`/`restart`/`restart_automatic`/`delete` and
 //! [`shutdown`](SupervisorHandle::shutdown) resolve their selector into a
 //! set of matched ids up front, then wait until every matched sheep is
 //! terminal before answering the caller. The crash loop's own restarts go
@@ -205,6 +203,11 @@ impl core::error::Error for SupervisorError {}
 ///
 /// Cloning shares the same actor; every clone's commands are serialized
 /// through its single mailbox.
+///
+/// Public, with [`spawn_supervisor`] and [`SupervisorError`], because the
+/// crate-root doc example drives one — and rustdoc compiles a doc example as
+/// its own crate, so `start`, `list` and `shutdown` have to be reachable from
+/// outside. The rest of the handle's methods do not, and are crate-private.
 #[derive(Debug, Clone)]
 pub struct SupervisorHandle {
     tx: mpsc::Sender<Msg>,
@@ -233,7 +236,7 @@ impl SupervisorHandle {
     ///
     /// - [`SupervisorError::NotFound`] — nothing matched.
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
-    pub async fn stop(
+    pub(crate) async fn stop(
         &self,
         selector: ProcessSelector,
     ) -> Result<Vec<ProcessInfo>, SupervisorError> {
@@ -263,7 +266,7 @@ impl SupervisorHandle {
     ///
     /// - [`SupervisorError::NotFound`] — nothing matched.
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
-    pub async fn restart(
+    pub(crate) async fn restart(
         &self,
         selector: ProcessSelector,
     ) -> Result<Vec<ProcessInfo>, SupervisorError> {
@@ -287,7 +290,7 @@ impl SupervisorHandle {
     ///
     /// - [`SupervisorError::NotFound`] — nothing matched.
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
-    pub async fn restart_automatic(
+    pub(crate) async fn restart_automatic(
         &self,
         selector: ProcessSelector,
     ) -> Result<Vec<ProcessInfo>, SupervisorError> {
@@ -328,7 +331,7 @@ impl SupervisorHandle {
     /// like [`Self::restart_automatic`] it goes in as
     /// `CommandOrigin::Automatic` — displaceable by an operator's command,
     /// and reported on the bus with `manually: false`.
-    pub async fn extra_restart(&self, id: u32, pid: u32) {
+    pub(crate) async fn extra_restart(&self, id: u32, pid: u32) {
         let _ = self
             .tx
             .send(Msg::Command(Command::ExtraRestart { id, pid }))
@@ -341,7 +344,10 @@ impl SupervisorHandle {
     ///
     /// - [`SupervisorError::NotFound`] — nothing matched.
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
-    pub async fn delete(&self, selector: ProcessSelector) -> Result<Vec<u32>, SupervisorError> {
+    pub(crate) async fn delete(
+        &self,
+        selector: ProcessSelector,
+    ) -> Result<Vec<u32>, SupervisorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Command(Command::Delete { selector, reply }))
@@ -355,7 +361,7 @@ impl SupervisorHandle {
     /// # Errors
     ///
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
-    pub async fn list_checked(&self) -> Result<Vec<ProcessInfo>, SupervisorError> {
+    pub(crate) async fn list_checked(&self) -> Result<Vec<ProcessInfo>, SupervisorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Command(Command::List { reply }))
@@ -366,7 +372,7 @@ impl SupervisorHandle {
 
     /// Full flock listing, id-sorted.
     ///
-    /// Convenience over [`Self::list_checked`] for callers that don't need
+    /// Convenience over `Self::list_checked` for callers that don't need
     /// to distinguish "actor gone" from "empty flock" — mainly tests.
     ///
     /// # Panics
@@ -400,7 +406,7 @@ impl SupervisorHandle {
 /// on the roadmap, so the optional wiring goes on a builder rather than growing
 /// [`spawn_supervisor`] a positional parameter each time.
 #[derive(Debug)]
-pub struct SupervisorBuilder<R: ProcessRunner> {
+pub(crate) struct SupervisorBuilder<R: ProcessRunner> {
     runner: R,
     paths: ShepPaths,
     events: broadcast::Sender<BusEvent>,
@@ -413,7 +419,7 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
     ///
     /// `events` receives [`BusEvent::Process`] (+ `LogOut`/`LogErr` forwarded
     /// from each sheep's `ProcIo::logs`).
-    pub fn new(runner: R, paths: ShepPaths, events: broadcast::Sender<BusEvent>) -> Self {
+    pub(crate) fn new(runner: R, paths: ShepPaths, events: broadcast::Sender<BusEvent>) -> Self {
         Self {
             runner,
             paths,
@@ -424,7 +430,7 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
 
     /// Wires in the lifecycle extras.
     #[must_use]
-    pub fn extras(mut self, extras: Extras) -> Self {
+    pub(crate) fn extras(mut self, extras: Extras) -> Self {
         self.extras = Some(extras);
         self
     }
@@ -432,7 +438,7 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
     /// Spawns the actor.
     ///
     /// Must be called from within a Tokio runtime context.
-    pub fn spawn(self) -> SupervisorHandle {
+    pub(crate) fn spawn(self) -> SupervisorHandle {
         let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
         let actor = Actor {
             runner: self.runner,
