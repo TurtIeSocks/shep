@@ -1917,8 +1917,24 @@ impl<R: ProcessRunner> Actor<R> {
         };
 
         if readiness == Readiness::TimedOut {
-            self.abort_reload(&name, "the replacement was not ready inside listen_timeout");
-            return;
+            // Abandoning protects the instance that can still serve, so it
+            // is only worth doing while there IS one. A drainee that went on
+            // its own while this replacement was starting leaves nothing to
+            // fall back to, and killing the replacement as well would empty
+            // the instance slot outright — no entry, no restart, no report
+            // beyond a log line. With nothing to protect, this takes the
+            // ordinary readiness rule instead: online anyway, rather than
+            // turn a slow start into a missing instance.
+            let old_id = self.reloads[&name].swap.old_id;
+            if self.sheep.contains_key(&old_id) {
+                self.abort_reload(&name, "the replacement was not ready inside listen_timeout");
+                return;
+            }
+            tracing::warn!(
+                id = new_id,
+                "a replacement's readiness deadline elapsed with no old instance left to keep; \
+                 marking online anyway"
+            );
         }
 
         let info = self.set_status(new_id, ProcStatus::Online);
@@ -2349,7 +2365,29 @@ impl<R: ProcessRunner> Actor<R> {
         // straight back into an instance slot its replacement already holds —
         // two live processes for one instance, with no path back.
         match reload {
-            ReloadState::SpawningReplacement { .. } => return self.reap_drainee(id),
+            ReloadState::SpawningReplacement { .. } => {
+                // The drainee's slot belongs to its replacement, so its
+                // registration goes with the process — unless an operator's
+                // own command reached it first while the swap was still
+                // abandonable. That command, not the reload, decides what
+                // this exit becomes: `stop` must leave a sheep registered
+                // and `Stopped`, and deregistering here would delete an app
+                // an operator only asked to stop. A drainee that went with
+                // no command behind it (`kind` is `None`) is the reload's
+                // business either way, and must not be restarted into a slot
+                // its replacement already holds.
+                let name = self.reload_of(id);
+                let abandonable = name
+                    .as_deref()
+                    .is_some_and(|name| self.reloads[name].swap.phase == ReloadPhase::AwaitReady);
+                if !abandonable || kind.is_none() {
+                    return self.reap_drainee(id);
+                }
+                let name = name.expect("a phase was just read off this job");
+                self.abort_reload(&name, "an operator's command reached the drainee first");
+                // Falls through as an ordinary entry: `abort_reload` has
+                // already cleared this one's marker and put its status back.
+            }
             ReloadState::Draining { .. } => {
                 // Whether this is a failure depends on how far the swap got.
                 // Still `AwaitReady` and the replacement never proved it could
@@ -5642,6 +5680,86 @@ mod tests {
         assert_eq!(after[0].id, 1);
         assert_eq!(after[0].status, ProcStatus::Online);
         assert_eq!(runner.kill_counts().len(), 2, "the drainee never respawned");
+    }
+
+    // fails if an operator's `stop` landing mid-reload DELETES the app. The
+    // drainee's registration is the reload's to reap only once its
+    // replacement is serving; before that, an operator's own command decides
+    // what the exit becomes, and `stop` leaves a sheep registered and
+    // `Stopped`. Deregistering both entries would take an app out of `shep
+    // flock` entirely on a verb that never promised to.
+    #[tokio::test(start_paused = true)]
+    async fn an_operators_stop_mid_reload_leaves_the_app_stopped_and_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two scripts: the original and the one replacement. The stop lands
+        // during `AwaitReady`, so no third spawn is correct here either.
+        let (handle, runner, mut rx) = started(
+            &dir,
+            AppConfig::minimal("web", "./srv"),
+            vec![ProcScript::never_exits(), ProcScript::never_exits()],
+        )
+        .await;
+
+        handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the reload is accepted");
+        expect_event(&mut rx, 1, ProcessEventKind::Start).await;
+
+        let stopped = handle
+            .stop(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the stop reaches both entries");
+        assert_eq!(stopped.len(), 2, "a stop answers for every id it matched");
+
+        let after = handle.list().await;
+        assert_eq!(
+            after.iter().map(|info| info.id).collect::<Vec<_>>(),
+            vec![0],
+            "the instance stays registered; only the abandoned replacement goes"
+        );
+        assert_eq!(after[0].status, ProcStatus::Stopped);
+        assert_eq!(runner.kill_counts().len(), 2, "nothing was spawned again");
+    }
+
+    // fails if a replacement whose readiness deadline elapses is killed even
+    // when the instance it was replacing has already gone. Abandoning exists
+    // to keep the instance that can still serve; with none left, killing the
+    // replacement too empties the slot outright — no entry, no restart, and
+    // nothing in `shep flock` to say the app lost an instance.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_is_kept_when_the_deadline_elapses_with_no_old_instance_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.wait_ready = true; // nobody ever signals the replacement
+        // Two scripts: the original — which ends 1000ms in, before the
+        // replacement's 3000ms deadline — and the replacement itself. An
+        // implementation that killed the replacement anyway would leave an
+        // empty flock, which is what the count below reads.
+        let (handle, runner, mut rx) = started(
+            &dir,
+            app,
+            vec![
+                ProcScript::stable_then_exit(1_000, 1),
+                ProcScript::never_exits(),
+            ],
+        )
+        .await;
+        handle.tx.send(Msg::Ready { id: 0 }).await.unwrap();
+        expect_event(&mut rx, 0, ProcessEventKind::Online).await;
+
+        handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the reload is accepted");
+        expect_event(&mut rx, 0, ProcessEventKind::Delete).await;
+        expect_event(&mut rx, 1, ProcessEventKind::Online).await;
+
+        let after = handle.list().await;
+        assert_eq!(after.len(), 1, "the app still has its instance");
+        assert_eq!(after[0].id, 1);
+        assert_eq!(after[0].status, ProcStatus::Online);
+        assert_eq!(runner.kill_counts(), vec![0, 0], "neither was SIGKILLed");
     }
 
     // fails if a replacement starts its restart count at zero. A reload is
