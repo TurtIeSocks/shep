@@ -81,6 +81,12 @@ pub enum Request {
         /// Which sheep
         selector: SelectorSpec,
     },
+    /// Reopen every matched sheep's log files, for an external rotator that
+    /// has renamed them (`create`-mode rotation)
+    Reopen {
+        /// Which sheep
+        selector: SelectorSpec,
+    },
     /// Graceful daemon shutdown
     KillDaemon,
     /// Subscribe this connection to bus topics (glob patterns)
@@ -160,6 +166,10 @@ pub enum Response {
     Restarted(Vec<ProcessInfo>),
     /// Answer to `Delete` — ids removed
     Deleted(Vec<u32>),
+    /// Answer to `Reopen` — every matched sheep, running or not. A sheep with
+    /// no live log pump has nothing to reopen and is reported as a success,
+    /// so this carries the same matches `Describe` would.
+    Reopened(Vec<ProcessInfo>),
     /// Answer to `Subscribe`
     Subscribed,
     /// Answer to `KillDaemon`
@@ -319,6 +329,16 @@ mod tests {
                 deadline_ms: None,
                 body: Request::Start {
                     apps: vec![AppConfig::minimal("web", "./srv")],
+                },
+            },
+            // `All` rather than a named sheep: it is the selector `shep
+            // reopen` sends when given no argument, and the one a signal can
+            // ever mean, so it is the row worth pinning.
+            Envelope {
+                id: 5,
+                deadline_ms: None,
+                body: Request::Reopen {
+                    selector: SelectorSpec::All,
                 },
             },
         ];

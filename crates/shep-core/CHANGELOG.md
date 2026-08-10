@@ -59,6 +59,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add wire protocol v1 types — `Request`, `Response`, `Envelope`, `Reply`,
   `RpcError`, `Hello`/`HelloAck`, `BusEvent` — with pinned insta snapshots of
   their serialized form.
+- Add `Request::Reopen` and `Response::Reopened`, asking a daemon to reopen
+  the log files of every matched sheep after an external rotator has renamed
+  them. Both enums are `#[non_exhaustive]` and no existing variant changes,
+  so `PROTOCOL_VERSION` stays **1**: the committed v1 byte fixtures still
+  deserialize, and an older daemon answers the new verb with
+  `RpcErrorCode::Internal` rather than failing to decode it. `Reopened`
+  carries `ProcessInfo`s like `Stopped` and `Restarted` do — every matched
+  sheep, including any that was not running and so had nothing to reopen.
 - Add `MemSize` and `UpDuration` config value newtypes, parsing the strict
   Flockfile grammars `^\d+(G|M|K)?$` and `^\d+(h|m|s)?$`.
 - Add `ProcStatus` with stable wire strings for the process lifecycle states.

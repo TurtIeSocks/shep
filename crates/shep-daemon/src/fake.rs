@@ -255,6 +255,9 @@ struct SpawnedProc {
     /// `false` once this spawn's log-control task has ended — read back via
     /// [`ScriptedRunner::log_ctl_live`].
     log_ctl_live: Arc<AtomicBool>,
+    /// How many [`LogCtl::Reopen`] requests this spawn's log-control task has
+    /// answered — read back via [`ScriptedRunner::reopens`].
+    reopens: Arc<AtomicU32>,
 }
 
 /// Deterministic fake [`ProcessRunner`] driven by a pre-scripted [`ProcScript`] per spawn.
@@ -335,6 +338,24 @@ impl ScriptedRunner {
             .load(Ordering::SeqCst)
     }
 
+    /// How many [`LogCtl::Reopen`] requests the proc spawned at `spawn_index`
+    /// has been sent.
+    ///
+    /// The fake writes no files, so this is the only thing an engine-tier
+    /// test can assert about a reopen: that the request reached this spawn's
+    /// end of [`ProcIo::log_ctl`] at all. Whether a reopened handle really
+    /// lands on a recreated inode is `tests/real_runner.rs`'s question.
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[must_use]
+    pub fn reopens(&self, spawn_index: usize) -> u32 {
+        self.spawned.lock().unwrap()[spawn_index]
+            .reopens
+            .load(Ordering::SeqCst)
+    }
+
     /// Takes the [`FakeIo`] test-side handles for the proc spawned at `spawn_index`
     ///
     /// # Panics
@@ -398,11 +419,17 @@ impl ProcessRunner for ScriptedRunner {
         // as with the sender.
         let log_ctl_live = Arc::new(AtomicBool::new(true));
         let ctl_live = Arc::clone(&log_ctl_live);
+        let reopens = Arc::new(AtomicU32::new(0));
+        let reopen_count = Arc::clone(&reopens);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     ctl = log_ctl_rx.recv() => match ctl {
                         Some(LogCtl::Reopen { done }) => {
+                            // Counted BEFORE the answer, so a test that
+                            // observes the acknowledgement can read the
+                            // count without racing this task.
+                            reopen_count.fetch_add(1, Ordering::SeqCst);
                             let _ = done.send(());
                         }
                         None => break, // the holder dropped ProcIo::log_ctl
@@ -448,6 +475,7 @@ impl ProcessRunner for ScriptedRunner {
                 to_child_rx: relay_rx,
             }),
             log_ctl_live,
+            reopens,
         });
         drop(spawned);
 

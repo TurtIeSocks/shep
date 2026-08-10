@@ -71,6 +71,8 @@ pub enum Commands {
     /// Show or follow bleats (log output) for one or more sheep.
     #[command(visible_alias = "logs")]
     Bleats(BleatsArgs),
+    /// Reopen log files after an external rotator has renamed them.
+    Reopen(ReopenArgs),
     /// Check whether the shepherd answers.
     Ping,
     /// Shut the shepherd down.
@@ -116,11 +118,18 @@ pub struct FoldArgs {
     pub name: String,
 }
 
+/// The selector the verbs that take an optional one fall back to.
+///
+/// One owner for the string, shared rather than spelled twice: `bleats` and
+/// `reopen` default to the same thing on purpose, and a copy that drifted
+/// would leave one of them quietly targeting something else.
+const DEFAULT_SELECTOR: &str = "all";
+
 /// Arguments to `shep bleats` (alias `logs`).
 #[derive(Debug, clap::Args)]
 pub struct BleatsArgs {
     /// Which sheep (default: all)
-    #[arg(default_value = "all")]
+    #[arg(default_value = DEFAULT_SELECTOR)]
     pub selector: String,
     /// Print the tail of each sheep's log file and exit, instead of following
     #[arg(long)]
@@ -131,6 +140,20 @@ pub struct BleatsArgs {
     /// Only stdout
     #[arg(long, conflicts_with = "err")]
     pub out: bool,
+}
+
+/// Arguments to `shep reopen`.
+///
+/// The selector is optional, defaulting to [`DEFAULT_SELECTOR`], where
+/// `stop`/`restart`/`delete` all demand one: those destroy something, and
+/// a reopen destroys nothing — it swaps a file handle for another handle on
+/// the same path. Rotating every sheep at once is also the ordinary case, a
+/// `postrotate` stanza having just renamed the whole log directory.
+#[derive(Debug, clap::Args)]
+pub struct ReopenArgs {
+    /// Which sheep (default: all)
+    #[arg(default_value = DEFAULT_SELECTOR)]
+    pub selector: String,
 }
 
 /// Arguments to `shep completions`.
@@ -177,6 +200,38 @@ mod tests {
             Cli::try_parse_from(["shep", "logs"]).unwrap().command,
             Commands::Bleats(_)
         ));
+    }
+
+    /// Pins [`DEFAULT_SELECTOR`] on both verbs that carry it.
+    ///
+    /// Fails if either loses its `default_value`: the bare invocation
+    /// becomes a clap usage error instead of targeting the flock, which for
+    /// `reopen` is the whole reason a signal — which carries no selector —
+    /// can mean this verb at all. Both halves matter: an explicit selector
+    /// must still win, or the default would be a hardcoded `all` wearing a
+    /// default's clothes.
+    #[test]
+    fn bleats_and_reopen_default_to_every_sheep() {
+        use clap::Parser;
+        let bare = Cli::try_parse_from(["shep", "reopen"]).unwrap().command;
+        let Commands::Reopen(args) = bare else {
+            panic!("`shep reopen` must parse with no selector")
+        };
+        assert_eq!(args.selector, "all");
+
+        let bare = Cli::try_parse_from(["shep", "bleats"]).unwrap().command;
+        let Commands::Bleats(args) = bare else {
+            panic!("`shep bleats` must parse with no selector")
+        };
+        assert_eq!(args.selector, "all");
+
+        let named = Cli::try_parse_from(["shep", "reopen", "web"])
+            .unwrap()
+            .command;
+        let Commands::Reopen(args) = named else {
+            panic!("expected reopen")
+        };
+        assert_eq!(args.selector, "web");
     }
 
     #[test]
@@ -230,7 +285,15 @@ mod tests {
                 "{hidden} must stay hidden from --help"
             );
         }
-        for visible in ["start", "flock", "bleats", "ping", "kill", "completions"] {
+        for visible in [
+            "start",
+            "flock",
+            "bleats",
+            "reopen",
+            "ping",
+            "kill",
+            "completions",
+        ] {
             assert!(
                 !cmd.find_subcommand(visible).unwrap().is_hide_set(),
                 "{visible} must stay visible in --help"

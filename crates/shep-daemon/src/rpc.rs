@@ -220,6 +220,15 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
             )
             .await
         }
+        Request::Reopen { selector } => {
+            selector_call(
+                id,
+                selector,
+                |s| ctx.supervisor.reopen(s),
+                Response::Reopened,
+            )
+            .await
+        }
         Request::Delete { selector } => match selector_of(selector) {
             Err(err) => reply(Err(err)),
             Ok(selector) => match ctx.supervisor.delete(selector).await {
@@ -455,6 +464,75 @@ mod tests {
         };
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "api");
+    }
+
+    /// Fails if `Reopen` is left to the catch-all arm at the bottom of
+    /// `run` — a verb this daemon has never heard of — which answers
+    /// `Internal` for a request it in fact implements. Also fails if it is
+    /// routed to another verb's supervisor call: `Stop` would answer
+    /// `Response::Stopped` and, worse, stop the sheep.
+    #[tokio::test(start_paused = true)]
+    async fn reopen_routes_to_the_supervisor_and_leaves_the_sheep_running() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        dispatch(
+            envelope(
+                1,
+                Request::Start {
+                    apps: vec![AppConfig::minimal("web", "./srv")],
+                },
+            ),
+            &h.ctx,
+        )
+        .await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::Reopen {
+                        selector: SelectorSpec::Name("web".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Response::Reopened(infos) = reply.result.unwrap() else {
+            panic!("expected reopened")
+        };
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].status, ProcStatus::Online);
+
+        let listed = reply_of(dispatch(envelope(3, Request::ListFlock), &h.ctx).await);
+        let Response::Flock(flock) = listed.result.unwrap() else {
+            panic!("expected flock")
+        };
+        assert_eq!(
+            flock[0].status,
+            ProcStatus::Online,
+            "a reopen must not disturb the sheep it reopens"
+        );
+    }
+
+    /// Fails if `Reopen` skips the selector conversion, or converts it
+    /// without reporting the failure: a peer regex the daemon cannot compile
+    /// is the client's usage error, not an internal one.
+    #[tokio::test(start_paused = true)]
+    async fn a_bad_reopen_selector_is_invalid_config() {
+        let h = harness(vec![]);
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Reopen {
+                        selector: SelectorSpec::Regex("((".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
     }
 
     #[tokio::test(start_paused = true)]

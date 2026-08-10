@@ -14,9 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add the clap command tree (`Cli`, `Commands`, and every argument struct
   the CLI will ever parse — `Start`, `Stop`/`Restart`/`Delete`/`Describe`,
-  `Flock` (aliases `list`/`ls`), `Fold`, `Bleats` (alias `logs`), `Ping`,
-  `Kill`, `Completions`, the hidden `Thatlldo` and `Daemon`), pure tier so
-  it compiles and its tests run on Windows.
+  `Flock` (aliases `list`/`ls`), `Fold`, `Bleats` (alias `logs`), `Reopen`,
+  `Ping`, `Kill`, `Completions`, the hidden `Thatlldo` and `Daemon`), pure
+  tier so it compiles and its tests run on Windows.
 - Add the process exit-code taxonomy (`ExitCode`, matching spec §9's table
   exactly, values included) with its stable `code_str` spelling and a
   `From<RpcErrorCode>` conversion; the three `From<&shep_client::*Error>`
@@ -76,6 +76,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that could not be armed, a cron pattern that would not parse, and the
   observed RSS and ceiling behind a memory restart — the last of which no
   bus event carries at all.
+- Add `shep reopen [selector]`, which tells the daemon to reopen the log
+  files of the sheep the selector matches — the half of `create`-mode
+  rotation that runs after the rotator's rename. The command returns only
+  once every matched sheep's log pump holds a handle on the recreated path,
+  so a logrotate `postrotate` stanza can wait for it. The selector is
+  optional and defaults to `all`, matching `bleats` rather than
+  `stop`/`restart`/`delete`: those destroy something and this destroys
+  nothing, and rotating the whole flock at once is the ordinary case. A
+  matched sheep that is not running has nothing to reopen and is listed in
+  the output rather than failing the command. Output is the same table of
+  matched sheep `stop` and `restart` print.
 
 ### Fixes
 

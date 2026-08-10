@@ -308,7 +308,8 @@ fn track_spawned(spawned: &std::sync::Arc<std::sync::Mutex<Vec<i32>>>, reply: &R
         | Response::Described(infos)
         | Response::Started(infos)
         | Response::Stopped(infos)
-        | Response::Restarted(infos) => infos,
+        | Response::Restarted(infos)
+        | Response::Reopened(infos) => infos,
         _ => return,
     };
     let mut spawned = spawned
@@ -410,6 +411,123 @@ async fn log_lines_reach_a_log_subscriber() {
 
     let line = client.await_log_line(id).await;
     assert_eq!(line, "hello-flock");
+
+    fixture.shutdown().await;
+}
+
+/// Waits for `path` to hold exactly `expected`, failing at [`RECV_TIMEOUT`].
+///
+/// Polls rather than sleeping a fixed guess. A line observed on the bus has
+/// had its file write ISSUED, not necessarily completed — `tokio::fs`
+/// dispatches the real `write(2)` to the blocking pool — so this waits for
+/// the write to land instead of assuming it already has. Duplicated from
+/// `real_runner.rs` rather than shared: integration binaries are separate
+/// crates, as that file's own helpers already note.
+async fn await_file_contents(path: &std::path::Path, expected: &str) {
+    let settled = tokio::time::timeout(RECV_TIMEOUT, async {
+        while std::fs::read_to_string(path).unwrap_or_default() != expected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "{}: expected {expected:?}, found {:?}",
+        path.display(),
+        std::fs::read_to_string(path)
+    );
+}
+
+/// `create`-mode rotation, end to end: rename the live log, ask the daemon
+/// over its own socket, and watch the sheep's next line land on the
+/// recreated path.
+///
+/// Fails if the request never reaches the sheep's log pump — which is the
+/// whole of this verb, and which the engine tier cannot show: the scripted
+/// fake writes no files, so there every wiring that answers `Ok` looks
+/// alike. Here a `Reopen` that resolved the selector and pushed nothing
+/// leaves the pump on the renamed inode, the live path missing, and the
+/// second line invisible to anything reading the log.
+///
+/// Both halves are asserted for the reason `real_runner.rs`'s own reopen
+/// case gives: a pump that opened a second handle without dropping the
+/// first would grow the new file too, and only the archive standing still
+/// rules that out.
+///
+/// The sheep's own log path is read off the `Started` reply rather than
+/// derived here, so the test cannot disagree with the daemon about which
+/// file it is looking at.
+#[tokio::test]
+async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+
+    // Subscribe BEFORE starting: a connection gets no forwarder task, and so
+    // no events at all, until it does.
+    let subscribed = client
+        .request(Request::Subscribe {
+            topics: vec!["log.*".to_string()],
+        })
+        .await;
+    assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
+
+    // The marker lets the test decide when the second line happens, so
+    // "after the reopen" is a fact rather than a timing bet. `sleep`'s only
+    // portable argument is a whole number of seconds (POSIX), which is why
+    // the poll is that coarse.
+    let marker = fixture.paths.home.join("go");
+    let mut app = AppConfig::minimal("rotator", "/bin/sh");
+    app.interpreter = Some("none".to_string());
+    app.args = vec![
+        "-c".to_string(),
+        format!(
+            "echo before; while [ ! -f {} ]; do sleep 1; done; echo after; sleep 5",
+            marker.display()
+        ),
+    ];
+    let started = client.request(Request::Start { apps: vec![app] }).await;
+    let Response::Started(infos) = started.result.unwrap() else {
+        panic!("expected started")
+    };
+    let id = infos[0].id;
+    let out_file = std::path::PathBuf::from(
+        infos[0]
+            .out_file
+            .clone()
+            .expect("this daemon reports its own resolved log paths"),
+    );
+
+    assert_eq!(client.await_log_line(id).await, "before");
+    await_file_contents(&out_file, "before\n").await;
+
+    let archive = out_file.with_extension("log.1");
+    std::fs::rename(&out_file, &archive).unwrap();
+    assert!(!out_file.exists(), "sanity: the rename really moved it");
+
+    let reopened = client
+        .request(Request::Reopen {
+            selector: SelectorSpec::All,
+        })
+        .await;
+    let Response::Reopened(matched) = reopened.result.unwrap() else {
+        panic!("expected reopened")
+    };
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].id, id);
+
+    // The reply is the barrier: it lands only after the pump has flushed
+    // the old handle and opened the path again, so neither of these polls.
+    assert_eq!(std::fs::read_to_string(&out_file).unwrap(), "");
+    assert_eq!(std::fs::read_to_string(&archive).unwrap(), "before\n");
+
+    std::fs::write(&marker, "").unwrap();
+    assert_eq!(client.await_log_line(id).await, "after");
+    await_file_contents(&out_file, "after\n").await;
+    assert_eq!(
+        std::fs::read_to_string(&archive).unwrap(),
+        "before\n",
+        "the renamed file must stop growing the moment the handle is swapped"
+    );
 
     fixture.shutdown().await;
 }

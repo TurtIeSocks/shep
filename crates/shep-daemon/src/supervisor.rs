@@ -46,7 +46,7 @@ use crate::privilege::{self, Credentials};
 use crate::probes::Prober;
 use crate::probes::os::OsProber;
 use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
-use crate::runner::{ExitOutcome, ProcIo, ProcessRunner, RunningProcess, SpawnSpec};
+use crate::runner::{ExitOutcome, LogCtl, ProcIo, ProcessRunner, RunningProcess, SpawnSpec};
 
 /// Capacity of the actor's own mailbox (commands + internal events).
 const MAILBOX_CAPACITY: usize = 256;
@@ -117,6 +117,15 @@ pub(crate) enum Command {
     List {
         /// Answers with the current snapshot.
         reply: oneshot::Sender<Vec<ProcessInfo>>,
+    },
+    /// Reopens the log files of every sheep matching `selector`.
+    Reopen {
+        /// Which sheep.
+        selector: ProcessSelector,
+        /// Answers once every matched sheep's log pump has acknowledged —
+        /// off a task of its own, never the actor loop (see
+        /// [`Actor::handle_reopen`]).
+        reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     },
     /// Graceful engine shutdown: kill ladder on every online sheep, then stop.
     Shutdown {
@@ -356,6 +365,32 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
     }
 
+    /// Reopens the log files of every sheep matching `selector`, for an
+    /// external rotator that has renamed them.
+    ///
+    /// Answers only once every matched sheep's log pump has swapped both
+    /// handles, which is the contract a logrotate `postrotate` stanza needs:
+    /// when this returns, no live pump is still holding a renamed inode. A
+    /// matched sheep that is not running has no pump and nothing to reopen,
+    /// and is reported as a success alongside the rest — see
+    /// [`Actor::handle_reopen`] for both ways that shows up.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::NotFound`] — nothing matched.
+    /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    pub(crate) async fn reopen(
+        &self,
+        selector: ProcessSelector,
+    ) -> Result<Vec<ProcessInfo>, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::Reopen { selector, reply }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
     /// Full flock listing, id-sorted.
     ///
     /// # Errors
@@ -542,6 +577,24 @@ struct SheepSlot {
     entry: ProcessEntry,
     /// Sender for this sheep's control mailbox; `None` when not running.
     ctl: Option<mpsc::Sender<SheepCtl>>,
+    /// A clone of the [`ProcIo::log_ctl`] the most recent successful spawn
+    /// handed out, which is how a `Reopen` reaches this sheep's log pump.
+    /// `None` only for a slot whose spawn never succeeded at all.
+    ///
+    /// Written on every successful spawn and never cleared, unlike `ctl`.
+    /// Whether a pump is still there is a fact the channel already answers —
+    /// a send fails the moment the pump ends — and recording it here as well
+    /// would be a second copy of it, free to disagree with the first. The two
+    /// are not even the same question: a sheep's pump outlives its process
+    /// whenever a forked lamb inherited the pipe and is still writing, and
+    /// rotating THAT log is worth doing precisely because something is still
+    /// filling it.
+    ///
+    /// The sheep task holds the original for the whole run (see `run_sheep`),
+    /// so this clone never shortens the pump's life. It does not lengthen it
+    /// either: a pump ends at both-EOF or when its `logs` receiver goes, and
+    /// both follow the child's exit regardless of who still holds a sender.
+    log_ctl: Option<mpsc::Sender<LogCtl>>,
     /// Which manual command (if any) is waiting on this sheep's next exit,
     /// and who asked for it. Claimed through [`Actor::claim_manual`].
     manual: Option<PendingManual>,
@@ -691,6 +744,13 @@ impl<R: ProcessRunner> Actor<R> {
                 let _ = reply.send(self.snapshot_all());
                 false
             }
+            // Not rejected while `shutting_down`, unlike Start and Restart:
+            // a reopen registers nothing and spawns nothing, so there is no
+            // child it could leave outside the shutdown aggregation.
+            Command::Reopen { selector, reply } => {
+                self.handle_reopen(&selector, reply);
+                false
+            }
             Command::Stop { selector, reply } => {
                 self.begin_manual(
                     selector,
@@ -827,6 +887,7 @@ impl<R: ProcessRunner> Actor<R> {
                     err_file,
                 };
                 let info = to_info(&entry);
+                let log_ctl = io.log_ctl.clone();
                 let ctl = spawn_sheep_task::<R::Proc>(
                     id,
                     proc,
@@ -856,6 +917,7 @@ impl<R: ProcessRunner> Actor<R> {
                     SheepSlot {
                         entry,
                         ctl: Some(ctl),
+                        log_ctl: Some(log_ctl),
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
@@ -894,6 +956,7 @@ impl<R: ProcessRunner> Actor<R> {
                     SheepSlot {
                         entry,
                         ctl: None,
+                        log_ctl: None,
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
@@ -938,6 +1001,7 @@ impl<R: ProcessRunner> Actor<R> {
         match self.runner.spawn(&spec) {
             Ok((proc, io)) => {
                 let pid = proc.pid();
+                let log_ctl = io.log_ctl.clone();
                 let ctl = spawn_sheep_task::<R::Proc>(
                     id,
                     proc,
@@ -976,6 +1040,7 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.entry.started_at = Some(tokio::time::Instant::now());
                 slot.entry.restarts += 1;
                 slot.ctl = Some(ctl);
+                slot.log_ctl = Some(log_ctl);
                 // IMPORTANT-3: a new process now exists for this id — any
                 // RestartDue timer, or readiness task, scheduled before this
                 // point (targeting the process this replaced) is stale the
@@ -1226,6 +1291,70 @@ impl<R: ProcessRunner> Actor<R> {
                 Some(self.respawn(id, manually))
             }
         }
+    }
+
+    /// Resolves `selector` and hands every match to a task that reopens its
+    /// log files and then answers the caller.
+    ///
+    /// # Why the acknowledgements are never awaited here
+    ///
+    /// Awaiting one from inside the actor loop closes a permanent cycle
+    /// (CRITICAL-2): the actor stops draining its mailbox, so a sheep task
+    /// blocks in `actor_tx.send`, so nothing drains that sheep's `logs`, so
+    /// its pump — the party that owes the acknowledgement — never gets to
+    /// answer. This handler is therefore synchronous and does nothing but
+    /// collect senders; `spawn_reopen_task` owns every await.
+    ///
+    /// That task reports to the caller directly rather than back through the
+    /// mailbox as a `Msg`, which is where this departs from
+    /// [`spawn_readiness_task`]'s shape. A readiness result decides a status
+    /// transition, so it has to re-enter the actor to be applied, and has to
+    /// be checked against the slot's epoch in case a respawn beat it home. A
+    /// reopen changes no actor state at all, and the only party waiting is
+    /// the caller — so a return trip through the mailbox would buy nothing
+    /// but a second hop and an epoch check with nothing to guard.
+    ///
+    /// Staleness needs no guard for the same reason. A respawn between this
+    /// handler and the send leaves the task holding the previous run's
+    /// sender: that pump is already ending, so the send or the acknowledgement
+    /// fails and the sheep is reported as the no-op success below — which is
+    /// honest, because the replacement process opened its log files after the
+    /// rotation and is not holding a renamed inode either way.
+    ///
+    /// # What a matched sheep with no pump means
+    ///
+    /// Nothing to reopen, reported as a success rather than an error —
+    /// nobody rotating logs wants `reopen all` to fail because one sheep in
+    /// the flock is stopped. It reaches the task in one of two shapes, and
+    /// they are the same answer: `log_ctl` is `None` because no spawn ever
+    /// succeeded for this slot, or the send (or the acknowledgement) fails
+    /// because the pump has ended, which is how a stopped sheep normally
+    /// presents.
+    fn handle_reopen(
+        &mut self,
+        selector: &ProcessSelector,
+        reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
+    ) {
+        let mut matched: Vec<(ProcessInfo, Option<mpsc::Sender<LogCtl>>)> = self
+            .sheep
+            .iter()
+            .filter(|(id, slot)| {
+                let config = slot.entry.spec.config();
+                selector.matches(&config.name, **id, config.fold.as_deref())
+            })
+            .map(|(_, slot)| (to_info(&slot.entry), slot.log_ctl.clone()))
+            .collect();
+
+        if matched.is_empty() {
+            let _ = reply.send(Err(SupervisorError::NotFound));
+            return;
+        }
+
+        // Sorted here, where the whole set is in hand, rather than after the
+        // reopens: `HashMap` iteration order is arbitrary, and a caller
+        // reading the reply as a table wants the same id order `list` gives.
+        matched.sort_unstable_by_key(|(info, _)| info.id);
+        spawn_reopen_task(matched, reply);
     }
 
     /// Kills every currently-online sheep, deferring the reply the same way
@@ -1835,6 +1964,58 @@ fn spawn_readiness_task(
     ready_tx
 }
 
+/// Spawns the task that carries out one `Reopen` and answers its caller.
+///
+/// Every await a reopen needs lives in here, off the actor loop — see
+/// [`Actor::handle_reopen`] for the cycle that rules out doing it inline.
+///
+/// The sheep are visited one after another rather than concurrently. A
+/// reopen is two `open(2)`s behind a flush, so the serial cost is
+/// microseconds per sheep on a healthy filesystem, and one task with a plain
+/// loop is a great deal easier to follow than a join over the flock. The
+/// trade is real on a wedged filesystem, where one stalled pump delays every
+/// sheep behind it rather than just itself: the request's own deadline
+/// (`crate::rpc`'s `budget`) is what bounds the caller either way.
+///
+/// Must be called from within a Tokio runtime context: it spawns
+/// immediately, like `spawn_readiness_task` and `schedule_restart`.
+fn spawn_reopen_task(
+    matched: Vec<(ProcessInfo, Option<mpsc::Sender<LogCtl>>)>,
+    reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
+) {
+    tokio::spawn(async move {
+        let mut reopened = Vec::with_capacity(matched.len());
+        for (info, log_ctl) in matched {
+            if let Some(log_ctl) = log_ctl {
+                reopen_logs(&log_ctl).await;
+            }
+            reopened.push(info);
+        }
+        let _ = reply.send(Ok(reopened));
+    });
+}
+
+/// Asks one sheep's log pump to reopen both of its files and waits for the
+/// acknowledgement.
+///
+/// Returns once the pump has answered, or as soon as it is clear no pump
+/// will. Both failures mean the same thing operationally — there was nothing
+/// left to reopen — and neither is worth reporting to whoever asked:
+///
+/// - the send fails when the pump is already gone (a sheep that is not
+///   running), which is exactly what [`ProcIo::log_ctl`] promises callers;
+/// - the acknowledgement resolves `Err` when the pump ended between
+///   accepting the request and answering it, at both-EOF or with its `logs`
+///   receiver dropped. A request still sitting in the channel is dropped
+///   with it.
+async fn reopen_logs(log_ctl: &mpsc::Sender<LogCtl>) {
+    let (done, ack) = oneshot::channel();
+    if log_ctl.send(LogCtl::Reopen { done }).await.is_err() {
+        return;
+    }
+    let _ = ack.await;
+}
+
 /// Spawns the per-sheep task and returns its control sender.
 fn spawn_sheep_task<P: RunningProcess>(
     id: u32,
@@ -1969,6 +2150,10 @@ mod tests {
     use super::*;
     use crate::fake::{ProcScript, ScriptedRunner};
     use crate::testing::{probe_config, test_paths}; // the one crate-root fixture (IR-33)
+    // Test-only: `SilentPumpRunner` counts the requests its pumps receive so
+    // a case can order itself against the actor. Imported here rather than
+    // beside the module's other `tokio::sync` uses, which do not need it.
+    use tokio::sync::watch;
 
     /// Drives virtual time by parking on recv(); returns when the id reaches
     /// `kind`, handing back that event's `manually` flag (most callers only
@@ -3579,6 +3764,268 @@ mod tests {
              running: against the real runner that closes the read ends of \
              the child's stdout and stderr"
         );
+    }
+
+    /// A [`ScriptedRunner`] whose spawns hand out a log-control channel
+    /// that accepts requests and never answers them.
+    ///
+    /// Each request is held rather than dropped — holding it holds the
+    /// `oneshot` sender inside it, so the acknowledgement stays permanently
+    /// owed instead of resolving `Err` the moment the request is discarded.
+    /// The scripted fake answers a reopen the instant it arrives, which is
+    /// right for every other case and useless for the one below: a reopen
+    /// that completes immediately cannot show whether the actor was free
+    /// while it was outstanding.
+    ///
+    /// The `watch` counts requests that have reached a pump. A test needs it
+    /// to order itself against the actor: it is proof the actor has already
+    /// taken the `Reopen` off its mailbox, without which the probe below
+    /// could be answered by an actor that simply had not looked at the
+    /// command yet.
+    struct SilentPumpRunner {
+        inner: ScriptedRunner,
+        seen: watch::Sender<u32>,
+    }
+
+    impl SilentPumpRunner {
+        fn new(scripts: Vec<ProcScript>) -> (Self, watch::Receiver<u32>) {
+            let (seen, requests) = watch::channel(0);
+            (
+                Self {
+                    inner: ScriptedRunner::new(scripts),
+                    seen,
+                },
+                requests,
+            )
+        }
+    }
+
+    impl fmt::Debug for SilentPumpRunner {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("SilentPumpRunner").finish_non_exhaustive()
+        }
+    }
+
+    impl ProcessRunner for SilentPumpRunner {
+        type Proc = crate::fake::FakeProc;
+
+        fn spawn(
+            &self,
+            spec: &SpawnSpec,
+        ) -> Result<(Self::Proc, ProcIo), crate::runner::RunnerError> {
+            let (proc, mut io) = self.inner.spawn(spec)?;
+            let (tx, mut rx) = mpsc::channel(SHEEP_CTL_CAPACITY);
+            // Replacing the sender drops the fake's own, which ends the
+            // control task it spawned — deliberate. This runner's whole
+            // purpose is that nothing answers.
+            io.log_ctl = tx;
+            let seen = self.seen.clone();
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Some(request) = rx.recv().await {
+                    held.push(request);
+                    seen.send_modify(|count| *count += 1);
+                }
+            });
+            Ok((proc, io))
+        }
+    }
+
+    /// Fails if the actor awaits a reopen's acknowledgement inside its own
+    /// loop. That is the cycle CRITICAL-2 documents: an actor parked on an
+    /// acknowledgement stops draining its mailbox, so its sheep tasks block
+    /// sending into it, so nothing drains their `logs`, so the pump that
+    /// owes the acknowledgement never gets to answer. Here the pump simply
+    /// never answers, which is the same wedge with none of the timing.
+    ///
+    /// `list` is the probe because it is answered from the actor loop and
+    /// from nowhere else, so an answer is proof the loop is still turning.
+    ///
+    /// Waiting for the request to reach the pump first is what makes the
+    /// probe mean anything. Without it the reopen task might not have sent
+    /// yet, the actor would answer `list` from an empty mailbox, and an
+    /// inline await would pass unnoticed — measured, not assumed: the
+    /// version of this case that skipped the wait stayed green under
+    /// exactly that mutation.
+    #[tokio::test(start_paused = true)]
+    async fn the_actor_keeps_answering_while_a_reopen_waits_on_a_silent_pump() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (runner, mut requests) = SilentPumpRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        handle
+            .start(vec![normalize(AppConfig::minimal("web", "./srv")).unwrap()])
+            .await
+            .unwrap();
+
+        let reopening = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.reopen(ProcessSelector::All).await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), requests.wait_for(|seen| *seen == 1))
+            .await
+            .expect("the reopen must reach the pump")
+            .expect("the runner outlives this wait, so its sender cannot have closed");
+
+        let listed = tokio::time::timeout(Duration::from_secs(5), handle.list())
+            .await
+            .expect("the actor must keep answering while a reopen is outstanding");
+        assert_eq!(listed.len(), 1);
+        assert!(
+            !reopening.is_finished(),
+            "sanity: nothing can acknowledge this reopen, so `list` answering \
+             above is not just the reopen having finished first"
+        );
+        reopening.abort();
+    }
+
+    /// Fails if a reopen skips a matched sheep's pump, reaches a sheep the
+    /// selector never named, or answers with the wrong set.
+    ///
+    /// The counts are what make this more than a smoke test: an
+    /// implementation that resolved the selector, answered with the right
+    /// snapshots and pushed nothing at any pump passes every other
+    /// assertion here. Three sheep and a selector naming two of them is the
+    /// smallest shape that catches both halves — too narrow and too wide.
+    #[tokio::test(start_paused = true)]
+    async fn a_reopen_reaches_every_matched_sheep_and_no_others() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        // Three scripts for three instances, counted: a fourth spawn would
+        // answer `SpawnFailed("script exhausted")` and land that sheep in
+        // `Errored` with no pump at all — a state this case could not tell
+        // apart from the skipped pump it is looking for.
+        let runner = Arc::new(ScriptedRunner::new(vec![
+            ProcScript::never_exits(),
+            ProcScript::never_exits(),
+            ProcScript::never_exits(),
+        ]));
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(SharedRunner(Arc::clone(&runner)), test_paths(&dir), events);
+
+        let mut web = AppConfig::minimal("web", "./srv");
+        web.instances = 2;
+        handle
+            .start(vec![
+                normalize(web).unwrap(),
+                normalize(AppConfig::minimal("api", "./api")).unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let reopened = handle
+            .reopen(ProcessSelector::Name("web".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reopened.iter().map(|info| info.id).collect::<Vec<_>>(),
+            vec![0, 1],
+            "the reply must carry both `web` instances, id-sorted, and no `api`"
+        );
+        assert_eq!(runner.reopens(0), 1, "web's first instance");
+        assert_eq!(runner.reopens(1), 1, "web's second instance");
+        assert_eq!(runner.reopens(2), 0, "api was never named");
+    }
+
+    /// Fails if a selector that matches nothing is answered as a success.
+    /// `reopen` is the one selector verb with a default, so a bare `shep
+    /// reopen` against an empty flock is the ordinary way to reach this —
+    /// and silence would look exactly like a rotation that worked.
+    #[tokio::test(start_paused = true)]
+    async fn a_reopen_matching_nothing_is_not_found() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+
+        assert_eq!(
+            handle.reopen(ProcessSelector::All).await,
+            Err(SupervisorError::NotFound)
+        );
+    }
+
+    /// Fails if a stopped sheep makes a reopen error out, or hang waiting
+    /// for an acknowledgement that cannot come. Rotating a flock with one
+    /// sheep stopped in it must still succeed and still report that sheep:
+    /// there was nothing to reopen, which is not a failure.
+    ///
+    /// The fake's control task ends with its proc (`ScriptedRunner`'s own
+    /// doc), so this sheep's pump is genuinely gone by the time the reopen
+    /// is issued rather than merely notionally so.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_sheep_is_a_no_op_success() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        // One script, one spawn: `autorestart = false` below means the
+        // supervisor never asks for a second.
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.autorestart = false;
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        handle
+            .stop(ProcessSelector::Name("web".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(handle.list().await[0].status, ProcStatus::Stopped);
+
+        let reopened =
+            tokio::time::timeout(Duration::from_secs(5), handle.reopen(ProcessSelector::All))
+                .await
+                .expect("a reopen aimed at a stopped sheep must not wait for an acknowledgement")
+                .expect("a stopped sheep has nothing to reopen, which is a success");
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0].status, ProcStatus::Stopped);
+    }
+
+    /// Fails if [`reopen_logs`] waits on an acknowledgement that no longer
+    /// has anyone to send it — the leg where the pump is already gone and
+    /// the send itself fails, which is what a stopped sheep looks like from
+    /// the actor's side.
+    #[tokio::test(start_paused = true)]
+    async fn a_reopen_whose_pump_is_already_gone_returns_at_once() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx); // the pump ended before the request was made
+
+        tokio::time::timeout(Duration::from_secs(5), reopen_logs(&tx))
+            .await
+            .expect("a failed send must end the reopen, not leave it waiting");
+    }
+
+    /// Fails if [`reopen_logs`] treats a dropped acknowledgement as
+    /// something to keep waiting on — the other leg, where the pump ends
+    /// between accepting the request and answering it (at both-EOF, or with
+    /// its `logs` receiver gone). The request in hand is dropped with it,
+    /// taking the `done` sender along.
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_that_ends_mid_request_still_ends_the_reopen() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let request = rx.recv().await.expect("the reopen must reach the pump");
+            drop(request); // ends without answering, exactly as a closing pump does
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), reopen_logs(&tx))
+            .await
+            .expect("a dropped acknowledgement must end the reopen, not leave it waiting");
+    }
+
+    /// A [`ScriptedRunner`] a test can still read after the engine has taken
+    /// ownership of it. [`ProcessRunner::spawn`] takes `&self`, so sharing
+    /// one costs nothing but this forwarding impl.
+    #[derive(Debug)]
+    struct SharedRunner(Arc<ScriptedRunner>);
+
+    impl ProcessRunner for SharedRunner {
+        type Proc = crate::fake::FakeProc;
+
+        fn spawn(
+            &self,
+            spec: &SpawnSpec,
+        ) -> Result<(Self::Proc, ProcIo), crate::runner::RunnerError> {
+            self.0.spawn(spec)
+        }
     }
 
     /// A spawn spec for the cases that drive [`run_sheep`] directly. The

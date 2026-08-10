@@ -31,6 +31,8 @@ use commands::daemon::{daemon_exit_code, run_daemon};
 #[cfg(unix)]
 use commands::lifecycle;
 #[cfg(unix)]
+use commands::logs;
+#[cfg(unix)]
 use commands::query;
 use exit::ExitCode;
 #[cfg(unix)]
@@ -209,6 +211,10 @@ async fn run(cli: Cli) -> ExitCode {
         },
         Commands::Ping => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => query::ping(&client, &mut streams, fmt).await,
+            Err(code) => code,
+        },
+        Commands::Reopen(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => logs::reopen(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
         Commands::Kill => match connect_client(&mut streams, fmt, &paths).await {

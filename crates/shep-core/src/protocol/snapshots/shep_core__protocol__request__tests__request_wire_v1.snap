@@ -76,5 +76,15 @@ expression: requests
         }
       ]
     }
+  },
+  {
+    "id": 5,
+    "deadline_ms": null,
+    "body": {
+      "kind": "reopen",
+      "selector": {
+        "kind": "all"
+      }
+    }
   }
 ]

@@ -130,6 +130,99 @@ async fn exit_code_and_logs_are_captured() {
     await_file_contents(&err_file, "err-line\n").await;
 }
 
+/// A shell fragment that blocks until `marker` exists, polling once a
+/// second. `sleep`'s only portable argument is a whole number of seconds
+/// (POSIX), so a finer poll would be a bet on a particular `sleep`.
+///
+/// Used to put a real child's output either side of a reopen without
+/// guessing at timing: the test writes the marker exactly when it wants the
+/// next line, so "after" can only have been written after the swap.
+fn wait_for_marker(marker: &Path) -> String {
+    format!("while [ ! -f {} ]; do sleep 1; done", marker.display())
+}
+
+/// Fails if a reopen leaves the pump writing into the renamed inode — which
+/// is `create`-mode rotation (rename, then ask) silently producing an empty
+/// live log forever, with `bleats --no-follow` printing nothing and exiting
+/// 0.
+///
+/// Both halves are the assertion. A test that only checked the recreated
+/// path grows would also pass against a pump that opened a SECOND handle
+/// and kept the first: the new lines would land in both files. Checking
+/// that the archive stopped growing is what pins the old handle as closed.
+///
+/// The duplex-stream cases in `tokio_runner.rs` cover the same swap without
+/// a child. This one is the real article — a real fork, real pipes, a real
+/// inode under the rename — which is the only tier where the child's own
+/// view of its stdout could be disturbed by the swap, and the reason
+/// nothing child-side is asked for: it holds a pipe, never the file.
+#[tokio::test]
+async fn a_reopen_moves_a_real_childs_output_onto_the_recreated_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let out_file = dir.path().join("out.log");
+    let err_file = dir.path().join("err.log");
+    let marker = dir.path().join("go");
+    let runner = TokioRunner::new();
+    let spec = sh_spec(
+        &format!("echo before; {}; echo after", wait_for_marker(&marker)),
+        false,
+        out_file.clone(),
+        err_file.clone(),
+    );
+
+    let (mut proc, mut io) = runner.spawn(&spec).unwrap();
+    // The child blocks on the marker, so any assertion that fails before
+    // it is written leaves a real process behind for the rest of the run.
+    let _reaper = Reaper(vec![i32::try_from(proc.pid()).unwrap()]);
+
+    let line = tokio::time::timeout(LOG_WRITE_DEADLINE, io.logs.recv())
+        .await
+        .expect("the child's first line must arrive")
+        .expect("logs closed before the first line");
+    assert_eq!(line.line, "before");
+    await_file_contents(&out_file, "before\n").await;
+
+    // The rotator's half: the pump's handle now names an inode the live
+    // path no longer resolves to.
+    let archive = dir.path().join("out.log.1");
+    fs::rename(&out_file, &archive).unwrap();
+    assert!(!out_file.exists(), "sanity: the rename really moved it");
+
+    let (done, ack) = tokio::sync::oneshot::channel();
+    io.log_ctl
+        .send(shep_daemon::runner::LogCtl::Reopen { done })
+        .await
+        .expect("a running sheep's pump must still be reachable");
+    tokio::time::timeout(LOG_WRITE_DEADLINE, ack)
+        .await
+        .expect("the reopen must be acknowledged")
+        .expect("the pump must answer rather than drop the acknowledgement");
+
+    // No polling: the acknowledgement is a real barrier, since the reopen
+    // flushes the old handle before dropping it.
+    assert_eq!(fs::read_to_string(&out_file).unwrap(), "");
+    assert_eq!(fs::read_to_string(&archive).unwrap(), "before\n");
+
+    fs::write(&marker, "").unwrap();
+    let line = tokio::time::timeout(LOG_WRITE_DEADLINE, io.logs.recv())
+        .await
+        .expect("the child's second line must arrive")
+        .expect("logs closed before the second line");
+    assert_eq!(line.line, "after");
+
+    await_file_contents(&out_file, "after\n").await;
+    assert_eq!(
+        fs::read_to_string(&archive).unwrap(),
+        "before\n",
+        "the renamed file must stop growing the moment the handle is swapped"
+    );
+
+    let outcome = tokio::time::timeout(REAP_DEADLINE, proc.wait())
+        .await
+        .expect("the child exits once it has printed its second line");
+    assert_eq!(outcome.code, Some(0));
+}
+
 #[tokio::test]
 async fn signal_ignored_then_kill_tree_reaps() {
     let dir = tempfile::tempdir().unwrap();

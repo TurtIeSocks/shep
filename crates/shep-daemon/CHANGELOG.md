@@ -131,6 +131,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and closed. The child is not involved and never notices: it holds a pipe,
   and the daemon does the file I/O on the far side of it. Reaching a pump
   means holding the `ProcIo` field below.
+- Answer `Request::Reopen`: the supervisor keeps a clone of every running
+  sheep's log-control sender and pushes a `LogCtl::Reopen` at each sheep the
+  selector matches, which is what makes `create`-mode rotation — rename the
+  file, then ask — work at all. Until now the pump kept filling the renamed
+  inode and the live path was never recreated, so `shep bleats --no-follow`
+  printed nothing and exited 0 with no diagnostic; a restart was the only
+  working reopen. The reply lands only once every matched pump has swapped
+  both handles, so a `postrotate` stanza that waits for it knows nothing is
+  still holding what it renamed. A matched sheep with no live pump is
+  reported as a success rather than an error: there was nothing to reopen,
+  which is not a failure worth failing `reopen all` over. The
+  acknowledgements are awaited on a task of their own and never inside the
+  actor loop — an actor parked on one stops draining its mailbox, which
+  stops the sheep task draining its logs, which stops the pump answering.
 
 ### Fixes
 
