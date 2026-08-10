@@ -2742,12 +2742,14 @@ impl<R: ProcessRunner> Actor<R> {
     ///    reload's drainee, the one entry [`ProcStatus::Stopping`] otherwise
     ///    reaches: a liveness failure or memory breach raised against it must
     ///    ride out to the drainee's own exit, never claim its manual marker
-    ///    and kill it a second time. For that one case this is now the first
-    ///    of two rejections — `begin_manual`, which every automatic restart
-    ///    goes through including this one, holds them off both halves of an
-    ///    uncommitted swap on its own. The stopped-sheep case above is this
-    ///    guard's alone, so it is not redundant; and a report against a
-    ///    drainee being dropped twice over is the right amount.
+    ///    and kill it a second time. For that one case this is the first of
+    ///    two rejections and the only one that runs: `begin_manual`, which
+    ///    every automatic restart goes through including this one, would hold
+    ///    it off both halves of an uncommitted swap on its own, but the
+    ///    `return` here means it never gets the chance. The stopped-sheep case
+    ///    above is this guard's alone, so it is not redundant; a drainee is
+    ///    covered twice over, and that is the right amount for the one case
+    ///    where getting it wrong ends the instance being replaced.
     ///
     /// Delegates to `begin_manual` rather than `respawn`: that keeps the kill
     /// ladder, the marker rule, the `pending_delete` interaction and the budget
