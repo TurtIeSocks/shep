@@ -26,7 +26,7 @@ Free on crates.io (verified 2026-08-07): `shep`, `shepd`, plus reserves `bleat`,
 | resurrect saved state | resurrect | **muster** | `shep muster`, snapshot = the muster roll |
 | TUI dashboard | monit/dash | **lookout** | `shep lookout`; `shep dash` alias |
 | host machine | host | **the heft** (sheep bound to their hill) | subtle: docs + host-metrics naming |
-| zero-downtime reload | reload | reload (verb stays) — strategies **come-bye** / **away** if we ever name them | reload internals, maybe strategy flags |
+| graceful reload (an overlap, not zero downtime) | reload | reload (verb stays) — strategies **come-bye** / **away** if we ever name them | reload internals, maybe strategy flags |
 | kill escalation | kill | kill (stays — clarity beats cuteness on destructive ops) | — |
 
 ## Usage rules (readability > theme)
