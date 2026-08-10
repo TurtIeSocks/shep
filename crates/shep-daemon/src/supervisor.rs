@@ -25,7 +25,9 @@
 
 use core::fmt;
 use core::time::Duration;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -47,7 +49,7 @@ use crate::probes::Prober;
 use crate::probes::os::OsProber;
 use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
 use crate::runner::{
-    ExitOutcome, LogCtl, ProcIo, ProcessRunner, ReopenError, RunningProcess, SpawnSpec,
+    ExitOutcome, FlushError, LogCtl, ProcIo, ProcessRunner, ReopenError, RunningProcess, SpawnSpec,
 };
 
 /// Capacity of the actor's own mailbox (commands + internal events).
@@ -129,6 +131,15 @@ pub(crate) enum Command {
         /// [`Actor::handle_reopen`]).
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     },
+    /// Empties the log files of every sheep matching `selector`: flushes
+    /// every matched pump, then truncates the recorded paths.
+    Flush {
+        /// Which sheep.
+        selector: ProcessSelector,
+        /// Answers once every path is empty — off a task of its own, never
+        /// the actor loop (see [`Actor::handle_flush`]).
+        reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
+    },
     /// Graceful engine shutdown: kill ladder on every online sheep, then stop.
     Shutdown {
         /// Answers once every online sheep is terminal, right before the
@@ -199,6 +210,16 @@ pub enum SupervisorError {
     /// `"<name> (id <id>): <paths and reasons>"` entry per such sheep,
     /// joined by `"; "`. Every other matched sheep was reopened.
     ReopenFailed(String),
+    /// At least one matched log file is not empty after a `Flush`, because
+    /// its pump still owed it bytes or because the path could not be
+    /// truncated. Carries one `"<path>: <reason>"` entry per such file,
+    /// joined by `"; "`. Every other matched path was emptied.
+    ///
+    /// Keyed by path where [`Self::ReopenFailed`] is keyed by sheep, and
+    /// deliberately: a reopen's unit of work is one sheep's pump, while a
+    /// flush's is one file — and one file can belong to several sheep at
+    /// once (see [`FlushError::message`](crate::runner::FlushError::message)).
+    FlushFailed(String),
     /// The actor has shut down; its mailbox is closed.
     EngineStopped,
 }
@@ -209,6 +230,7 @@ impl fmt::Display for SupervisorError {
             Self::NotFound => f.write_str("selector matched no registered sheep"),
             Self::SpawnFailed(msg) => write!(f, "spawn failed: {msg}"),
             Self::ReopenFailed(msg) => write!(f, "log reopen failed: {msg}"),
+            Self::FlushFailed(msg) => write!(f, "log flush failed: {msg}"),
             Self::EngineStopped => f.write_str("supervisor engine has shut down"),
         }
     }
@@ -398,6 +420,34 @@ impl SupervisorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Command(Command::Reopen { selector, reply }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
+    /// Empties the log files of every sheep matching `selector`: flushes
+    /// every matched pump, then truncates the paths those sheep were
+    /// registered with.
+    ///
+    /// Answers only once every matched path is empty. A matched sheep that is
+    /// not running has no pump to flush, and its files are truncated all the
+    /// same — the operation addresses paths, and a stopped sheep's logs are
+    /// readable (`shep bleats --no-follow`) and so worth being able to empty.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::NotFound`] — nothing matched.
+    /// - [`SupervisorError::FlushFailed`] — at least one matched file is not
+    ///   empty: a pump could not land what it still owed, or a path could not
+    ///   be truncated. Every other matched path was emptied.
+    /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    pub(crate) async fn flush(
+        &self,
+        selector: ProcessSelector,
+    ) -> Result<Vec<ProcessInfo>, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::Flush { selector, reply }))
             .await
             .map_err(|_| SupervisorError::EngineStopped)?;
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
@@ -758,11 +808,16 @@ impl<R: ProcessRunner> Actor<R> {
                 let _ = reply.send(self.snapshot_all());
                 false
             }
-            // Not rejected while `shutting_down`, unlike Start and Restart:
-            // a reopen registers nothing and spawns nothing, so there is no
-            // child it could leave outside the shutdown aggregation.
+            // Neither is rejected while `shutting_down`, unlike Start and
+            // Restart: a reopen and a flush each register nothing and spawn
+            // nothing, so there is no child either could leave outside the
+            // shutdown aggregation.
             Command::Reopen { selector, reply } => {
                 self.handle_reopen(&selector, reply);
+                false
+            }
+            Command::Flush { selector, reply } => {
+                self.handle_flush(&selector, reply);
                 false
             }
             Command::Stop { selector, reply } => {
@@ -1374,6 +1429,70 @@ impl<R: ProcessRunner> Actor<R> {
         // reading the reply as a table wants the same id order `list` gives.
         matched.sort_unstable_by_key(|(info, _)| info.id);
         spawn_reopen_task(matched, reply);
+    }
+
+    /// Resolves `selector` and hands every match to a task that flushes its
+    /// log pump, truncates its log files and then answers the caller.
+    ///
+    /// Synchronous and `&self` for the reasons [`Self::handle_reopen`] gives
+    /// at length, all of which hold here unchanged: awaiting a pump's
+    /// acknowledgement inside the actor loop closes CRITICAL-2's cycle, a
+    /// flush changes no actor state, and the compiler re-checks that second
+    /// claim on every build.
+    ///
+    /// # Why the paths come from the entry and not from the pump
+    ///
+    /// [`ProcessEntry::out_file`]/[`ProcessEntry::err_file`] are what the
+    /// assembler resolved at registration, and they are what this truncates
+    /// — never the inode the pump currently holds. The two are the same file
+    /// right up until an external rotator renames it, and from that moment a
+    /// flush that chased the pump's handle would empty the ARCHIVE and leave
+    /// the live log untouched: the exact opposite of what was asked, and
+    /// silent about it. Being path-based is also what lets a stopped sheep,
+    /// which has no pump at all, still be flushed.
+    ///
+    /// The `PathBuf`s are read rather than `ProcessInfo`'s `out_file`, whose
+    /// `String` is lossy by design (see [`to_info`]): a truncate must open
+    /// the path the child is really writing to, not a rendering of it.
+    ///
+    /// # Why the paths are a set
+    ///
+    /// Several matched sheep can name one path — `merge_logs`, or an
+    /// explicit `out_file` on a multi-instance app — and under `O_APPEND` one
+    /// truncate empties the file for every handle open on it. Truncating once
+    /// per sheep would repeat completed work and, worse, reopen the window:
+    /// each extra truncate can discard a line a sibling instance wrote after
+    /// the flush barrier. Deduplicating here is what makes "flush, then
+    /// truncate" a single barrier rather than N interleaved ones.
+    fn handle_flush(
+        &self,
+        selector: &ProcessSelector,
+        reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
+    ) {
+        let mut matched: Vec<(ProcessInfo, Option<mpsc::Sender<LogCtl>>)> = Vec::new();
+        let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
+        for (id, slot) in &self.sheep {
+            let config = slot.entry.spec.config();
+            if !selector.matches(&config.name, *id, config.fold.as_deref()) {
+                continue;
+            }
+            paths.insert(slot.entry.out_file.clone());
+            paths.insert(slot.entry.err_file.clone());
+            matched.push((to_info(&slot.entry), slot.log_ctl.clone()));
+        }
+
+        if matched.is_empty() {
+            let _ = reply.send(Err(SupervisorError::NotFound));
+            return;
+        }
+
+        // Sorted for the reason `handle_reopen` sorts: `HashMap` iteration
+        // order is arbitrary, and a caller rendering the reply as a table
+        // wants `list`'s id order. `paths` needs no such step — a `BTreeSet`
+        // is already ordered, which is what makes a multi-file failure
+        // message reproducible.
+        matched.sort_unstable_by_key(|(info, _)| info.id);
+        spawn_flush_task(matched, paths, reply);
     }
 
     /// Kills every currently-online sheep, deferring the reply the same way
@@ -2054,6 +2173,118 @@ async fn reopen_logs(log_ctl: &mpsc::Sender<LogCtl>) -> Result<(), ReopenError> 
         return Ok(());
     }
     ack.await.unwrap_or(Ok(()))
+}
+
+/// Spawns the task that carries out one `Flush` and answers its caller.
+///
+/// Every await a flush needs lives in here, off the actor loop — see
+/// [`Actor::handle_reopen`] for the cycle that rules out doing it inline.
+///
+/// # Why both phases are in one task, in this order
+///
+/// EVERY pump is flushed before ANY path is truncated. That ordering is the
+/// whole reason the flush half exists: `write_all` on a [`tokio::fs::File`]
+/// returns once the real `write(2)` is queued on the blocking pool, so a line
+/// already dispatched can land at offset 0 of a file that was truncated in
+/// between. Draining every pump first turns that into a single barrier — and
+/// it is the only ordering that is also correct when several matched sheep
+/// share one path, where a per-sheep flush-then-truncate would let one
+/// instance's freshly flushed lines be wiped by the next instance's truncate.
+///
+/// Like the reopen task, sheep are visited one after another rather than
+/// concurrently, and every one of them is visited before anything is
+/// reported: one unwritable path must not stop the rest of the flock being
+/// emptied, and an operator wants every failure in one answer.
+///
+/// Must be called from within a Tokio runtime context: it spawns immediately.
+fn spawn_flush_task(
+    matched: Vec<(ProcessInfo, Option<mpsc::Sender<LogCtl>>)>,
+    paths: BTreeSet<PathBuf>,
+    reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
+) {
+    tokio::spawn(async move {
+        let mut failures = Vec::new();
+        let mut flushed = Vec::with_capacity(matched.len());
+
+        for (info, log_ctl) in matched {
+            if let Some(log_ctl) = log_ctl
+                && let Err(error) = flush_logs(&log_ctl).await
+            {
+                failures.push(error.message);
+            }
+            flushed.push(info);
+        }
+
+        for path in paths {
+            if let Err(error) = truncate_log(&path).await {
+                failures.push(error.message);
+            }
+        }
+
+        let _ = reply.send(if failures.is_empty() {
+            Ok(flushed)
+        } else {
+            Err(SupervisorError::FlushFailed(failures.join("; ")))
+        });
+    });
+}
+
+/// Asks one sheep's log pump to land everything it still owes both of its
+/// files, and waits for the acknowledgement.
+///
+/// # Errors
+///
+/// [`FlushError`] — a pump answered, and at least one stream still has bytes
+/// that never reached its file. Those bytes are what the truncate about to
+/// follow would race, so this is worth failing the caller's request over.
+///
+/// Not reaching a pump at all is a success, exactly as in [`reopen_logs`],
+/// and for a reason that is if anything plainer here: a pump that is gone —
+/// whether the send failed or the acknowledgement was dropped by a pump that
+/// ended mid-request — has no handle and so owes no bytes to anything. The
+/// truncate that follows still runs, which is how a stopped sheep's logs get
+/// emptied.
+async fn flush_logs(log_ctl: &mpsc::Sender<LogCtl>) -> Result<(), FlushError> {
+    let (done, ack) = oneshot::channel();
+    if log_ctl.send(LogCtl::Flush { done }).await.is_err() {
+        return Ok(());
+    }
+    ack.await.unwrap_or(Ok(()))
+}
+
+/// Truncates the log file at `path` to zero length.
+///
+/// Opened write-only with `O_TRUNC` and dropped straight away — this handle
+/// never writes, so it is not the exception to `open_append` being the only
+/// thing that opens a log file *for logging*. The pump's own handle is
+/// untouched and stays `O_APPEND`, which is what makes its next write land at
+/// offset 0 of the emptied file rather than past a sparse hole.
+///
+/// Deliberately not `create(true)`: a log file that is not there is already
+/// empty, so a missing path (or a missing log directory, which surfaces the
+/// same `NotFound`) is a no-op success rather than a failure. That is the
+/// ordinary state of a sheep that has never been started, and failing
+/// `shep flush all` over one such sheep would be the same complaint the
+/// reopen path answers for stopped sheep. Creating the file instead would
+/// leave a stray empty log wherever a rotator had just renamed one away.
+///
+/// # Errors
+///
+/// [`FlushError`] — the path exists and could not be opened for truncation: a
+/// mode the daemon cannot write, a read-only filesystem, an IO error.
+async fn truncate_log(path: &Path) -> Result<(), FlushError> {
+    match tokio::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(FlushError {
+            message: format!("{}: {error}", path.display()),
+        }),
+    }
 }
 
 /// Spawns the per-sheep task and returns its control sender.
@@ -4158,10 +4389,25 @@ mod tests {
             // control task it spawned. This pump answers in its place.
             io.log_ctl = tx;
             tokio::spawn(async move {
-                while let Some(LogCtl::Reopen { done }) = rx.recv().await {
-                    let _ = done.send(Err(ReopenError {
-                        message: PUMP_REFUSAL.to_string(),
-                    }));
+                while let Some(ctl) = rx.recv().await {
+                    // Both variants, so this pump keeps serving whichever
+                    // arrives. Matching on only one would end the loop at the
+                    // first of the other and drop the receiver, and every
+                    // request after that would look like the no-op success a
+                    // vanished pump gets — which is the opposite of what this
+                    // runner exists to produce.
+                    match ctl {
+                        LogCtl::Reopen { done } => {
+                            let _ = done.send(Err(ReopenError {
+                                message: PUMP_REFUSAL.to_string(),
+                            }));
+                        }
+                        LogCtl::Flush { done } => {
+                            let _ = done.send(Err(FlushError {
+                                message: PUMP_REFUSAL.to_string(),
+                            }));
+                        }
+                    }
                 }
             });
             Ok((proc, io))
@@ -4218,6 +4464,436 @@ mod tests {
             scripted.reopens(1),
             1,
             "the healthy sheep must still have been reopened"
+        );
+    }
+
+    // --- flush -------------------------------------------------------
+    //
+    // The engine tier can show four of the five things `flush` has to get
+    // right: that the request reaches exactly the matched pumps, that the
+    // actor stays free while one is outstanding, that the truncate is
+    // ordered AFTER the acknowledgement, and that recorded paths are
+    // emptied whether or not a pump is there to answer. The fifth — that
+    // the path and not the pump's current inode is what gets emptied —
+    // needs a pump holding a real handle on a real file, and lives in
+    // `tests/daemon_e2e.rs`.
+
+    /// Fails if a flush skips a matched sheep's pump, reaches a sheep the
+    /// selector never named, or answers with the wrong set.
+    ///
+    /// The counts are what make this more than a smoke test, exactly as in
+    /// [`a_reopen_reaches_every_matched_sheep_and_no_others`]: an
+    /// implementation that resolved the selector, truncated the paths and
+    /// pushed nothing at any pump passes every other assertion here — and
+    /// that implementation is the one with the bug the flush half exists to
+    /// prevent, since nothing would then be waited on before the truncate.
+    /// Three sheep and a selector naming two of them is the smallest shape
+    /// that catches both halves.
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_reaches_every_matched_sheep_and_no_others() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        // Three scripts for three instances, counted, for the reason the
+        // reopen case gives: a fourth spawn would fail and land that sheep
+        // pumpless, which reads the same as the skip being looked for.
+        let runner = Arc::new(ScriptedRunner::new(vec![
+            ProcScript::never_exits(),
+            ProcScript::never_exits(),
+            ProcScript::never_exits(),
+        ]));
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(SharedRunner(Arc::clone(&runner)), test_paths(&dir), events);
+
+        let mut web = AppConfig::minimal("web", "./srv");
+        web.instances = 2;
+        handle
+            .start(vec![
+                normalize(web).unwrap(),
+                normalize(AppConfig::minimal("api", "./api")).unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let flushed = handle
+            .flush(ProcessSelector::Name("web".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            flushed.iter().map(|info| info.id).collect::<Vec<_>>(),
+            vec![0, 1],
+            "the reply must carry both `web` instances, id-sorted, and no `api`"
+        );
+        assert_eq!(runner.flushes(0), 1, "web's first instance");
+        assert_eq!(runner.flushes(1), 1, "web's second instance");
+        assert_eq!(runner.flushes(2), 0, "api was never named");
+        assert_eq!(
+            runner.reopens(0),
+            0,
+            "a flush must push `LogCtl::Flush`, never `LogCtl::Reopen` — a \
+             flush wired to the neighbouring variant would swap the flock's \
+             handles and empty nothing"
+        );
+    }
+
+    /// Fails if the actor awaits a flush's acknowledgement inside its own
+    /// loop — the same CRITICAL-2 cycle
+    /// [`the_actor_keeps_answering_while_a_reopen_waits_on_a_silent_pump`]
+    /// describes, reached through the other verb. [`SilentPumpRunner`] holds
+    /// every request it is sent whatever the variant, so it wedges a flush
+    /// exactly as it wedges a reopen.
+    ///
+    /// `list` is the probe because it is answered from the actor loop and
+    /// from nowhere else. Waiting for the request to reach the pump first is
+    /// what makes the probe mean anything — see the reopen case for the
+    /// measurement behind that.
+    #[tokio::test(start_paused = true)]
+    async fn the_actor_keeps_answering_while_a_flush_waits_on_a_silent_pump() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (runner, mut requests) = SilentPumpRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        handle
+            .start(vec![normalize(AppConfig::minimal("web", "./srv")).unwrap()])
+            .await
+            .unwrap();
+
+        let flushing = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.flush(ProcessSelector::All).await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), requests.wait_for(|seen| *seen == 1))
+            .await
+            .expect("the flush must reach the pump")
+            .expect("the runner outlives this wait, so its sender cannot have closed");
+
+        let listed = tokio::time::timeout(Duration::from_secs(5), handle.list())
+            .await
+            .expect("the actor must keep answering while a flush is outstanding");
+        assert_eq!(listed.len(), 1);
+        assert!(
+            !flushing.is_finished(),
+            "sanity: nothing can acknowledge this flush, so `list` answering \
+             above is not just the flush having finished first"
+        );
+        flushing.abort();
+    }
+
+    /// What [`LateWritingPumpRunner`]'s pump appends as it answers a flush.
+    /// One owner for the string, because the case below asserts the file it
+    /// lands in is empty and a second copy could drift out of agreement with
+    /// what was actually written.
+    const LATE_LINE: &str = "landed-while-the-flush-was-being-answered\n";
+
+    /// A [`ScriptedRunner`] whose pumps append [`LATE_LINE`] to the sheep's
+    /// real stdout log path at the moment they acknowledge a flush.
+    ///
+    /// This is the whole of the ordering hazard, made deterministic. A real
+    /// [`tokio::fs::File`] hands its `write(2)` to the blocking pool and
+    /// returns, so at the instant a `Flush` arrives there can be bytes that
+    /// have not reached the file yet — and the acknowledgement is what says
+    /// they have. Waiting for a real one to land in the right microsecond is
+    /// a race; a pump that writes as it answers turns "did the truncate wait
+    /// for the acknowledgement?" into a question about file contents, which
+    /// is decidable every run.
+    ///
+    /// The path comes from the [`SpawnSpec`] rather than being derived here,
+    /// so this cannot disagree with the assembler about which file the sheep
+    /// owns.
+    struct LateWritingPumpRunner {
+        inner: ScriptedRunner,
+    }
+
+    impl LateWritingPumpRunner {
+        fn new(inner: ScriptedRunner) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl fmt::Debug for LateWritingPumpRunner {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("LateWritingPumpRunner")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ProcessRunner for LateWritingPumpRunner {
+        type Proc = crate::fake::FakeProc;
+
+        fn spawn(
+            &self,
+            spec: &SpawnSpec,
+        ) -> Result<(Self::Proc, ProcIo), crate::runner::RunnerError> {
+            let (proc, mut io) = self.inner.spawn(spec)?;
+            let (tx, mut rx) = mpsc::channel(SHEEP_CTL_CAPACITY);
+            // Replacing the sender drops the fake's own, which ends the
+            // control task it spawned. This pump answers in its place.
+            io.log_ctl = tx;
+            let out_file = spec.out_file.clone();
+            tokio::spawn(async move {
+                while let Some(ctl) = rx.recv().await {
+                    match ctl {
+                        LogCtl::Flush { done } => {
+                            if let Some(parent) = out_file.parent() {
+                                std::fs::create_dir_all(parent).unwrap();
+                            }
+                            let mut file = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&out_file)
+                                .unwrap();
+                            std::io::Write::write_all(&mut file, LATE_LINE.as_bytes()).unwrap();
+                            // Answered only once the bytes are really on
+                            // disk, which is what a real pump's `flush`
+                            // promises and what the truncate must wait for.
+                            let _ = done.send(Ok(()));
+                        }
+                        LogCtl::Reopen { done } => {
+                            let _ = done.send(Ok(()));
+                        }
+                    }
+                }
+            });
+            Ok((proc, io))
+        }
+    }
+
+    /// Fails if the truncate runs before the pump has acknowledged the
+    /// flush.
+    ///
+    /// That ordering is the reason this verb has two halves at all. Without
+    /// it the file is emptied while a line is still in flight, the line
+    /// lands at offset 0 immediately afterwards under `O_APPEND`, and the
+    /// operator is told the log is empty when it holds exactly the one line
+    /// they most recently produced.
+    ///
+    /// Both assertions are load-bearing and catch opposite mutations. That
+    /// the file EXISTS is proof the pump was flushed at all — a flush that
+    /// only truncated would never create it, and would then pass an
+    /// emptiness check vacuously, since the truncate deliberately does not
+    /// create a missing path. That it is EMPTY is proof the truncate came
+    /// second.
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_truncates_only_after_its_pump_has_answered() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(
+            LateWritingPumpRunner::new(ScriptedRunner::new(vec![ProcScript::never_exits()])),
+            test_paths(&dir),
+            events,
+        );
+        handle
+            .start(vec![normalize(AppConfig::minimal("web", "./srv")).unwrap()])
+            .await
+            .unwrap();
+
+        // Read off the daemon's own snapshot rather than derived here, so
+        // the test cannot disagree with the assembler about the path.
+        let out_file = PathBuf::from(
+            handle.list().await[0]
+                .out_file
+                .clone()
+                .expect("the daemon reports its own resolved log paths"),
+        );
+
+        handle.flush(ProcessSelector::All).await.unwrap();
+
+        assert!(
+            out_file.exists(),
+            "the pump never wrote, so this flush never reached one: {}",
+            out_file.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out_file).unwrap(),
+            "",
+            "a line the pump landed as it answered the flush must not survive \
+             the truncate that follows it"
+        );
+    }
+
+    /// Fails if a flush leaves a stopped sheep's log file alone.
+    ///
+    /// The operation addresses recorded paths, not open handles, so a sheep
+    /// with no pump at all is emptied like any other — and it is worth
+    /// emptying, because `shep bleats --no-follow` reads a stopped sheep's
+    /// logs. An implementation that flushed only live pumps and truncated
+    /// only what it had flushed would answer `Ok` here and change nothing.
+    ///
+    /// The fake's control task ends with its proc (`ScriptedRunner`'s own
+    /// doc), so this sheep's pump is genuinely gone rather than notionally
+    /// so, and the truncate is reached through the no-pump leg.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_sheeps_log_file_is_truncated_too() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        // One script, one spawn: `autorestart = false` means no second.
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.autorestart = false;
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        handle
+            .stop(ProcessSelector::Name("web".to_string()))
+            .await
+            .unwrap();
+
+        let listed = handle.list().await;
+        assert_eq!(listed[0].status, ProcStatus::Stopped);
+        let out_file = PathBuf::from(listed[0].out_file.clone().unwrap());
+        std::fs::create_dir_all(out_file.parent().unwrap()).unwrap();
+        std::fs::write(&out_file, "what the sheep logged before it stopped\n").unwrap();
+
+        let flushed =
+            tokio::time::timeout(Duration::from_secs(5), handle.flush(ProcessSelector::All))
+                .await
+                .expect("a flush aimed at a stopped sheep must not wait for an acknowledgement")
+                .expect("a stopped sheep has no pump to flush, which is not a failure");
+
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].status, ProcStatus::Stopped);
+        assert_eq!(
+            std::fs::read_to_string(&out_file).unwrap(),
+            "",
+            "a stopped sheep's log is still readable, so it is still emptied"
+        );
+    }
+
+    /// Fails if instances sharing one log path answer with one row per FILE
+    /// rather than one per sheep, or leave the shared file unemptied.
+    ///
+    /// `merge_logs` points every instance of an app at one path, where each
+    /// holds its own independent `O_APPEND` handle. Two decisions meet here.
+    /// The answer is keyed by SHEEP — the selector named sheep, `Describe`
+    /// would return two rows for the same selector, and an operator reading
+    /// `shep flush web` wants to see which sheep it reached. The work is
+    /// keyed by PATH — one truncate empties the file for every handle open
+    /// on it, so the daemon deduplicates and truncates once.
+    ///
+    /// The shared path is asserted rather than assumed: without that check a
+    /// fixture where `merge_logs` had quietly stopped applying would leave
+    /// this case testing two ordinary sheep and proving nothing.
+    #[tokio::test(start_paused = true)]
+    async fn instances_sharing_one_log_path_answer_one_row_each() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let runner =
+            ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+
+        let mut web = AppConfig::minimal("web", "./srv");
+        web.instances = 2;
+        web.merge_logs = true;
+        handle.start(vec![normalize(web).unwrap()]).await.unwrap();
+
+        let listed = handle.list().await;
+        assert_eq!(
+            listed[0].out_file, listed[1].out_file,
+            "fixture check: `merge_logs` must really point both instances at \
+             one path, or this case proves nothing"
+        );
+        let shared = PathBuf::from(listed[0].out_file.clone().unwrap());
+        std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        std::fs::write(&shared, "both instances wrote here\n").unwrap();
+
+        let flushed = handle.flush(ProcessSelector::All).await.unwrap();
+
+        assert_eq!(
+            flushed.iter().map(|info| info.id).collect::<Vec<_>>(),
+            vec![0, 1],
+            "one row per sheep, not per file emptied"
+        );
+        assert_eq!(std::fs::read_to_string(&shared).unwrap(), "");
+    }
+
+    /// Fails if a pump that could not land what it owed is reported as a
+    /// success.
+    ///
+    /// The acknowledgement carries a `Result` for the same reason the
+    /// reopen's does, one layer down: pending bytes that never reached the
+    /// file are exactly what the truncate is racing, so a flush that
+    /// answered `Ok` over them would exit 0 about a log that is about to
+    /// gain a line. The failure is keyed by path rather than by sheep — see
+    /// [`SupervisorError::FlushFailed`].
+    ///
+    /// The healthy sheep is the second half: a failure must not stop the
+    /// rest of the flock being flushed, and nothing here would say so except
+    /// that count.
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_that_could_not_flush_fails_the_request() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        // Two scripts for two instances, counted: a third spawn would answer
+        // `SpawnFailed("script exhausted")` and land that sheep pumpless.
+        let scripted = Arc::new(ScriptedRunner::new(vec![
+            ProcScript::never_exits(),
+            ProcScript::never_exits(),
+        ]));
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(
+            FailingPumpRunner::new(Arc::clone(&scripted)),
+            test_paths(&dir),
+            events,
+        );
+        handle
+            .start(vec![
+                normalize(AppConfig::minimal(REFUSING_SHEEP, "./srv")).unwrap(),
+                normalize(AppConfig::minimal("api", "./api")).unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(5), handle.flush(ProcessSelector::All))
+                .await
+                .expect("a pump that answers must not leave the flush waiting")
+                .expect_err("a flush a pump could not carry out must not answer Ok");
+
+        assert_eq!(
+            error,
+            SupervisorError::FlushFailed(PUMP_REFUSAL.to_string()),
+            "the failure must carry the path, and only the path that failed"
+        );
+        assert_eq!(
+            scripted.flushes(1),
+            1,
+            "the healthy sheep must still have been flushed"
+        );
+    }
+
+    /// Fails if a selector that matches nothing is answered as a success.
+    ///
+    /// `flush` demands an explicit selector, so reaching this means the
+    /// operator named something — a deleted sheep, a typo — and a zero exit
+    /// would tell them the logs they meant are now empty when nothing was
+    /// touched at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_matching_nothing_is_not_found() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(ScriptedRunner::new(vec![]), test_paths(&dir), events);
+
+        assert_eq!(
+            handle.flush(ProcessSelector::All).await,
+            Err(SupervisorError::NotFound)
+        );
+    }
+
+    /// Fails if [`truncate_log`] gains a `create(true)`, or treats a missing
+    /// path as an error.
+    ///
+    /// Both halves are the same decision seen from two sides. A log file
+    /// that is not there is already empty, so `shep flush all` must not fail
+    /// over the sheep in the flock that has never been started — and it must
+    /// not leave a stray empty log behind either, which is what creating one
+    /// would do at a path a rotator had just renamed away.
+    #[tokio::test]
+    async fn truncating_a_path_that_is_not_there_creates_nothing_and_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-started-out.log");
+
+        assert_eq!(truncate_log(&missing).await, Ok(()));
+        assert!(
+            !missing.exists(),
+            "a flush must not create the log file it did not find"
         );
     }
 

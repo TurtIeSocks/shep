@@ -1523,6 +1523,104 @@ fn reopen_puts_a_rotated_log_back_where_bleats_can_read_it() {
     graceful_kill(home);
 }
 
+/// `shep flush` through the real binary: empty a running sheep's log, and
+/// watch it keep logging into the same file afterwards.
+///
+/// Two properties, and the second is why this reuses the rotating script
+/// rather than a simpler one. That [`ROTATE_BEFORE`] is gone proves the
+/// truncate happened. That [`ROTATE_AFTER`] — written by the same process,
+/// through the same handle the daemon never touched — arrives and is
+/// readable proves the handle survived it, and lands at offset 0 rather than
+/// past a sparse hole the size of what was emptied. That second half is
+/// `O_APPEND` doing its job, and a `flush` that reopened or replaced the
+/// handle instead of leaving it alone would still pass the first assertion
+/// on its own.
+///
+/// `daemon_e2e` proves the path-not-inode rule over the daemon's own socket,
+/// but nothing there runs the binary an operator actually types — the argv,
+/// the exit code and the reading verb are this tier's to prove.
+#[test]
+fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let gate = home.join("flushed");
+    let script = write_rotating_script(&dir, &gate);
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("flusher")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    // Through the reading verb rather than the file, so the precondition is
+    // the same observation the assertions below make.
+    let before = bleats_no_follow_until_written(home, &["all"]);
+    let printed = String::from_utf8_lossy(&before.stdout);
+    assert!(
+        printed.contains(ROTATE_BEFORE),
+        "precondition: the sheep's first line must be readable before the \
+         flush: stdout={printed}"
+    );
+
+    // The selector is explicit because the verb requires one — a bare `shep
+    // flush` is a usage error, which the case below pins.
+    let flushed = shep(home).arg("flush").arg("all").output().unwrap();
+    assert_success(&flushed);
+
+    // Only now is the gate opened, so the line below cannot predate the
+    // flush it has to survive.
+    std::fs::write(&gate, "").unwrap();
+
+    let after = bleats_no_follow_until_written(home, &["all"]);
+    assert_eq!(
+        after.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&after.stdout);
+    assert!(
+        stdout.contains(ROTATE_AFTER),
+        "a flushed sheep must go on logging into the same file: stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains(ROTATE_BEFORE),
+        "everything written before the flush is gone: stdout={stdout}"
+    );
+
+    graceful_kill(home);
+}
+
+/// Fails if `shep flush` ever runs without a selector.
+///
+/// The one command in this CLI whose slip of the finger cannot be undone, so
+/// it is pinned through the real binary and not only in clap's unit tests: a
+/// `default_value` added to the verb would make a bare `shep flush` empty
+/// every log file in the flock and exit 0. No daemon is started, because
+/// none is needed — clap refuses this before anything connects, and that it
+/// never reaches the socket is part of what is being asserted.
+#[test]
+fn flush_without_a_selector_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let bare = shep(dir.path()).arg("flush").output().unwrap();
+
+    assert_eq!(
+        bare.status.code(),
+        Some(2),
+        "clap's usage exit code; stdout={}",
+        String::from_utf8_lossy(&bare.stdout)
+    );
+    assert!(
+        !dir.path().join("run/shep.sock").exists(),
+        "a usage error must not have autostarted a daemon"
+    );
+}
+
 // --- Case 8 --------------------------------------------------------------
 
 /// `shep --home <tmp> start <script>` autostarts a daemon whose socket is

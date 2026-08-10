@@ -229,6 +229,9 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
             )
             .await
         }
+        Request::Flush { selector } => {
+            selector_call(id, selector, |s| ctx.supervisor.flush(s), Response::Flushed).await
+        }
         Request::Delete { selector } => match selector_of(selector) {
             Err(err) => reply(Err(err)),
             Ok(selector) => match ctx.supervisor.delete(selector).await {
@@ -270,13 +273,15 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
             message: msg.clone(),
         },
         // `Internal` — an "unexpected daemon-side failure", which a log path
-        // the daemon can no longer open is. No code of its own: the wire
-        // enum is versioned, and a client that predates a new code cannot
-        // decode the reply at all, which would cost the operator the message
-        // as well. The message carries the sheep and the path either way,
-        // and `err.to_string()` rather than the bare payload so the reader
-        // is told what kind of failure it is.
-        SupervisorError::ReopenFailed(_) => RpcError {
+        // the daemon can no longer open, or can no longer empty, both are.
+        // No code of its own: the wire enum is versioned, and a client that
+        // predates a new code cannot decode the reply at all, which would
+        // cost the operator the message as well. The message names every
+        // path that failed either way, and `err.to_string()` rather than the
+        // bare payload so the reader is told which of the two it is —
+        // `SupervisorError`'s `Display` is the only thing that still
+        // distinguishes them once they share a code.
+        SupervisorError::ReopenFailed(_) | SupervisorError::FlushFailed(_) => RpcError {
             code: RpcErrorCode::Internal,
             message: err.to_string(),
         },

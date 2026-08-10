@@ -118,6 +118,36 @@ pub enum LogCtl {
         /// moment apart, and neither is a reopen that failed.
         done: oneshot::Sender<Result<(), ReopenError>>,
     },
+    /// Wait for every write already handed to the blocking pool to reach the
+    /// file, keeping the handle, then acknowledge. Sent as the first half of
+    /// `shep flush`, immediately before the recorded paths are truncated.
+    Flush {
+        /// Fires once both handles have no write left in flight, carrying
+        /// what came of it.
+        ///
+        /// The acknowledgement is the barrier the truncate that follows is
+        /// ordered against: `write_all` on a [`tokio::fs::File`] returns as
+        /// soon as the real `write(2)` is queued, so without waiting here a
+        /// line already dispatched can land at offset 0 of the file *after*
+        /// it was emptied — the one line that survives a flush, in the file
+        /// the operator was told is now empty.
+        ///
+        /// [`FlushError`] says at least one stream still has bytes owed to
+        /// it. That is exactly the condition the ordering above exists to
+        /// rule out, so it is reported rather than logged — where
+        /// `LogFile::reopen` can log its own flush failure and move on
+        /// (the handle it belongs to is being replaced by a working one),
+        /// nothing here is replaced, and the bytes race the truncate.
+        ///
+        /// # When it never fires
+        ///
+        /// Exactly as [`Self::Reopen`]'s: a pump that ends between accepting
+        /// a request and serving it drops this sender, and the caller's
+        /// `await` resolves [`Err`](oneshot::error::RecvError). Treat that as
+        /// the same stopped-sheep no-op a failed send means — a pump that is
+        /// gone owes no bytes to anything.
+        done: oneshot::Sender<Result<(), FlushError>>,
+    },
 }
 
 /// A [`LogCtl::Reopen`] that could not open one or both of a sheep's log
@@ -144,6 +174,40 @@ impl fmt::Display for ReopenError {
 
 impl core::error::Error for ReopenError {}
 
+/// A `shep flush` that could not empty a log file, from either of the two
+/// halves that verb is made of: a pump whose pending writes would not reach
+/// the file ([`LogCtl::Flush`]), or a path that could not be truncated once
+/// they had.
+///
+/// One type for both halves because an operator is owed one answer about one
+/// file, and because either half failing means the same thing to them — that
+/// file is not empty, whatever they were told. Carries a rendered message for
+/// the reasons [`ReopenError`] gives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlushError {
+    /// Every log file the flush could not empty, as
+    /// `"<path>: <what the failing call reported>"`, joined by `"; "` when
+    /// more than one did. Never empty: a flush that emptied every file
+    /// answers `Ok`.
+    ///
+    /// Keyed by path and never by sheep, unlike [`SupervisorError`]'s
+    /// reopen failures: several sheep can share one log path (`merge_logs`,
+    /// or an explicit `out_file` on a multi-instance app), so naming one of
+    /// them would be arbitrary and naming all of them would repeat the path
+    /// the reader actually needs.
+    ///
+    /// [`SupervisorError`]: crate::supervisor::SupervisorError
+    pub message: String,
+}
+
+impl fmt::Display for FlushError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "could not flush {}", self.message)
+    }
+}
+
+impl core::error::Error for FlushError {}
+
 /// IO endpoints handed back by spawn — the runner pumps internally.
 ///
 /// The sheep task owns this and MUST drain every receiver: an undrained
@@ -167,8 +231,9 @@ pub struct ProcIo {
     /// than stalling on a pipe nobody drains.
     ///
     /// Cloning it is therefore not free of consequence, and the supervisor
-    /// does clone it (`SheepSlot::log_ctl`, so a `Reopen` can reach a pump
-    /// without going through the sheep task). What keeps a clone from
+    /// does clone it (`SheepSlot::log_ctl`, so a `Reopen` or a `Flush` can
+    /// reach a pump without going through the sheep task). What keeps a clone
+    /// from
     /// stretching a pump's life is the pump's own exit on the `logs`
     /// receiver going away — see `tokio_runner`'s `spawn_log_pump` — which
     /// the owner of this bundle drops when it drops the bundle.

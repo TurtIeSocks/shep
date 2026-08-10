@@ -31,16 +31,20 @@ pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(5);
 /// inside what the daemon will honour.
 pub const START_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Budget for `Request::Reopen`. The daemon visits matched sheep one after
-/// another and each visit is two `open(2)`s behind a `flush`, with no bound
-/// of its own — microseconds per sheep on a healthy filesystem, and as long
-/// as the kernel takes on a wedged or NFS-backed log directory. The 5s
-/// default would report failure to the one caller the docs invite to wait
-/// for this (a logrotate `postrotate` stanza) while the reopen it asked for
-/// was still running, leaving that caller both a non-zero exit and pumps
-/// still on the renamed inodes. Same 30s as [`START_DEADLINE`], and for the
-/// same reason: comfortably inside the daemon's own clamp.
-pub const REOPEN_DEADLINE: Duration = Duration::from_secs(30);
+/// Budget for the log-plane verbs that walk the flock file by file —
+/// `Request::Reopen` and `Request::Flush`.
+///
+/// One constant for both, because it answers one fact about both: the daemon
+/// visits matched sheep one after another with no per-sheep bound of its own,
+/// and each visit is a handful of syscalls behind a `flush` — microseconds
+/// per sheep on a healthy filesystem, and as long as the kernel takes on a
+/// wedged or NFS-backed log directory. The 5s default would report failure to
+/// the one caller the docs invite to wait for these (a logrotate `postrotate`
+/// stanza) while the work it asked for was still running, leaving that caller
+/// both a non-zero exit and a log plane in whatever half-finished state the
+/// timeout caught. Same 30s as [`START_DEADLINE`], and for the same reason:
+/// comfortably inside the daemon's own clamp.
+pub const LOG_PLANE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// How much longer the client waits than the deadline it asked the daemon to
 /// honour. Without a gap the client abandons a request the daemon is still

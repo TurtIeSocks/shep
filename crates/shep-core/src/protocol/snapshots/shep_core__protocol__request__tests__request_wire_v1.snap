@@ -86,5 +86,15 @@ expression: requests
         "kind": "all"
       }
     }
+  },
+  {
+    "id": 6,
+    "deadline_ms": null,
+    "body": {
+      "kind": "flush",
+      "selector": {
+        "kind": "all"
+      }
+    }
   }
 ]

@@ -73,6 +73,8 @@ pub enum Commands {
     Bleats(BleatsArgs),
     /// Reopen log files after an external rotator has renamed them.
     Reopen(ReopenArgs),
+    /// Empty the log files of one or more sheep.
+    Flush(SelectorArgs),
     /// Check whether the shepherd answers.
     Ping,
     /// Shut the shepherd down.
@@ -104,7 +106,11 @@ pub struct StartArgs {
 }
 
 /// Arguments shared by every verb that targets an existing selection of the
-/// flock (`stop`, `restart`, `delete`, `describe`, `thatlldo`).
+/// flock (`stop`, `restart`, `delete`, `describe`, `flush`, `thatlldo`).
+///
+/// The selector is required, which is the whole reason `flush` takes this
+/// rather than an optional-selector struct of its own: see
+/// [`Commands::Flush`]'s handler in `commands::logs`.
 #[derive(Debug, clap::Args)]
 pub struct SelectorArgs {
     /// name, id, `all`, `/regex/`, or `fold:<name>`
@@ -234,6 +240,33 @@ mod tests {
         assert_eq!(args.selector, "web");
     }
 
+    /// The other side of [`bleats_and_reopen_default_to_every_sheep`]: the
+    /// log-plane verb that destroys data must NOT have a default.
+    ///
+    /// Fails if `flush` is ever given a `default_value`, or moved onto
+    /// [`ReopenArgs`] — either of which turns a bare `shep flush`, the single
+    /// most likely slip of the finger this CLI offers, from a usage error
+    /// into "empty every log file in the flock" with nothing to undo it. The
+    /// explicit form is asserted alongside, so a verb that rejected every
+    /// selector could not pass the first half alone.
+    #[test]
+    fn flush_refuses_to_run_without_a_selector() {
+        use clap::Parser;
+        assert!(
+            Cli::try_parse_from(["shep", "flush"]).is_err(),
+            "`shep flush` with no selector must be a usage error, never the \
+             whole flock"
+        );
+
+        let named = Cli::try_parse_from(["shep", "flush", "all"])
+            .unwrap()
+            .command;
+        let Commands::Flush(args) = named else {
+            panic!("expected flush")
+        };
+        assert_eq!(args.selector, "all");
+    }
+
     #[test]
     fn format_defaults_to_table_and_accepts_json() {
         use clap::Parser;
@@ -290,6 +323,7 @@ mod tests {
             "flock",
             "bleats",
             "reopen",
+            "flush",
             "ping",
             "kill",
             "completions",

@@ -15,8 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add the clap command tree (`Cli`, `Commands`, and every argument struct
   the CLI will ever parse — `Start`, `Stop`/`Restart`/`Delete`/`Describe`,
   `Flock` (aliases `list`/`ls`), `Fold`, `Bleats` (alias `logs`), `Reopen`,
-  `Ping`, `Kill`, `Completions`, the hidden `Thatlldo` and `Daemon`), pure
-  tier so it compiles and its tests run on Windows.
+  `Flush`, `Ping`, `Kill`, `Completions`, the hidden `Thatlldo` and
+  `Daemon`), pure tier so it compiles and its tests run on Windows.
 - Add the process exit-code taxonomy (`ExitCode`, matching spec §9's table
   exactly, values included) with its stable `code_str` spelling and a
   `From<RpcErrorCode>` conversion; the three `From<&shep_client::*Error>`
@@ -89,11 +89,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path again does fail it, naming the sheep and the path: the rename is
   still safe to act on, but that sheep is writing a stream nowhere, and
   exiting 0 there would be the silent failure this verb exists to end. The
-  request carries `REOPEN_DEADLINE` rather than the client's 5s default,
+  request carries `LOG_PLANE_DEADLINE` rather than the client's 5s default,
   since the daemon visits matched sheep serially with no per-sheep bound —
   the default would report failure to a `postrotate` stanza whose reopen was
   still running. Output is the same table of matched sheep `stop` and
   `restart` print.
+- Add `shep flush <selector>`, which empties the log files of the sheep the
+  selector matches: the daemon flushes what each matched pump still owes its
+  files, then truncates the paths those sheep were registered with. **The
+  selector is required**, where `bleats` and `reopen` both default to `all` —
+  this is the one command in the CLI whose slip of the finger cannot be
+  undone, so it follows `stop`/`restart`/`delete` and makes the operator name
+  a target. `shep flush all` is still short to type when it is meant. A
+  matched sheep that is not running is emptied like any other, since the
+  operation addresses paths rather than open handles and a stopped sheep's
+  logs are still readable with `shep bleats --no-follow`. The sheep goes on
+  logging into the same file afterwards, at offset 0 — its handle is
+  `O_APPEND` and the daemon never touches it. A file that could not be
+  emptied fails the command and is named on stderr; exiting 0 there would
+  leave an operator believing a log is empty when it holds everything it did
+  before. The shepherd's own `shepd.out.log`/`shepd.err.log` are out of
+  reach: the CLI's launcher creates those before the daemon exists (which
+  truncates them on every launch, and is the whole of their rotation story
+  today) and the daemon inherits them as plain fds 1 and 2, so it holds no
+  handle to flush and no path to truncate. Restarting the shepherd is what
+  empties them. Output is the same table of matched sheep `stop`, `restart`
+  and `reopen` print — one row per sheep, not per file emptied.
 
 ### Fixes
 

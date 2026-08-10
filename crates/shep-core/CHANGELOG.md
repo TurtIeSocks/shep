@@ -67,6 +67,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RpcErrorCode::Internal` rather than failing to decode it. `Reopened`
   carries `ProcessInfo`s like `Stopped` and `Restarted` do — every matched
   sheep, including any that was not running and so had nothing to reopen.
+- Add `Request::Flush` and `Response::Flushed`, asking a daemon to empty the
+  log files of every matched sheep. Additive under `#[non_exhaustive]` on the
+  same terms as `Reopen` above, so `PROTOCOL_VERSION` stays **1**. `Flush`
+  carries a `SelectorSpec` with no default anywhere in the stack — the verb
+  destroys log data, so the operator names its target. `Flushed` carries one
+  `ProcessInfo` per matched SHEEP, not one per file emptied: several sheep
+  can share a log path (`merge_logs`, or an explicit `out_file` on a
+  multi-instance app) and the daemon truncates each distinct path once, but
+  the selector names sheep and so does the answer.
 - Add `MemSize` and `UpDuration` config value newtypes, parsing the strict
   Flockfile grammars `^\d+(G|M|K)?$` and `^\d+(h|m|s)?$`.
 - Add `ProcStatus` with stable wire strings for the process lifecycle states.

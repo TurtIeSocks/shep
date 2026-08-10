@@ -284,6 +284,9 @@ struct SpawnedProc {
     /// How many [`LogCtl::Reopen`] requests this spawn's log-control task has
     /// answered — read back via [`ScriptedRunner::reopens`].
     reopens: Arc<AtomicU32>,
+    /// How many [`LogCtl::Flush`] requests it has answered — read back via
+    /// [`ScriptedRunner::flushes`].
+    flushes: Arc<AtomicU32>,
 }
 
 /// Deterministic fake [`ProcessRunner`] driven by a pre-scripted [`ProcScript`] per spawn.
@@ -383,6 +386,32 @@ impl ScriptedRunner {
             .load(Ordering::SeqCst)
     }
 
+    /// How many [`LogCtl::Flush`] requests the proc spawned at `spawn_index`
+    /// has been sent.
+    ///
+    /// A separate counter from [`Self::reopens`] rather than one shared
+    /// "control requests" total, because the two verbs differ only in which
+    /// variant they push: a `flush` wired to send `LogCtl::Reopen` would
+    /// reopen the flock's handles and truncate nothing, and a single counter
+    /// would read the same either way.
+    ///
+    /// Note what this can and cannot show. The fake writes no files, so it
+    /// proves only that the request reached this spawn's end of
+    /// [`ProcIo::log_ctl`]. That the truncate happens AFTER the answer is
+    /// `supervisor.rs`'s own `LateWritingPumpRunner`, and that a real
+    /// handle's pending bytes land where they should is
+    /// `tests/real_runner.rs`.
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[must_use]
+    pub fn flushes(&self, spawn_index: usize) -> u32 {
+        self.spawned.lock().unwrap()[spawn_index]
+            .flushes
+            .load(Ordering::SeqCst)
+    }
+
     /// Takes the [`FakeIo`] test-side handles for the proc spawned at `spawn_index`
     ///
     /// # Panics
@@ -448,16 +477,18 @@ impl ProcessRunner for ScriptedRunner {
         let ctl_live = Arc::clone(&log_ctl_live);
         let reopens = Arc::new(AtomicU32::new(0));
         let reopen_count = Arc::clone(&reopens);
+        let flushes = Arc::new(AtomicU32::new(0));
+        let flush_count = Arc::clone(&flushes);
         let lamb_holds_the_pipe = script.lamb_holds_the_pipe;
         let logs_for_pump = logs_tx.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     ctl = log_ctl_rx.recv() => match ctl {
+                        // Both arms count BEFORE they answer, so a test that
+                        // observes the acknowledgement can read the count
+                        // without racing this task.
                         Some(LogCtl::Reopen { done }) => {
-                            // Counted BEFORE the answer, so a test that
-                            // observes the acknowledgement can read the
-                            // count without racing this task.
                             reopen_count.fetch_add(1, Ordering::SeqCst);
                             // Always `Ok`: the fake writes no files, so it
                             // has no open that could fail. A pump that
@@ -465,6 +496,13 @@ impl ProcessRunner for ScriptedRunner {
                             // tier, and a caller's handling of that answer
                             // is tested against a runner written for it
                             // (`supervisor`'s `FailingPumpRunner`).
+                            let _ = done.send(Ok(()));
+                        }
+                        Some(LogCtl::Flush { done }) => {
+                            flush_count.fetch_add(1, Ordering::SeqCst);
+                            // Always `Ok`, for the same reason: with no
+                            // handle there is nothing queued that could
+                            // fail to land.
                             let _ = done.send(Ok(()));
                         }
                         None => break, // nothing holds ProcIo::log_ctl
@@ -517,6 +555,7 @@ impl ProcessRunner for ScriptedRunner {
             }),
             log_ctl_live,
             reopens,
+            flushes,
         });
         drop(spawned);
 

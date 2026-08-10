@@ -309,7 +309,8 @@ fn track_spawned(spawned: &std::sync::Arc<std::sync::Mutex<Vec<i32>>>, reply: &R
         | Response::Started(infos)
         | Response::Stopped(infos)
         | Response::Restarted(infos)
-        | Response::Reopened(infos) => infos,
+        | Response::Reopened(infos)
+        | Response::Flushed(infos) => infos,
         _ => return,
     };
     let mut spawned = spawned
@@ -527,6 +528,102 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
         std::fs::read_to_string(&archive).unwrap(),
         "before\n",
         "the renamed file must stop growing the moment the handle is swapped"
+    );
+
+    fixture.shutdown().await;
+}
+
+/// What the flush case writes at the live log path after renaming the real
+/// one away — standing in for the file a `create`-mode rotator leaves behind,
+/// and the thing that must be gone afterwards.
+///
+/// One owner: the case asserts both that this is gone from one file and that
+/// it never reached the other, and a second copy could drift between them.
+const STRAY_CONTENT: &str = "what the recreated log holds\n";
+
+/// `flush` resolves to the RECORDED PATH, never to the inode the pump is
+/// holding — the one thing about this verb that only a real pump on a real
+/// file can show.
+///
+/// The rename is what separates the two. Afterwards the sheep's log pump
+/// still has the archive open (nothing reopened it), while the path the
+/// daemon recorded at registration now names a different file. An
+/// implementation that emptied the pump's own handle — by `set_len(0)` on it,
+/// or by asking the pump to truncate what it holds — would empty the ARCHIVE
+/// and leave the live log untouched: the exact opposite of what was asked,
+/// exiting 0 while doing it. That is the shape of failure this case exists
+/// for, and both assertions are needed to catch it, since either one alone
+/// still passes under the inversion.
+///
+/// The stray content is written at the live path deliberately. Without it the
+/// live path would simply be missing after the rename, the truncate would be
+/// the documented no-op, and an inode-chasing implementation would look
+/// identical from the outside.
+///
+/// The paths are read off the `Started` reply rather than derived here, so
+/// the test cannot disagree with the daemon about which file it is renaming.
+#[tokio::test]
+async fn flush_empties_the_recorded_path_and_leaves_a_renamed_archive_alone() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+
+    // Subscribe BEFORE starting: a connection gets no forwarder task, and so
+    // no events at all, until it does.
+    let subscribed = client
+        .request(Request::Subscribe {
+            topics: vec!["log.*".to_string()],
+        })
+        .await;
+    assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
+
+    let mut app = AppConfig::minimal("noisy", "/bin/sh");
+    app.interpreter = Some("none".to_string());
+    app.args = vec!["-c".to_string(), "echo before; sleep 5".to_string()];
+    let started = client.request(Request::Start { apps: vec![app] }).await;
+    let Response::Started(infos) = started.result.unwrap() else {
+        panic!("expected started")
+    };
+    let id = infos[0].id;
+    let out_file = std::path::PathBuf::from(
+        infos[0]
+            .out_file
+            .clone()
+            .expect("this daemon reports its own resolved log paths"),
+    );
+
+    assert_eq!(client.await_log_line(id).await, "before");
+    await_file_contents(&out_file, "before\n").await;
+
+    // From here the pump's handle and the recorded path name different
+    // files, which is the whole point of the case.
+    let archive = out_file.with_extension("log.1");
+    std::fs::rename(&out_file, &archive).unwrap();
+    std::fs::write(&out_file, STRAY_CONTENT).unwrap();
+
+    let flushed = client
+        .request(Request::Flush {
+            selector: SelectorSpec::All,
+        })
+        .await;
+    let Response::Flushed(matched) = flushed.result.unwrap() else {
+        panic!("expected flushed")
+    };
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].id, id);
+
+    // The reply is the barrier: it lands only once every matched pump has
+    // answered and every recorded path has been truncated, so neither of
+    // these polls.
+    assert_eq!(
+        std::fs::read_to_string(&out_file).unwrap(),
+        "",
+        "the recorded path is what a flush empties"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&archive).unwrap(),
+        "before\n",
+        "the renamed file is not the daemon's to empty — a flush that chased \
+         the pump's inode would have emptied this one instead"
     );
 
     fixture.shutdown().await;

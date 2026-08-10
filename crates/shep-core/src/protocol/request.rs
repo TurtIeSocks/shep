@@ -87,6 +87,13 @@ pub enum Request {
         /// Which sheep
         selector: SelectorSpec,
     },
+    /// Empty every matched sheep's log files: flush what is still pending,
+    /// then truncate the recorded paths
+    Flush {
+        /// Which sheep. No default anywhere in the stack — this destroys
+        /// log data, so the operator names the target (see `shep flush`).
+        selector: SelectorSpec,
+    },
     /// Graceful daemon shutdown
     KillDaemon,
     /// Subscribe this connection to bus topics (glob patterns)
@@ -170,6 +177,15 @@ pub enum Response {
     /// no live log pump has nothing to reopen and is reported as a success,
     /// so this carries the same matches `Describe` would.
     Reopened(Vec<ProcessInfo>),
+    /// Answer to `Flush` — one row per matched sheep, running or not, exactly
+    /// as [`Self::Reopened`].
+    ///
+    /// One row per SHEEP, not per file emptied. Several sheep can share one
+    /// log path (`merge_logs`, or an explicit `out_file` on a multi-instance
+    /// app), and the daemon truncates each distinct path once — but the
+    /// selector names sheep, so the answer names sheep, and the count here
+    /// matches what `Describe` would return for the same selector.
+    Flushed(Vec<ProcessInfo>),
     /// Answer to `Subscribe`
     Subscribed,
     /// Answer to `KillDaemon`
@@ -338,6 +354,21 @@ mod tests {
                 id: 5,
                 deadline_ms: None,
                 body: Request::Reopen {
+                    selector: SelectorSpec::All,
+                },
+            },
+            // Deliberately the same selector as the row above, so the two
+            // log-plane rows differ by their `kind` and by nothing else: a
+            // `Flush` that serialized under `reopen`'s tag — the shape a
+            // copy-pasted variant takes — shows up here as two identical
+            // objects rather than as a diff a reader has to compare field by
+            // field. `shep flush` demands an explicit selector, so `all` is
+            // not a default here the way it is for `reopen`; it is simply the
+            // widest thing an operator can type.
+            Envelope {
+                id: 6,
+                deadline_ms: None,
+                body: Request::Flush {
                     selector: SelectorSpec::All,
                 },
             },

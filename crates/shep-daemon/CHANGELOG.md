@@ -120,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is otherwise indistinguishable from a sheep that answered.
 - Add `runner::LogCtl`, the request type a sheep's log pump takes mid-flight,
   and the first way anything has been able to reach the file handle that pump
-  writes to. Its one variant, `Reopen`, makes the pump flush, close and
+  writes to. `Reopen` makes the pump flush, close and
   re-open both of a sheep's log files, then answer on a `oneshot`. That
   acknowledgement is the point of the shape rather than a nicety: a flag the
   pump would notice before its next write promises nothing about a sheep that
@@ -134,6 +134,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   involved and never notices: it holds a pipe, and the daemon does the file
   I/O on the far side of it. Reaching a pump means holding the `ProcIo` field
   below.
+
+  `Flush` is the second variant: it waits for every write already handed to
+  the blocking pool to reach the file and keeps the handle, which is the
+  half of `shep flush` that runs before anything is truncated. It answers
+  with a `Result` too, and for a sharper reason than `Reopen` does —
+  `LogFile::reopen` can log a flush failure and move on because the handle
+  it belongs to is being replaced by a working one, while nothing here is
+  replaced and the bytes still owed are exactly what the truncate is racing.
+  `runner::FlushError` names the paths that are not empty, from either half
+  of the verb.
 - Answer `Request::Reopen`: the supervisor keeps a clone of every running
   sheep's log-control sender and pushes a `LogCtl::Reopen` at each sheep the
   selector matches, which is what makes `create`-mode rotation — rename the
@@ -158,6 +168,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the sheep task lets go of both together. That is what retires the pump
   of a sheep whose child forked a lamb and left it holding the pipe — with
   neither stream ever reaching EOF, nothing else would.
+- Answer `Request::Flush`: every matched sheep's pump is sent a
+  `LogCtl::Flush` and answers, and only then is each distinct recorded log
+  path truncated. Both halves of that sentence are load-bearing. The flush
+  comes first because `write_all` on a `tokio::fs::File` returns as soon as
+  the real `write(2)` is queued, so a line already in flight would otherwise
+  land at offset 0 of a file that had just been emptied — the one line that
+  survives a flush, in the log its operator was told is empty. And it is the
+  RECORDED PATH that is truncated, never the inode the pump currently holds:
+  after an external rotator's rename those name different files, and a flush
+  that chased the handle would empty the archive and leave the live log
+  untouched. Being path-based is also what lets a stopped sheep, which has no
+  pump at all, be flushed — its logs are still readable with
+  `shep bleats --no-follow`, so they are still worth emptying. Paths are
+  deduplicated, so instances sharing one file under `merge_logs` truncate it
+  once: one truncate empties the file for every `O_APPEND` handle open on it,
+  and a second would only widen the window in which a sibling's freshly
+  flushed line can be wiped. A pump that could not land what it owed, or a
+  path that could not be truncated, fails the request
+  (`SupervisorError::FlushFailed`, `RpcErrorCode::Internal` on the wire)
+  naming every such path — keyed by path rather than by sheep, since a shared
+  path belongs to no single one. Every matched sheep and path is visited
+  first, so one unwritable file neither stops the rest being emptied nor goes
+  unreported. A missing path is not a failure: a log file that is not there is
+  already empty, and it is deliberately not created, which would otherwise
+  leave a stray empty log wherever a rotator had just renamed one away. Like
+  the reopen above, every await lives on a task of its own and never inside
+  the actor loop.
 
 ### Fixes
 
@@ -291,7 +328,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stdout and stderr along with it, and the child's next write to either then
   gets `EPIPE`/`SIGPIPE` — a dropped sender kills children, it does not
   merely stop collecting from them. A send that fails means the pump is
-  already gone, which makes a reopen a no-op rather than an error.
+  already gone, which makes a reopen or a flush a no-op rather than an error.
 
   The real runner also spawns one pump task per sheep now instead of one per
-  stream, so a single reopen swaps both files and answers once.
+  stream, so a single request covers both files and answers once.

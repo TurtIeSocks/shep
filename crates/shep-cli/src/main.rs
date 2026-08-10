@@ -217,6 +217,10 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => logs::reopen(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
+        Commands::Flush(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => logs::flush(&client, &mut streams, fmt, args).await,
+            Err(code) => code,
+        },
         Commands::Kill => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => admin::kill(client, &mut streams, fmt).await,
             Err(code) => code,

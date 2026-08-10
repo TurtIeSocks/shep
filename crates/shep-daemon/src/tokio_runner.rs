@@ -37,8 +37,8 @@ use tokio::sync::mpsc;
 
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::runner::{
-    ExitOutcome, LogCtl, LogLine, ProcIo, ProcessRunner, ReopenError, RunnerError, RunningProcess,
-    SpawnSpec, StopSignal,
+    ExitOutcome, FlushError, LogCtl, LogLine, ProcIo, ProcessRunner, ReopenError, RunnerError,
+    RunningProcess, SpawnSpec, StopSignal,
 };
 
 /// Capacity of every channel a spawn wires up — generous enough that a
@@ -331,6 +331,34 @@ impl LogFile {
         }
     }
 
+    /// Waits for every write already handed to the blocking pool to reach
+    /// the file, keeping the handle open.
+    ///
+    /// The whole of [`LogCtl::Flush`], and the reason `shep flush` has two
+    /// halves: `write_all` returns once the real `write(2)` is queued, so
+    /// truncating the path without waiting here can empty the file a moment
+    /// before a line that was already in flight lands at offset 0 of it.
+    ///
+    /// A stream whose open failed has no handle and nothing queued, so it
+    /// has nothing to wait for and answers `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// A write already dispatched failed — a full disk, an unlinked
+    /// filesystem, an IO error the queued `write(2)` hit. Unlike
+    /// [`Self::reopen`]'s own flush this is reported rather than logged:
+    /// there no caller depends on the result (the handle is being replaced
+    /// by a working one), while here the caller is about to truncate this
+    /// exact path and the un-landed bytes are what it is racing.
+    async fn flush(&mut self) -> Result<(), FlushError> {
+        let Some(handle) = self.handle.as_mut() else {
+            return Ok(());
+        };
+        handle.flush().await.map_err(|error| FlushError {
+            message: format!("{}: {error}", self.path.display()),
+        })
+    }
+
     /// Flushes and closes the current handle, then opens the path again.
     ///
     /// Flushing first is what makes [`LogCtl::Reopen`]'s acknowledgement
@@ -374,7 +402,8 @@ impl LogFile {
     }
 }
 
-/// Both of a sheep's log files — the pair one [`LogCtl::Reopen`] swaps.
+/// Both of a sheep's log files — the pair one [`LogCtl::Reopen`] swaps, and
+/// the pair one [`LogCtl::Flush`] drains.
 #[derive(Debug)]
 struct LogFiles {
     out: LogFile,
@@ -390,16 +419,19 @@ impl LogFiles {
     /// Carries out one control request and then answers it.
     ///
     /// The acknowledgement is the last statement by construction, after BOTH
-    /// reopens: a caller that has heard back knows both handles were
-    /// swapped, which is what a rotator that renamed both files is waiting
-    /// on. One request, one answer — nothing here can send twice.
+    /// streams have been dealt with: a caller that has heard back knows both
+    /// handles were swapped, or that neither has a write left in flight,
+    /// which is what a rotator that renamed both files — or a truncate about
+    /// to empty both paths — is waiting on. One request, one answer —
+    /// nothing here can send twice.
     ///
-    /// stderr is reopened even when stdout's open just failed. The two files
-    /// are independent, and the stream that CAN come back is no less owed
+    /// stderr is served even when stdout's turn just failed. The two files
+    /// are independent, and the stream that CAN be reopened is no less owed
     /// its handle because the other one cannot; short-circuiting would take
-    /// a sheep's working half offline over the broken one. Both failures
-    /// then travel together, so an operator is told about both paths at
-    /// once rather than one per rotation.
+    /// a sheep's working half offline over the broken one, and would leave
+    /// stderr's queued bytes racing a truncate that stdout's failure never
+    /// stopped. Both failures then travel together, so an operator is told
+    /// about both paths at once rather than one per rotation.
     async fn serve(&mut self, ctl: LogCtl) {
         match ctl {
             LogCtl::Reopen { done } => {
@@ -419,6 +451,27 @@ impl LogFiles {
                 };
                 // A caller that stopped waiting is not a failure: the reopen
                 // happened either way.
+                let _ = done.send(result);
+            }
+            LogCtl::Flush { done } => {
+                let mut failures = Vec::new();
+                if let Err(error) = self.out.flush().await {
+                    failures.push(error.message);
+                }
+                if let Err(error) = self.err.flush().await {
+                    failures.push(error.message);
+                }
+                let result = if failures.is_empty() {
+                    Ok(())
+                } else {
+                    Err(FlushError {
+                        message: failures.join("; "),
+                    })
+                };
+                // Same as above: the flush happened either way. A caller that
+                // stopped waiting is one whose deadline expired, and it will
+                // not truncate anything on the strength of an answer it never
+                // read.
                 let _ = done.send(result);
             }
         }
