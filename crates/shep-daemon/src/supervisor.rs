@@ -1704,12 +1704,30 @@ impl<R: ProcessRunner> Actor<R> {
     /// it on after each drainee is reaped, so "one instance at a time" is a
     /// property of this function rather than a rule spread over its callers.
     ///
+    /// # What counts as replaceable
+    ///
     /// An instance that stopped being `Online` between acceptance and its turn
     /// is skipped and the reload carries on — an operator stopping one
-    /// instance is not a reason to abandon the others. A replacement that
-    /// cannot be SPAWNED is the opposite and ends the reload, per spec §4:
-    /// failure of a new instance aborts the rest and leaves the old instances
-    /// running.
+    /// instance is not a reason to abandon the others.
+    ///
+    /// So is one whose next exit something already owns, which the status does
+    /// not show: `claim_manual` sets the `manual` marker and sends the `Kill`
+    /// without writing a status, so a sheep an operator's `restart`, a cron
+    /// occurrence or a memory breach claimed a moment ago reads `Online` for
+    /// its whole kill ladder — up to `kill_timeout`. A swap against one is
+    /// doomed the instant it starts: the exit is already coming, it lands
+    /// inside `AwaitReady` carrying that marker, and `handle_exited` abandons
+    /// the reload and kills the replacement it had just spawned, after the
+    /// caller was told `Ok`. Skipping costs nothing that was not already lost.
+    /// The claimed exit is either terminal — a `stop` or a `delete`, leaving
+    /// nothing to keep reachable — or a restart that brings the instance back
+    /// on the same code a replacement would have carried, at the price of the
+    /// downtime that restart was always going to cost. The rest of the app
+    /// still gets its overlap.
+    ///
+    /// A replacement that cannot be SPAWNED is the opposite and ends the
+    /// reload, per spec §4: failure of a new instance aborts the rest and
+    /// leaves the old instances running.
     fn advance_reload(&mut self, name: &str, mut queue: VecDeque<u32>) {
         // CRITICAL-1, defence in depth: a shutdown clears every job before
         // anything can reach here, so this only fires if that ever stops
@@ -1720,10 +1738,9 @@ impl<R: ProcessRunner> Actor<R> {
             return;
         }
         while let Some(old_id) = queue.pop_front() {
-            let replaceable = self
-                .sheep
-                .get(&old_id)
-                .is_some_and(|slot| slot.entry.status == ProcStatus::Online);
+            let replaceable = self.sheep.get(&old_id).is_some_and(|slot| {
+                slot.entry.status == ProcStatus::Online && slot.manual.is_none()
+            });
             if !replaceable {
                 continue;
             }
@@ -2455,13 +2472,16 @@ impl<R: ProcessRunner> Actor<R> {
                 // business either way, and must not be restarted into a slot
                 // its replacement already holds.
                 //
-                // An operator's is the only command that can be here.
-                // `begin_manual` holds every automatic restart off both
-                // halves of a swap that has not committed — which is the only
-                // phase the branch below runs in — and
+                // An operator's is the only command that can be here, and it
+                // takes all three of these to be true. `advance_reload` starts
+                // a swap only against an instance whose `manual` marker is
+                // clear, so nothing is carried in from before it; once it has
+                // started, `begin_manual` holds every automatic restart off
+                // both halves of a swap that has not committed — which is the
+                // only phase the branch below runs in — and
                 // `handle_extra_restart`'s `Online` guard rejects the two
-                // triggers a second time, so the warning can name the
-                // operator without hedging.
+                // triggers that reach it a second time. So the warning can
+                // name the operator without hedging.
                 let name = self.reload_of(id);
                 let abandonable = name
                     .as_deref()
@@ -5743,6 +5763,66 @@ mod tests {
         assert_eq!(reloaded[0].status, ProcStatus::Stopped);
         assert_eq!(handle.list().await.len(), 1, "nothing was registered");
         assert_eq!(runner.kill_counts().len(), 1, "nothing was spawned");
+    }
+
+    // fails if a sheep whose kill ladder is already running counts as
+    // replaceable. `claim_manual` sets the `manual` marker and sends the
+    // `Kill` without touching the status, so an instance a memory breach — or
+    // a cron occurrence, or an operator's own `restart` — claimed a moment ago
+    // reads `Online` for the whole ladder, up to `kill_timeout`. A swap
+    // started against one is doomed the instant it is accepted: that ladder's
+    // exit lands inside `AwaitReady` carrying a marker, which abandons the
+    // reload, kills the replacement it had just spawned, and warns that an
+    // operator's command reached the drainee first when no operator issued
+    // one. The caller was told `Ok` and gets the hard restart the overlap
+    // exists to avoid.
+    //
+    // Skipping the instance is what the not-`Online` case already gets, and it
+    // costs nothing that was not already lost: the instance is on its way out
+    // under a restart that will bring it back on the same code a replacement
+    // would have carried.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_skips_an_instance_whose_kill_ladder_is_already_running() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two scripts, and a correct run uses both: the original, which defies
+        // its signal so the breach's ladder is still running when the reload
+        // lands, and the respawn that ladder ends in. A wrongly-spawned
+        // replacement takes the second one and succeeds into a live entry
+        // rather than hiding behind an exhausted pool, which is what the two
+        // assertions below read.
+        let (handle, runner, mut rx) = started(
+            &dir,
+            AppConfig::minimal("web", "./srv"),
+            vec![ProcScript::ignores_signals(), ProcScript::never_exits()],
+        )
+        .await;
+        let pid = handle.list().await[0].pid.expect("a live sheep has a pid");
+        handle.extra_restart(0, pid).await;
+
+        let reloaded = handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("a reload with nothing left to replace still succeeds");
+
+        assert_eq!(reloaded.len(), 1, "the reload still answers for the match");
+        assert_eq!(
+            handle.list().await.len(),
+            1,
+            "no replacement was registered against an instance on its way out"
+        );
+        assert_eq!(runner.kill_counts().len(), 1, "nothing was spawned");
+
+        // The restart the breach asked for still lands, in the instance's own
+        // slot and under its own id — no abandonment, nothing deregistered.
+        expect_event(&mut rx, 0, ProcessEventKind::Restart).await;
+        let after = handle.list().await;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, 0);
+        assert_eq!(
+            runner.kill_counts().len(),
+            2,
+            "the original and its respawn"
+        );
     }
 
     // A liveness failure or memory breach raised against a drainee must ride
