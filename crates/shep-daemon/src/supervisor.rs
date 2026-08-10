@@ -4316,6 +4316,74 @@ mod tests {
         assert_eq!(runner.reopens(2), 0, "api was never named");
     }
 
+    /// Fails if a respawn leaves [`SheepSlot::log_ctl`] pointing at the pump
+    /// of the process it replaced — `slot.log_ctl = Some(log_ctl);` dropped
+    /// from [`Actor::respawn`], which is the only line that re-points a slot
+    /// after a restart.
+    ///
+    /// Under that mutation the request goes to a pump whose process is gone,
+    /// the send fails, and a failed send is the documented no-op success —
+    /// so `shep reopen` and `shep flush` exit 0 having reached nothing, for
+    /// every sheep that has restarted since it started. Any restart does it:
+    /// an operator's, a crash loop's, a cron occurrence, a watched file, a
+    /// memory breach. One verb is enough to pin it, because both read the
+    /// same field.
+    ///
+    /// The counts are the whole case. The reply carries the sheep either
+    /// way, and so does its status — an implementation that answered from
+    /// the registry and pushed at nothing passes every other assertion here.
+    ///
+    /// Two scripts, counted: the initial spawn and the restart's. A third is
+    /// never asked for, and a pool of one would land the restart in
+    /// `SpawnFailed("script exhausted")` — leaving the sheep pumpless, which
+    /// reads exactly like the pump that was never reached.
+    #[tokio::test(start_paused = true)]
+    async fn a_reopen_after_a_restart_reaches_the_pump_the_restart_spawned() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let runner = Arc::new(ScriptedRunner::new(vec![
+            ProcScript::never_exits(),
+            ProcScript::never_exits(),
+        ]));
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(SharedRunner(Arc::clone(&runner)), test_paths(&dir), events);
+        handle
+            .start(vec![normalize(AppConfig::minimal("web", "./srv")).unwrap()])
+            .await
+            .unwrap();
+
+        let restarted = handle
+            .restart(ProcessSelector::Name("web".to_string()))
+            .await
+            .unwrap();
+        // The premise, stated rather than assumed: a reopen aimed at a sheep
+        // that never actually restarted would reach the first pump and prove
+        // nothing.
+        assert_eq!(
+            (restarted[0].restarts, restarted[0].status),
+            (1, ProcStatus::Online),
+            "the sheep must be back up on a second process before the reopen"
+        );
+
+        let reopened =
+            tokio::time::timeout(Duration::from_secs(5), handle.reopen(ProcessSelector::All))
+                .await
+                .expect("a live pump must answer rather than leave the reopen waiting")
+                .expect("a running sheep's reopen must succeed");
+
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(
+            runner.reopens(1),
+            1,
+            "the reopen must reach the pump the restart spawned"
+        );
+        assert_eq!(
+            runner.reopens(0),
+            0,
+            "the pre-restart pump belongs to a process that is gone; a reopen \
+             sent there reaches nothing and is reported as a success"
+        );
+    }
+
     /// Fails if a selector that matches nothing is answered as a success.
     /// `reopen` is the one selector verb with a default, so a bare `shep
     /// reopen` against an empty flock is the ordinary way to reach this —
