@@ -61,7 +61,12 @@ json5 = { version = "0.4", default-features = false }
 # huge pattern slip under the 1 MiB `size_limit`; 1.9+ rejects it. Floor to 1.9 so the
 # selector-bridge test holds under `-Z minimal-versions`.
 regex = { version = "1.9", default-features = false, features = ["std", "unicode-perl"] }
-globset = { version = "0.4", default-features = false }
+# Floor 0.4.11: `watch/mod.rs`'s `own_log_ignores` builds an ignore glob out of a real
+# path and calls `globset::escape` to neutralize the metacharacters a tempdir or a user's
+# directory name can contain. That function does not exist before 0.4.11 — `-Z
+# minimal-versions` picks 0.4.0 without this and fails with `cannot find function escape
+# in crate globset`.
+globset = { version = "0.4.11", default-features = false }
 # `tokio::task::JoinHandle::is_finished` (shep-daemon's fake.rs cancel-safety test uses
 # it to assert a `wait()` future is genuinely still pending before dropping it) landed in
 # tokio 1.19.0, but shep-daemon's tokio_runner.rs (the real `ProcessRunner`, already
