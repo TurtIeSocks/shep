@@ -2345,10 +2345,19 @@ impl<R: ProcessRunner> Actor<R> {
         self.shutting_down = true;
         // Every in-flight reload is abandoned here rather than allowed to run
         // out: its next step is always a spawn, and CRITICAL-1 forbids one
-        // from this point on. The two entries of a swap need no fixing up —
-        // both are `ctl.is_some()`, so both are in the `online` set killed
-        // below, and each takes the ordinary path for its own role once no
-        // job names it (`handle_exited`).
+        // from this point on. Neither entry of a swap needs fixing up — both
+        // are `ctl.is_some()`, so both are in the `online` set killed below,
+        // and `handle_exited` deals with each once no job names it.
+        //
+        // It does not give them the same ending, and the asymmetry is the
+        // point rather than an oversight. The replacement takes the ordinary
+        // clean-stop path and stays registered as `Stopped`, like every other
+        // sheep a shutdown kills. The drainee still carries
+        // `ReloadState::SpawningReplacement`, so it takes `reap_drainee` and
+        // is DEREGISTERED — which is right for the same reason it is right
+        // mid-reload: the instance slot belongs to the replacement now, and a
+        // second permanent row in it would double every name-keyed verb for
+        // as long as the flock lives.
         self.reloads.clear();
 
         let online: HashSet<u32> = self
