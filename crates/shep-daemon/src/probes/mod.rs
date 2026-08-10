@@ -1,6 +1,6 @@
 //! The `Prober` seam and the liveness probe loop (spec §7).
 //!
-//! [`spawn_liveness_task`] runs one sheep's readiness/liveness probe on
+//! `spawn_liveness_task` runs one sheep's readiness/liveness probe on
 //! [`ProbeConfig::interval`](shep_core::config::ProbeConfig::interval),
 //! reporting through a shared channel once
 //! [`ProbeConfig::failure_threshold`](shep_core::config::ProbeConfig::failure_threshold)
@@ -10,7 +10,7 @@
 //!
 //! # Which readiness source wins
 //!
-//! An app can name two, and [`ready::ReadinessSource::of`] picks exactly one:
+//! An app can name two, and `ready::ReadinessSource::of` picks exactly one:
 //!
 //! 1. **`wait_ready = true`** — the shepherd channel's `{"kind":"ready"}`.
 //!    Chosen whenever it is set, even alongside a `readiness_probe`: the
@@ -49,7 +49,7 @@
 //!
 //! # Caveats
 //!
-//! - **No TLS.** [`os::OsProber`]'s HTTP client is hand-rolled and speaks
+//! - **No TLS.** `os::OsProber`'s HTTP client is hand-rolled and speaks
 //!   cleartext only. `https://` targets are refused in `shep-core` at config
 //!   time rather than failing every poll, because a probe that always fails
 //!   is indistinguishable from an app that is down (decision D1).
@@ -65,15 +65,15 @@
 //! ## Reference
 //!
 //! - [`Prober`], [`ProbeFailure`]
-//! - [`LivenessFailure`], [`spawn_liveness_task`], `MIN_PROBE_INTERVAL`
-//! - [`os::OsProber`] — the real HTTP/TCP/exec implementation
-//! - [`ready::ReadinessSource`], [`ready::Readiness`], [`ready::await_ready`]
+//! - `LivenessFailure`, `spawn_liveness_task`, `MIN_PROBE_INTERVAL`
+//! - `os::OsProber` — the real HTTP/TCP/exec implementation
+//! - `ready::ReadinessSource`, `ready::Readiness`, `ready::await_ready`
 //!   — the `starting → online` gate (spec §7)
 //! - [`shep_core::config::ProbeTarget`] — where a target is parsed and an
 //!   `https://` one is refused
 
-pub mod os;
-pub mod ready;
+pub(crate) mod os;
+pub(crate) mod ready;
 
 use core::future::Future;
 use core::pin::Pin;
@@ -111,16 +111,19 @@ pub enum ProbeFailure {
 ///
 /// # Design note: `timeout` enforcement is the implementation's job
 ///
-/// [`spawn_liveness_task`] awaits [`Self::probe`] directly; it does not
+/// `spawn_liveness_task` awaits [`Self::probe`] directly; it does not
 /// additionally wrap the call in its own `tokio::time::timeout`. That means
 /// a `Prober` whose `probe` future never resolves — hangs rather than
 /// erroring — stalls the liveness loop forever: no further probes, no
 /// report, ever. This is an accepted design risk, not a defect (bounding
 /// every code path by `timeout` needs implementation-specific knowledge,
 /// e.g. a connect timeout versus a read timeout, that this seam has no
-/// business dictating) — but any implementor ([`os::OsProber`] chief among
+/// business dictating) — but any implementor (`os::OsProber` chief among
 /// them) must itself guarantee `probe` resolves within `timeout` on
 /// every path, or a hung sheep's liveness detection silently stops working.
+///
+/// Public, with [`ProbeFailure`], because `tests/external_impls.rs` implements
+/// it from outside this crate — the standing proof that the seam is a seam.
 pub trait Prober: Send + Sync + 'static {
     /// Probes `target`, giving up after `timeout`.
     ///
@@ -161,7 +164,7 @@ const MIN_PROBE_INTERVAL: Duration = Duration::from_millis(1_000);
 
 /// A sheep whose liveness probe hit `failure_threshold`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LivenessFailure {
+pub(crate) struct LivenessFailure {
     /// The sheep's id.
     pub id: u32,
     /// The pid this loop was armed against, for the same reason
@@ -178,7 +181,7 @@ pub struct LivenessFailure {
 /// Must be called from within a Tokio runtime context: it spawns the probing
 /// task immediately, the same way `spawn_supervisor`, `spawn_cron_worker` and
 /// `PollingEnforcer::start` already document for themselves.
-pub fn spawn_liveness_task(
+pub(crate) fn spawn_liveness_task(
     id: u32,
     pid: u32,
     config: ProbeConfig,

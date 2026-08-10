@@ -1,6 +1,6 @@
 //! Privilege drop: resolving an app's requested `user`/`group` to numeric ids.
 //!
-//! [`resolve`] is the only entry point: given an [`AppConfig`], it returns
+//! `resolve` is the only entry point: given an [`AppConfig`], it returns
 //! the [`Credentials`] a spawn should apply, or `None` when the app asked
 //! for neither. Resolution touches the OS passwd/group database (a real, if
 //! hermetic and read-only, syscall), which is why it stays a discrete step
@@ -9,7 +9,12 @@
 //! resolves once and stores the result on the `ProcessEntry`, reusing it for
 //! every later restart instead of re-touching the passwd database each time.
 //!
-//! [`Credentials`]/[`PrivilegeError`] stay plain data (no OS-specific
+//! [`Credentials`] is the only name here that leaves the crate: it is a field
+//! type on [`SpawnSpec`](crate::runner::SpawnSpec), and `tests/real_runner.rs`
+//! builds one to prove a real child comes up under the requested uid/gid.
+//! `resolve` and `PrivilegeError` have no reader outside this crate.
+//!
+//! [`Credentials`]/`PrivilegeError` stay plain data (no OS-specific
 //! fields), so they can live inside the portable `SpawnSpec`/`ProcessEntry`
 //! without pulling this crate's "engine tier compiles everywhere" invariant
 //! (see `lib.rs`'s module taxonomy) into the unix-only OS tier. Only the
@@ -38,7 +43,7 @@ pub struct Credentials {
 
 /// Error resolving an app's `user`/`group` config to numeric ids
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PrivilegeError {
+pub(crate) enum PrivilegeError {
     /// No passwd entry for this user name
     UnknownUser(String),
     /// No group entry for this group name
@@ -82,7 +87,7 @@ impl core::error::Error for PrivilegeError {}
 /// - [`PrivilegeError::NotPermitted`] — credentials were requested but this
 ///   daemon does not run as root, so it cannot change a child's identity.
 #[cfg(unix)]
-pub fn resolve(app: &AppConfig) -> Result<Option<Credentials>, PrivilegeError> {
+pub(crate) fn resolve(app: &AppConfig) -> Result<Option<Credentials>, PrivilegeError> {
     if app.user.is_none() && app.group.is_none() {
         return Ok(None);
     }
@@ -118,7 +123,7 @@ pub fn resolve(app: &AppConfig) -> Result<Option<Credentials>, PrivilegeError> {
 /// gets the daemon's own identity back with no error is a privilege-drop
 /// footgun, not a graceful degradation).
 #[cfg(not(unix))]
-pub fn resolve(app: &AppConfig) -> Result<Option<Credentials>, PrivilegeError> {
+pub(crate) fn resolve(app: &AppConfig) -> Result<Option<Credentials>, PrivilegeError> {
     match (&app.user, &app.group) {
         (None, None) => Ok(None),
         _ => Err(PrivilegeError::Lookup(

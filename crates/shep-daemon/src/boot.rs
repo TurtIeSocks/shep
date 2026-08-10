@@ -6,8 +6,8 @@
 //! own pid, binding the control socket — including recovering from a socket
 //! file a crashed daemon left behind — and, once bound, reporting readiness
 //! on an inherited pipe if the CLI daemonized us (spec §3). This module owns
-//! the 0700 guarantee [`crate::server::RpcServer`]'s doc names as the boot
-//! path's responsibility: [`init_dirs`] creates `run/` (and every other
+//! the 0700 guarantee `crate::server::RpcServer`'s doc names as the boot
+//! path's responsibility: `init_dirs` creates `run/` (and every other
 //! layout directory) `0700` and *tightens* it back down if it already
 //! exists looser, so the guarantee holds whether this is a first boot or a
 //! restart onto a directory some other process touched.
@@ -111,7 +111,7 @@ fn create_dir_at_dir_mode(dir: &Path) -> std::io::Result<()> {
 ///
 /// # Errors
 /// - [`BootError::Io`] — a directory could not be created or chmod'ed.
-pub fn init_dirs(paths: &ShepPaths) -> Result<(), BootError> {
+pub(crate) fn init_dirs(paths: &ShepPaths) -> Result<(), BootError> {
     for dir in [&paths.home, &paths.logs, &paths.pids, &paths.run] {
         create_dir_at_dir_mode(dir).map_err(|source| BootError::Io {
             path: dir.clone(),
@@ -128,6 +128,10 @@ pub fn init_dirs(paths: &ShepPaths) -> Result<(), BootError> {
 }
 
 /// The daemon's own pidfile: `$SHEP_HOME/pids/shepd.pid`
+///
+/// Public only for `tests/daemon_e2e.rs`, which reads the file back to check
+/// what a booted daemon wrote there. `shep-cli` derives the same path from
+/// `ShepPaths` itself rather than calling this.
 #[must_use]
 pub fn pidfile(paths: &ShepPaths) -> PathBuf {
     paths.pids.join("shepd.pid")
@@ -194,7 +198,7 @@ fn write_pidfile(paths: &ShepPaths, pid: u32) -> Result<(), BootError> {
 ///
 /// # Errors
 /// - [`BootError::Io`] — the pidfile exists but could not be read.
-pub fn read_pidfile(paths: &ShepPaths) -> Result<Option<u32>, BootError> {
+pub(crate) fn read_pidfile(paths: &ShepPaths) -> Result<Option<u32>, BootError> {
     let path = pidfile(paths);
     match std::fs::read_to_string(&path) {
         Ok(contents) => Ok(contents.trim().parse::<u32>().ok()),
@@ -315,7 +319,7 @@ impl PidfileLock {
 
 /// The socket this daemon binds: the layout default, or a config override
 #[must_use]
-pub fn socket_path(paths: &ShepPaths, override_path: Option<&Path>) -> PathBuf {
+pub(crate) fn socket_path(paths: &ShepPaths, override_path: Option<&Path>) -> PathBuf {
     match override_path {
         Some(path) => path.to_path_buf(),
         None => paths.socket.clone(),
@@ -349,7 +353,7 @@ fn warn_if_socket_dir_is_loose(socket: &Path) {
 /// # Errors
 /// - [`BootError::AlreadyRunning`] — a live daemon answered on the socket.
 /// - [`BootError::Io`] — bind, probe, or unlink failed.
-pub fn bind_socket(paths: &ShepPaths, socket: &Path) -> Result<UnixListener, BootError> {
+pub(crate) fn bind_socket(paths: &ShepPaths, socket: &Path) -> Result<UnixListener, BootError> {
     warn_if_socket_dir_is_loose(socket);
     match UnixListener::bind(socket) {
         Ok(listener) => Ok(listener),
@@ -397,16 +401,27 @@ pub fn bind_socket(paths: &ShepPaths, socket: &Path) -> Result<UnixListener, Boo
 /// anything in this crate — shep-daemon never parses this variable or sees
 /// a raw fd number itself, only the already-adopted [`std::fs::File`] that
 /// lands in [`BootOptions::ready_fd`].
+///
+/// Public with no caller yet, for the same reason [`crate::sys::adopt_fd`]
+/// is: both halves of this handshake belong to `shep-cli` and neither is
+/// written. Crate-private it has no use at all, and "unused constant" is a
+/// worse description of it than this paragraph.
 pub const READY_FD_ENV: &str = "SHEP_READY_FD";
 
 /// What the daemonizing parent reads off the readiness pipe.
+///
+/// Crate-private even though the paragraph above is not, because `write_ready`
+/// does use this type — so narrowing it costs nothing today. What would
+/// reopen it is the CLI-side reader deciding to deserialize into this exact
+/// struct rather than its own; until that exists, the wire format below is
+/// the contract, not the Rust type.
 // wire format: shep-cli parses this line; changing it is a breaking change
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonReady {
+pub(crate) struct DaemonReady {
     /// This daemon's OS pid.
-    pub pid: u32,
+    pub(crate) pid: u32,
     /// This daemon's crate version.
-    pub version: String,
+    pub(crate) version: String,
 }
 
 /// Writes one newline-terminated JSON readiness line to `pipe` and closes
@@ -474,7 +489,7 @@ pub struct BootOptions {
 ///    daemon instead of rotating logs;
 /// 2. layout, then the crate-private `PidfileLock::acquire` — this is the
 ///    FIRST thing that can fail with [`BootError::AlreadyRunning`], before
-///    [`bind_socket`] ever runs, and it is what makes that call race-free
+///    `bind_socket` ever runs, and it is what makes that call race-free
 ///    against another process booting the same `$SHEP_HOME` concurrently
 ///    (see `PidfileLock`'s own doc, next to its definition in this file) —
 ///    then socket bind (with stale-socket recovery, spec §6), then
@@ -709,12 +724,19 @@ pub struct RunningDaemon {
 
 impl RunningDaemon {
     /// Handles for driving this daemon from outside its run loop.
+    ///
+    /// Public only for `tests/daemon_e2e.rs`, which needs to shut a booted
+    /// daemon down and force a roll write without a socket round-trip. The
+    /// CLI boots and calls [`Self::run`]; it never reaches inside.
     #[must_use]
     pub fn context(&self) -> RpcContext {
         self.ctx.clone()
     }
 
     /// The control socket this daemon is bound to.
+    ///
+    /// Public only for the crate-root doc example, which connects a raw
+    /// client to it; the CLI already knows the path it asked to bind.
     #[must_use]
     pub fn socket(&self) -> &Path {
         &self.socket

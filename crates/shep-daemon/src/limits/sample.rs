@@ -7,6 +7,11 @@
 //! table to change between polls. [`tree_rss`] is the pure function both
 //! feed — see the [`limits`](crate::limits) module doc for why the sum is
 //! taken over the whole process tree rather than the sheep's own pid.
+//!
+//! Everything this module exports is public for consumers outside this crate's
+//! `src` and for no other reason: the bench crate builds [`ProcessRss`] tables
+//! and times [`tree_rss`] and [`SysinfoSampler`] against them, and
+//! `tests/external_impls.rs` implements [`MemorySampler`] from outside.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};

@@ -9,6 +9,12 @@
 //! Two implementations exist: a deterministic scripted fake (this crate's
 //! test-only `fake` module, `ScriptedRunner`) for engine tests, and a real
 //! runner over OS processes (a later task) for production.
+//!
+//! This whole module is public and stays that way: [`ProcessRunner`] is the
+//! bound on [`boot`](crate::boot::boot), which `shep-cli` calls, so a caller
+//! outside this crate has to be able to name it — and naming it drags in every
+//! type in its signature. `tests/real_runner.rs` drives the same surface
+//! directly against real children.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -180,7 +186,7 @@ pub struct SpawnSpec {
     /// Open the shepherd channel (fd 3 socketpair)
     pub channel: bool,
     /// Unix uid/gid to drop to before exec (`None` inherits the daemon's own
-    /// identity). Resolved once per `Start` by [`crate::privilege::resolve`];
+    /// identity). Resolved once per `Start` by `crate::privilege::resolve`;
     /// see that module for how `user`/`group` config names become this.
     pub credentials: Option<Credentials>,
 }

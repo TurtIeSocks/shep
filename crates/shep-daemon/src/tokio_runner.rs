@@ -56,6 +56,9 @@ impl TokioRunner {
 
 /// A live real OS child, produced by [`TokioRunner`]'s
 /// [`crate::runner::ProcessRunner::spawn`].
+///
+/// Public because it is [`TokioRunner`]'s [`ProcessRunner::Proc`], and an
+/// associated type cannot be less visible than the trait impl that names it.
 #[derive(Debug)]
 pub struct TokioProc {
     /// Captured once at spawn time — `tokio::process::Child::id` reports

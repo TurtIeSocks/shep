@@ -6,7 +6,7 @@
 //! [`sample::MemorySampler`] is the seam that reads the machine's process
 //! table; [`sample::tree_rss`] is the pure function that sums one sheep's
 //! tree out of a reading. [`LimitEnforcer`] watches those sums for a breach;
-//! [`PollingEnforcer`] is the polling implementation.
+//! `PollingEnforcer` is the polling implementation.
 //!
 //! > Deviation from pm2 (deliberate): memory is measured over the sheep's
 //! > whole process tree, not the root pid alone. [`sample::tree_rss`] walks
@@ -35,7 +35,7 @@
 //!
 //! # Caveats
 //!
-//! - **Polling granularity is [`MEMORY_POLL_INTERVAL`].** A breach is noticed
+//! - **Polling granularity is `MEMORY_POLL_INTERVAL`.** A breach is noticed
 //!   at the next sample, not at the allocation, so an app can sit over its
 //!   ceiling for most of an interval — and one that spikes and returns inside
 //!   a single interval is never noticed at all. Sampling more often would
@@ -55,8 +55,7 @@
 //!
 //! - [`sample::MemorySampler`], [`sample::SysinfoSampler`],
 //!   [`sample::ProcessRss`], [`sample::tree_rss`]
-//! - [`LimitEnforcer`], [`PollingEnforcer`], [`LimitBreach`],
-//!   [`MEMORY_POLL_INTERVAL`]
+//! - [`LimitEnforcer`], `PollingEnforcer`, `LimitBreach`, `MEMORY_POLL_INTERVAL`
 
 use core::time::Duration;
 use std::collections::HashMap;
@@ -75,11 +74,11 @@ use sample::{MemorySampler, TreeIndex};
 /// Spec §14.2 tightened this from 30s to 15s: sampling is cheap enough that
 /// halving worst-case breach latency costs nothing measurable. See the numbers
 /// in `benches/benches/memory_sample.rs`.
-pub const MEMORY_POLL_INTERVAL: Duration = Duration::from_secs(15);
+pub(crate) const MEMORY_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 /// A sheep whose process tree exceeded its `max_memory`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LimitBreach {
+pub(crate) struct LimitBreach {
     /// The sheep's id.
     pub id: u32,
     /// The pid this enforcement was armed against.
@@ -100,6 +99,10 @@ pub struct LimitBreach {
 /// implementation samples; the cgroup-v2 implementation planned for v1.1
 /// writes `memory.max` and reads `memory.events`, and must be able to replace
 /// this one without the engine noticing.
+///
+/// Public because `tests/external_impls.rs` implements it from outside this
+/// crate — that file is the standing proof the seam is really a seam and not
+/// a shape only the in-crate implementation happens to fit.
 pub trait LimitEnforcer: Send + Sync + 'static {
     /// Begins enforcing `limit` against the process tree rooted at `root_pid`.
     ///
@@ -112,7 +115,7 @@ pub trait LimitEnforcer: Send + Sync + 'static {
     /// report caused is still in flight. Re-arming is the caller's job, once
     /// the sheep is back online. Every implementation of this trait —
     /// including the cgroup-v2 one planned for v1.1 — must honour this, so
-    /// it is stated here rather than left as [`PollingEnforcer`]'s own
+    /// it is stated here rather than left as `PollingEnforcer`'s own
     /// implementation detail.
     fn arm(&self, id: u32, root_pid: u32, limit: MemSize);
     /// Stops enforcing against `id`. A no-op if it was never armed.
@@ -129,7 +132,7 @@ struct Armed {
 
 /// `LimitEnforcer` by periodic sampling.
 #[derive(Debug)]
-pub struct PollingEnforcer {
+pub(crate) struct PollingEnforcer {
     armed: Arc<Mutex<HashMap<u32, Armed>>>,
     // Aborted on `Drop` (below) — see `start`'s doc for why that is the only
     // stop mechanism this type needs.
@@ -148,7 +151,10 @@ impl PollingEnforcer {
     /// carries one, and IR-21 wants `# Panics` and `#[track_caller]` to travel
     /// together or not at all.
     #[must_use]
-    pub fn start(sampler: Arc<dyn MemorySampler>, breaches: mpsc::Sender<LimitBreach>) -> Self {
+    pub(crate) fn start(
+        sampler: Arc<dyn MemorySampler>,
+        breaches: mpsc::Sender<LimitBreach>,
+    ) -> Self {
         let armed: Arc<Mutex<HashMap<u32, Armed>>> = Arc::new(Mutex::new(HashMap::new()));
         let loop_armed = Arc::clone(&armed);
         let task = tokio::spawn(async move {
