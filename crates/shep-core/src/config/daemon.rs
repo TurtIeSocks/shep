@@ -462,12 +462,27 @@ port = 9615
     // fails if the enum grows a `#[serde(other)]` catch-all, which would turn
     // a misspelled level in `shep.toml` into a silent fallback instead of the
     // startup error `ExitCode::InvalidConfig` reports.
+    //
+    // Also fails if `log_level` is dropped from `DaemonSection` altogether,
+    // which the variant alone cannot tell apart: `deny_unknown_fields` answers
+    // an undefined key with the same `Toml` variant. Asserting the message
+    // merely mentions `verbose` would not separate them either — a
+    // `deny_unknown_fields` error echoes the offending source line, the value
+    // included, which was checked against a key this section really does not
+    // define. Only "unknown *variant*" is exclusive to the level's own name
+    // being rejected, so that is what is pinned; the wording is serde's, and
+    // it is also what an operator reads out of `ExitCode::InvalidConfig`.
     #[test]
     fn bad_file_log_level_is_a_toml_error() {
-        assert!(matches!(
-            DaemonConfig::load(Some("[daemon]\nlog_level = \"verbose\""), &no_env),
-            Err(DaemonConfigError::Toml(_))
-        ));
+        let err = DaemonConfig::load(Some("[daemon]\nlog_level = \"verbose\""), &no_env)
+            .expect_err("a misspelled level must not parse");
+        let DaemonConfigError::Toml(message) = err else {
+            panic!("a misspelled level is a TOML error, not {err:?}");
+        };
+        assert!(
+            message.contains("unknown variant `verbose`"),
+            "the error must reject the level's own name, not some other key: {message:?}"
+        );
     }
 
     #[test]

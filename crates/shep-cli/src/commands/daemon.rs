@@ -6,6 +6,7 @@
 //! `shep.toml`, boots `shep_daemon::boot`'s supervisor, and blocks in
 //! `RunningDaemon::run` until a signal or `KillDaemon` tears it down.
 
+use std::ffi::OsStr;
 use std::io::IsTerminal;
 
 use shep_core::config::{DaemonConfig, DaemonConfigError};
@@ -94,24 +95,31 @@ fn read_daemon_config_source(paths: &ShepPaths) -> Result<Option<String>, Daemon
 /// Everything the daemon has to say about itself — a watch that could not be
 /// registered, a cron pattern that would not parse, the observed RSS behind a
 /// memory restart — goes through `tracing`, and a `tracing` record with no
-/// subscriber is discarded where it is written. This is the only install site
-/// in the workspace.
+/// subscriber is discarded where it is written. This is the one *global*
+/// install in the workspace — `shep-daemon`'s `testing::capture_logs` installs
+/// a scoped one per test, which is a different thing and deliberately not
+/// this.
 ///
 /// The sink is **stderr**, never a file this function opens: `launch.rs`
 /// already redirects the re-exec'd daemon's stderr into
 /// `$SHEP_HOME/logs/shepd.err.log`, so naming a file here would duplicate the
 /// launcher's job and diverge the moment a daemon is run by hand — where the
 /// parent's terminal is exactly where its records belong. Colour follows the
-/// sink for the same reason: escape codes are noise in `shepd.err.log` and
-/// what a terminal is for.
+/// sink for the same reason ([`ansi_enabled`]): escape codes are noise in
+/// `shepd.err.log` and what a terminal is for.
 ///
 /// Records are written from tokio worker threads, so `main::run`'s `daemon`
 /// arm must not be holding a `stderr().lock()` guard while this process runs.
 /// Its own comment carries why, and what happens when it does.
 ///
-/// `EnvFilter::new` documents a panic on an unparseable directive and cannot
-/// reach it here — its input is [`LogLevel::as_str`], a closed set of six
-/// literals, each of them a valid directive on its own.
+/// `EnvFilter::new` neither fails nor panics on an unparseable directive: it
+/// is `builder().with_default_directive(ERROR).parse_lossy(..)`, which
+/// *ignores* what it cannot parse — saying `ignoring …` on stderr — and is
+/// left with its `ERROR`-only default. The failure mode to guard against is
+/// therefore a daemon that silently says nothing below `error` after being
+/// configured for `trace`, never a crash. It is out of reach here because the
+/// input is [`LogLevel::as_str`], a closed set of six literals, each a valid
+/// directive on its own; widening that grammar is what would bring it back.
 ///
 /// A failed install is reported on the same stderr rather than failing the
 /// boot. It means a subscriber is already installed, which the shipped binary
@@ -128,12 +136,33 @@ fn install_log_subscriber(config: &DaemonConfig) {
         builder.json().try_init()
     } else {
         builder
-            .with_ansi(std::io::stderr().is_terminal())
+            .with_ansi(ansi_enabled(
+                std::io::stderr().is_terminal(),
+                std::env::var_os("NO_COLOR").as_deref(),
+            ))
             .try_init()
     };
     if let Err(err) = installed {
         eprintln!("shep: the daemon's own logs are not being rendered: {err}");
     }
+}
+
+/// Whether ANSI colour belongs on the daemon's own records: only when stderr
+/// is a terminal, and only when `NO_COLOR` is unset or empty.
+///
+/// `NO_COLOR` is honoured even though `RUST_LOG` is deliberately ignored, and
+/// the two are not the same kind of variable. `RUST_LOG` would be a second way
+/// to configure *shep*, competing with `[daemon] log_level` and
+/// `SHEP_LOG_LEVEL` over one decision — which is what the `SHEP_`-prefix rule
+/// exists to prevent, and that rule governs our own knobs. `NO_COLOR` is a
+/// cross-ecosystem convention about the terminal, answered the same way by
+/// every well-behaved program sharing it, so it is not ours to opt out of.
+/// Reading it here rather than dropping it back is the deliberate call.
+///
+/// Empty means unset, per that convention: only a non-empty value suppresses
+/// colour.
+fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
+    stderr_is_terminal && no_color.is_none_or(OsStr::is_empty)
 }
 
 /// Runs the supervisor in this process until a signal or `KillDaemon`.
@@ -225,6 +254,27 @@ pub fn daemon_exit_code(err: &DaemonRunError) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Colour is a terminal's business and `NO_COLOR`'s, in that order.
+    ///
+    /// fails if the `NO_COLOR` read is dropped (the third case turns true
+    /// again), and fails if it is read as a plain presence check rather than
+    /// per the convention (the fourth case turns false, and a shell that
+    /// exports an empty `NO_COLOR=` silently loses its colour).
+    #[test]
+    fn colour_needs_a_terminal_and_no_no_color() {
+        assert!(ansi_enabled(true, None));
+        assert!(!ansi_enabled(false, None), "a file never gets escape codes");
+        assert!(!ansi_enabled(true, Some(OsStr::new("1"))));
+        assert!(
+            ansi_enabled(true, Some(OsStr::new(""))),
+            "an empty NO_COLOR is an unset NO_COLOR"
+        );
+        assert!(
+            !ansi_enabled(false, Some(OsStr::new("1"))),
+            "the two reasons to suppress colour must not cancel out"
+        );
+    }
 
     #[test]
     fn boot_options_pass_ready_fd_none_and_the_configured_socket() {

@@ -115,9 +115,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default, so every warn-and-continue arm in this crate is output rather
   than a comment claiming output. The arms worth knowing about: `extras`
   reports a watch, a cron worker or a liveness probe it could not arm and
-  lets the sheep come up `online` regardless, and `probes` reports a
-  readiness deadline that elapsed, which is otherwise indistinguishable
-  from a sheep that answered.
+  lets the sheep come up `online` regardless, and `supervisor`'s
+  `Actor::handle_ready_result` reports a readiness deadline that elapsed,
+  which is otherwise indistinguishable from a sheep that answered.
 
 ### Fixes
 

@@ -68,7 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without either path naming a file here. `[daemon] log_level`
   (`SHEP_LOG_LEVEL`) picks the level, default `warn`; the long-parsed
   `[daemon] log_json` (`SHEP_LOG_JSON`) finally does something and switches
-  the renderer to JSON lines. Colour is on only when stderr is a terminal.
+  the renderer to JSON lines. Colour is on only when stderr is a terminal and
+  `NO_COLOR` is unset or empty — that one is a cross-ecosystem convention
+  about the terminal rather than a shep knob, which is why it is honoured
+  where `RUST_LOG` is deliberately ignored.
   Fifty-one log sites in `shep-daemon` reached nobody before this: a watch
   that could not be armed, a cron pattern that would not parse, and the
   observed RSS and ceiling behind a memory restart — the last of which no
@@ -83,10 +86,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   holding it, so the first record any tokio worker wrote blocked forever and
   took the supervisor down with it — silently, leaving an empty
   `shepd.err.log` and a daemon that still accepted connections but answered
-  no handshake. The `daemon` arm now uses unlocked handles, which take the
-  lock per write. The guard had been held harmlessly since this crate's first
-  day, because nothing wrote to stderr off the main thread until the daemon
-  grew a subscriber for its own records.
+  no handshake. The `daemon` arm now holds no handle at all — its two error
+  envelopes take the lock for the length of one write each, which is also what
+  stops a record from a live worker tearing a `--format json` envelope in half
+  — and `bleats`, which follows until Ctrl-C and had the identical shape, now
+  uses unlocked handles that take the lock per write. The guard had been held
+  harmlessly since this crate's first day, because nothing wrote to stderr off
+  the main thread until the daemon grew a subscriber for its own records.
 - Give the workspace's path dependencies a version alongside their `path`,
   which `cargo publish` requires. The package here is `shep-cli`, but the
   `[[bin]]` it produces is named `shep`, so once published the install
