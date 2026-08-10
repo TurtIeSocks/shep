@@ -47,13 +47,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing quietly — see `shep-core`'s entry for why defaulting to the daemon's
   own cwd was the worse of the two remaining options.
 
-  **One path escapes the globs entirely.** A change reported *at the watch
-  root itself* triggers a restart before either set is consulted, so
-  `ignore_watch` cannot suppress it. That is the rescan signal an inotify
-  queue overflow produces — it means "unknown paths under here changed", not
-  "this path changed", and no user pattern can be matched against it
-  meaningfully. Restarting on it is the conservative reading; the alternative
-  is a watch that goes quiet exactly when it knows least.
+  **One thing escapes the globs entirely, and it is not a path.** When notify
+  reports a *rescan* — it dropped events (an inotify queue overflow, an
+  FSEvents `MustScanSubDirs`) and wants the tree re-read — the group restarts
+  whatever either list says. A rescan means "unknown paths under here
+  changed", not "this path changed", so no user pattern can be matched
+  against it meaningfully; restarting is the conservative reading, and the
+  alternative is a watch that goes quiet exactly when it knows least. It
+  travels alongside the changed paths as notify's own flag rather than being
+  inferred from them, because both available inferences are wrong: an empty
+  path list is inotify's shape for a rescan and not macOS's, and a path equal
+  to the watch root is macOS's shape for one *and* an ordinary event on that
+  directory's own inode. A change reported at the watch root itself is
+  therefore an ordinary event, filtered like any other — it changed nothing
+  under the tree, so it restarts nothing.
 
   Two halves of the reach are worth stating together, because either alone
   misleads. **A triggering change restarts every instance of the name**,

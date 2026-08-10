@@ -50,12 +50,17 @@
 //! happened to name the directory `logs`. See `own_log_ignores` for the loop
 //! that would otherwise leave behind.
 //!
-//! Two paths never reach the glob sets at all. A change reported *at the
-//! watch root itself* triggers unconditionally — that is the rescan signal an
-//! inotify queue overflow produces, and dropping it would mean silently
-//! losing every event in the overflowed batch. A path that does not lie under
-//! the root never triggers, rather than being matched as though it were
-//! relative.
+//! Two paths never reach the glob sets, and both answer "no". A path that
+//! does not lie under the root never triggers, rather than being matched as
+//! though it were relative. The root *itself* never triggers either: it
+//! strips to an empty relative path, and both lists are written about entries
+//! inside the tree rather than about the tree's own inode.
+//!
+//! One thing does bypass the glob sets, and it is not a path: a **rescan**,
+//! notify's marker for "I dropped events, re-read the tree". It arrives as
+//! [`source::WatchBatch::rescan`] rather than as a path, precisely so that an
+//! ordinary event on the root cannot be mistaken for it, and it restarts the
+//! group whatever either list says.
 //!
 //! # Caveats
 //!
@@ -92,7 +97,7 @@ use tokio::sync::mpsc;
 use shep_core::selector::ProcessSelector;
 
 use crate::supervisor::{SupervisorError, SupervisorHandle};
-use crate::watch::source::{WatchError, watch_tree};
+use crate::watch::source::{WatchBatch, WatchError, watch_tree};
 
 /// Debounce window when an app sets no `watch_delay`.
 ///
@@ -322,30 +327,31 @@ impl RootedFilter {
     /// Whether `path` — an absolute path exactly as notify delivered it —
     /// triggers a restart: strips `root`, then asks `filter`.
     ///
-    /// `root` itself always triggers, ahead of both glob sets. A path that
-    /// does not lie under `root` never triggers, rather than falling back
-    /// to matching the untouched absolute form against patterns written for
-    /// relative ones. The OS should not deliver one — `root` is the tree
-    /// being watched — but a symlinked subtree inside it can (see
+    /// Two paths never reach the glob sets, and both answer `false`.
+    ///
+    /// A path that does not lie under `root` never triggers, rather than
+    /// falling back to matching the untouched absolute form against patterns
+    /// written for relative ones. The OS should not deliver one — `root` is
+    /// the tree being watched — but a symlinked subtree inside it can (see
     /// [`source::watch_tree`]'s own doc on resolved-vs-literal paths).
+    ///
+    /// `root` itself does not trigger either. It strips to an empty relative
+    /// path, and both glob sets are written about entries *inside* the tree,
+    /// not about the tree's own inode: a `chmod` or a rename of that inode
+    /// changed nothing under it. macOS in particular delivers a spurious
+    /// `Create(Folder)` for the root whenever a stream is armed before
+    /// `fseventsd`'s cursor has passed the `mkdir` that made it, and treating
+    /// that as a trigger restarts an app the instant its watch is armed —
+    /// past every `ignore_watch` entry, since a bypass consults neither list.
+    ///
+    /// The rescan a bypass exists for is not a path at all, and reaches
+    /// [`run_group`] as [`source::WatchBatch::rescan`] instead.
     fn triggers(&self, path: &Path) -> bool {
         let Ok(relative) = path.strip_prefix(&self.root) else {
             return false;
         };
         if relative.as_os_str().is_empty() {
-            // `path == root`: the rescan marker [`source::watch_tree`]
-            // forwards as `vec![root]` when notify dropped events and wants
-            // the tree re-read. Stripping the root leaves an empty relative
-            // path, which no user pattern can match — `["src/**/*.rs"]`
-            // would silently swallow it and leave the watch deaf exactly
-            // when it has already lost events.
-            //
-            // Answered before either glob set on purpose. "Ignore wins over
-            // include" is a rule about paths, and a rescan is not a path: it
-            // is a signal that unknown paths changed. Restarting on it is
-            // conservative, and the alternative is a watch that goes quiet
-            // precisely when it knows least.
-            return true;
+            return false;
         }
         self.filter.triggers(relative)
     }
@@ -367,10 +373,11 @@ impl RootedFilter {
 ///
 /// A rescan — the OS told notify it dropped events — restarts the group
 /// whatever `watch_options` and `ignore_watch` say, since the paths that
-/// changed during the gap are exactly what nobody knows. The rule is keyed
-/// on the watched root itself rather than on a rescan flag, so an event on
-/// the root directory (a `chmod` or rename of that inode) takes the same
-/// path and is likewise not suppressible by either list.
+/// changed during the gap are exactly what nobody knows. The rule is keyed on
+/// notify's own rescan flag, carried alongside the paths as
+/// [`source::WatchBatch::rescan`]. An event on the root directory itself (a
+/// `chmod` or a rename of that inode) is an ordinary event and is *not* one:
+/// it changed nothing under the tree, so it restarts nothing.
 ///
 /// Must be called from within a Tokio runtime context: it spawns the group
 /// loop immediately, the same way [`crate::cron::spawn_cron_worker`] and
@@ -420,7 +427,7 @@ pub fn spawn_watch_group(
 async fn run_group(
     name: String,
     filter: RootedFilter,
-    mut rx: mpsc::UnboundedReceiver<Vec<PathBuf>>,
+    mut rx: mpsc::UnboundedReceiver<WatchBatch>,
     supervisor: SupervisorHandle,
 ) {
     loop {
@@ -431,9 +438,15 @@ async fn run_group(
         // while the *previous* restart (if any) was in flight — into this
         // same check.
         while let Ok(more) = rx.try_recv() {
-            batch.extend(more);
+            batch.paths.extend(more.paths);
+            batch.rescan |= more.rescan;
         }
-        if !batch.iter().any(|path| filter.triggers(path)) {
+        // A rescan is checked ahead of the glob sets, and deliberately: it is
+        // not a path but a statement that unknown paths changed, so there is
+        // nothing for either list to be matched against. Restarting is the
+        // conservative reading, and the alternative is a watch that goes quiet
+        // precisely when it knows least.
+        if !batch.rescan && !batch.paths.iter().any(|path| filter.triggers(path)) {
             continue;
         }
         match supervisor
@@ -619,22 +632,28 @@ mod tests {
         assert!(filter.triggers(Path::new("/watched/file.rs")));
     }
 
-    // fails if the root itself is matched against the glob sets like any
-    // other path: stripping the root leaves an empty relative path, which a
-    // configured `watch_options` cannot match, so `source::watch_tree`'s
-    // rescan marker would be filtered away and the watch would go deaf
-    // exactly when notify has already dropped events
+    // The root is an ordinary path, and this is the case that says so. The
+    // opposite reading — the root triggering ahead of both glob sets — cannot
+    // be right on macOS, where FSEvents delivers a `Create(Folder)` for the
+    // watch root itself to a stream armed before `fseventsd`'s event-ID cursor
+    // has passed the `mkdir` that made it: an app would be restarted the moment
+    // its watch came up, past every `ignore_watch` entry it had written. The
+    // rescan that DOES bypass both sets is not a path and never arrives as one
+    // — `a_rescan_restarts_under_a_non_matching_watch_options` is its case.
+    //
+    // fails if an unconditional bypass is put back — a `return true` for the
+    // empty relative path — under which no `watch_options` and no
+    // `ignore_watch` can suppress an event on the root's own inode.
     #[test]
-    fn the_root_itself_triggers_even_under_a_non_matching_watch_options() {
-        let filter = RootedFilter {
-            root: PathBuf::from("/watched"),
-            filter: WatchFilter::new(&["src/**/*.rs".to_string()], &[]).unwrap(),
-        };
-        assert!(filter.triggers(Path::new("/watched")));
-        // Control: the same filter still rejects an ordinary path its
-        // patterns do not cover, so the case above is about the root and
-        // not about a filter that matches everything.
-        assert!(!filter.triggers(Path::new("/watched/other/a.txt")));
+    fn the_root_itself_never_triggers_however_wide_the_watch_options() {
+        // The widest include there is, so a failure here is about the root
+        // and not about patterns that happened not to match it.
+        let filter = matches_everything(PathBuf::from("/watched"));
+        assert!(!filter.triggers(Path::new("/watched")));
+        // Control: the same filter, one level in, does trigger — so the case
+        // above is about the root itself rather than about a filter that
+        // matches nothing.
+        assert!(filter.triggers(Path::new("/watched/other/a.txt")));
     }
 
     // fails if `own_log_ignores` derives a pattern from a path OUTSIDE the
@@ -797,6 +816,25 @@ mod tests {
         }
     }
 
+    /// An ordinary delivery: these paths changed, and notify lost nothing.
+    fn changed(paths: Vec<PathBuf>) -> WatchBatch {
+        WatchBatch {
+            paths,
+            rescan: false,
+        }
+    }
+
+    /// A rescan in its path-less (inotify) shape — notify dropped events and
+    /// wants the tree re-read. The macOS shape carries the root alongside the
+    /// flag, and `source`'s own tests cover the difference; what matters here
+    /// is the flag.
+    fn rescan_marker() -> WatchBatch {
+        WatchBatch {
+            paths: Vec::new(),
+            rescan: true,
+        }
+    }
+
     // fails if only-ignored paths still reach `supervisor.restart` — e.g. a
     // loop that restarts on any non-empty batch without ever consulting the
     // filter
@@ -820,7 +858,7 @@ mod tests {
             handle.clone(),
         ));
 
-        tx.send(vec![root.join(".git/index")]).unwrap();
+        tx.send(changed(vec![root.join(".git/index")])).unwrap();
         assert_no_restart_within(&mut rx, name, Duration::from_secs(5)).await;
 
         group.abort();
@@ -848,7 +886,7 @@ mod tests {
             handle.clone(),
         ));
 
-        tx.send(vec![root.join("src/main.rs")]).unwrap();
+        tx.send(changed(vec![root.join("src/main.rs")])).unwrap();
         let info = expect_restart(&mut rx, name, EVENT_WAIT).await;
         assert_eq!(info.restarts, 1);
         assert_no_restart_within(&mut rx, name, Duration::from_secs(5)).await;
@@ -856,21 +894,21 @@ mod tests {
         group.abort();
     }
 
-    // fails if a rescan marker is filtered away like an ordinary path:
-    // `source::watch_tree` forwards "notify dropped events, re-read the
-    // tree" as a batch of the root alone, and the root strips to an empty
-    // relative path that no configured `watch_options` can match. Two
-    // scripts — one for `start_app`, one for the restart this expects —
-    // which is enough for the mutation to fail visibly, since dropping the
-    // marker produces no restart at all rather than an extra one.
+    // fails if a rescan is filtered away like an ordinary path: it carries no
+    // path a configured `watch_options` could match — on Linux it carries no
+    // path at all — so consulting the glob sets at all leaves the watch deaf
+    // exactly when notify has already lost events. Two scripts — one for
+    // `start_app`, one for the restart this expects — which is enough for the
+    // mutation to fail visibly, since dropping the marker produces no restart
+    // at all rather than an extra one.
     #[tokio::test(start_paused = true)]
-    async fn a_rescan_marker_restarts_under_a_non_matching_watch_options() {
+    async fn a_rescan_restarts_under_a_non_matching_watch_options() {
         let (handle, mut rx, _dir) = spawn_test_fixture(vec![ProcScript::never_exits(); 2]);
         let name = "web";
         start_app(&handle, name, 1).await;
         let root = PathBuf::from("/watched");
         let filter = RootedFilter {
-            root: root.clone(),
+            root,
             filter: WatchFilter::new(&["src/**/*.rs".to_string()], &[]).unwrap(),
         };
         let (tx, group_rx) = mpsc::unbounded_channel();
@@ -881,7 +919,86 @@ mod tests {
             handle.clone(),
         ));
 
-        tx.send(vec![root.clone()]).unwrap();
+        tx.send(rescan_marker()).unwrap();
+        let info = expect_restart(&mut rx, name, EVENT_WAIT).await;
+        assert_eq!(info.restarts, 1);
+
+        group.abort();
+    }
+
+    // The group-loop half of what
+    // `the_root_itself_never_triggers_however_wide_the_watch_options` pins at
+    // the filter tier, and it needs its own case: the loop's rescan check
+    // happens before the filter is consulted at all, so a loop that read the
+    // root as its rescan signal would restart here while every filter
+    // assertion stayed green.
+    //
+    // fails if an ordinary event on the root restarts the group: `batch.rescan
+    // || batch.paths.iter().any(|p| p == root)`, or a `RootedFilter` that
+    // answers `true` for the empty relative path.
+    //
+    // Two scripts: one for `start_app`, one so a loop that does restart here
+    // has something to spawn and emits a visible `Restart` — with one, the
+    // respawn would hit an exhausted script and land in `Errored`, which
+    // `assert_no_restart_within` does not watch for, and the mutation would
+    // pass by accident.
+    #[tokio::test(start_paused = true)]
+    async fn an_ordinary_event_on_the_root_itself_produces_no_restart() {
+        let (handle, mut rx, _dir) = spawn_test_fixture(vec![ProcScript::never_exits(); 2]);
+        let name = "web";
+        start_app(&handle, name, 1).await;
+        let root = PathBuf::from("/watched");
+        let (tx, group_rx) = mpsc::unbounded_channel();
+        let group = tokio::spawn(run_group(
+            name.to_string(),
+            matches_everything(root.clone()),
+            group_rx,
+            handle.clone(),
+        ));
+
+        // The root, with no rescan flag on it — a `chmod` of that inode, or
+        // FSEvents' arm-time `Create(Folder)`.
+        tx.send(changed(vec![root.clone()])).unwrap();
+        assert_no_restart_within(&mut rx, name, Duration::from_secs(5)).await;
+
+        // Control: the same loop, the same watch, one level in — so the
+        // silence above is the root being filtered and not a loop that stopped
+        // restarting for anything.
+        tx.send(changed(vec![root.join("src/main.rs")])).unwrap();
+        let info = expect_restart(&mut rx, name, EVENT_WAIT).await;
+        assert_eq!(info.restarts, 1);
+
+        group.abort();
+    }
+
+    // fails if the drain drops the rescan flag off a batch it folds in —
+    // `batch.paths.extend(more.paths);` without the `batch.rescan |=
+    // more.rescan;` beside it. A rescan that lands while the loop is busy, or
+    // simply behind a batch of ignored paths, would then be swallowed by the
+    // batch it was merged into: the loop consults the glob sets, finds nothing
+    // triggering, and re-reads nothing.
+    //
+    // The two sends are made back to back with no `settle` between them so
+    // they are genuinely queued together when the loop next looks, which is
+    // what puts them through the drain rather than through two `recv` rounds.
+    //
+    // Two scripts, one for `start_app` and one for the restart expected here.
+    #[tokio::test(start_paused = true)]
+    async fn a_rescan_queued_behind_an_ignored_batch_survives_the_drain() {
+        let (handle, mut rx, _dir) = spawn_test_fixture(vec![ProcScript::never_exits(); 2]);
+        let name = "web";
+        start_app(&handle, name, 1).await;
+        let root = PathBuf::from("/watched");
+        let (tx, group_rx) = mpsc::unbounded_channel();
+        let group = tokio::spawn(run_group(
+            name.to_string(),
+            matches_everything(root.clone()),
+            group_rx,
+            handle.clone(),
+        ));
+
+        tx.send(changed(vec![root.join(".git/index")])).unwrap();
+        tx.send(rescan_marker()).unwrap();
         let info = expect_restart(&mut rx, name, EVENT_WAIT).await;
         assert_eq!(info.restarts, 1);
 
@@ -919,13 +1036,13 @@ mod tests {
         // until the paused clock actually moves — nothing below can
         // resolve it early, `settle` included (it only yields, it never
         // advances time).
-        tx.send(vec![root.join("a.rs")]).unwrap();
+        tx.send(changed(vec![root.join("a.rs")])).unwrap();
         settle().await;
 
         // Two more sends land in the queue while restart 1 is still
         // pending.
-        tx.send(vec![root.join("b.rs")]).unwrap();
-        tx.send(vec![root.join("c.rs")]).unwrap();
+        tx.send(changed(vec![root.join("b.rs")])).unwrap();
+        tx.send(changed(vec![root.join("c.rs")])).unwrap();
 
         let first = expect_restart(&mut rx, name, EVENT_WAIT).await;
         assert_eq!(first.restarts, 1);
@@ -978,7 +1095,7 @@ mod tests {
             handle.clone(),
         ));
 
-        tx.send(vec![root.join("src/main.rs")]).unwrap();
+        tx.send(changed(vec![root.join("src/main.rs")])).unwrap();
 
         let first = expect_restart(&mut rx, name, EVENT_WAIT).await;
         let second = expect_restart(&mut rx, name, EVENT_WAIT).await;
@@ -1042,7 +1159,7 @@ mod tests {
         // The batch claims BOTH instances' next exit and starts both kill
         // ladders. Only the second sheep's ladder can finish without the clock
         // moving, so its restart lands while the first is still mid-ladder.
-        tx.send(vec![root.join("src/main.rs")]).unwrap();
+        tx.send(changed(vec![root.join("src/main.rs")])).unwrap();
         let restarted = expect_restart(&mut rx, name, EVENT_WAIT).await;
         assert_eq!(
             (restarted.id, restarted.restarts),
@@ -1094,14 +1211,14 @@ mod tests {
 
         // `name` matches nothing yet: the restart resolves `NotFound`, and
         // the loop must stay alive rather than returning.
-        tx.send(vec![root.join("a.rs")]).unwrap();
+        tx.send(changed(vec![root.join("a.rs")])).unwrap();
         assert_no_restart_within(&mut rx, name, Duration::from_millis(200)).await;
         assert!(!group.is_finished(), "the loop must not exit on NotFound");
 
         // Registering the name for real and sending a second batch: if the
         // earlier `NotFound` had ended the loop, this would time out.
         start_app(&handle, name, 1).await;
-        tx.send(vec![root.join("b.rs")]).unwrap();
+        tx.send(changed(vec![root.join("b.rs")])).unwrap();
         let info = expect_restart(&mut rx, name, EVENT_WAIT).await;
         assert_eq!(info.restarts, 1);
 
@@ -1145,7 +1262,7 @@ mod tests {
             handle,
         ));
 
-        tx.send(vec![root.join("src/main.rs")]).unwrap();
+        tx.send(changed(vec![root.join("src/main.rs")])).unwrap();
         tokio::time::timeout(EVENT_WAIT, group)
             .await
             .expect("the group task did not end after the engine shut down")
@@ -1420,7 +1537,7 @@ mod tests {
                     } else {
                         root.join(format!(".git/o{i}"))
                     };
-                    tx.send(vec![path]).unwrap();
+                    tx.send(changed(vec![path])).unwrap();
                 }
 
                 let observed = match collector.await.expect("collector task panicked") {

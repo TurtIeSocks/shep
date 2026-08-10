@@ -220,8 +220,10 @@ src/
                      guard. `watch_tree` is the seam fn (no trait — one implementation, and the
                      fake tier drives the channel directly).
     mod.rs           `WatchFilter` (pure globset include/ignore) + `spawn_watch_group`'s restart
-                     loop. A path equal to the watch root triggers before either glob set is
-                     consulted — that is the inotify-overflow rescan signal.
+                     loop. A rescan — notify's own flag for "events were dropped, re-read the
+                     tree" — triggers before either glob set is consulted. It rides beside the
+                     paths rather than being spelled as one, so an ordinary event on the watch
+                     root is filtered like any other path.
   probes/            ← new module (spec §7 — pm2 had no probes at all)
       Action: write fresh
       Drift (Phase 4, recorded): map.md never named this module; spec §7 requires it, and where
