@@ -5669,24 +5669,33 @@ mod tests {
         );
     }
 
-    // fails if a second reload of an app already reloading is accepted: two
-    // swaps would put three entries in one instance slot, and neither
-    // replacement would know which one it is meant to outlive.
+    // fails if a second reload of an app already reloading is accepted.
+    //
+    // The app is clustered so that an acceptance has somewhere to go. With
+    // instance 0 mid-swap, a second reload finds instance 1 still `Online`,
+    // starts a swap on it, and `advance_reload`'s insert overwrites the first
+    // job — whose drainee is then never reaped and whose queue is dropped,
+    // on top of a third live entry in an app that asked for two. A
+    // single-instance fixture shows none of that: its two entries are
+    // `Stopping` and `Starting`, neither is reloadable, so the second reload
+    // is accepted and then spawns nothing, and the reply is the only thing
+    // that moves.
     #[tokio::test(start_paused = true)]
     async fn a_second_reload_of_an_app_already_reloading_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let (handle, runner, mut rx) = started(
-            &dir,
-            AppConfig::minimal("web", "./srv"),
-            vec![ProcScript::never_exits(), ProcScript::never_exits()],
-        )
-        .await;
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.instances = 2;
+        // Four scripts, of which a correct run uses three: two originals and
+        // the first swap's replacement. The fourth is sized for the spawn a
+        // wrongly-accepted second reload performs, so it succeeds into a live
+        // entry rather than being hidden behind an exhausted pool.
+        let (handle, runner, mut rx) = started(&dir, app, vec![ProcScript::never_exits(); 4]).await;
 
         handle
             .reload(ProcessSelector::Name("web".to_string()))
             .await
             .expect("the first reload is accepted");
-        expect_event(&mut rx, 1, ProcessEventKind::Start).await;
+        expect_event(&mut rx, 2, ProcessEventKind::Start).await;
 
         let refused = handle.reload(ProcessSelector::All).await;
 
@@ -5696,8 +5705,13 @@ mod tests {
         );
         assert_eq!(
             runner.kill_counts().len(),
-            2,
+            3,
             "no second replacement was spawned"
+        );
+        assert_eq!(
+            handle.list().await.len(),
+            3,
+            "one drainee, its replacement, and the instance untouched so far"
         );
     }
 
