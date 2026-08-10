@@ -87,22 +87,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   8000ms) rather than `kill_timeout` (default 1600ms), which gives both of
   those app options their first reader in the daemon.
 
-  **An automatic restart is held off both halves of an in-flight swap.** A
-  cron occurrence, a change under a watched tree, a memory breach or a
-  liveness failure all restart an app on the daemon's own initiative, and one
-  landing on the instance being replaced — or on its replacement — abandons
-  the reload and turns the deploy into the ordinary hard restart the overlap
-  exists to avoid. For an app with `watch = true`, the one most likely to be
-  reloaded at all, that was any save inside the readiness window. **The
-  held-off trigger is dropped, not deferred**, and that is the price of
-  holding the overlap: a save landing inside the window came after the
-  replacement was spawned, so the replacement is not carrying it and nothing
-  re-fires it, and that one instance keeps serving the older code until
-  something else restarts it. A missed cron occurrence was never replayed
-  either. Instances of
-  the app the reload has not reached yet are not half of any swap and are
-  restarted as usual, and an operator's own `stop`/`restart`/`delete` still
-  reaches either half and still wins — a reload is not a lock on the app.
+  **A cron occurrence and a change under a watched tree are held off both
+  halves of a swap that has not committed.** Both restart an app on the
+  daemon's own initiative, and one landing on the instance being replaced — or
+  on its replacement — abandons the reload and turns the deploy into the
+  ordinary hard restart the overlap exists to avoid. For an app with `watch =
+  true`, the one most likely to be reloaded at all, that was any save inside
+  the readiness window. **The held-off trigger is dropped, not deferred**, and
+  that is the price of holding the overlap: a save landing inside the window
+  came after the replacement was spawned, so the replacement is not carrying
+  it and nothing re-fires it, and that one instance keeps serving the older
+  code until something else restarts it. A missed cron occurrence was never
+  replayed either.
+
+  A memory breach and a liveness failure never needed the hold. Both are
+  refused against anything that is not `online`, which a drainee stops being
+  before its replacement is spawned, and a replacement arms neither of them
+  until it goes `online` itself. The hold ends at the commit rather than at
+  the end of the reload: from there the replacement is the app's live
+  instance, and a trigger against it gets the restart it would get an hour
+  later, while the drainee is by then held by the drain's own claim on it.
+  Instances of the app the reload has not reached yet are not half of any swap
+  and are restarted as usual, and an operator's own `stop`/`restart`/`delete`
+  still reaches either half and still wins — a reload is not a lock on the
+  app.
 
   Not yet reachable from the control socket: the wire verb and the CLI are
   separate work.
