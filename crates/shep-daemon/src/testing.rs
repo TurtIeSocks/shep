@@ -7,7 +7,7 @@ use core::time::Duration;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
 use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, ProbeTarget, ResolvedApp, normalize};
@@ -92,6 +92,43 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
     }
 }
 
+/// A second [`tracing::Dispatch`], kept registered for the life of the
+/// process, so that a callsite's first registration is a union over every
+/// registered dispatcher instead of a read of one thread's default.
+///
+/// `tracing` caches each callsite's `Interest` process-wide the first time
+/// that line of code is reached, and how that first value is computed depends
+/// on a flag: `Dispatchers::has_just_one` is true whenever exactly one
+/// `Dispatch` is alive, and under it a registration resolves through
+/// `Rebuilder::JustOne` -> `dispatcher::get_default` — the default of whatever
+/// thread happened to register. In a test binary that is routinely a sibling
+/// test's thread, which has no subscriber at all, so the callsite caches
+/// `Interest::never()` for every thread and [`capture_logs`] comes back empty
+/// however right the subscriber inside it is. `extras`'
+/// `a_watch_root_that_will_not_resolve_costs_the_app_its_watch_and_nothing_else`
+/// reaches `arm_watch`'s `warn!` — the very callsite
+/// `a_watch_root_that_will_not_resolve_says_in_the_log_which_app_lost_its_watch`
+/// captures — in this same binary, so the two race for real.
+///
+/// A scoped subscriber does NOT sidestep that: `tracing::subscriber::with_default`
+/// is `dispatcher::with_default(&Dispatch::new(subscriber), f)`, and
+/// `Dispatch::new` already rebuilds the cache. What it cannot do is decide
+/// what a callsite registered on some *other* thread, a moment later, caches
+/// — and neither can an explicit `rebuild_interest_cache()`, which only
+/// narrows that window.
+///
+/// Keeping this dispatcher alive closes it: the flag goes false at the first
+/// [`capture_logs`] and stays false, registrations union over the registered
+/// dispatchers, and this one's `Interest::never()` unioned with a capture's
+/// gives `Interest::sometimes()` — the value that routes every event through a
+/// per-thread `enabled()`, which is the per-thread answer a scoped subscriber
+/// needs.
+///
+/// [`tracing::Dispatch::none`] would not do: it is a `'static` no-op that
+/// never registers itself, so it does not count towards the flag at all.
+static SECOND_DISPATCH: LazyLock<tracing::Dispatch> =
+    LazyLock::new(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
 /// Runs `f` with a subscriber scoped to THIS thread, returning everything the
 /// records it wrote rendered to.
 ///
@@ -101,36 +138,81 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
 /// on this thread — a record written by a `tokio::spawn`ed task is NOT
 /// captured, because a spawned task carries no thread-local dispatcher.
 ///
+/// Forcing [`SECOND_DISPATCH`] before the scope opens is load-bearing rather
+/// than tidiness — its own doc carries why, and what an empty capture looks
+/// like without it. Nothing further is needed to refresh the interest cache:
+/// building the `Dispatch` that `with_default` installs re-registers every
+/// callsite already known, against every dispatcher then alive.
+///
 /// ANSI is off so an assertion matches the text and not the escape codes
 /// around it, and the level is `TRACE` so nothing under test is filtered out
 /// by the harness itself.
 pub(crate) fn capture_logs(f: impl FnOnce()) -> String {
+    LazyLock::force(&SECOND_DISPATCH);
     let capture = LogCapture::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(capture.clone())
         .with_ansi(false)
         .with_max_level(tracing::Level::TRACE)
         .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        // `tracing` caches each callsite's `Interest` process-wide the first
-        // time that line of code is reached, and a SCOPED subscriber does not
-        // invalidate it (`tracing_core::dispatcher::set_default` bumps a
-        // counter and stops there). So whichever test in this binary reaches a
-        // `warn!` first decides for every test after it: reached with no
-        // subscriber anywhere, the callsite caches `Interest::never()` and
-        // stays disabled, and this capture comes back empty no matter what is
-        // installed here.
-        //
-        // That is not theoretical. This harness's first case passed alone and
-        // failed under `--workspace` (2026-08-09), because a sibling test
-        // exercising the same `arm_watch` failure arm happened to run first.
-        //
-        // The rebuild re-registers every callsite against the dispatcher this
-        // thread can currently see, which inside this scope is the one above.
-        tracing::callsite::rebuild_interest_cache();
-        f();
-    });
+    tracing::subscriber::with_default(subscriber, f);
     capture.rendered()
+}
+
+/// The one `warn!` [`a_sibling_thread_reaching_a_callsite_first_cannot_empty_the_capture`]
+/// races over, in a helper of its own so that exactly two threads share one
+/// callsite and nothing else in this binary can register it first.
+fn racing_warn() {
+    tracing::warn!("a callsite two threads reach");
+}
+
+/// The race [`SECOND_DISPATCH`] exists for, run deterministically: a sibling
+/// thread with no subscriber registers a callsite *inside* a capture's scope,
+/// after the scope opened and before the captured emit.
+///
+/// The two channels are the whole point. Without them this is a sleep-shaped
+/// hope; with them the sibling cannot register before the scope opens (it
+/// waits to be told the scope is open) and the capture cannot emit before the
+/// sibling has registered (it waits to be told registration is done), so the
+/// window is entered every run rather than on a coin toss.
+///
+/// fails if [`SECOND_DISPATCH`] stops being forced — verified by removing that
+/// line, which reddens this case with an empty capture while leaving the rest
+/// of the suite green. Run alone it is deterministic; under the full binary's
+/// parallelism another live capture can make `has_just_one` false anyway and
+/// let a broken build through, which is why the negative control is run with
+/// `--exact`.
+#[test]
+fn a_sibling_thread_reaching_a_callsite_first_cannot_empty_the_capture() {
+    let (scope_open, await_scope) = std::sync::mpsc::channel();
+    let (registered, await_registration) = std::sync::mpsc::channel();
+
+    let sibling = std::thread::spawn(move || {
+        await_scope.recv().expect("the capture must open its scope");
+        // No subscriber on this thread: this is the registration that decides
+        // the callsite's cached `Interest` for the whole process.
+        racing_warn();
+        registered
+            .send(())
+            .expect("the capture must still be waiting");
+    });
+
+    let rendered = capture_logs(|| {
+        scope_open
+            .send(())
+            .expect("the sibling must still be waiting");
+        await_registration
+            .recv()
+            .expect("the sibling must register before this emit");
+        racing_warn();
+    });
+
+    sibling.join().expect("the sibling thread must not panic");
+    assert!(
+        rendered.contains("a callsite two threads reach"),
+        "a sibling thread registering first must not disable the callsite for \
+         this capture: {rendered:?}"
+    );
 }
 
 // WHY a shallow home: later tasks bind a UDS under `run/`, and sun_path
