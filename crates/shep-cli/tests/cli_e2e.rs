@@ -1523,6 +1523,123 @@ fn reopen_puts_a_rotated_log_back_where_bleats_can_read_it() {
     graceful_kill(home);
 }
 
+/// `copytruncate`-mode rotation through the real binary: an external rotator
+/// copies the live log aside and empties it in place — no `shep` verb, no
+/// signal, nothing that tells the daemon it happened — and the sheep's next
+/// line lands at offset 0 of that same file.
+///
+/// The half of external rotation shep does nothing for, which is exactly why
+/// it is worth a case: it works only because a log file is opened `O_APPEND`
+/// (`shep-daemon`'s `open_append`), so every write seeks to end-of-file
+/// atomically and an external truncation moves the next one back to the
+/// start without the daemon being told. A handle carrying its own offset
+/// instead would put that line past a sparse hole the size of what was
+/// emptied, and a weekly rotation would turn a busy sheep's log into a file
+/// whose apparent size only ever grows.
+///
+/// The daemon's unit tier pins the same property against a pump harness, over
+/// a handle it reopened. What this adds is the stack an operator actually has
+/// — a real daemon, a real spawned sheep, the handle it has held since spawn,
+/// and a rotator acting on the file behind both of their backs.
+///
+/// The file's LENGTH is the whole assertion, for the reason
+/// [`flush_empties_a_log_the_sheep_goes_on_appending_to`] gives about its own:
+/// `bleats` prints the line either way, since a hole reads back as NUL bytes
+/// in front of it, and only the byte count tells an appending handle from a
+/// positional one.
+// fails if `open_append` stops asking for `.append(true)` — verified by
+// replacing it with `.write(true)`, under which this case reports 39 bytes
+// where 19 were expected: the hole the first line left, and then the second
+// line behind it. Blast radius, measured with `--no-fail-fast`: three cases,
+// this one plus `flush_empties_a_log_the_sheep_goes_on_appending_to` in this
+// file and `tokio_runner`'s
+// `a_reopened_handle_still_appends_so_a_truncation_leaves_no_hole`; every
+// other test in the workspace stays green, because a file nobody truncates
+// cannot tell the two handles apart.
+#[test]
+fn an_external_copytruncate_leaves_the_next_line_at_offset_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let gate = home.join("copied");
+    let script = write_rotating_script(&dir, &gate);
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("truncated")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    // Through the reading verb rather than the file, so the first line is
+    // known to be on disk before the rotator below copies it.
+    let before = bleats_no_follow_until_written(home, &["all"]);
+    let printed = String::from_utf8_lossy(&before.stdout);
+    assert!(
+        printed.contains(ROTATE_BEFORE),
+        "precondition: the sheep's first line must be readable before the \
+         rotation: stdout={printed}"
+    );
+
+    // Read off the daemon's own snapshot rather than derived here, so the
+    // test cannot disagree with it about which file this is.
+    let online = poll_flock(home, |info| info["status"] == "online");
+    let out_file = PathBuf::from(
+        online["out_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the daemon reports its own log paths: {online}")),
+    );
+
+    // `logrotate copytruncate`, spelled out: copy the file aside, then empty
+    // the original in place. Nothing here is a shep verb — the daemon is
+    // never told, and the pump goes on holding the same inode at size zero.
+    let archive = out_file.with_extension("log.1");
+    std::fs::copy(&out_file, &archive).unwrap();
+    std::fs::File::create(&out_file).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&archive).unwrap(),
+        format!("{ROTATE_BEFORE}\n"),
+        "sanity: the copy really took the line the truncate is about to drop"
+    );
+    assert_eq!(
+        std::fs::metadata(&out_file).unwrap().len(),
+        0,
+        "sanity: the truncate really emptied it"
+    );
+
+    // Only now is the gate opened, so the line below cannot predate the
+    // truncation it has to land after.
+    std::fs::write(&gate, "").unwrap();
+
+    let after = bleats_no_follow_until_written(home, &["all"]);
+    assert_eq!(
+        after.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&after.stdout);
+    assert!(
+        stdout.contains(ROTATE_AFTER),
+        "a truncated sheep must go on logging into the same file: stdout={stdout}"
+    );
+    // The line above is the only thing the sheep wrote after the truncation,
+    // and the loop that read it back has already waited for it to be on disk.
+    assert_eq!(
+        std::fs::metadata(&out_file).unwrap().len(),
+        (ROTATE_AFTER.len() + 1) as u64,
+        "the sheep's next line must land at offset 0 of the emptied file: a \
+         handle that kept its offset across an external truncation would \
+         leave a hole the size of what was emptied in front of it, and \
+         `bleats` would print the line just the same"
+    );
+
+    graceful_kill(home);
+}
+
 /// `shep flush` through the real binary: empty a running sheep's log, and
 /// watch it keep logging into the same file afterwards.
 ///
