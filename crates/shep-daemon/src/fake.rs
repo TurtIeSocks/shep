@@ -14,7 +14,8 @@ use tokio::time::{Duration, Instant, sleep_until};
 
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::runner::{
-    ExitOutcome, LogLine, ProcIo, ProcessRunner, RunnerError, RunningProcess, SpawnSpec, StopSignal,
+    ExitOutcome, LogCtl, LogLine, ProcIo, ProcessRunner, RunnerError, RunningProcess, SpawnSpec,
+    StopSignal,
 };
 
 /// Capacity of every channel the fake wires up — generous enough that no
@@ -340,6 +341,24 @@ impl ProcessRunner for ScriptedRunner {
         let (from_child_tx, from_child_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (to_child_tx, raw_to_child_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (relay_tx, relay_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (log_ctl_tx, mut log_ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
+
+        // The fake ignores `spec.out_file`/`err_file` and writes no files, so
+        // there is no handle here to swap and nothing about a reopen this
+        // tier can prove — `tests/real_runner.rs` is where a reopened handle
+        // meets a real inode. What the fake must not do is leave the
+        // acknowledgement unanswered: a caller awaiting one would hang
+        // against every scripted proc, so this answers each request as a
+        // live pump would.
+        tokio::spawn(async move {
+            while let Some(ctl) = log_ctl_rx.recv().await {
+                match ctl {
+                    LogCtl::Reopen { done } => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
 
         // Relay task: the fake watches its own to_child stream so a `Shutdown`
         // message resolves an obeys_signal wait (falling back to Term) exactly
@@ -376,6 +395,7 @@ impl ProcessRunner for ScriptedRunner {
             logs: logs_rx,
             from_child: from_child_rx,
             to_child: to_child_tx,
+            log_ctl: log_ctl_tx,
         };
         // Arbitrary but deterministic — real pids come from the OS in the real runner.
         let pid = 1000 + u32::try_from(index).unwrap_or(u32::MAX);
@@ -576,6 +596,35 @@ mod tests {
         io.to_child.send(sent.clone()).await.unwrap();
         let observed = fake_io.to_child_rx.recv().await.unwrap();
         assert_eq!(observed, sent);
+    }
+
+    /// Fails if the fake drops its control receiver instead of answering:
+    /// the send fails, or the acknowledgement resolves `Err` because the
+    /// `oneshot` sender was dropped unanswered. Either way a caller that
+    /// awaits a reopen would hang against every scripted proc.
+    ///
+    /// This tier proves the acknowledgement and nothing else — the fake
+    /// ignores `spec.out_file`/`err_file` and writes no files, so it has no
+    /// handle to swap. What a reopened handle does to a real inode is
+    /// `tokio_runner`'s own tests.
+    #[tokio::test(start_paused = true)]
+    async fn a_reopen_is_acknowledged_by_the_scripted_runner() {
+        // One script for one spawn. A second spawn would answer
+        // `SpawnFailed("script exhausted")`, which is why the count is
+        // stated rather than left generous.
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let (_proc, io) = runner.spawn(&spec()).unwrap();
+
+        let (done, ack) = tokio::sync::oneshot::channel();
+        io.log_ctl.send(LogCtl::Reopen { done }).await.unwrap();
+
+        // Bounded rather than a bare await: an unanswered reopen must fail
+        // this test, not hang it. Under the paused clock the deadline fires
+        // as soon as the runtime is idle, so a passing run costs nothing.
+        tokio::time::timeout(Duration::from_secs(5), ack)
+            .await
+            .expect("a reopen must be acknowledged")
+            .expect("the fake must answer rather than drop the acknowledgement");
     }
 
     #[tokio::test(start_paused = true)]

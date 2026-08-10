@@ -7,7 +7,9 @@
 //! without touching the daemon's own), optionally wires an fd-3
 //! socketpair as the shepherd channel, and spawns background pump tasks that
 //! drain stdout/stderr into the `logs` channel (and append them to the
-//! spec's log files) and shuttle shepherd-channel JSON both ways.
+//! spec's log files) and shuttle shepherd-channel JSON both ways. The log
+//! pump also takes [`LogCtl`](crate::runner::LogCtl) messages, which is how
+//! a rotated log file gets reopened without restarting the sheep.
 //!
 //! # Shepherd-channel fd lifecycle
 //!
@@ -19,6 +21,7 @@
 //! side of the channel sees a clean EOF once the child closes or exits
 //! rather than being kept artificially open by our own leftover reference.
 
+use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -27,14 +30,15 @@ use std::process::Stdio;
 use command_fds::{CommandFdExt, FdMapping};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWriteExt as _, BufReader, Lines};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::runner::{
-    ExitOutcome, LogLine, ProcIo, ProcessRunner, RunnerError, RunningProcess, SpawnSpec, StopSignal,
+    ExitOutcome, LogCtl, LogLine, ProcIo, ProcessRunner, RunnerError, RunningProcess, SpawnSpec,
+    StopSignal,
 };
 
 /// Capacity of every channel a spawn wires up — generous enough that a
@@ -272,54 +276,222 @@ impl ProcessRunner for TokioRunner {
         })?;
 
         let (logs_tx, logs_rx) = mpsc::channel(CHANNEL_CAPACITY);
-        if let Some(stdout) = child.stdout.take() {
-            spawn_log_pump(stdout, false, spec.out_file.clone(), logs_tx.clone());
-        }
-        if let Some(stderr) = child.stderr.take() {
-            spawn_log_pump(stderr, true, spec.err_file.clone(), logs_tx);
-        }
+        let (log_ctl_tx, log_ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        spawn_log_pump(
+            child.stdout.take(),
+            child.stderr.take(),
+            spec.out_file.clone(),
+            spec.err_file.clone(),
+            logs_tx,
+            log_ctl_rx,
+        );
 
         let io = ProcIo {
             logs: logs_rx,
             from_child: from_child_rx,
             to_child: to_child_tx,
+            log_ctl: log_ctl_tx,
         };
         Ok((TokioProc { pid, child }, io))
     }
 }
 
-/// Pumps one stdout/stderr stream to completion: every line is appended to
-/// `file_path` (parent directories created as needed) and then forwarded on
-/// `logs_tx` — in that order, so a receiver that observes a line on the
-/// channel can rely on that line's file write having already landed.
+/// One stream's log file: the path the spec named, plus the handle currently
+/// open on it — `None` when the open failed (see [`open_append`]).
+#[derive(Debug)]
+struct LogFile {
+    path: PathBuf,
+    handle: Option<tokio::fs::File>,
+}
+
+impl LogFile {
+    /// Opens `path` for appending, keeping the path for later reopens.
+    async fn open(path: PathBuf) -> Self {
+        let handle = open_append(&path).await;
+        Self { path, handle }
+    }
+
+    /// Appends one line and its newline, logging (never propagating) a write
+    /// failure — a log we cannot write to must not stop the pump draining
+    /// the child's pipes.
+    async fn append(&mut self, line: &str) {
+        let Some(handle) = self.handle.as_mut() else {
+            return;
+        };
+        let mut buf = String::with_capacity(line.len() + 1);
+        buf.push_str(line);
+        buf.push('\n');
+        if let Err(error) = handle.write_all(buf.as_bytes()).await {
+            tracing::error!(path = ?self.path, %error, "log file append failed");
+        }
+    }
+
+    /// Flushes and closes the current handle, then opens the path again.
+    ///
+    /// Flushing first is what makes [`LogCtl::Reopen`]'s acknowledgement
+    /// worth having: `write_all` returning only means the write was queued
+    /// onto the blocking pool, while `flush` waits for the operation in
+    /// flight — so every line read before the reopen has reached the OLD
+    /// file (the renamed one, in the rotation this exists for) by the time
+    /// the caller hears back.
+    ///
+    /// Reopening goes through [`open_append`] rather than opening the path
+    /// here, so the new handle is an appending one exactly like the original
+    /// — see that function for why `O_APPEND` is load-bearing.
+    async fn reopen(&mut self) {
+        if let Some(handle) = self.handle.as_mut()
+            && let Err(error) = handle.flush().await
+        {
+            tracing::error!(path = ?self.path, %error, "log file flush failed");
+        }
+        // Closed before the reopen, so the pump never holds two descriptors
+        // on one log at the same time.
+        drop(self.handle.take());
+        self.handle = open_append(&self.path).await;
+    }
+}
+
+/// What the pump does after handling one line result.
+enum AfterLine {
+    /// The stream is live; keep reading it.
+    KeepReading,
+    /// The stream reached EOF or failed; stop reading THIS stream.
+    StreamEnded,
+    /// The owning sheep task dropped its `logs` receiver; stop entirely.
+    LogsClosed,
+}
+
+/// Handles one line read from a stream: appends it to that stream's `file`,
+/// forwards it on `logs_tx`, and reports what the pump should do next.
+async fn deliver_line(
+    result: io::Result<Option<String>>,
+    err: bool,
+    file: &mut LogFile,
+    logs_tx: &mpsc::Sender<LogLine>,
+) -> AfterLine {
+    match result {
+        Ok(Some(line)) => {
+            file.append(&line).await;
+            if logs_tx.send(LogLine { err, line }).await.is_err() {
+                return AfterLine::LogsClosed;
+            }
+            AfterLine::KeepReading
+        }
+        Ok(None) => AfterLine::StreamEnded, // normally the child exiting
+        Err(error) => {
+            tracing::error!(path = ?file.path, %error, "log stream read failed");
+            AfterLine::StreamEnded
+        }
+    }
+}
+
+/// The next line from an optional stream, or a future that never resolves
+/// once there is no stream left to read.
 ///
-/// Runs until the stream hits EOF (normally the child exiting) or the owning
-/// sheep task drops its `logs` receiver.
-fn spawn_log_pump<R>(reader: R, err: bool, file_path: PathBuf, logs_tx: mpsc::Sender<LogLine>)
+/// The pump's `select!` needs a branch it can leave in place after a stream
+/// ends: a ready `None` would be re-selected on every poll and spin the
+/// loop, while pending forever drops the branch out of contention and lets
+/// the loop's own condition end the task once both streams are gone.
+///
+/// Cancel-safe, as a `select!` branch must be:
+/// [`tokio::io::Lines::next_line`] documents itself so — a partially read
+/// line stays in the `Lines` buffer instead of being lost when another
+/// branch wins the race.
+async fn next_line<R>(lines: &mut Option<Lines<BufReader<R>>>) -> io::Result<Option<String>>
 where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    R: AsyncRead + Unpin,
+{
+    match lines {
+        Some(lines) => lines.next_line().await,
+        None => core::future::pending().await,
+    }
+}
+
+/// Pumps a sheep's stdout and stderr to completion, and stays reachable the
+/// whole time it does.
+///
+/// Every line is appended to its stream's file (parent directories created
+/// as needed) and then forwarded on `logs_tx`. A [`LogCtl`] message is
+/// served between lines — and, the point of the `select!`, while no line is
+/// flowing at all: a sheep that has been quiet for hours reopens exactly as
+/// promptly as a chatty one.
+///
+/// # Why the reopen never disturbs the child
+///
+/// The child never sees the log file. It is spawned with `Stdio::piped()`
+/// and this task does the file I/O on the far side of that pipe, so swapping
+/// the handle here is invisible across the process boundary: no signal to
+/// the child, no fd surgery, no restart, and no gap in the pipe. Nothing
+/// child-side is needed to rotate a sheep's logs.
+///
+/// # Why one task for both streams
+///
+/// One [`LogCtl::Reopen`] swaps BOTH files and answers once, which is what a
+/// rotator that renamed both of them is waiting on. The alternatives cost
+/// more for less: an `mpsc::Receiver` cannot be split across two tasks, so
+/// one channel feeding two pumps would hand each request to whichever pump
+/// woke first and strand the other on the old inode, and a channel per pump
+/// would need a third task to fan one request out and join two
+/// acknowledgements. The two streams already share one `logs_tx`, so the
+/// only isolation merging them costs is a slow write on one stream delaying
+/// the other's read.
+///
+/// # Ordering
+///
+/// The file write is ISSUED before the line is forwarded, but
+/// `tokio::fs::File::write_all` returning means the write was queued onto
+/// the blocking pool, not that it reached the file. A receiver that observes
+/// a line on `logs_tx` therefore cannot conclude the file already holds it.
+/// The barrier that can be relied on is [`LogCtl::Reopen`]'s
+/// acknowledgement, which flushes before swapping handles.
+///
+/// Runs until both streams reach EOF (normally the child exiting), the
+/// owning sheep task drops its `logs` receiver, or that task drops its
+/// `log_ctl` sender.
+fn spawn_log_pump<O, E>(
+    stdout: Option<O>,
+    stderr: Option<E>,
+    out_path: PathBuf,
+    err_path: PathBuf,
+    logs_tx: mpsc::Sender<LogLine>,
+    mut ctl_rx: mpsc::Receiver<LogCtl>,
+) where
+    O: AsyncRead + Unpin + Send + 'static,
+    E: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut file = open_append(&file_path).await;
-        let mut lines = BufReader::new(reader).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    if let Some(file) = file.as_mut() {
-                        let mut buf = line.clone();
-                        buf.push('\n');
-                        if let Err(error) = file.write_all(buf.as_bytes()).await {
-                            tracing::error!(?file_path, %error, "log file append failed");
-                        }
-                    }
-                    if logs_tx.send(LogLine { err, line }).await.is_err() {
-                        break; // owning sheep task dropped its logs receiver
+        let mut out = LogFile::open(out_path).await;
+        let mut err = LogFile::open(err_path).await;
+        let mut out_lines = stdout.map(|reader| BufReader::new(reader).lines());
+        let mut err_lines = stderr.map(|reader| BufReader::new(reader).lines());
+
+        while out_lines.is_some() || err_lines.is_some() {
+            tokio::select! {
+                result = next_line(&mut out_lines) => {
+                    match deliver_line(result, false, &mut out, &logs_tx).await {
+                        AfterLine::KeepReading => {}
+                        AfterLine::StreamEnded => out_lines = None,
+                        AfterLine::LogsClosed => break,
                     }
                 }
-                Ok(None) => break, // stream closed, normally the child exiting
-                Err(error) => {
-                    tracing::error!(?file_path, %error, "log stream read failed");
-                    break;
+                result = next_line(&mut err_lines) => {
+                    match deliver_line(result, true, &mut err, &logs_tx).await {
+                        AfterLine::KeepReading => {}
+                        AfterLine::StreamEnded => err_lines = None,
+                        AfterLine::LogsClosed => break,
+                    }
+                }
+                ctl = ctl_rx.recv() => {
+                    match ctl {
+                        Some(LogCtl::Reopen { done }) => {
+                            out.reopen().await;
+                            err.reopen().await;
+                            // A caller that stopped waiting is not a
+                            // failure: the reopen happened either way.
+                            let _ = done.send(());
+                        }
+                        None => break, // owning sheep task dropped log_ctl
+                    }
                 }
             }
         }
@@ -332,6 +504,16 @@ where
 /// log file we can't create shouldn't stop us draining the child's
 /// stdout/stderr — leaving that unread risks the child stalling on a full
 /// pipe once its own stdout buffer backs up.
+///
+/// `.append(true)` is load-bearing rather than a convenience. `O_APPEND`
+/// makes every write seek to end atomically, which is what lets a
+/// `copytruncate` rotator truncate the file under a live handle and have the
+/// next line land at offset 0. A handle tracking its own offset instead
+/// would write past the truncation point, leaving a sparse hole the size of
+/// everything rotated away — and it would do so after every rotation, so the
+/// files would grow without bound. This holds for a reopened handle as much
+/// as for the first one, which is why [`LogFile::reopen`] comes back through
+/// here.
 async fn open_append(path: &Path) -> Option<tokio::fs::File> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -407,7 +589,243 @@ fn spawn_channel_pumps(
 
 #[cfg(test)]
 mod tests {
-    use super::{Signal, signal_group};
+    use std::fs;
+    use std::time::Duration;
+
+    use tokio::io::DuplexStream;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    use super::*;
+
+    // What needs a real OS child lives in `tests/real_runner.rs`; what is
+    // reachable with no process at all belongs here (IR-38). The log pump is
+    // the second kind: it reads an `AsyncRead`, and a `tokio::io::duplex`
+    // half is one, so its whole control surface can be driven from this tier
+    // against real files and with no child to reap.
+    //
+    // These cases run on the REAL clock rather than this crate's usual paused
+    // one (IR-33): they wait on actual file I/O dispatched to the blocking
+    // pool, which no amount of virtual-time advance brings any closer.
+
+    /// How long a pump gets to answer before a test calls it hung. A pump
+    /// that is working answers in microseconds; this is slack for a loaded
+    /// runner, not an expected duration.
+    const PUMP_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// One pump over two in-memory streams and two real files — everything
+    /// [`spawn_log_pump`] takes, with no child process involved.
+    struct PumpHarness {
+        dir: tempfile::TempDir,
+        out_path: PathBuf,
+        err_path: PathBuf,
+        out_writer: DuplexStream,
+        err_writer: DuplexStream,
+        logs: mpsc::Receiver<LogLine>,
+        ctl: mpsc::Sender<LogCtl>,
+    }
+
+    impl PumpHarness {
+        fn start() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let out_path = dir.path().join("out.log");
+            let err_path = dir.path().join("err.log");
+            let (out_writer, out_reader) = tokio::io::duplex(256);
+            let (err_writer, err_reader) = tokio::io::duplex(256);
+            let (logs_tx, logs) = mpsc::channel(CHANNEL_CAPACITY);
+            let (ctl, ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
+            spawn_log_pump(
+                Some(out_reader),
+                Some(err_reader),
+                out_path.clone(),
+                err_path.clone(),
+                logs_tx,
+                ctl_rx,
+            );
+            Self {
+                dir,
+                out_path,
+                err_path,
+                out_writer,
+                err_writer,
+                logs,
+                ctl,
+            }
+        }
+
+        /// Writes one line into the chosen stream and waits for the pump to
+        /// hand it back on `logs` — which is proof the pump read it and
+        /// issued its file write, and orders the two streams against each
+        /// other so a test never has to guess which line arrives first.
+        async fn feed(&mut self, err: bool, line: &str) {
+            let writer = if err {
+                &mut self.err_writer
+            } else {
+                &mut self.out_writer
+            };
+            writer
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+            let observed = timeout(PUMP_DEADLINE, self.logs.recv())
+                .await
+                .expect("the pump must forward a line it has read")
+                .expect("the pump must not end while its streams are open");
+            assert_eq!(
+                observed,
+                LogLine {
+                    err,
+                    line: line.to_string()
+                }
+            );
+        }
+
+        /// Sends a [`LogCtl::Reopen`] and waits for its acknowledgement.
+        async fn reopen(&self) {
+            let (done, ack) = oneshot::channel();
+            self.ctl
+                .send(LogCtl::Reopen { done })
+                .await
+                .expect("the pump must still be reading its control channel");
+            timeout(PUMP_DEADLINE, ack)
+                .await
+                .expect("a reopen must be acknowledged")
+                .expect("the pump must answer rather than drop the acknowledgement");
+        }
+    }
+
+    /// Waits for `path` to hold exactly `expected`.
+    ///
+    /// A line observed on `logs` has had its file write ISSUED, not
+    /// necessarily completed (see [`spawn_log_pump`]'s ordering note), so
+    /// this polls for the write to land instead of asserting it already has.
+    /// The barrier that would make polling unnecessary — a reopen
+    /// acknowledgement — is not usable where the point is what the CURRENT
+    /// handle does, since a reopen replaces it.
+    async fn assert_file_settles(path: &Path, expected: &str) {
+        let settled = timeout(PUMP_DEADLINE, async {
+            while fs::read_to_string(path).unwrap_or_default() != expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "{}: expected {expected:?}, found {:?}",
+            path.display(),
+            fs::read_to_string(path)
+        );
+    }
+
+    /// Fails if the `Reopen` arm acknowledges without opening the paths
+    /// again: the renamed inodes keep receiving every later line and the
+    /// live paths never come back — which is `create`-mode rotation silently
+    /// producing an empty log forever.
+    #[tokio::test]
+    async fn a_reopen_moves_both_streams_onto_the_recreated_paths() {
+        let mut pump = PumpHarness::start();
+        pump.feed(false, "before-out").await;
+        pump.feed(true, "before-err").await;
+
+        // The rotator's rename: the pump's handles now point at inodes that
+        // answer to a different name, and the paths it was given are gone.
+        let rotated_out = pump.dir.path().join("out.log.1");
+        let rotated_err = pump.dir.path().join("err.log.1");
+        fs::rename(&pump.out_path, &rotated_out).unwrap();
+        fs::rename(&pump.err_path, &rotated_err).unwrap();
+        assert!(
+            !pump.out_path.exists(),
+            "sanity: the rename really moved it"
+        );
+
+        pump.reopen().await;
+
+        // No polling here: the acknowledgement is a real barrier, because
+        // the reopen flushes the old handle before dropping it.
+        assert_eq!(fs::read_to_string(&rotated_out).unwrap(), "before-out\n");
+        assert_eq!(fs::read_to_string(&rotated_err).unwrap(), "before-err\n");
+        assert_eq!(fs::read_to_string(&pump.out_path).unwrap(), "");
+        assert_eq!(fs::read_to_string(&pump.err_path).unwrap(), "");
+
+        pump.feed(false, "after-out").await;
+        pump.feed(true, "after-err").await;
+        pump.reopen().await; // second reopen, wanted here only as the flush
+
+        assert_eq!(fs::read_to_string(&pump.out_path).unwrap(), "after-out\n");
+        assert_eq!(fs::read_to_string(&pump.err_path).unwrap(), "after-err\n");
+        // Both archives stopped growing the moment the handles were swapped.
+        assert_eq!(fs::read_to_string(&rotated_out).unwrap(), "before-out\n");
+        assert_eq!(fs::read_to_string(&rotated_err).unwrap(), "before-err\n");
+    }
+
+    /// Fails if the reopen opens the path without `.append(true)`: the
+    /// handle would then carry its own offset across an external truncation
+    /// and write the next line past a sparse hole, instead of at offset 0.
+    #[tokio::test]
+    async fn a_reopened_handle_still_appends_so_a_truncation_leaves_no_hole() {
+        let mut pump = PumpHarness::start();
+        pump.feed(false, "first").await;
+        fs::rename(&pump.out_path, pump.dir.path().join("out.log.1")).unwrap();
+        pump.reopen().await;
+
+        // Push the REOPENED handle's offset off zero. Without this the case
+        // proves nothing: in a file nobody has written to, offset zero and
+        // end-of-file are the same place, so an appending handle and a
+        // positional one behave identically.
+        pump.feed(false, "second").await;
+        assert_file_settles(&pump.out_path, "second\n").await;
+
+        // The copytruncate rotator: it copies the file elsewhere and
+        // truncates this one in place, leaving the pump's handle open on the
+        // same inode at size zero.
+        fs::File::create(&pump.out_path).unwrap();
+        assert_eq!(fs::metadata(&pump.out_path).unwrap().len(), 0);
+
+        pump.feed(false, "third").await;
+        assert_file_settles(&pump.out_path, "third\n").await;
+    }
+
+    /// Fails if the control channel is only consulted after a line arrives
+    /// (a sequential `next_line().await` and then a check, rather than a
+    /// `select!`): a sheep that has gone quiet would never reopen at all,
+    /// which is the failure a pushed message exists to rule out.
+    #[tokio::test]
+    async fn a_reopen_is_answered_while_both_streams_are_idle() {
+        let pump = PumpHarness::start();
+        // The pump opens both paths as it starts, on its own task. This
+        // first acknowledgement is only a barrier proving it got that far,
+        // so the removal below cannot race the initial open.
+        pump.reopen().await;
+
+        // Deleted rather than renamed, so the reopen under test is the only
+        // thing that could put these paths back. Not one byte has been
+        // written to either stream, and none is written before the
+        // acknowledgement.
+        fs::remove_file(&pump.out_path).unwrap();
+        fs::remove_file(&pump.err_path).unwrap();
+
+        pump.reopen().await;
+
+        assert!(pump.out_path.exists(), "stdout's path must be back");
+        assert!(pump.err_path.exists(), "stderr's path must be back");
+    }
+
+    /// Fails if the pump treats a closed control channel as nothing to do:
+    /// `ProcIo::log_ctl` documents that dropping the sender ends the pump,
+    /// and an arm that ignored the `None` would spin on it forever — a
+    /// closed `mpsc::Receiver` is ready on every poll.
+    #[tokio::test]
+    async fn dropping_the_control_sender_ends_the_pump() {
+        let mut pump = PumpHarness::start();
+        pump.feed(false, "still-here").await;
+
+        drop(pump.ctl);
+
+        let after = timeout(PUMP_DEADLINE, pump.logs.recv())
+            .await
+            .expect("the pump must end once nothing can control it");
+        assert!(after.is_none(), "a pump that has ended sends nothing more");
+    }
 
     // Everything else in this module needs a real OS child and lives in
     // `tests/real_runner.rs`; this one case is reachable with no process at

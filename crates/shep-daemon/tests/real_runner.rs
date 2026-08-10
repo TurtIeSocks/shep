@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use shep_daemon::channel::ChildMessage;
@@ -56,6 +56,32 @@ fn spec_for(dir: &tempfile::TempDir, program: &str, args: &[&str]) -> SpawnSpec 
     }
 }
 
+/// How long a log line gets to travel from the pump's `write_all` to the
+/// file. A write that is going to land lands in microseconds; this is slack
+/// for a loaded runner, not an expected duration.
+const LOG_WRITE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Waits for `path` to hold exactly `expected`, failing at
+/// [`LOG_WRITE_DEADLINE`].
+///
+/// Polls rather than sleeping a fixed guess, the same shape as
+/// [`assert_reaped`] below and for the same reason: the wait is bounded by
+/// what must eventually be true, not by a number someone picked.
+async fn await_file_contents(path: &Path, expected: &str) {
+    let settled = tokio::time::timeout(LOG_WRITE_DEADLINE, async {
+        while fs::read_to_string(path).unwrap_or_default() != expected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "{}: expected {expected:?}, found {:?}",
+        path.display(),
+        fs::read_to_string(path)
+    );
+}
+
 #[tokio::test]
 async fn exit_code_and_logs_are_captured() {
     let dir = tempfile::tempdir().unwrap();
@@ -92,11 +118,16 @@ async fn exit_code_and_logs_are_captured() {
     assert_eq!(outcome.code, Some(7));
     assert_eq!(outcome.signal, None);
 
-    // By the time both lines were observed on `logs`, the pump's file write
-    // for each already completed (write-then-send ordering in the runner) —
-    // no extra sleep/poll needed to read these back reliably.
-    assert_eq!(fs::read_to_string(&out_file).unwrap(), "out-line\n");
-    assert_eq!(fs::read_to_string(&err_file).unwrap(), "err-line\n");
+    // Observing a line on `logs` means the pump ISSUED that line's file
+    // write before forwarding it, not that the write landed: `tokio::fs`
+    // copies into its own buffer and dispatches the real `write(2)` to the
+    // blocking pool, so `write_all().await` returning means queued. It is
+    // reliable in practice — at most one write is ever in flight, and the
+    // next one awaits the previous operation — but that is an implementation
+    // detail rather than a contract, so these read the file back on a
+    // bounded poll instead of resting on it.
+    await_file_contents(&out_file, "out-line\n").await;
+    await_file_contents(&err_file, "err-line\n").await;
 }
 
 #[tokio::test]

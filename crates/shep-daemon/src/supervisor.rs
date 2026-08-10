@@ -1881,6 +1881,11 @@ async fn run_sheep<P: RunningProcess>(
         mut logs,
         mut from_child,
         to_child,
+        // Held, unused, for the whole of this task: the log pump stops the
+        // moment this sender drops, and a stopped pump stops draining the
+        // child's stdout/stderr — which stalls the child itself once its own
+        // pipe buffer fills.
+        log_ctl: _log_ctl,
     } = io;
     let mut ctl_open = true;
     let mut logs_open = true;

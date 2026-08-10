@@ -20,7 +20,7 @@ use core::fmt;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::privilege::Credentials;
@@ -75,6 +75,34 @@ pub struct LogLine {
     pub line: String,
 }
 
+/// What the supervisor can ask a log pump to do mid-flight.
+///
+/// # Why a pushed message rather than a generation counter
+///
+/// A counter the pump re-read before each write would only ever promise
+/// "before the next line", and **a quiet sheep never writes a next line** —
+/// so a rotator could rename a file and be told nothing about when, or
+/// whether, the daemon caught up. The [`oneshot`] acknowledgement below is
+/// the whole point of the shape: once it resolves, every live pump provably
+/// holds the new handle, which is the answer a logrotate `postrotate` stanza
+/// actually needs before it compresses or deletes the renamed file.
+#[derive(Debug)]
+pub enum LogCtl {
+    /// Drop the current handle and open the path again, then acknowledge.
+    /// Sent when an external rotator has renamed the file.
+    Reopen {
+        /// Fires once the pump holds handles freshly opened on the spec's
+        /// log paths.
+        ///
+        /// It fires whether or not the reopen actually succeeded: a path
+        /// that cannot be opened leaves the pump with no file (logged, and
+        /// still draining the child's streams), exactly as a failed open at
+        /// spawn time does. The acknowledgement means "the pump has
+        /// processed this", not "a file now exists".
+        done: oneshot::Sender<()>,
+    },
+}
+
 /// IO endpoints handed back by spawn — the runner pumps internally.
 ///
 /// The sheep task owns this and MUST drain every receiver: an undrained
@@ -88,6 +116,15 @@ pub struct ProcIo {
     pub from_child: mpsc::Receiver<ChildMessage>,
     /// daemon→child shepherd-channel sender
     pub to_child: mpsc::Sender<ShepherdMessage>,
+    /// Control channel into this sheep's log pump
+    ///
+    /// The pump is the only reader, and it is the last thing keeping the
+    /// child's stdout/stderr pipes drained, so **dropping this sender ends
+    /// it** — hold it for as long as the child is alive, or the child stalls
+    /// on a full pipe once its own buffer backs up. A send that fails means
+    /// the pump is already gone (both streams reached EOF, normally the
+    /// child exiting), which makes a reopen a no-op rather than an error.
+    pub log_ctl: mpsc::Sender<LogCtl>,
 }
 
 /// A live child.

@@ -240,3 +240,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Doc links to the newly-private names became plain code spans rather than
   being deleted; in the crate-root taxonomy, a linked module name now means
   public and a backticked one means internal.
+- `ProcIo` gains a `log_ctl: mpsc::Sender<LogCtl>` field: the control channel
+  into a sheep's log pump, and the first way anything has been able to reach
+  the file handle the pump writes to. `LogCtl::Reopen` makes the pump flush,
+  close and re-open both log files, then answer on a `oneshot` — a
+  synchronous acknowledgement rather than a flag the pump would notice
+  before its next write, because a sheep that has gone quiet has no next
+  write, and an external rotator needs to know the swap has happened before
+  it compresses or deletes what it renamed. The child is not involved and
+  never notices: it holds a pipe, and the daemon does the file I/O on the
+  far side of it.
+
+  Filed as a change rather than an addition because the struct carries no
+  `#[non_exhaustive]`: any downstream `ProcIo` literal, or destructuring that
+  names every field, stops compiling until it names this one too. Dropping
+  the sender ends the pump, so a holder must keep it for as long as the child
+  is alive. The real runner also spawns one pump task per sheep now instead
+  of one per stream, so a single reopen swaps both files and answers once.
