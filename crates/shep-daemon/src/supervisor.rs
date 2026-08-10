@@ -1483,14 +1483,28 @@ impl<R: ProcessRunner> Actor<R> {
             // and killing the replacement abandons it just as surely — the
             // deploy becomes the ordinary hard restart the feature exists to
             // avoid. For a `watch` app, the archetypal reload-often one, any
-            // save inside the readiness window did it.
+            // save inside the readiness window did it. Those two are the only
+            // automatic triggers that reach here at all: a memory breach and a
+            // liveness failure arrive through `handle_extra_restart`, whose
+            // `Online` guard has already rejected a `Stopping` drainee, and
+            // the replacement has no extras armed until it goes `Online`.
             //
             // Dropping the trigger costs nobody an answer, which is
             // `claim_manual`'s own carve-out argument applied one step
             // earlier: an operator's command is the only one with a party
-            // waiting behind it. And the replacement is a process spawned
-            // moments ago, so it already carries whatever the trigger wanted
-            // picked up. Instances of the app the reload has not reached yet
+            // waiting behind it. What it does cost is the trigger itself. This
+            // DROPS the restart, it does not defer it, and for a watched tree
+            // that loses a real change: a save inside the readiness window
+            // happened after the replacement was spawned, so the replacement
+            // cannot be carrying it, and nothing re-fires it — the watcher
+            // reads the empty `Ok` as a restart that matched nothing and goes
+            // back to waiting, leaving that one instance on the older code
+            // until something else restarts it. The trade is one lost change
+            // against the overlap, and it is taken because the other half of
+            // it is losing the overlap on EVERY save inside the window, for
+            // the app class most likely to be reloaded at all. A cron
+            // occurrence loses nothing new: a missed occurrence is already not
+            // replayed. Instances of the app the reload has not reached yet
             // are not half of any swap and restart as usual.
             //
             // It stops at the commit rather than running to the end of the

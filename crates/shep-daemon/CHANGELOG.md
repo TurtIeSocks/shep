@@ -85,7 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   landing on the instance being replaced — or on its replacement — abandons
   the reload and turns the deploy into the ordinary hard restart the overlap
   exists to avoid. For an app with `watch = true`, the one most likely to be
-  reloaded at all, that was any save inside the readiness window. Instances of
+  reloaded at all, that was any save inside the readiness window. **The
+  held-off trigger is dropped, not deferred**, and that is the price of
+  holding the overlap: a save landing inside the window came after the
+  replacement was spawned, so the replacement is not carrying it and nothing
+  re-fires it, and that one instance keeps serving the older code until
+  something else restarts it. A missed cron occurrence was never replayed
+  either. Instances of
   the app the reload has not reached yet are not half of any swap and are
   restarted as usual, and an operator's own `stop`/`restart`/`delete` still
   reaches either half and still wins — a reload is not a lock on the app.
