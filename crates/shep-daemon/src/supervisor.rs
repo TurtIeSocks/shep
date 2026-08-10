@@ -2540,9 +2540,26 @@ impl<R: ProcessRunner> Actor<R> {
                 // The queue goes with it rather than carrying on, per spec §4:
                 // this replacement exited before it was ever `Online`, which is
                 // a failure of the new instance, and that aborts the rest.
+                //
+                // That last claim is an inference, not something the condition
+                // reads, so the assert below turns it into something the suite
+                // has to keep true. `DrainOld` with the drainee gone has one
+                // cause — `reap_drainee` committing the swap on the drainee's
+                // own death — because the other route into `DrainOld`,
+                // `begin_drain`, leaves the drainee registered until
+                // `reap_drainee` removes it and ends the job in the same call.
+                // A swap committed that way never had a replacement go
+                // `Online`, and a kill ladder writes no status, so an `Online`
+                // here would mean the inference had stopped holding.
                 if let Some(name) = name {
                     let old_id = self.reloads[&name].swap.old_id;
                     if !self.sheep.contains_key(&old_id) {
+                        debug_assert_ne!(
+                            self.sheep.get(&id).map(|slot| slot.entry.status),
+                            Some(ProcStatus::Online),
+                            "a swap committed by the drainee's death cannot have had a live \
+                             replacement"
+                        );
                         tracing::warn!(
                             name,
                             new_id = id,
