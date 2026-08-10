@@ -152,6 +152,15 @@ e2e polish.
 v1: N fork instances + SO_REUSEPORT load balancing. True cluster parity
 (fd-passing / LISTEN_FDS protocol) = v1.1/v1.2 per Rin.
 
+**Caveat added 2026-08-09 (measured):** "load balancing" holds on Linux
+(kernel spreads new connections across siblings) but not on macOS, where
+`SO_REUSEPORT` is last-binder-wins — cross-process over 40 connections,
+macOS sent 40/40 to the newest binder, Linux split 20/20. macOS is tier 1
+(spec §11), so this is a real v1 gap for the cluster model specifically,
+not a v1.1 deferral; it does not touch reload, which wants last-binder-wins
+behavior. Now documented in spec §4 and §11 rather than only in the trace
+notes.
+
 ## Research decisions (from Phase 4-6 design research, 2026-08-07 — PENDING Rin)
 
 1. **MSRV 1.85 → 1.88 — DONE (forced now, not future).** Originally framed as a

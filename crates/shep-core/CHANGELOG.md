@@ -159,3 +159,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parser), keeping the crate's `forbid(unsafe_code)` guarantee.
 - Rename `ConfigError` -> `NormalizeError`, matching the per-construction-site
   naming convention used by the crate's other error enums.
+- Rewrite `AppConfig::reuse_port`'s doc. It previously read "Bind listen
+  sockets with SO_REUSEPORT", first person, as though shep does the
+  binding — it doesn't. The child binds after `exec`, and a socket option
+  has to be set before `bind()` by the process that binds, so `reuse_port
+  = true` has only ever meant the operator asserting that the app sets the
+  option itself (Node ≥22's `reusePort`, Go's `Control` hook, nginx's
+  `reuseport`); shep's contribution is permission for the old and new
+  instance to overlap during reload, not the mechanism. The doc now also
+  names the failure mode: an app that does not set the option gets
+  `EADDRINUSE` at the replacement spawn on every reload, undetectable in
+  advance, and `SO_REUSEADDR` — which far more frameworks set by default —
+  is not sufficient. No behavior changed; the field's meaning was always
+  this, only the doc claimed otherwise.

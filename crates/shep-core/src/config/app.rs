@@ -137,7 +137,19 @@ pub struct AppConfig {
     pub channel: bool,
     /// Expect `{"kind":"ready"}` on the shepherd channel
     pub wait_ready: bool,
-    /// Bind listen sockets with SO_REUSEPORT (enables zero-downtime reload)
+    /// Asserts that the app itself sets `SO_REUSEPORT` before it binds —
+    /// shep binds nothing, so it cannot set the option on the app's behalf.
+    /// The child process owns the mechanism (Node ≥22's `reusePort`, Go's
+    /// `net.ListenConfig.Control`, nginx's `reuseport`); shep's contribution
+    /// is permission for the old and new instance to overlap during reload,
+    /// not the socket option itself.
+    ///
+    /// An app that does not actually set the option gets `EADDRINUSE` at the
+    /// replacement spawn, on every reload, and shep cannot detect the
+    /// misconfiguration in advance. `SO_REUSEADDR`, which far more
+    /// frameworks set by default, is not sufficient — a mixed pair (one
+    /// process with `SO_REUSEPORT` set, one without) is refused by the
+    /// kernel on both Linux and macOS.
     pub reuse_port: bool,
     /// Readiness probe — gates reload's AwaitReady (spec §7)
     pub readiness_probe: Option<ProbeConfig>,
