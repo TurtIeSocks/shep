@@ -14,7 +14,7 @@
 //! `std::os::unix::fs::PermissionsExt` usage) on the Windows CI leg too.
 //! Global Constraints names this file explicitly for that reason.
 //!
-//! The last two cases are the file's slow ones and the reason it no longer
+//! Cases 14 and 15 are the file's slow ones and the reason it no longer
 //! finishes in about eleven seconds: a cron occurrence and a memory-limit
 //! breach are both events on *real* wall clock — a minute boundary and a
 //! 15-second sampling tick — with no seam this tier could pause. Each names
@@ -174,6 +174,26 @@ const BALLOON_BYTES: u64 = 16 * 1024 * 1024;
 /// of the claim — under the ceiling before, over it after — hold with a wide
 /// margin rather than on a coin toss.
 const BREACH_LIMIT: &str = "8M";
+
+/// The `listen_timeout` [`write_never_ready_flockfile`] gives its sheep.
+///
+/// Short because the two log-plane cases wait it out twice over, and safe to
+/// be short because nothing races it: the sheep never signals at all, so this
+/// is a delay before a certainty rather than a window some slower machine
+/// could close first. The daemon takes a timed-out `wait_ready` sheep `Online`
+/// anyway, which is what makes the elapse observable through `shep flock`
+/// rather than only through the record under test.
+const NEVER_READY_TIMEOUT: &str = "1s";
+
+/// The daemon record the two log-plane cases provoke and then read out of
+/// `$SHEP_HOME/logs/shepd.err.log`.
+///
+/// One owner for the string, because the two cases assert opposite things
+/// about the same record — present at the default level, absent above it —
+/// and a pair that drifted apart would keep passing while proving nothing.
+/// It is `shep-daemon`'s `Actor::handle_ready_result` (`supervisor.rs`) that
+/// writes it, at `WARN`.
+const READINESS_RECORD: &str = "readiness deadline elapsed";
 
 // --- Fixture helpers ---------------------------------------------------
 
@@ -368,6 +388,34 @@ fn write_script(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
     path
 }
 
+/// Writes a Flockfile whose one app asks for a readiness handshake it never
+/// performs, so [`NEVER_READY_TIMEOUT`] elapses and the daemon writes
+/// [`READINESS_RECORD`] about it.
+///
+/// The provocation the two log-plane cases needed, chosen because it was the
+/// one actually observed doing the job. The obvious alternative — an
+/// unresolvable `watch` root, whose `arm_watch` warning is the record
+/// `shep-daemon`'s own unit tier captures — does **not** work from this tier:
+/// `assemble` passes an app's `cwd` through to `Command::current_dir`
+/// unchanged, so a `cwd` that cannot be canonicalized is a `cwd` the child
+/// cannot chdir into, and the sheep comes up `errored` having logged nothing.
+///
+/// A plain [`write_test_script`] sheep is enough here: `wait_ready` opens the
+/// shepherd channel on fd 3 and the script simply never writes to it, which is
+/// exactly a real app that was configured for a handshake it does not
+/// implement.
+fn write_never_ready_flockfile(dir: &TempDir) -> PathBuf {
+    let script = write_test_script(dir);
+    write_flockfile(
+        dir,
+        &format!(
+            "[[app]]\nname = \"gated\"\nscript = \"{}\"\n\
+             wait_ready = true\nlisten_timeout = \"{NEVER_READY_TIMEOUT}\"\n",
+            script.display(),
+        ),
+    )
+}
+
 /// Writes `Flockfile.toml` into `dir` and returns its path. The `.toml`
 /// extension is what routes `shep start <path>` down `FlockFormat::from_path`
 /// rather than the bare-script arm.
@@ -418,6 +466,49 @@ fn assert_success(output: &Output) {
 /// source, and has been reverted (see [`write_test_script`]).
 fn graceful_kill(home: &Path) {
     let _ = shep(home).arg("kill").output();
+}
+
+/// Boots a daemon on `dir`'s `$SHEP_HOME` with `env` set on the `shep start`
+/// that autostarts it, waits for [`write_never_ready_flockfile`]'s sheep to
+/// give up waiting, and hands back the daemon's own log.
+///
+/// The environment reaches the daemon because `launch::launch_command`
+/// deliberately does not `.env_clear()` the re-exec, so `SHEP_LOG_JSON` and
+/// `SHEP_LOG_LEVEL` are read by the child that installs the subscriber, not by
+/// the parent that spawns it.
+///
+/// Waiting for `online` is what orders the read: `handle_ready_result` writes
+/// [`READINESS_RECORD`] *before* it sets the status, so a sheep observed
+/// `online` has already had its record written and there is nothing to poll
+/// for — the same ordering argument [`a_real_memory_breach_restarts_a_sheep`]
+/// makes about its own record.
+///
+/// The daemon is killed before the log is returned, so a caller's assertion
+/// can panic without leaking a supervisor; its own [`DaemonGuard`] covers a
+/// panic inside this helper, before the kill.
+fn daemon_log_after_a_missed_handshake(dir: &TempDir, env: &[(&str, &str)]) -> String {
+    let home = dir.path();
+    let flockfile = write_never_ready_flockfile(dir);
+    let mut guard = DaemonGuard::default();
+
+    let mut start = shep(home);
+    for (key, value) in env {
+        start.env(key, value);
+    }
+    let boot = start.arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    let online = poll_flock(home, |info| info["status"] == "online");
+    assert_eq!(
+        online["status"], "online",
+        "a wait_ready sheep that never signals must still be taken online once \
+         its listen_timeout elapses, which is the record's own trigger: {online}"
+    );
+
+    let log = std::fs::read_to_string(home.join("logs").join("shepd.err.log")).unwrap();
+    graceful_kill(home);
+    log
 }
 
 /// A `$SHEP_HOME` whose daemon *and whole flock* this test is responsible
@@ -1776,11 +1867,12 @@ fn a_cron_occurrence_restarts_a_sheep_on_the_real_clock() {
 /// after it, and the cron case above has never been observed finishing
 /// sooner, so it has yet to be what any run of this file waited on.
 ///
-/// It is also the only case that reads the daemon's own log. Nothing else in
-/// the workspace exercises the whole chain from a `tracing::warn!` in
-/// `shep-daemon` to a line in `$SHEP_HOME/logs/shepd.err.log`, and the breach
-/// record is the natural one to read: it is written on this very restart, and
-/// it carries the observed RSS and the ceiling, which no bus event does.
+/// It reads the daemon's own log, as cases 16 and 17 do — but it is the only
+/// one that reads a record for its *contents* rather than for its presence,
+/// and the only one whose record is a consequence of the behaviour under test
+/// rather than a provocation staged to produce it. The breach record carries
+/// the observed RSS and the ceiling it crossed, which no bus event does, and
+/// it is written on this very restart.
 ///
 /// What a broken implementation this would catch: a `SysinfoSampler` that
 /// stopped reading the real process table; an `arm_instance` that never
@@ -1879,4 +1971,108 @@ fn a_real_memory_breach_restarts_a_sheep() {
     );
 
     graceful_kill(home);
+}
+
+// --- Case 16 -------------------------------------------------------------
+
+/// `SHEP_LOG_JSON=1` renders the daemon's own records as JSON — one object per
+/// line, in the file `launch.rs` redirects the daemon's stderr into.
+///
+/// `shep-core` already pins that `SHEP_LOG_JSON` *parses* into
+/// `DaemonConfig::daemon::log_json`, and [`a_real_memory_breach_restarts_a_sheep`]
+/// already pins that a record reaches `shepd.err.log` at all. Between the two
+/// sat the knob's actual job — choosing a renderer — which nothing asserted:
+/// dropping the `.json()` call left the whole workspace green while the flag
+/// silently did nothing.
+///
+/// Every non-empty line is parsed, not only the one under test. `log_json`
+/// exists so `shepd.err.log` can be read by a machine, and a file where one
+/// line in twenty is prose is not that file — the assertion has to be about
+/// the stream, not about a record that happens to be well-formed.
+///
+/// What a broken implementation this would catch: a `log_json` branch that
+/// selects the human renderer anyway (no line parses); a subscriber whose
+/// records go somewhere other than the stderr `launch.rs` captures (the file
+/// is empty); and a `--format json` error envelope torn in half by a record
+/// written from a worker thread mid-write, which is the one way this file
+/// could gain a line that is *almost* JSON.
+// fails if `install_log_subscriber` stops selecting the JSON renderer for
+// `log_json` — verified by replacing `builder.json().try_init()` with
+// `builder.try_init()`, which reddens this case, and only this case, across
+// `cargo test --workspace --all-features`.
+#[test]
+fn shep_log_json_makes_the_daemons_own_records_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = daemon_log_after_a_missed_handshake(&dir, &[("SHEP_LOG_JSON", "1")]);
+
+    let lines: Vec<&str> = log.lines().filter(|line| !line.trim().is_empty()).collect();
+    assert!(
+        !lines.is_empty(),
+        "the daemon must have written something to read: {log:?}"
+    );
+    let records: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|err| {
+                panic!("every line of shepd.err.log must be JSON under log_json: {line:?} ({err})")
+            })
+        })
+        .collect();
+    assert!(
+        records.iter().any(|record| {
+            record["level"] == "WARN"
+                && record["fields"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(READINESS_RECORD))
+        }),
+        "the readiness record must survive as a JSON object with its level and \
+         message intact: {records:?}"
+    );
+}
+
+// --- Case 17 -------------------------------------------------------------
+
+/// `[daemon] log_level` decides which of the daemon's records survive: the
+/// same `WARN` is written at the default level and filtered out at `error`.
+///
+/// Both halves provoke the identical record on identical configuration, so the
+/// only thing that differs between them is the knob — which is what makes the
+/// absent half mean "filtered" rather than "never happened". A one-sided case
+/// asserting only the absence would pass just as well against a daemon that
+/// had stopped writing the record at all, and one asserting only the presence
+/// would pass against a hard-coded filter.
+///
+/// `error` rather than `off` on purpose: `off` also happens to be what an
+/// `EnvFilter` built from an empty or unparseable directive degrades toward,
+/// so a half that only proved silence would be consistent with the level never
+/// having been read. `error` is a level with records above and below it, and
+/// the record under test sits on the far side.
+///
+/// What a broken implementation this would catch: a filter built from a
+/// literal instead of from the configured level (the `error` half still logs);
+/// a `SHEP_LOG_LEVEL` parsed into config and then never handed to the
+/// subscriber, which is the same silent-knob shape `log_json` had (same
+/// observable); and a subscriber installed with no filter at all (both halves
+/// log, plus every `debug!` in the daemon).
+// fails if `install_log_subscriber` stops building its filter from
+// `config.daemon.log_level` — verified by replacing
+// `EnvFilter::new(config.daemon.log_level.as_str())` with
+// `EnvFilter::new("warn")`, which reddens this case, and only this case,
+// across `cargo test --workspace --all-features`.
+#[test]
+fn shep_log_level_decides_which_of_the_daemons_records_survive() {
+    let at_default = tempfile::tempdir().unwrap();
+    let default_log = daemon_log_after_a_missed_handshake(&at_default, &[]);
+    assert!(
+        default_log.contains(READINESS_RECORD),
+        "a warn-level record must reach the log at the default level: {default_log:?}"
+    );
+
+    let at_error = tempfile::tempdir().unwrap();
+    let error_log = daemon_log_after_a_missed_handshake(&at_error, &[("SHEP_LOG_LEVEL", "error")]);
+    assert!(
+        !error_log.contains(READINESS_RECORD),
+        "SHEP_LOG_LEVEL=error must filter out the same warn-level record the \
+         default level lets through: {error_log:?}"
+    );
 }
