@@ -1779,11 +1779,16 @@ impl<R: ProcessRunner> Actor<R> {
     ///    breach for the process a crash-and-restart already replaced would
     ///    otherwise restart its healthy successor and reset its budget.
     /// 4. The entry still being `Online`. The extras stay armed for the whole
-    ///    kill ladder (there is no `Stopping` transition to disarm at), so a
-    ///    report raised *during* a `shep stop` can arrive seconds after the
-    ///    sheep is `Stopped` — and `ProcessSelector::Id` matches regardless of
-    ///    status, so without this the daemon would resurrect a process the
-    ///    user explicitly stopped and report success.
+    ///    kill ladder (there is no `Stopping` transition to disarm at for an
+    ///    operator's `stop`), so a report raised *during* a `shep stop` can
+    ///    arrive seconds after the sheep is `Stopped` — and
+    ///    `ProcessSelector::Id` matches regardless of status, so without this
+    ///    the daemon would resurrect a process the user explicitly stopped
+    ///    and report success. The same check is what rejects a report against
+    ///    a reload's drainee, the one entry [`ProcStatus::Stopping`] actually
+    ///    reaches: a liveness failure or memory breach raised against it must
+    ///    ride out to the drainee's own exit, never claim its manual marker
+    ///    and kill it a second time.
     ///
     /// Delegates to `begin_manual` rather than `respawn`: that keeps the kill
     /// ladder, the marker rule, the `pending_delete` interaction and the budget
@@ -1839,7 +1844,9 @@ impl<R: ProcessRunner> Actor<R> {
     ///    the shutdown aggregation's `online` snapshot, so it would leak.
     /// 2. The entry still being `WaitingRestart` — a manual command may
     ///    have intercepted it (see `apply_immediate`'s `Stop` case),
-    ///    making this a stale timer.
+    ///    making this a stale timer. The same check excludes
+    ///    [`ProcStatus::Stopping`]: a reload's drainee must never be
+    ///    respawned by a backoff timer that predates it becoming one.
     /// 3. Its epoch still matching the slot's current one (IMPORTANT-3) — a
     ///    respawn that happened after this timer was scheduled (a manual
     ///    restart during the wait, most commonly) makes it stale too, even
@@ -2508,7 +2515,7 @@ mod tests {
     use super::*;
     use crate::fake::{ProcScript, ScriptedRunner};
     // the one crate-root fixture (IR-33)
-    use crate::testing::{SharedRunner, probe_config, test_paths};
+    use crate::testing::{SharedRunner, armed_entry, probe_config, test_paths};
     // Test-only: `SilentPumpRunner` counts the requests its pumps receive so
     // a case can order itself against the actor. Imported here rather than
     // beside the module's other `tokio::sync` uses, which do not need it.
@@ -4074,6 +4081,116 @@ mod tests {
             handle.list().await.is_empty(),
             "a delete that raced an automatic restart must still deregister \
              the sheep, not leave one behind for the restart to bring back"
+        );
+    }
+
+    // --- `Stopping`: reload's drainee, pinned against the guards it must
+    // never pass ---
+    //
+    // Nothing in production code sets `ProcStatus::Stopping` yet (reload's
+    // state machine is a later addition), so there is no black-box path —
+    // no `SupervisorHandle` call — that lands a sheep in it. These two cases
+    // build the actor directly instead, the same private-module access
+    // `spawn`'s own struct literal uses, and call the guarded handlers as
+    // plain functions. That is a deliberate, narrower unit test of the
+    // guard itself, not a stand-in for coverage a real reload path will
+    // also need once it exists.
+
+    /// One sheep already `Stopping`, wired the way a reload's drainee will
+    /// be: a live `ctl` sender (its kill ladder owns the next exit) and a
+    /// pid a stale report can be raised against. The runner carries no
+    /// scripts — a guard that correctly rejects `Stopping` never asks it to
+    /// spawn, so an empty script list is what turns a broken guard's spawn
+    /// attempt into a loud `SpawnFailed("script exhausted")` instead of a
+    /// silent pass.
+    fn actor_with_stopping_drainee(
+        dir: &tempfile::TempDir,
+        pid: u32,
+        epoch: u64,
+    ) -> (Actor<ScriptedRunner>, mpsc::Receiver<SheepCtl>) {
+        let paths = test_paths(dir);
+        let app = normalize(AppConfig::minimal("web", "./srv")).unwrap();
+        let mut entry = armed_entry(0, 0, pid, app, &paths);
+        entry.status = ProcStatus::Stopping;
+        let (ctl_tx, ctl_rx) = mpsc::channel(1);
+        let slot = SheepSlot {
+            entry,
+            ctl: Some(ctl_tx),
+            log_ctl: None,
+            manual: None,
+            pending_delete: false,
+            epoch,
+            ready_tx: None,
+        };
+        let mut sheep = HashMap::new();
+        sheep.insert(0, slot);
+        let (events, _events_rx) = broadcast::channel(16);
+        let (tx, _rx) = mpsc::channel(16);
+        let actor = Actor {
+            runner: ScriptedRunner::new(vec![]),
+            paths,
+            events,
+            tx,
+            sheep,
+            next_id: 1,
+            pending: Vec::new(),
+            shutting_down: false,
+            extras: None,
+            registry: ExtrasRegistry::default(),
+        };
+        (actor, ctl_rx)
+    }
+
+    // fails if `handle_extra_restart`'s guard 4 stops checking status ==
+    // `Online` — e.g. if it let `Stopping` through too. A liveness failure
+    // or memory breach reported against a reload's drainee (which has
+    // exactly this shape: `Online`-like, a live `ctl`, a matching pid) must
+    // never claim its manual marker or send it a second `Kill` — its own
+    // kill ladder already owns its next exit.
+    #[test]
+    fn a_stopping_sheep_rejects_an_extra_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, mut ctl_rx) = actor_with_stopping_drainee(&dir, 4242, 0);
+
+        actor.handle_extra_restart(0, 4242);
+
+        let slot = actor.sheep.get(&0).expect("the sheep stays registered");
+        assert_eq!(
+            slot.entry.status,
+            ProcStatus::Stopping,
+            "a rejected extra restart must never touch status"
+        );
+        assert!(
+            slot.manual.is_none(),
+            "a Stopping sheep must never claim the manual marker off an extra restart"
+        );
+        assert!(
+            ctl_rx.try_recv().is_err(),
+            "a Stopping sheep must never receive a second Kill"
+        );
+    }
+
+    // fails if `handle_restart_due`'s guard stops checking status ==
+    // `WaitingRestart` — e.g. if it let `Stopping` through too. A backoff
+    // timer scheduled before a reload started draining this sheep must
+    // never respawn it: the slot it would respawn into already belongs to
+    // the fresh replacement.
+    #[test]
+    fn a_stopping_sheep_rejects_a_restart_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _ctl_rx) = actor_with_stopping_drainee(&dir, 4242, 7);
+
+        actor.handle_restart_due(0, 7);
+
+        let slot = actor.sheep.get(&0).expect("the sheep stays registered");
+        assert_eq!(
+            slot.entry.status,
+            ProcStatus::Stopping,
+            "a rejected restart-due must never touch status"
+        );
+        assert_eq!(
+            slot.entry.restarts, 0,
+            "a rejected restart-due must never respawn"
         );
     }
 

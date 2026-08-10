@@ -127,6 +127,12 @@ pub enum ReloadState {
         new_id: u32,
     },
     /// Draining connections before terminating old instance
+    ///
+    /// Pairs with [`ProcStatus::Stopping`] on [`ProcessEntry::status`]:
+    /// whichever code sets this variant sets that status in the same
+    /// update. This variant carries what the instance is doing (draining,
+    /// with the replacement's pid); the status is what every guard that
+    /// reads `status` alone actually sees.
     Draining {
         /// OS process ID of the instance being drained
         old_pid: u32,

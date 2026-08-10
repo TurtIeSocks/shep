@@ -125,6 +125,12 @@ impl FlockRegistry {
 }
 
 /// True for the statuses [`FlockRegistry::roll`] counts as "up".
+///
+/// [`ProcStatus::Stopping`] is deliberately absent: a reload's drainee is
+/// going away and its replacement already holds the same instance slot, so
+/// counting both would report two running instances for one — the muster
+/// roll must see only the replacement, never the entry riding out its own
+/// kill ladder to a terminal status.
 fn is_running(status: ProcStatus) -> bool {
     matches!(
         status,
