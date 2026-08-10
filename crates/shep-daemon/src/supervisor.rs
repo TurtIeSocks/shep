@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use shep_core::config::ResolvedApp;
+use shep_core::config::{AppConfig, ResolvedApp};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{BusEvent, ProcessEventKind, ProcessInfo};
 use shep_core::selector::ProcessSelector;
@@ -709,7 +709,7 @@ enum LadderCap {
 
 impl LadderCap {
     /// This cap's value for `app`.
-    fn of(self, app: &shep_core::config::AppConfig) -> Duration {
+    fn of(self, app: &AppConfig) -> Duration {
         match self {
             Self::Stop => app.kill_timeout,
             Self::Drain => app.graceful_timeout,
