@@ -1877,14 +1877,36 @@ async fn run_sheep<P: RunningProcess>(
     events: broadcast::Sender<BusEvent>,
     actor_tx: mpsc::Sender<Msg>,
 ) {
+    // `io` is destructured here, in the task's own body, and that placement
+    // is load-bearing rather than stylistic. The log pump ends the moment
+    // `log_ctl` drops, taking the read ends of the child's stdout and stderr
+    // with it, so the child's next write to either gets `EPIPE`/`SIGPIPE`:
+    // letting go of that sender early kills children rather than merely
+    // stopping their logs.
+    //
+    // Naming the field says so out loud, though `log_ctl: _` or a `..` would
+    // survive too — neither moves the field, so it rides `io` to the end of
+    // this function either way. What does NOT survive is `io` being taken
+    // apart in a scope shorter than the task: a helper that returns the three
+    // receivers, or a `let (a, b, c) = { ... };` block, drops the leftover
+    // field at its own closing brace and stops every child in the flock.
+    // `_log_ctl` is bound and never read on purpose. The log pump ends the
+    // moment that sender drops, taking the read ends of the child's stdout
+    // and stderr with it, so the child's next write to either gets
+    // `EPIPE`/`SIGPIPE`: letting go of it early kills children rather than
+    // merely stopping their logs. It has to outlive the sheep, and it does.
+    //
+    // The binding is documentation, not the mechanism. `io` is this
+    // function's own parameter, so a field the pattern leaves unbound —
+    // `log_ctl: _`, or a `..`, even inside a narrower inner block — is not
+    // moved anywhere and drops when `run_sheep` returns, exactly as this
+    // does. Both were tried against the case below and neither shortens the
+    // sender's life. What does is moving it: an explicit `drop`, or handing
+    // it to a helper that returns before the sheep exits.
     let ProcIo {
         mut logs,
         mut from_child,
         to_child,
-        // Held, unused, for the whole of this task: the log pump stops the
-        // moment this sender drops, and a stopped pump stops draining the
-        // child's stdout/stderr — which stalls the child itself once its own
-        // pipe buffer fills.
         log_ctl: _log_ctl,
     } = io;
     let mut ctl_open = true;
@@ -3508,6 +3530,72 @@ mod tests {
             "a delete that raced an automatic restart must still deregister \
              the sheep, not leave one behind for the restart to bring back"
         );
+    }
+
+    /// Fails if `run_sheep` lets go of `ProcIo::log_ctl` while its sheep is
+    /// still running — an explicit `drop` of the field, or a move of it into
+    /// anything that returns before the sheep does. The real runner's log
+    /// pump ends with that sender, and the read ends of the child's stdout
+    /// and stderr close along with the pump, under a live child.
+    ///
+    /// Not every way of ignoring the field is such a move, and the two that
+    /// look most dangerous are not: `log_ctl: _` and a `..` both leave the
+    /// field where it is, and `io` is `run_sheep`'s own parameter, so it
+    /// drops when the function returns either way. Both were run against
+    /// this case and both stay green, which is why the binding upstairs is
+    /// documentation rather than the thing holding the sender up.
+    ///
+    /// Nothing else in this suite notices a sender that is genuinely
+    /// dropped: the scripted fake writes no log files and its procs own no
+    /// pipes, so every other case passes without one. This reads the fake's
+    /// control task instead, which ends exactly when a real pump would.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_sheep_keeps_holding_its_log_control_sender() {
+        // One script for one spawn, and it must not exit: a proc that exits
+        // closes its own control channel, which is indistinguishable here
+        // from the dropped sender under test. A second spawn would answer
+        // `SpawnFailed("script exhausted")` and never open a channel at all.
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let (proc, io) = runner.spawn(&log_ctl_spec()).unwrap();
+        assert!(runner.log_ctl_live(0), "sanity: the fake starts it live");
+
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (_ctl_tx, ctl_rx) = mpsc::channel(8);
+        let (actor_tx, _actor_rx) = mpsc::channel(8);
+        let app = normalize(AppConfig::minimal("svc", "./svc")).unwrap();
+        tokio::spawn(run_sheep(7, proc, io, app, ctl_rx, events, actor_tx));
+
+        // A dropped sender closes the channel on the control task's own
+        // schedule, so this hands the runtime every chance to run that task
+        // before concluding it never had anything to do. Yields rather than
+        // a clock advance: the failing path is ready work, not a timer, and
+        // the proc under it must stay unexited.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            runner.log_ctl_live(0),
+            "run_sheep dropped ProcIo::log_ctl while its sheep was still \
+             running: against the real runner that closes the read ends of \
+             the child's stdout and stderr"
+        );
+    }
+
+    /// A spawn spec for the cases that drive [`run_sheep`] directly. The
+    /// scripted fake reads none of it — it exists because
+    /// [`ProcessRunner::spawn`] takes one.
+    fn log_ctl_spec() -> SpawnSpec {
+        SpawnSpec {
+            name: "svc".to_string(),
+            program: "./svc".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: std::collections::BTreeMap::new(),
+            out_file: std::path::PathBuf::from("out.log"),
+            err_file: std::path::PathBuf::from("err.log"),
+            channel: false,
+            credentials: None,
+        }
     }
 
     // ---------------------------------------------------------------

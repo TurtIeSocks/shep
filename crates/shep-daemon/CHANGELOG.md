@@ -118,6 +118,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lets the sheep come up `online` regardless, and `supervisor`'s
   `Actor::handle_ready_result` reports a readiness deadline that elapsed,
   which is otherwise indistinguishable from a sheep that answered.
+- Add `runner::LogCtl`, the request type a sheep's log pump takes mid-flight,
+  and the first way anything has been able to reach the file handle that pump
+  writes to. Its one variant, `Reopen`, makes the pump flush, close and
+  re-open both of a sheep's log files, then answer on a `oneshot`. That
+  acknowledgement is the point of the shape rather than a nicety: a flag the
+  pump would notice before its next write promises nothing about a sheep that
+  has gone quiet, and an external rotator needs to know the swap has happened
+  before it compresses or deletes what it renamed. The acknowledgement is a
+  barrier, not a success report — it fires whether or not either open worked,
+  and what a caller may conclude from it is that both old handles are flushed
+  and closed. The child is not involved and never notices: it holds a pipe,
+  and the daemon does the file I/O on the far side of it. Reaching a pump
+  means holding the `ProcIo` field below.
 
 ### Fixes
 
@@ -241,19 +254,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   being deleted; in the crate-root taxonomy, a linked module name now means
   public and a backticked one means internal.
 - `ProcIo` gains a `log_ctl: mpsc::Sender<LogCtl>` field: the control channel
-  into a sheep's log pump, and the first way anything has been able to reach
-  the file handle the pump writes to. `LogCtl::Reopen` makes the pump flush,
-  close and re-open both log files, then answer on a `oneshot` — a
-  synchronous acknowledgement rather than a flag the pump would notice
-  before its next write, because a sheep that has gone quiet has no next
-  write, and an external rotator needs to know the swap has happened before
-  it compresses or deletes what it renamed. The child is not involved and
-  never notices: it holds a pipe, and the daemon does the file I/O on the
-  far side of it.
-
-  Filed as a change rather than an addition because the struct carries no
+  into a sheep's log pump, carrying the requests described under Additions
+  above. Filed here rather than there because the struct carries no
   `#[non_exhaustive]`: any downstream `ProcIo` literal, or destructuring that
-  names every field, stops compiling until it names this one too. Dropping
-  the sender ends the pump, so a holder must keep it for as long as the child
-  is alive. The real runner also spawns one pump task per sheep now instead
-  of one per stream, so a single reopen swaps both files and answers once.
+  names every field, stops compiling until it names this one too.
+
+  Dropping the sender ends the pump, so a holder must keep it for as long as
+  the child is alive. Ending the pump drops the read ends of the child's
+  stdout and stderr along with it, and the child's next write to either then
+  gets `EPIPE`/`SIGPIPE` — a dropped sender kills children, it does not
+  merely stop collecting from them. A send that fails means the pump is
+  already gone, which makes a reopen a no-op rather than an error.
+
+  The real runner also spawns one pump task per sheep now instead of one per
+  stream, so a single reopen swaps both files and answers once.

@@ -91,14 +91,27 @@ pub enum LogCtl {
     /// Drop the current handle and open the path again, then acknowledge.
     /// Sent when an external rotator has renamed the file.
     Reopen {
-        /// Fires once the pump holds handles freshly opened on the spec's
-        /// log paths.
+        /// Fires once the pump has finished acting on this request — a
+        /// barrier, not a success report.
         ///
-        /// It fires whether or not the reopen actually succeeded: a path
-        /// that cannot be opened leaves the pump with no file (logged, and
-        /// still draining the child's streams), exactly as a failed open at
-        /// spawn time does. The acknowledgement means "the pump has
-        /// processed this", not "a file now exists".
+        /// It fires whether or not either open succeeded: a path that cannot
+        /// be opened leaves the pump holding no file for that stream
+        /// (logged, and still draining the child's streams), exactly as a
+        /// failed open at spawn time does. What a caller may conclude is
+        /// that both old handles have been flushed and closed, which is what
+        /// a rotator needs before it compresses or deletes what it renamed.
+        ///
+        /// # When it never fires
+        ///
+        /// A pump that ends between accepting a request and serving it drops
+        /// this sender, and the caller's `await` resolves
+        /// [`Err`](oneshot::error::RecvError). The channel buffers several
+        /// requests, so a send that succeeded is not a request that will be
+        /// served: both ways a pump ends — both streams reaching EOF, or the
+        /// `logs` receiver going away — retire it with whatever is still
+        /// queued. Treat that error as the same stopped-sheep no-op a failed
+        /// send means (see [`ProcIo::log_ctl`]); the two describe one
+        /// situation observed a moment apart.
         done: oneshot::Sender<()>,
     },
 }
@@ -118,12 +131,18 @@ pub struct ProcIo {
     pub to_child: mpsc::Sender<ShepherdMessage>,
     /// Control channel into this sheep's log pump
     ///
-    /// The pump is the only reader, and it is the last thing keeping the
-    /// child's stdout/stderr pipes drained, so **dropping this sender ends
-    /// it** — hold it for as long as the child is alive, or the child stalls
-    /// on a full pipe once its own buffer backs up. A send that fails means
-    /// the pump is already gone (both streams reached EOF, normally the
-    /// child exiting), which makes a reopen a no-op rather than an error.
+    /// The pump is the only reader of the child's stdout and stderr, so
+    /// **dropping this sender ends it** — hold it for as long as the child
+    /// is alive. Ending the pump drops the read ends of those two pipes
+    /// along with it, and the child's next write to either then gets
+    /// `EPIPE`/`SIGPIPE`: the child typically dies on the spot rather than
+    /// stalling on a pipe nobody drains.
+    ///
+    /// A send that fails means the pump is already gone (both streams
+    /// reached EOF, normally the child exiting), which makes a reopen a
+    /// no-op rather than an error. [`LogCtl::Reopen`]'s acknowledgement
+    /// resolving `Err` says the same thing about a request that was accepted
+    /// and then never served.
     pub log_ctl: mpsc::Sender<LogCtl>,
 }
 

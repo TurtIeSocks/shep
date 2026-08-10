@@ -956,6 +956,98 @@ mod tests {
         }
     }
 
+    /// Hands the runtime to the pump task and back.
+    ///
+    /// `#[tokio::test]` runs on a current-thread runtime, so yielding is
+    /// what lets the pump run at all: dropping a duplex writer wakes its
+    /// read with EOF, and retiring a stream from there has no await of its
+    /// own, so the pump reaches its next park before this returns. The
+    /// repeats are slack for a pump that wakes with other work already
+    /// queued, not a race the count papers over.
+    async fn let_the_pump_settle() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Fails if the pump lets go of a stream's [`LogFile`] once that stream
+    /// ends — the "free the file, nothing can be read into it now" tidy-up
+    /// that looks like an obvious win. A sheep whose stdout closes while
+    /// stderr runs on would then never get its stdout log back from a
+    /// rotation, and nothing else here would notice: every other case
+    /// reopens with both streams still live.
+    #[tokio::test]
+    async fn a_stream_that_has_ended_is_still_reopened() {
+        let mut pump = PumpHarness::start();
+        pump.feed(false, "before-out").await;
+        pump.feed(true, "before-err").await;
+
+        // stdout at EOF with stderr still live: what a child that closes one
+        // stream early leaves behind, and what the pump holds in between the
+        // two EOFs of an ordinary exit.
+        drop(pump.out_writer);
+        let_the_pump_settle().await;
+
+        // Deleted rather than renamed, so the reopen is the only thing that
+        // could put either path back.
+        fs::remove_file(&pump.out_path).unwrap();
+        fs::remove_file(&pump.err_path).unwrap();
+
+        let (done, ack) = oneshot::channel();
+        pump.ctl
+            .send(LogCtl::Reopen { done })
+            .await
+            .expect("a pump with one live stream still reads its control channel");
+        timeout(PUMP_DEADLINE, ack)
+            .await
+            .expect("a reopen must be acknowledged")
+            .expect("the pump must answer rather than drop the acknowledgement");
+
+        assert!(
+            pump.out_path.exists(),
+            "the ended stream's path must come back too"
+        );
+        assert!(
+            pump.err_path.exists(),
+            "the live stream's path must be back"
+        );
+    }
+
+    /// Fails if a pump that has ended leaves its control channel reachable.
+    /// The failed send is what [`ProcIo::log_ctl`] promises callers as the
+    /// signal that the pump is already gone, and it is what lets a reopen
+    /// aimed at a stopped sheep be a no-op rather than an error worth
+    /// reporting to whoever asked for it.
+    #[tokio::test]
+    async fn a_send_fails_once_the_pump_has_ended() {
+        let mut pump = PumpHarness::start();
+        pump.feed(false, "before-out").await;
+        pump.feed(true, "before-err").await;
+
+        // Both writers gone = both streams at EOF, which is what a child
+        // exiting looks like from inside the pump.
+        drop(pump.out_writer);
+        drop(pump.err_writer);
+
+        // The pump's `logs` sender drops with the task, so this `None` is a
+        // bounded wait for the task to have finished rather than a guess
+        // that it already has.
+        let ended = timeout(PUMP_DEADLINE, pump.logs.recv())
+            .await
+            .expect("the pump must end once both streams reach EOF");
+        assert!(ended.is_none(), "a pump that has ended sends nothing more");
+
+        let (done, ack) = oneshot::channel();
+        assert!(
+            pump.ctl.send(LogCtl::Reopen { done }).await.is_err(),
+            "a reopen aimed at an ended pump must fail to send"
+        );
+        // The rejected request takes its acknowledgement down with it, so a
+        // caller that had already started awaiting one is told the same
+        // thing rather than left pending.
+        assert!(ack.await.is_err());
+    }
+
     /// Fails if the pump treats a closed control channel as nothing to do:
     /// `ProcIo::log_ctl` documents that dropping the sender ends the pump,
     /// and an arm that ignored the `None` would spin on it forever — a

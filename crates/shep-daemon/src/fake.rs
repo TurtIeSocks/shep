@@ -6,10 +6,10 @@
 
 use core::fmt;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Duration, Instant, sleep_until};
 
 use crate::channel::{ChildMessage, ShepherdMessage};
@@ -135,6 +135,16 @@ struct ProcState {
     /// it instead of racing the notify/sleep branches again — matches
     /// `tokio::process::Child::wait`'s documented repeat-call behavior.
     resolved: Mutex<Option<ExitOutcome>>,
+    /// Flipped to `true` when `wait()` latches an outcome, and watched by
+    /// this proc's log-control task so that task ends with the proc.
+    ///
+    /// Without it the fake would answer a reopen aimed at a proc that exited
+    /// long ago, while the real runner's pump — and with it the receiving
+    /// end of [`ProcIo::log_ctl`] — is gone once the child's streams reach
+    /// EOF. A caller's "the pump is already gone" branch would then be
+    /// unreachable from this tier, and a test for it would pass whether or
+    /// not that branch existed.
+    exited: watch::Sender<bool>,
 }
 
 impl ProcState {
@@ -213,6 +223,10 @@ impl RunningProcess for FakeProc {
             }
         };
         *self.state.resolved.lock().unwrap() = Some(outcome);
+        // Ends this proc's log-control task; see `ProcState::exited`.
+        // `send_replace` rather than `send` because the task may already be
+        // gone, and a proc having exited is not news the fake can fail on.
+        self.state.exited.send_replace(true);
         outcome
     }
 
@@ -238,6 +252,9 @@ impl RunningProcess for FakeProc {
 struct SpawnedProc {
     state: Arc<ProcState>,
     io: Option<FakeIo>,
+    /// `false` once this spawn's log-control task has ended — read back via
+    /// [`ScriptedRunner::log_ctl_live`].
+    log_ctl_live: Arc<AtomicBool>,
 }
 
 /// Deterministic fake [`ProcessRunner`] driven by a pre-scripted [`ProcScript`] per spawn.
@@ -298,6 +315,26 @@ impl ScriptedRunner {
             .clone()
     }
 
+    /// Whether the log-control task for the proc spawned at `spawn_index` is
+    /// still running.
+    ///
+    /// It runs while someone still holds the [`ProcIo::log_ctl`] sender that
+    /// spawn handed out AND the proc has not exited — the two facts that
+    /// keep a real runner's log pump alive. This is how an engine test pins
+    /// that a live sheep is still holding its end of that channel, which
+    /// nothing else in the fake can show: the fake writes no files, so a
+    /// sender dropped by mistake costs its tests nothing.
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[must_use]
+    pub fn log_ctl_live(&self, spawn_index: usize) -> bool {
+        self.spawned.lock().unwrap()[spawn_index]
+            .log_ctl_live
+            .load(Ordering::SeqCst)
+    }
+
     /// Takes the [`FakeIo`] test-side handles for the proc spawned at `spawn_index`
     ///
     /// # Panics
@@ -325,6 +362,7 @@ impl ProcessRunner for ScriptedRunner {
             .pop_front()
             .ok_or_else(|| RunnerError::SpawnFailed("script exhausted".to_string()))?;
 
+        let (exited_tx, mut exited_rx) = watch::channel(false);
         let state = Arc::new(ProcState {
             exit_deadline: Instant::now() + Duration::from_millis(script.delay_ms),
             outcome: script.outcome,
@@ -335,6 +373,7 @@ impl ProcessRunner for ScriptedRunner {
             kill_notify: Notify::new(),
             kill_count: AtomicU32::new(0),
             resolved: Mutex::new(None),
+            exited: exited_tx,
         });
 
         let (logs_tx, logs_rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -350,14 +389,34 @@ impl ProcessRunner for ScriptedRunner {
         // acknowledgement unanswered: a caller awaiting one would hang
         // against every scripted proc, so this answers each request as a
         // live pump would.
+        //
+        // What it must ALSO not do is answer forever. A real pump ends when
+        // the child's streams reach EOF, so a reopen aimed at a sheep that
+        // has stopped fails to send; a fake that kept answering past its
+        // proc's exit would make that branch unreachable from this tier and
+        // every test of it vacuous. So this task ends with the proc as well
+        // as with the sender.
+        let log_ctl_live = Arc::new(AtomicBool::new(true));
+        let ctl_live = Arc::clone(&log_ctl_live);
         tokio::spawn(async move {
-            while let Some(ctl) = log_ctl_rx.recv().await {
-                match ctl {
-                    LogCtl::Reopen { done } => {
-                        let _ = done.send(());
-                    }
+            loop {
+                tokio::select! {
+                    ctl = log_ctl_rx.recv() => match ctl {
+                        Some(LogCtl::Reopen { done }) => {
+                            let _ = done.send(());
+                        }
+                        None => break, // the holder dropped ProcIo::log_ctl
+                    },
+                    // Resolves when `wait()` latches an outcome, and errors
+                    // once nothing holds this proc's state any more. Either
+                    // way the proc is over, and so is its pump.
+                    _ = exited_rx.changed() => break,
                 }
             }
+            // Stored before this task returns, so the flag is already false
+            // by the time `log_ctl_rx` drops and closes the channel: a test
+            // that waits on the close never then reads a stale `true`.
+            ctl_live.store(false, Ordering::SeqCst);
         });
 
         // Relay task: the fake watches its own to_child stream so a `Shutdown`
@@ -388,6 +447,7 @@ impl ProcessRunner for ScriptedRunner {
                 from_child_tx,
                 to_child_rx: relay_rx,
             }),
+            log_ctl_live,
         });
         drop(spawned);
 
@@ -625,6 +685,42 @@ mod tests {
             .await
             .expect("a reopen must be acknowledged")
             .expect("the fake must answer rather than drop the acknowledgement");
+    }
+
+    /// Fails if the fake's control task outlives its proc: `log_ctl.send`
+    /// would keep succeeding against a proc that exited long ago, and the
+    /// "the pump is already gone" branch every caller of
+    /// [`ProcIo::log_ctl`] is told to take would be unreachable from this
+    /// tier. A test for reopening a stopped sheep would then pass whether or
+    /// not the code handled one.
+    #[tokio::test(start_paused = true)]
+    async fn a_proc_that_has_exited_closes_its_control_channel() {
+        // One script for one spawn. A second spawn would answer
+        // `SpawnFailed("script exhausted")` and never reach the channel at
+        // all, which is why the count is stated rather than left generous.
+        let runner = ScriptedRunner::new(vec![ProcScript::const_exit(0)]);
+        let (mut proc, io) = runner.spawn(&spec()).unwrap();
+        assert!(runner.log_ctl_live(0), "sanity: live before the proc exits");
+
+        proc.wait().await;
+
+        // Bounded rather than an immediate assertion: the control task ends
+        // on its own schedule, so this waits for the close instead of
+        // requiring it to have already happened.
+        tokio::time::timeout(Duration::from_secs(5), io.log_ctl.closed())
+            .await
+            .expect("a proc that has exited must close its control channel");
+        assert!(!runner.log_ctl_live(0));
+
+        let (done, ack) = tokio::sync::oneshot::channel();
+        assert!(
+            io.log_ctl.send(LogCtl::Reopen { done }).await.is_err(),
+            "a reopen aimed at an exited proc must fail to send"
+        );
+        // And a request that never reaches a pump resolves the caller's
+        // acknowledgement as an error rather than leaving it pending — the
+        // same no-op, observed a moment later.
+        assert!(ack.await.is_err());
     }
 
     #[tokio::test(start_paused = true)]
