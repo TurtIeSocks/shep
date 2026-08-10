@@ -9,6 +9,7 @@
 
 #![cfg(unix)]
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -27,7 +28,7 @@ use shep_core::protocol::{
 use shep_core::status::ProcStatus;
 use shep_core::values::UpDuration;
 
-use shep_daemon::boot::{BootError, BootOptions, boot};
+use shep_daemon::boot::{BootError, BootOptions, DIR_MODE, boot};
 use shep_daemon::rpc::RpcContext;
 use shep_daemon::tokio_runner::TokioRunner;
 
@@ -529,6 +530,106 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
         "before\n",
         "the renamed file must stop growing the moment the handle is swapped"
     );
+
+    fixture.shutdown().await;
+}
+
+/// A reopen asked for over the socket puts a REMOVED log directory back at
+/// [`DIR_MODE`], the mode every directory shep creates is worth — the case a
+/// rotator that moves the directory aside rather than the files produces.
+///
+/// Fails if the pump's own directory creation stops asking `mkdir` for the
+/// mode: swapping `open_append`'s `DirBuilder::new().mode(DIR_MODE)` back to
+/// a plain `create_dir_all` recreates the directory at `0o777` narrowed by
+/// whatever the ambient umask strips — `0o755` under the common `umask 022` —
+/// and the mode assertion below reddens on the difference. Dropping the
+/// creation altogether reddens the assertions around it instead: the reopen
+/// answers `ReopenFailed` for a path whose parent is gone, and the sheep's
+/// next line has nowhere to land.
+///
+/// One umask cannot be distinguished. Under `umask 0o077` a plain
+/// `create_dir_all` lands `0o700` unaided and both implementations look
+/// alike here. That is a property of the ambient umask rather than of the
+/// code, and the only way to remove it is for the test to set a process-wide
+/// umask — `unsafe`, and it would leak into every other case in this binary.
+///
+/// The mode assertion needs no `#[cfg]` of its own: this file is
+/// `#![cfg(unix)]` at its root, so `DIR_MODE` and `PermissionsExt` are only
+/// ever compiled where they mean something and `--all-targets` never builds
+/// this binary on the Windows leg.
+///
+/// No `ScriptedRunner`, so there are no scripts to size — this tier runs the
+/// real runner, and the fixture is ONE sheep needing ONE real spawn. The
+/// scripted fake is not merely awkward here but blind: it writes no files, so
+/// its pump answers a reopen `Ok` whether or not any directory exists.
+#[tokio::test]
+async fn reopen_recreates_a_removed_log_directory_owner_only() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+
+    // The marker lives beside the log directory, not inside it, so removing
+    // that directory below cannot disturb it. `sleep`'s only portable
+    // argument is a whole number of seconds (POSIX), which is why the sheep's
+    // own poll is that coarse.
+    let marker = fixture.paths.home.join("go");
+    let mut app = AppConfig::minimal("rotator", "/bin/sh");
+    app.interpreter = Some("none".to_string());
+    app.args = vec![
+        "-c".to_string(),
+        format!(
+            "echo before; while [ ! -f {} ]; do sleep 1; done; echo after; sleep 5",
+            marker.display()
+        ),
+    ];
+    let started = client.request(Request::Start { apps: vec![app] }).await;
+    let Response::Started(infos) = started.result.unwrap() else {
+        panic!("expected started")
+    };
+    let id = infos[0].id;
+    let out_file = std::path::PathBuf::from(
+        infos[0]
+            .out_file
+            .clone()
+            .expect("this daemon reports its own resolved log paths"),
+    );
+    await_file_contents(&out_file, "before\n").await;
+
+    // The whole directory, not the file. That is what a rotator moving
+    // `logs/` aside leaves behind, and it is the only shape in which the mode
+    // of a freshly created directory is observable at all — `mkdir`'s mode
+    // governs the directories a call creates, never one already there.
+    std::fs::remove_dir_all(&fixture.paths.logs).unwrap();
+    assert!(
+        !fixture.paths.logs.exists(),
+        "sanity: the log directory really is gone"
+    );
+
+    let reopened = client
+        .request(Request::Reopen {
+            selector: SelectorSpec::All,
+        })
+        .await;
+    let Response::Reopened(matched) = reopened.result.unwrap() else {
+        panic!("expected reopened")
+    };
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].id, id);
+
+    let mode = std::fs::metadata(&fixture.paths.logs)
+        .expect("a reopen must put the log directory back")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, DIR_MODE,
+        "the recreated log directory must be {DIR_MODE:o}, found {mode:o}"
+    );
+
+    // The reply is the barrier — both handles are open on the recreated path
+    // by the time it lands — so the sheep's next line is what says the
+    // directory is usable and not merely present.
+    std::fs::write(&marker, "").unwrap();
+    await_file_contents(&out_file, "after\n").await;
 
     fixture.shutdown().await;
 }

@@ -80,7 +80,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   files of the sheep the selector matches — the half of `create`-mode
   rotation that runs after the rotator's rename. A zero exit means every
   matched sheep's log pump holds a handle on the recreated path, so a
-  logrotate `postrotate` stanza can wait for it. The selector is
+  logrotate `postrotate` stanza can wait for it. A rotator that moved the log
+  DIRECTORY aside rather than the files is covered too: the pump puts it back
+  at `0700`, the mode every directory shep creates gets. The selector is
   optional and defaults to `all`, matching `bleats` rather than
   `stop`/`restart`/`delete`: those destroy something and this destroys
   nothing, and rotating the whole flock at once is the ordinary case. A

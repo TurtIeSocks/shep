@@ -991,7 +991,6 @@ fn install_signals(
         source,
     })?;
     let (connect_supervisor, supervisor_rx) = oneshot::channel::<SupervisorHandle>();
-    let logs = paths.logs.clone();
     signals.tasks.push(tokio::spawn(async move {
         // Parked until `boot` reaches step 4 — see this fn's own doc for why
         // the wait loses no signal, and for what an `Err` here means.
@@ -999,14 +998,12 @@ fn install_signals(
             return;
         };
         while usr2.recv().await.is_some() {
-            // Before the reopen, not instead of it. A rotator that moved the
-            // whole log DIRECTORY leaves each pump's own `create_dir_all` to
-            // put it back at whatever the umask allows, and `DIR_MODE` is the
-            // layout's standing guarantee (spec §10). Winning that race is all
-            // this does: the pumps below then find the directory already there.
-            if let Err(err) = create_dir_at_dir_mode(&logs) {
-                tracing::warn!(%err, path = %logs.display(), "SIGUSR2: could not recreate the log directory");
-            }
+            // A rotator that moved the whole log DIRECTORY needs it back at
+            // `DIR_MODE`, and the pump this reaches is what puts it there —
+            // its own open asks `mkdir` for the mode (see `open_append`).
+            // Recreating it here as well would be a second owner of the same
+            // guarantee, differing from the pump's for any sheep logging
+            // outside the layout.
             match supervisor.reopen(ProcessSelector::All).await {
                 Ok(reopened) => tracing::info!(
                     reopened = reopened.len(),

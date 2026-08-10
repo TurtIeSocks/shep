@@ -35,6 +35,7 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
+use crate::boot::DIR_MODE;
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::runner::{
     ExitOutcome, FlushError, LogCtl, LogLine, ProcIo, ProcessRunner, ReopenError, RunnerError,
@@ -700,7 +701,8 @@ fn spawn_log_pump<O, E>(
     });
 }
 
-/// Opens `path` for appending, creating its parent directory first.
+/// Opens `path` for appending, creating its parent directory at
+/// [`DIR_MODE`] first.
 ///
 /// Every failure is logged here, where the two causes can still be told
 /// apart, and returned as well: [`LogFile::open`] discards it (a log file we
@@ -714,6 +716,33 @@ fn spawn_log_pump<O, E>(
 /// The parent directory could not be created, or the file itself could not
 /// be opened.
 ///
+/// # Why the mode is asked for at creation
+///
+/// [`DIR_MODE`] is the mode every directory shep creates gets, and this is
+/// the only place the daemon creates one once its boot layout is already
+/// there. A rotator that moved or removed the log DIRECTORY rather than the
+/// files leaves the next open to put it back, and a plain `create_dir_all`
+/// would put it back at `0o777` narrowed by whatever the process umask
+/// happens to strip — `0o755` under the common `umask 022`, world-writable
+/// under `umask 0`.
+/// Asking for the mode at `mkdir` time rather than chmod'ing afterwards is
+/// `crate::boot::init_dirs`' discipline for the same reason it holds there:
+/// `0o700` has no group or other bits for a umask to strip, so the directory
+/// is never wider than `DIR_MODE`, not even for the instant between the two
+/// calls.
+///
+/// This is the whole of that guarantee for a log directory, and it holds
+/// however the reopen was asked for — `Request::Reopen` over the socket,
+/// `SIGUSR2`, or the first open of a freshly spawned sheep. A directory that
+/// already exists is left alone: the mode given to `mkdir` governs only the
+/// directories a call actually creates, and re-tightening one that was
+/// already there is `init_dirs`' boot-time pass, not this function's job.
+///
+/// An app whose `out_file` points outside the log directory gets the same
+/// treatment for any parent shep has to create on its behalf, which is the
+/// intended reading of `DIR_MODE` rather than an accident of where the call
+/// sits.
+///
 /// `.append(true)` is load-bearing rather than a convenience. `O_APPEND`
 /// makes every write seek to end atomically, which is what lets a
 /// `copytruncate` rotator truncate the file under a live handle and have the
@@ -726,7 +755,11 @@ fn spawn_log_pump<O, E>(
 async fn open_append(path: &Path) -> io::Result<tokio::fs::File> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
-        && let Err(error) = tokio::fs::create_dir_all(parent).await
+        && let Err(error) = tokio::fs::DirBuilder::new()
+            .mode(DIR_MODE)
+            .recursive(true)
+            .create(parent)
+            .await
     {
         tracing::error!(?path, %error, "log directory create failed");
         return Err(error);

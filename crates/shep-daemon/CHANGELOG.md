@@ -182,9 +182,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the signal is still fatal. Two things the socket form gives that this one
   cannot: a signal has no reply, so the result is logged rather than
   reported and nothing can wait for the swap to finish; and it reaches the
-  whole flock or nothing. The log directory is recreated at `0700` first, so
-  a rotation that moved the directory rather than the files does not leave
-  the daemon's own layout at whatever the umask allows.
+  whole flock or nothing. A rotation that moved the log directory rather than
+  the files is handled the same way it is for the socket form — by the pump,
+  see the directory-mode entry below.
 - Answer `Request::Flush`: every pump writing to a matched log path is sent a
   `LogCtl::Flush` and answers, and only then is each distinct recorded log
   path truncated. Both halves of that sentence are load-bearing. The flush
@@ -245,7 +245,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Create every runtime directory at `0700` directly via `DirBuilder::mode`
   instead of creating then `chmod`-ing, closing a TOCTOU window where a
   freshly created directory briefly sat at its umask-derived (potentially
-  world-writable) mode.
+  world-writable) mode. A sheep's log pump asks `mkdir` for the same mode
+  when it opens or reopens a log file, so a rotation that moved the log
+  DIRECTORY aside rather than the files gets it back at `0700` however the
+  reopen was asked for — `shep reopen`, `SIGUSR2`, or the next spawn — rather
+  than at whatever the umask allows. The pump is the only owner of that
+  guarantee, which is also why an app whose `out_file` points outside the
+  layout gets `0700` on any parent directory shep has to create for it.
 - Adopt the CLI's inherited readiness descriptor as the first fd-touching
   statement in `boot`, before anything else opens or closes one of its own —
   closes an IO-safety hazard where a stale `SHEP_READY_FD` could land on a
