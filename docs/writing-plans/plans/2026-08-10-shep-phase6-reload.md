@@ -142,6 +142,19 @@ muster-roll fix that was never needed.
 
 ## Task 4: close the liveness window
 
+> **Runs after Task 5, not before it.** Two reasons, both found during
+> execution. Step 1's "decide the marker timing" is a question only the state
+> machine can answer — when the drainee is claimed is part of how the machine
+> sequences, so deciding it here would mean deciding it twice. Step 2's test
+> drives a real reload of an app with a `liveness_probe`, which cannot exist
+> until Task 5 lands. What remains here after Task 5 is the integration proof
+> that the window is actually shut.
+>
+> The unit-level half is already done: Task 1's
+> `a_stopping_sheep_rejects_an_extra_restart` pins the guard that drops an
+> automatic report against a drainee. This task proves the same thing end to
+> end, through a reload the daemon actually performs.
+
 **Files:** Modify `crates/shep-daemon/src/supervisor.rs`.
 
 The exposed window is **`AwaitReady`, not `DrainOld`** — `claim_manual` drops an automatic report once the drainee carries a `manual` marker, so the ~3s while the replacement starts and the drainee is `Online` *and unclaimed* is the gap. An app whose liveness probe fails during that window gets **restarted rather than reaped**.
