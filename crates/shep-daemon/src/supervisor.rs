@@ -5688,6 +5688,15 @@ mod tests {
     // what the exit becomes, and `stop` leaves a sheep registered and
     // `Stopped`. Deregistering both entries would take an app out of `shep
     // flock` entirely on a verb that never promised to.
+    //
+    // The two scripts are asymmetric on purpose, and the case is worthless
+    // without it. A `stop` claims both entries at once, so which exit the
+    // actor handles first decides what is observable: if the REPLACEMENT's
+    // lands first, abandoning the reload clears the drainee's marker before
+    // its own exit is ever looked at, and a drainee-always-reaped
+    // implementation passes. Making the replacement defy its signal puts its
+    // exit a whole `kill_timeout` behind the drainee's, which is the order
+    // that exercises the branch.
     #[tokio::test(start_paused = true)]
     async fn an_operators_stop_mid_reload_leaves_the_app_stopped_and_registered() {
         let dir = tempfile::tempdir().unwrap();
@@ -5696,7 +5705,7 @@ mod tests {
         let (handle, runner, mut rx) = started(
             &dir,
             AppConfig::minimal("web", "./srv"),
-            vec![ProcScript::never_exits(), ProcScript::never_exits()],
+            vec![ProcScript::never_exits(), ProcScript::ignores_signals()],
         )
         .await;
 
