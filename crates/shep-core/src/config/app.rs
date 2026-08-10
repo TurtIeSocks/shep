@@ -128,6 +128,13 @@ pub struct AppConfig {
     pub err_file: Option<String>,
     /// Merge instance logs into one file pair
     pub merge_logs: bool,
+    /// Open the shepherd channel on fd 3 for this app on its own, without
+    /// needing `wait_ready` or `shutdown_with_message` to imply it.
+    ///
+    /// Defaults to `false`: a socketpair plus two pump tasks per sheep is
+    /// real cost weighed against spec §14.11's single-digit-MB idle-RSS
+    /// goal, so a channel is opened only when something asks for one.
+    pub channel: bool,
     /// Expect `{"kind":"ready"}` on the shepherd channel
     pub wait_ready: bool,
     /// Bind listen sockets with SO_REUSEPORT (enables zero-downtime reload)
@@ -188,6 +195,7 @@ impl Default for AppConfig {
             out_file: None,
             err_file: None,
             merge_logs: false,
+            channel: false,
             wait_ready: false,
             reuse_port: false,
             readiness_probe: None,
@@ -231,6 +239,7 @@ mod tests {
         assert_eq!(app.graceful_timeout, UpDuration::from_millis(8000));
         assert!(app.max_memory.is_none());
         assert!(app.fold.is_none());
+        assert!(!app.channel);
     }
 
     #[test]

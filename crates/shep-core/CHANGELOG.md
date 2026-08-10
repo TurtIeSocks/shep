@@ -65,6 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `ShepPaths` to resolve the `$SHEP_HOME` runtime directory layout.
 - Add `AppConfig` with the v1 Flockfile field set, plus `normalize` and
   `normalize_all`, which produce a proof-token `ResolvedApp`.
+- Add `AppConfig::channel`, opening the shepherd channel on fd 3 for an app
+  on its own rather than only as a side effect of `wait_ready` or
+  `shutdown_with_message`. Defaults to `false`: a socketpair plus two pump
+  tasks per sheep is real cost against spec §14.11's single-digit-MB
+  idle-RSS goal, so the channel now opens only when something asks for one.
+  `wait_ready` and `shutdown_with_message` keep opening it on their own,
+  unaffected by the new field.
 - Add `Flockfile` discovery (`discover`) and TOML/YAML/JSON/JSON5 parsing.
 - Add `DaemonConfig`, parsing `shep.toml` with `SHEP_*` env-variable
   layering.
