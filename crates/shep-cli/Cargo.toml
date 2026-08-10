@@ -32,12 +32,11 @@ clap = { version = "4", default-features = false, features = ["std", "derive", "
 # 4.0.0 without this pin and fails with "cannot find `aot` in `clap_complete`".
 clap_complete = { version = "4.6.0", default-features = false }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
-# `EventStream` implements `futures_util::Stream`; the `.next()` method comes
-# from `futures_util::StreamExt`, which nothing else in this crate's
-# dependency graph re-exports (tokio dropped its own `StreamExt` at 1.0, and
-# shep-client's transitive futures-util is not nameable from here). The
-# Ctrl-C wiring (`tokio::signal::ctrl_c().map(|_| ())`) needs `FutureExt`
-# from the same crate.
+# `bleats.rs`'s `stream.next()` now comes from `EventStream::next`, an
+# inherent method shep-client provides directly — no `StreamExt` import
+# needed here any more. This dependency stays for `FutureExt`: the Ctrl-C
+# wiring (`tokio::signal::ctrl_c().map(|_| ())`) still needs it, and
+# nothing else in this crate's dependency graph exposes it.
 futures-util.workspace = true
 # `Render: Serialize` needs the trait and its derive, not just the
 # serializer — `serde_json` alone does not bring either.

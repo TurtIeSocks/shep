@@ -46,6 +46,19 @@ pub use client::{Client, DEADLINE_GRACE, DEFAULT_DEADLINE, RequestError, START_D
 pub use connection::{ConnectError, HANDSHAKE_TIMEOUT};
 #[cfg(unix)]
 pub use events::{EventStream, Lagged};
+/// The trait [`EventStream`] implements.
+///
+/// Re-exported (IR-32: third-party re-exports normalized under our
+/// namespace) because there is no stable `core::stream::Stream` — this
+/// trait is otherwise unnameable in a caller's own bound without a direct
+/// `futures-util` dependency. Pulling one event at a time needs no import
+/// at all: [`EventStream::next`] is an inherent method. Only the trait
+/// itself is re-exported, not `StreamExt`'s combinators — the inherent
+/// `next` covers the common case, and a narrower surface is easier to widen
+/// later than to walk back.
+#[cfg(unix)]
+#[doc(inline)]
+pub use futures_util::Stream;
 
 // Unix-only for the same reason as `connection` above: every fake here
 // binds a `UnixListener`.

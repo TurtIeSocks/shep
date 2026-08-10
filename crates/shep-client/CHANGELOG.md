@@ -35,7 +35,10 @@ change to any of it is a `[Unreleased]` entry of its own, not a silent diff.
   subscription's own item type, distinguishing "this client's receiver fell
   behind reading its socket" from `BusEvent::Dropped` (the daemon's own
   outbound queue overflowing), which is a different fault on the other side
-  of the connection.
+  of the connection. `EventStream::next` is an inherent method, so pulling
+  one event needs no `futures-util` dependency of the caller's own; the
+  `Stream` trait itself is also re-exported from the crate root
+  (`#[doc(inline)]`, IR-32) for callers that need it nameable in a bound.
 - Add the `spawn` module: `connect_or_spawn`/`connect_or_spawn_with` (the
   autostart state machine — probe, launch only on "nothing listening", retry
   with backoff against a total deadline), `SpawnOutcome`, `SpawnOptions`, and

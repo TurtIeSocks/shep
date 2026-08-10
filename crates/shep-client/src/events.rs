@@ -13,7 +13,7 @@ use core::fmt;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
@@ -44,6 +44,17 @@ impl EventStream {
         Self {
             inner: BroadcastStream::new(receiver),
         }
+    }
+
+    /// Returns the next event, or `None` once the subscription ends.
+    ///
+    /// Inherent so a caller needs no `StreamExt` import: an inherent method
+    /// wins name resolution over a trait method of the same name, so
+    /// `stream.next()` resolves here even when `futures_util::StreamExt` is
+    /// nowhere in scope. For combinators beyond a single `next()`, the
+    /// [`Stream`] implementation is also re-exported from the crate root.
+    pub async fn next(&mut self) -> Option<Result<BusEvent, Lagged>> {
+        StreamExt::next(self).await
     }
 }
 

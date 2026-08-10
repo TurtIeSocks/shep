@@ -56,7 +56,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use futures_util::{FutureExt, StreamExt};
+use futures_util::FutureExt;
 use serde::Serialize;
 
 use shep_client::{Client, EventStream, Lagged};

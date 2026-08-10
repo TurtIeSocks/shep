@@ -30,6 +30,10 @@ name = "event_stream"
 required-features = ["test-support"]
 
 [[test]]
+name = "event_stream_next_without_futures_util"
+required-features = ["test-support"]
+
+[[test]]
 name = "spawn"
 required-features = ["test-support"]
 
