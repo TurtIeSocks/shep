@@ -231,7 +231,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the signal is still fatal. Two things the socket form gives that this one
   cannot: a signal has no reply, so the result is logged rather than
   reported and nothing can wait for the swap to finish; and it reaches the
-  whole flock or nothing. A rotation that moved the log directory rather than
+  whole flock or nothing. The logged result is asymmetric on purpose — a
+  failed reopen is a `warn` and so visible at the default level, while a
+  successful one is an `info` the default `log_level = "warn"` filters out,
+  since a routine success is not a warning. Confirming a signal-driven
+  rotation worked therefore means running at `log_level = "info"`, which is
+  why `SECURITY.md` recommends `shep reopen` in a `postrotate` stanza over
+  `kill -USR2`: the command exits 9 naming the sheep and path, and the signal
+  cannot report anything. A rotation that moved the log directory rather than
   the files is handled the same way it is for the socket form — by the pump,
   see the directory-mode entry below.
 - Answer `Request::Flush`: every pump writing to a matched log path is sent a
