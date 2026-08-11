@@ -210,11 +210,24 @@ impl Client {
 
     /// The next frame of any kind: whatever an earlier call already read but
     /// didn't consume, oldest first, else the next one off the wire.
+    ///
+    /// Every process event that passes through records its pid for `Fixture`'s
+    /// panic-path cleanup, the same way [`track_spawned`] records a reply's.
+    /// One choke point covers every wait in this file, which matters for the
+    /// one process no reply ever names in time: a reload's replacement is
+    /// spawned, and can be left an orphan by a panic, well before any reply a
+    /// test asks for carries its pid. Observed, not theorised — a deliberately
+    /// broken kill ladder timed a reload measurement out and left one
+    /// `reuse_port_sheep` reparented to init.
     async fn next_frame(&mut self) -> ServerFrame {
-        if let Some(frame) = self.pending.pop_front() {
-            return frame;
+        let frame = match self.pending.pop_front() {
+            Some(frame) => frame,
+            None => self.recv_as().await,
+        };
+        if let ServerFrame::Event(BusEvent::Process { info, .. }) = &frame {
+            track_pid(&self.spawned, info);
         }
-        self.recv_as().await
+        frame
     }
 
     /// Sends one request, then reads frames until its `Reply` arrives,
@@ -336,15 +349,21 @@ fn track_spawned(spawned: &std::sync::Arc<std::sync::Mutex<Vec<i32>>>, reply: &R
         | Response::Flushed(infos) => infos,
         _ => return,
     };
-    let mut spawned = spawned
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for info in infos {
-        if let Some(pid) = info.pid
-            && let Ok(pid) = i32::try_from(pid)
-        {
-            spawned.push(pid);
-        }
+        track_pid(spawned, info);
+    }
+}
+
+/// Records one `ProcessInfo`'s pid, if it has one. The single writer behind
+/// both [`track_spawned`] and every process event [`Client::next_frame`] sees.
+fn track_pid(spawned: &std::sync::Arc<std::sync::Mutex<Vec<i32>>>, info: &ProcessInfo) {
+    if let Some(pid) = info.pid
+        && let Ok(pid) = i32::try_from(pid)
+    {
+        spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(pid);
     }
 }
 
