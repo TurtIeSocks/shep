@@ -133,7 +133,9 @@ pub struct StartArgs {
 /// Required means no `default_value` on the field below, and that one
 /// attribute is the whole of it — adding one would turn a bare `shep stop`
 /// into `shep stop all` for every verb in the list at once. It is pinned by
-/// [`tests::a_selector_taking_verb_refuses_to_run_without_one`].
+/// this module's own `a_selector_taking_verb_refuses_to_run_without_one`
+/// (named rather than linked: that module is `#[cfg(test)]`, so an intra-doc
+/// link to it does not resolve under `cargo doc`).
 #[derive(Debug, clap::Args)]
 pub struct SelectorArgs {
     /// name, id, `all`, `/regex/`, or `fold:<name>`
