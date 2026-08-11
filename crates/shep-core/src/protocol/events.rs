@@ -45,9 +45,9 @@ pub enum ProcessEventKind {
     /// and whether that one is serving depends on which abandonment it was.
     /// Where the reload gave up on replacing an instance, that instance is
     /// named and is still the app's live one. Where it gave up because the
-    /// replacement itself went down after taking the slot over, the
-    /// replacement is named and carries whatever terminal status it reached.
-    /// Read `info.status` rather than assuming.
+    /// replacement went down instead, the replacement is named. As with every
+    /// event here, `info` is that instance as it stood when the event was
+    /// raised, so read `info.status` rather than assuming a live one.
     ReloadAbandoned,
     /// Stopped by request
     Stop,

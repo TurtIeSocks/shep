@@ -171,14 +171,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still true, or the replacement itself where that is what went down. Read the
   status on the event rather than assuming. Every way a swap can fail reaches
   it: a replacement that could not be spawned at all, one that did not become
-  ready inside `listen_timeout`, one that exited before it was ready, one that
-  exited after taking the slot over but before the instance it replaced was
-  gone, and an operator's own command reaching the instance being replaced
-  while the swap was still abandonable. The one case that reports nothing is
-  the one with nothing left to name — a replacement exiting when the instance
-  it was replacing has already gone, and one deleted outright mid-drain —
-  which is a warning in the daemon's log and no event. An instance the reload
-  passed
+  ready inside `listen_timeout`, one that exited before it was ready — with or
+  without the instance it was replacing still there — one that exited after
+  taking the slot over but before the instance it replaced was gone, and an
+  operator's own command reaching the instance being replaced while the swap
+  was still abandonable. The one case that reports nothing is the one with
+  nothing left to name: a replacement deleted outright while the instance it
+  replaced was still draining, which is a warning in the daemon's log and no
+  event. An instance the reload passed
   over — not `online` when its turn came, or already on its way out under
   something else — also produces none of the three, because no swap was ever
   attempted against it.

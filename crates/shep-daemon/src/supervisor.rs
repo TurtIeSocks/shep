@@ -2672,6 +2672,16 @@ impl<R: ProcessRunner> Actor<R> {
                 // A swap committed that way never had a replacement go
                 // `Online`, and a kill ladder writes no status, so an `Online`
                 // here would mean the inference had stopped holding.
+                //
+                // It is the third way a reload can end, and it says so on the
+                // bus like the other two: a subscriber told the reload was
+                // accepted and never told otherwise cannot tell one still
+                // running from one that gave up, and this is the ending where
+                // knowing matters most, since the queue went with it. The
+                // event carries this entry as it stands, which is what every
+                // event in this file carries — the exit's own transition has
+                // not run yet, so the `Stop` or `Exit` that reports where the
+                // replacement actually landed follows a moment later.
                 if let Some(name) = name {
                     let old_id = self.reloads[&name].swap.old_id;
                     if !self.sheep.contains_key(&old_id) {
@@ -2688,6 +2698,10 @@ impl<R: ProcessRunner> Actor<R> {
                              the instance it replaced already gone"
                         );
                         self.reloads.remove(&name);
+                        if let Some(slot) = self.sheep.get(&id) {
+                            let info = to_info(&slot.entry);
+                            self.emit(ProcessEventKind::ReloadAbandoned, info, true);
+                        }
                     }
                 }
             }
@@ -6445,6 +6459,13 @@ mod tests {
     // job then refuses every later reload of the app for as long as the
     // daemon runs, and drops the rest of a clustered reload's queue after the
     // caller was already told `Ok`.
+    //
+    // Two separate defects live on this one path and the case checks both,
+    // because they fail independently: the job outliving both of its ids
+    // (which the second `reload` catches), and that ending reaching the bus as
+    // nothing but a log line (which the `ReloadAbandoned` catches). Deleting
+    // the emit leaves the reload verb working and the subscriber blind;
+    // deleting the removal leaves the bus honest and the verb dead.
     #[tokio::test(start_paused = true)]
     async fn a_reload_ends_when_its_replacement_goes_with_the_drainee_already_gone() {
         let dir = tempfile::tempdir().unwrap();
@@ -6477,6 +6498,13 @@ mod tests {
             .stop(ProcessSelector::Name("web".to_string()))
             .await
             .expect("the stop reaches the replacement");
+
+        let seen = events_through(&mut rx, 1, ProcessEventKind::Stop).await;
+        assert!(
+            at(&seen, 1, ProcessEventKind::ReloadAbandoned) < at(&seen, 1, ProcessEventKind::Stop),
+            "the reload gives up before the exit that ended it is reported, so a \
+             subscriber reads the two in the order they happened: {seen:?}"
+        );
 
         let again = handle
             .reload(ProcessSelector::Name("web".to_string()))
