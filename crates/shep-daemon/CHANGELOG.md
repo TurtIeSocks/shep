@@ -90,7 +90,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `listen_timeout` **abandons the reload**: the instance being replaced goes
   back to serving, the instances the reload had not reached yet are left
   alone, and the replacement is killed through the stop ladder and
-  deregistered. The drain itself runs under `graceful_timeout` (default
+  deregistered. Abandoning protects the instance that can still serve, so it
+  only happens while there is one — a replacement whose deadline elapses
+  after the instance it was replacing has already gone on its own is taken
+  `online` anyway, since killing it too would empty the instance slot
+  outright. The drain itself runs under `graceful_timeout` (default
   8000ms) rather than `kill_timeout` (default 1600ms), which gives both of
   those app options their first reader in the daemon.
 
@@ -146,9 +150,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a reply that waited for the swaps would routinely be abandoned while the
   reload it asked for went on running. Both refusals — a selector that
   reached an app already reloading, and a reload arriving after a shutdown
-  has begun — answer `RpcErrorCode::Internal` carrying the `SupervisorError`'s
-  own message, since that code set is versioned and neither refusal has one
-  of its own.
+  has begun — answer `RpcErrorCode::Internal`, since that code set is
+  versioned and neither refusal has one of its own. An app already reloading
+  is the one an operator can act on, so its reply carries the
+  `SupervisorError`'s own message, which names the app.
 
   **The swaps report themselves on the bus**, which an early reply makes the
   only account of them there is. Each swap puts a `process.reload` on the
@@ -157,11 +162,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing on its own — and a `process.reloaded` on the replacement once the
   instance it drained is gone, so the event means "the swap is over" rather
   than "the new one is up". A reload that gives up sends
-  `process.reload_abandoned` naming the instance that is still serving, from
-  both ends it can come to: a replacement that never became ready, and a
-  replacement that could not be spawned at all. An instance the reload passed
+  `process.reload_abandoned` naming the instance it gave up on replacing —
+  which is the app's live one wherever going back to serving is still true.
+  Every way a swap can fail reaches it: a replacement that could not be
+  spawned at all, one that did not become ready inside `listen_timeout`, one
+  that exited before it was ready, and an operator's own command reaching the
+  instance being replaced while the swap was still abandonable. The one case
+  that reports nothing is the one with nothing left to name — a replacement
+  exiting when the instance it was replacing has already gone — which is a
+  warning in the daemon's log and no event. An instance the reload passed
   over — not `online` when its turn came, or already on its way out under
-  something else — produces none of the three, because no swap was ever
+  something else — also produces none of the three, because no swap was ever
   attempted against it.
 - Add `SupervisorError::ReloadInFlight`, carrying an app's name — a reload
   that reaches an app whose reload has not finished is refused whole rather

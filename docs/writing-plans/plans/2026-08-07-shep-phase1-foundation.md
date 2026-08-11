@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust edition 2024 (MSRV 1.85), serde/serde_json/toml/serde_yml/json5, tokio + tokio-util (wire codec only), regex, globset, insta (snapshots), proptest (targeted).
 
-**Phase roadmap context:** This is plan 1 of 6 (foundation → daemon core → client+CLI → lifecycle extras → dogs+observability → UX surface). Later phases get their own plans once this lands. Deliberately deferred out of Phase 1: `config/kv.rs` (lands with Phase 4's `set`/`get` verbs), stale-socket recovery + reconnect backoff (transport runtime, Phase 2/3), croner-dialect cron validation (Phase 2, where crons execute), `channel.*` bus events (Phase 4, trigger/actions), topic glob matching + the `globset` dep (Phase 2, server-side subscription filtering), CI hardening jobs — minimal-versions, musl-run-tests, feature-combo ladder, llvm-cov (Phase 2/3 CI task), schemars JSON-schema export for AppConfig (Phase 6, docs/assets).
+**Phase roadmap context:** This is plan 1 of 6 (foundation → daemon core → client+CLI → lifecycle extras → dogs+observability → UX surface). Later phases get their own plans once this lands. Deliberately deferred out of Phase 1: `config/kv.rs` (lands with Phase 4's `set`/`get` verbs), stale-socket recovery + reconnect backoff (transport runtime, Phase 2/3), croner-dialect cron validation (Phase 2, where crons execute), `channel.*` bus events (Phase 4, trigger/actions), topic glob matching + the `globset` dep (Phase 2, server-side subscription filtering), CI hardening jobs — minimal-versions, musl-run-tests, feature-combo ladder, llvm-cov (Phase 2/3 CI task), schemars JSON-schema export for AppConfig (the UX-surface phase, docs/assets).
 
 ## Global Constraints
 

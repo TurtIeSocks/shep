@@ -153,6 +153,16 @@ src/
              external rename those name different files, and chasing the handle would empty the
              archive and leave the live log alone. A missing path is not a failure and is
              deliberately not created.
+             `handle_reopen` draws its barrier around the same set (Phase 6): every slot writing
+             to a path a matched sheep writes to, matched or not. It was selector-keyed until
+             reload made EVERY app a shared-log-path app for the length of a swap — both halves
+             derive byte-identical paths from the instance slot they share — so `shep reopen
+             <one id>` mid-reload left the drainee appending to the renamed inode while the
+             `postrotate` stanza waiting on the exit code was told otherwise. A path is what an
+             external rotator renames, and an operator naming one writer of a file is not a
+             statement about the others. Both REPLIES stay selector-keyed: a row means "a sheep
+             you named". A failure may name one you did not, which is the honest report of a
+             shared file that could not be reopened.
   spawn.rs           ← was lib/God/ForkMode.js + ClusterMode.js (unified — ONE spawn path)
       Action: port + merge
       Drift (Phase 3, recorded in Phase 5): shipped as a PAIR — `runner.rs` (portable: the
@@ -196,16 +206,99 @@ src/
              ever reaches EOF.
   kill.rs            ← was lib/God/Methods.js (kill ladder) + lib/TreeKill.js
       Action: port semantics + rewrite mechanism
-      Notes: ladder exact: SIGINT(configurable)/shutdown-msg → timeout(kill_timeout 1600ms) on
-             child.wait() → SIGKILL survivors → timeout error. Mechanism: owning-parent waitpid
-             (exact exit code+signal, kills pid-reuse ABA race), kill(-pgid) for trees (replaces
-             racy ps-snapshot walk), Job Objects on Windows (fixes taskkill /F signal-ignoring).
+      Notes: ladder exact: SIGTERM(configurable via `kill_signal`)/shutdown-msg → timeout on
+             child.wait() → SIGKILL survivors → timeout error. SIGTERM rather than pm2's SIGINT
+             is a deliberate deviation (spec §"deviations": unix convention wins). Mechanism:
+             owning-parent waitpid (exact exit code+signal, kills pid-reuse ABA race),
+             kill(-pgid) for trees (replaces racy ps-snapshot walk), Job Objects on Windows
+             (fixes taskkill /F signal-ignoring).
+      Two caps, not one (Phase 6): `LadderCap` picks which of the app's timeouts bounds the
+             wait. `Stop` is `kill_timeout` (1600ms) and covers an operator's stop/restart/
+             delete, the daemon's own automatic restarts and the engine-wide shutdown; `Drain`
+             is `graceful_timeout` (8000ms) and belongs to a reload's drain — the one stop that
+             asks the instance to finish the work already in hand, and so the one given longer
+             to do it. Both app options had zero readers before reload.
   reload.rs          ← was lib/God/Reload.js
       Action: port contract + rewrite mechanism                 [UPGRADE over pm2]
-      Notes: explicit state machine SpawnNew → AwaitReady(ready-msg | listening | timeout 3000)
-             → DrainOld(shutdown msg | SIGTERM, GRACEFUL_TIMEOUT 8000) → ReapOld. Zero-downtime
-             for ALL runtimes: SO_REUSEPORT (socket2) default, LISTEN_FDS fd-passing protocol
-             as the principled option — pm2 only had it for Node cluster.
+      Drift (Phase 6, recorded): THERE IS NO SUCH FILE. A reload is a sequence of actor
+             decisions over the actor's own state, so it shipped inside supervisor.rs —
+             `ReloadJob`, `ReloadSwap`, `ReloadPhase`, and the `handle_reload` →
+             `advance_reload` → `spawn_replacement` → `reload_ready_result` → `begin_drain` →
+             `reap_drainee` → `finish_swap` chain — with the per-entry marker `ReloadState` on
+             entry.rs. A module of its own would have had to reach into `Actor::sheep`,
+             `next_id`, the kill ladder, the extras registry and the bus, which is every field
+             the actor exists to own.
+      Notes: explicit state machine SpawnNew → AwaitReady → DrainOld → ReapOld, one instance of
+             an app at a time. `ReloadPhase` carries only two of the four names because the
+             other two are instants rather than intervals: SpawnNew is one synchronous step of
+             the actor loop, and ReapOld is the drainee's `Msg::Exited` arriving. The question
+             a handler actually asks is the one those two variants answer — is the old
+             instance still there to go back to?
+             ONE `ReloadJob` PER APP NAME in `Actor::reloads`, holding the instances not yet
+             taken (`queue`, in instance-slot order) and the one pair mid-swap (`swap`). The
+             key is what makes a second reload of the same app REFUSABLE rather than queued or
+             interleaved (`SupervisorError::ReloadInFlight`, refused whole before anything is
+             spawned), and what every other handler asks "is this id half of a live reload".
+             SpawnNew (`spawn_replacement`) registers the replacement under a NEW ID IN THE
+             DRAINEE'S INSTANCE SLOT — same slot because `assemble` writes it into the child's
+             environment and an app deriving its port from it must bind the same port, new id
+             because two live processes under one id is what the supervisor's property test
+             forbids. Reload is the first operation for which those two diverge. The drainee
+             takes `ProcStatus::Stopping` — which this is the ONLY production writer of, in
+             the whole daemon — and `ReloadState::SpawningReplacement{new_id}`, both BEFORE
+             `runner.spawn` is called; the
+             replacement carries `ReloadState::Draining{old_pid}`, so each half names the
+             other. That ordering is load-bearing twice over: `snapshot.rs`'s `is_running`
+             does not count `Stopping`, so the muster roll cannot record a count the flock
+             does not have; and `handle_extra_restart`'s `Online` guard then rejects the two
+             automatic triggers that reach it — a memory breach and a liveness failure — for
+             the whole overlap, which is what stops a drainee being RESTARTED because it is
+             draining. `restarts` carries over from the drainee, the restart budget does not.
+             AwaitReady is gated for EVERY replacement, including an app configuring neither
+             `wait_ready` nor `readiness_probe` — `await_ready`'s `Heuristic` arm exists for
+             this caller and had no production caller before it. `reload_ready_result` keys on
+             the `Readiness` VERDICT and never on the deadline, which is what makes one mapping
+             correct for all three sources: `Heuristic` reports `Ready` when its deadline
+             elapses, because for a heuristic the elapse IS the signal. `TimedOut` is the one
+             place a readiness deadline is a FAILURE rather than a slow start, and it abandons.
+             DrainOld (`begin_drain`) is the ordinary kill ladder under `LadderCap::Drain`
+             (`graceful_timeout`, not `kill_timeout` — see kill.rs), claimed through
+             `claim_manual` like an operator's stop. ReapOld is `reap_drainee` on the drainee's
+             exit, which deregisters it — nothing else ever would, and a drainee left
+             registered is a dead row per instance per reload — then `finish_swap` and on to
+             the next instance.
+             ABANDONMENT (`abort_reload`, spec §4): the drainee goes back to serving where that
+             is still true, the instances not yet reached are left alone, and the replacement
+             is killed through the ladder (`LadderCap::Stop` — nothing is being drained) and
+             DEREGISTERED rather than left as an `Errored` row that would double every
+             name-keyed verb for the life of the flock. Only reachable while the swap is
+             `AwaitReady`; past the commit there is no old instance to return to.
+             An automatic restart is held off BOTH halves of an uncommitted swap
+             (`in_an_uncommitted_swap`, checked in `begin_manual`) — a cron occurrence or a
+             watched-file change landing inside the readiness window destroys the overlap from
+             either side. The trigger is DROPPED, not deferred. `begin_shutdown` clears every
+             job (CRITICAL-1: a reload's next step is always a spawn).
+             THE WIRE: `Request::Reload` is answered `Response::Reloading` the moment the
+             reload is ACCEPTED, before the first replacement is spawned, because one instance
+             costs `listen_timeout` + `graceful_timeout` ≈ 11s and `rpc.rs` caps a request
+             budget at `MAX_DEADLINE_MS` 60s — a synchronous reply would time out while the
+             reload went on running. Progress is therefore the bus's job alone:
+             `process.reload` on the instance being replaced (before its replacement's
+             `process.start`), `process.reloaded` on the replacement once the drainee is gone,
+             `process.reload_abandoned` on the instance still serving.
+      NOT BUILT, and the previous entry here promised it: SO_REUSEPORT is NOT set by shep and
+             cannot be — a socket option must be set before `bind()` by the process that binds,
+             and no shep process ever binds an app's port. `reuse_port` is the OPERATOR
+             ASSERTING the app sets it itself; a mismatch is `EADDRINUSE` at every replacement
+             spawn, undetectable in advance. No socket2, no LISTEN_FDS fd passing (spec defers
+             it to v1.2). So THE OVERLAP IS THE WHOLE MECHANISM, and it is not zero downtime:
+             the old listener's accept backlog is reset when it closes, on both tier-1
+             platforms, so a reload is downtime-free exactly insofar as the APP stops
+             accepting, drains and exits inside `graceful_timeout`. Measured, not reasoned:
+             a defiant app loses 5-8 connections in ~260 on Linux (which load-balances new
+             connections across every listener on the port, so the drainee keeps taking about
+             half until it closes) and none on macOS (last binder wins, so the replacement
+             takes everything the moment it is up). A draining app loses none on either.
   watch/             ← was lib/Watcher.js
       Action: port + redesign
       Drift (Phase 4, recorded): built as a DIRECTORY, not the `watcher.rs` named above — the
@@ -265,8 +358,17 @@ src/
       Notes: boot ritual kept (pidfile, both-sockets-bound readiness handshake via pipe,
              SIGTERM/INT/QUIT graceful dump+exit). Per-conn task: read frame → dispatch →
              reply. Peer-cred check (SO_PEERCRED/getpeereid) — pm2 had NONE. Per-call
-             deadlines default 5s. Drop: domain resurrection, $_ env hack, inspector
-             self-profiling.
+             deadlines default 5s, capped at `MAX_DEADLINE_MS` 60s. Drop: domain resurrection,
+             $_ env hack, inspector self-profiling.
+      One verb outruns the ceiling (Phase 6): a reload of a clustered app costs ~11s PER
+             INSTANCE, so no budget a client is allowed to ask for can cover it, and expiring a
+             budget bounds the REPLY and not the actor's work. `Reload` is therefore answered
+             `Response::Reloading` — an ACCEPTANCE, the one reply in the enum that does not
+             describe finished work — and its progress goes on the bus instead. Raising the
+             ceiling was the alternative and was refused: it would cost every other verb its
+             meaning. Both of reload's refusals (an app already reloading; a reload arriving
+             after shutdown has begun) map to `RpcErrorCode::Internal` for want of a code of
+             their own, which is a wire change rather than a mapping change.
       SIGUSR2 = REOPEN, not reload (Phase 5): `boot::install_signals` installs it, and it means
              exactly `shep reopen all` — a signal carries no selector, so `all` is the only
              thing it can mean. Installing it is load-bearing on its own, since SIGUSR2's
@@ -395,6 +497,15 @@ src/
              wins, --cron long alias); StartOptions struct = the camelCase→API contract,
              explicit + tested. Duplicate verbs collapse to clap aliases; dead surface
              (imonit, deepUpdate, --v1, conf, create) hidden or gone. stdin `-` JSON kept.
+      `shep reload <selector>` (Phase 6): `commands/lifecycle.rs::reload`, alongside
+             `stop`/`restart`/`delete` and sharing their `SelectorArgs` — so the selector is
+             REQUIRED for the same reason theirs are, now pinned by a test over every verb that
+             shares the struct (a `default_value` on that one field would have turned a bare
+             `shep stop` into `shep stop all` for six verbs at once). It takes the client's 5s
+             default deadline, not the log plane's 30s, because the daemon answers on
+             ACCEPTANCE — the command prints the flock as it stood at that moment and exits,
+             and does NOT subscribe to the bus to follow the swaps. Its `--help` says in as
+             many words that the window is not zero downtime.
   runtime.rs         ← was lib/binaries/Runtime4Docker.js (+ Runtime.js dropped)
       Action: port + fix
       Notes: no-daemon mode = daemon event loop in-process. Exit-code contract exact
@@ -492,6 +603,19 @@ crates/*/src (co-located #[cfg(test)])   ← was test/programmatic subset (utili
 crates/shep-daemon/tests/                 ← was god/cluster/reload/signals/treekill mocha
     Notes: tokio::time::pause makes kill_timeout/backoff DETERMINISTIC — the suites pm2
            excluded from all CI become always-run. proptest on supervisor state machine.
+crates/shep-daemon/examples/reuse_port_sheep.rs   ← new (Phase 6)
+    Notes: the reload measurement's fixture, and the ONLY real child in the suite that is not
+           `/bin/sh` running an inline script — `/bin/sh` cannot set a socket option. Binds
+           `SHEEP_PORT_BASE + SHEP_INSTANCE` with SO_REUSEPORT and answers `<pid>\n`, so every
+           answered connection is attributable to a process; `SHEEP_DEFIANT=1` makes it ignore
+           SIGTERM, and THE GAP BETWEEN THE TWO RUNS IS THE FINDING. An `examples/` target
+           because that is the only kind cargo builds for a plain `cargo test`, allows a
+           dev-dependency (`nix`, which must not join the shipped daemon's graph) and never
+           installs. Both platforms assert the weak property (the swap completes, the
+           replacement owns the port, the drainee is reaped); the CONNECTION COUNT is asserted
+           `#[cfg(target_os = "linux")]` only, because macOS hands every new connection to the
+           last socket to bind and the loss cannot manifest there. The Linux half was run in a
+           container, not inferred.
 crates/shep-cli/tests/e2e/                ← was test/e2e/*.sh
     Notes: assert_cmd + tempfile PM2_HOME (parallel without docker) + serde asserts on jlist
            (grep-prettylist dies). Exit-code contract tests from right-exit-code.sh.

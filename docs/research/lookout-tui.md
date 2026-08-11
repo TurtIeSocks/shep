@@ -1,4 +1,4 @@
-# lookout TUI — Phase 6 design notes (research)
+# lookout TUI — UX-surface phase design notes (research)
 
 Key: `lookout-tui` · 2026-08-07 · network was available: all versions verified
 against crates.io on this date.
@@ -29,7 +29,7 @@ Workspace `rust-version = 1.85` (IR-4). But:
 - sysinfo 0.38.4 → MSRV **1.88** (0.39.x → 1.95 — too new, ~Apr 2026)
 - crossterm 0.29.0 → 1.63 (fine); tui-input declares none (trivial deps)
 
-**Recommendation: bump workspace MSRV 1.85 → 1.88** (released 2025-06-26, >13 months old at time of writing — comfortably conservative). Take ratatui 0.30.2 + sysinfo 0.38.4. Fallback if Rin vetoes the bump: ratatui **0.29.0** (MSRV 1.74, pre-modular but API-similar for our usage) + sysinfo **0.36.1** (1.75) + tui-input **0.14.x** — a known-good but aging island; the 0.29→0.30 migration later is mostly import paths. The bump is the better trade: Phase 6 shouldn't build on a line that was already superseded when the phase started.
+**Recommendation: bump workspace MSRV 1.85 → 1.88** (released 2025-06-26, >13 months old at time of writing — comfortably conservative). Take ratatui 0.30.2 + sysinfo 0.38.4. Fallback if Rin vetoes the bump: ratatui **0.29.0** (MSRV 1.74, pre-modular but API-similar for our usage) + sysinfo **0.36.1** (1.75) + tui-input **0.14.x** — a known-good but aging island; the 0.29→0.30 migration later is mostly import paths. The bump is the better trade: the UX-surface phase shouldn't build on a line that was already superseded when the phase started.
 
 ---
 
@@ -148,8 +148,9 @@ The load-bearing part is `ClientEvent` wrapping connection state: spec §6
 puts reconnect (100 ms ×1.5, cap 5 s) inside the client, so the TUI can only
 show a "reconnecting…" banner — and re-poll + re-subscribe on recovery — if
 the stream *surfaces* those transitions as items. If the client phase ships
-a bare `Stream<Item = BusEvent>`, lookout has no reconnect UX and Phase 6
-gets blocked on a client API change. Flag this in the client phase's spec.
+a bare `Stream<Item = BusEvent>`, lookout has no reconnect UX and the
+UX-surface phase gets blocked on a client API change. Flag this in the
+client phase's spec.
 lookout subscribes `["process.*", "log.out", "log.err", "daemon.*"]`.
 
 ### D5 — Input modes and filter semantics. → Two-mode keymap; tui-input for the line editor; filter = case-insensitive substring over name + fold
