@@ -25,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `graceful_timeout` runs out loses whatever was waiting there. The verb's
   own `--help` says so.
 
+  **A port-binding app has to set `SO_REUSEPORT` itself before it binds**, or
+  every reload of it fails. shep binds nothing and so cannot set the option
+  on the app's behalf; the `reuse_port` app option is the operator asserting
+  that the app does, and a mismatch is `EADDRINUSE` at the replacement spawn,
+  undetectable in advance. What the operator sees without it is nothing at
+  all: `shep reload` has already exited 0 by the time the replacement fails,
+  so the abandonment shows up as `process.reload_abandoned` on the bus and in
+  the shepherd's log, and the old instance goes on serving. `--help` names
+  the precondition for the same reason.
+
   The selector is **required**, exactly as it is for `stop`/`restart`/
   `delete` and for the same reason: the verb replaces running processes, so
   the operator names the target. That requirement is now pinned by a test

@@ -65,6 +65,13 @@ pub enum Commands {
     /// become ready before the instance it replaces is asked to go — so the
     /// app gets a window in which it can hand over without dropping work.
     ///
+    /// An app that binds a port has to set SO_REUSEPORT itself, before it
+    /// binds; shep binds nothing and cannot set it on the app's behalf.
+    /// Without it the replacement fails to bind on every reload and the
+    /// reload is abandoned with the old instance left serving. This command
+    /// has already exited 0 by then, so process.reload_abandoned on the bus
+    /// is the only report of it.
+    ///
     /// That window is not zero downtime. The old listener's queue of
     /// connections it has not accepted yet is dropped when it closes, so an
     /// app that does not stop accepting and finish what it has in hand
