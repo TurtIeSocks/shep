@@ -2069,20 +2069,54 @@ impl<R: ProcessRunner> Actor<R> {
     ///
     /// The `Reloaded` this announces is the one event that says a swap
     /// SUCCEEDED, and it goes out before the next swap begins so a clustered
-    /// app's reload reads in order. It is skipped where the replacement is
-    /// already gone — a swap the drainee's own death committed, whose
-    /// replacement then exited before this ran — because an event claiming an
-    /// instance took over would name a process that is not there.
+    /// app's reload reads in order. It is owed only to a replacement that is
+    /// actually SERVING, which is strictly narrower than one that is still
+    /// registered. A replacement that went down inside the drain window keeps
+    /// its row — `Stopped` for an app that does not autorestart, `Errored`
+    /// for one whose budget ran out, `WaitingRestart` for one still owed a
+    /// respawn — and an event claiming an instance took over would name a
+    /// process that is not there.
+    ///
+    /// Anything else is a failed new instance, whichever side of `Online` it
+    /// died on, so the reload ends here rather than carrying on: spec §4,
+    /// failure of a new instance aborts the rest. It is announced as an
+    /// abandonment rather than passed over in silence, because the queue that
+    /// goes with it is the rest of a clustered app left on the old code long
+    /// after its caller was told `Ok`.
+    ///
+    /// The one shape that reaches the bus with nothing is a replacement that
+    /// is not registered at all — `shep delete <replacement>` during the
+    /// drain, which deregisters it while the instance it replaced is still
+    /// draining. There is no entry left to name, and that delete's own
+    /// `Delete` event has already said the process is gone.
     fn finish_swap(&mut self, name: &str) {
         let Some(job) = self.reloads.remove(name) else {
             return;
         };
-        self.clear_reload(job.swap.new_id);
-        if let Some(slot) = self.sheep.get(&job.swap.new_id) {
-            let info = to_info(&slot.entry);
+        let new_id = job.swap.new_id;
+        self.clear_reload(new_id);
+
+        let serving = self
+            .sheep
+            .get(&new_id)
+            .is_some_and(|slot| slot.entry.status == ProcStatus::Online);
+        if serving {
+            let info = to_info(&self.sheep[&new_id].entry);
             self.emit(ProcessEventKind::Reloaded, info, true);
+            self.advance_reload(name, job.queue);
+            return;
         }
-        self.advance_reload(name, job.queue);
+
+        tracing::warn!(
+            name,
+            new_id,
+            "reload abandoned: the replacement was no longer serving when the instance it \
+             replaced went"
+        );
+        if let Some(slot) = self.sheep.get(&new_id) {
+            let info = to_info(&slot.entry);
+            self.emit(ProcessEventKind::ReloadAbandoned, info, true);
+        }
     }
 
     /// Abandons `name`'s reload: the instance it was replacing goes back to
@@ -6618,6 +6652,59 @@ mod tests {
                 status: ProcStatus::Online,
                 manually: true,
             }
+        );
+    }
+
+    // fails if `finish_swap` announces a swap on the strength of the
+    // replacement still being REGISTERED rather than still SERVING. The two
+    // diverge for a whole class of exit: a replacement that goes down inside
+    // the drain window keeps its row in the map — `Stopped` for an app that
+    // does not autorestart, `Errored` for one whose budget ran out,
+    // `WaitingRestart` for one still owed a respawn — so a registration test
+    // passes for every one of them and `Reloaded`, the one event that means a
+    // swap succeeded, goes out naming a process that is down.
+    //
+    // Two scripts, both used by a correct run. The instance being replaced
+    // ignores its stop signal, so its drain runs the full `graceful_timeout`
+    // (8000ms) and there is a window to die inside; the replacement exits
+    // 5000ms in, which is after its 3000ms heuristic readiness wait — so the
+    // swap is committed and this is not the abandon-before-ready case — and
+    // well before the drain ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_swap_is_not_announced_for_a_replacement_that_is_no_longer_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.autorestart = false; // the replacement's exit is terminal, and registered
+        let (handle, _runner, mut rx) = started(
+            &dir,
+            app,
+            vec![
+                ProcScript::ignores_signals(),
+                ProcScript::stable_then_exit(5_000, 1),
+            ],
+        )
+        .await;
+
+        handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the reload is accepted");
+
+        let seen = events_through(&mut rx, 1, ProcessEventKind::ReloadAbandoned).await;
+        assert_eq!(
+            seen[at(&seen, 1, ProcessEventKind::ReloadAbandoned)],
+            Seen {
+                id: 1,
+                kind: ProcessEventKind::ReloadAbandoned,
+                status: ProcStatus::Stopped,
+                manually: true,
+            },
+            "a replacement that died inside the drain window is what the \
+             abandonment names, carrying the status it actually reached"
+        );
+        assert!(
+            !seen.iter().any(|e| e.kind == ProcessEventKind::Reloaded),
+            "no swap succeeded, so nothing may say one did: {seen:?}"
         );
     }
 

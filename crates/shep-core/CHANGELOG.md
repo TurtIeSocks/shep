@@ -105,8 +105,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`process.reload`, `process.reloaded`, `process.reload_abandoned`), the
   three ways a reload reports itself. `Reload` names the instance being
   replaced, `Reloaded` the replacement once the instance it drained is gone,
-  and `ReloadAbandoned` the instance a reload gave up on replacing — which is
-  still the app's live one. **A subscriber built before these variants cannot
+  and `ReloadAbandoned` whichever instance the abandonment left holding the
+  slot — the one the reload gave up on replacing, still the app's live one, or
+  the replacement itself where that is what went down. **A subscriber built
+  before these variants cannot
   decode the frames and drops them**, and unlike a new `Request` variant that
   is not something it opted into: every topic here is `process.<something>`,
   which the `process.*` glob already matches. Accepted rather than worked

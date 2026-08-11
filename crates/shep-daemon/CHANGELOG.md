@@ -161,16 +161,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second `start` in an instance slot that already holds a live entry explains
   nothing on its own — and a `process.reloaded` on the replacement once the
   instance it drained is gone, so the event means "the swap is over" rather
-  than "the new one is up". A reload that gives up sends
-  `process.reload_abandoned` naming the instance it gave up on replacing —
-  which is the app's live one wherever going back to serving is still true.
-  Every way a swap can fail reaches it: a replacement that could not be
-  spawned at all, one that did not become ready inside `listen_timeout`, one
-  that exited before it was ready, and an operator's own command reaching the
-  instance being replaced while the swap was still abandonable. The one case
-  that reports nothing is the one with nothing left to name — a replacement
-  exiting when the instance it was replacing has already gone — which is a
-  warning in the daemon's log and no event. An instance the reload passed
+  than "the new one is up". **`process.reloaded` is owed to a replacement that
+  is still serving**, not merely to one still registered: a replacement that
+  goes down inside the drain window keeps its row in the flock, and announcing
+  a swap off that row would name a process that is not there. A reload that
+  gives up sends `process.reload_abandoned` instead, naming whichever instance
+  the abandonment left holding the slot — the instance it gave up on
+  replacing, which is the app's live one wherever going back to serving is
+  still true, or the replacement itself where that is what went down. Read the
+  status on the event rather than assuming. Every way a swap can fail reaches
+  it: a replacement that could not be spawned at all, one that did not become
+  ready inside `listen_timeout`, one that exited before it was ready, one that
+  exited after taking the slot over but before the instance it replaced was
+  gone, and an operator's own command reaching the instance being replaced
+  while the swap was still abandonable. The one case that reports nothing is
+  the one with nothing left to name — a replacement exiting when the instance
+  it was replacing has already gone, and one deleted outright mid-drain —
+  which is a warning in the daemon's log and no event. An instance the reload
+  passed
   over — not `online` when its turn came, or already on its way out under
   something else — also produces none of the three, because no swap was ever
   attempted against it.

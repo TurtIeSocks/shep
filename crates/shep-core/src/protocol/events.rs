@@ -39,9 +39,15 @@ pub enum ProcessEventKind {
     /// This instance has replaced the one it was spawned to drain, and that
     /// one is gone — the swap is over
     Reloaded,
-    /// A reload was abandoned before this instance was replaced, so this is
-    /// still the app's live instance and the instances the reload had not
-    /// reached are left alone
+    /// A reload gave up, so the instances it had not reached are left alone
+    ///
+    /// The instance named is the one the abandonment left holding the slot,
+    /// and whether that one is serving depends on which abandonment it was.
+    /// Where the reload gave up on replacing an instance, that instance is
+    /// named and is still the app's live one. Where it gave up because the
+    /// replacement itself went down after taking the slot over, the
+    /// replacement is named and carries whatever terminal status it reached.
+    /// Read `info.status` rather than assuming.
     ReloadAbandoned,
     /// Stopped by request
     Stop,
