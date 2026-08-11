@@ -773,11 +773,10 @@ struct ReloadJob {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReloadSwap {
     /// The instance being replaced. Carries `ProcStatus::Stopping` and
-    /// [`ReloadState::SpawningReplacement`] from the moment the replacement
-    /// is spawned.
+    /// [`ReloadState::Drainee`] from the moment the replacement is spawned.
     old_id: u32,
     /// Its replacement, in the same instance slot under a new id. Carries
-    /// [`ReloadState::Draining`] until the swap finishes.
+    /// [`ReloadState::Replacement`] until the swap finishes.
     new_id: u32,
     /// How far along `SpawnNew → AwaitReady → DrainOld → ReapOld` this pair
     /// is.
@@ -1959,7 +1958,7 @@ impl<R: ProcessRunner> Actor<R> {
             .get_mut(&old_id)
             .expect("spawn_replacement: the drainee was read a moment ago");
         drainee.entry.status = ProcStatus::Stopping;
-        drainee.entry.reload = ReloadState::SpawningReplacement { new_id };
+        drainee.entry.reload = ReloadState::Drainee { new_id };
 
         match self.runner.spawn(&spec) {
             Ok((proc, io)) => {
@@ -1973,7 +1972,7 @@ impl<R: ProcessRunner> Actor<R> {
                     restarts,
                     started_at: Some(tokio::time::Instant::now()),
                     budget: RestartBudget::default(),
-                    reload: ReloadState::Draining,
+                    reload: ReloadState::Replacement,
                     credentials,
                     out_file,
                     err_file,
@@ -2065,7 +2064,7 @@ impl<R: ProcessRunner> Actor<R> {
     /// `readiness_probe`, which is most of them.
     fn reload_ready_result(&mut self, new_id: u32, manually: bool, readiness: Readiness) {
         let Some(name) = self.reload_of(new_id) else {
-            // Defensive: nothing leaves a `Draining` marker behind without a
+            // Defensive: nothing leaves a `Replacement` marker behind without a
             // job naming it. Take the ordinary transition rather than strand
             // the sheep at `Starting` for the rest of its life.
             tracing::warn!(
@@ -2354,7 +2353,7 @@ impl<R: ProcessRunner> Actor<R> {
     /// dropped where it stands and the replacement — the app's live instance
     /// by then — is left exactly as it is.
     ///
-    /// The instance being replaced keeps [`ReloadState::SpawningReplacement`]
+    /// The instance being replaced keeps [`ReloadState::Drainee`]
     /// through that second ending, deliberately. It is what routes a late exit
     /// to [`Self::reap_drainee`], and a cleared marker would send that exit to
     /// `decide_on_exit` instead — which either leaves a dead row in an
@@ -2718,7 +2717,7 @@ impl<R: ProcessRunner> Actor<R> {
         // point rather than an oversight. The replacement takes the ordinary
         // clean-stop path and stays registered as `Stopped`, like every other
         // sheep a shutdown kills. The drainee still carries
-        // `ReloadState::SpawningReplacement`, so it takes `reap_drainee` and
+        // `ReloadState::Drainee`, so it takes `reap_drainee` and
         // is DEREGISTERED — which is right for the same reason it is right
         // mid-reload: the instance slot belongs to the replacement now, and a
         // second permanent row in it would double every name-keyed verb for
@@ -2798,7 +2797,7 @@ impl<R: ProcessRunner> Actor<R> {
         // straight back into an instance slot its replacement already holds —
         // two live processes for one instance, with no path back.
         match reload {
-            ReloadState::SpawningReplacement { .. } => {
+            ReloadState::Drainee { .. } => {
                 // The drainee's slot belongs to its replacement, so its
                 // registration goes with the process — unless an operator's
                 // own command reached it first while the swap was still
@@ -2830,7 +2829,7 @@ impl<R: ProcessRunner> Actor<R> {
                     _ => return self.reap_drainee(id),
                 }
             }
-            ReloadState::Draining => {
+            ReloadState::Replacement => {
                 // Whether this is a failure depends on how far the swap got.
                 // Still `AwaitReady` and the replacement never proved it could
                 // take over, so the reload is abandoned and the drainee kept.
@@ -2848,7 +2847,7 @@ impl<R: ProcessRunner> Actor<R> {
                 // itself committed has none: it was the drainee's death that
                 // committed it, and the deregistration went with it. That left
                 // this replacement's readiness result as the last event able to
-                // end the job, and clearing its `Draining` marker a line above
+                // end the job, and clearing its `Replacement` marker a line above
                 // cancels that too, because `handle_ready_result` routes on the
                 // marker. So the job ends here or never, and a job nothing can
                 // end refuses every later reload of the app for as long as the
@@ -3206,7 +3205,7 @@ impl<R: ProcessRunner> Actor<R> {
         if slot.entry.status != ProcStatus::Starting {
             return;
         }
-        if matches!(slot.entry.reload, ReloadState::Draining) {
+        if matches!(slot.entry.reload, ReloadState::Replacement) {
             self.reload_ready_result(id, manually, readiness);
             return;
         }
@@ -5645,8 +5644,8 @@ mod tests {
     }
 
     // fails if the two halves of a swap land on the wrong entries.
-    // `SpawningReplacement` names the replacement and belongs on the drainee;
-    // `Draining` belongs on the replacement and names nothing, since the only
+    // `Drainee` names the replacement and belongs on the instance being
+    // replaced; `Replacement` belongs on the replacement and names nothing, since the only
     // caller that needs the other half holds the reload job that has it;
     // `Stopping` is the drainee's status and only the drainee's. Asserted
     // against the machine that sets them rather than a rehearsal of it —
@@ -5668,14 +5667,14 @@ mod tests {
         let replacement = &actor.sheep[&new_id].entry;
 
         assert_eq!(drainee.status, ProcStatus::Stopping);
-        assert_eq!(drainee.reload, ReloadState::SpawningReplacement { new_id });
+        assert_eq!(drainee.reload, ReloadState::Drainee { new_id });
         assert_ne!(
             replacement.status,
             ProcStatus::Stopping,
             "`Stopping` belongs to the instance going away, not the one arriving"
         );
         assert_eq!(replacement.status, ProcStatus::Starting);
-        assert_eq!(replacement.reload, ReloadState::Draining);
+        assert_eq!(replacement.reload, ReloadState::Replacement);
         assert_eq!(
             replacement.instance, drainee.instance,
             "a replacement takes the drainee's instance slot, or an app deriving \
@@ -6652,7 +6651,7 @@ mod tests {
     // `DrainOld` with the drainee already deregistered — so no second exit is
     // coming for it, and the replacement's readiness result is the last event
     // that could end the job. When the replacement goes first, clearing its
-    // `Draining` marker cancels that event too (`handle_ready_result` routes
+    // `Replacement` marker cancels that event too (`handle_ready_result` routes
     // on the marker), and nothing is left that can reach `finish_swap`. The
     // job then refuses every later reload of the app for as long as the
     // daemon runs, and drops the rest of a clustered reload's queue after the

@@ -246,9 +246,9 @@ src/
              because two live processes under one id is what the supervisor's property test
              forbids. Reload is the first operation for which those two diverge. The drainee
              takes `ProcStatus::Stopping` — which this is the ONLY production writer of, in
-             the whole daemon — and `ReloadState::SpawningReplacement{new_id}`, both BEFORE
+             the whole daemon — and `ReloadState::Drainee{new_id}`, both BEFORE
              `runner.spawn` is called; the
-             replacement carries `ReloadState::Draining`, which says only which half of the
+             replacement carries `ReloadState::Replacement`, which says only which half of the
              swap it is — the drainee it must outlive is named by the reload job, in the
              entry ids the rest of the machinery navigates by, rather than by an OS pid
              nothing reads. That ordering is load-bearing twice over: `snapshot.rs`'s `is_running`

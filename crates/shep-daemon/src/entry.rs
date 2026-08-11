@@ -104,41 +104,47 @@ impl RestartBudget {
     }
 }
 
-/// Reload state machine for graceful reload scenarios
+/// Which half of a reload's swap a [`ProcessEntry`] is, if either
 ///
-/// A reload runs two [`ProcessEntry`] records at once — the drainee (old,
-/// going away) and the replacement (new) — and the two non-`None` variants
-/// split across them rather than sharing one: [`Self::SpawningReplacement`]
-/// lives on the drainee, [`Self::Draining`] lives on the replacement. All
-/// this type says is which half of a swap an entry is. Getting from one half
-/// to the other belongs to the reload job, and only the drainee's direction
-/// is answered here at all: the replacement's back-reference lives on that
-/// job, in the entry ids the machinery around it navigates by.
+/// A reload runs two entries at once — the drainee (old, going away) and the
+/// replacement (new) — and the two non-`None` variants split across them
+/// rather than sharing one: [`Self::Drainee`] lives on the drainee,
+/// [`Self::Replacement`] lives on the replacement. The variants are named for
+/// the ROLE they mark rather than for the phase the job was in when they were
+/// written, because they outlive that phase in both directions: a drainee
+/// carries its marker through the whole drain, and a replacement carries its
+/// own from the moment it is spawned. What the job is doing is `ReloadPhase`'s
+/// to say, in `supervisor`.
+///
+/// Getting from one half to the other belongs to the reload job, and only the
+/// drainee's direction is answered here at all: the replacement's
+/// back-reference lives on that job, in the entry ids the machinery around it
+/// navigates by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadState {
-    /// Not in a reload sequence
+    /// Not half of any swap
     None,
-    /// Spawning replacement instance for graceful reload
+    /// This entry is the instance being replaced
     ///
-    /// Lives on the **drainee's** entry: the instance being replaced is what
-    /// names its replacement, not the other way around. Sibling to
-    /// [`ProcStatus::Stopping`] on that same entry's `status`, which is what
-    /// every guard that only reads `status` sees; this variant is what says
-    /// why, and who is coming to take its place.
-    SpawningReplacement {
+    /// The instance being replaced is what names its replacement, not the
+    /// other way around. Sibling to [`ProcStatus::Stopping`] on this same
+    /// entry's `status`, which is what every guard that only reads `status`
+    /// sees; this variant is what says why, and who is coming to take its
+    /// place.
+    Drainee {
         /// [`ProcessEntry::id`] of the new replacement instance — an entry
         /// ID, not an OS `pid`: the replacement is looked up by entry, and
         /// only gains an OS pid once it is actually spawned.
         new_id: u32,
     },
-    /// Draining connections before terminating old instance
+    /// This entry is the replacement
     ///
-    /// Lives on the **replacement's** entry, and says only that: this record
-    /// is the half that arrived. The drainee it must outlive is a different
-    /// record, carrying `status = `[`ProcStatus::Stopping`]` and set in the
-    /// same logical transition — reachable from the reload job, which is what
-    /// every caller that needs it already holds.
-    Draining,
+    /// Says only that: this record is the half that arrived. The drainee it
+    /// must outlive is a different record, carrying `status =
+    /// `[`ProcStatus::Stopping`]` and set in the same logical transition —
+    /// reachable from the reload job, which is what every caller that needs
+    /// it already holds.
+    Replacement,
 }
 
 #[cfg(test)]
