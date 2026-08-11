@@ -2251,13 +2251,30 @@ impl<R: ProcessRunner> Actor<R> {
         self.resolve_pending(id, info)
     }
 
-    /// Whether `id` is half of a swap that has not committed yet — the window
-    /// in which ending either half loses the overlap the reload exists for.
+    /// The app whose swap `id` is half of, while that swap has not committed
+    /// yet — the window in which ending either half loses the overlap the
+    /// reload exists for.
+    ///
+    /// The one spelling of that rule. Both of [`Self::handle_exited`]'s reload
+    /// arms ask it and want the app's name as well as the answer, and
+    /// [`Self::begin_manual`] asks it and wants only the answer — three sites
+    /// in which two readings of "has this swap committed" disagreeing is at
+    /// its most expensive, since one of them decides whether an instance that
+    /// is still serving gets killed.
+    fn uncommitted_swap_of(&self, id: u32) -> Option<String> {
+        self.reloads
+            .iter()
+            .find(|(_, job)| {
+                job.swap.phase == ReloadPhase::AwaitReady
+                    && (job.swap.old_id == id || job.swap.new_id == id)
+            })
+            .map(|(name, _)| name.clone())
+    }
+
+    /// Whether `id` is half of a swap that has not committed yet; see
+    /// [`Self::uncommitted_swap_of`], which this is the name-less reading of.
     fn in_an_uncommitted_swap(&self, id: u32) -> bool {
-        self.reloads.values().any(|job| {
-            job.swap.phase == ReloadPhase::AwaitReady
-                && (job.swap.old_id == id || job.swap.new_id == id)
-        })
+        self.uncommitted_swap_of(id).is_some()
     }
 
     /// The app whose in-flight reload names `id`, in either role.
@@ -2614,17 +2631,15 @@ impl<R: ProcessRunner> Actor<R> {
                 // `handle_extra_restart`'s `Online` guard rejects the two
                 // triggers that reach it a second time. So the warning can
                 // name the operator without hedging.
-                let name = self.reload_of(id);
-                let abandonable = name
-                    .as_deref()
-                    .is_some_and(|name| self.reloads[name].swap.phase == ReloadPhase::AwaitReady);
-                if !abandonable || kind.is_none() {
-                    return self.reap_drainee(id);
+                match self.uncommitted_swap_of(id) {
+                    Some(name) if kind.is_some() => {
+                        self.abort_reload(&name, "an operator's command reached the drainee first");
+                        // Falls through as an ordinary entry: `abort_reload`
+                        // has already cleared this one's marker and put its
+                        // status back.
+                    }
+                    _ => return self.reap_drainee(id),
                 }
-                let name = name.expect("a phase was just read off this job");
-                self.abort_reload(&name, "an operator's command reached the drainee first");
-                // Falls through as an ordinary entry: `abort_reload` has
-                // already cleared this one's marker and put its status back.
             }
             ReloadState::Draining => {
                 // Whether this is a failure depends on how far the swap got.
@@ -2633,13 +2648,8 @@ impl<R: ProcessRunner> Actor<R> {
                 // Past that and the swap is committed: this is an ordinary
                 // instance now, and its exit is its own restart policy's
                 // business.
-                let name = self.reload_of(id);
-                let abandoning = name
-                    .as_deref()
-                    .is_some_and(|name| self.reloads[name].swap.phase == ReloadPhase::AwaitReady);
                 self.clear_reload(id);
-                if abandoning {
-                    let name = name.expect("a phase was just read off this job");
+                if let Some(name) = self.uncommitted_swap_of(id) {
                     self.abort_reload(&name, "the replacement exited before it was ready");
                     return self.deregister_on_exit(id);
                 }
@@ -2679,7 +2689,7 @@ impl<R: ProcessRunner> Actor<R> {
                 // event in this file carries — the exit's own transition has
                 // not run yet, so the `Stop` or `Exit` that reports where the
                 // replacement actually landed follows a moment later.
-                if let Some(name) = name {
+                if let Some(name) = self.reload_of(id) {
                     let old_id = self.reloads[&name].swap.old_id;
                     if !self.sheep.contains_key(&old_id) {
                         debug_assert_ne!(
