@@ -544,7 +544,7 @@ mod tests {
                 let sent = envelopes.recv().await.unwrap();
                 assert_eq!(sent.body, expected_body, "verb={verb:?} input={input}");
                 // `request_and_render` is called with `deadline: None` for
-                // all three verbs — `Client::request_with_deadline` never
+                // every verb here — `Client::request_with_deadline` never
                 // leaves that unstated on the wire, it fills in
                 // `DEFAULT_DEADLINE` (client.rs:194), so the wire-level
                 // signal that the call site truly passed `None` (rather
