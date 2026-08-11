@@ -19,14 +19,63 @@ pm2's artifacts. `/Users/rin/GitHub/rand` is the style reference — read freely
 
 ## Commands
 
+MSRV 1.88, edition 2024. The build cache works — a no-op rebuild is **0.35s**.
+Slow runs are never compilation; they are test execution, and almost all of it
+is one class of test.
+
+### The inner loop — use this while iterating, including for every mutation
+
 ```bash
-cargo check --workspace          # fast gate
-cargo clippy --workspace -- -D warnings
-cargo fmt --all --check
-cargo test --workspace
+cargo test -p shep-daemon --lib --all-features -- --skip watch:: --skip extras::
 ```
 
-All four must be green before any task is called done. MSRV 1.88, edition 2024.
+**1.3s, 316 of 395 lib tests.** The 79 it skips are filesystem-watch tests that
+wait on `fseventsd`; 26 of them burn 281s of CPU between them, and they are the
+entire reason a full run costs two minutes. A mutation in `supervisor.rs` does
+not need them.
+
+### The task gate — run once, when the task is otherwise done
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+```
+
+Each from its own command with `$?` captured directly, never through a pipe —
+in zsh a pipeline's `$?` is the last command's and `${PIPESTATUS[0]}` is empty.
+**One cargo command at a time**: the workspace shares one target-dir build
+lock, so concurrent runs block rather than parallelise. (A separate worktree,
+or `benches/`, has its own lock and may run alongside.)
+
+### The phase gate — run at a merge, not per task
+
+The four above, plus `cargo test --workspace --all-features -- --test-threads=1`
+and both `benches/` gates. The serial run is not ceremony: it was red on `main`
+before Phase 5 and it caught a real regression in Phase 6.
+
+### Measuring a mutation's blast radius
+
+Use the inner loop. Escalate to `cargo test --workspace --all-features
+--no-fail-fast` **only if the targeted run shows a radius above 1**, or if the
+change crosses a crate boundary. Without `--no-fail-fast` cargo stops at the
+first failing binary and a radius of 3 reads as 1.
+
+Bounded waits on real children produce **false radii under load** — an earlier
+task saw 9 failures that were all load artefacts. Confirm any radius above 1 by
+re-running that suite in isolation with the mutation still applied.
+
+## Subagent dispatch
+
+- **Writing plans:** Opus, extra thinking. Plans carry the design work; a thin
+  plan spends its cost later, in review loops.
+- **Implementing a written plan:** Sonnet, high thinking. The design decisions
+  are already made.
+- Reviews scale to the diff: a mechanical change needs no reviewer, a normal
+  task one, and anything touching a boot path, the wire, or concurrency gets
+  two with distinct lenses — at least one of which runs the code rather than
+  reading it.
 
 ## Architecture
 
