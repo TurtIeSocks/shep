@@ -137,7 +137,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the output rather than failing the command. A pump that could not open a
   path again does fail it, naming the sheep and the path: the rename is
   still safe to act on, but that sheep is writing a stream nowhere, and
-  exiting 0 there would be the silent failure this verb exists to end. The
+  exiting 0 there would be the silent failure this verb exists to end. **That
+  failure can name a sheep the selector did not** — the daemon asks every
+  writer to a path it is rotating, which during a reload is both halves of a
+  swap, while the table stays keyed by the selector. The
   request carries `LOG_PLANE_DEADLINE` rather than the client's 5s default,
   since the daemon visits matched sheep serially with no per-sheep bound —
   the default would report failure to a `postrotate` stanza whose reopen was
