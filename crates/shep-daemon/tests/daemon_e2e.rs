@@ -262,6 +262,28 @@ impl Client {
         info
     }
 
+    /// Reads frames until a `Process` event of `kind` arrives for ANY sheep,
+    /// re-queueing (never discarding) everything else — see `pending`'s doc.
+    ///
+    /// The id-blind twin of [`Self::await_process_event`], for the one event
+    /// whose subject a caller cannot name in advance: a reload's replacement
+    /// is allocated a fresh id that first reaches the client on the event
+    /// itself.
+    async fn await_any_process_event(&mut self, kind: ProcessEventKind) -> ProcessInfo {
+        let mut skipped = Vec::new();
+        let info = loop {
+            let frame = self.next_frame().await;
+            if let ServerFrame::Event(BusEvent::Process { event, info, .. }) = &frame
+                && *event == kind
+            {
+                break info.clone();
+            }
+            skipped.push(frame);
+        };
+        requeue(&mut self.pending, skipped);
+        info
+    }
+
     /// Reads frames until a `LogOut` event for `id` arrives, re-queueing
     /// (never discarding) everything else — see `pending`'s doc — bounded by
     /// one overall [`RECV_TIMEOUT`], not merely `recv_as`'s own per-frame
@@ -1166,4 +1188,496 @@ async fn a_bare_interpreter_resolves_via_the_inherited_path() {
     assert_eq!(online.status, ProcStatus::Online);
 
     fixture.shutdown().await;
+}
+
+/// Serializes this file's two reload measurements against each other.
+///
+/// Each hands a FIXED port to a child that has to bind it twice over — the
+/// instance being replaced and its replacement, at once — so the two cannot be
+/// allowed to interleave, and `cargo test` runs the tests inside one binary in
+/// parallel by default. This is `boot.rs`'s `SIGNAL_TEST_LOCK` again, for the
+/// same class of reason its own doc records: a process-wide resource one test
+/// owns silently reaching another and deciding its result. `tokio::sync::Mutex`
+/// for that doc's reason too — the guard is held across `.await` points, where
+/// clippy's `await_holding_lock` correctly denies a blocking guard.
+///
+/// It does not serialize against other test BINARIES, which cargo also runs
+/// concurrently. Nothing else in the workspace has a child bind a port, and
+/// each measurement takes a port the OS handed out moments earlier; the
+/// residual risk is [`free_port`]'s own.
+static RELOAD_PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// How long [`reuse_port_sheep`] holds a connection before answering it.
+///
+/// A reply is not instant because a handover's cost is mostly what happens to
+/// work already in hand: at [`CONNECT_INTERVAL`] this keeps around fifteen
+/// connections open at every instant, which is what an instance killed
+/// mid-flight destroys and a draining one finishes.
+const HOLD_MS: u64 = 60;
+
+/// One new connection every 4ms for as long as a reload lasts.
+///
+/// A rate, not a wait — IR-39's no-sleeps rule is about waiting for a
+/// condition by guessing how long it takes, and this is the load the
+/// measurement is made under. Fast enough that the window between the drainee
+/// emptying its accept queue and closing its listener is a real chance to lose
+/// something, slow enough that a loss is never the fixture's queue overflowing.
+const CONNECT_INTERVAL: Duration = Duration::from_millis(4);
+
+/// How long one connection gets before it counts as lost. Two orders of
+/// magnitude over [`HOLD_MS`]: an answer that is coming arrives in milliseconds
+/// and this is slack for a loaded runner, not an expected duration.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The `AwaitReady` window a replacement gets, as `listen_timeout`.
+///
+/// The fixture signals no readiness, so this app is the `Heuristic` case: the
+/// deadline elapsing IS the readiness verdict, and it is what holds the
+/// drainee's kill ladder back until the replacement has had time to bind. Half
+/// a second against a process that binds in single-digit milliseconds — the
+/// margin is the point, since the measurement must not be a race between exec
+/// and a stop signal.
+const READY_WINDOW: UpDuration = UpDuration::from_millis(500);
+
+/// The drain window a replaced instance gets, as `graceful_timeout` — and, for
+/// an instance that will not take its stop signal, exactly how long it is
+/// before `SIGKILL`. Short only because nothing here needs longer; the spec
+/// default is 8s and a test that waited it out twice would pay it for nothing.
+const DRAIN_WINDOW: UpDuration = UpDuration::from_millis(1_000);
+
+/// Connections opened at once before a reload and again after it, to establish
+/// which process owns the port at each end of the swap.
+const BURST: usize = 10;
+
+/// What one connection to the fixture got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Attempt {
+    /// Answered, by the process with this pid. The pid is the whole reason the
+    /// fixture replies with one: it attributes every served connection to a
+    /// process, so "the port answered" and "the process I think is serving
+    /// answered" are separate claims here.
+    Served(u32),
+    /// Refused, reset, timed out, or closed with nothing on it — carrying the
+    /// reason so a failure message names it. A connection ACCEPTED into a
+    /// listener's backlog and never answered because that listener closed
+    /// arrives here as an empty answer, not as a connect error: the handshake
+    /// completed, the reset came later.
+    Failed(String),
+}
+
+impl Attempt {
+    /// Whether this attempt got no answer — the thing the measurement counts.
+    fn failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+}
+
+/// One connection: open it, read what the server says, classify the outcome.
+async fn attempt(port: u16) -> Attempt {
+    let exchange = tokio::time::timeout(ATTEMPT_TIMEOUT, async {
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        let mut answer = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut conn, &mut answer).await?;
+        std::io::Result::Ok(answer)
+    });
+    match exchange.await {
+        Err(_) => Attempt::Failed(format!("no answer inside {ATTEMPT_TIMEOUT:?}")),
+        Ok(Err(error)) => Attempt::Failed(error.to_string()),
+        Ok(Ok(answer)) => match answer.trim().parse() {
+            Ok(pid) => Attempt::Served(pid),
+            Err(_) => Attempt::Failed(format!("answered {answer:?}")),
+        },
+    }
+}
+
+/// Opens [`BURST`] connections at once and hands back what each got.
+async fn burst(port: u16) -> Vec<Attempt> {
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..BURST {
+        set.spawn(attempt(port));
+    }
+    let mut attempts = Vec::new();
+    while let Some(outcome) = set.join_next().await {
+        attempts.push(outcome.expect("an attempt cannot panic"));
+    }
+    attempts
+}
+
+/// A caller that keeps connecting for as long as a reload takes.
+struct Hammer {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<Vec<Attempt>>,
+}
+
+impl Hammer {
+    /// Starts opening one connection every [`CONNECT_INTERVAL`].
+    fn start(port: u16) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = tokio::spawn({
+            let stop = std::sync::Arc::clone(&stop);
+            async move {
+                let mut set = tokio::task::JoinSet::new();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    set.spawn(attempt(port));
+                    tokio::time::sleep(CONNECT_INTERVAL).await;
+                }
+                // Every connection already open is waited out rather than
+                // abandoned: the ones in flight when the swap finishes are
+                // precisely the ones an instance killed mid-answer loses, and
+                // dropping them here would drop the measurement with them.
+                let mut attempts = Vec::new();
+                while let Some(outcome) = set.join_next().await {
+                    attempts.push(outcome.expect("an attempt cannot panic"));
+                }
+                attempts
+            }
+        });
+        Self { stop, task }
+    }
+
+    /// Stops connecting and reports every attempt made, in-flight ones
+    /// included.
+    async fn finish(self) -> Vec<Attempt> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.task.await.expect("the hammer cannot panic")
+    }
+}
+
+/// A one-line tally of a run of attempts, so a failure message names the
+/// reasons instead of dumping several hundred outcomes.
+fn tally(attempts: &[Attempt]) -> String {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for attempt in attempts {
+        let key = match attempt {
+            Attempt::Served(pid) => format!("served by {pid}"),
+            Attempt::Failed(reason) => reason.clone(),
+        };
+        *counts.entry(key).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(reason, count)| format!("{count}x {reason}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Waits for `pid` to be the process answering `port`, failing at
+/// [`RECV_TIMEOUT`].
+///
+/// The bus cannot say when a sheep has bound: the daemon arms a readiness wait
+/// for a `Channel` or `Probe` app only, so this app — which configures neither
+/// — is `Online` from the moment it is spawned, exec included. Polling the port
+/// is what can, and it is the condition the measurement depends on rather than
+/// a proxy for it. A replacement is a different matter and needs no poll: a
+/// reload gates readiness for every app, which is what holds the drainee's
+/// ladder back (`spawn_replacement`'s own doc).
+async fn await_serving(port: u16, pid: u32) {
+    let serving = tokio::time::timeout(RECV_TIMEOUT, async {
+        while attempt(port).await != Attempt::Served(pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        serving.is_ok(),
+        "pid {pid} must be the process answering 127.0.0.1:{port}"
+    );
+}
+
+/// A port with nothing on it: bind `:0`, read what the OS chose, release it.
+///
+/// The repo's existing idiom (`supervisor.rs`, `boot.rs` and `extras.rs` all do
+/// this) and inherently a check-then-use — a stranger can take the port between
+/// the release here and the fixture's own bind. That loss is loud rather than
+/// quiet: the fixture panics with the bind error into its own stderr log and
+/// never reaches `Online`, so the wait for it fails instead of the measurement
+/// quietly measuring something else. What cannot happen is the port still being
+/// held by this file's other measurement — [`RELOAD_PORT_LOCK`] covers that,
+/// and each measurement takes a fresh port regardless.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("the OS must have a free loopback port")
+        .local_addr()
+        .expect("a bound listener has an address")
+        .port()
+}
+
+/// The fixture server's binary — see `examples/reuse_port_sheep.rs` for what it
+/// is and why it is an example.
+///
+/// Located rather than named: `env!("CARGO_BIN_EXE_<name>")` covers a package's
+/// `[[bin]]` targets and nothing else. Cargo puts an example at
+/// `<target>/<triple?>/<profile>/examples/<name>` and this test binary at the
+/// sibling `.../deps/<name>-<hash>`, so it is two levels up and back down — a
+/// shape that survives `--target` (the musl leg of CI runs these tests) and a
+/// custom `CARGO_TARGET_DIR`, since both move the whole tree together.
+fn reuse_port_sheep() -> std::path::PathBuf {
+    let test_binary = std::env::current_exe().expect("a running test knows its own path");
+    let path = test_binary
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("a test binary lives at <profile>/deps/<name>")
+        .join("examples")
+        .join("reuse_port_sheep");
+    assert!(
+        path.is_file(),
+        "{} must exist: a plain `cargo test` builds the package's examples, so a \
+         missing one means this test was run some way that does not",
+        path.display()
+    );
+    path
+}
+
+/// Reloads one `reuse_port_sheep` while a caller connects continuously, and
+/// hands back every attempt made between the request and the swap finishing.
+///
+/// Asserts what holds whatever the app does with its stop signal, and on every
+/// platform: the swap completes, the replacement is what answers the port
+/// afterwards, and the instance it replaced is gone. The counting is the
+/// caller's, because that is the part the two behaviours disagree about.
+async fn reload_under_load(name: &str, defiant: bool) -> Vec<Attempt> {
+    let _port_guard = RELOAD_PORT_LOCK.lock().await;
+    let port = free_port();
+
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+    let subscribed = client
+        .request(Request::Subscribe {
+            topics: vec!["process.*".to_string()],
+        })
+        .await;
+    assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
+
+    let mut app = AppConfig::minimal(name, &reuse_port_sheep().display().to_string());
+    app.interpreter = Some("none".to_string());
+    app.env
+        .insert("SHEEP_PORT_BASE".to_string(), port.to_string());
+    app.env
+        .insert("SHEEP_HOLD_MS".to_string(), HOLD_MS.to_string());
+    if defiant {
+        app.env.insert("SHEEP_DEFIANT".to_string(), "1".to_string());
+    }
+    app.listen_timeout = READY_WINDOW;
+    app.graceful_timeout = DRAIN_WINDOW;
+    // Teardown's ladder, not the reload's. A defiant replacement has to be
+    // SIGKILLed at the end of the test as well, and the spec's 1.6s default
+    // would be 1.6s of waiting for a process that is never going to answer.
+    app.kill_timeout = DRAIN_WINDOW;
+    // Nothing may respawn behind the measurement: a restart would put a third
+    // process on this port and every count below would be about the wrong two.
+    // The drainee's own exit is a claimed manual stop and would not restart
+    // regardless — this covers everything else.
+    app.autorestart = false;
+
+    let started = client.request(Request::Start { apps: vec![app] }).await;
+    let Response::Started(infos) = started.result.unwrap() else {
+        panic!("expected started")
+    };
+    let drainee_id = infos[0].id;
+    let drainee_pid = infos[0].pid.expect("a real spawn reports a real pid");
+    client
+        .await_process_event(drainee_id, ProcessEventKind::Online)
+        .await;
+    await_serving(port, drainee_pid).await;
+
+    // The port answers, and it answers as the process this test thinks is on
+    // it. Both halves are load-bearing: this is what rules out a stranger, a
+    // leftover from the sibling measurement, or a client of this test's own
+    // making being the reason any later attempt fails.
+    let before = burst(port).await;
+    assert_eq!(
+        tally(&before),
+        format!("{BURST}x served by {drainee_pid}"),
+        "the sheep must own the port outright before its reload begins"
+    );
+
+    let hammer = Hammer::start(port);
+    let accepted = client
+        .request(Request::Reload {
+            selector: SelectorSpec::Name(name.to_string()),
+        })
+        .await;
+    let Response::Reloading(accepted) = accepted.result.unwrap() else {
+        panic!("expected an accepted reload")
+    };
+    assert_eq!(accepted.len(), 1);
+
+    // `Reloaded` is the one event that says a swap SUCCEEDED, and it carries
+    // the replacement. Waiting for it — rather than for a duration — is what
+    // makes the window measured below exactly the reload.
+    let replacement = client
+        .await_any_process_event(ProcessEventKind::Reloaded)
+        .await;
+    let during = hammer.finish().await;
+    let replacement_pid = replacement.pid.expect("a replacement has a pid");
+    assert_ne!(replacement_pid, drainee_pid);
+    assert_reaped(i32::try_from(drainee_pid).unwrap()).await;
+
+    // One row, the replacement's: the drainee's registration went with the
+    // process rather than leaving a second entry in an instance slot its
+    // replacement now holds.
+    let listed = client.request(Request::ListFlock).await;
+    let Response::Flock(flock) = listed.result.unwrap() else {
+        panic!("expected flock")
+    };
+    assert_eq!(flock.len(), 1);
+    assert_eq!(flock[0].id, replacement.id);
+    // The status is the sharpest assertion in this function, and the one that
+    // catches a swap committed before its replacement could prove anything —
+    // see `a_reload_costs_a_draining_app_no_connections`'s second "fails if",
+    // where that mutation costs no connections at all and shows up only here.
+    assert_eq!(flock[0].status, ProcStatus::Online);
+
+    // The replacement serves, on the same port, under the same instance slot —
+    // the fixture derives its port from `SHEP_INSTANCE`, so a replacement put
+    // in a different slot would be answering somewhere else entirely.
+    let after = burst(port).await;
+    assert_eq!(
+        tally(&after),
+        format!("{BURST}x served by {replacement_pid}"),
+        "the replacement must own the port outright once the swap is done"
+    );
+
+    let dir = fixture.shutdown().await;
+    assert_reaped(i32::try_from(replacement_pid).unwrap()).await;
+    drop(dir);
+
+    during
+}
+
+/// A reload of an app that drains costs a caller connecting continuously
+/// nothing.
+///
+/// # What shep promises here, and what it does not
+///
+/// The overlap, not zero downtime. Mid-swap both instances are bound to the
+/// same port and both are serving, which is the window an application needs in
+/// order to hand over — but a listener's accept backlog is RESET when it
+/// closes, so what is queued and not yet accepted is lost unless the app itself
+/// drains inside `graceful_timeout`. Zero downtime is the application's
+/// achievement; the window is shep's. This measures a cooperating app's side of
+/// that bargain, `a_reload_costs_a_defiant_app_the_work_it_will_not_finish`
+/// measures the other, and the gap between the two counts is the finding
+/// neither of them states alone.
+///
+/// # Why the count is asserted on Linux only
+///
+/// Because the two platforms do not share the mechanism the count is about.
+/// From this test's own runs (2026-08-10, ~95 connections across the reload):
+///
+/// - **Linux** load-balances new connections over every listener in the
+///   `SO_REUSEPORT` group, so the instance being replaced keeps taking a share
+///   of them right up until it closes — 47 to the drainee, 48 to its
+///   replacement. Zero here says the drainee carried half the traffic through
+///   the whole overlap and handed every connection over.
+/// - **macOS** gives every new connection to the LAST socket to bind, so the
+///   drainee stops receiving them the moment its replacement is up — 1 to the
+///   drainee, 93 to its replacement. There is almost nothing left for a zero
+///   here to be about, and the mutation below proves it: a drain that waits
+///   nothing before `SIGKILL` still costs macOS zero connections.
+///
+/// So macOS asserts what it can still see, which is what `reload_under_load`
+/// asserts for both: the swap completes, the replacement is what answers the
+/// port afterwards, and the instance it replaced is gone.
+///
+/// # Fails if
+///
+/// **The drain stops waiting** (Linux). `LadderCap::of`'s `Drain` arm returning
+/// `Duration::ZERO` — a ladder that signals and `SIGKILL`s in the same breath —
+/// takes this to 5 lost of 89, every one of them a connection the drainee had
+/// accepted and not yet answered. The same mutation on macOS: 0 lost of 94,
+/// which is the platform statement above made concrete.
+///
+/// **The swap is committed before the replacement can serve** (both platforms),
+/// which is a reload degenerating into a restart. Calling `begin_drain` from
+/// `spawn_replacement`'s success arm instead of leaving it to the replacement's
+/// readiness result reddens the flock check inside `reload_under_load` — the
+/// swap reports `Reloaded` with its replacement still `Starting`. Measured, and
+/// worth recording because the guess was wrong: it does NOT show up in the
+/// count on either platform (0 lost of 11 on Linux, 0 of 13 on macOS). The
+/// drainee's own drain outlasts its replacement's exec, so the port is never
+/// actually unserved — the loss the mutation causes is to the meaning of
+/// `Reloaded`, not to any connection.
+///
+/// Nothing else in the suite reaches either: the engine tier's runner has no
+/// sockets, so there a swap that keeps its ordering and one that drops it
+/// produce the same events.
+#[tokio::test]
+async fn a_reload_costs_a_draining_app_no_connections() {
+    let during = reload_under_load("drainer", false).await;
+    let failures = during.iter().filter(|attempt| attempt.failed()).count();
+    // Printed on every platform, asserted on one: the count is the finding, and
+    // it is what the sibling measurement's own count is worth reading against.
+    println!(
+        "draining app, {} attempts across the reload, {failures} lost: {}",
+        during.len(),
+        tally(&during)
+    );
+    assert!(
+        during.len() > 20,
+        "the reload must last long enough to be measured: {}",
+        tally(&during)
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        failures,
+        0,
+        "an app that drains inside its graceful timeout must lose nothing: {}",
+        tally(&during)
+    );
+}
+
+/// A reload of an app that ignores its stop signal loses the caller work, and
+/// shep completes the swap anyway.
+///
+/// The honest half of the pair. shep's contribution is the overlap; an instance
+/// that will not stop accepting, finish what it has, and exit inside
+/// `graceful_timeout` reaches the end of that window still holding work, and
+/// `SIGKILL` takes the work with it. No supervisor can give that app zero
+/// downtime, and a suite that shipped only the cooperating fixture would be
+/// asserting a promise shep does not make.
+///
+/// # Why the count is asserted on Linux only
+///
+/// Because only Linux can produce it, for the reason the sibling test's doc
+/// records: there the defiant instance is still being handed a share of every
+/// new connection, and still holding some unanswered, at the moment `SIGKILL`
+/// lands. Measured across five runs each — Linux 5, 7, 5, 7 and 8 lost of
+/// ~260; macOS 0 of ~280, every run. On macOS the defiant instance is handed
+/// nothing from the moment its replacement binds, so it is killed empty, and
+/// asserting non-zero there would be asserting a bug that platform cannot have.
+///
+/// # Fails if
+///
+/// **The application cooperates** (Linux) — which is the whole point of
+/// counting rather than asserting a boolean. Dropping `SHEEP_DEFIANT` from this
+/// app's environment takes the same reload, under the same load, from 5 lost to
+/// 0 lost of 95, with the drainee still carrying half the connections (50 to
+/// it, 45 to its replacement). Nothing about shep changed.
+///
+/// **The ladder stops escalating** (both platforms). Removing `kill_process`'s
+/// `SIGKILL` rung leaves a sheep that never exits, so no `Reloaded` ever
+/// reaches the bus and the wait for it times out at 10s — the shared
+/// assertions in `reload_under_load` are what catch that, and for this app
+/// "the drainee is gone" can only mean the escalation happened.
+#[tokio::test]
+async fn a_reload_costs_a_defiant_app_the_work_it_will_not_finish() {
+    let during = reload_under_load("defier", true).await;
+    let failures = during.iter().filter(|attempt| attempt.failed()).count();
+    println!(
+        "defiant app, {} attempts across the reload, {failures} lost: {}",
+        during.len(),
+        tally(&during)
+    );
+    assert!(
+        during.len() > 20,
+        "the reload must last long enough to be measured: {}",
+        tally(&during)
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        failures > 0,
+        "an app that will not drain must be seen to lose connections: {}",
+        tally(&during)
+    );
 }
