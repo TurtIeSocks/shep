@@ -346,21 +346,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `runner::FlushError` names the files either half of the verb could not
   deal with.
 - Answer `Request::Reopen`: the supervisor keeps a clone of every running
-  sheep's log-control sender and pushes a `LogCtl::Reopen` at each sheep the
-  selector matches, which is what makes `create`-mode rotation — rename the
-  file, then ask — work at all. Until now the pump kept filling the renamed
-  inode and the live path was never recreated, so `shep bleats --no-follow`
-  printed nothing and exited 0 with no diagnostic; a restart was the only
-  working reopen. The reply lands only once every matched pump has swapped
-  both handles, so a `postrotate` stanza that waits for it knows nothing is
-  still holding what it renamed. A matched sheep with no live pump is
-  reported as a success rather than an error: there was nothing to reopen,
-  which is not a failure worth failing `reopen all` over. A pump that
-  answered and could not open a path again is the opposite case and fails
-  the request (`SupervisorError::ReopenFailed`, `RpcErrorCode::Internal` on
-  the wire), naming every such sheep and path — every matched sheep is
-  visited first, so one sheep whose log directory is gone neither stops the
-  rest being reopened nor goes unreported. The
+  sheep's log-control sender and pushes a `LogCtl::Reopen` at every sheep
+  writing to a path a matched sheep writes to, which is what makes
+  `create`-mode rotation — rename the file, then ask — work at all. Until now
+  the pump kept filling the renamed inode and the live path was never
+  recreated, so `shep bleats --no-follow` printed nothing and exited 0 with
+  no diagnostic; a restart was the only working reopen. The reach is keyed by
+  the path rather than by the selector because what a rotator renamed is a
+  file, and any writer left unasked goes on appending to the renamed inode —
+  see the reload entry above for the case that forced the distinction. The
+  reply stays selector-keyed and names the sheep the operator asked for and
+  no others; a failure can name one they did not. That reply lands only once
+  every pump reached has swapped both handles, so a `postrotate` stanza that
+  waits for it knows nothing is still holding what it renamed. A matched
+  sheep with no live pump is reported as a success rather than an error:
+  there was nothing to reopen, which is not a failure worth failing `reopen
+  all` over. A pump that answered and could not open a path again is the
+  opposite case and fails the request (`SupervisorError::ReopenFailed`,
+  `RpcErrorCode::Internal` on the wire), naming every such sheep and path —
+  every pump is visited first, so one sheep whose log directory is gone
+  neither stops the rest being reopened nor goes unreported. The
   acknowledgements are awaited on a task of their own and never inside the
   actor loop — an actor parked on one stops draining its mailbox, which
   stops the sheep task draining its logs, which stops the pump answering.
