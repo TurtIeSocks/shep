@@ -221,6 +221,21 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
             )
             .await
         }
+        // `Reloading` names an acceptance, and the deadline machinery above
+        // is why it has to. The supervisor answers this one as soon as the
+        // reload is taken, before the first replacement is spawned, so the
+        // reply lands well inside any budget; a reply that waited for the
+        // swaps would routinely outlive `MAX_DEADLINE_MS` and be abandoned by
+        // `with_deadline` while the reload it asked for went on running.
+        Request::Reload { selector } => {
+            selector_call(
+                id,
+                selector,
+                |s| ctx.supervisor.reload(s),
+                Response::Reloading,
+            )
+            .await
+        }
         Request::Reopen { selector } => {
             selector_call(
                 id,
@@ -545,6 +560,135 @@ mod tests {
             ProcStatus::Online,
             "a reopen must not disturb the sheep it reopens"
         );
+    }
+
+    /// Fails if `Reload` is left to the catch-all arm at the bottom of `run`,
+    /// which answers `Internal` for a request this daemon in fact implements.
+    ///
+    /// Fails too if the arm is routed to another verb's supervisor call while
+    /// keeping `Response::Reloading` as its answer — the shape a copy-pasted
+    /// arm takes, and one no assertion on the reply alone can see. What
+    /// separates a reload from every other verb is the flock it leaves
+    /// behind: two entries in one instance slot, the drainee `Stopping` under
+    /// its original id and a replacement `Starting` under a new one. A
+    /// `restart` leaves one entry under the same id, a `stop` one entry
+    /// `Stopped`.
+    ///
+    /// The mid-swap state is what is asserted, and it is not a race: nothing
+    /// here advances the clock, so the replacement's readiness wait cannot
+    /// elapse between the two dispatches. `ListFlock` is queued to an actor
+    /// that has already finished `handle_reload` — the reply is sent inside
+    /// it, before the swap starts, but the whole function runs to completion
+    /// before the actor takes another message.
+    ///
+    /// Three scripts, of which a correct run uses two: the original and its
+    /// replacement. The third is sized for the spawn a broken arm performs
+    /// that a correct one does not — a `restart` misroute's respawn on top of
+    /// a swap — so it lands as a live entry rather than as the
+    /// `SpawnFailed("script exhausted")` that an exhausted pool turns into
+    /// `Errored`, which reads like a different failure entirely.
+    #[tokio::test(start_paused = true)]
+    async fn reload_routes_to_the_supervisor_and_starts_a_swap() {
+        let h = harness(vec![ProcScript::never_exits(); 3]);
+        dispatch(
+            envelope(
+                1,
+                Request::Start {
+                    apps: vec![AppConfig::minimal("web", "./srv")],
+                },
+            ),
+            &h.ctx,
+        )
+        .await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::Reload {
+                        selector: SelectorSpec::Name("web".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Response::Reloading(accepted) = reply.result.unwrap() else {
+            panic!("expected reloading")
+        };
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(
+            accepted[0].status,
+            ProcStatus::Online,
+            "the answer is the flock as it stood when the reload was accepted"
+        );
+
+        let listed = reply_of(dispatch(envelope(3, Request::ListFlock), &h.ctx).await);
+        let Response::Flock(flock) = listed.result.unwrap() else {
+            panic!("expected flock")
+        };
+        assert_eq!(
+            flock.len(),
+            2,
+            "a swap in progress is two entries in one instance slot, not one: {flock:?}"
+        );
+        assert_eq!(flock[0].id, accepted[0].id);
+        assert_eq!(flock[0].status, ProcStatus::Stopping);
+        assert_ne!(
+            flock[1].id, accepted[0].id,
+            "the replacement takes a new id"
+        );
+        assert_eq!(flock[1].status, ProcStatus::Starting);
+    }
+
+    /// The whole of what an operator sees when a reload is refused, and both
+    /// refusals reach them the same way: the daemon's code becomes the CLI's
+    /// exit status, and the daemon's message is the only thing printed.
+    ///
+    /// Fails if either arm answers a code that is not `Internal` — the
+    /// `RpcErrorCode` set is versioned, so neither refusal has one of its
+    /// own, and `SupervisorError`'s `Display` is what is left to tell them
+    /// apart. Fails too if `ReloadInFlight`'s arm drops the app's name: the
+    /// name is the actionable half of that message, because it says which
+    /// reload to wait for.
+    ///
+    /// `ReloadInFlight` reaching the wire at all is pinned in `supervisor`
+    /// (`a_second_reload_of_an_app_already_reloading_is_refused`), as is a
+    /// reload arriving after a shutdown has begun
+    /// (`a_reload_is_refused_once_a_shutdown_has_begun`, which answers
+    /// `EngineStopped`). What neither reaches is this mapping.
+    #[test]
+    fn a_refused_reload_is_internal_and_says_which_refusal_it_was() {
+        let in_flight = rpc_error(&SupervisorError::ReloadInFlight("web".to_string()));
+        assert_eq!(in_flight.code, RpcErrorCode::Internal);
+        assert_eq!(in_flight.message, "web is already being reloaded");
+
+        let shutting_down = rpc_error(&SupervisorError::EngineStopped);
+        assert_eq!(shutting_down.code, RpcErrorCode::Internal);
+        assert_eq!(shutting_down.message, "the supervisor engine has stopped");
+    }
+
+    /// Fails if `Reload` skips the selector conversion, or converts it
+    /// without reporting the failure — a peer regex the daemon cannot compile
+    /// is the client's usage error, not an internal one. A hand-rolled arm
+    /// that answered `Reloading` correctly could still lose this; it is the
+    /// shared `selector_call` helper that keeps it.
+    #[tokio::test(start_paused = true)]
+    async fn a_bad_reload_selector_is_invalid_config() {
+        let h = harness(vec![]);
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Reload {
+                        selector: SelectorSpec::Regex("((".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
     }
 
     /// Fails if `Reopen` skips the selector conversion, or converts it

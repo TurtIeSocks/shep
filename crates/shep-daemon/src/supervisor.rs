@@ -123,13 +123,6 @@ pub(crate) enum Command {
     },
     /// Replaces every matched sheep with a fresh instance, one instance of
     /// each app at a time.
-    ///
-    /// `allow` rather than `expect` because the supervisor's own tests drive
-    /// this command while no production caller does yet: the expectation
-    /// would be fulfilled in the test build and unfulfilled in the lib build,
-    /// which is an error either way round. Both attributes go when the
-    /// control socket grows the verb that sends it.
-    #[allow(dead_code, reason = "no production sender until the wire verb lands")]
     Reload {
         /// Which sheep.
         selector: ProcessSelector,
@@ -463,7 +456,6 @@ impl SupervisorHandle {
     /// - [`SupervisorError::EngineStopped`] — the actor is gone, or a
     ///   graceful shutdown has begun (a reload spawns, and a shutdown forbids
     ///   any new spawn).
-    #[allow(dead_code, reason = "no production caller until the wire verb lands")]
     pub(crate) async fn reload(
         &self,
         selector: ProcessSelector,

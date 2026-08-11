@@ -130,8 +130,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator did not, which is the honest report of a shared file that could not
   be reopened.
 
-  Not yet reachable from the control socket: the wire verb and the CLI are
-  separate work.
+  **The verb is answered on the control socket.** `Request::Reload` comes
+  back as `Response::Reloading` the moment the reload is *accepted*, before
+  the first replacement is spawned, carrying the matched sheep as they stood
+  at that moment. That is forced rather than chosen: one instance costs a
+  readiness wait plus a drain in the worst case, a client's budget is capped
+  at 60s, and expiring a budget bounds the reply and not the actor's work —
+  so a reply that waited for the swaps would routinely be abandoned while the
+  reload it asked for went on running. Both refusals — a selector that
+  reached an app already reloading, and a reload arriving after a shutdown
+  has begun — answer `RpcErrorCode::Internal` carrying the `SupervisorError`'s
+  own message, since that code set is versioned and neither refusal has one
+  of its own.
 - Add `SupervisorError::ReloadInFlight`, carrying an app's name — a reload
   that reaches an app whose reload has not finished is refused whole rather
   than queued or partly accepted. **Breaking for anything matching
