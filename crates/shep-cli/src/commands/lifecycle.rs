@@ -545,8 +545,8 @@ mod tests {
                 assert_eq!(sent.body, expected_body, "verb={verb:?} input={input}");
                 // `request_and_render` is called with `deadline: None` for
                 // every verb here — `Client::request_with_deadline` never
-                // leaves that unstated on the wire, it fills in
-                // `DEFAULT_DEADLINE` (client.rs:194), so the wire-level
+                // leaves that unstated on the wire — `request_with_deadline`
+                // fills in `DEFAULT_DEADLINE` — so the wire-level
                 // signal that the call site truly passed `None` (rather
                 // than some other explicit `Some(_)`) is the envelope
                 // carrying exactly that default.
