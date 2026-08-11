@@ -1720,7 +1720,11 @@ impl<R: ProcessRunner> Actor<R> {
         // `SupervisorError::ReloadInFlight` for why a partly-accepted
         // selector is worse than a refused one.
         let in_flight = matched.iter().find_map(|id| {
-            let name = &self.sheep[id].entry.spec.config().name;
+            let slot = self
+                .sheep
+                .get(id)
+                .expect("handle_reload: `matched` holds ids read off this map a moment ago");
+            let name = &slot.entry.spec.config().name;
             self.reloads.contains_key(name).then(|| name.clone())
         });
         if let Some(name) = in_flight {
@@ -1730,7 +1734,13 @@ impl<R: ProcessRunner> Actor<R> {
 
         let accepted: Vec<ProcessInfo> = matched
             .iter()
-            .map(|id| to_info(&self.sheep[id].entry))
+            .map(|id| {
+                let slot = self
+                    .sheep
+                    .get(id)
+                    .expect("handle_reload: `matched` holds ids read off this map a moment ago");
+                to_info(&slot.entry)
+            })
             .collect();
 
         // Grouped by app because a reload runs one instance of an app at a
@@ -1739,7 +1749,11 @@ impl<R: ProcessRunner> Actor<R> {
         // thing until the first respawn and then quietly stop being.
         let mut queues: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
         for id in matched {
-            let entry = &self.sheep[&id].entry;
+            let entry = &self
+                .sheep
+                .get(&id)
+                .expect("handle_reload: `matched` holds ids read off this map a moment ago")
+                .entry;
             if entry.status != ProcStatus::Online {
                 continue;
             }
