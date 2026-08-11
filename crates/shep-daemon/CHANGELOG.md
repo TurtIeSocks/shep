@@ -112,6 +112,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still reaches either half and still wins — a reload is not a lock on the
   app.
 
+  **Both halves of a swap write to one pair of log files**, because a sheep's
+  log paths are derived from its name and its instance and the two entries
+  share an instance slot. Every app is therefore a shared-log-path app for as
+  long as a swap lasts, which until now took a `merge_logs` or an explicit
+  `out_file` to arrange. `shep flush` already drew its barrier around the file
+  rather than around the selector and needed nothing; **`shep reopen` now
+  reaches every pump writing to a path it is rotating** instead of only the
+  sheep the selector matched. Without that, an external rotator renaming a
+  file mid-reload left the drainee appending to the renamed inode — the
+  archive going on growing after the rotation meant to close it, while the
+  recreated path took only the replacement's lines, and the `postrotate`
+  stanza that waited for a zero exit was told the opposite. The same gap was
+  open, and is now closed, for `shep reopen <one id>` against any app whose
+  instances share a path. The reply is unchanged and still names the sheep the
+  selector reached and no others; a failure, however, can now name a sheep the
+  operator did not, which is the honest report of a shared file that could not
+  be reopened.
+
   Not yet reachable from the control socket: the wire verb and the CLI are
   separate work.
 - Add `SupervisorError::ReloadInFlight`, carrying an app's name — a reload

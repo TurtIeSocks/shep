@@ -243,10 +243,15 @@ pub enum SupervisorError {
     /// it — a partly-accepted selector leaves the caller unable to tell which
     /// half was taken.
     ReloadInFlight(String),
-    /// At least one matched sheep's log pump could not open a log path
-    /// again, so that stream has no file to write to. Carries one
+    /// At least one log pump could not open a log path again, so that stream
+    /// has no file to write to. Carries one
     /// `"<name> (id <id>): <paths and reasons>"` entry per such sheep,
-    /// joined by `"; "`. Every other matched sheep was reopened.
+    /// joined by `"; "`. Every other pump was reopened.
+    ///
+    /// The sheep named can be one the selector did not match. The reach is
+    /// every writer to a matched path — several instances of an app can share
+    /// one log file — so a sibling that could not be reopened is reported
+    /// rather than swallowed.
     ///
     /// One sheep's own two paths arrive joined by `", "` — see
     /// [`ReopenError::message`](crate::runner::ReopenError::message) — so
@@ -489,20 +494,22 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
     }
 
-    /// Reopens the log files of every sheep matching `selector`, for an
-    /// external rotator that has renamed them.
+    /// Reopens the log files of every sheep matching `selector` — and of
+    /// every other sheep writing to one of their paths — for an external
+    /// rotator that has renamed them.
     ///
-    /// Answers only once every matched sheep's log pump has swapped both
-    /// handles, which is the contract a logrotate `postrotate` stanza needs:
-    /// when this returns, no live pump is still holding a renamed inode. A
-    /// matched sheep that is not running has no pump and nothing to reopen,
-    /// and is reported as a success alongside the rest — see
-    /// [`Actor::handle_reopen`] for both ways that shows up.
+    /// Answers only once every one of those pumps has swapped both handles,
+    /// which is the contract a logrotate `postrotate` stanza needs: when this
+    /// returns, no live pump is still holding a renamed inode. A matched sheep
+    /// that is not running has no pump and nothing to reopen, and is reported
+    /// as a success alongside the rest. The reply names the sheep the selector
+    /// reached and no others — see [`Actor::handle_reopen`] for why the work
+    /// is wider than the answer.
     ///
     /// # Errors
     ///
     /// - [`SupervisorError::NotFound`] — nothing matched.
-    /// - [`SupervisorError::ReopenFailed`] — every matched pump answered,
+    /// - [`SupervisorError::ReopenFailed`] — every pump reached answered,
     ///   but at least one could not open a log path again. The old handles
     ///   are closed either way, so the rename is safe to act on; what
     ///   failed is the sheep getting a file back.
@@ -2206,8 +2213,9 @@ impl<R: ProcessRunner> Actor<R> {
         }
     }
 
-    /// Resolves `selector` and hands every match to a task that reopens its
-    /// log files and then answers the caller.
+    /// Resolves `selector` and hands every pump writing to a matched sheep's
+    /// log paths to a task that reopens their files and then answers the
+    /// caller.
     ///
     /// # Why the acknowledgements are never awaited here
     ///
@@ -2243,36 +2251,84 @@ impl<R: ProcessRunner> Actor<R> {
     ///
     /// Nothing to reopen, reported as a success rather than an error —
     /// nobody rotating logs wants `reopen all` to fail because one sheep in
-    /// the flock is stopped. It reaches the task in one of two shapes, and
-    /// they are the same answer: `log_ctl` is `None` because no spawn ever
-    /// succeeded for this slot, or the send (or the acknowledgement) fails
+    /// the flock is stopped. It shows up in one of two shapes, and they are
+    /// the same answer: the slot's `log_ctl` is `None` because no spawn ever
+    /// succeeded for it, so it contributes no pump below and is a row in the
+    /// reply and nothing more; or the send (or the acknowledgement) fails
     /// because the pump has ended, which is how a stopped sheep normally
-    /// presents.
+    /// presents, and [`reopen_logs`] reads that as the no-op it is.
+    ///
+    /// # Why more pumps are reopened than the reply names
+    ///
+    /// A log path can have writers the selector never named. Two apps can be
+    /// given one explicit `out_file`; `merge_logs` points every instance of an
+    /// app at one path; and a reload makes every app one of these for the
+    /// length of a swap, because both entries sharing an instance slot derive
+    /// byte-identical paths from it. So the reach is every slot writing to a
+    /// path a matched sheep writes to, matched or not.
+    ///
+    /// The rule has to be "every writer to this path" rather than "every sheep
+    /// the selector matched" because what an external rotator renamed is a
+    /// FILE, and a pump left unasked goes on appending to the renamed inode:
+    /// the archive keeps growing, the recreated path stays empty, and the
+    /// `postrotate` stanza that waited for a zero exit was told the opposite.
+    /// Selector-keying cannot express that, since the operator naming one
+    /// writer of a file is not a statement about the others.
+    ///
+    /// [`Actor::handle_flush`] draws its barrier around the same set for a
+    /// harsher reason — an unflushed sibling's write lands in a file the
+    /// operator was just told is empty — and the two verbs agreeing on the
+    /// reach is worth more than either argument alone: an operator rotating
+    /// logs should not have to hold two different mental models of which
+    /// sheep a log-plane verb touches.
+    ///
+    /// The reply stays keyed by the selector, exactly as `flush`'s does: a row
+    /// means "a sheep you named", and adding the unnamed writers would make
+    /// the one table an operator reads unable to say which was which.
     fn handle_reopen(
         &self,
         selector: &ProcessSelector,
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     ) {
-        let mut matched: Vec<(ProcessInfo, Option<mpsc::Sender<LogCtl>>)> = self
-            .sheep
-            .iter()
-            .filter(|(id, slot)| {
-                let config = slot.entry.spec.config();
-                selector.matches(&config.name, **id, config.fold.as_deref())
-            })
-            .map(|(_, slot)| (to_info(&slot.entry), slot.log_ctl.clone()))
-            .collect();
+        let mut matched: Vec<ProcessInfo> = Vec::new();
+        let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
+        for (id, slot) in &self.sheep {
+            let config = slot.entry.spec.config();
+            if !selector.matches(&config.name, *id, config.fold.as_deref()) {
+                continue;
+            }
+            paths.insert(slot.entry.out_file.clone());
+            paths.insert(slot.entry.err_file.clone());
+            matched.push(to_info(&slot.entry));
+        }
 
         if matched.is_empty() {
             let _ = reply.send(Err(SupervisorError::NotFound));
             return;
         }
 
-        // Sorted here, where the whole set is in hand, rather than after the
-        // reopens: `HashMap` iteration order is arbitrary, and a caller
-        // reading the reply as a table wants the same id order `list` gives.
-        matched.sort_unstable_by_key(|(info, _)| info.id);
-        spawn_reopen_task(matched, reply);
+        let mut pumps: Vec<(ProcessInfo, mpsc::Sender<LogCtl>)> = self
+            .sheep
+            .values()
+            .filter(|slot| {
+                paths.contains(&slot.entry.out_file) || paths.contains(&slot.entry.err_file)
+            })
+            .filter_map(|slot| {
+                slot.log_ctl
+                    .clone()
+                    .map(|log_ctl| (to_info(&slot.entry), log_ctl))
+            })
+            .collect();
+
+        // Both sorted here, where the whole set is in hand, rather than after
+        // the reopens: `HashMap` iteration order is arbitrary, a caller
+        // reading the reply as a table wants the same id order `list` gives,
+        // and pump failures are reported in the order they are collected, so
+        // an unsorted reopen set would make a multi-pump failure message read
+        // differently run to run.
+        matched.sort_unstable_by_key(|info| info.id);
+        pumps.sort_unstable_by_key(|(info, _)| info.id);
+        spawn_reopen_task(matched, pumps, reply);
     }
 
     /// Resolves `selector` and hands every match to a task that flushes its
@@ -3152,31 +3208,37 @@ fn spawn_readiness_task(
 /// sheep behind it rather than just itself: the request's own deadline
 /// (`crate::rpc`'s `budget`) is what bounds the caller either way.
 ///
+/// `pumps` is every writer to a path a sheep in `matched` writes to, which is
+/// a wider set than `matched` whenever a selector names some but not all of
+/// the sheep sharing a file — see [`Actor::handle_reopen`] for why the reach
+/// is drawn around the file rather than around the selection, and why the
+/// reply is not.
+///
 /// Must be called from within a Tokio runtime context: it spawns
 /// immediately, like `spawn_readiness_task` and `schedule_restart`.
 fn spawn_reopen_task(
-    matched: Vec<(ProcessInfo, Option<mpsc::Sender<LogCtl>>)>,
+    matched: Vec<ProcessInfo>,
+    pumps: Vec<(ProcessInfo, mpsc::Sender<LogCtl>)>,
     reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
 ) {
     tokio::spawn(async move {
-        let mut reopened = Vec::with_capacity(matched.len());
         let mut failures = Vec::new();
-        for (info, log_ctl) in matched {
-            if let Some(log_ctl) = log_ctl
-                && let Err(error) = reopen_logs(&log_ctl).await
-            {
+        for (info, log_ctl) in &pumps {
+            if let Err(error) = reopen_logs(log_ctl).await {
                 // Named and id'd, because the reply that would have said
-                // which sheep these are is the one being replaced.
+                // which sheep these are is the one being replaced — and
+                // because a widened set can fail on a sheep the operator never
+                // named, which is worth being told in those words rather than
+                // as an unattributed path.
                 failures.push(format!("{} (id {}): {error}", info.name, info.id));
             }
-            reopened.push(info);
         }
-        // Every sheep is visited before anything is reported: one sheep
+        // Every pump is visited before anything is reported: one sheep
         // whose log directory is gone must not stop the rest of the flock
         // being reopened, and an operator wants every failing path in one
         // answer rather than one per rotation.
         let _ = reply.send(if failures.is_empty() {
-            Ok(reopened)
+            Ok(matched)
         } else {
             Err(SupervisorError::ReopenFailed(failures.join("; ")))
         });
@@ -7578,6 +7640,169 @@ mod tests {
             error.message,
             format!("{}: {}", link.display(), crate::runner::SYMLINK_REFUSED),
             "the failure must name the path and say the word symlink: {error}"
+        );
+    }
+
+    // --- the log plane mid-reload ------------------------------------
+    //
+    // A swap puts two entries in ONE instance slot, and `assemble` derives a
+    // sheep's log paths from its name and its instance — so the drainee and
+    // its replacement derive byte-identical paths and every app is a
+    // shared-log-path app for as long as the swap lasts. What `merge_logs`
+    // made reachable by configuration is reachable by running a verb, which
+    // is why both log-plane verbs are pinned against this shape and not only
+    // against `merge_logs`.
+    //
+    // Both cases below name the REPLACEMENT by id, the one selector form that
+    // cannot reach the drainee by matching: `all` and `web` both name it
+    // outright, and would pass against an implementation with no notion of a
+    // shared path at all.
+
+    /// Fails if the set of pumps a flush drains is narrowed back to the sheep
+    /// the selector matched, which would leave a reload's drainee appending to
+    /// a file being emptied under it.
+    ///
+    /// [`a_sibling_sharing_a_path_is_flushed_even_when_the_selector_skips_it`]
+    /// proves the widening for two apps handed one explicit `out_file`. This
+    /// is the same mechanism reached the way an operator meets it without
+    /// having configured anything, and the two are worth keeping apart: that
+    /// one would still pass if the shared-path case were narrowed to
+    /// configurations that name a path outright.
+    ///
+    /// The equal paths are asserted rather than assumed. A swap that had
+    /// quietly started taking a fresh instance slot would leave this case
+    /// testing two unrelated sheep, where a narrowed pump set is invisible.
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_naming_a_replacement_still_drains_the_drainee_sharing_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two scripts, counted: the original spawn, and the one replacement a
+        // reload of a one-instance app performs. A third would be answered
+        // with `SpawnFailed("script exhausted")`, which abandons the reload
+        // and leaves a single entry standing — no overlap at all, and nothing
+        // here to see.
+        let (handle, runner, mut rx) = started(
+            &dir,
+            AppConfig::minimal("web", "./srv"),
+            vec![ProcScript::never_exits(), ProcScript::never_exits()],
+        )
+        .await;
+
+        handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the reload is accepted");
+        expect_event(&mut rx, 1, ProcessEventKind::Start).await;
+
+        let mid = handle.list().await;
+        assert_eq!(
+            mid.len(),
+            2,
+            "fixture check: both halves of the swap must be registered, or \
+             there is no shared path to widen to"
+        );
+        assert_eq!(
+            mid[0].out_file, mid[1].out_file,
+            "fixture check: one instance slot must really give both entries \
+             one out path, or this case proves nothing"
+        );
+        assert_eq!(
+            mid[0].err_file, mid[1].err_file,
+            "fixture check: and one err path"
+        );
+
+        let flushed = handle.flush(ProcessSelector::Id(1)).await.unwrap();
+
+        assert_eq!(
+            flushed.iter().map(|info| info.id).collect::<Vec<_>>(),
+            vec![1],
+            "the reply answers the selector: the drainee's pump was drained \
+             too, but the operator named only the replacement"
+        );
+        assert_eq!(
+            runner.flushes(0),
+            1,
+            "the drainee's pump is what this case exists for — it is still \
+             holding the file the truncate is about to empty"
+        );
+        assert_eq!(
+            runner.flushes(1),
+            1,
+            "the replacement's pump, which the selector did name"
+        );
+    }
+
+    /// Fails if a reopen is keyed on the selector alone, leaving a reload's
+    /// drainee holding the inode an external rotator has just renamed.
+    ///
+    /// The consequence is the one `reopen` exists to prevent, and it is
+    /// silent: the drainee goes on appending to the archive, which keeps
+    /// growing after the rotation that was supposed to close it, while the
+    /// recreated path takes only the replacement's lines. A `postrotate`
+    /// stanza that waited for a zero exit was told the opposite of what
+    /// happened.
+    ///
+    /// The counts are the whole case. The reply carries the named sheep
+    /// either way, so an implementation that resolved the selector and pushed
+    /// at one pump passes every other assertion here — see
+    /// [`a_reopen_reaches_every_matched_sheep_and_no_others`], which pins that
+    /// the reach does not go WIDER than the paths a selector reached.
+    #[tokio::test(start_paused = true)]
+    async fn a_reopen_naming_a_replacement_still_reaches_the_drainee_sharing_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two scripts, counted, for the reason the flush case above gives.
+        let (handle, runner, mut rx) = started(
+            &dir,
+            AppConfig::minimal("web", "./srv"),
+            vec![ProcScript::never_exits(), ProcScript::never_exits()],
+        )
+        .await;
+
+        handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the reload is accepted");
+        expect_event(&mut rx, 1, ProcessEventKind::Start).await;
+
+        let mid = handle.list().await;
+        assert_eq!(
+            mid.len(),
+            2,
+            "fixture check: both halves of the swap must be registered"
+        );
+        assert_eq!(
+            mid[0].out_file, mid[1].out_file,
+            "fixture check: one instance slot must really give both entries \
+             one out path, or this case proves nothing"
+        );
+        assert_eq!(
+            mid[0].err_file, mid[1].err_file,
+            "fixture check: and one err path"
+        );
+
+        let reopened = handle.reopen(ProcessSelector::Id(1)).await.unwrap();
+
+        assert_eq!(
+            reopened.iter().map(|info| info.id).collect::<Vec<_>>(),
+            vec![1],
+            "the reply answers the selector, the same way `flush`'s does"
+        );
+        assert_eq!(
+            runner.reopens(0),
+            1,
+            "the drainee's pump is what this case exists for — unasked, it \
+             keeps the renamed inode open and goes on filling the archive"
+        );
+        assert_eq!(
+            runner.reopens(1),
+            1,
+            "the replacement's pump, which the selector did name"
+        );
+        assert_eq!(
+            runner.flushes(0),
+            0,
+            "a reopen must push `LogCtl::Reopen`, never `LogCtl::Flush` — the \
+             neighbouring variant would land the drainee's owed bytes and \
+             leave it on the renamed inode regardless"
         );
     }
 
