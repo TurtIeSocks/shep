@@ -345,6 +345,7 @@ fn track_spawned(spawned: &std::sync::Arc<std::sync::Mutex<Vec<i32>>>, reply: &R
         | Response::Started(infos)
         | Response::Stopped(infos)
         | Response::Restarted(infos)
+        | Response::Reloading(infos)
         | Response::Reopened(infos)
         | Response::Flushed(infos) => infos,
         _ => return,
