@@ -499,6 +499,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changes
 
+- `ShepherdMessage::Action` gains a `params: Option<String>` field: the
+  argument text an operator passes after an action name, handed to the child
+  verbatim. The daemon never parses it, validates it, or holds a schema for
+  it — an app that defines an action already has a grammar for that action's
+  arguments, and a second grammar here would only be something for every app
+  to either adopt or work around.
+
+  **It is additive on a channel that has no version to bump.**
+  `PROTOCOL_VERSION` governs the client↔daemon socket and not fd 3, so a
+  shape change here reaches every app that speaks it with no handshake in
+  which to negotiate one. `params` is skipped when it is `None` and reads
+  back as `None` when absent, so `{"kind":"action","name":"gc"}` is
+  byte-identical going out and unchanged coming in, and an app that ignores
+  the key is unaffected. Committed fixtures pin both forms. Nothing sends a
+  `params` yet — no verb reaches this message — and the field is here now
+  because its cost rises the moment one deployed app or the `@shep/io` shim
+  exists, which is the reasoning spec §9 now records.
+
+  Filed as a change rather than an addition for the reason `ProcIo` below is:
+  the variant carries no `#[non_exhaustive]`, so any
+  `ShepherdMessage::Action` literal, or a pattern that names every field
+  rather than ending in `..`, stops compiling until it names this one too.
 - An app that configures `wait_ready` or a `readiness_probe` no longer reaches
   `online` at spawn. It holds at `starting` until the shepherd channel
   delivers `{"kind":"ready"}` or the first probe passes, whichever its config

@@ -474,7 +474,7 @@ async fn channel_round_trip(io: &mut ProcIo, round: u32, err_file: &Path) -> Chi
     let name = format!("round-{round}");
     let delivered = io
         .to_child
-        .send(ShepherdMessage::Action { name })
+        .send(ShepherdMessage::Action { name, params: None })
         .await
         .is_ok();
     let reply = if delivered {

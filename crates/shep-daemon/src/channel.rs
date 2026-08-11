@@ -47,6 +47,29 @@ pub enum ShepherdMessage {
     Action {
         /// The action name
         name: String,
+        /// Argument text for the action, passed through to the child
+        /// verbatim; `None` when the action was triggered without any.
+        ///
+        /// Absent from the serialized form when `None`, and absent on the
+        /// wire deserializes back to `None`, so a message carrying no
+        /// arguments is byte-identical to one from before this field
+        /// existed. That is what makes the field additive on a channel that
+        /// has no version to negotiate — see the spec's §9 note on
+        /// `trigger`.
+        ///
+        /// One opaque string, not structured data: the daemon never reads
+        /// it, and an app that wants JSON, a flag list or a bare word parses
+        /// it in the grammar it already has.
+        // `skip_serializing_if` is the load-bearing half: without it a
+        // message with no arguments goes out as `"params":null` instead of
+        // no key at all. `default` is redundant today — serde's derive
+        // already reads a missing `Option` field back as `None`, and no test
+        // can tell whether it is here — and is written anyway because that
+        // is a property of the derive rather than of this field, and a
+        // change of type would withdraw it silently on a channel that has no
+        // version in which to announce one.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        params: Option<String>,
     },
 }
 
@@ -110,6 +133,35 @@ mod tests {
         let fixture = r#"{"kind":"action","name":"gc"}"#;
         let msg = ShepherdMessage::Action {
             name: "gc".to_string(),
+            params: None,
+        };
+        assert_eq!(
+            serde_json::from_str::<ShepherdMessage>(fixture).unwrap(),
+            msg
+        );
+        assert_eq!(serde_json::to_string(&msg).unwrap(), fixture);
+    }
+
+    /// The with-arguments form of the fixture above, pinned the same way so
+    /// that renaming or reordering either field fails here rather than at an
+    /// app that stopped understanding its own actions.
+    ///
+    /// It does not overlap with the fixture above, and each catches what the
+    /// other cannot. That one is what an argument-free action must keep
+    /// looking like: its serialize half is what fails if
+    /// `skip_serializing_if` is dropped — measured, and the message is
+    /// `"params":null` against `{"kind":"action","name":"gc"}` — and its
+    /// deserialize half is the proof that a message written before the field
+    /// existed still reads. This one is the only thing pinning the field's
+    /// name and its position when there is an argument: rename `params`, or
+    /// declare it ahead of `name`, and this test fails while the whole rest
+    /// of the workspace goes on passing.
+    #[test]
+    fn action_with_params_wire_fixture_round_trips() {
+        let fixture = r#"{"kind":"action","name":"set-log-level","params":"debug"}"#;
+        let msg = ShepherdMessage::Action {
+            name: "set-log-level".to_string(),
+            params: Some("debug".to_string()),
         };
         assert_eq!(
             serde_json::from_str::<ShepherdMessage>(fixture).unwrap(),
