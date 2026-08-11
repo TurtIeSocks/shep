@@ -1555,6 +1555,16 @@ impl<R: ProcessRunner> Actor<R> {
             let held_off_by_a_swap =
                 origin == CommandOrigin::Automatic && self.in_an_uncommitted_swap(id);
             if held_off_by_a_swap {
+                // The trade above loses a real change for a watched app, and
+                // an operator who sees a save go nowhere has nothing else to
+                // read. Same level and shape as `handle_extra_restart`'s
+                // drops.
+                tracing::debug!(
+                    id,
+                    ?kind,
+                    "automatic command dropped: this sheep is half of a swap that has not \
+                     committed"
+                );
                 continue;
             }
             let is_running = self.sheep.get(&id).is_some_and(|slot| slot.ctl.is_some());
@@ -1792,10 +1802,23 @@ impl<R: ProcessRunner> Actor<R> {
             return;
         }
         while let Some(old_id) = queue.pop_front() {
-            let replaceable = self.sheep.get(&old_id).is_some_and(|slot| {
+            let slot = self.sheep.get(&old_id);
+            let replaceable = slot.is_some_and(|slot| {
                 slot.entry.status == ProcStatus::Online && slot.manual.is_none()
             });
             if !replaceable {
+                // Logged for the reason `handle_extra_restart` logs its four
+                // drops: a whole reload can end here having replaced nothing,
+                // long after its caller was told `Ok`, and there is no
+                // instance left for an abandonment to name — so this line is
+                // the only account of it there is.
+                tracing::debug!(
+                    name,
+                    old_id,
+                    status = ?slot.map(|slot| slot.entry.status),
+                    "reload skipped an instance: it is gone, no longer online, or its next \
+                     exit is already claimed"
+                );
                 continue;
             }
             match self.spawn_replacement(old_id) {
