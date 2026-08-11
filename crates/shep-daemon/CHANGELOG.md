@@ -75,7 +75,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepted is lost unless the app stops accepting, drains, and exits inside
   `graceful_timeout`. An app that ignores its stop signal until shep's
   `SIGKILL` drops that backlog on every single reload, and nothing shep does
-  prevents it.
+  prevents it. **What that costs depends on the platform**, now measured
+  rather than reasoned: Linux load-balances new connections across every
+  listener sharing the port, so the instance being replaced keeps taking about
+  half of them right up until it closes and a reload of a defiant app loses 5
+  to 8 connections in every ~260; macOS gives every new connection to the last
+  socket to bind, so the same app is handed nothing from the moment its
+  replacement is up and the same reload loses none. Draining costs zero on
+  both. Linux is where this is worth an operator's attention.
 
   Readiness is always gated for a replacement, even for an app that configures
   neither `wait_ready` nor `readiness_probe` — the heuristic wait exists for
