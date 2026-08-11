@@ -59,6 +59,23 @@ pub enum Commands {
     Stop(SelectorArgs),
     /// Restart one or more sheep.
     Restart(SelectorArgs),
+    /// Reload one or more sheep, one instance at a time.
+    ///
+    /// Each instance is replaced by a fresh one, which has to start and
+    /// become ready before the instance it replaces is asked to go — so the
+    /// app gets a window in which it can hand over without dropping work.
+    ///
+    /// That window is not zero downtime. The old listener's queue of
+    /// connections it has not accepted yet is dropped when it closes, so an
+    /// app that does not stop accepting and finish what it has in hand
+    /// before graceful_timeout runs out loses whatever was waiting there.
+    ///
+    /// Exits as soon as the shepherd accepts the reload, printing the flock
+    /// as it stood at that moment — a clustered app takes longer to swap
+    /// than any answer can wait for. The swaps themselves are reported on
+    /// the bus, under process.reload, process.reloaded and
+    /// process.reload_abandoned.
+    Reload(SelectorArgs),
     /// Delete one or more sheep from the flock.
     Delete(SelectorArgs),
     /// List the flock.
@@ -106,12 +123,17 @@ pub struct StartArgs {
 }
 
 /// Arguments shared by every verb that targets an existing selection of the
-/// flock (`stop`, `restart`, `delete`, `describe`, `thatlldo`).
+/// flock (`stop`, `restart`, `reload`, `delete`, `describe`, `thatlldo`).
 ///
 /// The selector is required on every one of them, because every one of them
 /// acts on something. `flush` has the same rule and its own struct
 /// ([`FlushArgs`]) only because it has a second target that is not a
 /// selection at all.
+///
+/// Required means no `default_value` on the field below, and that one
+/// attribute is the whole of it — adding one would turn a bare `shep stop`
+/// into `shep stop all` for every verb in the list at once. It is pinned by
+/// [`tests::a_selector_taking_verb_refuses_to_run_without_one`].
 #[derive(Debug, clap::Args)]
 pub struct SelectorArgs {
     /// name, id, `all`, `/regex/`, or `fold:<name>`
@@ -278,6 +300,40 @@ mod tests {
         assert_eq!(args.selector, "web");
     }
 
+    /// Every verb sharing [`SelectorArgs`] must refuse to run without one.
+    ///
+    /// Fails if that struct's `selector` field ever gains a `default_value`.
+    /// That is a one-line edit reaching six verbs at once, and it is worth a
+    /// case of its own precisely because it looks harmless: it does not break
+    /// a single other test, and what it changes is that `shep stop` — typed
+    /// by an operator who then remembered which sheep they meant — becomes
+    /// `shep stop all` instead of a usage error. `reopen` and `bleats`
+    /// deliberately do have that default (see
+    /// [`bleats_and_reopen_default_to_every_sheep`]); the difference is that
+    /// neither of them ends a process.
+    ///
+    /// The explicit form is asserted alongside, for the reason
+    /// [`flush_refuses_to_run_without_a_selector`] gives: a verb that had
+    /// stopped accepting any selector at all would pass the first half on its
+    /// own.
+    #[test]
+    fn a_selector_taking_verb_refuses_to_run_without_one() {
+        use clap::Parser;
+        for verb in [
+            "stop", "restart", "reload", "delete", "describe", "thatlldo",
+        ] {
+            assert!(
+                Cli::try_parse_from(["shep", verb]).is_err(),
+                "`shep {verb}` with no selector must be a usage error, never \
+                 the whole flock"
+            );
+            assert!(
+                Cli::try_parse_from(["shep", verb, "web"]).is_ok(),
+                "`shep {verb} web` must still parse"
+            );
+        }
+    }
+
     /// The other side of [`bleats_and_reopen_default_to_every_sheep`]: the
     /// log-plane verb that destroys data must NOT have a default.
     ///
@@ -397,6 +453,7 @@ mod tests {
             "start",
             "flock",
             "bleats",
+            "reload",
             "reopen",
             "flush",
             "ping",

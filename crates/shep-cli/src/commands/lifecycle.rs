@@ -321,6 +321,41 @@ pub async fn restart(
     .await
 }
 
+/// Reloads the sheep matching `args.selector`, replacing each instance with
+/// a fresh one so the app has a window in which it can hand over.
+///
+/// Sends `Request::Reload` with the client's default deadline, exactly as
+/// `stop`/`restart`/`delete` do, and for a reason particular to this verb: the
+/// daemon answers as soon as the reload is ACCEPTED rather than when the swaps
+/// finish (see `Response::Reloading`), so a longer deadline would buy nothing
+/// — the answer is already back long before the first swap commits. The rows
+/// printed are the flock as it stood at acceptance, and the swaps report
+/// themselves on the bus.
+pub async fn reload(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    args: &SelectorArgs,
+) -> ExitCode {
+    let selector = match parse_selector(streams, fmt, &args.selector) {
+        Ok(selector) => selector,
+        Err(code) => return code,
+    };
+    request_and_render(
+        client,
+        streams,
+        fmt,
+        "reload",
+        Request::Reload { selector },
+        None,
+        |response| match response {
+            Response::Reloading(procs) => Some(FlockRows(procs)),
+            _ => None,
+        },
+    )
+    .await
+}
+
 /// Deletes (stops and deregisters) the sheep matching `args.selector`.
 pub async fn delete(
     client: &Client,
@@ -452,11 +487,17 @@ mod tests {
     /// the reviewer proved this reachable by mutating both `restart` and
     /// `delete` to send `Request::Stop { selector }` and getting 9 passed,
     /// 0 failed — because the previous version of this test only ever
-    /// drove `stop`. Also pins that all three call `request_and_render`
+    /// drove `stop`. Also pins that all four call `request_and_render`
     /// with `deadline: None` — visible on the wire as `DEFAULT_DEADLINE`,
     /// since `Client::request_with_deadline` never leaves `deadline_ms`
     /// unstated — and a verb that stopped doing so passed unnoticed before
     /// this.
+    ///
+    /// `reload` belongs in the same list and takes the same default despite
+    /// being the slowest thing this CLI can ask for: the daemon answers it
+    /// as soon as the reload is accepted, so the round trip is a short one
+    /// and a `START_DEADLINE`-sized budget here would be a claim about the
+    /// swaps that the reply never waits for anyway.
     #[tokio::test]
     async fn a_selector_reaches_the_wire_in_its_compiled_form() {
         let dir = tempfile::tempdir().unwrap();
@@ -467,10 +508,11 @@ mod tests {
         enum Verb {
             Stop,
             Restart,
+            Reload,
             Delete,
         }
 
-        for verb in [Verb::Stop, Verb::Restart, Verb::Delete] {
+        for verb in [Verb::Stop, Verb::Restart, Verb::Reload, Verb::Delete] {
             for (input, expected) in [
                 ("all", SelectorSpec::All),
                 ("7", SelectorSpec::Id(7)),
@@ -490,11 +532,13 @@ mod tests {
                 let expected_body = match verb {
                     Verb::Stop => Request::Stop { selector: expected },
                     Verb::Restart => Request::Restart { selector: expected },
+                    Verb::Reload => Request::Reload { selector: expected },
                     Verb::Delete => Request::Delete { selector: expected },
                 };
                 let _ = match verb {
                     Verb::Stop => stop(&client, &mut streams, Format::Table, &args).await,
                     Verb::Restart => restart(&client, &mut streams, Format::Table, &args).await,
+                    Verb::Reload => reload(&client, &mut streams, Format::Table, &args).await,
                     Verb::Delete => delete(&client, &mut streams, Format::Table, &args).await,
                 };
                 let sent = envelopes.recv().await.unwrap();

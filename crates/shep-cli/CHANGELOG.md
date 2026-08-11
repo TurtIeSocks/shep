@@ -13,10 +13,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Additions
 
 - Add the clap command tree (`Cli`, `Commands`, and every argument struct
-  the CLI will ever parse — `Start`, `Stop`/`Restart`/`Delete`/`Describe`,
-  `Flock` (aliases `list`/`ls`), `Fold`, `Bleats` (alias `logs`), `Reopen`,
-  `Flush`, `Ping`, `Kill`, `Completions`, the hidden `Thatlldo` and
+  the CLI will ever parse — `Start`, `Stop`/`Restart`/`Reload`/`Delete`/
+  `Describe`, `Flock` (aliases `list`/`ls`), `Fold`, `Bleats` (alias `logs`),
+  `Reopen`, `Flush`, `Ping`, `Kill`, `Completions`, the hidden `Thatlldo` and
   `Daemon`), pure tier so it compiles and its tests run on Windows.
+- Add `shep reload <selector>`: replace each instance of the matched sheep
+  with a fresh one, one instance at a time, so the app gets a window in which
+  it can hand over. **Not zero downtime** — the old listener's queue of
+  connections it has not accepted yet is dropped when it closes, so an app
+  that does not stop accepting and finish what it has in hand before
+  `graceful_timeout` runs out loses whatever was waiting there. The verb's
+  own `--help` says so.
+
+  The selector is **required**, exactly as it is for `stop`/`restart`/
+  `delete` and for the same reason: the verb replaces running processes, so
+  the operator names the target. That requirement is now pinned by a test
+  covering every verb sharing `SelectorArgs` — a `default_value` on that one
+  field would have turned a bare `shep stop` into `shep stop all` for six
+  verbs at once, and nothing caught it before.
+
+  **The command exits as soon as the shepherd accepts the reload**, printing
+  the flock as it stood at that moment rather than after the swaps. A
+  clustered app takes longer to swap than any reply can wait for, so the
+  alternative was not a slower `shep reload` but one that reported a timeout
+  for a reload still running. Progress is on the bus, under `process.reload`,
+  `process.reloaded` and `process.reload_abandoned`.
 - Add the process exit-code taxonomy (`ExitCode`, matching spec §9's table
   exactly, values included) with its stable `code_str` spelling and a
   `From<RpcErrorCode>` conversion; the three `From<&shep_client::*Error>`
@@ -31,7 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discovering it.
 - Carry `ProcessInfo`'s new `out_file`/`err_file` in every `--json` payload
   built from `FlockRows` (`flock`, `describe`, `fold`, `start`, `stop`,
-  `restart`, `reopen`). They are `JSON_ONLY` on those verbs, not columns:
+  `restart`, `reload`, `reopen`). They are `JSON_ONLY` on those verbs, not
+  columns:
   absolute log paths are routinely longer than the rest of the row put
   together and would wreck the table they exist to print. `flush` is the one
   exception and renders them — see its own entry below.

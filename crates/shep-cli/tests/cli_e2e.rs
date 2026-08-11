@@ -2763,3 +2763,75 @@ fn shep_log_level_decides_which_of_the_daemons_records_survive() {
          default level lets through: {error_log:?}"
     );
 }
+
+// --- Reload ---------------------------------------------------------------
+
+/// `shep reload` reaches the reload verb, and the swap it starts really
+/// finishes against real processes.
+///
+/// Two halves, and each covers something no other tier does. The envelope's
+/// `command` is the only thing anywhere that pins which handler
+/// `Commands::Reload` reaches — `main`'s dispatch arms have no unit coverage,
+/// and an arm wired to `lifecycle::restart` would answer `"restart"` here
+/// while otherwise behaving plausibly. The polled id is the other half: a
+/// reload is the one verb whose success is a *new* id in the same instance
+/// slot, so a restart in its place leaves the id where it was and a stop
+/// leaves the sheep down.
+///
+/// The reply is asserted to carry the ORIGINAL id, which is the acceptance
+/// contract — `shep reload` exits before the swap commits — and the poll is
+/// what waits for the swap itself. A default `listen_timeout` of 3s plus a
+/// drain fits inside [`FLOCK_DEADLINE`] with room to spare.
+///
+/// What a broken implementation this would catch: the dispatch misroute
+/// above; a reload that answers and then never swaps (the poll expires and
+/// the id assertion names what it wanted); a swap that leaves the drainee
+/// registered, since the flock would still hold two entries and `data[0]`
+/// would still be the original id.
+#[test]
+fn reload_swaps_a_sheep_for_a_fresh_instance_under_a_new_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&script)
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+    let envelope: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    let original_id = envelope["data"][0]["id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("a started sheep must carry an id: {envelope}"));
+
+    let reloaded = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("reload")
+        .arg("sheep")
+        .output()
+        .unwrap();
+    assert_success(&reloaded);
+    let envelope: serde_json::Value = serde_json::from_slice(&reloaded.stdout).unwrap();
+    assert_eq!(
+        envelope["command"], "reload",
+        "`shep reload` must reach the reload verb and no other: {envelope}"
+    );
+    assert_eq!(
+        envelope["data"][0]["id"], original_id,
+        "the answer is the flock as it stood when the reload was accepted: {envelope}"
+    );
+
+    let after = poll_flock(dir.path(), |info| info["id"] != original_id);
+    assert_ne!(
+        after["id"], original_id,
+        "the swap must finish, leaving one entry under a new id: {after}"
+    );
+    assert_eq!(after["status"], "online", "{after}");
+
+    graceful_kill(dir.path());
+}
