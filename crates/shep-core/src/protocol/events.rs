@@ -6,6 +6,20 @@ use crate::protocol::request::ProcessInfo;
 
 /// What happened to a sheep
 // wire format: changing existing variants is a breaking change
+//
+// A NEW variant is additive for Rust and for the protocol version, but it is
+// not free for a subscriber that predates it, and this enum is the one place
+// in the protocol where that is true. There is no `#[serde(other)]` fallback,
+// and every variant's topic is `process.<something>`, which the `process.*`
+// glob an existing subscriber already uses matches — so an older client is
+// sent a frame it cannot decode. It drops that frame; it is not sent
+// anything it asked for and lost. The same does not arise for `Request` or
+// `Response`, where an old client never sends the verb whose answer it could
+// not read. Weigh that cost against the alternative before adding one:
+// reusing an existing kind and leaving subscribers to infer the event is the
+// other option, and it was the losing one for reload only because a reload's
+// reply is an acceptance, which leaves the bus as the only place its outcome
+// is ever reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -18,6 +32,17 @@ pub enum ProcessEventKind {
     Exit,
     /// Restart initiated
     Restart,
+    /// A reload is replacing this instance: its replacement has been spawned
+    /// into the same instance slot, and this one will be asked to go once
+    /// that replacement is serving
+    Reload,
+    /// This instance has replaced the one it was spawned to drain, and that
+    /// one is gone — the swap is over
+    Reloaded,
+    /// A reload was abandoned before this instance was replaced, so this is
+    /// still the app's live instance and the instances the reload had not
+    /// reached are left alone
+    ReloadAbandoned,
     /// Stopped by request
     Stop,
     /// Deregistered
@@ -86,6 +111,9 @@ impl BusEvent {
                 ProcessEventKind::Online => "process.online",
                 ProcessEventKind::Exit => "process.exit",
                 ProcessEventKind::Restart => "process.restart",
+                ProcessEventKind::Reload => "process.reload",
+                ProcessEventKind::Reloaded => "process.reloaded",
+                ProcessEventKind::ReloadAbandoned => "process.reload_abandoned",
                 ProcessEventKind::Stop => "process.stop",
                 ProcessEventKind::Delete => "process.delete",
                 ProcessEventKind::Errored => "process.errored",
@@ -141,6 +169,54 @@ mod tests {
         };
         assert_eq!(e.topic(), "log.out");
         assert_eq!(BusEvent::DaemonShutdown.topic(), "daemon.shutdown");
+    }
+
+    /// The three kinds a reload reports itself with, pinned as topic strings
+    /// and as wire strings.
+    ///
+    /// Fails if [`BusEvent::topic`] maps any of them to the wrong dotted
+    /// string — a typo there is invisible to a `process.*` subscriber, which
+    /// matches anything under `process.`, and silently unreachable to one
+    /// that named the topic it wanted. Fails too if a variant's serde
+    /// spelling drifts from its snake_case default (a stray
+    /// `#[serde(rename)]`, or a variant renamed without its topic): a reload's
+    /// reply is an acceptance, so these frames are the whole of what a client
+    /// ever learns about how the reload went, and a client matching on the
+    /// wire string would stop recognising them.
+    #[test]
+    fn a_reload_reports_itself_under_three_topics() {
+        for (kind, topic, wire) in [
+            (ProcessEventKind::Reload, "process.reload", "\"reload\""),
+            (
+                ProcessEventKind::Reloaded,
+                "process.reloaded",
+                "\"reloaded\"",
+            ),
+            (
+                ProcessEventKind::ReloadAbandoned,
+                "process.reload_abandoned",
+                "\"reload_abandoned\"",
+            ),
+        ] {
+            let event = BusEvent::Process {
+                event: kind,
+                info: ProcessInfo {
+                    id: 3,
+                    name: "web".to_string(),
+                    status: ProcStatus::Stopping,
+                    pid: Some(4242),
+                    restarts: 0,
+                    uptime_ms: 0,
+                    fold: None,
+                    out_file: None,
+                    err_file: None,
+                },
+                manually: true,
+                at_ms: 0,
+            };
+            assert_eq!(event.topic(), topic, "{kind:?}");
+            assert_eq!(serde_json::to_string(&kind).unwrap(), wire, "{kind:?}");
+        }
     }
 
     #[test]

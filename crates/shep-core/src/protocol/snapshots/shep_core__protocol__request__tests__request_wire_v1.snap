@@ -96,5 +96,16 @@ expression: requests
         "kind": "all"
       }
     }
+  },
+  {
+    "id": 7,
+    "deadline_ms": null,
+    "body": {
+      "kind": "reload",
+      "selector": {
+        "kind": "name",
+        "value": "web"
+      }
+    }
   }
 ]
