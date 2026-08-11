@@ -207,7 +207,7 @@ src/
   kill.rs            ← was lib/God/Methods.js (kill ladder) + lib/TreeKill.js
       Action: port semantics + rewrite mechanism
       Notes: ladder exact: SIGTERM(configurable via `kill_signal`)/shutdown-msg → timeout on
-             child.wait() → SIGKILL survivors → timeout error. SIGTERM rather than pm2's SIGINT
+             child.wait() → SIGKILL survivors → wait for that to land. SIGTERM rather than pm2's SIGINT
              is a deliberate deviation (spec §"deviations": unix convention wins). Mechanism:
              owning-parent waitpid (exact exit code+signal, kills pid-reuse ABA race),
              kill(-pgid) for trees (replaces racy ps-snapshot walk), Job Objects on Windows
