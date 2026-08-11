@@ -247,6 +247,23 @@ impl ProcessRunner for TokioRunner {
             let std_child_end = child_end.into_std().map_err(|error| {
                 RunnerError::SpawnFailed(format!("shepherd channel into_std: {error}"))
             })?;
+            // `O_NONBLOCK` on this descriptor is inherited, never chosen:
+            // `UnixStream::pair()` sets it on BOTH ends because tokio's own
+            // half needs it, and `into_std` documents that it leaves the flag
+            // exactly as it found it. The child inherits whatever this fd
+            // carries across the exec, so leaving it set hands every app a
+            // non-blocking fd 3 — a plain `read <&3` gets `EAGAIN` rather
+            // than parking, and a child waiting to be told something (the
+            // `{"kind":"shutdown"}` of `shutdown_with_message`, say) fails
+            // instead of waiting. Runtimes with an event loop set their own
+            // descriptors non-blocking anyway and never notice; an app that
+            // simply reads does. Clearing it here is what makes fd 3 an
+            // ordinary blocking descriptor on the far side, and nothing on
+            // this side wants it back: the daemon's end is a separate
+            // descriptor, still tokio's, still non-blocking.
+            std_child_end.set_nonblocking(false).map_err(|error| {
+                RunnerError::SpawnFailed(format!("shepherd channel set_nonblocking: {error}"))
+            })?;
             let child_fd = OwnedFd::from(std_child_end);
             command
                 .as_std_mut()

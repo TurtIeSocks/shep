@@ -432,6 +432,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixes
 
+- Let a child block on the shepherd channel. Every fd 3 handed to a child was
+  non-blocking, and nothing meant it to be: `UnixStream::pair()` sets
+  `O_NONBLOCK` on both ends for the sake of the daemon's own half, `into_std`
+  leaves the flag exactly as it found it, and it then rode across the exec into
+  the app. A child doing a plain blocking `read` on fd 3 got `EAGAIN` —
+  "Resource temporarily unavailable" — rather than parking. What this broke is
+  `shutdown_with_message`, which sends `{"kind":"shutdown"}` to a child that
+  has been waiting since long before the message existed: that child never
+  heard it. Runtimes with an event loop set their own descriptors non-blocking
+  regardless and never noticed, which is how the flag survived this long; an
+  app written to simply read did not. The daemon's end is a separate
+  descriptor and keeps the flag it needs.
 - Report an automatic restart as automatic. Every restart the daemon raised
   on its own — cron, watch, a memory breach or a liveness failure — emitted
   `BusEvent::Process { manually: true }`, whose documented meaning is "a
