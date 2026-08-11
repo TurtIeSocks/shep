@@ -180,8 +180,10 @@ pub enum Response {
     Stopped(Vec<ProcessInfo>),
     /// Answer to `Restart`
     Restarted(Vec<ProcessInfo>),
-    /// Answer to `Reload` — an ACCEPTANCE, not a result, and the one reply in
-    /// this enum that does not describe finished work.
+    /// Answer to `Reload` — an ACCEPTANCE, not a result, and the only reply
+    /// in this enum carrying a flock listing that names one rather than
+    /// finished work. [`Self::ShuttingDown`] is an acceptance too, sent
+    /// before the daemon actually goes down, but it carries nothing.
     ///
     /// One instance costs a readiness wait plus a drain in the worst case, so
     /// a clustered app outlasts any deadline a client is allowed to ask for.

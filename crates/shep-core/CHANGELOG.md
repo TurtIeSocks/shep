@@ -94,7 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator names its target.
 
   `Reloading` is named for what it is. It is an **acceptance**, and the only
-  reply in the enum that does not describe finished work: one instance costs a
+  reply in the enum carrying a flock listing that names one rather than
+  finished work — `ShuttingDown` is an acceptance too and carries nothing.
+  The reason is timing: one instance costs a
   readiness wait plus a drain in the worst case, so a clustered app outlasts
   any deadline a client is allowed to ask for, and a reply that waited would
   time out while the reload it asked for went on running. It carries the

@@ -366,8 +366,9 @@ src/
       One verb outruns the ceiling (Phase 6): a reload of a clustered app costs ~11s PER
              INSTANCE, so no budget a client is allowed to ask for can cover it, and expiring a
              budget bounds the REPLY and not the actor's work. `Reload` is therefore answered
-             `Response::Reloading` — an ACCEPTANCE, the one reply in the enum that does not
-             describe finished work — and its progress goes on the bus instead. Raising the
+             `Response::Reloading` — an ACCEPTANCE, the only reply in the enum carrying a flock
+             listing that names one rather than finished work (`ShuttingDown` is an acceptance
+             too and carries nothing) — and its progress goes on the bus instead. Raising the
              ceiling was the alternative and was refused: it would cost every other verb its
              meaning. Both of reload's refusals (an app already reloading; a reload arriving
              after shutdown has begun) map to `RpcErrorCode::Internal` for want of a code of
