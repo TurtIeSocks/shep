@@ -288,7 +288,9 @@ src/
              reload went on running. Progress is therefore the bus's job alone:
              `process.reload` on the instance being replaced (before its replacement's
              `process.start`), `process.reloaded` on the replacement once the drainee is gone,
-             `process.reload_abandoned` on the instance still serving.
+             `process.reload_abandoned` on the instance the abandonment left holding the slot,
+             which is the drainee where the reload gave up on replacing it and the replacement
+             where it gave up because the replacement went down.
       NOT BUILT, and the previous entry here promised it: SO_REUSEPORT is NOT set by shep and
              cannot be — a socket option must be set before `bind()` by the process that binds,
              and no shep process ever binds an app's port. `reuse_port` is the OPERATOR
