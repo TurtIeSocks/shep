@@ -84,6 +84,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can share a log path (`merge_logs`, or an explicit `out_file` on a
   multi-instance app) and the daemon truncates each distinct path once, but
   the selector names sheep and so does the answer.
+- Add `Request::Reload` and `Response::Reloading`, asking a daemon to replace
+  each matched sheep with a fresh instance of the same app, one instance of an
+  app at a time. Additive under `#[non_exhaustive]` on the same terms as
+  `Reopen` above — `PROTOCOL_VERSION` stays **1**, and an older daemon fails
+  to decode the verb rather than answering it. `Reload` carries a
+  `SelectorSpec` with no default anywhere in the stack, matching
+  `stop`/`restart`/`delete`: the verb replaces running processes, so the
+  operator names its target.
+
+  `Reloading` is named for what it is. It is an **acceptance**, and the only
+  reply in the enum carrying a flock listing that names one rather than
+  finished work — `ShuttingDown` is an acceptance too and carries nothing.
+  The reason is timing: one instance costs a
+  readiness wait plus a drain in the worst case, so a clustered app outlasts
+  any deadline a client is allowed to ask for, and a reply that waited would
+  time out while the reload it asked for went on running. It carries the
+  matched sheep as they stood when the reload was accepted — including any
+  with nothing to replace, which are the no-op successes they look like — and
+  the swaps themselves report on the bus.
+- Add `ProcessEventKind::Reload`, `Reloaded` and `ReloadAbandoned`
+  (`process.reload`, `process.reloaded`, `process.reload_abandoned`), the
+  three ways a reload reports itself. `Reload` names the instance being
+  replaced, `Reloaded` the replacement once the instance it drained is gone,
+  and `ReloadAbandoned` whichever instance the abandonment left holding the
+  slot — the one the reload gave up on replacing, still the app's live one, or
+  the replacement itself where that is what went down. **A subscriber built
+  before these variants cannot
+  decode the frames and drops them**, and unlike a new `Request` variant that
+  is not something it opted into: every topic here is `process.<something>`,
+  which the `process.*` glob already matches. Accepted rather than worked
+  around, because a reload's reply is an acceptance and the bus is therefore
+  the only place its outcome is reported at all; reusing `Start`/`Stop` and
+  leaving subscribers to infer a reload from a doubled name would make the
+  outcome unreadable to a new client as well as an old one.
 - Add `MemSize` and `UpDuration` config value newtypes, parsing the strict
   Flockfile grammars `^\d+(G|M|K)?$` and `^\d+(h|m|s)?$`.
 - Add `ProcStatus` with stable wire strings for the process lifecycle states.

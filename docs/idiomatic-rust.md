@@ -128,6 +128,15 @@ Priority when rules collide: **Readability > KISS > DRY** (Rin's global order).
   CI. Show the better pattern proactively ("reuse one Client").
 - **IR-31** Implementation rationale = `//` block comments above the item,
   never `///`. Rendered docs are for users; essays are for maintainers.
+  - **Standing deviation — private items in `shep-daemon`.** Their rationale
+    stays in `///`. The actor's methods, guards and state machines all carry
+    theirs there and the file is unanimous about it, so converting some of
+    them splits one file's voice between two comment styles for a cosmetic
+    result — Readability first. The rule's stated reason does not bite either:
+    rendered docs are a user's, and a private item has no user. The honest
+    counter-argument is that `--document-private-items` renders them anyway,
+    and it loses to the above. Raised and declined twice in review; treat as
+    settled rather than re-litigating it per review.
 - **IR-32** `#[cfg(doc)] use` for link-only imports; `#[doc(inline)]` on
   curated re-exports; `#[doc(hidden)]` + `// used by shep-daemon` comment for
   workspace-internal surface. Third-party re-exports normalized under our

@@ -12,7 +12,7 @@ they disagree, this spec wins (and map.md gets fixed).
 
 shep is a general-purpose process manager: a single Rust binary whose daemon
 (the shepherd) supervises long-running processes (the flock) with restart
-policies, log capture, zero-downtime reload, file watching, native
+policies, log capture, graceful reload, file watching, native
 observability (Prometheus, webhooks, TUI, MCP), and first-party plugins
 (dogs). Clean-room build inspired by pm2's feature list; MIT OR Apache-2.0.
 
@@ -99,7 +99,13 @@ terminate. Exit code + signal recorded exactly (owning-parent `waitpid`).
 > Deviation from pm2 (deliberate): default stop signal is SIGTERM, not
 > SIGINT — SIGTERM is the unix convention; `kill_signal` covers the rest.
 
-**Reload (zero-downtime, any runtime):** state machine per instance:
+**Reload (graceful, any runtime):** shep does not provide zero downtime. It
+provides an **overlap** in which the application can achieve it — the old
+instance and its replacement are both live for a window, and closing the gap
+inside that window is the app's to do (stop accepting, finish the work in
+hand, exit). An app that ignores its stop signal until shep's `SIGKILL` loses
+whatever its listener had queued and not yet accepted, on every reload, and
+nothing shep does prevents that. State machine per instance:
 `SpawnNew → AwaitReady → DrainOld → ReapOld`. AwaitReady = readiness signal
 (§7) or `listen_timeout` (default 3000ms). DrainOld = stop ladder with
 `graceful_timeout` (default 8000ms) cap. Socket sharing via SO_REUSEPORT
@@ -111,9 +117,11 @@ at the replacement spawn, on every reload, and shep cannot detect the
 misconfiguration in advance; `SO_REUSEADDR`, which far more frameworks set
 by default, is not sufficient, and a mixed pair (one process with
 `SO_REUSEPORT` set, one without) is refused by the kernel on both tier-1
-platforms. Without `reuse_port`, reload degrades to rolling-restart
-(documented, one instance at a time). Reload proceeds instance-by-instance;
-failure of the new instance aborts the rest and keeps old instances running.
+platforms. There is no degraded mode without `reuse_port`: nothing in shep
+reads the option, so reload runs exactly the same machine either way and a
+port-binding app's replacement simply fails to bind. Reload proceeds
+instance-by-instance; failure of the new instance aborts the rest and keeps
+old instances running.
 
 > macOS caveat: `SO_REUSEPORT` there is last-binder-wins, not
 > load-balancing — measured cross-process over 40 connections, macOS sent
@@ -301,7 +309,7 @@ daemon memory (explicit non-goal).
   macOS's `SO_REUSEPORT` is last-binder-wins, not load-balancing (§4): the
   "cluster" instance model does not spread steady-state connections across
   sibling instances on macOS the way it does on Linux, even though it is
-  tier 1. Zero-downtime reload is unaffected by this — the new instance
+  tier 1. The reload overlap is unaffected by this — the new instance
   taking over 100% of new connections is the desired reload behavior on
   either platform.
 - **Windows v1 functional tier:** compiles + unit tests in CI from day one;

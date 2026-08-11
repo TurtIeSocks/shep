@@ -112,9 +112,12 @@ fn parse_selector(
 ///
 /// A zero exit means every matched sheep's log pump holds a handle on the
 /// recreated path, so a `postrotate` stanza that waits for this command
-/// knows no live pump is still filling the archive it just renamed. A
-/// matched sheep that is not running has no pump and nothing to reopen; it
-/// is reported alongside the rest rather than as a failure.
+/// knows no live pump is still filling the archive it just renamed. That
+/// holds because the daemon reaches every writer to a path it is rotating,
+/// not only the sheep named here — several instances can share one file, and
+/// one of them left unasked would go on filling the archive. A matched sheep
+/// that is not running has no pump and nothing to reopen; it is reported
+/// alongside the rest rather than as a failure.
 ///
 /// A pump that could not open a path again fails the command instead, with
 /// the sheep and the path on stderr. The rename is still safe to act on —

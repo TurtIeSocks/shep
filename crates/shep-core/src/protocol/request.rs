@@ -76,6 +76,15 @@ pub enum Request {
         /// Which sheep
         selector: SelectorSpec,
     },
+    /// Replace each matching sheep with a fresh instance of the same app, one
+    /// instance of an app at a time, so the app has a window in which it can
+    /// stay reachable across the swap
+    Reload {
+        /// Which sheep. No default anywhere in the stack — a reload replaces
+        /// running processes, so the operator names the target, exactly as
+        /// `stop`/`restart`/`delete` do (see `shep reload`).
+        selector: SelectorSpec,
+    },
     /// Stop + deregister matching sheep
     Delete {
         /// Which sheep
@@ -171,6 +180,20 @@ pub enum Response {
     Stopped(Vec<ProcessInfo>),
     /// Answer to `Restart`
     Restarted(Vec<ProcessInfo>),
+    /// Answer to `Reload` — an ACCEPTANCE, not a result, and the only reply
+    /// in this enum carrying a flock listing that names one rather than
+    /// finished work. [`Self::ShuttingDown`] is an acceptance too, sent
+    /// before the daemon actually goes down, but it carries nothing.
+    ///
+    /// One instance costs a readiness wait plus a drain in the worst case, so
+    /// a clustered app outlasts any deadline a client is allowed to ask for.
+    /// The daemon therefore answers as soon as the reload is accepted, with
+    /// the matched sheep as they stood at that moment, and the swaps report
+    /// themselves on the bus — `process.reload`, `process.reloaded`,
+    /// `process.reload_abandoned`. A matched sheep with nothing to replace is
+    /// listed here as the no-op success it is, so this carries the same
+    /// matches `Describe` would.
+    Reloading(Vec<ProcessInfo>),
     /// Answer to `Delete` — ids removed
     Deleted(Vec<u32>),
     /// Answer to `Reopen` — every matched sheep, running or not. A sheep with
@@ -370,6 +393,19 @@ mod tests {
                 deadline_ms: None,
                 body: Request::Flush {
                     selector: SelectorSpec::All,
+                },
+            },
+            // The same selector as the `stop` row above, for the reason the
+            // pair above share theirs: `reload` is the third verb that
+            // demands an explicit selector and replaces what it matches, so
+            // the variant it would be copy-pasted from is `stop`. Serialized
+            // under `stop`'s tag it shows up here as two identical objects
+            // rather than as a diff a reader has to compare field by field.
+            Envelope {
+                id: 7,
+                deadline_ms: None,
+                body: Request::Reload {
+                    selector: SelectorSpec::Name("web".to_string()),
                 },
             },
         ];

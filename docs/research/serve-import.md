@@ -1,4 +1,4 @@
-# Phase 6 design notes — `shep serve` + `shep import` (spec §9)
+# UX-surface phase design notes — `shep serve` + `shep import` (spec §9)
 
 Status: research for plan-writing · 2026-08-07 · network was up — versions below are
 live crates.io `max_stable_version` as of today. Ground truth: spec §9 (serve, import),

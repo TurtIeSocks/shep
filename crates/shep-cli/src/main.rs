@@ -202,6 +202,10 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => lifecycle::restart(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
+        Commands::Reload(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => lifecycle::reload(&client, &mut streams, fmt, args).await,
+            Err(code) => code,
+        },
         Commands::Delete(ref args) => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => lifecycle::delete(&client, &mut streams, fmt, args).await,
             Err(code) => code,

@@ -13,10 +13,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Additions
 
 - Add the clap command tree (`Cli`, `Commands`, and every argument struct
-  the CLI will ever parse — `Start`, `Stop`/`Restart`/`Delete`/`Describe`,
-  `Flock` (aliases `list`/`ls`), `Fold`, `Bleats` (alias `logs`), `Reopen`,
-  `Flush`, `Ping`, `Kill`, `Completions`, the hidden `Thatlldo` and
+  the CLI will ever parse — `Start`, `Stop`/`Restart`/`Reload`/`Delete`/
+  `Describe`, `Flock` (aliases `list`/`ls`), `Fold`, `Bleats` (alias `logs`),
+  `Reopen`, `Flush`, `Ping`, `Kill`, `Completions`, the hidden `Thatlldo` and
   `Daemon`), pure tier so it compiles and its tests run on Windows.
+- Add `shep reload <selector>`: replace each instance of the matched sheep
+  with a fresh one, one instance at a time, so the app gets a window in which
+  it can hand over. **Not zero downtime** — the old listener's queue of
+  connections it has not accepted yet is dropped when it closes, so an app
+  that does not stop accepting and finish what it has in hand before
+  `graceful_timeout` runs out loses whatever was waiting there. The verb's
+  own `--help` says so.
+
+  **A port-binding app has to set `SO_REUSEPORT` itself before it binds**, or
+  every reload of it fails. shep binds nothing and so cannot set the option
+  on the app's behalf; the `reuse_port` app option is the operator asserting
+  that the app does, and a mismatch is `EADDRINUSE` at the replacement spawn,
+  undetectable in advance. What the operator sees without it is nothing at
+  all: `shep reload` has already exited 0 by the time the replacement fails,
+  so the abandonment shows up as `process.reload_abandoned` on the bus and in
+  the shepherd's log, and the old instance goes on serving. `--help` names
+  the precondition for the same reason.
+
+  The selector is **required**, exactly as it is for `stop`/`restart`/
+  `delete` and for the same reason: the verb replaces running processes, so
+  the operator names the target. That requirement is now pinned by a test
+  covering every verb sharing `SelectorArgs` — a `default_value` on that one
+  field would have turned a bare `shep stop` into `shep stop all` for six
+  verbs at once, and nothing caught it before.
+
+  **The command exits as soon as the shepherd accepts the reload**, printing
+  the flock as it stood at that moment rather than after the swaps. A
+  clustered app takes longer to swap than any reply can wait for, so the
+  alternative was not a slower `shep reload` but one that reported a timeout
+  for a reload still running. Progress is on the bus, under `process.reload`,
+  `process.reloaded` and `process.reload_abandoned`.
 - Add the process exit-code taxonomy (`ExitCode`, matching spec §9's table
   exactly, values included) with its stable `code_str` spelling and a
   `From<RpcErrorCode>` conversion; the three `From<&shep_client::*Error>`
@@ -31,7 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discovering it.
 - Carry `ProcessInfo`'s new `out_file`/`err_file` in every `--json` payload
   built from `FlockRows` (`flock`, `describe`, `fold`, `start`, `stop`,
-  `restart`, `reopen`). They are `JSON_ONLY` on those verbs, not columns:
+  `restart`, `reload`, `reopen`). They are `JSON_ONLY` on those verbs, not
+  columns:
   absolute log paths are routinely longer than the rest of the row put
   together and would wreck the table they exist to print. `flush` is the one
   exception and renders them — see its own entry below.
@@ -105,7 +137,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the output rather than failing the command. A pump that could not open a
   path again does fail it, naming the sheep and the path: the rename is
   still safe to act on, but that sheep is writing a stream nowhere, and
-  exiting 0 there would be the silent failure this verb exists to end. The
+  exiting 0 there would be the silent failure this verb exists to end. **That
+  failure can name a sheep the selector did not** — the daemon asks every
+  writer to a path it is rotating, which during a reload is both halves of a
+  swap, while the table stays keyed by the selector. The
   request carries `LOG_PLANE_DEADLINE` rather than the client's 5s default,
   since the daemon visits matched sheep serially with no per-sheep bound —
   the default would report failure to a `postrotate` stanza whose reopen was

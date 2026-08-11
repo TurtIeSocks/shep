@@ -64,7 +64,7 @@ Recorded so no task re-litigates them. Rin ruled 2, 8 and 9; the rest follow fro
 | # | Decision |
 |---|---|
 | 1 | Drainee status is `Stopping` (Rin). |
-| 2 | `is_running` excludes `Stopping`, which fixes the muster-roll inflation — see Task 3. |
+| 2 | ~~`is_running` excludes `Stopping`, which fixes the muster-roll inflation.~~ **Amended after Task 1's audit:** `is_running` already excluded it, and the "inflation" was never a correctness bug — see the dropped Task 3. Reusing `Stopping` is still right; its payoff is Task 4's guards. |
 | 3 | `ReloadState::SpawningReplacement { new_id }` lives on the **old** entry (it names the new); `Draining { old_pid }` on the **new** entry (it points back at what it must outlive). |
 | 4 | Reload reuses `CommandOrigin::Operator`. No third variant. |
 | 5 | An operator's `stop`/`delete` mid-reload **aborts the reload** and applies to both ids. |
@@ -107,19 +107,53 @@ Recorded so no task re-litigates them. Rin ruled 2, 8 and 9; the rest follow fro
 
 ---
 
-## Task 3: the muster roll stops double-counting
+## Task 3: ~~the muster roll stops double-counting~~ — DROPPED
 
-**Files:** Modify `crates/shep-daemon/src/snapshot.rs`.
+**Dropped after Task 1's audit refuted its premise.** Kept here rather than
+deleted, because the reasoning is what justifies not doing the work.
 
-**This is a data-corruption bug that survives a restart**, found during the research refresh. `FlockRegistry::roll`'s debounce fires ~250ms in; mid-reload **both entries pass `is_running`**, so a daemon reboot in that window resurrects `instances = 1` as **two**.
+The task was written on this claim: *mid-reload both entries pass
+`is_running`, so a daemon reboot in that window resurrects `instances = 1` as
+two.* Both halves are false.
 
-- [ ] **Step 1: Exclude `Stopping` from `is_running`.** Settled decision 2 — this is why `Stopping` was chosen.
-- [ ] **Step 2: Test** that a roll taken mid-overlap records the configured instance count, not the transient one. Fails if `is_running` starts counting the drainee again.
-- [ ] **Step 3: Commit** — `fix(daemon): stop the muster roll counting a reload twice`
+- **`is_running` never counted `Stopping`.** It is
+  `matches!(status, Online | Starting | WaitingRestart)`. Step 1 would have
+  been a no-op.
+- **`instances_running` is not a count on the way back in.** Its only
+  production reader is `restorable`'s `if saved.instances_running == 0 ||
+  !app.autostart { continue }` — a **boolean gate**. The number of instances
+  a restored app actually starts comes from `app.config().instances`
+  (`supervisor.rs:920`, `instance_slots(&existing, app.config().instances)`).
+  A roll recording `2` and a roll recording `1` restore identically.
+
+What survives is smaller and belongs to Task 5, not here: between the
+replacement reaching `Starting` and the drainee being marked `Stopping`, both
+entries satisfy `is_running`, so a roll written in that window records a
+count the flock does not have. It is cosmetic — a human reading the roll file
+mid-reload — but it is free to avoid, so **Task 5 marks the drainee
+`Stopping` no later than the replacement's spawn**, and pins that ordering
+with a test.
+
+Settled decision 2 in the table above is amended accordingly: reusing
+`Stopping` is still correct, but its payoff is the guards in Task 4, not a
+muster-roll fix that was never needed.
 
 ---
 
 ## Task 4: close the liveness window
+
+> **Runs after Task 5, not before it.** Two reasons, both found during
+> execution. Step 1's "decide the marker timing" is a question only the state
+> machine can answer — when the drainee is claimed is part of how the machine
+> sequences, so deciding it here would mean deciding it twice. Step 2's test
+> drives a real reload of an app with a `liveness_probe`, which cannot exist
+> until Task 5 lands. What remains here after Task 5 is the integration proof
+> that the window is actually shut.
+>
+> The unit-level half is already done: Task 1's
+> `a_stopping_sheep_rejects_an_extra_restart` pins the guard that drops an
+> automatic report against a drainee. This task proves the same thing end to
+> end, through a reload the daemon actually performs.
 
 **Files:** Modify `crates/shep-daemon/src/supervisor.rs`.
 

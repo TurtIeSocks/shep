@@ -125,6 +125,12 @@ impl FlockRegistry {
 }
 
 /// True for the statuses [`FlockRegistry::roll`] counts as "up".
+///
+/// [`ProcStatus::Stopping`] is deliberately absent: a reload's drainee is
+/// going away and its replacement already holds the same instance slot, so
+/// counting both would report two running instances for one — the muster
+/// roll must see only the replacement, never the entry riding out its own
+/// kill ladder to a terminal status.
 fn is_running(status: ProcStatus) -> bool {
     matches!(
         status,
@@ -404,6 +410,15 @@ mod tests {
         }
     }
 
+    // fails if `is_running` starts counting `ProcStatus::Stopping` — the
+    // status a reload's drainee wears from the moment its replacement is
+    // spawned. Both entries share one instance slot for the length of the
+    // swap, so counting the drainee as well would roll a one-instance app at
+    // two. This is the half of that guarantee that lives here: the
+    // supervisor's
+    // `a_reload_stops_counting_the_drainee_as_running_before_its_replacement_starts`
+    // pins the other half, that the mark lands before the replacement
+    // registers. Neither covers for the other.
     #[test]
     fn roll_counts_running_instances_and_prunes_deleted_names() {
         let registry = FlockRegistry::new();
@@ -415,6 +430,7 @@ mod tests {
             info(0, "web", ProcStatus::Online),
             info(1, "web", ProcStatus::WaitingRestart),
             info(2, "web", ProcStatus::Stopped),
+            info(3, "web", ProcStatus::Stopping),
         ]; // `job` was deleted: no entries left
         let roll = registry.roll(&infos, 1_700_000_000_000);
 
@@ -422,7 +438,8 @@ mod tests {
         assert_eq!(roll.saved_at_ms, 1_700_000_000_000);
         assert_eq!(roll.apps.len(), 1, "a name with no live entry is pruned");
         assert_eq!(roll.apps[0].app.name, "web");
-        assert_eq!(roll.apps[0].instances_running, 2); // online + waiting-restart
+        // online + waiting-restart; neither the stopped one nor the drainee
+        assert_eq!(roll.apps[0].instances_running, 2);
         // The prune is sticky: a second roll must not resurrect `job`.
         assert_eq!(registry.roll(&infos, 0).apps.len(), 1);
     }

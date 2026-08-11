@@ -79,5 +79,15 @@ proptest.workspace = true
 # global install.
 tracing-subscriber.workspace = true
 
+# Only for `examples/reuse_port_sheep.rs`, the fixture server behind the reload
+# measurement in `tests/daemon_e2e.rs`: `socket` is what sets `SO_REUSEPORT`
+# before a bind, which is the mechanism a reload's overlap rests on and the one
+# thing `std` cannot express; `net` is where nix keeps `SockaddrIn`, so a bind
+# has an address to name. Dev-only, and in its own `cfg(unix)` table for the
+# reason the dependency table above gives — nix does not build on Windows, and
+# that leg of the matrix compiles this crate's examples too.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true, features = ["socket", "net"] }
+
 [lints]
 workspace = true

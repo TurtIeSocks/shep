@@ -26,16 +26,13 @@ pub struct ProcessEntry {
     pub started_at: Option<tokio::time::Instant>,
     /// Restart budget and stability tracking
     pub budget: RestartBudget,
-    /// Reload state machine (None, SpawningReplacement, or Draining)
+    /// Which half of a reload this entry is, if any.
     ///
-    /// Written at registration and never read: reload execution is deferred,
-    /// and this field is the data half landing ahead of it. The expectation
-    /// below is what keeps that honest rather than silent — it fires the day
-    /// a reload path reads this, and the attribute goes with it.
-    #[expect(
-        dead_code,
-        reason = "data-only ahead of reload execution; the reader lands with it"
-    )]
+    /// `None` for an ordinary instance, which is every entry outside the few
+    /// seconds a reload of its app is in flight. The supervisor reads this on
+    /// two paths that would otherwise get a reload's entries badly wrong — a
+    /// readiness wait resolving, and an exit being decided — so the variant
+    /// docs below are what those paths are keying on.
     pub reload: ReloadState,
     /// Resolved once at the initial `Start` and reused for every later
     /// respawn — never re-resolved, so a restart never re-touches the
@@ -107,30 +104,47 @@ impl RestartBudget {
     }
 }
 
-/// Reload state machine for graceful reload scenarios
+/// Which half of a reload's swap a [`ProcessEntry`] is, if either
 ///
-/// Data only: nothing constructs the two non-`None` variants yet, because
-/// reload execution is deferred. `allow` rather than `expect` because this
-/// module's own tests do construct them, so the expectation would be
-/// fulfilled in the lib build and unfulfilled in the test build.
-#[allow(
-    dead_code,
-    reason = "data-only ahead of reload execution; the constructors land with it"
-)]
+/// A reload runs two entries at once — the drainee (old, going away) and the
+/// replacement (new) — and the two non-`None` variants split across them
+/// rather than sharing one: [`Self::Drainee`] lives on the drainee,
+/// [`Self::Replacement`] lives on the replacement. The variants are named for
+/// the ROLE they mark rather than for the phase the job was in when they were
+/// written, because they outlive that phase in both directions: a drainee
+/// carries its marker through the whole drain, and a replacement carries its
+/// own from the moment it is spawned. What the job is doing is `ReloadPhase`'s
+/// to say, in `supervisor`.
+///
+/// Getting from one half to the other belongs to the reload job, and only the
+/// drainee's direction is answered here at all: the replacement's
+/// back-reference lives on that job, in the entry ids the machinery around it
+/// navigates by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadState {
-    /// Not in a reload sequence
+    /// Not half of any swap
     None,
-    /// Spawning replacement instance for graceful reload
-    SpawningReplacement {
-        /// Process ID of the new replacement instance
+    /// This entry is the instance being replaced
+    ///
+    /// The instance being replaced is what names its replacement, not the
+    /// other way around. Sibling to [`ProcStatus::Stopping`] on this same
+    /// entry's `status`, which is what every guard that only reads `status`
+    /// sees; this variant is what says why, and who is coming to take its
+    /// place.
+    Drainee {
+        /// [`ProcessEntry::id`] of the new replacement instance — an entry
+        /// ID, not an OS `pid`: the replacement is looked up by entry, and
+        /// only gains an OS pid once it is actually spawned.
         new_id: u32,
     },
-    /// Draining connections before terminating old instance
-    Draining {
-        /// OS process ID of the instance being drained
-        old_pid: u32,
-    },
+    /// This entry is the replacement
+    ///
+    /// Says only that: this record is the half that arrived. The drainee it
+    /// must outlive is a different record, carrying `status =
+    /// `[`ProcStatus::Stopping`]` and set in the same logical transition —
+    /// reachable from the reload job, which is what every caller that needs
+    /// it already holds.
+    Replacement,
 }
 
 #[cfg(test)]
@@ -185,16 +199,5 @@ mod tests {
 
         budget.reset();
         assert_eq!(budget.unstable_count(), 0);
-    }
-
-    #[test]
-    fn reload_state_is_data_only() {
-        let none = ReloadState::None;
-        let spawning = ReloadState::SpawningReplacement { new_id: 42 };
-        let draining = ReloadState::Draining { old_pid: 1234 };
-
-        assert_eq!(none, ReloadState::None);
-        assert_eq!(spawning, ReloadState::SpawningReplacement { new_id: 42 });
-        assert_eq!(draining, ReloadState::Draining { old_pid: 1234 });
     }
 }

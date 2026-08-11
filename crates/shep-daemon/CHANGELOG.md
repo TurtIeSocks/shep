@@ -51,6 +51,157 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add the reload state machine: the supervisor can replace each instance of an
+  app with a fresh one, one instance at a time, so the app has a window in
+  which it can stay reachable across the swap. A replacement registers under a
+  **new id in the drainee's instance slot**, so an app deriving its port from
+  `SHEP_INSTANCE` binds the same one; both entries coexist until the drainee
+  exits, and the drainee's registration is removed with it rather than left
+  behind as a dead row. The old instance is marked `stopping` before the
+  replacement is spawned, which gives `ProcStatus::Stopping` its first writer
+  and keeps a one-instance app from ever counting as two.
+
+  An instance that is no longer replaceable when its turn comes is skipped and
+  the reload carries on to the rest: one that is not `online`, and one already
+  on its way out under a `stop`, a `restart` or a memory breach that claimed
+  it before the reload arrived. The second kind still reads `online` — a kill
+  ladder does not change the status while it runs — but a swap against it
+  cannot survive, because the exit that ladder is about to produce would
+  abandon the reload it was accepted into.
+
+  **This is an overlap, not zero downtime, and the difference is the
+  application's to close.** The old listener's accept backlog is reset when it
+  closes — on both tier-1 platforms — so whatever was queued and not yet
+  accepted is lost unless the app stops accepting, drains, and exits inside
+  `graceful_timeout`. An app that ignores its stop signal until shep's
+  `SIGKILL` drops that backlog on every single reload, and nothing shep does
+  prevents it. **What that costs depends on the platform**, now measured
+  rather than reasoned: Linux load-balances new connections across every
+  listener sharing the port, so the instance being replaced keeps taking about
+  half of them right up until it closes and a reload of a defiant app loses 5
+  to 8 connections in every ~260; macOS gives every new connection to the last
+  socket to bind, so the same app is handed nothing from the moment its
+  replacement is up and the same reload loses none. Draining costs zero on
+  both. Linux is where this is worth an operator's attention.
+
+  Readiness is always gated for a replacement, even for an app that configures
+  neither `wait_ready` nor `readiness_probe` — the heuristic wait exists for
+  exactly this caller. A replacement that does not become ready inside
+  `listen_timeout` **abandons the reload**: the instance being replaced goes
+  back to serving, the instances the reload had not reached yet are left
+  alone, and the replacement is killed through the stop ladder and
+  deregistered. Abandoning protects the instance that can still serve, so it
+  only happens while there is one — a replacement whose deadline elapses
+  after the instance it was replacing has already gone on its own is taken
+  `online` anyway, since killing it too would empty the instance slot
+  outright. The drain itself runs under `graceful_timeout` (default
+  8000ms) rather than `kill_timeout` (default 1600ms), which gives
+  `graceful_timeout` its first reader in the daemon — `kill_timeout` already
+  bounded every other stop.
+
+  **Every swap is bounded by a deadline of the daemon's own**, five seconds
+  past its two timeouts back to back (`listen_timeout` + `graceful_timeout`),
+  and gives up when it expires. Without one, a reload could only ever end on a
+  message from somewhere else — a readiness task's result, or a sheep's exit —
+  and the kill ladder's wait after `SIGKILL` is unbounded, so a single
+  instance wedged in uninterruptible sleep left the app answering `<name> is
+  already being reloaded` until the daemon was restarted, and took `shep
+  reload all` down with it because that refusal is whole-selector. Giving up
+  early is cheap enough to make the margin this tight: an abandonment never
+  ends an instance that is serving. Before the swap commits it puts the
+  instance being replaced back and takes the replacement down, exactly as a
+  readiness timeout does; after it, the replacement is the app's live instance
+  and is left alone, and only the rest of the reload is lost.
+
+  **A cron occurrence and a change under a watched tree are held off both
+  halves of a swap that has not committed.** Both restart an app on the
+  daemon's own initiative, and one landing on the instance being replaced — or
+  on its replacement — abandons the reload and turns the deploy into the
+  ordinary hard restart the overlap exists to avoid. For an app with `watch =
+  true`, the one most likely to be reloaded at all, that was any save inside
+  the readiness window. **The held-off trigger is dropped, not deferred**, and
+  that is the price of holding the overlap: a save landing inside the window
+  came after the replacement was spawned, so the replacement is not carrying
+  it and nothing re-fires it, and that one instance keeps serving the older
+  code until something else restarts it. A missed cron occurrence was never
+  replayed either.
+
+  A memory breach and a liveness failure never needed the hold. Both are
+  refused against anything that is not `online`, which a drainee stops being
+  before its replacement is spawned, and a replacement arms neither of them
+  until it goes `online` itself. The hold ends at the commit rather than at
+  the end of the reload: from there the replacement is the app's live
+  instance, and a trigger against it gets the restart it would get an hour
+  later, while the drainee is by then held by the drain's own claim on it.
+  Instances of the app the reload has not reached yet are not half of any swap
+  and are restarted as usual, and an operator's own `stop`/`restart`/`delete`
+  still reaches either half and still wins — a reload is not a lock on the
+  app.
+
+  **Both halves of a swap write to one pair of log files**, because a sheep's
+  log paths are derived from its name and its instance and the two entries
+  share an instance slot. Every app is therefore a shared-log-path app for as
+  long as a swap lasts, which until now took a `merge_logs` or an explicit
+  `out_file` to arrange. `shep flush` already drew its barrier around the file
+  rather than around the selector and needed nothing; **`shep reopen` now
+  reaches every pump writing to a path it is rotating** instead of only the
+  sheep the selector matched. Without that, an external rotator renaming a
+  file mid-reload left the drainee appending to the renamed inode — the
+  archive going on growing after the rotation meant to close it, while the
+  recreated path took only the replacement's lines, and the `postrotate`
+  stanza that waited for a zero exit was told the opposite. The same gap was
+  open, and is now closed, for `shep reopen <one id>` against any app whose
+  instances share a path. The reply is unchanged and still names the sheep the
+  selector reached and no others; a failure, however, can now name a sheep the
+  operator did not, which is the honest report of a shared file that could not
+  be reopened.
+
+  **The verb is answered on the control socket.** `Request::Reload` comes
+  back as `Response::Reloading` the moment the reload is *accepted*, before
+  the first replacement is spawned, carrying the matched sheep as they stood
+  at that moment. That is forced rather than chosen: one instance costs a
+  readiness wait plus a drain in the worst case, a client's budget is capped
+  at 60s, and expiring a budget bounds the reply and not the actor's work —
+  so a reply that waited for the swaps would routinely be abandoned while the
+  reload it asked for went on running. Both refusals — a selector that
+  reached an app already reloading, and a reload arriving after a shutdown
+  has begun — answer `RpcErrorCode::Internal`, since that code set is
+  versioned and neither refusal has one of its own. An app already reloading
+  is the one an operator can act on, so its reply carries the
+  `SupervisorError`'s own message, which names the app.
+
+  **The swaps report themselves on the bus**, which an early reply makes the
+  only account of them there is. Each swap puts a `process.reload` on the
+  instance being replaced *before* its replacement's `process.start` — a
+  second `start` in an instance slot that already holds a live entry explains
+  nothing on its own — and a `process.reloaded` on the replacement once the
+  instance it drained is gone, so the event means "the swap is over" rather
+  than "the new one is up". **`process.reloaded` is owed to a replacement that
+  is still serving**, not merely to one still registered: a replacement that
+  goes down inside the drain window keeps its row in the flock, and announcing
+  a swap off that row would name a process that is not there. A reload that
+  gives up sends `process.reload_abandoned` instead, naming whichever instance
+  the abandonment left holding the slot — the instance it gave up on
+  replacing, which is the app's live one wherever going back to serving is
+  still true, or the replacement itself where that is what went down. Read the
+  status on the event rather than assuming. Every way a swap can fail reaches
+  it: a replacement that could not be spawned at all, one that did not become
+  ready inside `listen_timeout`, one that exited before it was ready — with or
+  without the instance it was replacing still there — one that exited after
+  taking the slot over but before the instance it replaced was gone, and an
+  operator's own command reaching the instance being replaced while the swap
+  was still abandonable. The one case that reports nothing is the one with
+  nothing left to name: a replacement deleted outright while the instance it
+  replaced was still draining, which is a warning in the daemon's log and no
+  event. An instance the reload passed
+  over — not `online` when its turn came, or already on its way out under
+  something else — also produces none of the three, because no swap was ever
+  attempted against it.
+- Add `SupervisorError::ReloadInFlight`, carrying an app's name — a reload
+  that reaches an app whose reload has not finished is refused whole rather
+  than queued or partly accepted. **Breaking for anything matching
+  exhaustively on `SupervisorError`**, which is not `#[non_exhaustive]` by
+  deliberate choice.
 - Add the cron-restart worker: one worker per name-group, restarting every
   instance of the name — stopped instances included — on its `cron_restart`
   schedule, the same reach the watch below has. The dialect is five-field
@@ -196,21 +347,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `runner::FlushError` names the files either half of the verb could not
   deal with.
 - Answer `Request::Reopen`: the supervisor keeps a clone of every running
-  sheep's log-control sender and pushes a `LogCtl::Reopen` at each sheep the
-  selector matches, which is what makes `create`-mode rotation — rename the
-  file, then ask — work at all. Until now the pump kept filling the renamed
-  inode and the live path was never recreated, so `shep bleats --no-follow`
-  printed nothing and exited 0 with no diagnostic; a restart was the only
-  working reopen. The reply lands only once every matched pump has swapped
-  both handles, so a `postrotate` stanza that waits for it knows nothing is
-  still holding what it renamed. A matched sheep with no live pump is
-  reported as a success rather than an error: there was nothing to reopen,
-  which is not a failure worth failing `reopen all` over. A pump that
-  answered and could not open a path again is the opposite case and fails
-  the request (`SupervisorError::ReopenFailed`, `RpcErrorCode::Internal` on
-  the wire), naming every such sheep and path — every matched sheep is
-  visited first, so one sheep whose log directory is gone neither stops the
-  rest being reopened nor goes unreported. The
+  sheep's log-control sender and pushes a `LogCtl::Reopen` at every sheep
+  writing to a path a matched sheep writes to, which is what makes
+  `create`-mode rotation — rename the file, then ask — work at all. Until now
+  the pump kept filling the renamed inode and the live path was never
+  recreated, so `shep bleats --no-follow` printed nothing and exited 0 with
+  no diagnostic; a restart was the only working reopen. The reach is keyed by
+  the path rather than by the selector because what a rotator renamed is a
+  file, and any writer left unasked goes on appending to the renamed inode —
+  see the reload entry above for the case that forced the distinction. The
+  reply stays selector-keyed and names the sheep the operator asked for and
+  no others; a failure can name one they did not. That reply lands only once
+  every pump reached has swapped both handles, so a `postrotate` stanza that
+  waits for it knows nothing is still holding what it renamed. A matched
+  sheep with no live pump is reported as a success rather than an error:
+  there was nothing to reopen, which is not a failure worth failing `reopen
+  all` over. A pump that answered and could not open a path again is the
+  opposite case and fails the request (`SupervisorError::ReopenFailed`,
+  `RpcErrorCode::Internal` on the wire), naming every such sheep and path —
+  every pump is visited first, so one sheep whose log directory is gone
+  neither stops the rest being reopened nor goes unreported. The
   acknowledgements are awaited on a task of their own and never inside the
   actor loop — an actor parked on one stops draining its mailbox, which
   stops the sheep task draining its logs, which stops the pump answering.
@@ -350,6 +506,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the bus event are the same either way. Treating a slow start as a spawn
   failure would produce exactly the restart loop `max_restarts` exists to
   contain, out of an app that is slow rather than broken.
+- `fake::ProcScript` (behind `test-fakes`) gains an `obeys_kill: bool` field
+  and a `never_reports_its_exit()` constructor for a script whose `wait()`
+  never resolves — the one child a kill ladder cannot end, wedged in
+  uninterruptible sleep, where `SIGKILL` is delivered and the wait behind it
+  never returns. Nothing else could put a test on what the supervisor does
+  when a message it is waiting for never comes. Filed as a change rather than
+  an addition for the same reason `BootOptions` below is: the struct carries
+  no `#[non_exhaustive]`, so a downstream literal naming every field stops
+  compiling until it names this one. Every existing constructor sets it
+  `true`, which is what every real process does.
 - `BootOptions` gains a `max_cron_sleep: Option<Duration>` field, carrying
   `[daemon] max_cron_sleep` from `shep.toml` to the cron workers; `None` means
   the crate-private default, applied by `boot` and nowhere else. Filed as a

@@ -22,7 +22,8 @@ use crate::runner::{
 /// test blocks on backpressure without meaning to.
 const CHANNEL_CAPACITY: usize = 32;
 
-/// Delay used by [`ProcScript::never_exits`] / [`ProcScript::ignores_signals`].
+/// Delay used by [`ProcScript::never_exits`], [`ProcScript::ignores_signals`]
+/// and [`ProcScript::never_reports_its_exit`].
 ///
 /// Large enough that no test's `tokio::time::advance` ever reaches it, small
 /// enough (~30 days of milliseconds) to stay far under tokio's timer-wheel
@@ -38,6 +39,11 @@ pub struct ProcScript {
     pub outcome: ExitOutcome,
     /// Whether the process honors `signal()`/`Shutdown` by exiting early
     pub obeys_signal: bool,
+    /// Whether `kill_tree()` resolves its `wait()`. `true` for every ordinary
+    /// process — `SIGKILL` cannot be caught — and `false` only for
+    /// [`ProcScript::never_reports_its_exit`], which models the one child a
+    /// kill ladder cannot end.
+    pub obeys_kill: bool,
     /// Whether a forked lamb keeps the child's stdout and stderr open past
     /// the child's own exit, so neither stream ever reaches EOF. See
     /// [`ProcScript::with_a_lamb_holding_the_pipe`].
@@ -55,6 +61,7 @@ impl ProcScript {
                 signal: None,
             },
             obeys_signal: true,
+            obeys_kill: true,
             lamb_holds_the_pipe: false,
         }
     }
@@ -69,6 +76,7 @@ impl ProcScript {
                 signal: None,
             },
             obeys_signal: true,
+            obeys_kill: true,
             lamb_holds_the_pipe: false,
         }
     }
@@ -83,6 +91,7 @@ impl ProcScript {
                 signal: None,
             },
             obeys_signal: true,
+            obeys_kill: true,
             lamb_holds_the_pipe: false,
         }
     }
@@ -93,6 +102,27 @@ impl ProcScript {
         Self {
             obeys_signal: false,
             ..Self::never_exits()
+        }
+    }
+
+    /// Never resolves its `wait()` at all: not on a signal, and not on
+    /// `kill_tree` either.
+    ///
+    /// Models the one child a kill ladder cannot end — one wedged in
+    /// uninterruptible sleep, where `SIGKILL` is delivered and accepted by the
+    /// kernel and the `wait(2)` behind it simply never returns. `kill_process`
+    /// waits on that unbounded, so the sheep task never reports a
+    /// `Msg::Exited`, and this is the only way to put a test on what the
+    /// supervisor does when a message it is waiting on never comes.
+    ///
+    /// The kill is still delivered and still counted
+    /// ([`ScriptedRunner::kill_counts`]) — what this withholds is the exit,
+    /// not the signal.
+    #[must_use]
+    pub fn never_reports_its_exit() -> Self {
+        Self {
+            obeys_kill: false,
+            ..Self::ignores_signals()
         }
     }
 
@@ -139,6 +169,9 @@ struct ProcState {
     outcome: ExitOutcome,
     /// Whether a signal/shutdown event resolves the wait early
     obeys_signal: bool,
+    /// Whether a `kill_tree()` event resolves the wait; see
+    /// [`ProcScript::obeys_kill`]
+    obeys_kill: bool,
     /// Notified on `signal()` or a `Shutdown` message; permit buffers if
     /// nobody is awaiting yet, so events firing before OR during a `wait()`
     /// both resolve it.
@@ -232,9 +265,12 @@ impl RunningProcess for FakeProc {
             return outcome;
         }
 
-        // Every branch resolves the wait, so this select! never re-loops: a signal
-        // this wait doesn't obey simply isn't a candidate branch (the `if` guard),
-        // it doesn't fall through to a retry.
+        // Every branch resolves the wait, so this select! never re-loops: an
+        // event this wait doesn't obey simply isn't a candidate branch (the
+        // `if` guard), it doesn't fall through to a retry. With both guards
+        // off, `exit_deadline` is the only branch left — which for
+        // `never_reports_its_exit` is `NEVER_MS` away, so nothing this side
+        // of a month of virtual time resolves it.
         let outcome = tokio::select! {
             () = sleep_until(self.state.exit_deadline) => self.state.outcome,
             () = self.state.signal_notify.notified(), if self.state.obeys_signal => {
@@ -244,7 +280,7 @@ impl RunningProcess for FakeProc {
                     signal: Some(raw.unwrap_or_else(|| StopSignal::Term.as_raw())),
                 }
             }
-            () = self.state.kill_notify.notified() => {
+            () = self.state.kill_notify.notified(), if self.state.obeys_kill => {
                 ExitOutcome { code: None, signal: Some(StopSignal::Kill.as_raw()) }
             }
         };
@@ -444,6 +480,7 @@ impl ProcessRunner for ScriptedRunner {
             exit_deadline: Instant::now() + Duration::from_millis(script.delay_ms),
             outcome: script.outcome,
             obeys_signal: script.obeys_signal,
+            obeys_kill: script.obeys_kill,
             signal_notify: Notify::new(),
             pending_signal: Mutex::new(None),
             signals: Mutex::new(Vec::new()),
