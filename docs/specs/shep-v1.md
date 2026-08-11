@@ -117,9 +117,11 @@ at the replacement spawn, on every reload, and shep cannot detect the
 misconfiguration in advance; `SO_REUSEADDR`, which far more frameworks set
 by default, is not sufficient, and a mixed pair (one process with
 `SO_REUSEPORT` set, one without) is refused by the kernel on both tier-1
-platforms. Without `reuse_port`, reload degrades to rolling-restart
-(documented, one instance at a time). Reload proceeds instance-by-instance;
-failure of the new instance aborts the rest and keeps old instances running.
+platforms. There is no degraded mode without `reuse_port`: nothing in shep
+reads the option, so reload runs exactly the same machine either way and a
+port-binding app's replacement simply fails to bind. Reload proceeds
+instance-by-instance; failure of the new instance aborts the rest and keeps
+old instances running.
 
 > macOS caveat: `SO_REUSEPORT` there is last-binder-wins, not
 > load-balancing — measured cross-process over 40 connections, macOS sent
