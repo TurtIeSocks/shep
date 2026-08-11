@@ -109,12 +109,11 @@ impl RestartBudget {
 /// A reload runs two [`ProcessEntry`] records at once — the drainee (old,
 /// going away) and the replacement (new) — and the two non-`None` variants
 /// split across them rather than sharing one: [`Self::SpawningReplacement`]
-/// lives on the drainee, [`Self::Draining`] lives on the replacement. Which
-/// half an entry is, is the whole of what this type says. Navigating from one
-/// half to the other is the reload job's job, and only the drainee's
-/// direction is answered here at all — the replacement's back-reference lives
-/// on that job, in the same currency (an entry id) the machinery around it
-/// uses.
+/// lives on the drainee, [`Self::Draining`] lives on the replacement. All
+/// this type says is which half of a swap an entry is. Getting from one half
+/// to the other belongs to the reload job, and only the drainee's direction
+/// is answered here at all: the replacement's back-reference lives on that
+/// job, in the entry ids the machinery around it navigates by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadState {
     /// Not in a reload sequence
