@@ -3485,7 +3485,12 @@ mod tests {
     use super::*;
     use crate::fake::{ProcScript, ScriptedRunner};
     // the one crate-root fixture (IR-33)
-    use crate::testing::{SharedRunner, armed_entry, probe_config, test_paths};
+    use crate::testing::{RecordingEnforcer, SharedRunner, armed_entry, probe_config, test_paths};
+    // Test-only: the one case that drives a real `liveness_probe` has to
+    // build the lifecycle extras the production wiring builds at boot, and
+    // put the daemon's own reporter behind them.
+    use crate::cron::{DEFAULT_MAX_CRON_SLEEP, SystemClock};
+    use crate::extras::{ExtrasReports, spawn_extras_reporter};
     // Test-only: `SilentPumpRunner` counts the requests its pumps receive so
     // a case can order itself against the actor. Imported here rather than
     // beside the module's other `tokio::sync` uses, which do not need it.
@@ -5921,6 +5926,146 @@ mod tests {
             2,
             "the report never caused a spawn"
         );
+    }
+
+    // `a_report_raised_against_a_drainee_never_takes_it_off_the_reload`'s
+    // guarantee, observed end to end instead of off a report handed to the
+    // actor by hand: a real `liveness_probe`, the real `OsProber` the engine
+    // builds for it, the real loop that probes with it, the daemon's own
+    // extras reporter, and a reload the supervisor performs. The drainee
+    // stops answering while its replacement is still starting, and must be
+    // reaped when the swap commits rather than restarted into the slot the
+    // replacement already holds.
+    //
+    // What it pins is the OUTCOME, and TWO mechanisms stand behind that
+    // outcome, so it reddens only when both are gone. Each is one line:
+    // `handle_extra_restart`'s `status != Online` rejection, and
+    // `begin_manual`'s `if held_off_by_a_swap { continue; }`. Removing either
+    // one alone leaves this case green — checked both ways round — so a
+    // comment naming a single mechanism here would be naming a bug this case
+    // cannot catch. With both gone the drainee is killed and respawned, and
+    // the `Restart` assertion below is what fails.
+    //
+    // The replacement's own restart at the end is a control: same run, same
+    // dead target, same loop, and it says the chain really does carry a
+    // failing probe all the way to a restart here. Delete the
+    // `spawn_extras_reporter` call and it is what reddens (`no Restart for id
+    // 1 within 30s`), where every assertion above would pass on a fixture
+    // that reported nothing at all. What it does NOT do is prove the
+    // DRAINEE's own probe failed — the mutation above proves that, since a
+    // drainee nothing reported against cannot be respawned by deleting two
+    // rejections. A change that armed no liveness loop on a drainee
+    // specifically would leave this case green.
+    //
+    // The paused clock holds here where `readiness_probe_app_stays_starting_until_the_probe_passes`
+    // needs real time, and the difference is that every probe in this case
+    // must FAIL. A failure waits on nothing the frozen clock could hold up:
+    // there is no listener to bind, no accept and no child to exit, and a
+    // connection refused and an auto-advanced `timeout` are the same verdict.
+    #[tokio::test(start_paused = true)]
+    async fn a_drainee_whose_liveness_probe_fails_is_reaped_rather_than_restarted() {
+        let dir = tempfile::tempdir().unwrap();
+        // Reserve a port and release it: nothing ever listens there, so every
+        // probe below fails, from the first one to the last.
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let mut app = AppConfig::minimal("web", "./srv");
+        // Both halves go online by hand, so the liveness failure lands
+        // squarely inside `AwaitReady` rather than racing a deadline...
+        app.wait_ready = true;
+        // ...and that window cannot elapse on its own while this case waits
+        // out a probe interval inside it.
+        app.listen_timeout = UpDuration::from_millis(60_000);
+        app.liveness_probe = Some(ProbeConfig {
+            // The floor `spawn_liveness_task` honours anyway, so the report
+            // lands as early in the window as one can.
+            interval: UpDuration::from_millis(1_000),
+            timeout: UpDuration::from_millis(500),
+            // One failed probe is a failure here: the threshold is another
+            // case's subject.
+            failure_threshold: 1,
+            ..probe_config(ProbeKind::Tcp, &addr.to_string())
+        });
+
+        // Four scripts for the three spawns a correct run performs — the
+        // original, the replacement, and the replacement's own liveness
+        // restart at the end — plus one for the respawn a broken
+        // implementation performs in between. `ScriptedRunner` answers
+        // `SpawnFailed("script exhausted")` once it runs out, which would land
+        // that respawn `Errored` rather than the live process the bug really
+        // produces, and `Errored` is a state this case could mistake for the
+        // failure it is looking for.
+        let (events, mut rx) = tokio::sync::broadcast::channel(256);
+        let runner = Arc::new(ScriptedRunner::new(vec![ProcScript::never_exits(); 4]));
+        // Capacity past anything this case raises: one liveness failure per
+        // armed instance, and no breaches at all.
+        let (breaches_tx, breaches_rx) = mpsc::channel(8);
+        let (liveness_tx, liveness_rx) = mpsc::channel(8);
+        let handle =
+            SupervisorBuilder::new(SharedRunner(Arc::clone(&runner)), test_paths(&dir), events)
+                .extras(Extras {
+                    // Neither seam is read: the app configures no
+                    // `cron_restart` and no `max_memory`. The liveness half of
+                    // `reports` is the whole reason the extras are wired here.
+                    clock: Arc::new(SystemClock),
+                    enforcer: Arc::new(RecordingEnforcer::default()),
+                    max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+                    reports: ExtrasReports {
+                        breaches: breaches_tx,
+                        liveness: liveness_tx,
+                    },
+                })
+                .spawn();
+        // The daemon's own reporter, not a forwarding line written here: it
+        // is the step that turns a `LivenessFailure` into the `extra_restart`
+        // the two rejections then rule on.
+        let _reporter = spawn_extras_reporter(breaches_rx, liveness_rx, handle.clone());
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+        handle.tx.send(Msg::Ready { id: 0 }).await.unwrap();
+        expect_event(&mut rx, 0, ProcessEventKind::Online).await;
+
+        handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the reload is accepted");
+        expect_event(&mut rx, 1, ProcessEventKind::Start).await;
+
+        // Five times the probe interval, so the failure has long since been
+        // raised, and far short of the 60s readiness deadline, so nothing but
+        // that failure could have moved the drainee inside the window.
+        // `Restart`, not `Delete`: the bug kills the drainee and respawns it,
+        // which never emits a `Delete` for this id.
+        assert_no_event_within(
+            &mut rx,
+            0,
+            ProcessEventKind::Restart,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(handle.list().await[0].status, ProcStatus::Stopping);
+        assert_eq!(
+            runner.kill_counts().len(),
+            2,
+            "the failing probe never caused a spawn"
+        );
+
+        // The replacement takes over, and the drainee goes the way a reload
+        // ends one: reaped, with nothing put back in its place.
+        handle.tx.send(Msg::Ready { id: 1 }).await.unwrap();
+        expect_event(&mut rx, 1, ProcessEventKind::Online).await;
+        expect_event(&mut rx, 0, ProcessEventKind::Delete).await;
+        let after = handle.list().await;
+        assert_eq!(after.len(), 1, "the drainee left no registration behind");
+        assert_eq!(after[0].id, 1);
+
+        // The control. The replacement is the app's live instance now, armed
+        // against the same dead target, and its own probe failure DOES
+        // restart it — so the chain this case rests on is delivering in this
+        // run rather than reporting nothing at all.
+        expect_event(&mut rx, 1, ProcessEventKind::Restart).await;
     }
 
     // fails if a drainee's own exit is handed to `decide_on_exit`: an
