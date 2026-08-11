@@ -617,7 +617,8 @@ crates/shep-daemon/examples/reuse_port_sheep.rs   ← new (Phase 6)
            answered connection is attributable to a process; `SHEEP_DEFIANT=1` makes it ignore
            SIGTERM, and THE GAP BETWEEN THE TWO RUNS IS THE FINDING. An `examples/` target
            because that is the only kind cargo builds for a plain `cargo test`, allows a
-           dev-dependency (`nix`, which must not join the shipped daemon's graph) and never
+           dev-dependency (nix's `socket`/`net` features, which must not join the shipped
+           daemon's graph — nix itself is already a dependency of it, for `fs`) and never
            installs. Both platforms assert the weak property (the swap completes, the
            replacement owns the port, the drainee is reaped); the CONNECTION COUNT is asserted
            `#[cfg(target_os = "linux")]` only, because macOS hands every new connection to the
