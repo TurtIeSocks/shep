@@ -95,8 +95,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the instance it was replacing has already gone on its own is taken
   `online` anyway, since killing it too would empty the instance slot
   outright. The drain itself runs under `graceful_timeout` (default
-  8000ms) rather than `kill_timeout` (default 1600ms), which gives both of
-  those app options their first reader in the daemon.
+  8000ms) rather than `kill_timeout` (default 1600ms), which gives
+  `graceful_timeout` its first reader in the daemon — `kill_timeout` already
+  bounded every other stop.
 
   **Every swap is bounded by a deadline of the daemon's own**, five seconds
   past its two timeouts back to back (`listen_timeout` + `graceful_timeout`),

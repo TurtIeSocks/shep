@@ -217,7 +217,8 @@ src/
              delete, the daemon's own automatic restarts and the engine-wide shutdown; `Drain`
              is `graceful_timeout` (8000ms) and belongs to a reload's drain — the one stop that
              asks the instance to finish the work already in hand, and so the one given longer
-             to do it. Both app options had zero readers before reload.
+             to do it. `graceful_timeout` had no reader in the daemon before reload;
+             `kill_timeout` already bounded the wait on every other stop.
   reload.rs          ← was lib/God/Reload.js
       Action: port contract + rewrite mechanism                 [UPGRADE over pm2]
       Drift (Phase 6, recorded): THERE IS NO SUCH FILE. A reload is a sequence of actor
