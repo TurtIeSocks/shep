@@ -5369,14 +5369,14 @@ mod tests {
     // --- `Stopping`: reload's drainee, pinned against the guards it must
     // never pass ---
     //
-    // Nothing in production code sets `ProcStatus::Stopping` yet (reload's
-    // state machine is a later addition), so there is no black-box path —
-    // no `SupervisorHandle` call — that lands a sheep in it. These two cases
-    // build the actor directly instead, the same private-module access
-    // `spawn`'s own struct literal uses, and call the guarded handlers as
-    // plain functions. That is a deliberate, narrower unit test of the
-    // guard itself, not a stand-in for coverage a real reload path will
-    // also need once it exists.
+    // These two cases build the actor directly — the same private-module
+    // access `spawn`'s own struct literal uses — and call the guarded
+    // handlers as plain functions rather than reaching them through a whole
+    // swap. That is what makes a failure here name the guard that stopped
+    // rejecting instead of some later consequence of it: nothing between the
+    // handler and the assertion can absorb the difference. The reload cases
+    // below drive the same guards through `SupervisorHandle::reload`, and
+    // these sit alongside that coverage rather than in place of it.
 
     /// One sheep already `Stopping`, wired the way a reload's drainee will
     /// be: a live `ctl` sender (its kill ladder owns the next exit) and a
