@@ -142,6 +142,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has begun — answer `RpcErrorCode::Internal` carrying the `SupervisorError`'s
   own message, since that code set is versioned and neither refusal has one
   of its own.
+
+  **The swaps report themselves on the bus**, which an early reply makes the
+  only account of them there is. Each swap puts a `process.reload` on the
+  instance being replaced *before* its replacement's `process.start` — a
+  second `start` in an instance slot that already holds a live entry explains
+  nothing on its own — and a `process.reloaded` on the replacement once the
+  instance it drained is gone, so the event means "the swap is over" rather
+  than "the new one is up". A reload that gives up sends
+  `process.reload_abandoned` naming the instance that is still serving, from
+  both ends it can come to: a replacement that never became ready, and a
+  replacement that could not be spawned at all. An instance the reload passed
+  over — not `online` when its turn came, or already on its way out under
+  something else — produces none of the three, because no swap was ever
+  attempted against it.
 - Add `SupervisorError::ReloadInFlight`, carrying an app's name — a reload
   that reaches an app whose reload has not finished is refused whole rather
   than queued or partly accepted. **Breaking for anything matching

@@ -1780,6 +1780,16 @@ impl<R: ProcessRunner> Actor<R> {
                         "reload abandoned: the replacement could not be spawned"
                     );
                     self.reloads.remove(name);
+                    // The other end a reload can come to, and the only one
+                    // that reaches the bus without `abort_reload`: no
+                    // replacement was ever registered, so nothing but this
+                    // says the swap is off. `spawn_replacement` has already
+                    // put the drainee back to `Online`, which is what the
+                    // event carries.
+                    if let Some(slot) = self.sheep.get(&old_id) {
+                        let info = to_info(&slot.entry);
+                        self.emit(ProcessEventKind::ReloadAbandoned, info, true);
+                    }
                     return;
                 }
             }
@@ -1925,6 +1935,17 @@ impl<R: ProcessRunner> Actor<R> {
                         ready_tx: Some(ready_tx),
                     },
                 );
+                // The instance being replaced announces itself BEFORE its
+                // replacement's `Start`, and the order is the useful half. A
+                // reload's reply is an acceptance, so a subscriber's whole
+                // account of the swap is what arrives here; a second `Start`
+                // in an instance slot that already had a live entry is not
+                // self-explanatory, and `Reload` is what explains it. Emitted
+                // from the drainee's own entry, which is `Stopping` by now,
+                // so a reader following one id sees it change hands rather
+                // than having to pair two events by slot.
+                let drainee = to_info(&self.sheep[&old_id].entry);
+                self.emit(ProcessEventKind::Reload, drainee, true);
                 self.emit(ProcessEventKind::Start, info, true);
                 Ok(new_id)
             }
@@ -2045,11 +2066,22 @@ impl<R: ProcessRunner> Actor<R> {
 
     /// One instance replaced: the replacement stops being half of a pair, and
     /// the reload moves on to the next instance (or ends).
+    ///
+    /// The `Reloaded` this announces is the one event that says a swap
+    /// SUCCEEDED, and it goes out before the next swap begins so a clustered
+    /// app's reload reads in order. It is skipped where the replacement is
+    /// already gone — a swap the drainee's own death committed, whose
+    /// replacement then exited before this ran — because an event claiming an
+    /// instance took over would name a process that is not there.
     fn finish_swap(&mut self, name: &str) {
         let Some(job) = self.reloads.remove(name) else {
             return;
         };
         self.clear_reload(job.swap.new_id);
+        if let Some(slot) = self.sheep.get(&job.swap.new_id) {
+            let info = to_info(&slot.entry);
+            self.emit(ProcessEventKind::Reloaded, info, true);
+        }
         self.advance_reload(name, job.queue);
     }
 
@@ -2093,7 +2125,10 @@ impl<R: ProcessRunner> Actor<R> {
             "reload abandoned"
         );
 
-        if let Some(drainee) = self.sheep.get_mut(&job.swap.old_id) {
+        // Read back out of the map rather than emitted inside the block: the
+        // event has to carry the status the restore below decides, and that
+        // block holds a mutable borrow while it decides it.
+        let kept = self.sheep.get_mut(&job.swap.old_id).map(|drainee| {
             drainee.entry.reload = ReloadState::None;
             // `Online` only where going back to serving is actually true.
             // Two abandonments reach a drainee for which it is not. When the
@@ -2108,6 +2143,10 @@ impl<R: ProcessRunner> Actor<R> {
             if drainee.ctl.is_some() && drainee.manual.is_none() {
                 drainee.entry.status = ProcStatus::Online;
             }
+            to_info(&drainee.entry)
+        });
+        if let Some(info) = kept {
+            self.emit(ProcessEventKind::ReloadAbandoned, info, true);
         }
 
         let new_id = job.swap.new_id;
@@ -6445,6 +6484,228 @@ mod tests {
         let after = handle.list().await;
         assert_eq!(after[0].id, 1);
         assert_eq!(after[0].restarts, 1);
+    }
+
+    /// One process event, flattened to what a reload's bus claims are made
+    /// of: who it names, what happened, the status that went out with it,
+    /// and whether it was reported as an operator's doing.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Seen {
+        id: u32,
+        kind: ProcessEventKind,
+        status: ProcStatus,
+        manually: bool,
+    }
+
+    /// Every process event in arrival order, up to and including `kind` for
+    /// `id`.
+    ///
+    /// [`expect_event`] skips past whatever it is not looking for, which is
+    /// exactly wrong for an ordering claim — this keeps the run. Bounded by
+    /// [`SWAP_WINDOW`] (rule 11: a bounded `timeout` + `recv`, never a bare
+    /// `try_recv`), so an event that never arrives fails naming what was
+    /// waited for rather than parking the suite. A `Lagged` is fatal rather
+    /// than skipped: a hole in the stream is a hole in every claim read off
+    /// it.
+    async fn events_through(
+        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        id: u32,
+        kind: ProcessEventKind,
+    ) -> Vec<Seen> {
+        let collect = async {
+            let mut seen = Vec::new();
+            loop {
+                match rx.recv().await {
+                    Ok(BusEvent::Process {
+                        event,
+                        info,
+                        manually,
+                        ..
+                    }) => {
+                        seen.push(Seen {
+                            id: info.id,
+                            kind: event,
+                            status: info.status,
+                            manually,
+                        });
+                        if info.id == id && event == kind {
+                            return seen;
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        panic!("the event stream lagged by {n}; no ordering claim survives that")
+                    }
+                    Err(e) => panic!("event stream closed before {kind:?} for id {id}: {e}"),
+                }
+            }
+        };
+        tokio::time::timeout(SWAP_WINDOW, collect)
+            .await
+            .unwrap_or_else(|_| panic!("no {kind:?} for id {id} within {SWAP_WINDOW:?}"))
+    }
+
+    /// Where `seen` first records `kind` for `id`, or a panic naming the run.
+    fn at(seen: &[Seen], id: u32, kind: ProcessEventKind) -> usize {
+        seen.iter()
+            .position(|e| e.id == id && e.kind == kind)
+            .unwrap_or_else(|| panic!("no {kind:?} for id {id} in {seen:?}"))
+    }
+
+    // fails if a completed swap goes unreported on the bus, or is reported in
+    // an order a subscriber cannot read.
+    //
+    // A reload's reply is an ACCEPTANCE, so these frames are the whole of
+    // what a client ever learns about how the reload actually went, and each
+    // of the three claims here is one a subscriber has to be able to make:
+    //
+    // - `Reload` names the drainee BEFORE the replacement's `Start`. Without
+    //   the ordering, the first thing a subscriber sees is a second `Start`
+    //   in an instance slot that already had a live entry, which nothing
+    //   explains. Deleting the emit, or moving it after the `Start`, fails
+    //   here.
+    // - `Reload` carries `Stopping`, which is what says the named instance is
+    //   the one going rather than the one arriving.
+    // - `Reloaded` lands only once the drainee's `Delete` has, so it means
+    //   "the swap is over" and not merely "the replacement is up". An emit
+    //   moved into `reload_ready_result`, where the replacement goes
+    //   `Online`, is the plausible slip and this ordering is what catches it.
+    //
+    // Three scripts, of which a correct run uses two — the original and its
+    // replacement. The third is for the spawn a broken run makes that a
+    // correct one does not (a restart in place of a swap), so it lands as a
+    // live entry rather than as the `SpawnFailed("script exhausted")` that
+    // turns into `Errored` and reads like an unrelated failure.
+    #[tokio::test(start_paused = true)]
+    async fn a_completed_swap_reports_itself_on_the_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _runner, mut rx) = started(
+            &dir,
+            AppConfig::minimal("web", "./srv"),
+            vec![ProcScript::never_exits(); 3],
+        )
+        .await;
+
+        handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the reload is accepted");
+
+        let seen = events_through(&mut rx, 1, ProcessEventKind::Reloaded).await;
+
+        assert!(
+            at(&seen, 0, ProcessEventKind::Reload) < at(&seen, 1, ProcessEventKind::Start),
+            "the instance being replaced is named before its replacement starts: {seen:?}"
+        );
+        assert_eq!(
+            seen[at(&seen, 0, ProcessEventKind::Reload)],
+            Seen {
+                id: 0,
+                kind: ProcessEventKind::Reload,
+                status: ProcStatus::Stopping,
+                manually: true,
+            }
+        );
+        assert!(
+            at(&seen, 0, ProcessEventKind::Delete) < at(&seen, 1, ProcessEventKind::Reloaded),
+            "a swap is not over until the instance it replaced is gone: {seen:?}"
+        );
+        assert_eq!(
+            seen[at(&seen, 1, ProcessEventKind::Reloaded)],
+            Seen {
+                id: 1,
+                kind: ProcessEventKind::Reloaded,
+                status: ProcStatus::Online,
+                manually: true,
+            }
+        );
+    }
+
+    // fails if an abandoned reload ends in silence on the bus. The reply was
+    // an acceptance, so a subscriber that hears a `Reload` and never hears
+    // again cannot tell a reload still running from one that gave up — and
+    // giving up is the case where knowing matters, because the app is still
+    // on the old code.
+    //
+    // The abandonment here is the readiness one: `wait_ready` with nothing
+    // ever signalling the replacement, so the wait elapses and
+    // `abort_reload` runs. The `Online` in the event is the second half of
+    // the claim — the instance named is the one still serving, which is what
+    // makes the event actionable rather than merely a notice.
+    //
+    // Two scripts, both used by a correct run: the original and the
+    // replacement that never becomes ready. A third would be spawned only by
+    // an implementation that carried the reload on past the abandonment.
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_reload_says_so_on_the_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.wait_ready = true; // nobody ever signals the replacement
+        let (handle, _runner, mut rx) =
+            started(&dir, app, vec![ProcScript::never_exits(); 2]).await;
+        handle.tx.send(Msg::Ready { id: 0 }).await.unwrap();
+        expect_event(&mut rx, 0, ProcessEventKind::Online).await;
+
+        handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the reload is accepted");
+
+        let seen = events_through(&mut rx, 0, ProcessEventKind::ReloadAbandoned).await;
+        assert_eq!(
+            seen[at(&seen, 0, ProcessEventKind::ReloadAbandoned)],
+            Seen {
+                id: 0,
+                kind: ProcessEventKind::ReloadAbandoned,
+                status: ProcStatus::Online,
+                manually: true,
+            },
+            "the abandoned reload's own instance is still the one serving"
+        );
+    }
+
+    // fails if a reload that cannot spawn its replacement ends in silence.
+    // This is the other way a reload ends badly, and the one that reaches the
+    // bus without going through `abort_reload`: no replacement was ever
+    // registered, so no `Start`, no `Delete`, nothing at all unless
+    // `advance_reload`'s own failure arm says so. A subscriber would see the
+    // acceptance and then never hear about that app again.
+    //
+    // ONE script, and the exhausted pool IS the injected failure rather than
+    // something hiding one: `ScriptedRunner` answers `SpawnFailed("script
+    // exhausted")` for the replacement, which is `runner.spawn` failing —
+    // exactly the arm under test. The assertions rule out the readings an
+    // exhausted pool could otherwise be confused with: nothing extra is
+    // registered, and the drainee is `Online` rather than `Errored`.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_whose_replacement_cannot_spawn_says_so_on_the_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _runner, mut rx) = started(
+            &dir,
+            AppConfig::minimal("web", "./srv"),
+            vec![ProcScript::never_exits()],
+        )
+        .await;
+
+        handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the reload is accepted before anything is spawned");
+
+        let seen = events_through(&mut rx, 0, ProcessEventKind::ReloadAbandoned).await;
+        assert_eq!(
+            seen[at(&seen, 0, ProcessEventKind::ReloadAbandoned)],
+            Seen {
+                id: 0,
+                kind: ProcessEventKind::ReloadAbandoned,
+                status: ProcStatus::Online,
+                manually: true,
+            },
+            "a failed spawn leaves the instance it was replacing serving"
+        );
+        let after = handle.list().await;
+        assert_eq!(after.len(), 1, "no replacement was registered: {after:?}");
+        assert_eq!(after[0].id, 0);
     }
 
     /// Fails if `run_sheep` lets go of `ProcIo::log_ctl` while its sheep is
