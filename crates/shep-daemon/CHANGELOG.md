@@ -98,6 +98,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   8000ms) rather than `kill_timeout` (default 1600ms), which gives both of
   those app options their first reader in the daemon.
 
+  **Every swap is bounded by a deadline of the daemon's own**, five seconds
+  past its two timeouts back to back (`listen_timeout` + `graceful_timeout`),
+  and gives up when it expires. Without one, a reload could only ever end on a
+  message from somewhere else — a readiness task's result, or a sheep's exit —
+  and the kill ladder's wait after `SIGKILL` is unbounded, so a single
+  instance wedged in uninterruptible sleep left the app answering `<name> is
+  already being reloaded` until the daemon was restarted, and took `shep
+  reload all` down with it because that refusal is whole-selector. Giving up
+  early is cheap enough to make the margin this tight: an abandonment never
+  ends an instance that is serving. Before the swap commits it puts the
+  instance being replaced back and takes the replacement down, exactly as a
+  readiness timeout does; after it, the replacement is the app's live instance
+  and is left alone, and only the rest of the reload is lost.
+
   **A cron occurrence and a change under a watched tree are held off both
   halves of a swap that has not committed.** Both restart an app on the
   daemon's own initiative, and one landing on the instance being replaced — or
@@ -486,6 +500,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the bus event are the same either way. Treating a slow start as a spawn
   failure would produce exactly the restart loop `max_restarts` exists to
   contain, out of an app that is slow rather than broken.
+- `fake::ProcScript` (behind `test-fakes`) gains an `obeys_kill: bool` field
+  and a `never_reports_its_exit()` constructor for a script whose `wait()`
+  never resolves — the one child a kill ladder cannot end, wedged in
+  uninterruptible sleep, where `SIGKILL` is delivered and the wait behind it
+  never returns. Nothing else could put a test on what the supervisor does
+  when a message it is waiting for never comes. Filed as a change rather than
+  an addition for the same reason `BootOptions` below is: the struct carries
+  no `#[non_exhaustive]`, so a downstream literal naming every field stops
+  compiling until it names this one. Every existing constructor sets it
+  `true`, which is what every real process does.
 - `BootOptions` gains a `max_cron_sleep: Option<Duration>` field, carrying
   `[daemon] max_cron_sleep` from `shep.toml` to the cron workers; `None` means
   the crate-private default, applied by `boot` and nowhere else. Filed as a
