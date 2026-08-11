@@ -1293,6 +1293,127 @@ mod tests {
         assert_no_restart_within(&mut rx, "web", PAST_THE_NEXT_OCCURRENCE).await;
     }
 
+    // The overlap a reload runs on. A replacement takes a NEW id in the
+    // drainee's instance slot and arms BEFORE the drainee's exit disarms the
+    // old id, so `disarm` finds a member still standing and the name group's
+    // two tasks are never touched. Nothing in this type states that ordering
+    // or enforces it — it belongs to the sequence the swap runs — so it is
+    // pinned here, at the tier where "the same worker" is a thing that can be
+    // said out loud.
+    //
+    // WHAT DISTINGUISHES A REBUILD FROM A SURVIVAL. A group torn down and put
+    // straight back is otherwise INDISTINGUISHABLE from one never touched:
+    // `arm` re-spawns a cron worker on the same schedule and re-registers a
+    // watcher on the same root, both succeed in a test environment, and
+    // `groups["web"].cron.is_some()`, the member set below, and every restart
+    // the worker goes on to fire read identically under both orderings. The
+    // observation that does tell them apart is TASK IDENTITY: `JoinHandle::id`
+    // names one spawned task, and a rebuilt group's tasks are different ones.
+    //
+    // The two `AbortHandle`s are what make that identity airtight rather than
+    // merely likely. tokio allows a task id to be reused once the task has
+    // exited AND no handle to it is left alive — which is exactly the state a
+    // teardown produces, since `NameExtras::abort` aborts both tasks and drops
+    // both handles. Holding an `AbortHandle` keeps the id reserved for the
+    // ORIGINAL task for the whole test, so a rebuilt task cannot be handed the
+    // same one and pass this by coincidence. They are held and never fired.
+    //
+    // The clock count is a second, independent half, and it is what stands if
+    // tokio's id semantics ever move: `spawn_cron_worker` reads the wall clock
+    // once on its first poll to derive its next occurrence, so a rebuild costs
+    // a reading that a survival does not. That is a claim about work performed
+    // rather than about identity.
+    //
+    // fails if `arm` stops leaving a live name-group task alone — the
+    // `is_none_or(is_finished)` guard dropped, so every re-arm re-registers the
+    // OS watcher, a step that can fail and whose failure silently costs an app
+    // the watch that restarts it — and fails if `disarm` stops keying its
+    // teardown on the member set emptying.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_arming_before_the_drainee_disarms_keeps_the_groups_own_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        // Both per-name extras, because the overlap has to hold for both — and
+        // the watch is the one whose rebuild `arm`'s own doc calls out as
+        // costly rather than merely wasteful.
+        let app = app_with("web", |app| {
+            app.cron_restart = Some("0 * * * *".to_string());
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+
+        // The drainee: id 0, holding instance slot 0.
+        registry.arm(
+            &armed_entry(0, 0, 1000, app.clone(), &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+        // Lets the cron worker reach its first poll, so the reading taken
+        // below is a settled number rather than a race with it.
+        tokio::task::yield_now().await;
+
+        let group = &registry.groups["web"];
+        let cron = group
+            .cron
+            .as_ref()
+            .expect("fixture check: the cron worker must have armed")
+            .abort_handle();
+        let watch = group
+            .watch
+            .as_ref()
+            .expect("fixture check: the watch must have armed")
+            .abort_handle();
+        let reads_before = rig.clock.reads();
+
+        // The overlap, in the order a swap performs it: the replacement takes
+        // a new id in the drainee's instance slot and goes `Online` first, and
+        // only then does the drainee's exit disarm the old id.
+        registry.arm(
+            &armed_entry(1, 0, 2000, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+        registry.disarm(0, "web");
+        // Lets a REBUILT worker reach its own first poll. Without this the
+        // clock count below could read unchanged because the replacement's
+        // worker had not run yet, rather than because there is no such worker.
+        tokio::task::yield_now().await;
+
+        let group = &registry.groups["web"];
+        assert_eq!(
+            group.members,
+            HashSet::from([1]),
+            "fixture check: the drainee must really have left a group the \
+             replacement had already joined — this reads the same under either \
+             ordering, which is why it cannot be the claim that matters"
+        );
+        assert_eq!(
+            group.cron.as_ref().map(JoinHandle::id),
+            Some(cron.id()),
+            "the group must still hold the cron worker it was armed with, not \
+             an identical one put back in its place"
+        );
+        assert_eq!(
+            group.watch.as_ref().map(JoinHandle::id),
+            Some(watch.id()),
+            "and the watch it was armed with, whose rebuild means re-registering \
+             the OS watcher"
+        );
+        assert_eq!(
+            rig.clock.reads(),
+            reads_before,
+            "a surviving cron worker performs no startup work; a rebuilt one \
+             reads the clock again to derive its next occurrence"
+        );
+    }
+
     // Boundary sweep (IR-40): a name group with zero online instances —
     // armed and disarmed again before it ever gets to do anything.
     //
@@ -2254,6 +2375,116 @@ mod tests {
             .expect("the sheep stops");
         assert_no_restart_within(&mut rx, "web", PAST_THE_NEXT_OCCURRENCE).await;
         assert_eq!(h.ctx.supervisor.list().await[0].status, ProcStatus::Stopped);
+    }
+
+    /// Waits up to `window` for `kind` naming `id`, panicking if none arrives.
+    ///
+    /// [`expect_restart`]'s shape, keyed by id and kind rather than by name: a
+    /// swap puts two entries under ONE name, so a name alone cannot say which
+    /// half of it an event is about.
+    async fn expect_process_event(
+        rx: &mut broadcast::Receiver<BusEvent>,
+        id: u32,
+        kind: ProcessEventKind,
+        window: Duration,
+    ) {
+        let wanted = async {
+            loop {
+                match rx.recv().await {
+                    Ok(BusEvent::Process { event, info, .. }) if event == kind && info.id == id => {
+                        return;
+                    }
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("event stream closed before {kind:?} for id {id}: {err}"),
+                }
+            }
+        };
+        if tokio::time::timeout(window, wanted).await.is_err() {
+            panic!("timed out waiting for {kind:?} for id {id}");
+        }
+    }
+
+    // fails if the swap's own ordering inverts: the drainee's extras disarmed
+    // before the replacement arms, which is what "drain first, spawn second" —
+    // the shape a rolling restart takes — would produce. Every reload would
+    // then tear the name group down and put it back, and `arm`'s doc says what
+    // that costs: re-registering the OS watcher each time, a step that can fail
+    // and whose failure silently leaves an app without the watch that restarts
+    // it.
+    //
+    // The registry case above says the registry HONOURS that ordering; this
+    // one says the engine still PERFORMS it. Neither implies the other, and
+    // the ordering itself lives in the swap rather than in the registry.
+    //
+    // The clock reading is the observation, and it is the only one that
+    // survives out here. A torn-down-and-rebuilt group is otherwise identical
+    // from the actor's outside — it fires on the same schedule, and the
+    // registry's own fields are private to this module's other tier — but a
+    // rebuild re-spawns the cron worker, and `spawn_cron_worker` reads the wall
+    // clock on its first poll to derive its next occurrence. One reading is
+    // therefore the difference between a group that was rebuilt and one that
+    // was left alone.
+    //
+    // `max_cron_sleep` is 600s against a swap costing at most `listen_timeout`
+    // (3s) plus `graceful_timeout` (8s) of virtual time, so the SURVIVING
+    // worker cannot wake inside the window and take a reading of its own —
+    // which would read exactly like the rebuild being watched for.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_leaves_the_name_groups_cron_worker_where_it_was() {
+        let clock = Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z")));
+        // Two procs, counted: the original and the one replacement a reload of
+        // a one-instance app performs. A third would be answered "script
+        // exhausted", which abandons the reload — no overlap, and a clock
+        // count that proves nothing.
+        let h = harness_with_extras(vec![ProcScript::never_exits(); 2], |reports| Extras {
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
+            enforcer: Arc::new(RecordingEnforcer::default()),
+            max_cron_sleep: Duration::from_secs(600),
+            reports,
+        });
+        let mut rx = h.ctx.events.subscribe();
+        h.ctx
+            .supervisor
+            .start(vec![app_with("web", |app| {
+                app.cron_restart = Some("0 * * * *".to_string());
+            })])
+            .await
+            .unwrap();
+        expect_process_event(&mut rx, 0, ProcessEventKind::Online, EVENT_WAIT).await;
+        // Lets the armed worker reach its first poll before the count is taken.
+        tokio::task::yield_now().await;
+
+        let reads_before = clock.reads();
+        assert_eq!(
+            reads_before, 1,
+            "fixture check: one armed cron worker takes exactly one reading, \
+             so a rebuild's second one is a countable difference rather than \
+             noise — and a count of 0 here would mean the worker had not run \
+             yet, which would make the claim below vacuous"
+        );
+
+        h.ctx
+            .supervisor
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the reload is accepted");
+        expect_process_event(&mut rx, 1, ProcessEventKind::Online, EVENT_WAIT).await;
+        expect_process_event(&mut rx, 0, ProcessEventKind::Delete, EVENT_WAIT).await;
+
+        let listed = h.ctx.supervisor.list().await;
+        assert_eq!(
+            listed.iter().map(|info| info.id).collect::<Vec<_>>(),
+            vec![1],
+            "fixture check: the swap must have run to completion, or there was \
+             never an overlap for the ordering to matter in"
+        );
+        assert_eq!(
+            clock.reads(),
+            reads_before,
+            "the name group's cron worker must have been left where it was: a \
+             rebuilt one reads the clock again to derive its next occurrence"
+        );
     }
 
     /// A harness whose scripted runner hands out one proc that exits at once
