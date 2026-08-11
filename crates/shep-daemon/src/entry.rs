@@ -109,11 +109,12 @@ impl RestartBudget {
 /// A reload runs two [`ProcessEntry`] records at once — the drainee (old,
 /// going away) and the replacement (new) — and the two non-`None` variants
 /// split across them rather than sharing one: [`Self::SpawningReplacement`]
-/// lives on the drainee, [`Self::Draining`] lives on the replacement. Each
-/// variant's field names the *other* entry, which is what makes the pair
-/// navigable in both directions: from the drainee, `new_id` says who is
-/// replacing it; from the replacement, `old_pid` says who it must outlive.
-/// See the two variants for the full split.
+/// lives on the drainee, [`Self::Draining`] lives on the replacement. Which
+/// half an entry is, is the whole of what this type says. Navigating from one
+/// half to the other is the reload job's job, and only the drainee's
+/// direction is answered here at all — the replacement's back-reference lives
+/// on that job, in the same currency (an entry id) the machinery around it
+/// uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadState {
     /// Not in a reload sequence
@@ -127,23 +128,18 @@ pub enum ReloadState {
     /// why, and who is coming to take its place.
     SpawningReplacement {
         /// [`ProcessEntry::id`] of the new replacement instance — an entry
-        /// ID, not an OS `pid` (contrast [`Self::Draining`]'s `old_pid`,
-        /// which is a `pid`): the replacement is looked up by entry, and
+        /// ID, not an OS `pid`: the replacement is looked up by entry, and
         /// only gains an OS pid once it is actually spawned.
         new_id: u32,
     },
     /// Draining connections before terminating old instance
     ///
-    /// Lives on the **replacement's** entry, pointing back at the drainee it
-    /// must outlive: the replacement cannot be considered the reload's
-    /// success until the drainee it names has actually gone. That drainee's
-    /// own entry is the one carrying `status = `[`ProcStatus::Stopping`]` —
-    /// a different record from this one, set in the same logical transition
-    /// but not the same struct.
-    Draining {
-        /// OS process ID of the instance being drained
-        old_pid: u32,
-    },
+    /// Lives on the **replacement's** entry, and says only that: this record
+    /// is the half that arrived. The drainee it must outlive is a different
+    /// record, carrying `status = `[`ProcStatus::Stopping`]` and set in the
+    /// same logical transition — reachable from the reload job, which is what
+    /// every caller that needs it already holds.
+    Draining,
 }
 
 #[cfg(test)]

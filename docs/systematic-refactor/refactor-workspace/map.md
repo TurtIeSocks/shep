@@ -247,8 +247,10 @@ src/
              takes `ProcStatus::Stopping` — which this is the ONLY production writer of, in
              the whole daemon — and `ReloadState::SpawningReplacement{new_id}`, both BEFORE
              `runner.spawn` is called; the
-             replacement carries `ReloadState::Draining{old_pid}`, so each half names the
-             other. That ordering is load-bearing twice over: `snapshot.rs`'s `is_running`
+             replacement carries `ReloadState::Draining`, which says only which half of the
+             swap it is — the drainee it must outlive is named by the reload job, in the
+             entry ids the rest of the machinery navigates by, rather than by an OS pid
+             nothing reads. That ordering is load-bearing twice over: `snapshot.rs`'s `is_running`
              does not count `Stopping`, so the muster roll cannot record a count the flock
              does not have; and `handle_extra_restart`'s `Online` guard then rejects the two
              automatic triggers that reach it — a memory breach and a liveness failure — for

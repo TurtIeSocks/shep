@@ -1865,9 +1865,6 @@ impl<R: ProcessRunner> Actor<R> {
         // `Credentials` is `Copy`; reused, never re-resolved.
         let credentials = drainee.credentials;
         let restarts = drainee.restarts;
-        let old_pid = drainee
-            .pid
-            .expect("spawn_replacement: an Online drainee has a pid");
 
         let new_id = self.next_id;
         self.next_id += 1;
@@ -1897,7 +1894,7 @@ impl<R: ProcessRunner> Actor<R> {
                     restarts,
                     started_at: Some(tokio::time::Instant::now()),
                     budget: RestartBudget::default(),
-                    reload: ReloadState::Draining { old_pid },
+                    reload: ReloadState::Draining,
                     credentials,
                     out_file,
                     err_file,
@@ -2629,7 +2626,7 @@ impl<R: ProcessRunner> Actor<R> {
                 // Falls through as an ordinary entry: `abort_reload` has
                 // already cleared this one's marker and put its status back.
             }
-            ReloadState::Draining { .. } => {
+            ReloadState::Draining => {
                 // Whether this is a failure depends on how far the swap got.
                 // Still `AwaitReady` and the replacement never proved it could
                 // take over, so the reload is abandoned and the drainee kept.
@@ -3010,7 +3007,7 @@ impl<R: ProcessRunner> Actor<R> {
         if slot.entry.status != ProcStatus::Starting {
             return;
         }
-        if matches!(slot.entry.reload, ReloadState::Draining { .. }) {
+        if matches!(slot.entry.reload, ReloadState::Draining) {
             self.reload_ready_result(id, manually, readiness);
             return;
         }
@@ -5448,12 +5445,13 @@ mod tests {
     }
 
     // fails if the two halves of a swap land on the wrong entries.
-    // `SpawningReplacement` names the replacement and belongs on the
-    // drainee; `Draining` names the drainee's OS pid and belongs on the
-    // replacement; `Stopping` is the drainee's status and only the
-    // drainee's. Asserted against the machine that sets them rather than a
-    // rehearsal of it — `ProcessEntry::reload` never reaches the wire, so
-    // this is the only tier that can read it back.
+    // `SpawningReplacement` names the replacement and belongs on the drainee;
+    // `Draining` belongs on the replacement and names nothing, since the only
+    // caller that needs the other half holds the reload job that has it;
+    // `Stopping` is the drainee's status and only the drainee's. Asserted
+    // against the machine that sets them rather than a rehearsal of it —
+    // `ProcessEntry::reload` never reaches the wire, so this is the only tier
+    // that can read it back.
     #[tokio::test(start_paused = true)]
     async fn a_swap_puts_each_half_of_a_reload_on_the_entry_that_owns_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -5477,7 +5475,7 @@ mod tests {
             "`Stopping` belongs to the instance going away, not the one arriving"
         );
         assert_eq!(replacement.status, ProcStatus::Starting);
-        assert_eq!(replacement.reload, ReloadState::Draining { old_pid: 1111 });
+        assert_eq!(replacement.reload, ReloadState::Draining);
         assert_eq!(
             replacement.instance, drainee.instance,
             "a replacement takes the drainee's instance slot, or an app deriving \
