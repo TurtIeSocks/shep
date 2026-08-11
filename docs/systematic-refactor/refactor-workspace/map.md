@@ -610,8 +610,9 @@ crates/shep-daemon/tests/                 ← was god/cluster/reload/signals/tre
     Notes: tokio::time::pause makes kill_timeout/backoff DETERMINISTIC — the suites pm2
            excluded from all CI become always-run. proptest on supervisor state machine.
 crates/shep-daemon/examples/reuse_port_sheep.rs   ← new (Phase 6)
-    Notes: the reload measurement's fixture, and the ONLY real child in the suite that is not
-           `/bin/sh` running an inline script — `/bin/sh` cannot set a socket option. Binds
+    Notes: the reload measurement's fixture, and the ONLY real child in `tests/daemon_e2e.rs`
+           that is not `/bin/sh` running an inline script — `/bin/sh` cannot set a socket
+           option. Binds
            `SHEEP_PORT_BASE + SHEP_INSTANCE` with SO_REUSEPORT and answers `<pid>\n`, so every
            answered connection is attributable to a process; `SHEEP_DEFIANT=1` makes it ignore
            SIGTERM, and THE GAP BETWEEN THE TWO RUNS IS THE FINDING. An `examples/` target
