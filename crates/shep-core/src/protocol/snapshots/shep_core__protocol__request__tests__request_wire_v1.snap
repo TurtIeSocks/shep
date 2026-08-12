@@ -54,6 +54,7 @@ expression: requests
           "shutdown_with_message": false,
           "listen_timeout": "3s",
           "graceful_timeout": "8s",
+          "action_timeout": "3s",
           "max_memory": null,
           "watch": false,
           "ignore_watch": [],
@@ -106,6 +107,19 @@ expression: requests
         "kind": "name",
         "value": "web"
       }
+    }
+  },
+  {
+    "id": 8,
+    "deadline_ms": null,
+    "body": {
+      "kind": "trigger",
+      "selector": {
+        "kind": "name",
+        "value": "web"
+      },
+      "action": "set-log-level",
+      "params": "debug"
     }
   }
 ]

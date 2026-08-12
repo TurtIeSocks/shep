@@ -21,9 +21,9 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use shep_core::config::AppConfig;
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
-    BusEvent, Envelope, Hello, HelloAck, HelloReply, PROTOCOL_VERSION, ProcessEventKind,
-    ProcessInfo, Reply, Request, Response, RpcErrorCode, SelectorSpec, ServerFrame, codec,
-    decode_frame, encode_frame,
+    ActionOutcome, BusEvent, Envelope, Hello, HelloAck, HelloReply, PROTOCOL_VERSION,
+    ProcessEventKind, ProcessInfo, Reply, Request, Response, RpcErrorCode, SelectorSpec,
+    ServerFrame, codec, decode_frame, encode_frame,
 };
 use shep_core::status::ProcStatus;
 use shep_core::values::UpDuration;
@@ -844,6 +844,195 @@ async fn a_wait_ready_sheep_goes_online_on_its_own_channel_message() {
         panic!("expected flock")
     };
     assert_eq!(flock[0].status, ProcStatus::Online);
+
+    fixture.shutdown().await;
+}
+
+/// A real child answers a triggered action over its own fd 3, twice in a
+/// row.
+///
+/// The paused-clock tier cannot reach this at all: `ScriptedRunner`
+/// (`fake.rs`) is driven entirely off in-process `tokio::sync::mpsc`
+/// channels, so nothing there ever crosses a real socketpair, and nothing
+/// there can catch a regression in the fd-3 wiring itself — the
+/// `SHEP_CHANNEL_FD`/`fd_mappings` half in `tokio_runner.rs`, or the
+/// newline-JSON framing `spawn_channel_pumps` puts on the wire. This is the
+/// one place in the workspace that can.
+///
+/// Two round trips, not one, because a single exchange is not evidence: it
+/// was measured, while fixing the fd-3 blocking bug this test now guards,
+/// that a one-round-trip version of this test ran 25/25 green against the
+/// UNFIXED daemon — a single reply can land by winning a spawn-timing race
+/// even on a build that cannot really do this at all. A second exchange on
+/// the SAME live channel is what a race cannot fake twice.
+///
+/// The child echoes a counter rather than a fixed string, so the two
+/// replies are also distinguishable from each other — a build that answered
+/// every trigger with whatever the child happened to have buffered first
+/// would still pass a same-body assertion.
+///
+/// # What this does NOT try to prove
+///
+/// That a successful `to_child.send()` is delivery. It measurably is not —
+/// see `begin_action`'s own doc in `supervisor.rs`: the first send after a
+/// child has died is accepted and discarded, and only the second one
+/// errors. So nothing here ever asserts on a send's own `Ok`/`Err`; the only
+/// proof either round trip landed is the `Replied` row itself, read back off
+/// the RPC reply.
+#[tokio::test]
+async fn a_triggered_action_reaches_a_real_child_and_answers_it_twice() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+
+    let mut app = AppConfig::minimal("responder", "/bin/sh");
+    app.interpreter = Some("none".to_string());
+    // `channel` is what `assemble()` needs to open fd 3 at all here — unlike
+    // the `wait_ready` fixture above, this app never gates readiness on it.
+    app.channel = true;
+    app.args = vec![
+        "-c".to_string(),
+        r#"i=0; while IFS= read -r _line <&3; do i=$((i + 1)); printf '{"kind":"action-reply","action":"gc","body":"round-%d"}\n' "$i" >&3; done"#
+            .to_string(),
+    ];
+    let started = client.request(Request::Start { apps: vec![app] }).await;
+    let Response::Started(infos) = started.result.unwrap() else {
+        panic!("expected started")
+    };
+    let id = infos[0].id;
+
+    for round in 1..=2 {
+        let triggered = client
+            .request(Request::Trigger {
+                selector: SelectorSpec::Id(id),
+                action: "gc".to_string(),
+                params: None,
+            })
+            .await;
+        let Response::Triggered(rows) = triggered.result.unwrap() else {
+            panic!("expected triggered")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(
+            rows[0].outcome,
+            ActionOutcome::Replied {
+                body: format!("round-{round}"),
+            },
+            "round {round} must carry its own reply, not a leftover from the other one"
+        );
+    }
+
+    fixture.shutdown().await;
+}
+
+/// A trigger against a sheep with no shepherd channel is refused per-row,
+/// naming the missing channel, rather than waiting out a timeout for a
+/// reply that was never coming.
+///
+/// `AppConfig::minimal` leaves `channel`, `wait_ready`, and
+/// `shutdown_with_message` all false — the only three things `assemble()`
+/// ORs together to decide whether a sheep gets fd 3 at all
+/// (`assemble.rs`'s own doc) — so this app is spawned with no channel from
+/// the start.
+///
+/// Only the real runner can show what this test is actually about: with
+/// `spec.channel == false`, `tokio_runner.rs` never spawns a writer task for
+/// this sheep and drops the send side's receiving end at spawn
+/// (`drop(from_child_tx); drop(to_child_rx);`), so `spawn_action_task`'s own
+/// `to_child.send()` fails AT ONCE and the row comes back `NoChannel`
+/// without ever arming a wait. The paused-clock tier can only assert the
+/// same OUTCOME by building a `SheepSlot` with `to_child: None` by hand
+/// (`supervisor.rs`'s `a_sheep_with_no_channel_is_refused_in_its_own_row`
+/// and its siblings) — which proves the row-aggregation logic but not this
+/// send-fails-fast wiring underneath it.
+#[tokio::test]
+async fn a_trigger_against_a_channelless_sheep_names_the_missing_channel() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+
+    let mut app = AppConfig::minimal("mute", "/bin/sh");
+    app.interpreter = Some("none".to_string());
+    app.args = vec!["-c".to_string(), "while :; do sleep 1; done".to_string()];
+    let started = client.request(Request::Start { apps: vec![app] }).await;
+    let Response::Started(infos) = started.result.unwrap() else {
+        panic!("expected started")
+    };
+    let id = infos[0].id;
+
+    let triggered = client
+        .request(Request::Trigger {
+            selector: SelectorSpec::Id(id),
+            action: "gc".to_string(),
+            params: None,
+        })
+        .await;
+    let Response::Triggered(rows) = triggered.result.unwrap() else {
+        panic!("expected triggered")
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id);
+    assert_eq!(
+        rows[0].outcome,
+        ActionOutcome::NoChannel,
+        "a sheep spawned with no channel must be refused by name, not waited out"
+    );
+
+    fixture.shutdown().await;
+}
+
+/// A trigger against a child that reads its action and then says nothing
+/// gets the daemon's own `TimedOut` row back — never a client-side
+/// `DeadlineExceeded`, which would name no sheep at all.
+///
+/// `action_timeout` is set well under both this file's own [`RECV_TIMEOUT`]
+/// and `rpc.rs`'s `DEFAULT_DEADLINE_MS` (5s) — the budget every
+/// `Client::request` in this file gets, since none of them ever send a
+/// deadline of their own. That ordering is what `rpc.rs`'s own
+/// `an_oversized_action_timeout_loses_the_race` pins at the paused-clock
+/// tier; here it costs real wall-clock time, so the value is kept small
+/// deliberately rather than left at the 3s spec default.
+///
+/// The child reads (and discards) the action before falling silent, rather
+/// than never touching fd 3 at all — a fixture that never reads still leaves
+/// the message sitting in the socket's own kernel buffer, which times out
+/// exactly the same way for a reason this test is not about. Reading first
+/// is what makes the silence itself the fact under test.
+#[tokio::test]
+async fn a_trigger_against_a_silent_child_times_out_rather_than_hitting_the_rpc_deadline() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+
+    let mut app = AppConfig::minimal("silent", "/bin/sh");
+    app.interpreter = Some("none".to_string());
+    app.channel = true;
+    app.action_timeout = UpDuration::from_millis(500);
+    app.args = vec![
+        "-c".to_string(),
+        "read -r _line <&3; while :; do sleep 1; done".to_string(),
+    ];
+    let started = client.request(Request::Start { apps: vec![app] }).await;
+    let Response::Started(infos) = started.result.unwrap() else {
+        panic!("expected started")
+    };
+    let id = infos[0].id;
+
+    let triggered = client
+        .request(Request::Trigger {
+            selector: SelectorSpec::Id(id),
+            action: "gc".to_string(),
+            params: None,
+        })
+        .await;
+    let Response::Triggered(rows) = triggered.result.unwrap() else {
+        panic!("expected triggered")
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id);
+    assert_eq!(
+        rows[0].outcome,
+        ActionOutcome::TimedOut,
+        "an app that never replies must produce a named TimedOut row, not a bare RPC error"
+    );
 
     fixture.shutdown().await;
 }

@@ -38,6 +38,25 @@ const MIN_LIVENESS_INTERVAL: UpDuration = UpDuration::from_millis(1_000);
 /// not take it away.
 const MIN_READINESS_INTERVAL: UpDuration = UpDuration::from_millis(1);
 
+/// Longest `action_timeout` an app may name.
+///
+/// Not a floor this time but a ceiling, and for a different reason than
+/// [`MIN_LIVENESS_INTERVAL`]'s: there, a smaller number was silently
+/// honoured as the floor; here, a larger one could never be honoured by
+/// ANY caller at all. The daemon clamps every RPC deadline a client can
+/// possibly ask for — its own `MAX_DEADLINE_MS`, 60s, in `shep-daemon`'s
+/// `rpc` module — so an `action_timeout` at or above that line describes a
+/// wait the daemon could never finish inside any request budget, no matter
+/// how generous a caller's own `Client::request_with_deadline` call is.
+/// That is not "the caller forgot to widen its deadline" (this crate has no
+/// way to see a caller's choice, and does not try to); it is "no choice
+/// exists", which is what makes it a config error rather than a caller's to
+/// fix. Set 2s under the hard clamp — the same margin `action_timeout`'s own
+/// default keeps under the *default* RPC budget — so the daemon still has
+/// room to build the `TimedOut` row and get it back down the wire after the
+/// wait itself gives up.
+const MAX_ACTION_TIMEOUT: UpDuration = UpDuration::from_millis(58_000);
+
 /// A validated app config — only obtainable via [`normalize`]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedApp {
@@ -80,6 +99,9 @@ impl ResolvedApp {
 ///   only "greater than zero" for `readiness_probe` (carries which probe, the
 ///   value and the floor).
 /// - [`NormalizeError::ZeroMaxMemory`] — `max_memory` is `0`.
+/// - [`NormalizeError::ActionTimeoutTooLong`] — `action_timeout` is at or
+///   above the ceiling no RPC caller could ever be given room to wait past
+///   (carries the app name, the value and the ceiling).
 /// - [`NormalizeError::WatchWithoutCwd`] — `watch` is `true` with no `cwd`
 ///   set.
 /// - [`NormalizeError::ZeroWatchDelay`] — `watch_delay` is `0`.
@@ -132,6 +154,20 @@ pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
         // RESETS the restart budget rather than spending it. `max_restarts`
         // cannot end that loop, so it has to be refused here.
         return Err(NormalizeError::ZeroMaxMemory { name: app.name });
+    }
+    if app.action_timeout > MAX_ACTION_TIMEOUT {
+        // Rejected rather than clamped, the same trade `MIN_LIVENESS_INTERVAL`
+        // and `max_cron_sleep` already made: a daemon running detached has no
+        // reader for a log line saying the value was silently lowered, so the
+        // Flockfile would be the only place the discrepancy ever showed up —
+        // and here there is no honest lowered value to fall back to anyway,
+        // since every value above the ceiling is equally unreachable by any
+        // caller.
+        return Err(NormalizeError::ActionTimeoutTooLong {
+            name: app.name,
+            value: app.action_timeout,
+            max: MAX_ACTION_TIMEOUT,
+        });
     }
     if app.watch && app.cwd.is_none() {
         // `watch` asked for a feature the daemon has no directory to arm:
@@ -314,6 +350,18 @@ pub enum NormalizeError {
         /// The sheep name, so the error names which Flockfile entry to edit.
         name: String,
     },
+    /// `action_timeout` is at or above `normalize`'s own ceiling — a wait no
+    /// RPC caller could ever be given enough deadline to outlast, since the
+    /// daemon clamps every deadline a caller can ask for. Carries the app
+    /// name, the value as written, and the ceiling it failed.
+    ActionTimeoutTooLong {
+        /// The sheep name, so the error names which Flockfile entry to edit.
+        name: String,
+        /// The value as the user wrote it.
+        value: UpDuration,
+        /// The ceiling it failed.
+        max: UpDuration,
+    },
     /// `watch` is enabled but the app sets no `cwd`, so there is no
     /// directory to watch. Carries the app name.
     WatchWithoutCwd {
@@ -371,6 +419,13 @@ impl fmt::Display for NormalizeError {
                 write!(
                     f,
                     "sheep `{name}` has max_memory = 0, a limit nothing can stay under"
+                )
+            }
+            Self::ActionTimeoutTooLong { name, value, max } => {
+                write!(
+                    f,
+                    "sheep `{name}` has action_timeout = {value}: must be at most {max}, \
+                     the longest wait any caller's deadline could ever cover"
                 )
             }
             Self::WatchWithoutCwd { name } => {
@@ -686,6 +741,46 @@ mod tests {
         let mut app = AppConfig::minimal("web", "./srv");
         app.max_memory = Some("512M".parse().unwrap());
         assert!(normalize(app).is_ok());
+    }
+
+    #[test]
+    fn action_timeout_past_the_ceiling_is_rejected() {
+        // fails if `action_timeout` is never inspected. One millisecond over
+        // the ceiling is deliberate: a test at a round number like 60s could
+        // pass by coincidence if the check used the wrong constant entirely
+        // (`MAX_DEADLINE_MS` itself, say, instead of the margin under it).
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.action_timeout = UpDuration::from_millis(MAX_ACTION_TIMEOUT.as_millis() + 1);
+        let err = normalize(app).unwrap_err();
+        assert_eq!(
+            err,
+            NormalizeError::ActionTimeoutTooLong {
+                name: "web".to_string(),
+                value: UpDuration::from_millis(MAX_ACTION_TIMEOUT.as_millis() + 1),
+                max: MAX_ACTION_TIMEOUT,
+            }
+        );
+        // fails if the message regresses to a bare variant name with no
+        // explanation — following the sibling precedent at app.rs:261.
+        assert!(err.to_string().contains("action_timeout"), "{err}");
+    }
+
+    #[test]
+    fn action_timeout_at_the_ceiling_is_accepted() {
+        // fails if the comparison is `>=` rather than `>` — the ceiling
+        // itself still leaves the daemon its full margin under the hard
+        // clamp, so it is not one of the values nothing could ever satisfy.
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.action_timeout = MAX_ACTION_TIMEOUT;
+        assert!(normalize(app).is_ok());
+    }
+
+    #[test]
+    fn the_default_action_timeout_is_accepted() {
+        // fails if `AppConfig::default()`'s own value ever drifts past the
+        // ceiling normalize enforces — the one combination that must never
+        // reject the config nobody customized.
+        assert!(normalize(AppConfig::minimal("web", "./srv")).is_ok());
     }
 
     #[test]

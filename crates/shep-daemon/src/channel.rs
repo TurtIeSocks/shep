@@ -10,6 +10,13 @@
 //! reads [`ChildMessage`] back off a real child's fd 3, and [`ShepherdMessage`]
 //! is the payload type of [`ProcIo::to_child`](crate::runner::ProcIo::to_child),
 //! so it has to be nameable wherever that field is.
+//!
+//! This module pins the wire shapes; it is not the app-author-facing
+//! contract. An app that wants to speak this wire — including why it
+//! should reply to a [`ShepherdMessage::Action`] even when it does not
+//! recognize the name, how a reply is matched to its trigger with no
+//! correlation id on the wire, and the `params` quoting gap — wants
+//! `docs/shepherd-channel.md` at the repository root instead.
 
 use serde::{Deserialize, Serialize};
 

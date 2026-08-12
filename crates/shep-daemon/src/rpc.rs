@@ -248,6 +248,11 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
         Request::Flush { selector } => {
             selector_call(id, selector, |s| ctx.supervisor.flush(s), Response::Flushed).await
         }
+        Request::Trigger {
+            selector,
+            action,
+            params,
+        } => trigger(id, selector, action, params, ctx).await,
         Request::Delete { selector } => match selector_of(selector) {
             Err(err) => reply(Err(err)),
             Ok(selector) => match ctx.supervisor.delete(selector).await {
@@ -360,14 +365,52 @@ where
     Outcome::Reply(Reply { id, result })
 }
 
+/// `Trigger`'s own resolve-then-map path. [`selector_call`] cannot serve
+/// it: that helper is typed `Fut: Future<Output = Result<Vec<ProcessInfo>,
+/// SupervisorError>>` with `ok: fn(Vec<ProcessInfo>) -> Response`, and
+/// `Response::Triggered` carries `Vec<ActionReply>` — a distinct row
+/// `ProcessInfo` cannot hold a reply body on. Everything else about the shape
+/// is the same: convert the selector, call the supervisor, map the rows.
+///
+/// How long each app gets to answer is not decided here any more: it is
+/// `AppConfig::action_timeout`, one value per matched sheep rather than one
+/// for the whole flock, read off each sheep's own config where the wait is
+/// armed (`Actor::begin_action`). What used to be this function's own
+/// `ACTION_TIMEOUT` constant is now that field's problem, including staying
+/// under [`DEFAULT_DEADLINE_MS`] — `shep_core::config::normalize` refuses a
+/// value no caller could ever be given enough deadline to outlast; a value
+/// merely past the *default* budget is accepted; the caller's own deadline is
+/// what decides whether that pays off.
+async fn trigger(
+    id: u64,
+    spec: SelectorSpec,
+    action: String,
+    params: Option<String>,
+    ctx: &RpcContext,
+) -> Outcome {
+    let result = match selector_of(spec) {
+        Err(err) => Err(err),
+        Ok(selector) => ctx
+            .supervisor
+            .trigger(selector, action, params)
+            .await
+            .map(Response::Triggered)
+            .map_err(|err| rpc_error(&err)),
+    };
+    Outcome::Reply(Reply { id, result })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fake::ProcScript;
     use crate::testing::harness;
     use shep_core::config::AppConfig;
-    use shep_core::protocol::{Request, Response, RpcErrorCode, SelectorSpec};
+    use shep_core::protocol::{
+        ActionOutcome, ActionReply, Request, Response, RpcErrorCode, SelectorSpec,
+    };
     use shep_core::status::ProcStatus;
+    use shep_core::values::UpDuration;
 
     fn envelope(id: u64, body: Request) -> Envelope {
         Envelope {
@@ -710,6 +753,184 @@ mod tests {
             .await,
         );
         assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
+    }
+
+    /// Fails if `Trigger` is left to the catch-all arm at the bottom of
+    /// `run` — a verb this daemon has never heard of — which answers
+    /// `Internal` for a request it in fact implements. Fails too if the row
+    /// stops carrying the sheep it is about.
+    ///
+    /// `TimedOut` rather than `NoChannel` is the assertion that matters, and
+    /// it is two claims at once. The action was really delivered and really
+    /// waited on — `NoChannel` is what a build that never reached the sheep
+    /// would answer — and `web`'s `action_timeout` (3s, `AppConfig::minimal`'s
+    /// spec default) elapsed INSIDE the request's own budget. Raise it past
+    /// [`DEFAULT_DEADLINE_MS`] and this stops being a row at all:
+    /// `with_deadline` fires first and the reply becomes `DeadlineExceeded`,
+    /// which names no sheep and says nothing about which of them answered —
+    /// pinned right below, in `an_oversized_action_timeout_loses_the_race`.
+    /// The ordering is what both cases pin; the constants are pinned in
+    /// `budgets_default_and_clamp`.
+    ///
+    /// Nothing answers because the harness keeps no handle on its runner, so
+    /// no case here can put a reply on a child's end of the channel. An app's
+    /// own words reaching a caller is pinned a tier down, in
+    /// `a_triggered_action_answers_with_the_apps_reply`.
+    #[tokio::test(start_paused = true)]
+    async fn trigger_routes_to_the_flock_and_reports_each_match_within_the_budget() {
+        // Two apps, not one: ids start at 0, so a single-app harness would
+        // give `web` id 0 — indistinguishable from a row-mapping bug that
+        // drops the real id and leaves the field's default. Registering
+        // `other` first pushes `web` to id 1, a value only the real mapping
+        // produces.
+        let h = harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        let mut web = AppConfig::minimal("web", "./srv");
+        web.channel = true;
+        let started = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("other", "./o"), web],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Response::Started(started) = started.result.unwrap() else {
+            panic!("expected started")
+        };
+        let web_id = started
+            .iter()
+            .find(|i| i.name == "web")
+            .expect("web registered")
+            .id;
+        assert_ne!(web_id, 0, "the test's own premise: web must not be id 0");
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::Trigger {
+                        selector: SelectorSpec::Name("web".to_string()),
+                        action: "gc".to_string(),
+                        params: None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Response::Triggered(rows) = reply.result.unwrap() else {
+            panic!("expected triggered")
+        };
+        assert_eq!(
+            rows,
+            vec![ActionReply {
+                id: web_id,
+                name: "web".to_string(),
+                outcome: ActionOutcome::TimedOut,
+            }]
+        );
+    }
+
+    /// Fails if the daemon's own per-app wait is ever allowed to reach or
+    /// exceed the caller's default RPC budget. `shep_core::config::normalize`
+    /// only refuses an `action_timeout` no caller could ever satisfy however
+    /// long a deadline it asks for (its own ceiling, 58s); anything between
+    /// that and [`DEFAULT_DEADLINE_MS`] normalizes fine, on the documented
+    /// understanding that a caller sending no deadline of its own has to lose
+    /// this exact race. This case drives that failure mode for real rather
+    /// than asserting a constant comparison: `web`'s `action_timeout` is set
+    /// past the 5s default budget, the request carries no deadline of its own
+    /// (`envelope`'s `deadline_ms: None`), and under the paused clock
+    /// `dispatch`'s own `with_deadline` wins — the reply is
+    /// `DeadlineExceeded`, never a `Triggered` row, honest or otherwise.
+    ///
+    /// Confirmed by mutating the sibling case above rather than by
+    /// construction: raising `AppConfig::minimal`'s `action_timeout` there to
+    /// 9s (past `DEFAULT_DEADLINE_MS`, same value this case uses) reproduced
+    /// exactly this — `RpcError { code: DeadlineExceeded, message: "the
+    /// request deadline of 5000 ms expired before the daemon finished" }`
+    /// where that test expected a `TimedOut` row. This case pins that same
+    /// shape as its own assertion, so a regression that reintroduces it fails
+    /// the suite outright instead of needing a mutation run to surface again.
+    #[tokio::test(start_paused = true)]
+    async fn an_oversized_action_timeout_loses_the_race() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let mut web = AppConfig::minimal("web", "./srv");
+        web.channel = true;
+        web.action_timeout = UpDuration::from_millis(9_000); // > DEFAULT_DEADLINE_MS (5s)
+        reply_of(dispatch(envelope(1, Request::Start { apps: vec![web] }), &h.ctx).await);
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::Trigger {
+                        selector: SelectorSpec::Name("web".to_string()),
+                        action: "gc".to_string(),
+                        params: None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert_eq!(
+            reply.result.unwrap_err().code,
+            RpcErrorCode::DeadlineExceeded,
+            "an action_timeout past the caller's default budget must lose that race, not \
+             report an honest TimedOut row nobody can reach"
+        );
+    }
+
+    /// Fails if `Trigger` skips the selector conversion, or converts it
+    /// without reporting the failure: a peer regex the daemon cannot compile
+    /// is the client's usage error, not an internal one.
+    #[tokio::test(start_paused = true)]
+    async fn a_bad_trigger_selector_is_invalid_config() {
+        let h = harness(vec![]);
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Trigger {
+                        selector: SelectorSpec::Regex("((".to_string()),
+                        action: "gc".to_string(),
+                        params: None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
+    }
+
+    /// A selector matching no registered sheep is a whole-request `NotFound`
+    /// — same as every other selector-in verb, `a_selector_matching_nothing_is_not_found`
+    /// pins it for `Stop` — kept separate from a per-row `NoChannel`, which
+    /// only ever appears inside a non-empty match and never on its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_trigger_matching_nothing_is_not_found() {
+        let h = harness(vec![]);
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Trigger {
+                        selector: SelectorSpec::Name("ghost".to_string()),
+                        action: "gc".to_string(),
+                        params: None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::NotFound);
     }
 
     /// The whole of an operator's feedback loop for a rotation that failed:

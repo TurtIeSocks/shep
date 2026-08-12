@@ -51,6 +51,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Answer `Request::Trigger` on the control socket: the daemon resolves the
+  selector against the flock, puts the action on each matched sheep's
+  shepherd channel, and answers with one id-sorted `ActionReply` row per
+  match carrying what that app said back. An empty match is `NotFound`, as it
+  is for every other selector-in verb. `selector_call` (the helper those verbs
+  share) is typed to `Vec<ProcessInfo>` and cannot carry `ActionReply`'s reply
+  body, so this is its own small dispatch path rather than a forced fit.
+
+  The waits run alongside each other — never one after another — so a whole
+  flock costs whichever matched sheep's own `action_timeout` is longest,
+  never the sum of them, and the answer fires only once the last of them has
+  ended. A sheep that cannot take the action is refused in its own
+  row and the rest are still asked: `NoChannel` when nothing is receiving on
+  its channel — read off the channel itself, never off `channel = true`, so
+  there is no second copy of that fact to disagree — and `Skipped` for a
+  reload drainee, since both halves of a swap answer to the app's name and an
+  answer from the process being replaced is worse than no answer. Both
+  refusals are decided before any wait is armed, which is what keeps a refused
+  sheep from leaving a wait nothing will ever resolve.
+
+  A trigger no matched sheep could take is still a success — every match was
+  found, and every row says why nothing was delivered to it — and the daemon
+  logs a warning naming the action, because a whole request that delivered
+  nothing is usually one misconfiguration repeated across a flock rather than
+  a per-sheep surprise.
+
+  What an app on the receiving end needs to know — the wire shapes in both
+  directions, why it should reply even to an action name it does not
+  recognize, and how a reply is matched to its trigger with no correlation
+  id on the wire — is `docs/shepherd-channel.md`, not this entry.
 - Add the reload state machine: the supervisor can replace each instance of an
   app with a fresh one, one instance at a time, so the app has a window in
   which it can stay reachable across the swap. A replacement registers under a
@@ -444,6 +474,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regardless and never noticed, which is how the flag survived this long; an
   app written to simply read did not. The daemon's end is a separate
   descriptor and keeps the flag it needs.
+- Make `ScriptedRunner::spawn` (behind `test-fakes`) honour `spec.channel`
+  instead of ignoring the whole spawn spec and wiring a live channel relay
+  for every spawn regardless of what the config asked for. A `channel =
+  false` spawn now drops both real channel ends immediately — the same
+  shape `tokio_runner.rs`'s own `else` branch already has — with `FakeIo`'s
+  `from_child_tx`/`to_child_rx` standing in already-closed rather than
+  disappearing, so `io_handles` still never panics. Before this fix the fake
+  and the real runner disagreed about the one fact Trigger (above) now
+  treats as load-bearing: a `channel = false` sheep read as reachable under
+  the fake and as `ActionOutcome::NoChannel` against a real child, so a test
+  built only against the fake could not tell the two apart.
 - Report an automatic restart as automatic. Every restart the daemon raised
   on its own — cron, watch, a memory breach or a liveness failure — emitted
   `BusEvent::Process { manually: true }`, whose documented meaning is "a

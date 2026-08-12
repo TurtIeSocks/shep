@@ -467,7 +467,21 @@ impl ScriptedRunner {
 impl ProcessRunner for ScriptedRunner {
     type Proc = FakeProc;
 
-    fn spawn(&self, _spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
+    /// Every field of `spec` besides `spec.channel` is still read by nothing
+    /// here: the fake writes no files (`spec.out_file`/`err_file`) and runs
+    /// no program (`spec.program`/`args`/`env`/`cwd`/`credentials`), which is
+    /// what keeps it deterministic and instant under the paused clock — see
+    /// this module's own top-level `WHY`. `spec.channel` is the one exception,
+    /// because `begin_action` (`supervisor.rs`) now treats "does this sheep
+    /// have a channel" as load-bearing, and a fake that answered that
+    /// question wrong for every spawn would be worse than one that could not
+    /// answer it at all. What that one flag changes is below, gated on it.
+    ///
+    /// Real fd-3 delivery, refusal, and timeout — the facts this flag alone
+    /// cannot reach, since nothing here is a real socketpair to a real child
+    /// — are proven against [`crate::tokio_runner::TokioRunner`] instead, in
+    /// `tests/daemon_e2e.rs`.
+    fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
         let script = self
             .scripts
             .lock()
@@ -568,18 +582,42 @@ impl ProcessRunner for ScriptedRunner {
         // so it never shows up in `ScriptedRunner::signals`. Every message is
         // also forwarded onward so tests can independently observe daemon→child
         // traffic via `FakeIo::to_child_rx`.
-        let relay_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let mut raw_rx = raw_to_child_rx;
-            while let Some(msg) = raw_rx.recv().await {
-                if msg == ShepherdMessage::Shutdown {
-                    relay_state.record_shutdown();
+        //
+        // Gated on `spec.channel` — mirroring `tokio_runner.rs`'s own `else`
+        // branch — so this fake agrees with the real runner about the one
+        // fact `begin_action` now treats as load-bearing: whether a sheep has
+        // a channel at all. `spec.channel == false` drops both real ends
+        // (`from_child_tx`, `raw_to_child_rx`) right here, exactly as the real
+        // runner does at spawn: `ProcIo::from_child` reads closed at once and
+        // `ProcIo::to_child.send()` fails immediately, rather than being
+        // accepted by a relay that will never run. `FakeIo`'s own test-facing
+        // handles get their own already-closed stand-ins in that branch —
+        // there is no reader or writer task on this spawn for a test to
+        // observe traffic through.
+        let (fake_from_child_tx, fake_to_child_rx) = if spec.channel {
+            let relay_state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let mut raw_rx = raw_to_child_rx;
+                while let Some(msg) = raw_rx.recv().await {
+                    if msg == ShepherdMessage::Shutdown {
+                        relay_state.record_shutdown();
+                    }
+                    if relay_tx.send(msg).await.is_err() {
+                        break; // observer dropped FakeIo::to_child_rx; stop relaying
+                    }
                 }
-                if relay_tx.send(msg).await.is_err() {
-                    break; // observer dropped FakeIo::to_child_rx; stop relaying
-                }
-            }
-        });
+            });
+            (from_child_tx, relay_rx)
+        } else {
+            drop(from_child_tx);
+            drop(raw_to_child_rx);
+            drop(relay_tx);
+            let (stand_in_tx, stand_in_rx) = mpsc::channel::<ChildMessage>(1);
+            drop(stand_in_rx);
+            let (dead_tx, dead_rx) = mpsc::channel::<ShepherdMessage>(1);
+            drop(dead_tx);
+            (stand_in_tx, dead_rx)
+        };
 
         let mut spawned = self.spawned.lock().unwrap();
         let index = spawned.len();
@@ -587,8 +625,8 @@ impl ProcessRunner for ScriptedRunner {
             state: Arc::clone(&state),
             io: Some(FakeIo {
                 logs_tx,
-                from_child_tx,
-                to_child_rx: relay_rx,
+                from_child_tx: fake_from_child_tx,
+                to_child_rx: fake_to_child_rx,
             }),
             log_ctl_live,
             reopens,

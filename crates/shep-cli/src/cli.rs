@@ -90,6 +90,19 @@ pub enum Commands {
     Flock,
     /// Describe one sheep in detail.
     Describe(SelectorArgs),
+    /// Send a named action to matched sheep and report what each app
+    /// answers.
+    ///
+    /// Reaches an app over its shepherd channel — the fd-3 pipe the daemon
+    /// opens when the app's Flockfile sets `channel = true`. `wait_ready`
+    /// and `shutdown_with_message` both imply the same channel, so either
+    /// one of the three is enough; a sheep with none of them answers a
+    /// `no_channel` row instead of a reply, naming the same fields.
+    ///
+    /// `action` and any `params` are free-form and unvalidated here — sent
+    /// to the app verbatim, on its own shepherd-channel wire, for the app
+    /// itself to recognize or refuse.
+    Trigger(TriggerArgs),
     /// List one fold.
     Fold(FoldArgs),
     /// Show or follow bleats (log output) for one or more sheep.
@@ -147,6 +160,25 @@ pub struct StartArgs {
 pub struct SelectorArgs {
     /// name, id, `all`, `/regex/`, or `fold:<name>`
     pub selector: String,
+}
+
+/// Arguments to `shep trigger`.
+///
+/// Not [`SelectorArgs`]: this verb needs two more positionals than a
+/// selector, `action` and the optional `params` after it, so it carries its
+/// own struct rather than widening the one every other selector-taking verb
+/// shares. The selector is still required — no `default_value`, matching
+/// `stop`/`restart`/`reload`/`delete`/`describe` — for the same reason: this
+/// reaches a running app, so the operator names the target rather than
+/// trigger one against the whole flock by accident.
+#[derive(Debug, clap::Args)]
+pub struct TriggerArgs {
+    /// name, id, `all`, `/regex/`, or `fold:<name>`
+    pub selector: String,
+    /// Action name — free-form, defined by the app
+    pub action: String,
+    /// Argument text for the action, passed through to the app verbatim
+    pub params: Option<String>,
 }
 
 /// Arguments to `shep flush`.
@@ -325,9 +357,18 @@ mod tests {
     /// [`flush_refuses_to_run_without_a_selector`] gives: a verb that had
     /// stopped accepting any selector at all would pass the first half on its
     /// own.
+    ///
+    /// `trigger` joins this group too, but cannot share the loop above
+    /// verbatim: [`TriggerArgs`] carries two required positionals, not one,
+    /// so a bare `shep trigger web` (selector only) is already a usage error
+    /// for missing `action` regardless of whether `selector` itself has a
+    /// default — that loop's second assertion would pass by accident. What
+    /// pins `selector` specifically is the same thing
+    /// `home_flag_is_wired_to_the_shep_home_env_var` checks for `--home`:
+    /// the clap `Arg` itself, read directly off `trigger`'s own `Command`.
     #[test]
     fn a_selector_taking_verb_refuses_to_run_without_one() {
-        use clap::Parser;
+        use clap::{CommandFactory, Parser};
         for verb in [
             "stop", "restart", "reload", "delete", "describe", "thatlldo",
         ] {
@@ -341,6 +382,26 @@ mod tests {
                 "`shep {verb} web` must still parse"
             );
         }
+
+        assert!(
+            Cli::try_parse_from(["shep", "trigger"]).is_err(),
+            "`shep trigger` with neither selector nor action must be a usage error"
+        );
+        assert!(
+            Cli::try_parse_from(["shep", "trigger", "web", "reload-config"]).is_ok(),
+            "`shep trigger web reload-config` (selector, then action) must parse"
+        );
+
+        let cmd = Cli::command();
+        let trigger = cmd.find_subcommand("trigger").unwrap();
+        let selector_arg = trigger
+            .get_arguments()
+            .find(|a| a.get_id().as_str() == "selector")
+            .expect("TriggerArgs must still carry a `selector` field");
+        assert!(
+            selector_arg.is_required_set(),
+            "trigger's selector must stay required, never default to the whole flock"
+        );
     }
 
     /// The other side of [`bleats_and_reopen_default_to_every_sheep`]: the
@@ -465,6 +526,7 @@ mod tests {
             "reload",
             "reopen",
             "flush",
+            "trigger",
             "ping",
             "kill",
             "completions",

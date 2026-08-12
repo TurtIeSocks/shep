@@ -43,6 +43,7 @@ pub mod spawn;
 #[cfg(unix)]
 pub use client::{
     Client, DEADLINE_GRACE, DEFAULT_DEADLINE, LOG_PLANE_DEADLINE, RequestError, START_DEADLINE,
+    TRIGGER_DEADLINE,
 };
 #[cfg(unix)]
 pub use connection::{ConnectError, HANDSHAKE_TIMEOUT};

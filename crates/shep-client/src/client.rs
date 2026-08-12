@@ -46,6 +46,20 @@ pub const START_DEADLINE: Duration = Duration::from_secs(30);
 /// comfortably inside the daemon's own clamp.
 pub const LOG_PLANE_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Budget for `Request::Trigger`.
+///
+/// Not 30s like [`START_DEADLINE`]/[`LOG_PLANE_DEADLINE`] — `shep_core`'s
+/// `config::normalize` accepts an app's own `AppConfig::action_timeout` up
+/// to 58s (`MAX_ACTION_TIMEOUT`, 2s under the daemon's own `MAX_DEADLINE_MS`
+/// clamp — `shep-daemon`'s `rpc` module, 60s — so the daemon still has room
+/// to build a `TimedOut` row and get it back down the wire after its own
+/// wait gives up). A caller sending less than that clamp would abandon a
+/// reply the daemon is still legitimately building for a sheep with a long
+/// `action_timeout`, so this asks for the full 60s: the daemon clamps
+/// anything higher to the same number anyway, so asking for more would buy
+/// nothing.
+pub const TRIGGER_DEADLINE: Duration = Duration::from_secs(60);
+
 /// How much longer the client waits than the deadline it asked the daemon to
 /// honour. Without a gap the client abandons a request the daemon is still
 /// legitimately working on, and the user sees a timeout for work that

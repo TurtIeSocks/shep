@@ -209,7 +209,11 @@ tweaks; file-locked JSON; not the primary config path.
   `{"kind":"action-reply",...}`; daemon→child `{"kind":"shutdown"}`,
   `{"kind":"action",...}`. Fd number exported as `SHEP_CHANNEL_FD`. An
   `action` carries `name`, and `params` when the operator supplied any — the
-  key is absent otherwise, which is what keeps it additive (§9).
+  key is absent otherwise, which is what keeps it additive (§9). Full
+  contract for an app author writing to this wire, including the parts this
+  bullet has no room for (why an action should reply even to a name it does
+  not recognize, how a reply is matched to its trigger with no correlation
+  id, the `params` quoting gap): [`docs/shepherd-channel.md`](../shepherd-channel.md).
 - **Probes** (per app, optional): `readiness_probe` / `liveness_probe` =
   HTTP GET / TCP connect / exec, with interval, timeout, failure threshold.
   Readiness gates reload; liveness failures trigger the restart policy.

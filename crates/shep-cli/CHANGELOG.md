@@ -14,9 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add the clap command tree (`Cli`, `Commands`, and every argument struct
   the CLI will ever parse — `Start`, `Stop`/`Restart`/`Reload`/`Delete`/
-  `Describe`, `Flock` (aliases `list`/`ls`), `Fold`, `Bleats` (alias `logs`),
-  `Reopen`, `Flush`, `Ping`, `Kill`, `Completions`, the hidden `Thatlldo` and
-  `Daemon`), pure tier so it compiles and its tests run on Windows.
+  `Describe`, `Trigger`, `Flock` (aliases `list`/`ls`), `Fold`, `Bleats`
+  (alias `logs`), `Reopen`, `Flush`, `Ping`, `Kill`, `Completions`, the
+  hidden `Thatlldo` and `Daemon`), pure tier so it compiles and its tests
+  run on Windows.
 - Add `shep reload <selector>`: replace each instance of the matched sheep
   with a fresh one, one instance at a time, so the app gets a window in which
   it can hand over. **Not zero downtime** — the old listener's queue of
@@ -201,6 +202,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   paths ARE the answer. A file that is not there is already empty and is
   reported rather than created, so `shep flush --daemon` on a cold
   `$SHEP_HOME` exits 0.
+- Add `shep trigger <selector> <action> [params]`, which sends a named,
+  free-form action to the sheep the selector matches over its shepherd
+  channel and reports what each one answered. Delivery needs `channel = true`
+  in the app's own Flockfile — or `wait_ready`/`shutdown_with_message`,
+  either of which opens the same channel on its own — and nothing user-facing
+  said so before this: an operator without it got a `no_channel` row and no
+  way to know why. Both `--help` and the row itself now name the field. The
+  selector is **required**, matching `stop`/`restart`/`reload`/`delete`/
+  `describe`: this reaches a running app, so the operator names the target.
+
+  A row's own outcome is never a request failure — `replied`, `no_channel`,
+  `skipped` (a reload drainee, mid-swap) and `timed_out` (no reply inside the
+  app's own `action_timeout`) all render as rows of one successful reply, the
+  same precedent `reopen`/`flush` set for a per-sheep refusal inside a
+  request that otherwise succeeded. Only a selector matching nothing, or the
+  daemon itself being unreachable, fails the command as a whole.
+
+  The table renders `ID`/`NAME`/`OUTCOME`/`DETAIL`; a `Replied` body is
+  arbitrary, app-chosen text of unknown length, so the table cannot show it
+  verbatim the way `--format json` does — a long body would stretch every row
+  in the column to match it, and an embedded newline would split one row
+  across output lines and desync every column beneath it. `DETAIL` therefore
+  escapes embedded newlines to `\n`/`\r` and caps the preview at 80
+  characters with a trailing `...`; `--format json` always carries the real
+  reply, full length, real newlines included. Sent with a 60s deadline
+  (`TRIGGER_DEADLINE`, `shep-client`) rather than the client's 5s default,
+  since an app's own `action_timeout` can be configured up to 58s and the
+  default would abandon a reply the daemon was still honestly building.
+
+  `parse_selector` — duplicated once per verb module (`lifecycle`, `logs`,
+  `query`, `bleats`) and about to become a fifth copy for this verb — is now
+  one function in `commands::selector`, landed as its own commit ahead of
+  this one so the new verb builds on a single copy instead of adding to the
+  pile.
 
 ### Fixes
 
