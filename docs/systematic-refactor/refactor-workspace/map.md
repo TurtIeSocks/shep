@@ -37,6 +37,11 @@ src/
              channel for an app that wants one without also wanting `wait_ready` or
              `shutdown_with_message`, which were previously the only ways to get one. Defaults
              to false — see spawn.rs for the per-sheep cost that default is protecting.
+             `action_timeout` (Phase 7) bounds how long a triggered action gets to answer on
+             that same channel before its row reports `ActionOutcome::TimedOut`. Defaults to
+             3s, under the 5s an RPC caller gets when it sends no deadline of its own; a value
+             `normalize` could never satisfy however long a caller's own deadline asks for is
+             refused outright — see rpc_server.rs below for the exact ceiling.
     ecosystem.rs     ← was lib/Common.js (parseConfig + file detection)
       Action: port + redesign
       Notes: serde_json strict (NOT JS-eval — kills code-exec-on-parse), json5, serde-saphyr.
@@ -165,6 +170,27 @@ src/
              statement about the others. Both REPLIES stay selector-keyed: a row means "a sheep
              you named". A failure may name one you did not, which is the honest report of a
              shared file that could not be reopened.
+      Trigger (Phase 7): `SheepSlot::to_child` is a clone of `ProcIo::to_child`, taken at every
+             spawn site and cleared alongside `ctl` in `handle_exited` — the actor's own handle
+             onto a live sheep's shepherd channel, held for exactly as long as the sheep is.
+             `Actor::begin_action` is the selector pass (shaped like `begin_manual`): an empty
+             match is `NotFound`; a matched reload drainee (`ReloadState::Drainee`) is refused
+             `ActionOutcome::Skipped` without ever touching its channel, because a drainee's
+             replacement answers under the same name and an answer from the process on its way
+             out is worse than none; a sheep with no live sender (`SheepSlot::open_channel`,
+             which checks `to_child.is_closed()` too, not only `is_some()`) is refused
+             `NoChannel`. Every other match gets one wait, armed by `Actor::arm_action` and
+             joined off the actor loop by `spawn_trigger_task`, so N matched sheep run their
+             waits concurrently rather than in sequence — a flock's answer waits on its slowest
+             match, never their sum. `ActionWaits` (`live` plus a per-sheep `abandoned` name
+             ledger, capped at `MAX_ABANDONED_ACTION_REPLIES`) is what stops a late reply to a
+             timed-out action from answering a same-named re-trigger: the shepherd channel
+             carries no correlation id (a silent break for every app already speaking it), so
+             order is the only thing the daemon can lean on — a reply settles the oldest debt
+             for its action name before it is ever allowed to answer a live wait. A whole
+             matched flock answering nothing is still a success (every row says why), and
+             `begin_action` logs a `warn!` naming the action and the match/skip counts — the
+             daemon-side visibility a reload's own silent no-op swap still lacks.
   spawn.rs           ← was lib/God/ForkMode.js + ClusterMode.js (unified — ONE spawn path)
       Action: port + merge
       Drift (Phase 3, recorded in Phase 5): shipped as a PAIR — `runner.rs` (portable: the
@@ -180,6 +206,21 @@ src/
              plus two pump tasks per sheep is real cost against spec §14.11's idle-RSS goal.
              NOTE the channel does NOT carry a log:reload of pm2's kind — see the log plane
              below, where the child is not a participant at all.
+             Fd 3 blocks (Phase 7, fixed): `UnixStream::pair()` sets `O_NONBLOCK` on BOTH ends
+             for tokio's own sake, and `into_std()` carries the flag across the exec unless
+             something clears it — nothing did, so every child inherited a non-blocking fd 3 and
+             a plain `read <&3` got `EAGAIN` instead of parking. This broke `shutdown_with_message`
+             for any app that just reads rather than running an event loop.
+             `tokio_runner.rs`'s spawn path now calls `set_nonblocking(false)` on the child's end
+             between `into_std()` and the fd mapping; the daemon's own end is a separate
+             descriptor and keeps the flag it needs. `ShepherdMessage::Action` also gained a
+             `params: Option<String>` field (Phase 7) — the argument text after a triggered
+             action's name, `skip_serializing_if`-omitted when there is none so
+             `{"kind":"action","name":"gc"}` stays byte-identical to before the field existed.
+             One opaque string, never structured: the daemon does not read it, only routes it —
+             see spec §9's own note on why, and `docs/shepherd-channel.md` for the app-facing
+             contract (channel opened by `channel`/`wait_ready`/`shutdown_with_message`, wire
+             shapes both ways, why an app should reply to an action name it does not recognize).
              Cluster mode = N fork instances (Node cluster injection dies — see reload.rs for
              the load-balancing story). Log pipeline: BufReader lines → broadcast + append
              files. Framing (raw/date-prefix/json) and the /dev/null skip are still ahead.
@@ -389,6 +430,20 @@ src/
              gap is served LATE, never dropped. What the signal form gives up against the
              socket form: no reply, so the result is logged and nothing can wait for the swap,
              and no selector narrower than the whole flock.
+      Trigger (Phase 7): `Request::Trigger`/`Response::Triggered` is answered on completion, not
+             acceptance, unlike Reload above — an action either gets a reply or its own
+             `action_timeout` runs out, neither anywhere near a reload's ~11s per instance.
+             `ActionOutcome` (`Replied{body}`/`NoChannel`/`Skipped`/`TimedOut`) is
+             `#[non_exhaustive]`; `action_timeout` on `AppConfig` (config/normalize.rs above) is
+             refused outright past `MAX_ACTION_TIMEOUT` (58s, two seconds under the daemon's own
+             `MAX_DEADLINE_MS` clamp) — the ceiling nothing could ever satisfy however long a
+             caller's own deadline asks for — and defaults to 3s, comfortably under
+             `DEFAULT_DEADLINE_MS`'s 5s so an honest `TimedOut` row has room to get back down the
+             wire before a caller with no deadline of its own gives up first. shep-client's own
+             `TRIGGER_DEADLINE` (60s) is the matching client-side budget. `channel.*`, the bus
+             topic spec §6 promises for raw fd-3 traffic, is still unbuilt — trigger's own reply
+             is not a substitute for it (`docs/specs/deferred.md`): a stale or unprompted
+             `action-reply`, and `Ready`/`Metric` traffic, stay invisible either way.
   bus.rs             ← was God.bus (EventEmitter2) + axon pub/sub
       Action: rewrite
       Notes: tokio::sync::broadcast<BusEvent>; wire side: subscribe-with-topic-globs on connect,
@@ -514,6 +569,19 @@ src/
              ACCEPTANCE — the command prints the flock as it stood at that moment and exits,
              and does NOT subscribe to the bus to follow the swaps. Its `--help` says in as
              many words that the window is not zero downtime.
+      `shep trigger <selector> <action> [params]` (Phase 7): `commands/trigger.rs::trigger`.
+             Selector REQUIRED, joining `stop`/`restart`/`reload`/`delete` for the same reason —
+             `TriggerArgs` carries its own struct rather than `SelectorArgs` because the verb
+             needs two more positionals. `action` and `params` are free-form and unvalidated on
+             this side too, carried to the daemon exactly as typed for the app on the other end
+             of the shepherd channel to recognize or refuse — neither `--help` nor the CLI
+             invents a grammar for either. Sent with `shep-client::TRIGGER_DEADLINE` (60s) rather
+             than the 5s default, since `AppConfig::action_timeout` can be configured up to 58s
+             per sheep and the daemon answers on completion, not acceptance, unlike `reload`
+             above. `TriggeredRows` (`output/rows.rs`) renders `ID`/`NAME`/`OUTCOME`/`DETAIL`:
+             `OUTCOME` is the stable `kind` tag, `DETAIL` the per-variant human text, and a
+             `Replied` body is capped and newline-escaped for the table only — `--format json`
+             carries it whole, exactly as the daemon sent it.
   runtime.rs         ← was lib/binaries/Runtime4Docker.js (+ Runtime.js dropped)
       Action: port + fix
       Notes: no-daemon mode = daemon event loop in-process. Exit-code contract exact
@@ -555,9 +623,12 @@ src/
              own shepd.out.log/shepd.err.log, which the CLI's launcher creates before the daemon
              exists and the daemon inherits as plain fds 1 and 2 — it holds no handle to flush
              and no recorded path to truncate, so restarting the shepherd is what empties those.
-      KNOWN DUPLICATION: `request_and_render` + `parse_selector` are a third per-module copy,
-             after `commands/lifecycle.rs`'s and `commands/query.rs`'s. Extraction is deferred,
-             not decided against.
+      KNOWN DUPLICATION: `request_and_render` is still a three-way per-module copy
+             (`commands/lifecycle.rs`, `commands/logs.rs`, `commands/query.rs`). Extraction is
+             deferred, not decided against. `parse_selector` no longer is (Phase 7): collapsed
+             from four near-identical copies (`lifecycle`, `logs`, `query`, `bleats`) into
+             `commands/selector.rs::parse_selector`, shared by every verb — including
+             `trigger` — that takes a selector off the command line.
   startup.rs         ← was lib/API/Startup.js + lib/templates/
       Action: port (reduced platforms)
       Notes: systemd (Type=notify + sd_notify — upgrade from Type=forking), launchd, openrc,
