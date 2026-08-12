@@ -8023,6 +8023,10 @@ mod tests {
         // removing the row, which is not the clearing under test.
         let mut app = AppConfig::minimal("web", "./srv");
         app.autorestart = false;
+        // Asked for explicitly: the writer task under test only exists for a
+        // sheep that has a channel, and the runner wires one only when the
+        // spec says so. Leaving it off gives this case nothing to reap.
+        app.channel = true;
         // One script for one spawn, exiting on its own rather than under a
         // kill: a `Kill` can put a `Shutdown` on this very channel, and the
         // read below wants the channel's END, not its traffic.
