@@ -155,6 +155,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idle-RSS goal, so the channel now opens only when something asks for one.
   `wait_ready` and `shutdown_with_message` keep opening it on their own,
   unaffected by the new field.
+- Add `AppConfig::action_timeout`, how long a triggered action gets to answer
+  before its row becomes `ActionOutcome::TimedOut`. Defaults to 3s, replacing
+  the flock-wide constant the daemon used before this field existed, with the
+  same value and the same reasoning: comfortably under the 5s an RPC caller
+  gets by default, so the honest `TimedOut` row still reaches a caller who set
+  no deadline of its own. `normalize` rejects a value at or above 58s — 2s
+  under the daemon's own hard ceiling on any deadline a caller could ever be
+  given, `MAX_DEADLINE_MS` — because past that line no caller, however long a
+  deadline it asks for, could ever be given room to wait it out; a value
+  merely above the 5s *default* is accepted, on the understanding that
+  satisfying it is the caller's to arrange with a wider deadline of its own
+  (`Client::request_with_deadline`, the way `shep logs -f` already asks for
+  `LOG_PLANE_DEADLINE` rather than the client's default).
 - Add `Flockfile` discovery (`discover`) and TOML/YAML/JSON/JSON5 parsing.
 - Add `DaemonConfig`, parsing `shep.toml` with `SHEP_*` env-variable
   layering.

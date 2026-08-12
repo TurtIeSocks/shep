@@ -207,8 +207,6 @@ pub(crate) enum Command {
         action: String,
         /// Argument text for the action, passed to the app verbatim.
         params: Option<String>,
-        /// How long each app gets to answer before its wait gives up.
-        timeout: Duration,
         /// Answers once every matched sheep has answered, timed out or been
         /// refused — off a task of its own, never the actor loop (see
         /// [`Actor::begin_action`]).
@@ -652,12 +650,13 @@ impl SupervisorHandle {
     ///
     /// Answers on completion rather than on acceptance: an action has no
     /// floor on how long it takes, so an acceptance would tell a caller
-    /// nothing it did not already know. `timeout` is what bounds that — each
-    /// app gets that long to reply before its row becomes
-    /// [`ActionOutcome::TimedOut`] — and it should be set below the caller's
-    /// own budget, or the caller gives up before this honest answer reaches
-    /// it. The waits run alongside each other, so a whole flock costs one
-    /// timeout rather than one per sheep.
+    /// nothing it did not already know. Each matched sheep's own
+    /// `AppConfig::action_timeout` is what bounds that — read at wait time
+    /// from its config, not passed in here — and it should be set below the
+    /// caller's own RPC budget, or the caller gives up before this honest
+    /// answer reaches it. The waits run alongside each other, so a whole
+    /// flock costs whichever matched sheep's own timeout is longest, never
+    /// the sum of them.
     ///
     /// A sheep that cannot be reached is refused in its own row rather than
     /// failing the whole request: spec §9's selector grammar (`all`,
@@ -686,7 +685,6 @@ impl SupervisorHandle {
         selector: ProcessSelector,
         action: String,
         params: Option<String>,
-        timeout: Duration,
     ) -> Result<Vec<ActionReply>, SupervisorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -694,7 +692,6 @@ impl SupervisorHandle {
                 selector,
                 action,
                 params,
-                timeout,
                 reply,
             }))
             .await
@@ -1373,10 +1370,9 @@ impl<R: ProcessRunner> Actor<R> {
                 selector,
                 action,
                 params,
-                timeout,
                 reply,
             } => {
-                self.begin_action(&selector, action, params, timeout, reply);
+                self.begin_action(&selector, action, params, reply);
                 false
             }
             Command::Stop { selector, reply } => {
@@ -3650,7 +3646,6 @@ impl<R: ProcessRunner> Actor<R> {
         selector: &ProcessSelector,
         action: String,
         params: Option<String>,
-        timeout: Duration,
         reply: oneshot::Sender<Result<Vec<ActionReply>, SupervisorError>>,
     ) {
         let mut matched: Vec<u32> = self
@@ -3681,7 +3676,12 @@ impl<R: ProcessRunner> Actor<R> {
                 .sheep
                 .get(&id)
                 .expect("begin_action: `matched` holds ids read off this map a moment ago");
-            let name = slot.entry.spec.config().name.clone();
+            let config = slot.entry.spec.config();
+            let name = config.name.clone();
+            // Each sheep's own `action_timeout` bounds its own wait — a
+            // slow-flushing cache and an instant `gc` on the same flock no
+            // longer share one number picked for neither of them.
+            let action_timeout = config.action_timeout.as_duration();
             if matches!(slot.entry.reload, ReloadState::Drainee { .. }) {
                 refused.push(ActionReply {
                     id,
@@ -3698,7 +3698,8 @@ impl<R: ProcessRunner> Actor<R> {
                 });
                 continue;
             };
-            let answer = self.arm_action(id, to_child, action.clone(), params.clone(), timeout);
+            let answer =
+                self.arm_action(id, to_child, action.clone(), params.clone(), action_timeout);
             waits.push((id, name, answer));
         }
 
@@ -4126,7 +4127,8 @@ fn spawn_action_task(
 /// started before this one existed — [`spawn_action_task`] spawns on the spot.
 /// So the loop is a join and not a queue: it settles when the LAST wait does,
 /// not when their timeouts add up, and a flock of ten unresponsive apps costs
-/// one timeout rather than ten. Written as a plain loop for the reason
+/// whichever one of their `action_timeout`s is longest, not the sum of all
+/// ten. Written as a plain loop for the reason
 /// [`spawn_reopen_task`] gives for its own: one task with a `for` is a great
 /// deal easier to follow than a join over the flock, and here it buys nothing
 /// to give that up.
@@ -8255,7 +8257,6 @@ mod tests {
                     ProcessSelector::Name("web".to_string()),
                     "gc".to_string(),
                     Some("--full".to_string()),
-                    ACTION_TIMEOUT,
                 )
                 .await
         });
@@ -8312,7 +8313,6 @@ mod tests {
                     ProcessSelector::Name("api".to_string()),
                     "stats".to_string(),
                     None,
-                    ACTION_TIMEOUT
                 )
                 .await,
             Ok(vec![ActionReply {
@@ -8568,7 +8568,6 @@ mod tests {
             selector,
             action: action.to_string(),
             params: None,
-            timeout: ACTION_TIMEOUT,
             reply,
         });
         answer

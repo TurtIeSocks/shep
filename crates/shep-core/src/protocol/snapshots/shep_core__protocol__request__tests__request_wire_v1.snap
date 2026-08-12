@@ -54,6 +54,7 @@ expression: requests
           "shutdown_with_message": false,
           "listen_timeout": "3s",
           "graceful_timeout": "8s",
+          "action_timeout": "3s",
           "max_memory": null,
           "watch": false,
           "ignore_watch": [],

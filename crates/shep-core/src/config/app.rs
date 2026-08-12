@@ -106,6 +106,24 @@ pub struct AppConfig {
     pub listen_timeout: UpDuration,
     /// Drain window for the old instance during reload
     pub graceful_timeout: UpDuration,
+    /// How long a triggered action gets to answer on the shepherd channel
+    /// before its row becomes `ActionOutcome::TimedOut`.
+    ///
+    /// Defaults to 3s — comfortably under the 5s an RPC caller gets when it
+    /// sends no deadline of its own (`shep-client`'s `DEFAULT_DEADLINE`,
+    /// mirrored daemon-side as `rpc`'s `DEFAULT_DEADLINE_MS`). The margin
+    /// matters more than the number: push this past that budget and a caller
+    /// using the plain default gives up with `DeadlineExceeded` before the
+    /// daemon's own honest `TimedOut` row ever reaches it. A legitimately
+    /// slow action (a cache flush, say) can still ask for longer, but its
+    /// caller has to ask for a longer deadline in step —
+    /// `Client::request_with_deadline`, the way `shep logs -f` already asks
+    /// for `LOG_PLANE_DEADLINE` rather than the client's default. `normalize`
+    /// refuses a value no caller could ever satisfy, however long a deadline
+    /// it asks for; a value merely above the *default* budget is a caller's
+    /// choice to widen its own deadline, not a config error this crate can
+    /// see.
+    pub action_timeout: UpDuration,
     /// Memory ceiling — polling enforcer restarts above this
     pub max_memory: Option<MemSize>,
     /// Watch files and restart on change
@@ -196,6 +214,7 @@ impl Default for AppConfig {
             shutdown_with_message: false,
             listen_timeout: UpDuration::from_millis(3000),
             graceful_timeout: UpDuration::from_millis(8000),
+            action_timeout: UpDuration::from_millis(3000),
             max_memory: None,
             watch: false,
             ignore_watch: Vec::new(),
@@ -249,6 +268,7 @@ mod tests {
         assert_eq!(app.kill_timeout, UpDuration::from_millis(1600));
         assert_eq!(app.listen_timeout, UpDuration::from_millis(3000));
         assert_eq!(app.graceful_timeout, UpDuration::from_millis(8000));
+        assert_eq!(app.action_timeout, UpDuration::from_millis(3000));
         assert!(app.max_memory.is_none());
         assert!(app.fold.is_none());
         assert!(!app.channel);

@@ -59,9 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   share) is typed to `Vec<ProcessInfo>` and cannot carry `ActionReply`'s reply
   body, so this is its own small dispatch path rather than a forced fit.
 
-  The waits run alongside each other, so a whole flock costs one action
-  timeout rather than one per sheep, and the answer fires only once the last
-  of them has ended. A sheep that cannot take the action is refused in its own
+  The waits run alongside each other — never one after another — so a whole
+  flock costs whichever matched sheep's own `action_timeout` is longest,
+  never the sum of them, and the answer fires only once the last of them has
+  ended. A sheep that cannot take the action is refused in its own
   row and the rest are still asked: `NoChannel` when nothing is receiving on
   its channel — read off the channel itself, never off `channel = true`, so
   there is no second copy of that fact to disagree — and `Skipped` for a

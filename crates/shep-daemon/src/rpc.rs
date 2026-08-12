@@ -37,16 +37,6 @@ use crate::supervisor::{SupervisorError, SupervisorHandle};
 pub(crate) const DEFAULT_DEADLINE_MS: u64 = 5_000;
 /// Ceiling on a client-supplied deadline — a peer cannot pin a daemon task open.
 pub(crate) const MAX_DEADLINE_MS: u64 = 60_000;
-/// How long an app gets to answer a triggered action before its row becomes
-/// [`ActionOutcome::TimedOut`](shep_core::protocol::ActionOutcome::TimedOut).
-///
-/// Deliberately under [`DEFAULT_DEADLINE_MS`], and by a margin rather than by
-/// a hair. The two bound different things — this one bounds the app, that one
-/// bounds the reply — and the honest per-row answer is only worth producing
-/// if it can still reach a caller who sent no deadline of its own. Reversed,
-/// every unanswered action would read as `DeadlineExceeded`, which says
-/// nothing about which sheep answered and which did not.
-const ACTION_TIMEOUT: Duration = Duration::from_millis(3_000);
 
 /// Everything a request handler may touch — one clone per connection.
 ///
@@ -382,9 +372,15 @@ where
 /// `ProcessInfo` cannot hold a reply body on. Everything else about the shape
 /// is the same: convert the selector, call the supervisor, map the rows.
 ///
-/// [`ACTION_TIMEOUT`] is one value for the whole flock rather than one per
-/// app. What decides it is its relationship with the request budget, not the
-/// number itself — see the constant's own doc.
+/// How long each app gets to answer is not decided here any more: it is
+/// `AppConfig::action_timeout`, one value per matched sheep rather than one
+/// for the whole flock, read off each sheep's own config where the wait is
+/// armed (`Actor::begin_action`). What used to be this function's own
+/// `ACTION_TIMEOUT` constant is now that field's problem, including staying
+/// under [`DEFAULT_DEADLINE_MS`] — `shep_core::config::normalize` refuses a
+/// value no caller could ever be given enough deadline to outlast; a value
+/// merely past the *default* budget is accepted; the caller's own deadline is
+/// what decides whether that pays off.
 async fn trigger(
     id: u64,
     spec: SelectorSpec,
@@ -396,7 +392,7 @@ async fn trigger(
         Err(err) => Err(err),
         Ok(selector) => ctx
             .supervisor
-            .trigger(selector, action, params, ACTION_TIMEOUT)
+            .trigger(selector, action, params)
             .await
             .map(Response::Triggered)
             .map_err(|err| rpc_error(&err)),
@@ -414,6 +410,7 @@ mod tests {
         ActionOutcome, ActionReply, Request, Response, RpcErrorCode, SelectorSpec,
     };
     use shep_core::status::ProcStatus;
+    use shep_core::values::UpDuration;
 
     fn envelope(id: u64, body: Request) -> Envelope {
         Envelope {
@@ -766,12 +763,14 @@ mod tests {
     /// `TimedOut` rather than `NoChannel` is the assertion that matters, and
     /// it is two claims at once. The action was really delivered and really
     /// waited on — `NoChannel` is what a build that never reached the sheep
-    /// would answer — and [`ACTION_TIMEOUT`] elapsed INSIDE the request's own
-    /// budget. Raise it past [`DEFAULT_DEADLINE_MS`] and this stops being a
-    /// row at all: `with_deadline` fires first and the reply becomes
-    /// `DeadlineExceeded`, which names no sheep and says nothing about which
-    /// of them answered. The ordering is what is pinned here; the constants
-    /// are pinned in `budgets_default_and_clamp`.
+    /// would answer — and `web`'s `action_timeout` (3s, `AppConfig::minimal`'s
+    /// spec default) elapsed INSIDE the request's own budget. Raise it past
+    /// [`DEFAULT_DEADLINE_MS`] and this stops being a row at all:
+    /// `with_deadline` fires first and the reply becomes `DeadlineExceeded`,
+    /// which names no sheep and says nothing about which of them answered —
+    /// pinned right below, in `an_oversized_action_timeout_loses_the_race`.
+    /// The ordering is what both cases pin; the constants are pinned in
+    /// `budgets_default_and_clamp`.
     ///
     /// Nothing answers because the harness keeps no handle on its runner, so
     /// no case here can put a reply on a child's end of the channel. An app's
@@ -833,6 +832,57 @@ mod tests {
                 name: "web".to_string(),
                 outcome: ActionOutcome::TimedOut,
             }]
+        );
+    }
+
+    /// Fails if the daemon's own per-app wait is ever allowed to reach or
+    /// exceed the caller's default RPC budget. `shep_core::config::normalize`
+    /// only refuses an `action_timeout` no caller could ever satisfy however
+    /// long a deadline it asks for (its own ceiling, 58s); anything between
+    /// that and [`DEFAULT_DEADLINE_MS`] normalizes fine, on the documented
+    /// understanding that a caller sending no deadline of its own has to lose
+    /// this exact race. This case drives that failure mode for real rather
+    /// than asserting a constant comparison: `web`'s `action_timeout` is set
+    /// past the 5s default budget, the request carries no deadline of its own
+    /// (`envelope`'s `deadline_ms: None`), and under the paused clock
+    /// `dispatch`'s own `with_deadline` wins — the reply is
+    /// `DeadlineExceeded`, never a `Triggered` row, honest or otherwise.
+    ///
+    /// Confirmed by mutating the sibling case above rather than by
+    /// construction: raising `AppConfig::minimal`'s `action_timeout` there to
+    /// 9s (past `DEFAULT_DEADLINE_MS`, same value this case uses) reproduced
+    /// exactly this — `RpcError { code: DeadlineExceeded, message: "the
+    /// request deadline of 5000 ms expired before the daemon finished" }`
+    /// where that test expected a `TimedOut` row. This case pins that same
+    /// shape as its own assertion, so a regression that reintroduces it fails
+    /// the suite outright instead of needing a mutation run to surface again.
+    #[tokio::test(start_paused = true)]
+    async fn an_oversized_action_timeout_loses_the_race() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let mut web = AppConfig::minimal("web", "./srv");
+        web.channel = true;
+        web.action_timeout = UpDuration::from_millis(9_000); // > DEFAULT_DEADLINE_MS (5s)
+        reply_of(dispatch(envelope(1, Request::Start { apps: vec![web] }), &h.ctx).await);
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::Trigger {
+                        selector: SelectorSpec::Name("web".to_string()),
+                        action: "gc".to_string(),
+                        params: None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert_eq!(
+            reply.result.unwrap_err().code,
+            RpcErrorCode::DeadlineExceeded,
+            "an action_timeout past the caller's default budget must lose that race, not \
+             report an honest TimedOut row nobody can reach"
         );
     }
 
