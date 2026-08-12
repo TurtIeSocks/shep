@@ -73,6 +73,9 @@
 //!   test-call-site accounting) (unix-only)
 //! - [`privilege`]: `user`/`group` config -> numeric uid/gid, one portable `resolve()`
 //!   signature over a real unix impl and a refuse-outright non-unix stub
+//! - [`notify`]: one `READY=1` datagram to `$NOTIFY_SOCKET` — readiness for
+//!   an init system supervising this process directly, sent by [`boot`] once
+//!   the muster restore has finished (unix-only)
 //! - [`tokio_runner`]: real [`ProcessRunner`](runner::ProcessRunner) over `tokio::process` (unix-only)
 //!
 //! # Quick start
@@ -280,6 +283,19 @@ pub mod boot;
 // its documented caller.
 #[cfg(unix)]
 pub mod sys;
+
+// Unix-only: `std::os::unix::net::UnixDatagram`, plus (on Linux) the
+// abstract-namespace address it can be handed. Doc lives inside notify.rs's
+// own `//!` header, not here — same reasoning as `server`'s note below.
+//
+// Reachable tier: `shep-cli`'s hidden `daemon` subcommand names
+// `NOTIFY_SOCKET_ENV`, because the environment read belongs where every
+// other `SHEP_*` override is already read — this crate receives the
+// resolved address instead (`boot::BootOptions::notify_socket`), which is
+// what lets a boot test observe the ordering without an ambient variable
+// that `#![deny(unsafe_code)]` forbids it to set.
+#[cfg(unix)]
+pub mod notify;
 
 /// Real [`ProcessRunner`](runner::ProcessRunner) over actual OS processes.
 ///

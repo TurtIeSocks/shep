@@ -2,9 +2,9 @@
 
 The single list. Spec §2's "v1.1 committed" section names six items
 deferred by design; everything else below is named as v1.0 scope in the
-spec (§2, §3, §5, §6, §8, §9) but is not built as of the 2026-08-11
-spec↔implementation audit (`feat/phase7-custom-actions` at `40ea59f`, 752
-tests passing locally). A spec section is a plan, not a shipped-state
+spec (§2, §3, §5, §6, §8, §9) but is not built as of the 2026-08-12
+spec↔implementation audit (`feat/phase8-cutover` at `fc3679e`, 883 tests
+passing locally, 1 ignored). A spec section is a plan, not a shipped-state
 claim — drift between the two is what this file exists to stop hiding.
 Linked from spec §2.
 
@@ -24,8 +24,10 @@ Six deliberate scope cuts, not oversights — spec §2 carries the reasoning:
 
 ## Named as v1.0 in spec §2/§9, not yet built
 
-No phase plan has reached any of these yet — "why" is schedule, not design.
-See `docs/systematic-refactor/refactor-workspace/` for what phase is next.
+Schedule rather than design is what leaves these open. Where a phase has
+landed part of a spec section, the entry names the part still missing rather
+than the whole section. See `docs/systematic-refactor/refactor-workspace/`
+for what phase is next.
 
 **Dogs subsystem** (spec §8) — the whole thing: the dog contract, the
 `enable`/`disable`/`dogs`/`barks` verbs and hidden `dog <name>` dispatch,
@@ -56,22 +58,17 @@ one `[[bin]]`.
 **`set`/`get`/`unset`** (spec §5, the KV store) — no clap variant, no
 file-locked JSON store.
 
-**`import` + migration guide** (spec §2, §9, §13.4) — reads a box's pm2
-state and emits a Flockfile; `docs/migration.md` is its companion. Neither
-exists.
-
-**`startup`/`unstartup`** (spec §9, §11) — the systemd (`Type=notify`)/
-launchd/openrc/rc.d unit generator, pm2's `startup` equivalent. No clap
-variant, no template.
-
-**`save` / `muster`** (spec §9, §13.4) — no `shep save` / `shep muster` /
-hidden `resurrect` verb exists. The mechanism they would sit on top of
-does: the daemon debounce-writes `flock.json` on every lifecycle change
-(`SnapshotWriter`, `crates/shep-daemon/src/snapshot.rs`) and restores from
-it automatically at boot unless `daemon --no-restore` is passed. What's
-missing is the operator-facing verbs to force a save or a restore on
-demand — together with `import`, one of §13.4's flagship "import, muster
-save, reboot" scenario's two missing thirds.
+**openrc and BSD rc.d units** (spec §11) — `shep startup` writes a systemd
+unit (`Type=notify`) on Linux and a `LaunchDaemon` plist on macOS; spec §11
+names four init systems and there is no renderer for the other two.
+`commands::startup::current_init` picks the renderer by compile target only
+(`target_os = "linux"` → systemd, `target_os = "macos"` → launchd), with no
+runtime check for which init system is actually active. A target that is
+neither — a BSD host, principally — is refused before any file is written,
+with a platform-level message naming neither renderer by name. A Linux host
+that runs openrc instead of systemd is not detected at all: `shep startup`
+still writes a systemd unit and tries to enable it, and the failure surfaces
+only when `systemctl` turns out not to exist.
 
 **Windows functional tier** (spec §11) — 0%, not partial. The Windows arm
 of `main.rs::run` prints "shep does not yet support Windows" and exits
@@ -113,3 +110,34 @@ including a real-child, two-round-trip end-to-end case
 (`crates/shep-daemon/tests/daemon_e2e.rs`). App-author-facing contract:
 `docs/shepherd-channel.md`. What §6 promises beyond it — the `channel.*`
 bus topic, above — is separate work and remains open.
+
+**`shep save` / `shep muster`** (the muster pair, spec §9) **shipped**:
+the wire (`Request::SaveRoll`/`Response::RollSaved`,
+`Request::Muster`/`Response::Mustered`), the daemon's one restore
+implementation (`snapshot::muster`, called from both `boot::restore_flock`
+at boot and the `Muster` RPC arm for an operator), and the verbs
+themselves (`shep save`, `shep muster` with hidden alias `resurrect`, per
+spec §14.5). A muster against a flock that already has an app leaves it
+running rather than restarting or duplicating it — `snapshot::restorable`'s
+rule, not stated in the spec itself.
+
+**`shep import`, and the migration guide** (spec §2, §9, §13.4)
+**shipped**: `commands::import` (`dump`, `convert`, `env`, `render`) reads
+`~/.pm2/dump.pm2` — JSON only, not `ecosystem.config.js`/`.yaml` — and
+writes a Flockfile whose every app passes `shep_core::config::normalize`.
+The migration-guide half is `docs/migration.md`.
+
+**`shep startup` / `shep unstartup`** (spec §9, §11) **shipped** for two of
+spec §11's four init systems: `commands::startup` renders a systemd
+`Type=notify` unit or a `launchd` `LaunchDaemon` plist
+(`commands::startup::unit`), installs or removes it privilege-gated by
+`geteuid()`, and `shep daemon --foreground` (`crates/shep-daemon/src/notify.rs`)
+reports `READY=1` once the muster restore has finished so the unit does not
+go green over an empty flock. openrc and BSD rc.d remain open, above.
+
+**CPU and memory in `shep flock`/`shep describe`** (spec §9's observability
+surface) **shipped**: `limits::stats` (`SheepStats`, `StatsState`) samples
+every sheep's process tree on the existing memory-poll tick;
+`ProcessInfo::cpu_percent`/`memory_bytes` carry the reading on the wire,
+populated only by `ListFlock`/`Describe` (`rpc::with_live_stats`); the CLI
+renders them as the `CPU`/`MEM` columns (`FlockRows`, `output::human_bytes`).

@@ -109,6 +109,31 @@ pub fn human_duration(ms: u64) -> String {
     }
 }
 
+/// Formats a byte count for a table cell: the largest binary unit that
+/// leaves at least one significant digit, one decimal place under 10.
+///
+/// Not `MemSize`'s `Display`, which renders the largest unit dividing the
+/// value EXACTLY and so prints a live RSS of 50 462 720 bytes as
+/// "50462720". A resident-set reading is never a round number of MiB.
+#[must_use]
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [(u64, &str); 6] = [
+        (1 << 60, "E"),
+        (1 << 50, "P"),
+        (1 << 40, "T"),
+        (1 << 30, "G"),
+        (1 << 20, "M"),
+        (1 << 10, "K"),
+    ];
+    for (unit, suffix) in UNITS {
+        if bytes >= unit {
+            #[allow(clippy::cast_precision_loss)] // display only, a table cell
+            return format!("{:.1}{suffix}", bytes as f64 / unit as f64);
+        }
+    }
+    format!("{bytes}B")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,7 +235,22 @@ mod tests {
             fold: None,
             out_file: None,
             err_file: None,
+            cpu_percent: None,
+            memory_bytes: None,
         }
+    }
+
+    /// fails if `human_bytes` renders a live RSS as raw digits. `MemSize`'s
+    /// own Display only names a unit that divides the value exactly, and a
+    /// resident set is never an exact number of MiB — so a column built on
+    /// it would show "50462720" where an operator expects "48.1M".
+    #[test]
+    fn bytes_render_with_a_unit_a_reader_can_scan() {
+        assert_eq!(human_bytes(0), "0B");
+        assert_eq!(human_bytes(512), "512B");
+        assert_eq!(human_bytes(50_462_720), "48.1M");
+        assert_eq!(human_bytes(3 << 30), "3.0G");
+        assert_eq!(human_bytes(u64::MAX), "16.0E");
     }
 
     /// "羊" is one character but three bytes in UTF-8. If column width were

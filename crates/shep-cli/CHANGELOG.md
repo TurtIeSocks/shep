@@ -58,9 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each replaced by its own command module as that verb is implemented.
 - Exit code 2 (`Usage`) is clap's own convention for bad arguments and
   collides with the fail-fast code spec §9 reserves for the `runtime`
-  subcommand's own use. `runtime` is out of scope for this phase; whichever
-  task builds it resolves the collision deliberately, rather than
-  discovering it.
+  subcommand's own use. `runtime` does not exist yet; whichever change
+  builds it resolves the collision deliberately, rather than discovering it.
 - Carry `ProcessInfo`'s new `out_file`/`err_file` in every `--json` payload
   built from `FlockRows` (`flock`, `describe`, `fold`, `start`, `stop`,
   `restart`, `reload`, `reopen`). They are `JSON_ONLY` on those verbs, not
@@ -105,8 +104,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hard-codes the same number so `connect_or_spawn` can tell "a losing
   cold-start racer's daemon exited on purpose" apart from every other exit,
   which is what lets both sides of a concurrent `shep start` race exit 0
-  (Task 12's end-to-end tier proves this against two real, genuinely
-  concurrent invocations). Changing either side without the other
+  (`cli_e2e`'s `concurrent_cold_starts_produce_exactly_one_daemon` proves
+  this against two real, genuinely concurrent invocations). Changing either
+  side without the other
   reintroduces the race — `exit.rs`'s own test pins the two constants equal.
 - Render the daemon's own diagnostics. The hidden `daemon` subcommand now
   installs a `tracing-subscriber` on **stderr**, which `launch.rs` already
@@ -236,6 +236,171 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one function in `commands::selector`, landed as its own commit ahead of
   this one so the new verb builds on a single copy instead of adding to the
   pile.
+
+- Add `shep save`, which asks the daemon to write the muster roll now,
+  bypassing the snapshot writer's debounce (`Request::SaveRoll` /
+  `Response::RollSaved`). `save` is pm2's own word, so the muscle memory
+  transfers directly. It takes **no selector**: the roll always records the
+  whole flock, so it is not one of the six verbs `SelectorArgs` gates.
+
+  The reply names the path the daemon wrote and how many apps that roll
+  records, and both ride the table — `FILE`/`APPS`, every field a column,
+  matching `EmptiedFiles`' own reason: a verb that wrote a file and would not
+  say which one has reported nothing. A failed save exits non-zero and names
+  why, rather than the silent no-op the verb exists to rule out.
+
+  Dispatched through `connect_client`, never `connect_or_spawn_client`:
+  saving the roll of a daemon that is not running is not a thing, and
+  autostarting one just to save an empty flock would overwrite a good roll
+  with an empty one.
+
+- Add `shep muster` (hidden alias `resurrect`, pm2's own word), which asks
+  the daemon to assemble the flock from the roll `save` wrote
+  (`Request::Muster` / `Response::Mustered`), rendered the same way `flock`
+  is. Sent with `START_DEADLINE` rather than the client's 5s default, same
+  reasoning as `start`: a muster spawns every app in the roll, and a cold
+  restore of a real flock routinely outruns five seconds. An empty
+  `Mustered` — the roll restored nothing — gets an explicit notice on
+  stderr, so that answer is never a silent exit 0.
+
+  This is the binary's **second** autostart path, after `start`: dispatched
+  through `connect_or_spawn_client` rather than `connect_client`, because
+  bringing a fresh daemon up is the whole point of the verb on a machine
+  that just rebooted. When that autostart itself just spawned the daemon,
+  boot has already restored the roll before this request goes out, so the
+  `Muster` that follows spawns nothing new and simply reports the flock
+  restore produced — `Response::Mustered` always names every sheep of every
+  app the roll restored, not only what this particular call spawned, which
+  is what makes the verb idempotent for an init system that runs it more
+  than once.
+
+- Add `shep import`, which reads a pm2 dump (`--from`, default
+  `~/.pm2/dump.pm2`) and writes it out as a Flockfile (`--out`, default
+  `./Flockfile.toml`) — the last piece of the pm2 cutover path.
+  **Starts nothing**: no client, no daemon round trip, just a file
+  read and a file write. `--dry-run` prints the rendered Flockfile to
+  stdout instead of writing it, with no envelope, so
+  `shep import --dry-run > Flockfile.toml` produces a byte-exact file;
+  without it, an existing output path is left alone unless `--force`.
+
+  A pm2 dump is per-instance — one row per running process — so the
+  conversion collapses same-named rows back into one app each, taking the
+  first row's scalars (script, cwd, interpreter, ...) and the row count as
+  `instances`. **Every clustered app is named on stderr**: shep binds
+  nothing, so N instances on one port is `EADDRINUSE` at start unless the
+  app itself sets `SO_REUSEPORT` (Node's `reusePort: true`, needing Node
+  >= 22.12) — the warning exists so that is discovered at import time, not
+  at the first restart. **Every ambiguous env key is named on stderr and
+  left out of the Flockfile**: a key that is neither declared in an
+  ecosystem file's `env_<name>` block nor recognizable login-shell or pm2
+  session junk is the operator's to decide, never guessed at — an
+  inherited `BUN_INSTALL` or `DATABASE_URL` is exactly the kind of thing a
+  heuristic would eventually get wrong, silently. `NODE_APP_INSTANCE`
+  becomes `increment_var` rather than a copied value, since copying it
+  would pin instance 0's number into every instance.
+
+  The renderer serializes a purpose-built projection of `AppConfig`, not
+  the type itself — `AppConfig` is `#[serde(default)]` across roughly forty
+  fields and would bury the handful that matter under the rest, each
+  written out at its own spec default. Every field this importer can
+  produce is skipped when it already matches that default, and
+  `max_memory`/`restart_delay` render in their string forms (`"512M"`,
+  `"5s"`), never as raw integers a Flockfile parser would reject.
+
+- Add `shep daemon --foreground`, for an init system that runs the shepherd
+  itself rather than letting the CLI autostart one. It reports readiness on
+  `$NOTIFY_SOCKET` once the muster restore has finished, which is what lets a
+  `Type=notify` unit go green when the flock is actually back instead of when
+  the process execs.
+
+  It is a second arrangement, not a second code path. `shep daemon` already
+  runs the supervisor in this process; the flag adds the readiness report and
+  nothing else — no fork, no re-exec, not one step of the boot changed.
+  Everything that makes an autostarted daemon survivable on its own — the new
+  process group, the detached terminal, stderr redirected into
+  `shepd.err.log` — lives in `launch.rs`, on the *parent's* side of a re-exec
+  this arrangement never performs, and systemd does those jobs itself.
+
+  The flag is also the only thing that turns the report on, so a `shep` the
+  CLI autostarts from inside some other notify-type service inherits that
+  service's `$NOTIFY_SOCKET` and stays silent on it. `launch_daemon` passes
+  exactly one argument, `daemon`, and its own test pins that argument vector.
+
+- Add `shep startup` and `shep unstartup`, which install and remove the init
+  unit that brings the shepherd — and the flock it last saved — back after a
+  reboot. On Linux that is a systemd unit at
+  `/etc/systemd/system/shep-<user>.service`, `Type=notify` so the unit goes
+  green once the restore has finished rather than when the process execs; on
+  macOS a `LaunchDaemon` plist at
+  `/Library/LaunchDaemons/io.github.turtiesocks.shep.<user>.plist`. Both
+  carry this binary's resolved path, the target user's `$SHEP_HOME`, and the
+  `PATH` of the invocation that wrote them — the last of those is what makes
+  an interpreter installed under `~/.bun` or `~/.cargo` findable on a machine
+  that has only just booted.
+
+  **shep never escalates.** No `sudo`, no setuid, no privilege helper
+  anywhere on this path. Running as root it writes the unit and enables it;
+  running as anyone else it prints the exact command to run — fully resolved,
+  and quoted, so a `$SHEP_HOME` with a space in it survives the paste — and
+  exits non-zero, so a script notices instead of believing a unit was
+  installed. `unstartup` disables and removes under the same rule, and prints
+  its own command without a `--home`, since a removal is addressed by the
+  unit's path and label alone.
+
+  **Under `sudo` the unit is built for `$SUDO_USER`, never for root.** The
+  invoking user IS root there, so a unit resolved from it would supervise
+  root's flock while the operator's stayed down, and would look correct doing
+  it. The `$SHEP_HOME` follows the same rule and comes from the target user's
+  passwd entry rather than `$HOME`, which `sudo` has already reset to root's:
+  a unit carrying `/root/.shep` boots cleanly and restores nothing, and says
+  so months later or not at all. A `$SHEP_HOME` that does not exist is
+  refused rather than written into a unit, because that is what the same trap
+  produces when nobody catches it.
+
+  One caveat the verb cannot detect: `sudo` on most distributions replaces
+  `PATH` with its own `secure_path` before the command runs, so a unit
+  written by `sudo shep startup` carries that rather than the operator's
+  login `PATH`. `systemctl cat shep-<user>` shows what was actually written.
+
+  **An existing unit is never overwritten.** `shep startup` refuses and names
+  `shep unstartup`. Rewriting the file changes nothing about the service
+  already loaded on either init system, so an overwrite would leave the file
+  and the running unit disagreeing — and an operator who edited theirs in
+  place should be told, not have the edits replaced. `unstartup` then
+  `startup` closes both halves; a `--force` flag would close neither.
+
+  Output is one row per step, in the order the steps were taken: the file
+  written or removed, and each `systemctl`/`launchctl` invocation, with what
+  it answered. A step that fails does not stop the ones after it — a
+  half-installed unit is worse than a fully-attempted one, and the operator
+  needs every row to know which half they are holding — and the command exits
+  non-zero once they have all run. `shep unstartup` on a machine that never
+  ran `startup` reports the unit `absent` and exits 0, matching
+  `shep flush --daemon` on a log file that is not there.
+
+  openrc and the BSD rc.d scripts get no renderer: spec §11 names four init
+  systems and this pair covers two, chosen by compile target rather than by
+  probing which init system is actually running. A target that is neither
+  Linux nor macOS is refused before any file is written, with a
+  platform-level message; a Linux host running openrc still gets a systemd
+  unit, and the mismatch surfaces later, at the `systemctl` step.
+
+- `flock` and `describe` show each sheep's live CPU and memory. `CPU` and
+  `MEM` land between `RESTARTS` and `UPTIME`, where `pm2 ls` puts them and
+  where an operator scanning the table looks; `-` for a sheep with no
+  reading, the same rule `PID` and `FOLD` already follow and for the same
+  reason — an empty cell in a padded table reads as a bug, and `0.0%` would
+  claim something the daemon never measured.
+
+  `MEM` goes through a new `human_bytes`, not `MemSize`'s own `Display`:
+  that impl only names a unit that divides the value exactly, so a live
+  resident set of 50 462 720 bytes would print as the unreadable "50462720"
+  rather than "48.1M". `CPU` gets the same one decimal place — six would be
+  noise on a number this volatile.
+
+  Both fields already rode along in the JSON; this only gives them a
+  column. `shep flush`'s own table is untouched — its CHANGELOG entry
+  already covers why lifecycle and resource fields stay JSON-only there.
 
 ### Fixes
 

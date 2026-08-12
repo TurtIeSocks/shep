@@ -26,7 +26,9 @@ expression: replies
             "uptime_ms": 60000,
             "fold": "backend",
             "out_file": "/home/rin/.shep/logs/web-0-out.log",
-            "err_file": "/home/rin/.shep/logs/web-0-err.log"
+            "err_file": "/home/rin/.shep/logs/web-0-err.log",
+            "cpu_percent": 12.5,
+            "memory_bytes": 50331648
           }
         ]
       }
@@ -56,6 +58,18 @@ expression: replies
             }
           }
         ]
+      }
+    }
+  },
+  {
+    "id": 5,
+    "result": {
+      "Ok": {
+        "kind": "roll_saved",
+        "data": {
+          "path": "/home/rin/.shep/flock.json",
+          "apps": 2
+        }
       }
     }
   }

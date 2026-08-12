@@ -18,8 +18,8 @@ use std::sync::{Mutex, PoisonError};
 
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
-/// One process's resident-set reading, with the parent link that lets a caller
-/// rebuild the tree.
+/// One process's resident-set and CPU-time reading, with the parent link that
+/// lets a caller rebuild the tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessRss {
     /// The process's own pid.
@@ -28,6 +28,14 @@ pub struct ProcessRss {
     pub parent: Option<u32>,
     /// Resident set size in bytes.
     pub bytes: u64,
+    /// Accumulated CPU time in CPU-milliseconds, as the OS reports it.
+    ///
+    /// Cumulative since the process started, not a rate: a percentage is a
+    /// delta between two readings divided by the wall time between them.
+    /// Bigger than the process's wall-clock lifetime on a multi-core
+    /// machine, which is why a percentage over 100 is honest rather than a
+    /// bug.
+    pub cpu_ms: u64,
 }
 
 /// Reads the machine's process table.
@@ -89,10 +97,26 @@ impl MemorySampler for SysinfoSampler {
         // only what this sampler has seen before could never discover a lamb
         // the sheep forked since the last poll, which is precisely the
         // process the tree sum exists to catch.
+        //
+        // `.with_cpu()` is load-bearing and fails SILENTLY without it:
+        // sysinfo populates `accumulated_cpu_time` only inside a
+        // `refresh_kind.cpu()` branch, on every platform, so a
+        // memory-only refresh leaves the counter at its `0` initial value
+        // and every percentage derived from it reads a plausible, wrong
+        // `0.0`. It costs nothing extra here — the macOS backend reads both
+        // out of the same `proc_pidinfo` call, and the Linux one out of the
+        // same `/proc/<pid>/stat` line.
+        //
+        // `MINIMUM_CPU_UPDATE_INTERVAL` and the wait-then-refresh-twice
+        // dance sysinfo documents do NOT apply: they govern `cpu_usage()`,
+        // which is a rate sysinfo computes between two of its own refreshes.
+        // `accumulated_cpu_time` is a counter and is correct on the first
+        // read; the rate over it is `stats`' baseline subtraction, not
+        // sysinfo's.
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing().with_memory(),
+            ProcessRefreshKind::nothing().with_memory().with_cpu(),
         );
         system
             .processes()
@@ -101,13 +125,14 @@ impl MemorySampler for SysinfoSampler {
                 pid: process.pid().as_u32(),
                 parent: process.parent().map(sysinfo::Pid::as_u32),
                 bytes: process.memory(),
+                cpu_ms: process.accumulated_cpu_time(),
             })
             .collect()
     }
 }
 
-/// Shared index over one sampled `table`: a byte total and a child list per
-/// pid, built once and then walked as many times as needed.
+/// Shared index over one sampled `table`: a byte total, a CPU-time total and
+/// a child list per pid, built once and then walked as many times as needed.
 ///
 /// [`tree_rss`] builds one of these and walks it exactly once — the right
 /// shape for a one-off sum. Summing *several* roots out of the same table
@@ -120,11 +145,13 @@ impl MemorySampler for SysinfoSampler {
 #[derive(Debug)]
 pub(crate) struct TreeIndex {
     bytes_by_pid: HashMap<u32, u64>,
+    cpu_by_pid: HashMap<u32, u64>,
     children_of: HashMap<u32, Vec<u32>>,
 }
 
 impl TreeIndex {
-    /// Indexes `table`: a byte total and a child list per pid.
+    /// Indexes `table`: a byte total, a CPU-time total and a child list per
+    /// pid.
     pub(crate) fn build(table: &[ProcessRss]) -> Self {
         // Indexed once so `sum_from`'s cycle-safe walk never rescans `table`
         // per node — the whole-machine table this feeds from can run to
@@ -132,15 +159,18 @@ impl TreeIndex {
         // polling enforcer, one root per armed id) builds this once and
         // reuses it, rather than paying this scan again per root.
         let mut bytes_by_pid: HashMap<u32, u64> = HashMap::with_capacity(table.len());
+        let mut cpu_by_pid: HashMap<u32, u64> = HashMap::with_capacity(table.len());
         let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
         for entry in table {
             bytes_by_pid.insert(entry.pid, entry.bytes);
+            cpu_by_pid.insert(entry.pid, entry.cpu_ms);
             if let Some(parent) = entry.parent {
                 children_of.entry(parent).or_default().push(entry.pid);
             }
         }
         Self {
             bytes_by_pid,
+            cpu_by_pid,
             children_of,
         }
     }
@@ -152,6 +182,23 @@ impl TreeIndex {
     /// parent links (which the kernel does not produce but a fixture can)
     /// terminates rather than recursing forever.
     pub(crate) fn sum_from(&self, root: u32) -> u64 {
+        self.total_over(root, &self.bytes_by_pid)
+    }
+
+    /// Sums accumulated CPU time over `root` and every descendant, exactly
+    /// as [`Self::sum_from`] sums resident memory — a clustered app's row in
+    /// `shep flock` reports the whole tree it really costs the machine, not
+    /// the bookkeeping its root pid does.
+    pub(crate) fn cpu_from(&self, root: u32) -> u64 {
+        self.total_over(root, &self.cpu_by_pid)
+    }
+
+    /// Sums `totals` over `root` and every descendant this index knows about.
+    ///
+    /// One walk shared by both per-pid quantities: the tree does not change
+    /// between them, and two hand-written copies of a cycle-safe traversal
+    /// are two places for a fix to land in only one of.
+    fn total_over(&self, root: u32, totals: &HashMap<u32, u64>) -> u64 {
         // A pid is summed the first time it is popped, never again — this is
         // what turns a self-parenting pid or a parent-link cycle (neither of
         // which the kernel produces, but a fixture can) into a terminating
@@ -164,7 +211,7 @@ impl TreeIndex {
             if !visited.insert(pid) {
                 continue;
             }
-            sum = sum.saturating_add(self.bytes_by_pid.get(&pid).copied().unwrap_or(0));
+            sum = sum.saturating_add(totals.get(&pid).copied().unwrap_or(0));
             if let Some(children) = self.children_of.get(&pid) {
                 stack.extend(children.iter().copied());
             }
@@ -191,8 +238,21 @@ pub fn tree_rss(table: &[ProcessRss], root: u32) -> u64 {
 mod tests {
     use super::*;
 
+    /// A reading with no CPU time on it, for the memory cases: every one of
+    /// them predates `cpu_ms` and stays byte-for-byte what it was, so a
+    /// regression in one of them still means what it used to mean.
     fn rss(pid: u32, parent: Option<u32>, bytes: u64) -> ProcessRss {
-        ProcessRss { pid, parent, bytes }
+        rss_cpu(pid, parent, bytes, 0)
+    }
+
+    /// A reading carrying both quantities, for the CPU cases.
+    fn rss_cpu(pid: u32, parent: Option<u32>, bytes: u64, cpu_ms: u64) -> ProcessRss {
+        ProcessRss {
+            pid,
+            parent,
+            bytes,
+            cpu_ms,
+        }
     }
 
     // fails if tree_rss omits the root's own reading — e.g. an
@@ -242,6 +302,24 @@ mod tests {
         assert_eq!(tree_rss(&table, 999), 0);
     }
 
+    // fails if `cpu_from` sums only descendants, or double-counts a pid
+    // reachable by two paths — the same two mutations `tree_rss`'s own cases
+    // pin for memory, which cannot see a CPU-side regression. The memory
+    // assertion rides along so a `cpu_from` that summed the wrong map, or a
+    // `build` that filled one map from the other's field, cannot pass.
+    #[test]
+    fn cpu_sums_the_whole_tree_including_the_root() {
+        let table = [
+            rss_cpu(100, None, 1024, 500),
+            rss_cpu(101, Some(100), 2048, 250),
+            rss_cpu(102, Some(101), 4096, 125),
+        ];
+        let index = TreeIndex::build(&table);
+        assert_eq!(index.cpu_from(100), 875);
+        assert_eq!(index.cpu_from(101), 375);
+        assert_eq!(index.sum_from(100), 7168, "memory must be unaffected");
+    }
+
     // fails if a naive walk with no visited-set follows a self-parenting pid
     // forever; the assertion is on the returned sum (counted exactly once),
     // not merely on the call completing at all
@@ -288,6 +366,20 @@ mod tests {
             .find(|p| p.pid == pid)
             .unwrap_or_else(|| panic!("own pid {pid} not found in sampled process table"));
         assert!(reading.bytes > 0, "own RSS reading was zero");
+
+        // The one assertion that catches a refresh missing `.with_cpu()`,
+        // which is the failure mode this whole field has: sysinfo populates
+        // `accumulated_cpu_time` only under a CPU refresh and otherwise
+        // leaves it at `0`, so every derived percentage reads a plausible,
+        // wrong `0.0` rather than erroring. Whole-table rather than own-pid
+        // alone: a freshly-started test binary can honestly round to zero
+        // CPU-milliseconds, while a host with hundreds of processes on it
+        // cannot have every one of them at zero.
+        assert!(
+            table.iter().any(|p| p.cpu_ms > 0),
+            "no entry in the table carried any accumulated CPU time; \
+             the refresh is missing `.with_cpu()`"
+        );
 
         // Guards the parent-pid decision itself (see limits/mod.rs's
         // deviation note): a sampler that hardcoded `parent: None`, or that

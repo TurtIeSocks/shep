@@ -12,9 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
-Phase 3 built this crate's whole public surface without a CHANGELOG entry;
-this is that entry, written retrospectively once the surface was proven
-end-to-end (shep-cli's `tests/cli_e2e.rs`) rather than piecemeal per task.
+This crate's whole public surface shipped without a CHANGELOG entry at the
+time; this is that entry, written retrospectively once the surface was
+proven end-to-end (shep-cli's `tests/cli_e2e.rs`) rather than piecemeal per
+change.
 Everything below is a stability surface as of this release — a breaking
 change to any of it is a `[Unreleased]` entry of its own, not a silent diff.
 

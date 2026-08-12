@@ -861,7 +861,15 @@ fn sheep_named<'a>(data: &'a serde_json::Value, name: &str) -> &'a serde_json::V
 /// differs on every run — the fixture would have to be rewritten by every
 /// test invocation to stay byte-exact. Blanking them is not a licence to
 /// skip checking them: each is asserted against its own real shape first.
-fn normalize_process_info(info: &mut serde_json::Value, home: &Path, name: &str) {
+///
+/// `samples` says whether the verb this envelope answers takes a live
+/// resource reading — `flock` and `describe` do, every other verb answers
+/// with the numbers the actor holds, which are none. It is the whole reason
+/// this helper takes the argument: `memory_bytes` is a real reading off the
+/// host and cannot be pinned either, but WHETHER it is there is exactly the
+/// asymmetry worth asserting, and this is the only tier with a real sheep
+/// and a real sampler to assert it against.
+fn normalize_process_info(info: &mut serde_json::Value, home: &Path, name: &str, samples: Samples) {
     let pid = info["pid"]
         .as_i64()
         .unwrap_or_else(|| panic!("pid must be a real positive OS pid: {info}"));
@@ -883,17 +891,53 @@ fn normalize_process_info(info: &mut serde_json::Value, home: &Path, name: &str)
             "{key} must name this sheep's own log file: {path}"
         );
     }
+    match samples {
+        Samples::Live => {
+            let bytes = info["memory_bytes"].as_u64().unwrap_or_else(|| {
+                panic!("memory_bytes must be a live reading off the host: {info}")
+            });
+            assert!(
+                bytes > 0,
+                "a running sheep's tree cannot be 0 bytes: {info}"
+            );
+        }
+        Samples::None => assert!(
+            info["memory_bytes"].is_null(),
+            "a verb that takes no live sample must report no memory: {info}"
+        ),
+    }
+    // `cpu_percent` is not asserted either way. It needs a periodic baseline
+    // to measure against, and whether one has been recorded depends on
+    // whether the daemon happened to live through a poll interval before
+    // this line ran — a real condition, but a clock race to assert on.
     info["pid"] = serde_json::Value::Null;
     info["uptime_ms"] = serde_json::Value::Null;
     info["out_file"] = serde_json::Value::Null;
     info["err_file"] = serde_json::Value::Null;
+    info["cpu_percent"] = serde_json::Value::Null;
+    info["memory_bytes"] = serde_json::Value::Null;
+}
+
+/// Whether the verb an envelope answers takes a live resource reading.
+#[derive(Debug, Clone, Copy)]
+enum Samples {
+    /// `flock` and `describe`, which sample the host as they reply.
+    Live,
+    /// Every other verb answering with a `ProcessInfo`.
+    None,
 }
 
 /// Parses `output.stdout` as a `flock`/`describe`/`start` envelope,
 /// normalizes its one `data[]` element (this whole file only ever starts
 /// one sheep per `$SHEP_HOME` in these cases), and compares the result
 /// against the committed fixture named `command`.
-fn assert_envelope_matches_fixture(output: &Output, home: &Path, command: &str, sheep_name: &str) {
+fn assert_envelope_matches_fixture(
+    output: &Output,
+    home: &Path,
+    command: &str,
+    sheep_name: &str,
+    samples: Samples,
+) {
     let mut envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
             panic!(
@@ -907,7 +951,7 @@ fn assert_envelope_matches_fixture(output: &Output, home: &Path, command: &str, 
             .unwrap_or_else(|| panic!("{command}: data must be an array"));
         assert_eq!(data.len(), 1, "{command}: exactly one sheep is expected");
     }
-    normalize_process_info(&mut envelope["data"][0], home, sheep_name);
+    normalize_process_info(&mut envelope["data"][0], home, sheep_name, samples);
     assert_eq!(
         envelope,
         load_fixture(command),
@@ -1191,7 +1235,7 @@ fn json_format_matches_the_committed_fixtures() {
         .unwrap();
     guard.adopt_home(home);
     assert_success(&start_out);
-    assert_envelope_matches_fixture(&start_out, home, "start", "fixture");
+    assert_envelope_matches_fixture(&start_out, home, "start", "fixture", Samples::None);
 
     let flock_out = shep(home)
         .arg("--format")
@@ -1200,7 +1244,7 @@ fn json_format_matches_the_committed_fixtures() {
         .output()
         .unwrap();
     assert_success(&flock_out);
-    assert_envelope_matches_fixture(&flock_out, home, "flock", "fixture");
+    assert_envelope_matches_fixture(&flock_out, home, "flock", "fixture", Samples::Live);
 
     let describe_out = shep(home)
         .arg("--format")
@@ -1210,7 +1254,7 @@ fn json_format_matches_the_committed_fixtures() {
         .output()
         .unwrap();
     assert_success(&describe_out);
-    assert_envelope_matches_fixture(&describe_out, home, "describe", "fixture");
+    assert_envelope_matches_fixture(&describe_out, home, "describe", "fixture", Samples::Live);
 
     let ping_out = shep(home)
         .arg("--format")
@@ -2902,4 +2946,177 @@ fn trigger_reaches_the_trigger_verb_and_names_the_missing_channel() {
     );
 
     graceful_kill(dir.path());
+}
+
+// --- Save / Muster ---------------------------------------------------------
+
+/// `shep save` writes the muster roll and `shep muster` reads it back — the
+/// §13.4 flagship "import, muster, save, reboot" shape, minus the reboot: a
+/// muster against the same still-live daemon that just saved exercises the
+/// already-running idempotence rule (`snapshot::restorable`) for real, since
+/// nothing here ever goes down in between.
+///
+/// Both dispatch arms carried no coverage beyond a clap-parsing pin
+/// (`save_parses_to_its_own_command`/`muster_parses_to_its_own_command`,
+/// `main.rs`) until this case: a dispatch arm in `run`'s `match` that calls
+/// the wrong verb's function still compiles and still passes every
+/// clap-parsing test, because nothing below the parse layer ever calls the
+/// verb it parsed to. This case closes that gap for both verbs — confirmed
+/// by rewiring `Commands::Save`/`Commands::Muster` to each other's function
+/// in turn and watching this case redden each time.
+///
+/// What a broken implementation this would catch, beyond the dispatch
+/// misroute above: a `save` that reports the wrong app count (`data.apps`
+/// pins it at 1); a `muster` that reports `Started`'s shape instead of
+/// `Mustered`'s, or that starts a *second* instance of `roundtrip` rather
+/// than recognising the one already running (`flock.len()` pins exactly
+/// one, `pid` pins it as the SAME process `start` reported, not a fresh
+/// one) — the exact failure decision 3/4 exist to rule out, since a
+/// duplicate or a restarted sheep here would silently double a real flock
+/// on every reboot.
+#[test]
+fn saving_the_roll_then_mustering_reports_the_same_flock() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("roundtrip")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&started);
+    let start_envelope: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert_eq!(
+        start_envelope["data"][0]["status"], "online",
+        "{start_envelope}"
+    );
+    let original_pid = start_envelope["data"][0]["pid"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("pid must be a real positive OS pid: {start_envelope}"));
+
+    let saved = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("save")
+        .output()
+        .unwrap();
+    assert_success(&saved);
+    let save_envelope: serde_json::Value = serde_json::from_slice(&saved.stdout).unwrap();
+    assert_eq!(
+        save_envelope["command"], "save",
+        "`shep save` must reach the save verb and no other: {save_envelope}"
+    );
+    assert_eq!(
+        save_envelope["data"]["apps"], 1,
+        "the roll must record the one app started above: {save_envelope}"
+    );
+
+    let mustered = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("muster")
+        .output()
+        .unwrap();
+    assert_success(&mustered);
+    let muster_envelope: serde_json::Value = serde_json::from_slice(&mustered.stdout).unwrap();
+    assert_eq!(
+        muster_envelope["command"], "muster",
+        "`shep muster` must reach the muster verb and no other: {muster_envelope}"
+    );
+    let flock = muster_envelope["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("muster data must be an array: {muster_envelope}"));
+    assert_eq!(
+        flock.len(),
+        1,
+        "muster against a daemon already running the flock the roll \
+         describes must not spawn a duplicate: {muster_envelope}"
+    );
+    assert_eq!(flock[0]["name"], "roundtrip", "{muster_envelope}");
+    assert_eq!(
+        flock[0]["pid"].as_i64().unwrap(),
+        original_pid,
+        "muster must leave an already-running sheep alone and report the \
+         SAME process, never restart it: {muster_envelope}"
+    );
+
+    graceful_kill(home);
+}
+
+// --- Import -----------------------------------------------------------
+
+/// `shep import` reads a pm2 dump and writes a Flockfile shep can read
+/// back, without ever touching a daemon.
+///
+/// The envelope's `command` is asserted for the same reason
+/// `saving_the_roll_then_mustering_reports_the_same_flock` asserts it on
+/// `save`/`muster`: `run`'s dispatch arms carry no unit coverage of their
+/// own, and an arm reaching the wrong function (or handing it the wrong
+/// args) would still exit 0 here without this. The written file is checked
+/// against the REAL parser (`shep_core::config::Flockfile::parse`), not
+/// merely "the process exited 0" — a Flockfile shep itself refuses to read
+/// back is not an import. That no socket ever appears is the other half:
+/// `import` takes no `Client` and starts nothing, and a dispatch arm that
+/// somehow reached `connect_or_spawn_client` first would autostart a
+/// daemon this verb never needs.
+///
+/// What a broken implementation this would catch: the dispatch misroute
+/// above; a source resolution that ignores `--from` and reads the real
+/// `~/.pm2/dump.pm2` instead; an `--out` silently ignored in favour of the
+/// default `./Flockfile.toml`; and a renderer whose output this crate's own
+/// `Flockfile::parse` refuses.
+#[test]
+fn import_writes_a_flockfile_shep_can_read_back_and_starts_no_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let out = home.join("Flockfile.toml");
+    let dump = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/commands/import/testdata/dump.pm2.json"
+    );
+    let mut guard = DaemonGuard::default();
+
+    let output = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("import")
+        .arg("--from")
+        .arg(dump)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&output);
+
+    assert!(
+        !home.join("run/shep.sock").exists(),
+        "`shep import` reads a file and writes a file; it must never \
+         autostart a daemon"
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["command"], "import",
+        "`shep import` must reach the import verb and no other: {envelope}"
+    );
+    let rows = envelope["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("import data must be an array: {envelope}"));
+    assert_eq!(rows.len(), 3, "{envelope}");
+
+    let written = std::fs::read_to_string(&out).unwrap();
+    let parsed =
+        shep_core::config::Flockfile::parse(&written, shep_core::config::FlockFormat::Toml)
+            .unwrap_or_else(|e| {
+                panic!("shep import wrote a Flockfile shep cannot read back: {e}\n{written}")
+            });
+    assert_eq!(parsed.apps.len(), 3, "{written}");
 }

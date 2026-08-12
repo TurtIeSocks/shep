@@ -88,6 +88,8 @@ pub fn sample_info() -> ProcessInfo {
         fold: Some("backend".to_string()),
         out_file: Some("/home/rin/.shep/logs/web-0-out.log".to_string()),
         err_file: Some("/home/rin/.shep/logs/web-0-err.log".to_string()),
+        cpu_percent: Some(12.5),
+        memory_bytes: Some(48 * 1024 * 1024),
     }
 }
 

@@ -2,10 +2,9 @@
 //! daemon launch/re-exec path. Module-by-module design:
 //! `docs/systematic-refactor/refactor-workspace/map.md`.
 //!
-//! A ratatui dashboard (`lookout`), a static file server (`serve`),
-//! startup-script generation (`startup`/`unstartup`), and the container
-//! (`shep runtime`) and dev (`shep dev`) execution modes are spec'd
-//! (`docs/specs/shep-v1.md` §9) but not built — this crate depends on
+//! A ratatui dashboard (`lookout`), a static file server (`serve`), and the
+//! container (`shep runtime`) and dev (`shep dev`) execution modes are
+//! spec'd (`docs/specs/shep-v1.md` §9) but not built — this crate depends on
 //! neither `ratatui`, `axum` nor `tower-http`, and there is no `[[bin]]`
 //! beyond `shep` itself. Recorded here as deliberately absent rather than
 //! letting them quietly read as shipped; full inventory:
@@ -36,11 +35,17 @@ use commands::bleats;
 #[cfg(unix)]
 use commands::daemon::{daemon_exit_code, run_daemon};
 #[cfg(unix)]
+use commands::import;
+#[cfg(unix)]
 use commands::lifecycle;
 #[cfg(unix)]
 use commands::logs;
 #[cfg(unix)]
+use commands::muster;
+#[cfg(unix)]
 use commands::query;
+#[cfg(unix)]
+use commands::startup;
 #[cfg(unix)]
 use commands::trigger;
 use exit::ExitCode;
@@ -101,12 +106,16 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
 /// to the verb's own module.
 ///
 /// Every command receives an already-connected client; no verb module
-/// itself connects or autostarts. `Start` is the one exception at this
-/// layer: [`connect_or_spawn_client`] autostarts a daemon if nothing
-/// answers, and is the *only* autostart path in the binary. Every other
-/// client-taking arm goes through [`connect_client`], which never spawns —
-/// `shep stop` against a dead daemon must not launch a supervisor in order
-/// to tell it to stop nothing.
+/// itself connects or autostarts. `Start` and `Muster` are the two
+/// exceptions at this layer: both dispatch through
+/// [`connect_or_spawn_client`], which autostarts a daemon if nothing
+/// answers — for `Start` because starting a sheep against a dead daemon
+/// means bringing one up first, and for `Muster` because that is the whole
+/// point of the verb: assembling the flock from the saved roll has to work
+/// against a freshly booted machine, where nothing is listening yet. Every
+/// other client-taking arm goes through [`connect_client`], which never
+/// spawns — `shep stop` against a dead daemon must not launch a supervisor
+/// in order to tell it to stop nothing.
 ///
 /// `resolve_paths` runs only for the arms that actually touch the socket.
 /// `Completions` and `Daemon` never do — shell completion generation is
@@ -115,6 +124,12 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
 /// re-exec'd `daemon` subcommand resolves its own paths independently, in
 /// [`run_daemon_command`], rather than through this shared gate. Requiring
 /// a resolvable home for either was a bug, not a deliberate restriction.
+///
+/// `Startup` and `Unstartup` are dispatched from the same early block, for
+/// a different reason: they resolve their own `$SHEP_HOME` from the TARGET
+/// user's passwd entry rather than from this process's environment, so the
+/// shared gate would both impose a requirement they do not have and hand
+/// them the wrong answer under `sudo`, which resets `$HOME` to root's.
 #[cfg(unix)]
 async fn run(cli: Cli) -> ExitCode {
     let fmt = cli.global.format;
@@ -159,6 +174,24 @@ async fn run(cli: Cli) -> ExitCode {
             return completions::completions(&mut out, args);
         }
         Commands::Daemon(ref args) => return run_daemon_command(fmt, &cli.global, args).await,
+        Commands::Startup(ref args) => {
+            let mut out = std::io::stdout().lock();
+            let mut err = std::io::stderr().lock();
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            return startup::startup(&mut streams, fmt, cli.global.home.as_deref(), args);
+        }
+        Commands::Unstartup(ref args) => {
+            let mut out = std::io::stdout().lock();
+            let mut err = std::io::stderr().lock();
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            return startup::unstartup(&mut streams, fmt, args);
+        }
         _ => {}
     }
 
@@ -239,6 +272,18 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => query::ping(&client, &mut streams, fmt).await,
             Err(code) => code,
         },
+        // `connect_client`, not `connect_or_spawn_client`: saving the roll
+        // of a daemon that is not running is not a thing, and autostarting
+        // one to save an empty flock would overwrite a good roll with an
+        // empty one.
+        Commands::Save => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => muster::save(&client, &mut streams, fmt).await,
+            Err(code) => code,
+        },
+        Commands::Muster => match connect_or_spawn_client(&mut streams, fmt, &paths).await {
+            Ok(client) => muster::muster(&client, &mut streams, fmt).await,
+            Err(code) => code,
+        },
         Commands::Reopen(ref args) => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => logs::reopen(&client, &mut streams, fmt, args).await,
             Err(code) => code,
@@ -259,8 +304,16 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => admin::kill(client, &mut streams, fmt).await,
             Err(code) => code,
         },
-        Commands::Completions(_) | Commands::Daemon(_) | Commands::Bleats(_) => {
-            unreachable!("handled above, on unlocked handles")
+        // Reads a file and writes a file; starts nothing, so there is
+        // nothing to ask the socket. `logs::flush_daemon` is the other arm
+        // that finishes without a client.
+        Commands::Import(ref args) => import::import(&mut streams, fmt, args),
+        Commands::Completions(_)
+        | Commands::Daemon(_)
+        | Commands::Startup(_)
+        | Commands::Unstartup(_)
+        | Commands::Bleats(_) => {
+            unreachable!("handled above: before the shared $SHEP_HOME gate, or on unlocked handles")
         }
     }
 }
@@ -288,8 +341,9 @@ fn emit_error_locked(fmt: Format, code: ExitCode, message: &str) {
 }
 
 /// Connects to the daemon at `paths.socket`, autostarting one via
-/// [`launch_daemon`] if nothing answers. The only autostart in the binary —
-/// see [`run`]'s own doc.
+/// [`launch_daemon`] if nothing answers. `Start` and `Muster` are the two
+/// arms that dispatch through this rather than [`connect_client`] — see
+/// [`run`]'s own doc.
 ///
 /// Not unit-tested here: its coverage is `shep_client::spawn::connect_or_spawn`'s
 /// own suite plus the real-binary end-to-end tier. What would need testing
@@ -408,6 +462,154 @@ async fn run(cli: Cli) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fails if `Commands::Save` is wired to another verb's function. The
+    /// dispatch arms carried no unit coverage at all until recently, and a
+    /// verb pointed at the wrong handler was invisible workspace-wide.
+    ///
+    /// `Commands` is imported locally rather than via `super::*`: the
+    /// top-level `use cli::Commands` (main.rs:31) is `#[cfg(unix)]`-gated
+    /// alongside every verb module, but this test — like every other one in
+    /// this file — must still compile on the Windows target, where that
+    /// import does not exist.
+    #[test]
+    fn save_parses_to_its_own_command() {
+        use clap::Parser;
+        use cli::Commands;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "save"]).unwrap().command,
+            Commands::Save
+        ));
+    }
+
+    /// fails if `Commands::Muster` is wired to another verb's function —
+    /// the same gap `save_parses_to_its_own_command` closes for `save`.
+    #[test]
+    fn muster_parses_to_its_own_command() {
+        use clap::Parser;
+        use cli::Commands;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "muster"]).unwrap().command,
+            Commands::Muster
+        ));
+    }
+
+    /// fails if `Commands::Import` is wired to another verb's function — the
+    /// same gap `save_parses_to_its_own_command` closes for `save`. This
+    /// pins clap's own parse only; it cannot see a dispatch arm in `run`
+    /// that parses correctly and then calls the wrong function — that class
+    /// of bug needs a real invocation of the compiled binary, which is what
+    /// `cli_e2e.rs`'s own import case (asserting the envelope's `command`
+    /// field, the way `saving_the_roll_then_mustering_reports_the_same_flock`
+    /// already does for `save`/`muster`) is for.
+    #[test]
+    fn import_parses_to_its_own_command() {
+        use clap::Parser;
+        use cli::Commands;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "import"]).unwrap().command,
+            Commands::Import(_)
+        ));
+    }
+
+    /// fails if `Commands::Startup` or `Commands::Unstartup` is wired to
+    /// another verb's function — the same gap
+    /// `save_parses_to_its_own_command` closes for `save`. This pins clap's
+    /// parse only; the dispatch arms themselves are covered by
+    /// `startup_and_unstartup_reach_their_own_verbs` below.
+    #[test]
+    fn startup_and_unstartup_parse_to_their_own_commands() {
+        use clap::Parser;
+        use cli::Commands;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "startup"]).unwrap().command,
+            Commands::Startup(_)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "unstartup"]).unwrap().command,
+            Commands::Unstartup(_)
+        ));
+        let named = Cli::try_parse_from(["shep", "startup", "--user", "deploy"])
+            .unwrap()
+            .command;
+        let Commands::Startup(args) = named else {
+            panic!("expected startup")
+        };
+        assert_eq!(args.user.as_deref(), Some("deploy"));
+    }
+
+    /// fails if either verb's dispatch arm calls the other's function, or is
+    /// moved below the shared `$SHEP_HOME` gate.
+    ///
+    /// The two verbs are told apart by what they do with `--home`, which is
+    /// the one observable difference that does not depend on the machine
+    /// this runs on: `startup` refuses a `$SHEP_HOME` that is not there
+    /// (`Usage`, the sudo-trap gate), and `unstartup` ignores `--home`
+    /// entirely, because a removal is addressed by the unit's path and label
+    /// alone. So a `Startup` arm calling `unstartup` stops returning
+    /// `Usage`, and an `Unstartup` arm calling `startup` starts returning
+    /// it. Routing either through the main dispatch below without adding it
+    /// there hits that block's `unreachable!` instead.
+    ///
+    /// What it cannot catch, honestly: with `$HOME` set — true of ordinary
+    /// dev machines and most CI — `resolve_paths` would succeed if these
+    /// arms were moved behind it, and both verbs would then reach the same
+    /// functions and return the same codes. That is
+    /// `completions_never_resolves_paths`'s own caveat, for the same reason
+    /// (mutating the environment is `unsafe` in edition 2024 and this crate
+    /// is `#![forbid(unsafe_code)]`); the gate matters under `sudo`, where
+    /// `$HOME` is root's rather than absent, and only the real binary can
+    /// be run that way.
+    ///
+    /// Skipped as root: `unstartup` would reach a real `systemctl`/
+    /// `launchctl` against whatever this machine actually has installed, and
+    /// no test in this crate may.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn startup_and_unstartup_reach_their_own_verbs() {
+        use clap::Parser;
+
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipping: as root these verbs really install and remove a system unit");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-created");
+        let missing = missing.to_str().unwrap();
+
+        let cli = Cli::try_parse_from(["shep", "--home", missing, "startup"]).unwrap();
+        assert_eq!(
+            run(cli).await,
+            ExitCode::Usage,
+            "startup must refuse a $SHEP_HOME that is not there"
+        );
+
+        let cli = Cli::try_parse_from(["shep", "--home", missing, "unstartup"]).unwrap();
+        assert_ne!(
+            run(cli).await,
+            ExitCode::Usage,
+            "unstartup removes a unit and never reads the home a --home names"
+        );
+    }
+
+    /// fails if `resurrect` stops reaching `muster`, or starts showing up in
+    /// `--help`. It exists for a pm2 muscle-memory invocation, not to be
+    /// taught.
+    #[test]
+    fn resurrect_is_a_hidden_alias_for_muster() {
+        use clap::{CommandFactory, Parser};
+        use cli::Commands;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "resurrect"]).unwrap().command,
+            Commands::Muster
+        ));
+        let cmd = Cli::command();
+        let muster = cmd.find_subcommand("muster").unwrap();
+        assert!(
+            muster.get_visible_aliases().next().is_none(),
+            "resurrect must stay out of --help"
+        );
+    }
 
     /// A `--home` that never reached `ShepPaths` is invisible from the
     /// outside until a daemon binds the wrong socket well after the fact.

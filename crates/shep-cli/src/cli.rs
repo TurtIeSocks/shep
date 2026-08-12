@@ -116,6 +116,47 @@ pub enum Commands {
     Ping,
     /// Shut the shepherd down.
     Kill,
+    /// Write the muster roll now, so a reboot can bring this flock back.
+    Save,
+    /// Assemble the flock from the muster roll `save` wrote, starting the
+    /// shepherd first if none is running.
+    // Hidden alias `resurrect` (pm2's own word for this), so the muscle
+    // memory carries over: `alias`, not `visible_aliases`, so it stays out
+    // of `--help` rather than being taught by it. A plain `//` comment
+    // rather than `///` on purpose — the paragraph above already becomes
+    // this subcommand's own `--help` text, and naming the alias there would
+    // defeat the point of keeping it hidden.
+    #[command(alias = "resurrect")]
+    Muster,
+    /// Write a Flockfile from a pm2 dump. Starts nothing.
+    ///
+    /// Reads `--from`, or `~/.pm2/dump.pm2` if it names nothing — whichever
+    /// `pm2 save` last wrote. Every clustered app is named on stderr: shep
+    /// binds nothing, so N instances on one port need the app to set
+    /// `SO_REUSEPORT` itself, or the second instance hits EADDRINUSE at
+    /// start. Every env key the dump carried that was neither declared nor
+    /// recognizable session junk is named on stderr too, and left out of
+    /// the Flockfile, for the operator to decide.
+    Import(ImportArgs),
+    /// Install an init unit so the shepherd starts at boot.
+    ///
+    /// Writes a systemd unit (Linux) or a launchd plist (macOS) for the
+    /// target user, carrying this binary's own path, that user's
+    /// $SHEP_HOME, and the PATH of this invocation — which is what makes an
+    /// interpreter installed under ~/.bun or ~/.cargo findable after a
+    /// reboot.
+    ///
+    /// Needs root, and never asks for it: without it this prints the exact
+    /// command to run and exits non-zero, so a script notices. Under sudo
+    /// the unit is built for $SUDO_USER rather than root, so it supervises
+    /// the flock the operator actually has.
+    Startup(StartupArgs),
+    /// Disable and remove the unit `startup` installed.
+    ///
+    /// Needs root under the same rule: without it, prints the command to
+    /// run and exits non-zero. A unit that is not there is reported absent
+    /// rather than failing.
+    Unstartup(StartupArgs),
     /// Print a shell completion script.
     ///
     /// Static only: sheep names, fold names and other daemon-side
@@ -263,6 +304,36 @@ pub struct ReopenArgs {
     pub selector: String,
 }
 
+/// Arguments to `shep import`.
+#[derive(Debug, clap::Args)]
+pub struct ImportArgs {
+    /// Read this pm2 dump instead of `~/.pm2/dump.pm2`
+    #[arg(long)]
+    pub from: Option<PathBuf>,
+    /// Write the Flockfile here instead of `./Flockfile.toml`
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+    /// Print the Flockfile that would be written, and write nothing
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Overwrite an existing Flockfile
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// Arguments shared by `shep startup` and `shep unstartup`.
+///
+/// One struct for both verbs, and one field: the unit is named after the
+/// user it runs the shepherd as, so that user is the only thing either verb
+/// needs to be told. `--home` is read from [`GlobalArgs`] by `startup` and
+/// ignored by `unstartup`, which removes a unit rather than writing one.
+#[derive(Debug, clap::Args)]
+pub struct StartupArgs {
+    /// The user the unit runs the shepherd as (default: $SUDO_USER, else the invoking user)
+    #[arg(long)]
+    pub user: Option<String>,
+}
+
 /// Arguments to `shep completions`.
 #[derive(Debug, clap::Args)]
 pub struct CompletionArgs {
@@ -277,6 +348,10 @@ pub struct DaemonArgs {
     /// Boot without restoring the saved muster roll
     #[arg(long)]
     pub no_restore: bool,
+    /// Run supervised by an init system: do not expect to have been
+    /// daemonized, and report readiness once the flock is back
+    #[arg(long)]
+    pub foreground: bool,
 }
 
 #[cfg(test)]
@@ -529,6 +604,10 @@ mod tests {
             "trigger",
             "ping",
             "kill",
+            "save",
+            "muster",
+            "startup",
+            "unstartup",
             "completions",
         ] {
             assert!(

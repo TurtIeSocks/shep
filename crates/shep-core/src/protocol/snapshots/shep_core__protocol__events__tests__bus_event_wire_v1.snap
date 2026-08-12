@@ -16,7 +16,9 @@ expression: events
         "uptime_ms": 500,
         "fold": null,
         "out_file": "/home/rin/.shep/logs/web-0-out.log",
-        "err_file": "/home/rin/.shep/logs/web-0-err.log"
+        "err_file": "/home/rin/.shep/logs/web-0-err.log",
+        "cpu_percent": null,
+        "memory_bytes": null
       },
       "manually": false,
       "at_ms": 1700000000000

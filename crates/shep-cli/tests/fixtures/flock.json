@@ -11,7 +11,9 @@
       "uptime_ms": null,
       "fold": null,
       "out_file": null,
-      "err_file": null
+      "err_file": null,
+      "cpu_percent": null,
+      "memory_bytes": null
     }
   ]
 }

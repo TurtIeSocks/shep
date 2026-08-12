@@ -51,6 +51,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Answer `flock` and `describe` with each sheep's live CPU and memory, in the
+  two `ProcessInfo` fields shep-core grew for them. The reading is taken when
+  the request is served, not read off the last periodic tick, so memory is
+  current rather than up to 15 s stale; CPU is the delta since that tick,
+  which is what lets a listing report a rate without blocking for a second
+  reading of its own. A sheep the daemon has not yet sampled once reports no
+  CPU — a percentage invented from a 50 ms window is worse than an empty
+  cell.
+
+  Only those two verbs pay for it. The sample is a syscall walk over the
+  host's whole process table, measured at 5.77 ms across 883 processes, and
+  `start`/`stop`/`restart`/`reload`/`reopen`/`flush` answer with
+  `ProcessInfo` rows nobody reads resource use from. It runs on the blocking
+  pool rather than on a runtime worker, and a listing whose sample fails
+  comes back without the numbers rather than failing outright.
+
+- Name `fake::FIRST_SCRIPTED_PID` (behind `test-fakes`), the pid
+  `ScriptedRunner` hands its first spawn. A fixture describing that proc's
+  process table can say which pid it means instead of repeating the literal.
+
+- Sample every sheep, and enforce only where a limit exists. The polling loop
+  used to run for the ids `max_memory` armed it against and for nobody else,
+  so an app that set no ceiling — the ordinary case — was never measured at
+  all. Sampling is now its own concern (`limits::stats`): every sheep with a
+  pid is watched from the moment it comes online, and a memory ceiling arms
+  the enforcer on top of that rather than instead of it. Enforcement itself
+  is untouched — same cadence, same self-disarm on breach, same backpressure
+  on a full report channel.
+
+  It costs no extra walk of the process table. The polling tick already built
+  one index per pass; it now hands that index to the sampler before running
+  the enforcement pass, so the 6.5 ms syscall walk still happens once every
+  15 s however many sheep are in the flock.
+
+  CPU is the reason the two halves have to share a tick. Resident memory is a
+  level and can be read on demand, but the OS reports CPU as a counter, so a
+  percentage needs two readings and the wall time between them. The tick
+  records one baseline per sheep; an on-demand read subtracts against it and
+  writes nothing back, which is what stops two listings a moment apart from
+  dividing a near-zero counter delta by a near-zero window. A sheep that came
+  online since the last tick has no baseline and reports no CPU at all, which
+  is the honest answer for a window nobody has measured yet.
+
+- Report readiness to an init system that supervises the shepherd directly:
+  one `READY=1` datagram to whatever `$NOTIFY_SOCKET` names, sent as the
+  **last** step of `boot`, after the muster restore has finished and the
+  control plane is assembled. New unix-only `notify` module.
+
+  The ordering is the whole feature. A unit that goes green when the process
+  execs describes a flock that is not up yet, so a restore that hangs reads
+  as a healthy service supervising nothing, and anything ordered after that
+  unit starts against apps that do not exist. Reporting last turns the same
+  hang into a failed start. This is deliberately the opposite of the
+  readiness pipe filed further down, and the two answer different parents:
+  that one tells a `shep` process that daemonized this one it may now exit,
+  and is written the moment the socket binds so a slow muster cannot make it
+  think the boot failed; this one decides when a unit goes green. Both may
+  be set, but whichever is supervising, the other is not.
+
+  No new dependency and no unsafe: `std` addresses both shapes systemd can
+  hand a service — a filesystem path through `UnixDatagram::send_to`, and an
+  `@`-prefixed abstract name through `SocketAddrExt::from_abstract_name` plus
+  `UnixDatagram::send_to_addr`, stable since 1.70. Off Linux an `@` address is
+  `NotifyError::Unsupported` rather than a path, because there is no abstract
+  namespace to reach and writing into a file literally named `@…` would
+  succeed while telling nobody anything. An **absent** `$NOTIFY_SOCKET` is
+  the ordinary case — every interactive run, the daemon the CLI autostarts
+  for itself, and macOS, whose launchd has no readiness protocol at all — and
+  it is a silent no-op, never an error.
+
+  A failed send is a `warn!` and the boot continues. The daemon is fully
+  functional; what failed is the init system's knowledge of it, which
+  systemd's own `TimeoutStartSec` reports honestly. Killing a working
+  supervisor over one undeliverable datagram would leave the flock down after
+  a reboot instead of merely unannounced.
+
+  `notify` is public because `shep-cli` names `NOTIFY_SOCKET_ENV` — the
+  environment read belongs where every `SHEP_*` override is already read, and
+  what crosses the crate boundary is the resolved address (see Changes).
+- Answer `Request::Muster` on the control socket, over the same restore the
+  daemon already runs at boot. `snapshot::muster` is now that one
+  implementation: `boot::restore_flock` is a line over it, and the request
+  handler calls it and turns the names it hands back into a listing. The
+  restore that runs unattended after a reboot is therefore the one an operator
+  exercises by hand, rather than a second path nobody has driven. It returns
+  names instead of a listing so the boot caller has nothing to report and no
+  reason to try.
+
+  An app the flock already has is left where it stands, and is still counted
+  as restored. Boot never meets that case, since its flock is empty by
+  construction; an operator meets it whenever a muster follows a partial
+  restore, or simply runs twice. Starting such an app again is not the no-op
+  it looks like — `instance_slots` allocates the lowest FREE slot, so a second
+  start of a one-instance app leaves it running two and the next roll records
+  the pair. Restarting it would drop live connections over a verb that never
+  claimed to be `restart`, and refusing the whole muster over it would break
+  the partial-restore case the verb is most useful for. The unit of the rule
+  is the app, not the instance count.
+- Answer `Request::SaveRoll` on the control socket: the daemon writes the
+  muster roll immediately, bypassing the debounce the snapshot writer
+  otherwise applies, and reports back the path it wrote and how many apps
+  that roll recorded — the count taken from the roll actually persisted, not
+  from the flock before it was filtered down to one entry per app. `Ok(None)`
+  — the supervisor engine has already stopped — answers `RpcErrorCode::Internal`
+  rather than a success carrying nothing: an operator running this verb wants
+  the roll on disk before a reboot, and a reply that said "saved" for a write
+  that never happened is exactly the failure the verb exists to rule out.
+  `RpcContext::save_roll_now` is the new entry point, returning
+  `Option<SavedRoll>`; `RpcContext::snapshot_now` becomes a one-line wrapper
+  over it that discards the count, keeping its own signature and its
+  engine-stopped `Ok(())` behaviour unchanged, since `boot::run`'s teardown
+  depends on both.
 - Answer `Request::Trigger` on the control socket: the daemon resolves the
   selector against the flock, puts the action on each matched sheep's
   shepherd channel, and answers with one id-sorted `ActionReply` row per
@@ -540,6 +652,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changes
 
+- `ProcessRss` gains a `cpu_ms: u64` field — accumulated CPU time in
+  CPU-milliseconds, as the OS reports it, cumulative since the process
+  started. **Breaking for anything outside this crate that implements
+  `MemorySampler`**: the struct carries no `#[non_exhaustive]`, so every
+  literal that builds one stops compiling until it names the new field.
+
+  `SysinfoSampler` fills it from a refresh that now asks for CPU as well as
+  memory. That flag is load-bearing and fails quietly without it: sysinfo
+  populates the counter only under a CPU refresh and otherwise leaves it at
+  zero, so a memory-only refresh yields a table of 900 processes with not one
+  of them reporting any CPU time — and every percentage derived from it reads
+  a plausible, wrong `0.0` rather than erroring.
+
+- `BootOptions` gains a `notify_socket: Option<OsString>` field, carrying the
+  address the readiness datagram above goes to; `None` — the ordinary case —
+  reports nothing. Filed as a change rather than an addition for the same
+  reason `max_cron_sleep` below is: the struct carries no
+  `#[non_exhaustive]`, so any downstream literal naming every field stops
+  compiling until it names this one (`..Default::default()` is unaffected).
+
+  It carries the **resolved address** rather than a bool because a boot test
+  could not otherwise observe the ordering it exists to guarantee:
+  `std::env::set_var` is `unsafe` in edition 2024 and this crate is
+  `#![deny(unsafe_code)]`, so no test here can establish an ambient
+  `$NOTIFY_SOCKET` to watch against. The CLI reads the variable once, beside
+  every `SHEP_*` override it already reads, and hands the value down.
 - `ShepherdMessage::Action` gains a `params: Option<String>` field: the
   argument text an operator passes after an action name, handed to the child
   verbatim. The daemon never parses it, validates it, or holds a schema for

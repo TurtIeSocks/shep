@@ -22,8 +22,9 @@ use crate::assemble::assemble;
 use crate::cron::{Clock, DEFAULT_MAX_CRON_SLEEP};
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
 use crate::extras::{Extras, ExtrasReports};
-use crate::fake::{ProcScript, ScriptedRunner};
+use crate::fake::{FIRST_SCRIPTED_PID, ProcScript, ScriptedRunner};
 use crate::limits::sample::{MemorySampler, ProcessRss};
+use crate::limits::stats::StatsState;
 use crate::limits::{LimitBreach, LimitEnforcer};
 use crate::probes::{LivenessFailure, ProbeFailure, Prober};
 use crate::rpc::RpcContext;
@@ -245,6 +246,57 @@ impl ProcessRunner for SharedRunner {
     }
 }
 
+/// A [`ProcessRunner`] that announces each spawn on a unix datagram socket
+/// before delegating, so a test can assert on the ORDER of two events rather
+/// than on the presence of one.
+///
+/// It exists for `boot`'s readiness-ordering case. Both the announcement and
+/// `boot`'s own `READY=1` land on the same socket, and AF_UNIX `SOCK_DGRAM`
+/// enqueues synchronously, so the queue order a test reads back after `boot`
+/// returns *is* the program order — which reading only `READY=1` could never
+/// establish, because the kernel keeps that datagram queued however early it
+/// was sent.
+///
+/// Unix-only, like the socket it writes to and the `boot` module it serves.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct AnnouncingRunner<R> {
+    inner: R,
+    target: PathBuf,
+}
+
+#[cfg(unix)]
+impl<R> AnnouncingRunner<R> {
+    /// Wraps `inner`, announcing every spawn to the socket bound at `target`.
+    pub(crate) fn new(inner: R, target: &Path) -> Self {
+        Self {
+            inner,
+            target: target.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl<R: ProcessRunner> ProcessRunner for AnnouncingRunner<R> {
+    type Proc = R::Proc;
+
+    /// # Panics
+    ///
+    /// If the announcement cannot be sent — the socket the test bound is
+    /// gone, or was never bound. Panicking beats swallowing it: the case
+    /// this runner exists for would otherwise block on a datagram that is
+    /// never coming and report a timeout instead of the real fault.
+    #[track_caller]
+    fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
+        let socket = std::os::unix::net::UnixDatagram::unbound()
+            .expect("a test must be able to open an unbound datagram socket");
+        socket
+            .send_to(b"SPAWNED\n", &self.target)
+            .expect("the test's listening socket must be bound before the spawn");
+        self.inner.spawn(spec)
+    }
+}
+
 /// A proptest configuration running `local_cases` by default, and whatever
 /// `PROPTEST_CASES` names when the environment sets it (IR-37: "case count
 /// capped in CI via env").
@@ -303,6 +355,11 @@ pub(crate) struct Harness {
     /// Liveness-failure reports, for tests that assert a probe threshold
     /// tripped.
     pub(crate) liveness: mpsc::Receiver<LivenessFailure>,
+    /// The same [`StatsState`] the extras and [`Self::ctx`] share, so a test
+    /// can plant the periodic CPU baseline an on-demand reading measures
+    /// against instead of waiting a poll interval for the enforcer's own
+    /// tick to plant one.
+    pub(crate) stats: Arc<StatsState>,
 }
 
 /// Capacity of the harness's two report channels — a test that needs more
@@ -313,25 +370,75 @@ const HARNESS_REPORT_CAPACITY: usize = 16;
 /// plus a fresh [`RpcContext`] wired to it, with neutral lifecycle extras: a
 /// harness nobody configured arms nothing and reports nothing.
 pub(crate) fn harness(scripts: Vec<ProcScript>) -> Harness {
-    harness_with_extras(scripts, |reports| Extras {
-        clock: Arc::new(TestClock::starting_at(
-            "2026-01-01T00:00:00Z"
-                .parse()
-                .expect("a valid RFC3339 timestamp"),
-        )),
-        // A machine with no visible processes: nothing an app arms against
-        // can ever be found, so nothing breaches. NOT `ScriptedSampler::new
-        // (vec![])`, which is a fixture bug the constructor asserts on — the
-        // neutral value is one reading holding an empty table.
-        enforcer: Arc::new(crate::limits::PollingEnforcer::start(
-            Arc::new(ScriptedSampler::new(vec![vec![]])),
-            reports.breaches.clone(),
-        )),
-        // A fixture nobody configured behaves like a daemon nobody
-        // configured.
-        max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
-        reports,
+    // A machine with no visible processes: nothing an app arms against can
+    // ever be found, so nothing breaches. NOT `ScriptedSampler::new(vec![])`,
+    // which is a fixture bug the constructor asserts on — the neutral value
+    // is one reading holding an empty table.
+    harness_sampling(scripts, vec![vec![]])
+}
+
+/// [`harness`], over a process table that really holds the first sheep's
+/// tree.
+///
+/// The one fixture in this file whose resource readings mean anything: the
+/// pid it describes is the one [`ScriptedRunner`] hands the first spawn, so a
+/// sheep started through this harness joins against a reading rather than
+/// against nothing. Every reading reports the same 4 KiB tree and a CPU
+/// counter that advances 1500 ms between the first two — enough for a caller
+/// to record a baseline off one reading and measure a known percentage
+/// against the next.
+pub(crate) fn harness_with_stats(scripts: Vec<ProcScript>) -> Harness {
+    let tree = |cpu_ms| {
+        vec![ProcessRss {
+            pid: FIRST_SCRIPTED_PID,
+            parent: None,
+            bytes: SCRIPTED_TREE_BYTES,
+            cpu_ms,
+        }]
+    };
+    harness_sampling(scripts, vec![tree(1_000), tree(2_500), tree(2_501)])
+}
+
+/// Resident size every reading [`harness_with_stats`] scripts reports, small
+/// and distinctive so a test asserting on it cannot be reading a default.
+pub(crate) const SCRIPTED_TREE_BYTES: u64 = 4096;
+
+/// [`harness`] over a scripted process table — the body both spellings share.
+fn harness_sampling(scripts: Vec<ProcScript>, readings: Vec<Vec<ProcessRss>>) -> Harness {
+    harness_with_extras(scripts, |reports| {
+        let sampler: Arc<dyn MemorySampler> = Arc::new(ScriptedSampler::new(readings));
+        let stats = Arc::new(StatsState::new(Arc::clone(&sampler)));
+        Extras {
+            clock: Arc::new(TestClock::starting_at(
+                "2026-01-01T00:00:00Z"
+                    .parse()
+                    .expect("a valid RFC3339 timestamp"),
+            )),
+            enforcer: Arc::new(crate::limits::PollingEnforcer::start(
+                sampler,
+                reports.breaches.clone(),
+                Arc::clone(&stats),
+            )),
+            // A fixture nobody configured behaves like a daemon nobody
+            // configured.
+            max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+            reports,
+            stats,
+        }
     })
+}
+
+/// A [`StatsState`] over a machine with no visible processes.
+///
+/// The neutral value for a fixture that has to hand [`Extras`] a `stats` but
+/// asserts nothing about resource readings — the same role
+/// [`RecordingEnforcer`] plays for the memory ceiling. Watching still works
+/// against it (the watch map is the fixture's own bookkeeping); every reading
+/// it produces is simply an empty tree.
+pub(crate) fn idle_stats() -> Arc<StatsState> {
+    Arc::new(StatsState::new(Arc::new(ScriptedSampler::new(vec![
+        vec![],
+    ]))))
 }
 
 /// [`harness`], with the caller deciding the extras.
@@ -359,6 +466,10 @@ pub(crate) fn harness_with_extras(
         breaches: breach_tx,
         liveness: live_tx,
     });
+    // Taken before `extras` is moved, exactly as `boot` takes it: the RPC
+    // layer and the extras must share ONE state, or a listing would read a
+    // watch set nothing ever wrote to.
+    let stats = Arc::clone(&extras.stats);
     let supervisor =
         SupervisorBuilder::new(ScriptedRunner::new(scripts), paths.clone(), events.clone())
             .extras(extras)
@@ -373,12 +484,14 @@ pub(crate) fn harness_with_extras(
             daemon_version: "0.1.0".to_string(),
             pid: 4242,
             shutdown: Arc::new(shutdown),
+            stats: Arc::clone(&stats),
         },
         _dir: dir,
         _events_rx: events_rx,
         shutdown_rx,
         breaches,
         liveness,
+        stats,
     }
 }
 

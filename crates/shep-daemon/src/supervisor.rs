@@ -3993,6 +3993,14 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
         // the whole reply and blank the listing for every other sheep.
         out_file: Some(entry.out_file.to_string_lossy().into_owned()),
         err_file: Some(entry.err_file.to_string_lossy().into_owned()),
+        // Left empty here, and filled in by the RPC layer for the two
+        // verbs an operator reads resource usage from. Reading them is a
+        // syscall walk over the host's whole process table, and the
+        // actor must never block; every other caller of this function
+        // answers a lifecycle verb, where the numbers would be paid for
+        // and never read.
+        cpu_percent: None,
+        memory_bytes: None,
     }
 }
 
@@ -4511,7 +4519,9 @@ mod tests {
     use super::*;
     use crate::fake::{ProcScript, ScriptedRunner};
     // the one crate-root fixture (IR-33)
-    use crate::testing::{RecordingEnforcer, SharedRunner, armed_entry, probe_config, test_paths};
+    use crate::testing::{
+        RecordingEnforcer, SharedRunner, armed_entry, idle_stats, probe_config, test_paths,
+    };
     // Test-only: the one case that drives a real `liveness_probe` has to
     // build the lifecycle extras the production wiring builds at boot, and
     // put the daemon's own reporter behind them.
@@ -7050,6 +7060,7 @@ mod tests {
                         breaches: breaches_tx,
                         liveness: liveness_tx,
                     },
+                    stats: idle_stats(),
                 })
                 .spawn();
         // The daemon's own reporter, not a forwarding line written here: it

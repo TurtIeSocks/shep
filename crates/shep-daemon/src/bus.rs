@@ -217,6 +217,8 @@ mod tests {
                 fold: None,
                 out_file: Some(format!("/logs/sheep-{id}-0-out.log")),
                 err_file: Some(format!("/logs/sheep-{id}-0-err.log")),
+                cpu_percent: None,
+                memory_bytes: None,
             },
             manually: false,
             at_ms: 0,

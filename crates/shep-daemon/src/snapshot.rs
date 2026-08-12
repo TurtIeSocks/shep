@@ -10,12 +10,22 @@
 //! human-editable) and collecting failures instead of aborting the whole
 //! muster.
 //!
+//! `muster` reads the roll and starts those apps. It is the daemon's ONE
+//! restore path, reached both from `boot` and from the `Muster` request an
+//! operator sends, so the restore that runs unattended after a reboot is the
+//! same code an operator can drive by hand.
+//!
 //! ## Restore rule
 //!
 //! An app restores iff it was running when the roll was saved
 //! (`instances_running > 0`) AND `autostart` is still true — "was up when we
 //! saved" is the muster contract; `autostart = false` is the user's explicit
 //! opt-out of being brought back automatically.
+//!
+//! An app the flock ALREADY has is then left exactly where it stands, and is
+//! still reported as restored. That half of the rule only ever bites the
+//! operator's call — boot's flock is empty by construction — and `muster`'s
+//! own doc carries the reasoning.
 
 use core::fmt;
 
@@ -274,6 +284,92 @@ pub(crate) fn restorable(snapshot: FlockSnapshot) -> Restorable {
     Restorable { apps, rejected }
 }
 
+/// Reads the muster roll and starts every app it restores, returning the
+/// names it restored.
+///
+/// The daemon's one restore path, and deliberately only one: `boot` runs it
+/// when `--restore` is set, and the `Muster` request runs it for an operator,
+/// so the restore that happens unattended after a reboot is the same code an
+/// operator exercises by hand. The two callers differ in what they do with
+/// the return — boot discards it, the request handler turns it into a listing
+/// — which is why this hands back NAMES rather than a listing: a listing
+/// would tempt the boot path into reporting one nobody reads.
+///
+/// An app the flock already has is left exactly where it stands, and is still
+/// counted as restored. Boot never meets that case, since its flock is empty
+/// by construction; an operator meets it whenever a muster follows a partial
+/// restore, or simply runs twice. Starting such an app again would not be the
+/// no-op it looks like: [`instance_slots`](crate::assemble::instance_slots)
+/// allocates the lowest FREE slot, so a second start of a one-instance app
+/// leaves it running two, and the next roll records the pair. Restarting it
+/// instead would drop live connections over a verb that never claimed to be
+/// `restart`, and refusing the whole muster over it would break the
+/// partial-restore case the verb is most useful for. Leaving it alone is what
+/// makes the verb idempotent, and idempotence is what lets it be run twice,
+/// or from a boot script, without an operator having to think about it. The
+/// unit of that rule is the APP, not the instance count: a muster starts apps
+/// the flock does not have, and never adds instances to one it does.
+///
+/// A missing roll restores nothing and is not an error — a fresh
+/// `$SHEP_HOME` has none, and that is a first boot rather than a fault. A
+/// roll that exists and will not parse IS reported: something corrupted or
+/// hand-edited it, and starting an empty flock instead would hide that.
+///
+/// # Errors
+/// - [`SnapshotError`] — the roll exists but could not be read or parsed.
+pub(crate) async fn muster(
+    path: &Path,
+    registry: &FlockRegistry,
+    supervisor: &SupervisorHandle,
+) -> Result<Vec<String>, SnapshotError> {
+    let saved = match read(path) {
+        Ok(saved) => saved,
+        Err(SnapshotError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(err) => return Err(err),
+    };
+    let restorable = restorable(saved);
+    for (name, err) in &restorable.rejected {
+        tracing::warn!(name, %err, "muster roll entry rejected on restore");
+    }
+    if restorable.apps.is_empty() {
+        return Ok(Vec::new());
+    }
+    let restored: Vec<String> = restorable
+        .apps
+        .iter()
+        .map(|app| app.config().name.clone())
+        .collect();
+
+    // A supervisor that cannot be listed has no flock left to collide with,
+    // and the `start` below announces itself when it fails for that same
+    // reason, so this needs no branch of its own.
+    let running = supervisor.list_checked().await.unwrap_or_default();
+    let to_start: Vec<ResolvedApp> = restorable
+        .apps
+        .into_iter()
+        .filter(|app| !running.iter().any(|info| info.name == app.config().name))
+        .collect();
+    if to_start.is_empty() {
+        return Ok(restored);
+    }
+    // Recorded regardless of whether `start` below fully succeeds, matching
+    // `rpc::run`'s own Start handler: already-registered entries must
+    // persist even when a later spawn in the same batch fails. Only what
+    // this call starts is recorded — an app left where it stands keeps the
+    // config it is actually running under, rather than having the roll's
+    // copy written over it for the next save to persist.
+    registry.record(&to_start);
+    if let Err(err) = supervisor.start(to_start).await {
+        // One bad entry does not sink the muster — the same policy
+        // `restorable` already applies at validation time. The sheep that
+        // failed to spawn is already recorded `Errored` by the supervisor.
+        tracing::warn!(%err, "muster roll restore failed to spawn one or more apps");
+    }
+    Ok(restored)
+}
+
 /// True for lifecycle transitions the roll cares about; false for log
 /// traffic and daemon-wide notices, which must not trigger a rewrite.
 fn is_state_change(event: &BusEvent) -> bool {
@@ -407,6 +503,8 @@ mod tests {
             fold: None,
             out_file: Some(format!("/logs/{name}-0-out.log")),
             err_file: Some(format!("/logs/{name}-0-err.log")),
+            cpu_percent: None,
+            memory_bytes: None,
         }
     }
 
@@ -584,6 +682,121 @@ mod tests {
         let rendered = format!("{roll:?}");
         assert!(!rendered.contains("postgres://secret"), "{rendered}");
         assert!(rendered.contains("<1 vars>"), "{rendered}");
+    }
+
+    /// fails if `muster` starts an app the roll says was down, or skips one
+    /// it says was up. Both halves in one case, because a restore rule that
+    /// inverted would pass either half alone.
+    #[tokio::test(start_paused = true)]
+    async fn muster_starts_what_the_roll_recorded_running_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        std::fs::create_dir_all(paths.snapshot.parent().unwrap()).unwrap();
+        let roll = FlockSnapshot {
+            version: SNAPSHOT_VERSION,
+            saved_at_ms: 0,
+            apps: vec![
+                SavedApp {
+                    app: AppConfig::minimal("up", "./srv"),
+                    instances_running: 1,
+                },
+                SavedApp {
+                    app: AppConfig::minimal("down", "./srv"),
+                    instances_running: 0,
+                },
+            ],
+        };
+        write_atomic(&paths.snapshot, &roll).unwrap();
+
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let handle = spawn_supervisor(
+            ScriptedRunner::new(vec![ProcScript::never_exits()]),
+            paths.clone(),
+            events,
+        );
+        let registry = FlockRegistry::new();
+
+        let restored = muster(&paths.snapshot, &registry, &handle).await.unwrap();
+        assert_eq!(restored, vec!["up".to_string()]);
+        let listed = handle.list().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "up");
+        handle.shutdown().await;
+    }
+
+    /// fails if `muster` starts an app the flock already has.
+    ///
+    /// `instance_slots` hands a second `Start` of a one-instance app the next
+    /// FREE slot rather than nothing, so a muster that started every
+    /// restorable app unconditionally would leave a one-instance app running
+    /// two — and the next roll would record the pair. The single script is
+    /// what makes that visible: the flock's own `web` consumes it, so the
+    /// duplicate lands as `Errored` (`ScriptedRunner` answers
+    /// `SpawnFailed("script exhausted")`), and this asserts on the status as
+    /// well as the count so the wrong implementation cannot pass by leaving
+    /// one healthy sheep and one wreck.
+    #[tokio::test(start_paused = true)]
+    async fn muster_leaves_an_app_the_flock_already_has_where_it_stands() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        std::fs::create_dir_all(paths.snapshot.parent().unwrap()).unwrap();
+        let roll = FlockSnapshot {
+            version: SNAPSHOT_VERSION,
+            saved_at_ms: 0,
+            apps: vec![SavedApp {
+                app: AppConfig::minimal("web", "./srv"),
+                instances_running: 1,
+            }],
+        };
+        write_atomic(&paths.snapshot, &roll).unwrap();
+
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let handle = spawn_supervisor(
+            ScriptedRunner::new(vec![ProcScript::never_exits()]),
+            paths.clone(),
+            events,
+        );
+        let registry = FlockRegistry::new();
+        let app = normalize(AppConfig::minimal("web", "./srv")).unwrap();
+        registry.record(std::slice::from_ref(&app));
+        handle.start(vec![app]).await.unwrap();
+
+        let restored = muster(&paths.snapshot, &registry, &handle).await.unwrap();
+        assert_eq!(
+            restored,
+            vec!["web".to_string()],
+            "the roll's app is restored whether or not this call is what started it"
+        );
+        let listed = handle.list().await;
+        assert_eq!(listed.len(), 1, "one instance of a one-instance app");
+        assert_eq!(listed[0].status, ProcStatus::Online);
+        handle.shutdown().await;
+    }
+
+    /// fails if a missing roll becomes an error. A fresh `$SHEP_HOME` has
+    /// none, and a daemon that refused to boot over it would be unbootable
+    /// on a clean machine.
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_roll_restores_nothing_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        std::fs::create_dir_all(paths.snapshot.parent().unwrap()).unwrap();
+        assert!(!paths.snapshot.exists());
+
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let handle = spawn_supervisor(
+            ScriptedRunner::new(vec![ProcScript::never_exits()]),
+            paths.clone(),
+            events,
+        );
+        let registry = FlockRegistry::new();
+
+        assert_eq!(
+            muster(&paths.snapshot, &registry, &handle).await.unwrap(),
+            Vec::<String>::new()
+        );
+        assert!(handle.list().await.is_empty());
+        handle.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]

@@ -8,13 +8,13 @@
 //! input every run, `black_box` on the table and the root pid going in and
 //! on the returned sum coming out, so the optimizer cannot fold the call
 //! away. This half scales with **`table.len()`**, the size of the whole
-//! input table: `tree_rss` builds two `HashMap`s over every entry in `table`
-//! before it walks the tree (`limits/sample.rs`'s `tree_rss`), so its cost is
-//! not confined to the flock subtree it sums. In production that table is
-//! the host's entire process list — `limits/sample.rs`'s own comment on the
-//! walk notes "the whole-machine table this feeds from can run to hundreds
-//! of entries" — so `tree_rss`'s real-world cost driver is host process
-//! count, the same driver `sysinfo_sampler` measures below, not an
+//! input table: `tree_rss` builds three `HashMap`s over every entry in
+//! `table` before it walks the tree (`limits/sample.rs`'s `tree_rss`), so
+//! its cost is not confined to the flock subtree it sums. In production that
+//! table is the host's entire process list — `limits/sample.rs`'s own comment
+//! on the walk notes "the whole-machine table this feeds from can run to
+//! hundreds of entries" — so `tree_rss`'s real-world cost driver is host
+//! process count, the same driver `sysinfo_sampler` measures below, not an
 //! independent axis. This fixture cannot separate the two: every one of its
 //! 500 entries is a descendant of the benched root, so here `table.len()`
 //! and flock size are equal by construction, and the number below is really
@@ -38,16 +38,23 @@
 //!
 //! ## Measured
 //!
-//! 2026-08-09, Apple M4 Pro (aarch64-apple-darwin), macOS 26.2 (Darwin
+//! 2026-08-12, Apple M4 Pro (aarch64-apple-darwin), macOS 26.2 (Darwin
 //! 25.2.0), `cargo bench --manifest-path benches/Cargo.toml`, criterion
 //! 0.7.0, release profile:
 //!
-//! - `tree_rss/500_process_tree`: 22.98 µs per call (100-sample estimate,
-//!   [22.819, 23.168] µs) — this is `table.len() == 500` cost, not flock-size
+//! - `tree_rss/500_process_tree`: 34.26 µs per call (100-sample estimate,
+//!   [34.171, 34.368] µs) — this is `table.len() == 500` cost, not flock-size
 //!   cost; see the driver discussion above.
-//! - `sysinfo_sampler/sample_real_machine`: 5.77 ms per call (100-sample
-//!   estimate, [5.6979, 5.8453] ms; host process count at measurement time:
-//!   883, per `ps aux | wc -l`)
+//! - `sysinfo_sampler/sample_real_machine`: 6.51 ms per call (100-sample
+//!   estimate, [6.3499, 6.6781] ms; host process count at measurement time:
+//!   871, per `ps aux | wc -l`)
+//!
+//! Both moved when the sampler started reading CPU time alongside memory, and
+//! both moves are accounted for: `tree_rss` was 22.98 µs when the index built
+//! two maps per table and now builds three, and `SysinfoSampler::sample` was
+//! 5.77 ms before its refresh asked for `.with_cpu()`. A poll still costs
+//! single-digit milliseconds against a 15 s interval, so the reasoning at
+//! `MEMORY_POLL_INTERVAL` is unchanged.
 //!
 //! Re-run and update this comment if the numbers drift enough to change the
 //! reasoning at the constant they justify — this is a recorded observation,
@@ -79,12 +86,15 @@ const BRANCHING_FACTOR: u32 = 4;
 fn synthetic_process_tree(total: u32) -> Vec<ProcessRss> {
     const ROOT_BYTES: u64 = 20 * 1024 * 1024; // 20 MiB, a plausible root RSS
     const CHILD_BYTES: u64 = 512 * 1024; // 512 KiB, a plausible lamb RSS
+    const ROOT_CPU_MS: u64 = 90_000; // 90 CPU-seconds, a plausible root total
+    const CHILD_CPU_MS: u64 = 1_500; // 1.5 CPU-seconds, a plausible lamb total
 
     let mut table = Vec::with_capacity(total as usize);
     table.push(ProcessRss {
         pid: 1,
         parent: None,
         bytes: ROOT_BYTES,
+        cpu_ms: ROOT_CPU_MS,
     });
 
     let mut next_pid = 2u32;
@@ -101,6 +111,7 @@ fn synthetic_process_tree(total: u32) -> Vec<ProcessRss> {
                 pid: next_pid,
                 parent: Some(parent),
                 bytes: CHILD_BYTES,
+                cpu_ms: CHILD_CPU_MS,
             });
             frontier.push_back(next_pid);
             next_pid += 1;

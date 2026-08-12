@@ -40,7 +40,8 @@ use shep_core::values::UpDuration;
 
 use crate::cron::{Clock, SystemClock, spawn_cron_worker};
 use crate::entry::ProcessEntry;
-use crate::limits::sample::SysinfoSampler;
+use crate::limits::sample::{MemorySampler, SysinfoSampler};
+use crate::limits::stats::StatsState;
 use crate::limits::{LimitBreach, LimitEnforcer, PollingEnforcer};
 use crate::probes::{LivenessFailure, Prober, spawn_liveness_task};
 use crate::supervisor::SupervisorHandle;
@@ -64,7 +65,8 @@ pub struct ExtrasReports {
 ///
 /// Constructed once at boot and handed to the supervisor. Every *seam* is a
 /// trait object so the engine's type does not grow a parameter per subsystem;
-/// `reports` is the exception and is wiring rather than a seam.
+/// `reports` and `stats` are the exceptions and are wiring rather than seams
+/// — the sampler underneath `stats` is where that subsystem's seam lives.
 pub struct Extras {
     /// Wall clock the cron workers read.
     pub clock: Arc<dyn Clock>,
@@ -85,6 +87,14 @@ pub struct Extras {
     /// construction; the liveness loops are free tasks and cannot, so the
     /// sender has to reach [`ExtrasRegistry::arm`] through here.
     pub reports: ExtrasReports,
+    /// Live resource readings, shared with the RPC layer so a listing can
+    /// take one on demand.
+    ///
+    /// Shared rather than owned for the same reason [`Extras::enforcer`] is:
+    /// [`ExtrasRegistry`] keeps a handle from the arming it will later have
+    /// to undo. The enforcer's polling loop holds a third handle — it is what
+    /// records the CPU baseline every on-demand reading measures against.
+    pub stats: Arc<StatsState>,
 }
 
 impl Extras {
@@ -98,23 +108,30 @@ impl Extras {
     /// polling enforcer starts its sampling task immediately.
     #[must_use]
     pub fn real(reports: ExtrasReports, max_cron_sleep: Duration) -> Self {
+        // One sampler behind both consumers, not two: sampling and
+        // enforcement read the same process table on the same tick, and a
+        // second `SysinfoSampler` would mean a second syscall walk.
+        let sampler: Arc<dyn MemorySampler> = Arc::new(SysinfoSampler::new());
+        let stats = Arc::new(StatsState::new(Arc::clone(&sampler)));
         let enforcer =
-            PollingEnforcer::start(Arc::new(SysinfoSampler::new()), reports.breaches.clone());
+            PollingEnforcer::start(sampler, reports.breaches.clone(), Arc::clone(&stats));
         Self {
             clock: Arc::new(SystemClock),
             enforcer: Arc::new(enforcer),
             max_cron_sleep,
             reports,
+            stats,
         }
     }
 }
 
 impl fmt::Debug for Extras {
     // Roles, not values, for the seams: neither is Debug, and printing the
-    // report channels would say nothing a reader wants. The sleep bound is
-    // the exception and prints for real — it is a tuning knob the user set,
-    // so a daemon log that dumps this struct should say what it ended up
-    // being.
+    // report channels would say nothing a reader wants. `stats` is omitted
+    // for the same reason as `reports` — it is wiring, and its own Debug
+    // prints a role and nothing else. The sleep bound is the exception and
+    // prints for real: it is a tuning knob the user set, so a daemon log that
+    // dumps this struct should say what it ended up being.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Extras")
             .field("clock", &"<dyn Clock>")
@@ -234,8 +251,11 @@ impl NameExtras {
 }
 
 /// One instance's per-pid extras.
-#[derive(Default)]
 struct InstanceExtras {
+    /// Where this id's sampling was started, so `disarm` can stop it. Not an
+    /// `Option`: every sheep with a pid is sampled, so an instance that
+    /// reached this type is a watched one by construction.
+    stats: Arc<StatsState>,
     /// The enforcer this id's memory limit was armed against, so `disarm` can
     /// undo that arming — see [`Extras::enforcer`] for why the registry holds
     /// a handle rather than being handed one.
@@ -245,15 +265,21 @@ struct InstanceExtras {
 }
 
 impl InstanceExtras {
-    /// Whether nothing at all was armed for this instance.
-    fn is_empty(&self) -> bool {
-        self.limit.is_none() && self.liveness.is_none()
+    /// Sampling armed and nothing else — what an app configuring neither
+    /// `max_memory` nor `liveness_probe` gets, which is most of them.
+    fn watched_only(stats: Arc<StatsState>) -> Self {
+        Self {
+            stats,
+            limit: None,
+            liveness: None,
+        }
     }
 
-    /// Undoes this instance's arming: the memory limit against `id`, and the
-    /// liveness loop. Takes `self` for the same reason [`NameExtras::abort`]
-    /// does.
+    /// Undoes this instance's arming: sampling, the memory limit against
+    /// `id`, and the liveness loop. Takes `self` for the same reason
+    /// [`NameExtras::abort`] does.
     fn disarm(self, id: u32) {
+        self.stats.unwatch(id);
         if let Some(enforcer) = self.limit {
             enforcer.disarm(id);
         }
@@ -266,11 +292,14 @@ impl InstanceExtras {
 impl fmt::Debug for InstanceExtras {
     // `Arc<dyn LimitEnforcer>` is not Debug — and the useful fact about it
     // here is that an arming exists, not which mechanism performed it.
+    // `stats` is omitted rather than redacted: it is armed for every instance
+    // that exists, so printing it would print a constant. Hence
+    // `finish_non_exhaustive` — a field really is being left out.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InstanceExtras")
             .field("limit_armed", &self.limit.is_some())
             .field("liveness", &self.liveness)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -411,9 +440,9 @@ impl Drop for ExtrasRegistry {
     }
 }
 
-/// Arms the two per-pid extras — memory limit and liveness loop — returning
-/// `None` when the app configures neither (or when the entry has no pid to
-/// arm them against).
+/// Arms the per-pid extras — sampling always, the memory limit and the
+/// liveness loop where the app configures them — returning `None` only when
+/// the entry has no pid to arm them against.
 fn arm_instance(
     entry: &ProcessEntry,
     prober: Arc<dyn Prober>,
@@ -435,7 +464,11 @@ fn arm_instance(
         return None;
     };
 
-    let mut instance = InstanceExtras::default();
+    // Unconditional, unlike the two below it: a listing reports CPU and
+    // memory for every sheep, and an app that configures no `max_memory` is
+    // the ordinary case rather than an opted-out one.
+    extras.stats.watch(entry.id, pid);
+    let mut instance = InstanceExtras::watched_only(Arc::clone(&extras.stats));
     if let Some(limit) = config.max_memory {
         extras.enforcer.arm(entry.id, pid, limit);
         instance.limit = Some(Arc::clone(&extras.enforcer));
@@ -469,7 +502,7 @@ fn arm_instance(
             }
         }
     }
-    (!instance.is_empty()).then_some(instance)
+    Some(instance)
 }
 
 /// Spawns the name-group's cron worker, or `None` when the app configures no
@@ -628,7 +661,8 @@ mod tests {
     use crate::supervisor::spawn_supervisor;
     use crate::testing::{
         ArmCall, Harness, RecordingEnforcer, ScriptedProber, ScriptedSampler, TestClock, app_with,
-        armed_entry, capture_logs, harness, harness_with_extras, probe_config, test_paths, touch,
+        armed_entry, capture_logs, harness, harness_with_extras, idle_stats, probe_config,
+        test_paths, touch,
     };
     use crate::watch::real_time;
     use shep_core::config::{ProbeConfig, ProbeKind};
@@ -690,6 +724,7 @@ mod tests {
                     breaches: breach_tx,
                     liveness: live_tx,
                 },
+                stats: idle_stats(),
             },
             enforcer,
             clock,
@@ -891,11 +926,16 @@ mod tests {
     // Both halves are load-bearing. `limit_armed: true` alone cannot tell a
     // correct `self.limit.is_some()` from a hardcoded `true`, and
     // `limit_armed: false` alone cannot tell it from a hardcoded `false`; the
-    // inversion to `is_none()` moves the boolean either way, so it takes the
-    // armed instance AND the bare default to say the field reports its own
-    // field. The default is the honest source for the disarmed half: an
-    // instance with nothing armed never reaches the registry, since
-    // `arm_instance` returns `None` for it.
+    // inversion to `is_none()` moves the boolean either way, so it takes an
+    // armed instance AND an unarmed one to say the field reports its own
+    // field. The unarmed half comes from an app configuring no `max_memory`,
+    // which — since sampling is armed for every sheep — is a real registry
+    // entry rather than a value only a fixture could build.
+    //
+    // The trailing `..` is `stats`, which every instance carries and which
+    // therefore prints nothing a reader could act on. That it stays out of
+    // the string is part of the claim: a Debug that started printing an `Arc`
+    // address would change this.
     //
     // The liveness loop is left unarmed on purpose. Its field is a derived
     // `Option<JoinHandle<()>>`, and a live one renders as
@@ -913,10 +953,17 @@ mod tests {
         let (handle, _rx, _fixture) = spawn_test_fixture();
         let rig = rig(DEFAULT_MAX_CRON_SLEEP);
         let mut registry = ExtrasRegistry::default();
-        let app = app_with("web", |app| app.max_memory = Some(MemSize::from_bytes(500)));
+        let capped = app_with("web", |app| app.max_memory = Some(MemSize::from_bytes(500)));
+        let uncapped = app_with("api", |app| app.max_memory = None);
 
         registry.arm(
-            &armed_entry(0, 0, 1000, app, &paths),
+            &armed_entry(0, 0, 1000, capped, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+        registry.arm(
+            &armed_entry(1, 0, 1001, uncapped, &paths),
             idle_prober(),
             &rig.extras,
             &handle,
@@ -924,11 +971,11 @@ mod tests {
 
         assert_eq!(
             format!("{:?}", registry.instances[&0]),
-            "InstanceExtras { limit_armed: true, liveness: None }"
+            "InstanceExtras { limit_armed: true, liveness: None, .. }"
         );
         assert_eq!(
-            format!("{:?}", InstanceExtras::default()),
-            "InstanceExtras { limit_armed: false, liveness: None }"
+            format!("{:?}", registry.instances[&1]),
+            "InstanceExtras { limit_armed: false, liveness: None, .. }"
         );
     }
 
@@ -993,14 +1040,59 @@ mod tests {
             registry.groups.is_empty(),
             "an app with neither cron_restart nor watch must arm no name-group tasks"
         );
-        assert!(
-            registry.instances.is_empty(),
-            "an app with neither max_memory nor liveness_probe must arm no per-instance tasks"
+        // Sampling is the exception, and deliberately so: it is armed for
+        // every sheep with a pid, so this app has an `InstanceExtras`
+        // carrying nothing else. `every_sheep_with_a_pid_is_watched_even_
+        // with_no_limit_and_no_probe` is where that half is asserted.
+        assert_eq!(
+            format!("{:?}", registry.instances[&0]),
+            "InstanceExtras { limit_armed: false, liveness: None, .. }",
+            "an app with neither max_memory nor liveness_probe must arm nothing beyond sampling"
         );
         assert!(
             rig.enforcer.arms().is_empty(),
             "an app with no max_memory must not reach the enforcer at all"
         );
+    }
+
+    // fails if only limit-carrying sheep get watched. An app with no
+    // `max_memory` is the ordinary case, and a listing reporting `-` for
+    // every one of them is the bug this split exists to fix. The disarm at
+    // the end is the other half: a watch that is never dropped samples a dead
+    // pid forever, and hands its CPU baseline to whatever process the OS next
+    // gives that number to.
+    #[tokio::test(start_paused = true)]
+    async fn every_sheep_with_a_pid_is_watched_even_with_no_limit_and_no_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.max_memory = None;
+            app.liveness_probe = None;
+        });
+
+        registry.arm(
+            &armed_entry(7, 0, 4242, app, &paths),
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+
+        assert_eq!(
+            rig.extras.stats.watched_for_test(),
+            vec![(7, 4242)],
+            "an app with neither max_memory nor a liveness_probe is the ORDINARY case, and a \
+             listing reporting `-` for every one of them is what this split exists to fix"
+        );
+        assert!(
+            rig.enforcer.arms().is_empty(),
+            "sampling is not enforcement: an app with no ceiling must still not be armed"
+        );
+
+        registry.disarm(7, "web");
+        assert!(rig.extras.stats.watched_for_test().is_empty());
     }
 
     // fails if `arm_watch` stops consulting `config.watch`. A cron-restarting
@@ -2355,6 +2447,7 @@ mod tests {
             enforcer: Arc::new(RecordingEnforcer::default()),
             max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
             reports,
+            stats: idle_stats(),
         });
         let mut rx = h.ctx.events.subscribe();
         h.ctx
@@ -2442,6 +2535,7 @@ mod tests {
             enforcer: Arc::new(RecordingEnforcer::default()),
             max_cron_sleep: Duration::from_secs(600),
             reports,
+            stats: idle_stats(),
         });
         let mut rx = h.ctx.events.subscribe();
         h.ctx
@@ -2512,6 +2606,7 @@ mod tests {
                 enforcer: Arc::new(RecordingEnforcer::default()),
                 max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
                 reports,
+                stats: idle_stats(),
             },
         )
     }
@@ -2678,6 +2773,7 @@ mod tests {
             enforcer: Arc::new(RecordingEnforcer::default()),
             max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
             reports,
+            stats: idle_stats(),
         });
         let mut rx = h.ctx.events.subscribe();
         h.ctx
@@ -2707,18 +2803,26 @@ mod tests {
     // breaches however long the test waits.
     #[tokio::test(start_paused = true)]
     async fn the_actor_arms_the_memory_limit_against_the_spawned_pid() {
-        let mut h = harness_with_extras(vec![ProcScript::never_exits(); 4], |reports| Extras {
-            clock: Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z"))),
-            enforcer: Arc::new(PollingEnforcer::start(
+        let mut h = harness_with_extras(vec![ProcScript::never_exits(); 4], |reports| {
+            let sampler: Arc<dyn MemorySampler> =
                 Arc::new(ScriptedSampler::new(vec![vec![ProcessRss {
                     pid: 1000,
                     parent: None,
                     bytes: 900,
-                }]])),
-                reports.breaches.clone(),
-            )),
-            max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
-            reports,
+                    cpu_ms: 0,
+                }]]));
+            let stats = Arc::new(StatsState::new(Arc::clone(&sampler)));
+            Extras {
+                clock: Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z"))),
+                enforcer: Arc::new(PollingEnforcer::start(
+                    sampler,
+                    reports.breaches.clone(),
+                    Arc::clone(&stats),
+                )),
+                max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+                reports,
+                stats,
+            }
         });
         h.ctx
             .supervisor
@@ -2757,18 +2861,26 @@ mod tests {
     // quietly degrading into a second copy of the ungated one above.
     #[tokio::test(start_paused = true)]
     async fn the_actor_arms_a_readiness_gated_app_once_it_comes_online() {
-        let mut h = harness_with_extras(vec![ProcScript::never_exits(); 4], |reports| Extras {
-            clock: Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z"))),
-            enforcer: Arc::new(PollingEnforcer::start(
+        let mut h = harness_with_extras(vec![ProcScript::never_exits(); 4], |reports| {
+            let sampler: Arc<dyn MemorySampler> =
                 Arc::new(ScriptedSampler::new(vec![vec![ProcessRss {
                     pid: 1000,
                     parent: None,
                     bytes: 900,
-                }]])),
-                reports.breaches.clone(),
-            )),
-            max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
-            reports,
+                    cpu_ms: 0,
+                }]]));
+            let stats = Arc::new(StatsState::new(Arc::clone(&sampler)));
+            Extras {
+                clock: Arc::new(TestClock::starting_at(dt("2026-01-01T00:00:00Z"))),
+                enforcer: Arc::new(PollingEnforcer::start(
+                    sampler,
+                    reports.breaches.clone(),
+                    Arc::clone(&stats),
+                )),
+                max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+                reports,
+                stats,
+            }
         });
         h.ctx
             .supervisor

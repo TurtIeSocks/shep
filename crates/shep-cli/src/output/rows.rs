@@ -31,7 +31,9 @@ pub struct FlockRows(pub Vec<ProcessInfo>);
 
 impl Render for FlockRows {
     fn headers() -> &'static [&'static str] {
-        &["ID", "NAME", "STATUS", "PID", "RESTARTS", "UPTIME", "FOLD"]
+        &[
+            "ID", "NAME", "STATUS", "PID", "RESTARTS", "CPU", "MEM", "UPTIME", "FOLD",
+        ]
     }
 
     fn rows(&self) -> Vec<Vec<String>> {
@@ -46,6 +48,15 @@ impl Render for FlockRows {
                     // padded table is indistinguishable from a rendering bug.
                     p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                     p.restarts.to_string(),
+                    // `-` for the same reason, and for the same stated
+                    // reason PID uses it: a sheep that is not running, or
+                    // has been up for less than one sampling window, has no
+                    // honest number to report, and `0.0%` would claim the
+                    // daemon never made — "this sheep is using no CPU".
+                    p.cpu_percent
+                        .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
+                    p.memory_bytes
+                        .map_or_else(|| "-".to_string(), super::human_bytes),
                     super::human_duration(p.uptime_ms),
                     p.fold.clone().unwrap_or_else(|| "-".to_string()),
                 ]
@@ -63,6 +74,8 @@ impl Render for FlockRows {
             "STATUS" => "status",
             "PID" => "pid",
             "RESTARTS" => "restarts",
+            "CPU" => "cpu_percent",
+            "MEM" => "memory_bytes",
             "UPTIME" => "uptime_ms",
             "FOLD" => "fold",
             other => panic!("FlockRows::headers() does not include {other:?}"),
@@ -145,17 +158,20 @@ impl Render for FlushedRows {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[
-        // A sheep's lifecycle, which a flush neither reads nor changes. They
-        // stay in the JSON because `Response::Flushed` carries the same
-        // `ProcessInfo` every other verb answers with, and a consumer
-        // switching on the envelope's `command` should not find the record
-        // shape switching with it — but four columns of it would push the two
-        // paths this verb exists to report off the side of a terminal.
+        // A sheep's lifecycle and its resource use, neither of which a flush
+        // reads or changes. They stay in the JSON because
+        // `Response::Flushed` carries the same `ProcessInfo` every other
+        // verb answers with, and a consumer switching on the envelope's
+        // `command` should not find the record shape switching with it — but
+        // a column each would push the two paths this verb exists to report
+        // off the side of a terminal.
         "status",
         "pid",
         "restarts",
         "uptime_ms",
         "fold",
+        "cpu_percent",
+        "memory_bytes",
     ];
 }
 
@@ -315,6 +331,173 @@ impl Render for KillRow {
         }
     }
 
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
+/// `Response::RollSaved` — where the muster roll landed, and what it
+/// recorded.
+///
+/// Constructed by `commands/muster.rs`'s `save`, from a real `Response`.
+/// Every field is a column — `JSON_ONLY: &[]` — for [`EmptiedFiles`]' own
+/// stated reason: a verb that wrote a file and would not say which one has
+/// reported nothing.
+#[derive(Debug, Serialize)]
+pub struct SavedRollRow {
+    /// The roll's path, exactly as the daemon reported it.
+    pub file: String,
+    /// How many apps that roll records.
+    pub apps: u32,
+}
+
+impl Render for SavedRollRow {
+    fn headers() -> &'static [&'static str] {
+        &["FILE", "APPS"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        vec![vec![self.file.clone(), self.apps.to_string()]]
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "FILE" => "file",
+            "APPS" => "apps",
+            other => panic!("SavedRollRow::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
+/// One app `shep import` read out of a pm2 dump.
+///
+/// Constructed by `commands/import/mod.rs`'s `import`, from the apps a
+/// dump was converted into — not from any wire `Response`, since this verb
+/// asks the daemon nothing. `REUSE_PORT` is the column an operator scans
+/// for at a glance; `import`'s own stderr notes are where they learn what
+/// to do about a `true` one (`shep` binds nothing, so the app itself has to
+/// set `SO_REUSEPORT`).
+#[derive(Debug, Serialize)]
+pub struct ImportRow {
+    /// The app's name, which is also the key its instance rows were grouped by.
+    pub name: String,
+    /// The script the app runs.
+    pub script: String,
+    /// How many instances of it the dump recorded running.
+    pub instances: u32,
+    /// Whether the app has to set `SO_REUSEPORT` itself (pm2 cluster mode).
+    pub reuse_port: bool,
+}
+
+/// `shep import`: one row per app the dump was collapsed into.
+///
+/// `transparent` so the JSON is a plain array, matching every other payload
+/// that reports a list.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct ImportRows(pub Vec<ImportRow>);
+
+impl Render for ImportRows {
+    fn headers() -> &'static [&'static str] {
+        &["NAME", "SCRIPT", "INSTANCES", "REUSE_PORT"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|row| {
+                vec![
+                    row.name.clone(),
+                    row.script.clone(),
+                    row.instances.to_string(),
+                    row.reuse_port.to_string(),
+                ]
+            })
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "NAME" => "name",
+            "SCRIPT" => "script",
+            "INSTANCES" => "instances",
+            "REUSE_PORT" => "reuse_port",
+            other => panic!("ImportRows::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
+/// One step `shep startup` or `shep unstartup` took.
+///
+/// Constructed by `commands/startup/mod.rs`, from the unit file it wrote or
+/// removed and the init-system commands it ran — not from any wire
+/// `Response`, since neither verb asks the shepherd anything.
+#[derive(Debug, Serialize)]
+pub struct StartupStep {
+    /// What was done: `wrote`, `removed`, `ran`.
+    pub action: &'static str,
+    /// The file or command it was done to.
+    pub target: String,
+    /// `ok`, `absent`, or the failure in one line.
+    ///
+    /// `absent` is the [`EmptiedFile`] spelling, and means the same thing
+    /// here: an `unstartup` found no unit to remove, which is the state it
+    /// was asked to produce rather than a failure.
+    pub result: String,
+}
+
+/// `shep startup`/`shep unstartup`: one row per step, in the order the steps
+/// were taken.
+///
+/// Every step is reported even when an earlier one failed — a half-installed
+/// unit is worse than a fully-attempted one, and the operator needs every row
+/// to know which half. `transparent` so the JSON is a plain array, matching
+/// every other payload that reports a list.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct StartupSteps(pub Vec<StartupStep>);
+
+impl Render for StartupSteps {
+    fn headers() -> &'static [&'static str] {
+        &["ACTION", "TARGET", "RESULT"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|step| {
+                vec![
+                    step.action.to_string(),
+                    step.target.clone(),
+                    step.result.clone(),
+                ]
+            })
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "ACTION" => "action",
+            "TARGET" => "target",
+            "RESULT" => "result",
+            other => panic!("StartupSteps::headers() does not include {other:?}"),
+        }
+    }
+
+    // Every field is a column, for [`EmptiedFiles`]' own reason: a verb that
+    // wrote or removed a system file and would not say which one has
+    // reported nothing.
     const JSON_ONLY: &'static [&'static str] = &[];
 }
 
@@ -479,16 +662,23 @@ pub(crate) mod tests {
             name: name.to_string(),
             status: ProcStatus::Online,
             // Every `Option` field `Some`: `flock_rows_do_not_drift` below
-            // serializes this value and diffs its keys against `headers()`,
-            // and a `None` field vanishes from the JSON entirely (no key at
-            // all) rather than merely rendering empty — the drift test would
-            // not see it either way.
+            // pins each cell against its own JSON value, and a `None`
+            // serializes as `null`, which that check skips rather than
+            // compares — so a field left empty here is a column the drift
+            // test stops watching.
             pid: Some(1000 + id),
             restarts: id,
             uptime_ms,
             fold: Some("backend".to_string()),
             out_file: Some(format!("/logs/{name}-0-out.log")),
             err_file: Some(format!("/logs/{name}-0-err.log")),
+            // Fixed rather than id-derived, like `fold` above: every sample
+            // sheep shares one reading. `memory_bytes` is the same value
+            // `human_bytes`'s own doc uses to show it is not `MemSize`'s
+            // `Display` — 50 462 720 bytes is not a round number of MiB, and
+            // rendering it as "48.1M" is the whole point of that function.
+            cpu_percent: Some(12.5),
+            memory_bytes: Some(50_462_720),
         }
     }
 
@@ -601,9 +791,27 @@ pub(crate) mod tests {
 
     #[test]
     fn flock_rows_do_not_drift() {
-        // UPTIME is formatted (`human_duration`), not a raw echo of
-        // `uptime_ms` — see the doc comment on `assert_no_drift` above.
-        assert_no_drift(&sample_flock(), |j| &j[0], &["UPTIME"]);
+        // UPTIME, CPU and MEM are formatted (`human_duration`/`human_bytes`),
+        // not raw echoes of `uptime_ms`/`cpu_percent`/`memory_bytes` — see
+        // the doc comment on `assert_no_drift` above.
+        assert_no_drift(&sample_flock(), |j| &j[0], &["UPTIME", "CPU", "MEM"]);
+    }
+
+    /// fails if a sheep with no reading renders an empty cell or a zero. A
+    /// zero is a claim — "this sheep is using no CPU" — and the daemon says
+    /// `None` precisely when it cannot make that claim.
+    #[test]
+    fn a_sheep_with_no_reading_renders_a_dash_not_a_zero() {
+        let mut info = sample_info(1, "web", 60_000);
+        info.cpu_percent = None;
+        info.memory_bytes = None;
+        let rows = FlockRows(vec![info]);
+        let cells = &rows.rows()[0];
+        let headers = FlockRows::headers();
+        let cpu = cells[headers.iter().position(|h| *h == "CPU").unwrap()].clone();
+        let mem = cells[headers.iter().position(|h| *h == "MEM").unwrap()].clone();
+        assert_eq!(cpu, "-");
+        assert_eq!(mem, "-");
     }
 
     #[test]
@@ -674,6 +882,66 @@ pub(crate) mod tests {
                 socket_removed: true,
             },
             |j| j,
+            &[],
+        );
+    }
+
+    /// fails if `SavedRollRow` grows a field that never reaches the table —
+    /// the same gate `flock_rows_do_not_drift` applies, instantiated for a
+    /// payload whose every field is a column.
+    #[test]
+    fn saved_roll_row_does_not_drift() {
+        let row = SavedRollRow {
+            file: "/home/rin/.shep/flock.json".to_string(),
+            apps: 9,
+        };
+        assert_no_drift(&row, |json| json, &[]);
+    }
+
+    /// fails if `ImportRow` grows a field that never reaches the table —
+    /// the same gate every other payload has.
+    #[test]
+    fn import_rows_do_not_drift() {
+        assert_no_drift(
+            &ImportRows(vec![
+                ImportRow {
+                    name: "api".to_string(),
+                    script: "/srv/api/dist/server.js".to_string(),
+                    instances: 2,
+                    reuse_port: true,
+                },
+                ImportRow {
+                    name: "worker".to_string(),
+                    script: "/srv/worker/dist/worker.js".to_string(),
+                    instances: 1,
+                    reuse_port: false,
+                },
+            ]),
+            |j| &j[0],
+            &[],
+        );
+    }
+
+    /// fails if `StartupStep` grows a field that never reaches the table —
+    /// the same gate every other payload has. The two rows cover both
+    /// shapes the payload carries: a file that was written, and a command
+    /// that was run and failed.
+    #[test]
+    fn startup_steps_do_not_drift() {
+        assert_no_drift(
+            &StartupSteps(vec![
+                StartupStep {
+                    action: "wrote",
+                    target: "/etc/systemd/system/shep-deploy.service".to_string(),
+                    result: "ok".to_string(),
+                },
+                StartupStep {
+                    action: "ran",
+                    target: "systemctl enable --now shep-deploy.service".to_string(),
+                    result: "Failed to enable unit: Unit file is masked.".to_string(),
+                },
+            ]),
+            |j| &j[0],
             &[],
         );
     }
