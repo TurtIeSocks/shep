@@ -22,7 +22,7 @@ use crate::assemble::assemble;
 use crate::cron::{Clock, DEFAULT_MAX_CRON_SLEEP};
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
 use crate::extras::{Extras, ExtrasReports};
-use crate::fake::{ProcScript, ScriptedRunner};
+use crate::fake::{FIRST_SCRIPTED_PID, ProcScript, ScriptedRunner};
 use crate::limits::sample::{MemorySampler, ProcessRss};
 use crate::limits::stats::StatsState;
 use crate::limits::{LimitBreach, LimitEnforcer};
@@ -355,6 +355,11 @@ pub(crate) struct Harness {
     /// Liveness-failure reports, for tests that assert a probe threshold
     /// tripped.
     pub(crate) liveness: mpsc::Receiver<LivenessFailure>,
+    /// The same [`StatsState`] the extras and [`Self::ctx`] share, so a test
+    /// can plant the periodic CPU baseline an on-demand reading measures
+    /// against instead of waiting a poll interval for the enforcer's own
+    /// tick to plant one.
+    pub(crate) stats: Arc<StatsState>,
 }
 
 /// Capacity of the harness's two report channels — a test that needs more
@@ -365,12 +370,43 @@ const HARNESS_REPORT_CAPACITY: usize = 16;
 /// plus a fresh [`RpcContext`] wired to it, with neutral lifecycle extras: a
 /// harness nobody configured arms nothing and reports nothing.
 pub(crate) fn harness(scripts: Vec<ProcScript>) -> Harness {
+    // A machine with no visible processes: nothing an app arms against can
+    // ever be found, so nothing breaches. NOT `ScriptedSampler::new(vec![])`,
+    // which is a fixture bug the constructor asserts on — the neutral value
+    // is one reading holding an empty table.
+    harness_sampling(scripts, vec![vec![]])
+}
+
+/// [`harness`], over a process table that really holds the first sheep's
+/// tree.
+///
+/// The one fixture in this file whose resource readings mean anything: the
+/// pid it describes is the one [`ScriptedRunner`] hands the first spawn, so a
+/// sheep started through this harness joins against a reading rather than
+/// against nothing. Every reading reports the same 4 KiB tree and a CPU
+/// counter that advances 1500 ms between the first two — enough for a caller
+/// to record a baseline off one reading and measure a known percentage
+/// against the next.
+pub(crate) fn harness_with_stats(scripts: Vec<ProcScript>) -> Harness {
+    let tree = |cpu_ms| {
+        vec![ProcessRss {
+            pid: FIRST_SCRIPTED_PID,
+            parent: None,
+            bytes: SCRIPTED_TREE_BYTES,
+            cpu_ms,
+        }]
+    };
+    harness_sampling(scripts, vec![tree(1_000), tree(2_500), tree(2_501)])
+}
+
+/// Resident size every reading [`harness_with_stats`] scripts reports, small
+/// and distinctive so a test asserting on it cannot be reading a default.
+pub(crate) const SCRIPTED_TREE_BYTES: u64 = 4096;
+
+/// [`harness`] over a scripted process table — the body both spellings share.
+fn harness_sampling(scripts: Vec<ProcScript>, readings: Vec<Vec<ProcessRss>>) -> Harness {
     harness_with_extras(scripts, |reports| {
-        // A machine with no visible processes: nothing an app arms against
-        // can ever be found, so nothing breaches. NOT `ScriptedSampler::new
-        // (vec![])`, which is a fixture bug the constructor asserts on — the
-        // neutral value is one reading holding an empty table.
-        let sampler: Arc<dyn MemorySampler> = Arc::new(ScriptedSampler::new(vec![vec![]]));
+        let sampler: Arc<dyn MemorySampler> = Arc::new(ScriptedSampler::new(readings));
         let stats = Arc::new(StatsState::new(Arc::clone(&sampler)));
         Extras {
             clock: Arc::new(TestClock::starting_at(
@@ -430,6 +466,10 @@ pub(crate) fn harness_with_extras(
         breaches: breach_tx,
         liveness: live_tx,
     });
+    // Taken before `extras` is moved, exactly as `boot` takes it: the RPC
+    // layer and the extras must share ONE state, or a listing would read a
+    // watch set nothing ever wrote to.
+    let stats = Arc::clone(&extras.stats);
     let supervisor =
         SupervisorBuilder::new(ScriptedRunner::new(scripts), paths.clone(), events.clone())
             .extras(extras)
@@ -444,12 +484,14 @@ pub(crate) fn harness_with_extras(
             daemon_version: "0.1.0".to_string(),
             pid: 4242,
             shutdown: Arc::new(shutdown),
+            stats: Arc::clone(&stats),
         },
         _dir: dir,
         _events_rx: events_rx,
         shutdown_rx,
         breaches,
         liveness,
+        stats,
     }
 }
 

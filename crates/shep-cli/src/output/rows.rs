@@ -74,7 +74,14 @@ impl Render for FlockRows {
         // together — a column here would wreck the table `flock` exists to
         // print. They ride the JSON so a programmatic consumer can find a
         // sheep's logs without re-deriving paths the daemon alone resolves.
-        "out_file", "err_file",
+        "out_file",
+        "err_file",
+        // Live resource readings. They reach a programmatic consumer
+        // through the JSON; giving each one a table column is a change to
+        // what this table looks like, and belongs with that change rather
+        // than with the payload growing the fields.
+        "cpu_percent",
+        "memory_bytes",
     ];
 }
 
@@ -145,17 +152,20 @@ impl Render for FlushedRows {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[
-        // A sheep's lifecycle, which a flush neither reads nor changes. They
-        // stay in the JSON because `Response::Flushed` carries the same
-        // `ProcessInfo` every other verb answers with, and a consumer
-        // switching on the envelope's `command` should not find the record
-        // shape switching with it — but four columns of it would push the two
-        // paths this verb exists to report off the side of a terminal.
+        // A sheep's lifecycle and its resource use, neither of which a flush
+        // reads or changes. They stay in the JSON because
+        // `Response::Flushed` carries the same `ProcessInfo` every other
+        // verb answers with, and a consumer switching on the envelope's
+        // `command` should not find the record shape switching with it — but
+        // a column each would push the two paths this verb exists to report
+        // off the side of a terminal.
         "status",
         "pid",
         "restarts",
         "uptime_ms",
         "fold",
+        "cpu_percent",
+        "memory_bytes",
     ];
 }
 
@@ -646,16 +656,21 @@ pub(crate) mod tests {
             name: name.to_string(),
             status: ProcStatus::Online,
             // Every `Option` field `Some`: `flock_rows_do_not_drift` below
-            // serializes this value and diffs its keys against `headers()`,
-            // and a `None` field vanishes from the JSON entirely (no key at
-            // all) rather than merely rendering empty — the drift test would
-            // not see it either way.
+            // pins each cell against its own JSON value, and a `None`
+            // serializes as `null`, which that check skips rather than
+            // compares — so a field left empty here is a column the drift
+            // test stops watching.
             pid: Some(1000 + id),
             restarts: id,
             uptime_ms,
             fold: Some("backend".to_string()),
             out_file: Some(format!("/logs/{name}-0-out.log")),
             err_file: Some(format!("/logs/{name}-0-err.log")),
+            // The two exceptions to the rule above: neither is a column
+            // (see `JSON_ONLY`), so neither has a cell for the drift test to
+            // pin, and a value here would only be a value nobody reads.
+            cpu_percent: None,
+            memory_bytes: None,
         }
     }
 

@@ -51,6 +51,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Answer `flock` and `describe` with each sheep's live CPU and memory, in the
+  two `ProcessInfo` fields shep-core grew for them. The reading is taken when
+  the request is served, not read off the last periodic tick, so memory is
+  current rather than up to 15 s stale; CPU is the delta since that tick,
+  which is what lets a listing report a rate without blocking for a second
+  reading of its own. A sheep the daemon has not yet sampled once reports no
+  CPU — a percentage invented from a 50 ms window is worse than an empty
+  cell.
+
+  Only those two verbs pay for it. The sample is a syscall walk over the
+  host's whole process table, measured at 5.77 ms across 883 processes, and
+  `start`/`stop`/`restart`/`reload`/`reopen`/`flush` answer with
+  `ProcessInfo` rows nobody reads resource use from. It runs on the blocking
+  pool rather than on a runtime worker, and a listing whose sample fails
+  comes back without the numbers rather than failing outright.
+
+- Name `fake::FIRST_SCRIPTED_PID` (behind `test-fakes`), the pid
+  `ScriptedRunner` hands its first spawn. A fixture describing that proc's
+  process table can say which pid it means instead of repeating the literal.
+
 - Sample every sheep, and enforce only where a limit exists. The polling loop
   used to run for the ids `max_memory` armed it against and for nobody else,
   so an app that set no ceiling — the ordinary case — was never measured at

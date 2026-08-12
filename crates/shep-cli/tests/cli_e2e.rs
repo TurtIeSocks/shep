@@ -861,7 +861,15 @@ fn sheep_named<'a>(data: &'a serde_json::Value, name: &str) -> &'a serde_json::V
 /// differs on every run — the fixture would have to be rewritten by every
 /// test invocation to stay byte-exact. Blanking them is not a licence to
 /// skip checking them: each is asserted against its own real shape first.
-fn normalize_process_info(info: &mut serde_json::Value, home: &Path, name: &str) {
+///
+/// `samples` says whether the verb this envelope answers takes a live
+/// resource reading — `flock` and `describe` do, every other verb answers
+/// with the numbers the actor holds, which are none. It is the whole reason
+/// this helper takes the argument: `memory_bytes` is a real reading off the
+/// host and cannot be pinned either, but WHETHER it is there is exactly the
+/// asymmetry worth asserting, and this is the only tier with a real sheep
+/// and a real sampler to assert it against.
+fn normalize_process_info(info: &mut serde_json::Value, home: &Path, name: &str, samples: Samples) {
     let pid = info["pid"]
         .as_i64()
         .unwrap_or_else(|| panic!("pid must be a real positive OS pid: {info}"));
@@ -883,17 +891,53 @@ fn normalize_process_info(info: &mut serde_json::Value, home: &Path, name: &str)
             "{key} must name this sheep's own log file: {path}"
         );
     }
+    match samples {
+        Samples::Live => {
+            let bytes = info["memory_bytes"].as_u64().unwrap_or_else(|| {
+                panic!("memory_bytes must be a live reading off the host: {info}")
+            });
+            assert!(
+                bytes > 0,
+                "a running sheep's tree cannot be 0 bytes: {info}"
+            );
+        }
+        Samples::None => assert!(
+            info["memory_bytes"].is_null(),
+            "a verb that takes no live sample must report no memory: {info}"
+        ),
+    }
+    // `cpu_percent` is not asserted either way. It needs a periodic baseline
+    // to measure against, and whether one has been recorded depends on
+    // whether the daemon happened to live through a poll interval before
+    // this line ran — a real condition, but a clock race to assert on.
     info["pid"] = serde_json::Value::Null;
     info["uptime_ms"] = serde_json::Value::Null;
     info["out_file"] = serde_json::Value::Null;
     info["err_file"] = serde_json::Value::Null;
+    info["cpu_percent"] = serde_json::Value::Null;
+    info["memory_bytes"] = serde_json::Value::Null;
+}
+
+/// Whether the verb an envelope answers takes a live resource reading.
+#[derive(Debug, Clone, Copy)]
+enum Samples {
+    /// `flock` and `describe`, which sample the host as they reply.
+    Live,
+    /// Every other verb answering with a `ProcessInfo`.
+    None,
 }
 
 /// Parses `output.stdout` as a `flock`/`describe`/`start` envelope,
 /// normalizes its one `data[]` element (this whole file only ever starts
 /// one sheep per `$SHEP_HOME` in these cases), and compares the result
 /// against the committed fixture named `command`.
-fn assert_envelope_matches_fixture(output: &Output, home: &Path, command: &str, sheep_name: &str) {
+fn assert_envelope_matches_fixture(
+    output: &Output,
+    home: &Path,
+    command: &str,
+    sheep_name: &str,
+    samples: Samples,
+) {
     let mut envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
             panic!(
@@ -907,7 +951,7 @@ fn assert_envelope_matches_fixture(output: &Output, home: &Path, command: &str, 
             .unwrap_or_else(|| panic!("{command}: data must be an array"));
         assert_eq!(data.len(), 1, "{command}: exactly one sheep is expected");
     }
-    normalize_process_info(&mut envelope["data"][0], home, sheep_name);
+    normalize_process_info(&mut envelope["data"][0], home, sheep_name, samples);
     assert_eq!(
         envelope,
         load_fixture(command),
@@ -1191,7 +1235,7 @@ fn json_format_matches_the_committed_fixtures() {
         .unwrap();
     guard.adopt_home(home);
     assert_success(&start_out);
-    assert_envelope_matches_fixture(&start_out, home, "start", "fixture");
+    assert_envelope_matches_fixture(&start_out, home, "start", "fixture", Samples::None);
 
     let flock_out = shep(home)
         .arg("--format")
@@ -1200,7 +1244,7 @@ fn json_format_matches_the_committed_fixtures() {
         .output()
         .unwrap();
     assert_success(&flock_out);
-    assert_envelope_matches_fixture(&flock_out, home, "flock", "fixture");
+    assert_envelope_matches_fixture(&flock_out, home, "flock", "fixture", Samples::Live);
 
     let describe_out = shep(home)
         .arg("--format")
@@ -1210,7 +1254,7 @@ fn json_format_matches_the_committed_fixtures() {
         .output()
         .unwrap();
     assert_success(&describe_out);
-    assert_envelope_matches_fixture(&describe_out, home, "describe", "fixture");
+    assert_envelope_matches_fixture(&describe_out, home, "describe", "fixture", Samples::Live);
 
     let ping_out = shep(home)
         .arg("--format")

@@ -3993,6 +3993,14 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
         // the whole reply and blank the listing for every other sheep.
         out_file: Some(entry.out_file.to_string_lossy().into_owned()),
         err_file: Some(entry.err_file.to_string_lossy().into_owned()),
+        // Left empty here, and filled in by the RPC layer for the two
+        // verbs an operator reads resource usage from. Reading them is a
+        // syscall walk over the host's whole process table, and the
+        // actor must never block; every other caller of this function
+        // answers a lifecycle verb, where the numbers would be paid for
+        // and never read.
+        cpu_percent: None,
+        memory_bytes: None,
     }
 }
 

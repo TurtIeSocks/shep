@@ -12,6 +12,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `ProcessInfo::cpu_percent` and `ProcessInfo::memory_bytes`, a sheep's
+  live resource use as the daemon read it while answering. CPU is a
+  percentage of one core over the window since the daemon's last periodic
+  sample, memory a resident set size in bytes; both are summed over the
+  sheep's whole process tree, so a sheep that forks lambs is reported as what
+  it actually costs the machine. Both are `Option`, and all three of the
+  cases that make one `None` render as unknown rather than as zero: the sheep
+  is not running, it has been up for less than one sampling window and so has
+  no honest CPU figure yet, or the peer daemon predates the fields.
+  `PROTOCOL_VERSION` stays 1 for the reason `out_file`/`err_file` left it at
+  1 — the fields are additive, they decode to `None` from pre-existing bytes
+  (pinned by a committed byte fixture), and a peer that predates them ignores
+  them.
+
 - Add `ProbeTarget`, parsing a probe's `target` once, at config time, into the
   form its kind promises: `http://host[:port][/path]` for `Http` (port
   defaults to 80, path to `/`), `host:port` for `Tcp`, and any non-empty
@@ -255,6 +269,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values (e.g. webhook URLs); it now prints only the table count.
 
 ### Changes
+
+- `ProcessInfo` no longer derives `Eq`. `cpu_percent` is an `f32` and floats
+  are only partially ordered, so the derive could not survive the field.
+  `PartialEq` stays, which is everything `assert_eq!` and a `==` comparison
+  need; what stops compiling downstream is a `HashSet<ProcessInfo>`, a
+  `BTreeSet` of them, or a type that derives `Eq` and holds one. Nothing in
+  this workspace does any of the three.
 
 - `cron_restart` validation moves in both directions. Tighter: patterns the
   stopgap accepted purely on token count (e.g. `99 99 99 99 99`) now fail

@@ -580,6 +580,8 @@ mod tests {
             fold: None,
             out_file: Some(format!("/logs/{name}-0-out.log")),
             err_file: Some(format!("/logs/{name}-0-err.log")),
+            cpu_percent: None,
+            memory_bytes: None,
         }
     }
 

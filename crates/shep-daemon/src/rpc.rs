@@ -30,6 +30,7 @@ use shep_core::protocol::{
 use shep_core::selector::ProcessSelector;
 
 use crate::bus::TopicFilter;
+use crate::limits::stats::StatsState;
 use crate::snapshot::{FlockRegistry, SnapshotError, write_atomic};
 use crate::supervisor::{SupervisorError, SupervisorHandle};
 
@@ -66,6 +67,12 @@ pub struct RpcContext {
     pub(crate) pid: u32,
     /// Flips to `true` to start graceful daemon shutdown; see [`Self::shutdown`].
     pub(crate) shutdown: Arc<watch::Sender<bool>>,
+    /// The live resource readings [`with_live_stats`] takes a sample from.
+    ///
+    /// The same state the supervisor's extras hold: they decide which sheep
+    /// is watched and record the periodic CPU baseline, and this side reads
+    /// against it.
+    pub(crate) stats: Arc<StatsState>,
 }
 
 /// Where a muster roll landed and what it recorded.
@@ -197,10 +204,18 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
     let reply = |result| Outcome::Reply(Reply { id, result });
     match request {
         Request::Ping => reply(Ok(Response::Pong)),
+        // One of the two verbs that pays for a live reading — see
+        // [`with_live_stats`] for what that costs and why every lifecycle
+        // verb below goes without.
         Request::ListFlock => match ctx.supervisor.list_checked().await {
-            Ok(infos) => reply(Ok(Response::Flock(infos))),
+            Ok(infos) => reply(Ok(Response::Flock(
+                with_live_stats(&ctx.stats, infos).await,
+            ))),
             Err(err) => reply(Err(rpc_error(&err))),
         },
+        // The other one. Sampled after the selector has narrowed the
+        // listing, not before: the walk itself costs the same either way,
+        // but the join below then runs over the matched rows alone.
         Request::Describe { selector } => match selector_of(selector) {
             Err(err) => reply(Err(err)),
             Ok(selector) => match ctx.supervisor.list_checked().await {
@@ -213,7 +228,9 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
                     if hits.is_empty() {
                         reply(Err(not_found()))
                     } else {
-                        reply(Ok(Response::Described(hits)))
+                        reply(Ok(Response::Described(
+                            with_live_stats(&ctx.stats, hits).await,
+                        )))
                     }
                 }
             },
@@ -348,6 +365,39 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
     }
 }
 
+/// Fills in each running sheep's live CPU and memory.
+///
+/// The sample is taken here rather than inside the supervisor for two
+/// reasons that point the same way: the actor must never block, and the
+/// reading is a syscall walk over the host's whole process table — measured
+/// at 5.77 ms across 883 processes — so it runs on a blocking-pool thread
+/// and not on a runtime worker.
+///
+/// Joined by pid, not by id: [`StatsState`] keys on the root pid it was armed
+/// against, which is the same number [`ProcessInfo::pid`] carries, and a sheep
+/// with no pid is not running and has nothing to report.
+///
+/// Only `ListFlock` and `Describe` call this. `Started`/`Stopped`/
+/// `Restarted`/`Reloading`/`Reopened`/`Flushed` all answer with
+/// [`ProcessInfo`] too, and none of them is a place an operator reads
+/// resource usage — paying that walk on every `stop` would be a cost for
+/// nobody.
+async fn with_live_stats(stats: &Arc<StatsState>, mut infos: Vec<ProcessInfo>) -> Vec<ProcessInfo> {
+    let stats = Arc::clone(stats);
+    let Ok(sample) = tokio::task::spawn_blocking(move || stats.sample_now()).await else {
+        // The blocking pool is gone or the task panicked: report the flock
+        // without stats rather than fail a listing over a decoration.
+        return infos;
+    };
+    for info in &mut infos {
+        if let Some(reading) = info.pid.and_then(|pid| sample.get(&pid)) {
+            info.cpu_percent = reading.cpu_percent;
+            info.memory_bytes = Some(reading.memory_bytes);
+        }
+    }
+    infos
+}
+
 fn rpc_error(err: &SupervisorError) -> RpcError {
     match err {
         SupervisorError::NotFound => not_found(),
@@ -465,14 +515,16 @@ async fn trigger(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake::ProcScript;
-    use crate::testing::harness;
+    use crate::fake::{FIRST_SCRIPTED_PID, ProcScript};
+    use crate::limits::MEMORY_POLL_INTERVAL;
+    use crate::testing::{Harness, SCRIPTED_TREE_BYTES, harness, harness_with_stats};
     use shep_core::config::AppConfig;
     use shep_core::protocol::{
         ActionOutcome, ActionReply, Request, Response, RpcErrorCode, SelectorSpec,
     };
     use shep_core::status::ProcStatus;
     use shep_core::values::UpDuration;
+    use tokio::time::Instant;
 
     fn envelope(id: u64, body: Request) -> Envelope {
         Envelope {
@@ -1265,5 +1317,221 @@ mod tests {
         );
         assert_eq!(infos[0].name, "web");
         assert_eq!(infos[0].status, ProcStatus::Online);
+    }
+
+    /// Starts `web` through `h` and returns nothing — every case below opens
+    /// this way, and none of them asserts on the start reply itself.
+    async fn start_web(h: &Harness) {
+        reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+    }
+
+    /// The flock a `ListFlock` on `ctx` answers with.
+    ///
+    /// # Panics
+    ///
+    /// If the reply is anything but `Flock` — a fixture bug at the call site.
+    async fn list_flock(ctx: &RpcContext, id: u64) -> Vec<ProcessInfo> {
+        let reply = reply_of(dispatch(envelope(id, Request::ListFlock), ctx).await);
+        let Ok(Response::Flock(infos)) = reply.result else {
+            panic!("expected Flock, got {:?}", reply.result)
+        };
+        infos
+    }
+
+    /// fails if `ListFlock` stops taking a live sample — the fields would
+    /// come back `None` for a running sheep, which a reader renders as `-`
+    /// and an operator reads as "shep cannot see it".
+    #[tokio::test]
+    async fn list_flock_carries_a_live_memory_reading_for_a_running_sheep() {
+        // The harness's sampler is scripted, so the number below is the
+        // fixture's and not the machine's — this asserts the plumbing, not
+        // sysinfo. `ScriptedRunner` hands out `FIRST_SCRIPTED_PID`, and the
+        // scripted reading describes a tree rooted at that same pid.
+        let h = harness_with_stats(vec![ProcScript::never_exits()]);
+        start_web(&h).await;
+
+        let infos = list_flock(&h.ctx, 2).await;
+        assert_eq!(infos[0].pid, Some(FIRST_SCRIPTED_PID));
+        assert_eq!(infos[0].memory_bytes, Some(SCRIPTED_TREE_BYTES));
+        assert_eq!(
+            infos[0].cpu_percent, None,
+            "no periodic baseline has been recorded, and a number invented \
+             from the read's own window is worse than an empty cell"
+        );
+    }
+
+    /// fails if a listing measures CPU over its own window rather than over
+    /// the one since the last periodic sample.
+    ///
+    /// The case the previous test cannot reach: there, `cpu_percent` is
+    /// `None` for a running sheep and stays `None` under an implementation
+    /// that hard-codes it. Here a baseline exists, so a real number has to
+    /// come back — and the SECOND listing is what says which window produced
+    /// it. 1500 CPU-ms over the 15 s since the baseline is 10%; the same
+    /// counter measured over the millisecond since the previous listing is
+    /// hundreds of percent.
+    #[tokio::test]
+    async fn list_flock_measures_cpu_from_the_periodic_baseline_not_from_the_previous_listing() {
+        let h = harness_with_stats(vec![ProcScript::never_exits()]);
+        start_web(&h).await;
+        // A baseline dated one poll interval back, which is what the tick
+        // would have left behind had one fired: the clock here is real, so a
+        // test that waited for the enforcer's own tick would wait 15 s.
+        let last_tick = Instant::now()
+            .checked_sub(MEMORY_POLL_INTERVAL)
+            .expect("the monotonic clock is older than one poll interval");
+        h.stats.record_baseline_now(last_tick);
+
+        let first = list_flock(&h.ctx, 2).await[0]
+            .cpu_percent
+            .expect("a baseline exists, so a running sheep has a CPU figure");
+        let second = list_flock(&h.ctx, 3).await[0]
+            .cpu_percent
+            .expect("a baseline exists, so a running sheep has a CPU figure");
+
+        assert!(
+            (5.0..=10.05).contains(&first),
+            "1500 CPU-ms over the 15 s since the baseline is 10%; got {first}"
+        );
+        assert!(
+            (second - first).abs() < 1.0,
+            "the second listing divided by the gap between the two LISTINGS \
+             rather than by the window since the tick: {first} then {second}"
+        );
+    }
+
+    /// fails if `Describe` stops taking a live sample. It is the second of
+    /// the two verbs an operator reads resource usage from, and an
+    /// implementation wired into `ListFlock` alone passes every other case
+    /// here.
+    #[tokio::test]
+    async fn describe_carries_a_live_reading_too() {
+        let h = harness_with_stats(vec![ProcScript::never_exits()]);
+        start_web(&h).await;
+
+        let described = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::Describe {
+                        selector: SelectorSpec::Name("web".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::Described(infos)) = described.result else {
+            panic!("expected Described, got {:?}", described.result)
+        };
+        assert_eq!(infos[0].memory_bytes, Some(SCRIPTED_TREE_BYTES));
+    }
+
+    /// fails if a sheep with no pid is given someone else's numbers. The
+    /// join is keyed on the pid a reading was taken against, and one that
+    /// fell back to anything else — the id, or simply the first reading in
+    /// the sample — would print one sheep's resource use against another.
+    ///
+    /// Two sheep, and both are needed. A listing holding only the stopped
+    /// one cannot tell a pid-keyed join from any other: stopping a sheep
+    /// unwatches it, so the sample comes back empty and EVERY join misses.
+    /// The running sheep is what puts a reading in that sample for a
+    /// fallback to reach.
+    #[tokio::test]
+    async fn a_sheep_with_no_pid_reports_no_stats() {
+        let h = harness_with_stats(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        start_web(&h).await;
+        reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("worker", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        reply_of(
+            dispatch(
+                envelope(
+                    3,
+                    Request::Stop {
+                        selector: SelectorSpec::Name("worker".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        let infos = list_flock(&h.ctx, 4).await;
+        let named = |name: &str| {
+            infos
+                .iter()
+                .find(|info| info.name == name)
+                .unwrap_or_else(|| panic!("{name} is missing from the listing"))
+        };
+        // The scripted table describes the first spawn's pid and no other,
+        // so this is the one row in the listing carrying a reading — and the
+        // one a fallback join would hand to its neighbour.
+        assert_eq!(named("web").pid, Some(FIRST_SCRIPTED_PID));
+        assert_eq!(named("web").memory_bytes, Some(SCRIPTED_TREE_BYTES));
+
+        assert_eq!(named("worker").pid, None);
+        assert_eq!(named("worker").memory_bytes, None);
+        assert_eq!(named("worker").cpu_percent, None);
+    }
+
+    /// fails if a lifecycle verb starts paying for a sample. A 5.77 ms
+    /// syscall walk over the host's whole process table, on every `start`,
+    /// buys a reading nobody reads there.
+    ///
+    /// Asserted on `Started` rather than on `Stopped`, which is the reply a
+    /// reader expects here: a stopped sheep has no pid, so its row comes
+    /// back empty whether or not the verb sampled, and the assertion would
+    /// hold for either implementation. `Started` answers with a running
+    /// sheep whose pid DOES join a scripted reading — pinned below, so this
+    /// case cannot quietly become the vacuous one.
+    #[tokio::test]
+    async fn a_lifecycle_reply_carries_no_stats() {
+        let h = harness_with_stats(vec![ProcScript::never_exits()]);
+        let started = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::Started(infos)) = started.result else {
+            panic!("expected Started, got {:?}", started.result)
+        };
+        assert_eq!(
+            infos[0].pid,
+            Some(FIRST_SCRIPTED_PID),
+            "a row with no pid would report no stats however the verb behaved"
+        );
+        assert_eq!(
+            infos[0].memory_bytes, None,
+            "only `flock` and `describe` take a live sample"
+        );
+        assert_eq!(infos[0].cpu_percent, None);
     }
 }

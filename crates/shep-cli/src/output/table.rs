@@ -210,6 +210,8 @@ mod tests {
             fold: None,
             out_file: None,
             err_file: None,
+            cpu_percent: None,
+            memory_bytes: None,
         }
     }
 

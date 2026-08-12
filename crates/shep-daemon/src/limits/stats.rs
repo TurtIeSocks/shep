@@ -156,7 +156,7 @@ impl StatsState {
     /// table twice per tick, which leaves this one with no production caller
     /// — it exists so a test can put a baseline in place in one line instead
     /// of reaching through to the sampler for an index of its own.
-    #[allow(dead_code, reason = "called by this module's own tests")]
+    #[allow(dead_code, reason = "called only by this crate's tests")]
     pub(crate) fn record_baseline_now(&self, now: Instant) {
         let table = self.sampler.sample();
         self.record_baseline(&TreeIndex::build(&table), now);
@@ -167,10 +167,6 @@ impl StatsState {
     /// Blocking: it performs the syscall walk itself, which is what makes the
     /// memory figure current rather than up to `MEMORY_POLL_INTERVAL` stale.
     /// It writes no baseline — see this type's own doc for why that matters.
-    #[allow(
-        dead_code,
-        reason = "no caller until a listing reads resource use off the RPC layer"
-    )]
     pub(crate) fn sample_now(&self) -> HashMap<u32, SheepStats> {
         let roots = self.watched_pids();
         let table = self.sampler.sample();

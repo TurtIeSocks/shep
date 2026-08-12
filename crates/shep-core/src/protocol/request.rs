@@ -162,7 +162,18 @@ pub enum Request {
 // there, so a new client could not list against an old daemon. `None`
 // means precisely "this peer predates the field" — which readers must
 // render as unknown, NOT as "this sheep has no log file".
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+//
+// `cpu_percent`/`memory_bytes` are optional for that same skew reason and
+// for one of their own: a sheep that is not running has no resource use to
+// report, and one that has been up for less than a sampling window has no
+// honest CPU figure. All three cases render as unknown, never as zero.
+//
+// No `Eq`, which every other wire struct in this module derives:
+// `cpu_percent` is an `f32` and floats are only partially ordered. Nothing
+// compares a `ProcessInfo` for total equality — `assert_eq!` needs only
+// `PartialEq`, and no listing is keyed on, hashed by, or sorted by a whole
+// row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessInfo {
     /// Stable numeric id
     pub id: u32,
@@ -184,6 +195,18 @@ pub struct ProcessInfo {
     pub out_file: Option<String>,
     /// Resolved stderr log path, resolved exactly as [`Self::out_file`]
     pub err_file: Option<String>,
+    /// Tree CPU as a percentage of one core, over the window since the
+    /// daemon's last periodic sample. `None` when the sheep is not running,
+    /// when it has been up for less than one sampling window, or when the
+    /// peer daemon predates this field — all three of which a reader
+    /// renders as unknown, never as zero.
+    ///
+    /// A value over 100 is a tree using more than one core, not a bug.
+    pub cpu_percent: Option<f32>,
+    /// Tree resident set size in bytes, current as of the reply. `None`
+    /// under the same three conditions as [`Self::cpu_percent`], minus the
+    /// window one — memory needs no baseline.
+    pub memory_bytes: Option<u64>,
 }
 
 /// What happened when the daemon tried to deliver one sheep's triggered
@@ -431,6 +454,11 @@ mod tests {
             fold: Some("backend".to_string()),
             out_file: Some("/home/rin/.shep/logs/web-0-out.log".to_string()),
             err_file: Some("/home/rin/.shep/logs/web-0-err.log".to_string()),
+            // 12.5 rather than a rounder-looking 12.3: an insta JSON
+            // snapshot is only stable across platforms for a float the
+            // binary representation holds exactly.
+            cpu_percent: Some(12.5),
+            memory_bytes: Some(48 * 1024 * 1024),
         }
     }
 
@@ -641,6 +669,18 @@ mod tests {
         let fixture = r#"{"Ok":{"daemon_version":"0.1.0","protocol":1,"pid":4242}}"#;
         let ack: HelloReply = serde_json::from_str(fixture).unwrap();
         assert_eq!(ack.unwrap().pid, 4242);
+    }
+
+    /// fails if the two fields stop being optional. A daemon built before
+    /// them sends a reply with no such keys, and both peers still announce
+    /// protocol 1 — a required field would make a current client unable to
+    /// list against that daemon at all.
+    #[test]
+    fn v1_process_info_without_stats_still_deserializes() {
+        let fixture = r#"{"id":3,"name":"web","status":"online","pid":4242,"restarts":1,"uptime_ms":60000,"fold":"backend","out_file":"/l/o.log","err_file":"/l/e.log"}"#;
+        let info: ProcessInfo = serde_json::from_str(fixture).unwrap();
+        assert_eq!(info.cpu_percent, None);
+        assert_eq!(info.memory_bytes, None);
     }
 
     #[test]

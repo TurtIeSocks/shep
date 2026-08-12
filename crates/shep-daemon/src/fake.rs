@@ -325,6 +325,14 @@ struct SpawnedProc {
     flushes: Arc<AtomicU32>,
 }
 
+/// The pid [`ScriptedRunner`] gives the first proc it spawns; each later
+/// spawn gets the next number up.
+///
+/// Named so a fixture that has to describe that proc's process table — a
+/// scripted memory sampler, say — can say which pid it means instead of
+/// repeating a literal this file is free to change.
+pub const FIRST_SCRIPTED_PID: u32 = 1000;
+
 /// Deterministic fake [`ProcessRunner`] driven by a pre-scripted [`ProcScript`] per spawn.
 pub struct ScriptedRunner {
     scripts: Mutex<VecDeque<ProcScript>>,
@@ -641,7 +649,7 @@ impl ProcessRunner for ScriptedRunner {
             log_ctl: log_ctl_tx,
         };
         // Arbitrary but deterministic — real pids come from the OS in the real runner.
-        let pid = 1000 + u32::try_from(index).unwrap_or(u32::MAX);
+        let pid = FIRST_SCRIPTED_PID + u32::try_from(index).unwrap_or(u32::MAX);
         Ok((FakeProc { pid, state }, proc_io))
     }
 }

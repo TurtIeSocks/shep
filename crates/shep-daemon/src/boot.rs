@@ -596,6 +596,12 @@ pub async fn boot<R: ProcessRunner>(
         },
         max_cron_sleep(&options),
     );
+    // Taken before `extras` is moved into the builder. One `StatsState`, two
+    // owners, for the reason `Extras::enforcer` is shared the same way: the
+    // extras decide which sheep is watched and record the periodic CPU
+    // baseline, the RPC layer reads a live sample against it, and a second
+    // state would leave one of the two reading an empty watch set.
+    let stats = Arc::clone(&extras.stats);
     let supervisor = SupervisorBuilder::new(runner, paths.clone(), events.clone())
         .extras(extras)
         .spawn();
@@ -646,6 +652,7 @@ pub async fn boot<R: ProcessRunner>(
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         pid,
         shutdown,
+        stats,
     };
 
     // 5. The flock is back and the plane is assembled, so this daemon is

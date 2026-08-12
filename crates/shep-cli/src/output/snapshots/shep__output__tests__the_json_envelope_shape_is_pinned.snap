@@ -15,7 +15,9 @@ expression: out
       "uptime_ms": 60000,
       "fold": "backend",
       "out_file": "/logs/web-0-out.log",
-      "err_file": "/logs/web-0-err.log"
+      "err_file": "/logs/web-0-err.log",
+      "cpu_percent": null,
+      "memory_bytes": null
     },
     {
       "id": 2,
@@ -26,7 +28,9 @@ expression: out
       "uptime_ms": 120000,
       "fold": "backend",
       "out_file": "/logs/worker-0-out.log",
-      "err_file": "/logs/worker-0-err.log"
+      "err_file": "/logs/worker-0-err.log",
+      "cpu_percent": null,
+      "memory_bytes": null
     },
     {
       "id": 3,
@@ -37,7 +41,9 @@ expression: out
       "uptime_ms": 30000,
       "fold": "backend",
       "out_file": "/logs/cron-0-out.log",
-      "err_file": "/logs/cron-0-err.log"
+      "err_file": "/logs/cron-0-err.log",
+      "cpu_percent": null,
+      "memory_bytes": null
     }
   ]
 }
