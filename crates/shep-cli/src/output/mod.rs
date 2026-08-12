@@ -35,7 +35,7 @@ pub use rows::{
     DeletedIds, EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, ImportRow, ImportRows, KillRow,
     PingRow, SavedRollRow, StartupStep, StartupSteps, TriggeredRows,
 };
-pub use table::{human_duration, render_table};
+pub use table::{human_bytes, human_duration, render_table};
 
 use crate::cli::Format;
 

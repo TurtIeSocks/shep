@@ -382,6 +382,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   systems and this pair covers two, so a machine running either of the others
   is refused by name rather than handed a unit for something it does not run.
 
+- `flock` and `describe` show each sheep's live CPU and memory. `CPU` and
+  `MEM` land between `RESTARTS` and `UPTIME`, where `pm2 ls` puts them and
+  where an operator scanning the table looks; `-` for a sheep with no
+  reading, the same rule `PID` and `FOLD` already follow and for the same
+  reason — an empty cell in a padded table reads as a bug, and `0.0%` would
+  claim something the daemon never measured.
+
+  `MEM` goes through a new `human_bytes`, not `MemSize`'s own `Display`:
+  that impl only names a unit that divides the value exactly, so a live
+  resident set of 50 462 720 bytes would print as the unreadable "50462720"
+  rather than "48.1M". `CPU` gets the same one decimal place — six would be
+  noise on a number this volatile.
+
+  Both fields already rode along in the JSON; this only gives them a
+  column. `shep flush`'s own table is untouched — its CHANGELOG entry
+  already covers why lifecycle and resource fields stay JSON-only there.
+
 ### Fixes
 
 - Open the shepherd's own `shepd.out.log`/`shepd.err.log` `O_APPEND` in the

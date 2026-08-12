@@ -31,7 +31,9 @@ pub struct FlockRows(pub Vec<ProcessInfo>);
 
 impl Render for FlockRows {
     fn headers() -> &'static [&'static str] {
-        &["ID", "NAME", "STATUS", "PID", "RESTARTS", "UPTIME", "FOLD"]
+        &[
+            "ID", "NAME", "STATUS", "PID", "RESTARTS", "CPU", "MEM", "UPTIME", "FOLD",
+        ]
     }
 
     fn rows(&self) -> Vec<Vec<String>> {
@@ -46,6 +48,15 @@ impl Render for FlockRows {
                     // padded table is indistinguishable from a rendering bug.
                     p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                     p.restarts.to_string(),
+                    // `-` for the same reason, and for the same stated
+                    // reason PID uses it: a sheep that is not running, or
+                    // has been up for less than one sampling window, has no
+                    // honest number to report, and `0.0%` would claim the
+                    // daemon never made — "this sheep is using no CPU".
+                    p.cpu_percent
+                        .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
+                    p.memory_bytes
+                        .map_or_else(|| "-".to_string(), super::human_bytes),
                     super::human_duration(p.uptime_ms),
                     p.fold.clone().unwrap_or_else(|| "-".to_string()),
                 ]
@@ -63,6 +74,8 @@ impl Render for FlockRows {
             "STATUS" => "status",
             "PID" => "pid",
             "RESTARTS" => "restarts",
+            "CPU" => "cpu_percent",
+            "MEM" => "memory_bytes",
             "UPTIME" => "uptime_ms",
             "FOLD" => "fold",
             other => panic!("FlockRows::headers() does not include {other:?}"),
@@ -74,14 +87,7 @@ impl Render for FlockRows {
         // together — a column here would wreck the table `flock` exists to
         // print. They ride the JSON so a programmatic consumer can find a
         // sheep's logs without re-deriving paths the daemon alone resolves.
-        "out_file",
-        "err_file",
-        // Live resource readings. They reach a programmatic consumer
-        // through the JSON; giving each one a table column is a change to
-        // what this table looks like, and belongs with that change rather
-        // than with the payload growing the fields.
-        "cpu_percent",
-        "memory_bytes",
+        "out_file", "err_file",
     ];
 }
 
@@ -666,11 +672,13 @@ pub(crate) mod tests {
             fold: Some("backend".to_string()),
             out_file: Some(format!("/logs/{name}-0-out.log")),
             err_file: Some(format!("/logs/{name}-0-err.log")),
-            // The two exceptions to the rule above: neither is a column
-            // (see `JSON_ONLY`), so neither has a cell for the drift test to
-            // pin, and a value here would only be a value nobody reads.
-            cpu_percent: None,
-            memory_bytes: None,
+            // Fixed rather than id-derived, like `fold` above: every sample
+            // sheep shares one reading. `memory_bytes` is the same value
+            // `human_bytes`'s own doc uses to show it is not `MemSize`'s
+            // `Display` — 50 462 720 bytes is not a round number of MiB, and
+            // rendering it as "48.1M" is the whole point of that function.
+            cpu_percent: Some(12.5),
+            memory_bytes: Some(50_462_720),
         }
     }
 
@@ -783,9 +791,27 @@ pub(crate) mod tests {
 
     #[test]
     fn flock_rows_do_not_drift() {
-        // UPTIME is formatted (`human_duration`), not a raw echo of
-        // `uptime_ms` — see the doc comment on `assert_no_drift` above.
-        assert_no_drift(&sample_flock(), |j| &j[0], &["UPTIME"]);
+        // UPTIME, CPU and MEM are formatted (`human_duration`/`human_bytes`),
+        // not raw echoes of `uptime_ms`/`cpu_percent`/`memory_bytes` — see
+        // the doc comment on `assert_no_drift` above.
+        assert_no_drift(&sample_flock(), |j| &j[0], &["UPTIME", "CPU", "MEM"]);
+    }
+
+    /// fails if a sheep with no reading renders an empty cell or a zero. A
+    /// zero is a claim — "this sheep is using no CPU" — and the daemon says
+    /// `None` precisely when it cannot make that claim.
+    #[test]
+    fn a_sheep_with_no_reading_renders_a_dash_not_a_zero() {
+        let mut info = sample_info(1, "web", 60_000);
+        info.cpu_percent = None;
+        info.memory_bytes = None;
+        let rows = FlockRows(vec![info]);
+        let cells = &rows.rows()[0];
+        let headers = FlockRows::headers();
+        let cpu = cells[headers.iter().position(|h| *h == "CPU").unwrap()].clone();
+        let mem = cells[headers.iter().position(|h| *h == "MEM").unwrap()].clone();
+        assert_eq!(cpu, "-");
+        assert_eq!(mem, "-");
     }
 
     #[test]
