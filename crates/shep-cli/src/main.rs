@@ -1,8 +1,15 @@
-//! The `shep` binary: clap command surface, output rendering, ratatui
-//! dashboard, static file server, startup-script generation, and the
-//! container (`shep runtime`) and dev (`shep dev`) execution modes — all one
-//! multi-call binary. Module-by-module design:
+//! The `shep` binary: clap command surface, output rendering, and the
+//! daemon launch/re-exec path. Module-by-module design:
 //! `docs/systematic-refactor/refactor-workspace/map.md`.
+//!
+//! A ratatui dashboard (`lookout`), a static file server (`serve`),
+//! startup-script generation (`startup`/`unstartup`), and the container
+//! (`shep runtime`) and dev (`shep dev`) execution modes are spec'd
+//! (`docs/specs/shep-v1.md` §9) but not built — this crate depends on
+//! neither `ratatui`, `axum` nor `tower-http`, and there is no `[[bin]]`
+//! beyond `shep` itself. Recorded here as deliberately absent rather than
+//! letting them quietly read as shipped; full inventory:
+//! `docs/specs/deferred.md`.
 
 #![forbid(unsafe_code)]
 
