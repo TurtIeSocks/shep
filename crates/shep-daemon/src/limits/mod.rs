@@ -8,6 +8,13 @@
 //! tree out of a reading. [`LimitEnforcer`] watches those sums for a breach;
 //! `PollingEnforcer` is the polling implementation.
 //!
+//! Sampling is not the same job as enforcement, and the two cover different
+//! sheep: `stats::StatsState` samples EVERY sheep with a pid, because
+//! `shep flock` reports CPU and memory for a whole flock, while the enforcer
+//! is armed only where an app configured a `max_memory` to enforce. One tick
+//! serves both — the polling loop takes the reading once and hands the index
+//! to each — so splitting the two costs no extra walk of the process table.
+//!
 //! > Deviation from pm2 (deliberate): memory is measured over the sheep's
 //! > whole process tree, not the root pid alone. [`sample::tree_rss`] walks
 //! > the OS's **parent-pid** links; sysinfo exposes no process-group id, so
@@ -56,6 +63,7 @@
 //! - [`sample::MemorySampler`], [`sample::SysinfoSampler`],
 //!   [`sample::ProcessRss`], [`sample::tree_rss`]
 //! - [`LimitEnforcer`], `PollingEnforcer`, `LimitBreach`, `MEMORY_POLL_INTERVAL`
+//! - `stats::StatsState`, `stats::SheepStats`
 
 use core::time::Duration;
 use std::collections::HashMap;
@@ -66,8 +74,10 @@ use tokio::sync::mpsc;
 use shep_core::values::MemSize;
 
 pub mod sample;
+pub(crate) mod stats;
 
 use sample::{MemorySampler, TreeIndex};
+use stats::StatsState;
 
 /// How often the polling enforcer samples the process table.
 ///
@@ -150,10 +160,15 @@ impl PollingEnforcer {
     /// prose rather than a `# Panics` section deliberately — neither of those
     /// carries one, and IR-21 wants `# Panics` and `#[track_caller]` to travel
     /// together or not at all.
+    ///
+    /// `stats` rides the same tick: this loop is the only place a process
+    /// table is walked on a schedule, and a second loop for sampling would
+    /// double a measured 5.77 ms walk to buy nothing.
     #[must_use]
     pub(crate) fn start(
         sampler: Arc<dyn MemorySampler>,
         breaches: mpsc::Sender<LimitBreach>,
+        stats: Arc<StatsState>,
     ) -> Self {
         let armed: Arc<Mutex<HashMap<u32, Armed>>> = Arc::new(Mutex::new(HashMap::new()));
         let loop_armed = Arc::clone(&armed);
@@ -174,6 +189,13 @@ impl PollingEnforcer {
                 // each id only pays its own walk.
                 let table = sampler.sample();
                 let index = TreeIndex::build(&table);
+
+                // The sampling half, over the same index and before the
+                // enforcement pass: this is the only writer of the CPU
+                // baseline every on-demand listing measures its window
+                // against, so a tick that skipped it would leave every row of
+                // `shep flock` reporting no CPU at all.
+                stats.record_baseline(&index, tokio::time::Instant::now());
 
                 // Computed and self-disarmed in the same locked section:
                 // `retain` sums each armed tree and drops the entries that
@@ -249,8 +271,16 @@ mod tests {
     use crate::limits::sample::ProcessRss;
     use crate::testing::ScriptedSampler;
 
+    /// Every case in this module is about the memory ceiling, so none of
+    /// them carries CPU time — a reading with `cpu_ms: 0` keeps them saying
+    /// exactly what they said before `ProcessRss` grew the field.
     fn rss(pid: u32, parent: Option<u32>, bytes: u64) -> ProcessRss {
-        ProcessRss { pid, parent, bytes }
+        ProcessRss {
+            pid,
+            parent,
+            bytes,
+            cpu_ms: 0,
+        }
     }
 
     /// Generous bound on how long a test may wait for a breach on the
@@ -270,7 +300,14 @@ mod tests {
         sampler: Arc<dyn MemorySampler>,
         breaches: mpsc::Sender<LimitBreach>,
     ) -> PollingEnforcer {
-        let enforcer = PollingEnforcer::start(sampler, breaches);
+        // A `StatsState` over the SAME sampler, watching nothing: the tick
+        // records a baseline for every watched sheep and there are none, so
+        // the sampling half is present (a tick that panicked in it would take
+        // every case here with it) without changing what any of them observe.
+        // It costs no extra `sample()` call — `record_baseline` reads the
+        // index the tick already built.
+        let stats = Arc::new(StatsState::new(Arc::clone(&sampler)));
+        let enforcer = PollingEnforcer::start(sampler, breaches, stats);
         tokio::task::yield_now().await;
         enforcer
     }
@@ -313,6 +350,56 @@ mod tests {
             Ok(Some(breach)) => panic!("unexpected breach observed: {breach:?}"),
             Ok(None) => panic!("breach channel disconnected while checking for no breach"),
         }
+    }
+
+    /// A reading carrying CPU time, for the one case here that is about the
+    /// sampling half rather than the ceiling.
+    fn rss_cpu(pid: u32, parent: Option<u32>, bytes: u64, cpu_ms: u64) -> ProcessRss {
+        ProcessRss {
+            pid,
+            parent,
+            bytes,
+            cpu_ms,
+        }
+    }
+
+    // fails if the tick stops recording the sampling baseline — the shape
+    // where enforcement still works perfectly and every row of a listing
+    // reports no CPU at all, because `record_baseline` is the ONLY writer of
+    // the baseline an on-demand read measures its window against. Nothing is
+    // armed here on purpose: this is the half that has to run for a sheep the
+    // enforcer was never told about.
+    //
+    // 1500 CPU-ms over the 7.5 s between the tick and the read is 20%. A
+    // baseline recorded at the wrong instant — at the read rather than at the
+    // tick — gives the same delta over 0 s and reports nothing like it.
+    #[tokio::test(start_paused = true)]
+    async fn one_tick_records_the_sampling_baseline_for_a_sheep_nothing_is_armed_against() {
+        let sampler: Arc<dyn MemorySampler> = Arc::new(ScriptedSampler::new(vec![
+            vec![rss_cpu(1, None, 100, 1_000)],
+            vec![rss_cpu(1, None, 100, 2_500)],
+        ]));
+        let stats = Arc::new(StatsState::new(Arc::clone(&sampler)));
+        stats.watch(9, 1);
+        let (tx, mut rx) = mpsc::channel(1);
+        let enforcer = PollingEnforcer::start(Arc::clone(&sampler), tx, Arc::clone(&stats));
+        tokio::task::yield_now().await;
+
+        // Crossing the clock through `timeout` + `recv` rather than a bare
+        // `advance`, for the reason `assert_no_breach_within` documents. The
+        // first call lands just past tick 1; the second carries the clock to
+        // 7.5 s past it without reaching tick 2.
+        assert_no_breach_within(&mut rx, ticks(1)).await;
+        assert_no_breach_within(&mut rx, Duration::from_millis(7_499)).await;
+
+        let cpu = stats.sample_now()[&1]
+            .cpu_percent
+            .expect("the tick must have recorded a baseline");
+        assert!(
+            (cpu - 20.0).abs() < 0.01,
+            "1500 CPU-ms over the 7.5 s since the tick is 20%, got {cpu}"
+        );
+        drop(enforcer);
     }
 
     /// Dyn-compatibility smoke test (IR-10): fails to compile the moment

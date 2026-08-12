@@ -4511,7 +4511,9 @@ mod tests {
     use super::*;
     use crate::fake::{ProcScript, ScriptedRunner};
     // the one crate-root fixture (IR-33)
-    use crate::testing::{RecordingEnforcer, SharedRunner, armed_entry, probe_config, test_paths};
+    use crate::testing::{
+        RecordingEnforcer, SharedRunner, armed_entry, idle_stats, probe_config, test_paths,
+    };
     // Test-only: the one case that drives a real `liveness_probe` has to
     // build the lifecycle extras the production wiring builds at boot, and
     // put the daemon's own reporter behind them.
@@ -7050,6 +7052,7 @@ mod tests {
                         breaches: breaches_tx,
                         liveness: liveness_tx,
                     },
+                    stats: idle_stats(),
                 })
                 .spawn();
         // The daemon's own reporter, not a forwarding line written here: it

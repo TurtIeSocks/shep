@@ -51,6 +51,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Sample every sheep, and enforce only where a limit exists. The polling loop
+  used to run for the ids `max_memory` armed it against and for nobody else,
+  so an app that set no ceiling — the ordinary case — was never measured at
+  all. Sampling is now its own concern (`limits::stats`): every sheep with a
+  pid is watched from the moment it comes online, and a memory ceiling arms
+  the enforcer on top of that rather than instead of it. Enforcement itself
+  is untouched — same cadence, same self-disarm on breach, same backpressure
+  on a full report channel.
+
+  It costs no extra walk of the process table. The polling tick already built
+  one index per pass; it now hands that index to the sampler before running
+  the enforcement pass, so the 6.5 ms syscall walk still happens once every
+  15 s however many sheep are in the flock.
+
+  CPU is the reason the two halves have to share a tick. Resident memory is a
+  level and can be read on demand, but the OS reports CPU as a counter, so a
+  percentage needs two readings and the wall time between them. The tick
+  records one baseline per sheep; an on-demand read subtracts against it and
+  writes nothing back, which is what stops two listings a moment apart from
+  dividing a near-zero counter delta by a near-zero window. A sheep that came
+  online since the last tick has no baseline and reports no CPU at all, which
+  is the honest answer for a window nobody has measured yet.
+
 - Report readiness to an init system that supervises the shepherd directly:
   one `READY=1` datagram to whatever `$NOTIFY_SOCKET` names, sent as the
   **last** step of `boot`, after the muster restore has finished and the
@@ -608,6 +631,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whichever of the four raised it.
 
 ### Changes
+
+- `ProcessRss` gains a `cpu_ms: u64` field — accumulated CPU time in
+  CPU-milliseconds, as the OS reports it, cumulative since the process
+  started. **Breaking for anything outside this crate that implements
+  `MemorySampler`**: the struct carries no `#[non_exhaustive]`, so every
+  literal that builds one stops compiling until it names the new field.
+
+  `SysinfoSampler` fills it from a refresh that now asks for CPU as well as
+  memory. That flag is load-bearing and fails quietly without it: sysinfo
+  populates the counter only under a CPU refresh and otherwise leaves it at
+  zero, so a memory-only refresh yields a table of 900 processes with not one
+  of them reporting any CPU time — and every percentage derived from it reads
+  a plausible, wrong `0.0` rather than erroring.
 
 - `BootOptions` gains a `notify_socket: Option<OsString>` field, carrying the
   address the readiness datagram above goes to; `None` — the ordinary case —
