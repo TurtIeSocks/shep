@@ -118,6 +118,12 @@ never costs clarity.
 
 ## Status / workflow
 
-Scaffold phase: crates compile, no implementation yet. Next phase =
-brainstorming → spec → plan off map.md. Project memory (cross-session state)
-tracks decisions; docs above are the source of truth.
+Phases 1–6 merged: shep-core, the daemon supervision engine, log plane, the
+16-verb CLI, watch/cron/memory-limit restarts, and SO_REUSEPORT reload. Phase
+7 (`shep trigger`, custom actions over the shepherd channel) is in flight —
+fd-3 plumbing merged, the RPC and verb itself not yet.
+
+What's built vs. deferred to v1.1+: [docs/specs/deferred.md](docs/specs/deferred.md).
+Windows is 0%, not partial — every verb prints "not yet supported" and exits.
+Project memory (cross-session state) tracks decisions; docs above are the
+source of truth.

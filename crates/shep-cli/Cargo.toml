@@ -1,6 +1,6 @@
 [package]
 name = "shep-cli"
-description = "The shep command-line interface: one binary embedding CLI, daemon, TUI, and static server"
+description = "The shep command-line interface: clap surface, output rendering, and the daemon launch/re-exec path"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -39,6 +39,10 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "
 # `log_json` branch, and `ansi` is colour when stderr is a terminal and
 # `NO_COLOR` says nothing to the contrary.
 tracing-subscriber.workspace = true
+# `warn_on_inert_dog_config` (commands/daemon.rs) is the one call site: a
+# `[daemon]`/`[dog.*]` knob with no reader yet should say so on the daemon's
+# own log, not stay silent until an operator notices nothing happened.
+tracing.workspace = true
 # `bleats.rs`'s `stream.next()` now comes from `EventStream::next`, an
 # inherent method shep-client provides directly — no `StreamExt` import
 # needed here any more. This dependency stays for `FutureExt`: the Ctrl-C

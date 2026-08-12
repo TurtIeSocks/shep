@@ -1,6 +1,6 @@
 [package]
 name = "shep-daemon"
-description = "Supervisor engine for shep: spawn, restart, reload, watch, metrics, alerts"
+description = "Supervisor engine for shep: spawn, restart, reload, watch, cron-restart, memory-limit polling"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

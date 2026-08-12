@@ -239,3 +239,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[[bin]]` it produces is named `shep`, so once published the install
   command is `cargo install shep-cli` — `cargo install shep` looks up an
   unrelated crate.
+- Warn, once at daemon boot, when `shep.toml` sets `[daemon] enabled_dogs`
+  or any `[dog.<name>]` section: both parse, validate and round-trip, but
+  there is no dogs infrastructure in this build to read either one, so an
+  operator who wrote `enabled_dogs = ["metrics"]` got a daemon that boots
+  and silently does nothing with it. The daemon still boots — a hard error
+  would be disproportionate to a field that does nothing, and would break a
+  config that works today the moment dogs land and start reading the same
+  field for real.

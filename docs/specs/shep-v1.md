@@ -44,6 +44,11 @@ observability).
 **v1.2 candidate:** fd-passing/LISTEN_FDS true cluster parity (Rin: "v1.1 or
 v1.2 even").
 
+The two lists above cover what is *deliberately* deferred. What is named
+above as v1.0 but not yet built — the larger gap, tracked against the
+implementation rather than designed away — is
+[docs/specs/deferred.md](deferred.md).
+
 ## 3. Architecture
 
 Four crates, one distributed binary (`shep`); see map.md for module detail.
@@ -73,9 +78,18 @@ slot among same-name; `increment_var` supported). Processes a sheep spawns
 are its **lambs** (the process-tree members): shown in `describe`'s tree
 view, killed with the sheep by the process-group/Job-Object tree kill.
 
-**States:** `starting → online → stopping → stopped`, plus `errored`
+**States:** `starting`, `online`, `stopping`, `stopped`, plus `errored`
 (restart budget exhausted or spawn failure) and `waiting-restart` (backoff
 delay pending). Serialized exactly as these strings on the wire.
+
+`stopping` is not a step every stop passes through — it is reachable from
+exactly one place: a reload's `SpawnNew` step marks the instance being
+replaced `stopping` before its replacement spawns, so the two never both
+count as running (`ProcStatus::Stopping`'s own doc,
+`crates/shep-core/src/status.rs`). A plain `stop` (or a restart, or the
+stop half of a delete) stays `online` for its whole kill ladder below and
+jumps straight to `stopped` once the process is reaped — there is no
+observable `stopping` state on that path at all.
 
 **Restart policy (per app):**
 - `autorestart` (default true): restart on unexpected exit.
@@ -200,7 +214,17 @@ tweaks; file-locked JSON; not the primary config path.
   HTTP GET / TCP connect / exec, with interval, timeout, failure threshold.
   Readiness gates reload; liveness failures trigger the restart policy.
 - `wait_ready = true` selects channel-based readiness; probe config selects
-  probe-based; neither → "ready" = spawn success + listen_timeout heuristic.
+  probe-based; neither selects the heuristic source (`ReadinessSource::
+  Heuristic`, "ready" = spawn success + `listen_timeout`) — but the
+  heuristic only ever *runs* during a reload's `AwaitReady` step. A plain
+  `start`/`restart` with neither `wait_ready` nor `readiness_probe`
+  configured goes `online` synchronously at spawn success, full stop: no
+  wait, no `listen_timeout` involved, because only reload gates a spawn on
+  readiness in the first place (`Supervisor::spawn_fresh`'s `gated` flag,
+  `crates/shep-daemon/src/supervisor.rs` — `false` for the heuristic
+  source outside a reload, so the sheep is `online` before the readiness
+  machinery is ever consulted). `probes/ready.rs`'s own doc states this
+  directly.
 
 ## 8. Dogs (plugins)
 
