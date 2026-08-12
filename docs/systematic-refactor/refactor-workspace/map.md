@@ -115,9 +115,16 @@ src/
              (pm2 had string-match errors, no deadlines anywhere).
     events.rs        ← was lib/Event.js + God bus ad-hoc objects + pm2-io-bpm packet shapes
       Action: port shapes + typing
-      Notes: BusEvent enum: ProcessEvent{event,manually,process,at}, LogOut/LogErr, ProcessMsg,
-             AxmMonitor/AxmAction/AxmReply, ProcessException, Pm2Kill. Wire shapes golden-
-             snapshot-tested (insta) — @pm2/io-instrumented Node apps keep working.
+      Notes: `BusEvent` shipped with five variants, not the ported pm2 set this
+             entry originally listed: `Process` (not `ProcessEvent`), `LogOut`, `LogErr`,
+             `Dropped` (a lagging subscriber's lost events — the bus is a
+             `tokio::sync::broadcast`, so a slow reader has events dropped rather than
+             queued), and `DaemonShutdown`. `ProcessMsg`, the three `Axm*` shapes,
+             `ProcessException` and `Pm2Kill` were never built, and with them the claim
+             that @pm2/io-instrumented apps keep working — nothing carries those packet
+             shapes. Wire shapes are golden-snapshot-tested (insta), and `BusEvent::topic`
+             is what `TopicFilter` globs; spec §6's `channel.*` topic has no variant and
+             is recorded in `docs/specs/deferred.md`.
     wire.rs          ← was modules/pm2-axon + amp framing
       Action: rewrite
       Notes: LengthDelimitedCodec(u32) + serde_json frames over UDS (unix) / named pipe
