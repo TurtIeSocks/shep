@@ -50,7 +50,7 @@ use shep_core::status::ProcStatus;
 
 use crate::assemble::{assemble, instance_slots};
 use crate::brain::{Decision, decide_on_exit};
-use crate::channel::ChildMessage;
+use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
 use crate::extras::{Extras, ExtrasRegistry};
 use crate::kill::kill_process;
@@ -878,6 +878,33 @@ struct SheepSlot {
     /// be the only thing left deciding when the pump — and its two files and
     /// two pipe read ends — got to end.
     log_ctl: Option<mpsc::Sender<LogCtl>>,
+    /// A clone of the [`ProcIo::to_child`] the most recent successful spawn
+    /// handed out — the daemon's writing end of this sheep's shepherd
+    /// channel, and the actor's only way to reach a live child directly.
+    /// `None` whenever no process is running under this id.
+    ///
+    /// Deliberately not carried as a `ctl` message. That mailbox holds
+    /// [`SHEEP_CTL_CAPACITY`] messages, [`Self::ctl`]'s senders `try_send`
+    /// into it, and [`Actor::claim_manual`] ignores a `Full` there *because a
+    /// queued [`SheepCtl::Kill`] means the ladder is already running*. That
+    /// argument holds only while `Kill` is the sole occupant of those four
+    /// slots: put anything else in them and the same code can drop a `Kill`.
+    /// The shepherd channel is the child's own, several times wider, and
+    /// carries nothing but child traffic — so a full one there means what it
+    /// says, that the child is not reading fd 3.
+    ///
+    /// # Why this one is cleared and `log_ctl` is not
+    ///
+    /// Every argument in `log_ctl`'s doc above turns on a pump having a
+    /// second way to end — its `logs` receiver going away with the sheep task
+    /// — so a clone kept on the slot can delay nothing. The other end of THIS
+    /// channel has no such branch. `tokio_runner`'s writer task parks on
+    /// `recv()`, and its only other exit is a write that fails, which cannot
+    /// happen while nothing is being sent. A clone left here past the exit
+    /// therefore parks that task for as long as the sheep stays registered,
+    /// holding the daemon's half of the socketpair with it: one leaked task
+    /// and one leaked descriptor per exit, on a daemon that runs for months.
+    to_child: Option<mpsc::Sender<ShepherdMessage>>,
     /// Which manual command (if any) is waiting on this sheep's next exit,
     /// and who asked for it. Claimed through [`Actor::claim_manual`].
     manual: Option<PendingManual>,
@@ -1197,6 +1224,7 @@ impl<R: ProcessRunner> Actor<R> {
                 };
                 let info = to_info(&entry);
                 let log_ctl = io.log_ctl.clone();
+                let to_child = io.to_child.clone();
                 let ctl = spawn_sheep_task::<R::Proc>(
                     id,
                     proc,
@@ -1227,6 +1255,7 @@ impl<R: ProcessRunner> Actor<R> {
                         entry,
                         ctl: Some(ctl),
                         log_ctl: Some(log_ctl),
+                        to_child: Some(to_child),
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
@@ -1266,6 +1295,7 @@ impl<R: ProcessRunner> Actor<R> {
                         entry,
                         ctl: None,
                         log_ctl: None,
+                        to_child: None,
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
@@ -1311,6 +1341,7 @@ impl<R: ProcessRunner> Actor<R> {
             Ok((proc, io)) => {
                 let pid = proc.pid();
                 let log_ctl = io.log_ctl.clone();
+                let to_child = io.to_child.clone();
                 let ctl = spawn_sheep_task::<R::Proc>(
                     id,
                     proc,
@@ -1350,6 +1381,7 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.entry.restarts += 1;
                 slot.ctl = Some(ctl);
                 slot.log_ctl = Some(log_ctl);
+                slot.to_child = Some(to_child);
                 // IMPORTANT-3: a new process now exists for this id — any
                 // RestartDue timer, or readiness task, scheduled before this
                 // point (targeting the process this replaced) is stale the
@@ -1384,6 +1416,12 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.entry.pid = None;
                 slot.entry.started_at = None;
                 slot.ctl = None;
+                // Already `None` on every route into a respawn: all three
+                // callers reach it only for an id whose `ctl` is clear, and
+                // the two are cleared in the same breath. Written anyway, so
+                // that "these two go together" is something a reader can see
+                // at each site rather than infer from the callers.
+                slot.to_child = None;
                 slot.ready_tx = None;
                 let info = to_info(&slot.entry);
                 self.emit(ProcessEventKind::Errored, info.clone(), manually);
@@ -1979,6 +2017,7 @@ impl<R: ProcessRunner> Actor<R> {
                 };
                 let info = to_info(&entry);
                 let log_ctl = io.log_ctl.clone();
+                let to_child = io.to_child.clone();
                 let ctl = spawn_sheep_task::<R::Proc>(
                     new_id,
                     proc,
@@ -2004,6 +2043,7 @@ impl<R: ProcessRunner> Actor<R> {
                         entry,
                         ctl: Some(ctl),
                         log_ctl: Some(log_ctl),
+                        to_child: Some(to_child),
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
@@ -2774,6 +2814,12 @@ impl<R: ProcessRunner> Actor<R> {
             return false;
         };
         slot.ctl = None;
+        // Goes with `ctl`, and the slot stays registered on most of the paths
+        // below, so this is the clearing that matters: the writer task on the
+        // far end of that sender has no way to notice a child that exited
+        // quietly, and would sit on `recv()` holding the daemon's half of the
+        // socketpair for as long as the entry lived. See `SheepSlot::to_child`.
+        slot.to_child = None;
         slot.entry.pid = None;
         // Split the moment the marker is taken, because the two halves answer
         // different questions. `kind` decides what this exit BECOMES, and
@@ -5435,6 +5481,7 @@ mod tests {
             entry,
             ctl: Some(ctl_tx),
             log_ctl: None,
+            to_child: None,
             manual: None,
             pending_delete: false,
             epoch,
@@ -5578,6 +5625,7 @@ mod tests {
                 entry: armed_entry(0, 0, 1111, app, &paths),
                 ctl: None,
                 log_ctl: None,
+                to_child: None,
                 manual: None,
                 pending_delete: false,
                 epoch: 0,
@@ -7297,6 +7345,150 @@ mod tests {
             reaped.is_ok(),
             "the pump outlived its sheep task, holding both log files and \
              both pipe read ends open"
+        );
+    }
+
+    /// Fails if [`SheepSlot::to_child`] outlives the process it was cloned
+    /// for — delete the clearing line in `handle_exited` and this case is the
+    /// one that reddens.
+    ///
+    /// The far end of that sender is a writer task parked on `recv()`
+    /// (`tokio_runner`'s `spawn_channel_pumps`, and the scripted fake's relay
+    /// task has the same shape). Its only other way out is a write that
+    /// fails, which needs traffic — and a stopped sheep produces none — so
+    /// every sender being dropped is the only thing that can retire it. One
+    /// left on a slot pins the task and the daemon's half of the socketpair
+    /// for as long as the entry lives.
+    ///
+    /// What is asserted is the TASK ending and not the field being clear: the
+    /// relay drops its own sender when it returns, so `to_child_rx` resolving
+    /// `None` is that return observed from outside. A relay still parked
+    /// keeps that sender, and the read below never resolves — which is the
+    /// distinction the case exists to draw, since a slot whose entry is
+    /// `Stopped` looks identical either way from the outside.
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_task_is_reaped_when_its_sheep_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        // `autorestart` off so the exit is terminal and the slot STAYS
+        // registered: a respawn would hand out a second channel, and a
+        // deregistration would drop the slot's clone as a side effect of
+        // removing the row, which is not the clearing under test.
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.autorestart = false;
+        // One script for one spawn, exiting on its own rather than under a
+        // kill: a `Kill` can put a `Shutdown` on this very channel, and the
+        // read below wants the channel's END, not its traffic.
+        let (handle, runner, mut rx) =
+            started(&dir, app, vec![ProcScript::stable_then_exit(1_000, 0)]).await;
+        let mut io = runner.io_handles(0);
+        assert_eq!(
+            io.to_child_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+            "sanity: a running sheep's channel is open and quiet, so the \
+             `None` below is a close and not a channel that never opened"
+        );
+
+        // `Stop`, not `Exit`: with `autorestart` off a clean exit is a clean
+        // stop, and `Exit` is the event that announces a pending restart.
+        await_event(&mut rx, 0, ProcessEventKind::Stop).await;
+        assert_eq!(
+            handle.list().await.len(),
+            1,
+            "sanity: the sheep is still registered, so nothing but the \
+             clearing can have let go of the slot's clone"
+        );
+
+        // Bounded rather than a bare `await`: the relay ends on its own
+        // task's schedule, after the event this woke on, and a leak has to
+        // fail the case instead of hanging it.
+        let reaped = tokio::time::timeout(Duration::from_secs(5), io.to_child_rx.recv()).await;
+        assert_eq!(
+            reaped.ok(),
+            Some(None),
+            "the writer task outlived its sheep, parked on `recv()` and \
+             holding the daemon's end of the shepherd channel"
+        );
+    }
+
+    /// Fails if any of the three spawns stops putting its
+    /// [`ProcIo::to_child`] clone on the slot — the handle the actor reaches a
+    /// live child through, and the thing the case above would pass vacuously
+    /// without, since a channel nobody cloned closes whether or not anything
+    /// clears it.
+    ///
+    /// All three are walked rather than one taken as representative. There is
+    /// nothing yet that READS the field, so a spawn that quietly stopped
+    /// taking its clone changes no behaviour any other case can see — it
+    /// would simply become an instance the actor cannot reach, discovered
+    /// whenever something first tries to.
+    ///
+    /// Driven against the actor directly because the field is private and
+    /// deliberately never on the wire. The exit is asserted here too, at the
+    /// field, where the case above asserts it at the task: one says the
+    /// handle is let go of, the other says letting go of it is enough.
+    #[tokio::test(start_paused = true)]
+    async fn every_spawn_leaves_the_daemons_end_of_the_channel_on_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        // Three scripts for the three spawns below, none of which exits: this
+        // case tells the actor about the one exit it handles, and a proc that
+        // went on its own would put a second, unasked-for `Msg::Exited` in
+        // play.
+        let (mut actor, _mailbox) = actor_with_one_online_sheep(
+            &dir,
+            vec![
+                ProcScript::never_exits(),
+                ProcScript::never_exits(),
+                ProcScript::never_exits(),
+            ],
+        );
+
+        // `spawn_fresh`, the door every sheep in the flock arrives by. The
+        // fixture's own hand-built sheep is left alone for the reload below;
+        // this registers id 1 next to it. `autorestart` off so the exit is a
+        // clean stop and the entry stays registered to be read.
+        let mut app = AppConfig::minimal("api", "./api");
+        app.autorestart = false;
+        let (reply, _answer) = oneshot::channel();
+        actor.handle_command(Command::Start {
+            apps: vec![normalize(app).unwrap()],
+            reply,
+        });
+        assert!(
+            actor.sheep[&1].to_child.is_some(),
+            "a fresh spawn's slot holds the daemon's end of its shepherd channel"
+        );
+
+        actor.handle_exited(
+            1,
+            ExitOutcome {
+                code: Some(0),
+                signal: None,
+            },
+        );
+        assert!(
+            actor.sheep[&1].to_child.is_none(),
+            "the clone goes with the process it was cloned for"
+        );
+
+        // `respawn`, the door a crash loop and a manual restart come back
+        // through. A new process under the same id needs a new handle, and a
+        // respawn that skipped this would leave the id permanently
+        // unreachable after its first exit.
+        actor.respawn(1, false);
+        assert!(
+            actor.sheep[&1].to_child.is_some(),
+            "a respawn hands the slot the new process's channel, not the dead \
+             one's"
+        );
+
+        // `spawn_replacement`, the reload's door. The replacement takes a new
+        // id in the drainee's instance slot, so it needs a handle of its own
+        // — the drainee's says nothing about the process now serving.
+        actor.advance_reload("web", VecDeque::from([0]));
+        let new_id = actor.reloads["web"].swap.new_id;
+        assert!(
+            actor.sheep[&new_id].to_child.is_some(),
+            "a reload's replacement holds the daemon's end of its own channel"
         );
     }
 

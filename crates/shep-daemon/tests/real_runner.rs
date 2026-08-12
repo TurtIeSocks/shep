@@ -13,9 +13,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use shep_daemon::channel::ChildMessage;
+use shep_daemon::channel::{ChildMessage, ShepherdMessage};
 use shep_daemon::privilege::Credentials;
-use shep_daemon::runner::{ProcessRunner, RunningProcess, SpawnSpec, StopSignal};
+use shep_daemon::runner::{ProcIo, ProcessRunner, RunningProcess, SpawnSpec, StopSignal};
 use shep_daemon::tokio_runner::TokioRunner;
 
 /// Builds a `/bin/sh -c <script>` spec writing logs into a fresh tempdir.
@@ -428,6 +428,133 @@ async fn shepherd_channel_delivers_ready() {
         .await
         .expect("kill_tree should reap promptly");
     assert_eq!(outcome.signal, Some(9));
+}
+
+/// A `/bin/sh` child that answers exactly `rounds` shepherd-channel messages
+/// with a reply naming which round it is, then exits 0.
+///
+/// `read -r line <&3` is the plainest blocking read there is, which is the
+/// point: the app author who writes this is the one a non-blocking fd 3
+/// breaks. A read that fails takes the child out with a distinct status
+/// rather than looping, so a broken channel ends the case promptly instead
+/// of hanging until the deadline.
+///
+/// The round number is the child's own count of completed reads, not
+/// anything parsed out of the message — extracting a JSON field in POSIX sh
+/// would be its own source of failure. Since the shepherd sends in order,
+/// reply *n* is still proof that the child got through *n* reads.
+fn channel_echo_script(rounds: u32) -> String {
+    format!(
+        r#"n=0
+while [ "$n" -lt {rounds} ]; do
+  read -r line <&3 || exit 3
+  n=$((n + 1))
+  printf '{{"kind":"action-reply","action":"round-%s","body":"ok"}}\n' "$n" >&3
+done"#
+    )
+}
+
+/// How long one shepherd-channel exchange gets. A channel that works
+/// answers in microseconds; this is slack for a loaded runner, not an
+/// expected duration.
+const CHANNEL_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Sends one message and returns the child's reply.
+///
+/// Panics with the child's stderr rather than a bare timeout, because that
+/// is where the diagnosis lives: a shell `read` that hits a non-blocking
+/// descriptor prints `read error: 0: Resource temporarily unavailable`
+/// there and nowhere else.
+///
+/// A send that fails is folded into the same report instead of asserted on
+/// separately: it means the writer task already saw the child's end close,
+/// which is the same failure one moment earlier and deserves the same
+/// stderr.
+async fn channel_round_trip(io: &mut ProcIo, round: u32, err_file: &Path) -> ChildMessage {
+    let name = format!("round-{round}");
+    let delivered = io
+        .to_child
+        .send(ShepherdMessage::Action { name, params: None })
+        .await
+        .is_ok();
+    let reply = if delivered {
+        tokio::time::timeout(CHANNEL_DEADLINE, io.from_child.recv())
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    reply.unwrap_or_else(|| {
+        panic!(
+            "round {round}: no reply on the shepherd channel; child stderr: {:?}",
+            fs::read_to_string(err_file).unwrap_or_default()
+        )
+    })
+}
+
+/// Fails if fd 3 reaches the child non-blocking: a plain `read <&3` then
+/// gets `EAGAIN` — "Resource temporarily unavailable" — instead of parking,
+/// and a child that is waiting for the shepherd to say something never
+/// hears it.
+///
+/// TWO round trips, and the second one is the whole test. The first is a
+/// spawn-timing race the child normally wins for the wrong reason: the
+/// shepherd's message is already sitting in the socket buffer by the time
+/// `/bin/sh` has exec'd and reached its first `read`, so that read finds
+/// bytes waiting and never has to block at all. Only the second round trip
+/// puts the child at the read FIRST — nothing is sent until the first reply
+/// proves it got through round one — and a descriptor that cannot block is
+/// obliged to fail there. Cutting this back to one exchange leaves a case
+/// that passes against a non-blocking fd 3.
+///
+/// `shutdown_with_message` is the shipped feature this protects. It sends
+/// `{"kind":"shutdown"}` to a child that has been running, and therefore
+/// waiting, since long before the message existed: always round two, never
+/// round one.
+#[tokio::test]
+async fn a_child_can_block_reading_the_shepherd_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let err_file = dir.path().join("err.log");
+    let runner = TokioRunner::new();
+    let spec = sh_spec(
+        &channel_echo_script(2),
+        true,
+        dir.path().join("out.log"),
+        err_file.clone(),
+    );
+
+    let (mut proc, mut io) = runner.spawn(&spec).unwrap();
+    let _reaper = Reaper(vec![i32::try_from(proc.pid()).unwrap()]);
+
+    let first = channel_round_trip(&mut io, 1, &err_file).await;
+    assert_eq!(
+        first,
+        ChildMessage::ActionReply {
+            action: "round-1".to_string(),
+            body: "ok".to_string(),
+        }
+    );
+
+    // Only now is the child parked on a read with an empty socket behind
+    // it, which is the state the whole case exists to exercise.
+    let second = channel_round_trip(&mut io, 2, &err_file).await;
+    assert_eq!(
+        second,
+        ChildMessage::ActionReply {
+            action: "round-2".to_string(),
+            body: "ok".to_string(),
+        }
+    );
+
+    let outcome = tokio::time::timeout(REAP_DEADLINE, proc.wait())
+        .await
+        .expect("the child exits once it has answered both rounds");
+    assert_eq!(
+        outcome.code,
+        Some(0),
+        "status 3 is the script's own `read` failure"
+    );
 }
 
 /// Proves `TokioRunner::spawn`'s `command.uid(creds.uid)` /

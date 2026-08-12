@@ -193,7 +193,9 @@ tweaks; file-locked JSON; not the primary config path.
 - **Shepherd channel** (extra pipe fd, newline JSON, language-agnostic):
   child→daemon `{"kind":"ready"}`, `{"kind":"metric",...}`,
   `{"kind":"action-reply",...}`; daemon→child `{"kind":"shutdown"}`,
-  `{"kind":"action",...}`. Fd number exported as `SHEP_CHANNEL_FD`.
+  `{"kind":"action",...}`. Fd number exported as `SHEP_CHANNEL_FD`. An
+  `action` carries `name`, and `params` when the operator supplied any — the
+  key is absent otherwise, which is what keeps it additive (§9).
 - **Probes** (per app, optional): `readiness_probe` / `liveness_probe` =
   HTTP GET / TCP connect / exec, with interval, timeout, failure threshold.
   Readiness gates reload; liveness failures trigger the restart policy.
@@ -235,8 +237,8 @@ Core verbs: `start` (script | Flockfile | `-` stdin JSON), `stop`, `restart`,
 `bleats` (logs; `logs` alias), `flush`, `reopen` (reopen log files for
 rotation; also SIGUSR2 to the daemon), `muster` (save + resurrect pair:
 `shep muster save` / `shep muster` restores; `resurrect` hidden alias),
-`signal`, `sendline`, `trigger <target> <action>` (custom actions via the
-shepherd channel `action`/`action-reply` messages), `enable`/`disable`
+`signal`, `sendline`, `trigger <target> <action> [params]` (custom actions via
+the shepherd channel `action`/`action-reply` messages), `enable`/`disable`
 (dogs), `dogs` (list dogs), `barks` (recent alert history), `fold <name>`
 (list a fold), `lookout` (TUI; `dash` alias), `whistle` (MCP stdio), `serve`,
 `startup`/`unstartup`, `set`/`get`/`unset`, `import`, `dev`, `runtime`,
@@ -245,6 +247,32 @@ shepherd channel `action`/`action-reply` messages), `enable`/`disable`
 name, id, `all`, `/regex/`, `fold:<name>`. Global `--format json|table`
 (versioned serde output schema), clap_complete completions incl. dynamic
 sheep-name completion (short-timeout daemon query, silent degrade).
+
+**`trigger` takes params, and this section did not always say so.** It was
+specified as `trigger <target> <action>`, with nothing after the action name,
+and §7's `action` message was specified to match. Both now carry an optional
+argument string. That was decided against the spec as written rather than
+found as an oversight in it, and it is recorded here because the reasoning is
+what a later reader will need, not the outcome.
+
+The moment decided it, not the merit. The shepherd channel has no version
+field — `PROTOCOL_VERSION` governs the client↔daemon socket and nothing else
+— so every string on fd 3 is a contract with every app that speaks it, and
+there is no handshake in which to negotiate a replacement. While there are no
+deployed apps and no `@shep/io` shim, a field added here costs nothing; from
+the moment either exists, the same field is a rewrite for everything already
+written. That asymmetry is the entire argument, and `trigger web
+set-log-level debug` is an ordinary thing for an operator to want.
+
+Additive is what makes it survivable at all: `params` is omitted from the
+serialized message when there are none, so `{"kind":"action","name":"gc"}` is
+still exactly what an argument-free action looks like on the wire, a message
+with no `params` key reads back as none, and an app that ignores the field
+goes on working. It is **one opaque string, not structured data** — shep does
+not parse it, validate it, or hold a schema for it. An app that defines an
+action already has a grammar for that action's arguments, and a second
+grammar in the daemon would only be something for every app to either adopt
+or work around.
 
 **Exit codes.** Distinct causes get distinct codes; no error ever exits 0.
 
