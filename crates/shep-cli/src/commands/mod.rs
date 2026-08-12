@@ -11,4 +11,5 @@ pub mod logs;
 pub mod muster;
 pub mod query;
 pub(crate) mod selector;
+pub(crate) mod startup;
 pub mod trigger;
