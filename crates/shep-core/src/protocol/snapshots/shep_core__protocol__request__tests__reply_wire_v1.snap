@@ -58,5 +58,17 @@ expression: replies
         ]
       }
     }
+  },
+  {
+    "id": 5,
+    "result": {
+      "Ok": {
+        "kind": "roll_saved",
+        "data": {
+          "path": "/home/rin/.shep/flock.json",
+          "apps": 2
+        }
+      }
+    }
   }
 ]

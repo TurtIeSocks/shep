@@ -142,6 +142,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grammar (`all`, `/regex/`, `fold:`) makes a mixed flock the normal case,
   and a channel-less sheep in that mix should not cost every other sheep its
   answer.
+- Add `Request::SaveRoll` and `Response::RollSaved`, asking a daemon to write
+  the muster roll now, bypassing the snapshot writer's debounce
+  (`shep save`). Additive under `#[non_exhaustive]` on the same terms as
+  `Reopen` above — `PROTOCOL_VERSION` stays **1**, and an older daemon fails
+  to decode the verb rather than answering it. `SaveRoll` carries no fields:
+  unlike `Stop`/`Restart`/`Trigger` and the rest, there is no flock to
+  select — the roll always records the whole flock. `RollSaved` is the only
+  struct-shaped `Response` variant, carrying the roll's absolute path (a
+  `String`, not a `PathBuf`, for the reason `ProcessInfo::out_file`'s own
+  comment gives) and how many apps it recorded (`apps: u32`, matching
+  `SavedApp::instances_running`'s width in shep-daemon's `snapshot.rs`).
 - Add `MemSize` and `UpDuration` config value newtypes, parsing the strict
   Flockfile grammars `^\d+(G|M|K)?$` and `^\d+(h|m|s)?$`.
 - Add `ProcStatus` with stable wire strings for the process lifecycle states.

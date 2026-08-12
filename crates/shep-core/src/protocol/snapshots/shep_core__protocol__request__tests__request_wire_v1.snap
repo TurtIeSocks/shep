@@ -121,5 +121,12 @@ expression: requests
       "action": "set-log-level",
       "params": "debug"
     }
+  },
+  {
+    "id": 9,
+    "deadline_ms": null,
+    "body": {
+      "kind": "save_roll"
+    }
   }
 ]

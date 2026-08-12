@@ -121,6 +121,8 @@ pub enum Request {
         /// `action` message this ultimately becomes.
         params: Option<String>,
     },
+    /// Write the muster roll now, bypassing the snapshot writer's debounce
+    SaveRoll,
     /// Graceful daemon shutdown
     KillDaemon,
     /// Subscribe this connection to bus topics (glob patterns)
@@ -279,6 +281,13 @@ pub enum Response {
     /// carrying what each one answered rather than a flock listing:
     /// `ProcessInfo` has nowhere to hold a reply body.
     Triggered(Vec<ActionReply>),
+    /// Answer to `SaveRoll`
+    RollSaved {
+        /// Absolute path of the roll the daemon wrote
+        path: String,
+        /// How many apps that roll records
+        apps: u32,
+    },
     /// Answer to `Subscribe`
     Subscribed,
     /// Answer to `KillDaemon`
@@ -493,6 +502,16 @@ mod tests {
                     params: Some("debug".to_string()),
                 },
             },
+            // The first fieldless verb added since `Ping`/`ListFlock`, and
+            // pinned for that reason: a fieldless variant serializes as a
+            // bare `{"kind":"..."}` with no `selector` key at all, so a
+            // reader comparing this row against `stop`'s sees the whole
+            // difference between the two shapes in one place.
+            Envelope {
+                id: 9,
+                deadline_ms: None,
+                body: Request::SaveRoll,
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v1", requests);
     }
@@ -532,6 +551,16 @@ mod tests {
                         body: "ok".to_string(),
                     },
                 }])),
+            },
+            // The only struct-shaped `Response` variant, so the one worth
+            // pinning here: every other variant on this wire is a newtype
+            // over a Vec or a unit, both shapes already proven above.
+            Reply {
+                id: 5,
+                result: Ok(Response::RollSaved {
+                    path: "/home/rin/.shep/flock.json".to_string(),
+                    apps: 2,
+                }),
             },
         ];
         insta::assert_json_snapshot!("reply_wire_v1", replies);
@@ -670,5 +699,23 @@ mod tests {
                 outcome
             );
         }
+    }
+
+    /// fails if `SaveRoll` or `RollSaved` is given a `rename`, or if
+    /// `Response`'s `content = "data"` is dropped — either changes these two
+    /// strings while every type-level test in this module keeps passing.
+    #[test]
+    fn save_roll_serializes_snake_case_with_its_payload_under_data() {
+        assert_eq!(
+            serde_json::to_string(&Request::SaveRoll).unwrap(),
+            r#"{"kind":"save_roll"}"#
+        );
+        let reply = Response::RollSaved {
+            path: "/tmp/flock.json".to_string(),
+            apps: 3,
+        };
+        let wire = r#"{"kind":"roll_saved","data":{"path":"/tmp/flock.json","apps":3}}"#;
+        assert_eq!(serde_json::to_string(&reply).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<Response>(wire).unwrap(), reply);
     }
 }
