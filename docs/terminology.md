@@ -24,7 +24,7 @@ Free on crates.io (verified 2026-08-07): `shep`, `shepd`, plus reserves `bleat`,
 | MCP agentic interface | MCP server | **the whistle** | `shep whistle` (serves MCP), docs metaphor: agents whistle, the shepherd and dogs respond |
 | graceful shutdown | stop | **`shep thatlldo [target]`** | easter-egg alias for graceful stop — real herding command for "work's done" |
 | freeze the running list | save | **save** | `shep save` writes the muster roll |
-| register a third-party plugin | install | **adopt** | `shep adopt <name> --exec <path>`; `enable --exec` is a hidden alias |
+| register a third-party plugin | install | **adopt** | `shep adopt <name> <path>`; `enable --exec` is a hidden alias |
 | drop a third-party plugin | uninstall | **rehome** | `shep rehome <name>` — unlike `disable`, it forgets the registration |
 | resurrect saved state | resurrect | **muster** | `shep muster` assembles the flock from the roll |
 | TUI dashboard | monit/dash | **lookout** | `shep lookout`; `shep dash` alias |
