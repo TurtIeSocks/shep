@@ -124,7 +124,11 @@ Two consequences, both departures from §8 as written and both deliberate:
   dogs to keep the flock listing uncluttered, and a separate table already
   achieves that. A bark dog that has died is precisely the thing an operator
   needs to notice, and hiding it means finding out by *not* being paged.
-  `--all` instead widens both tables to include stopped entries.
+  **There is no `--all` flag.** A stopped sheep has always been visible by
+  default and stays that way — the sample above shows `bpm_client  stopped`
+  for exactly that reason. A flag that could only ever widen an
+  already-unfiltered listing would widen nothing, and shipping one would be
+  worse than shipping none.
 - **Dogs never share a table with sheep**, so the shared id space stops
   mattering. Ids reflect spawn order and a dog booted alongside the flock will
   land among them; nobody sees that, because the two populations are never

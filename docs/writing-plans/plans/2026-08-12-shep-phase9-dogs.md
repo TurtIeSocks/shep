@@ -16,7 +16,7 @@
 - **Each dog's own logic** — a Prometheus exposition renderer plus a hand-rolled HTTP/1.1 server (metrics), and a rules engine plus webhook sinks plus a size-capped `barks.jsonl` ring (bark). Both are argv branches of the same binary, the multi-call pattern the hidden `daemon` subcommand already uses.
 - **The surface** — `enable`/`disable`, `adopt`/`rehome`, `dogs`, `barks`, and a second table under `shep flock`.
 
-**Tech stack:** one new *workspace* dependency, `ureq` (TLS for webhook POSTs — Task 19 states the reasoning and the alternative), plus `toml_edit`, which is already in `Cargo.lock` as `toml` 0.8's own dependency and so costs zero new crates. The metrics dog's HTTP server and every test's HTTP sink are hand-rolled over `tokio::net::TcpListener`; nothing here pulls in hyper, axum, or a `prometheus` crate.
+**Tech stack:** one new *workspace* dependency, `reqwest` 0.13 over rustls (TLS for webhook POSTs — Task 19 states the reasoning and the exact feature list), plus `toml_edit`, which is already in `Cargo.lock` as `toml` 0.8's own dependency and so costs zero new crates. The metrics dog's HTTP server and every test's HTTP sink are still hand-rolled over `tokio::net::TcpListener`, and neither reaches for `hyper`, `axum`, or a `prometheus` crate — `reqwest` brings `hyper` in transitively as its own outbound transport for bark's webhook POSTs, but nothing shep writes itself sits on top of it.
 
 ---
 
@@ -106,11 +106,11 @@ Recorded so no task re-litigates them. Items marked (Rin) come from the approved
 | 12 | (Rin) **A config change does not reach a running dog.** The dog read its section once, at connect. `shep disable <name> && shep enable <name>` re-reads it, and `docs/dogs.md` says so. Live push is a v1.1 question. |
 | 13 | (Rin) **Two tables, one registry.** `shep flock` prints the sheep table, then a `Dogs` table beneath it whenever any dog is registered. `--format json` stays **one flat array** of every entry, each carrying its own `dog` marker: the JSON *is* the single registry, and the two tables are a rendering of it. `SCHEMA_VERSION` stays 1. |
 | 14 | (Rin) **The dogs table shows by default.** §8 hid dogs behind `--all`; a separate table already achieves the uncluttered listing that was for, and a bark dog that has died is precisely the thing an operator needs to notice. `shep dogs` prints that second table alone. |
-| 15 | **`--all` is NOT added in this phase, and this is flagged for Rin.** The design says "`--all` instead widens both tables to include stopped entries", but the rendered sample in the same section shows `bpm_client  stopped` in what reads as default output. Implementing the sentence means `shep flock` stops showing a stopped sheep by default, which is a user-visible regression against today's behaviour, against pm2's, and against that sample. Shipping a flag that widens nothing is worse. So the two-table split and the default-visible dogs table land, `--all` does not, and Task 23 asks Rin which reading she meant. The revert either way is one filter in `emit_flock`. |
+| 15 | (Rin) **No `--all` flag, at all.** The design spec's prose said `--all` would widen both tables to include stopped entries, while its own rendered sample showed a stopped sheep (`bpm_client  stopped`) in what read as default output — the two contradicted each other. Rin's ruling resolves it by fixing the prose, not the sample: stopped entries have always been visible by default and stay that way, so a flag that could only ever widen an already-unfiltered listing would widen nothing, and hiding stopped entries to give the flag something to do would be a user-visible regression against today's behaviour, against pm2's, and against that sample. The two-table split and the default-visible dogs table land; `--all` is dropped outright, not deferred. The design spec's `--all` sentence is corrected to match. |
 | 16 | (Rin) **Listings sort by name.** Sorting by id scatters a clustered app's instances; sorting by name groups them. Applied **once**, in the actor's `snapshot_all`, so every listing reply and every consumer — the CLI, the metrics dog, bark's reconciliation — sees one order. Sorted by `(name, instance, id)`: instance keeps a clustered app's slots in their own order, and id breaks the tie a reload's fresh id creates. |
 | 17 | **A dog is named by an exact `name` or `id` selector, and never by a wildcard one.** The design requires `reload all` to skip dogs; the same argument holds verbatim for `stop all` and `delete all`, where getting it wrong takes alerting down silently. Implemented once as `ProcessSelector::is_exact` plus a single selection helper in the actor, never as five copies of an `if`. |
 | 18 | **The dog marker rides `ProcessInfo` as `Option<DogSource>`, and `None` conflates "a sheep" with "a peer that predates the field" on purpose.** Unlike `cpu_percent`, that conflation is *correct*: a daemon that predates dogs has none, so "not a dog" is the true answer in both cases. Say so in the field's doc rather than letting a reader assume it was overlooked. |
-| 19 | **Bark's sinks need TLS, so they need a dependency.** Discord and Slack webhooks are HTTPS and there is no way around that. `ureq` over rustls, called from `spawn_blocking`, is the smallest thing that does it (see Task 19 for the alternative and the flag). The **test** server is hand-rolled over `tokio::net::TcpListener` and needs nothing. |
+| 19 | (Rin) **Bark's sinks need TLS, so they need a dependency: `reqwest` 0.13.** Discord and Slack webhooks are HTTPS and there is no way around that. Rin has standardised on `reqwest` across her recent Rust projects, and consistency across the codebases she maintains outweighs a smaller crate count; an async client also fits a program that is tokio all the way down, where a blocking client would mean `spawn_blocking` around every webhook POST. `default-features = false` with only `rustls` named explicitly, matching the shape every dependency in this workspace already takes (Task 19 has the exact feature list and how it was confirmed). It ships in the binary unconditionally, for every user, by the same decided model that makes bark a dog rather than in-daemon code (`decision-briefs.md` §3b) — not a size tradeoff being accepted. The **test** server is hand-rolled over `tokio::net::TcpListener` and needs nothing. |
 | 20 | (Rin) **Restart-loop detection is two rule kinds, not one threshold.** "The daemon gave up" is keyed to budget exhaustion, is on by default, has nothing to tune, and cannot disagree with the daemon. The early warning ("N restarts in M seconds") is opt-in, because it is the one that pages at 3am for a blip. |
 | 21 | (Rin) **Bark reads `ProcessInfo.restarts` — the daemon's own count — rather than tallying bus events.** A private tally would drift from the number the daemon acts on, and the operator would be told a different story from the one the supervisor believes. |
 | 22 | (Rin) **When a dog dies, the daemon records it and metrics exposes it — and nothing watches across dogs.** Two dogs observing each other adds a failure mode without adding an independent observer, and fails hardest when both go down together. The daemon's record is written by a bus watcher at the *edge* of the supervisor, never by a branch inside `handle_exited` (decision 2). |
@@ -2715,24 +2715,29 @@ pub async fn deliver(sink: &Sink, bark: &Bark, timeout: Duration) -> Result<(), 
 
 Cargo shape for this task: `-p shep-cli`.
 
-### The dependency, and the flag
+### The dependency
 
 **Discord and Slack webhooks are HTTPS.** There is no way to POST to one without TLS, and TLS is not something to hand-roll. So bark needs an HTTP client, and this is the phase's one new workspace dependency.
 
-**Chosen: `ureq` over rustls, called from `spawn_blocking`.** It is the smallest thing in the ecosystem that does this — roughly 40 crates against `reqwest`'s ~90, and it brings no second async runtime, no `hyper`, and no `tower`. Blocking is not a compromise here: shep already runs blocking work on the blocking pool for the stats sample (`rpc.rs`'s `with_live_stats`, a measured 5.77ms syscall walk), a webhook POST is fire-and-forget with a timeout, and bark's own loop must not be waiting on Discord regardless of which client it uses.
+**Chosen: `reqwest` 0.13, over rustls, async.** Rin has standardised on `reqwest` across her recent Rust projects; consistency across the codebases she maintains outweighs a smaller crate count, and an async client fits a program that is tokio all the way down — a blocking client would mean `spawn_blocking` around every webhook POST, for no benefit bark needs.
 
 ```toml
 # Bark's sinks are Discord and Slack webhooks, which are HTTPS, so this is
-# the one thing in the workspace that needs TLS. ureq over rustls is the
-# smallest client that provides it — no second async runtime, no hyper, no
-# tower — and it is called from `spawn_blocking`, where a webhook POST
-# belongs anyway: bark's own loop must never be waiting on Discord.
-ureq = { version = "3", default-features = false, features = ["rustls"] }
+# the one thing in the workspace that needs TLS. reqwest 0.13, over rustls,
+# is what Rin standardises on across her Rust projects. Every dependency in
+# this workspace is default-features = false, so rustls is named explicitly
+# rather than inherited — reqwest 0.13 already defaults to it (native-tls,
+# an OpenSSL system dependency on some platforms, moved to opt-in), but the
+# workspace never leans on a crate's own defaults to get there. `json` is
+# not named: `render_body` already renders the templated body to a `String`,
+# and `deliver` sends it with an explicit `content-type` header rather than
+# through `.json()`, so nothing here needs reqwest's own (de)serialization.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 ```
 
-**Verify the version and the feature name against the crate's own manifest before committing** — the 2.x line spells this feature `tls` and the plan names the 3.x spelling. Paste `cargo tree -p shep-cli | wc -l` before and after into the report, so the real cost is a number rather than an estimate.
+**Confirmed against `reqwest`'s own `Cargo.toml` and its `src/lib.rs` feature-flag doc (0.13.4, the current 0.13 release, on the project's GitHub repository):** 0.12 spelled this feature `rustls-tls`; 0.13 renamed it to `rustls` and made it the crate's own default TLS backend, with `native-tls` moved to opt-in. `json` gates `RequestBuilder::json()`/`Response::json()` alone — `.header()`, `.body()` and `.timeout()` are core `RequestBuilder` methods gated behind no feature, so a POST carrying a hand-rendered JSON string, an explicit content-type header, and a timeout needs nothing beyond `rustls`. Paste `cargo tree -p shep-cli | wc -l` before and after into the report, so the real cost is a number rather than an estimate.
 
-**Flagged for Rin (Task 23's report):** this puts rustls into the shipped `shep` binary for every user, including one who never enables bark. The alternative is a default-on `bark` cargo feature — the shape spec §8 already uses for `otel` — which keeps the dependency out of a `--no-default-features` build at the cost of a `cfg` seam through `dog/mod.rs`. Not taken here, because a default-on feature nobody turns off is complexity with no reader; named so it is Rin's call rather than mine by omission.
+**The dependency ships unconditionally, in every `shep` binary, for every user including one who never enables bark — and that is the decided model, not a size tradeoff being accepted.** `docs/systematic-refactor/refactor-workspace/decision-briefs.md` §3b (Rin, 2026-08-07) settled the shape a first-party dog takes: cargo features are for build-slimming source builds, not runtime pluggability, because a feature-flagged dog is the weaker version of a dog — no crash isolation, no independent restart, and inert for most users anyway since the release binary is one binary. Runtime opt-in is `shep enable bark`, the process model doing the job a feature flag would do worse. `reqwest` sits in that one binary the same way the `bark` argv branch itself does, and for the same reason.
 
 ### The test server
 
@@ -2833,9 +2838,7 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 - [ ] **Step 2: Run, confirm failure.**
 
-- [ ] **Step 3: Implement.** `render_body` (pure), `deliver` (`spawn_blocking` around a `ureq` POST with the timeout set on the agent, never on a `tokio::time::timeout` alone — a timeout that abandons a blocking task leaves the task running), the hand-written `Debug`, and `one_shot_sink` in the test module.
-
-**`deliver` must bound the blocking side.** `tokio::time::timeout` around a `spawn_blocking` cancels the *future*, not the thread; a sink pointed at a black hole would otherwise consume a blocking-pool thread for the connect timeout's whole default, which on some platforms is over two minutes. Set the timeout on the agent, and say in the report which knob was used.
+- [ ] **Step 3: Implement.** `render_body` (pure), `deliver` (an async `reqwest::Client`, POSTing the rendered body with an explicit `content-type: application/json` header and `RequestBuilder::timeout(timeout)` — a per-request timeout that cancels the request future itself, with no separate thread for it to abandon), the hand-written `Debug`, and `one_shot_sink` in the test module.
 
 - [ ] **Step 4: Mutation check.** Swap `content` and `text` between the Discord and Slack renderers and watch `each_webhook_gets_the_body_its_own_endpoint_expects` redden on **both** the positive and the negative assertion — if only the positive fails, the negative one is not sharp enough. Restore from a `cp` snapshot; paste the failure.
 
@@ -3370,8 +3373,6 @@ grep -n "dog" crates/shep-daemon/src/supervisor.rs
 The first must find nothing. Every hit in the second must answer *where did this come from* or *who should see this*: the `StartDog` command and its arm, `start_dog`, the marker's parameter and field, `to_info`'s read, `matching_ids`' filter, tests. **A hit answering *how is this supervised* — a different kill ladder, backoff curve, restart budget, or meaning for `Errored` — is the design's own warning that the separate registry should have been built**, and it is a finding for Rin rather than something to quietly keep.
 
 - [ ] **Step 9: Report to Rin** — every judgement call made on her behalf, anything left unfixed, and specifically:
-  - **decision 15, `--all`.** The design says it "widens both tables to include stopped entries"; the rendered sample in the same section shows a stopped sheep in what reads as default output. This phase shipped neither reading — the two-table split and the default-visible dogs table landed, `--all` did not — because implementing the sentence hides a stopped sheep by default and that is a regression against today's behaviour, against pm2's, and against that sample. Which did she mean?
-  - **decision 19, the TLS dependency.** `ureq` over rustls is in the shipped binary for every user, including one who never enables bark. Name the measured crate-count delta and the default-on-`bark`-feature alternative.
   - whether the tripwire grep in step 8 came back clean, quoted in full;
   - which snapshot deltas moved, and confirmation that each was only its own task's addition;
   - the measured cost of the phase's slowest new test, and whether the e2e tier left any process behind.
