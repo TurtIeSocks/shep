@@ -44,6 +44,11 @@ observability).
 **v1.2 candidate:** fd-passing/LISTEN_FDS true cluster parity (Rin: "v1.1 or
 v1.2 even").
 
+The two lists above cover what is *deliberately* deferred. What is named
+above as v1.0 but not yet built — the larger gap, tracked against the
+implementation rather than designed away — is
+[docs/specs/deferred.md](deferred.md).
+
 ## 3. Architecture
 
 Four crates, one distributed binary (`shep`); see map.md for module detail.
