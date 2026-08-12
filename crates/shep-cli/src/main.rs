@@ -40,6 +40,8 @@ use commands::lifecycle;
 #[cfg(unix)]
 use commands::logs;
 #[cfg(unix)]
+use commands::muster;
+#[cfg(unix)]
 use commands::query;
 #[cfg(unix)]
 use commands::trigger;
@@ -239,6 +241,14 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => query::ping(&client, &mut streams, fmt).await,
             Err(code) => code,
         },
+        // `connect_client`, not `connect_or_spawn_client`: saving the roll
+        // of a daemon that is not running is not a thing, and autostarting
+        // one to save an empty flock would overwrite a good roll with an
+        // empty one.
+        Commands::Save => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => muster::save(&client, &mut streams, fmt).await,
+            Err(code) => code,
+        },
         Commands::Reopen(ref args) => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => logs::reopen(&client, &mut streams, fmt, args).await,
             Err(code) => code,
@@ -408,6 +418,25 @@ async fn run(cli: Cli) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fails if `Commands::Save` is wired to another verb's function. The
+    /// dispatch arms carried no unit coverage at all until recently, and a
+    /// verb pointed at the wrong handler was invisible workspace-wide.
+    ///
+    /// `Commands` is imported locally rather than via `super::*`: the
+    /// top-level `use cli::Commands` (main.rs:31) is `#[cfg(unix)]`-gated
+    /// alongside every verb module, but this test — like every other one in
+    /// this file — must still compile on the Windows target, where that
+    /// import does not exist.
+    #[test]
+    fn save_parses_to_its_own_command() {
+        use clap::Parser;
+        use cli::Commands;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "save"]).unwrap().command,
+            Commands::Save
+        ));
+    }
 
     /// A `--home` that never reached `ShepPaths` is invisible from the
     /// outside until a daemon binds the wrong socket well after the fact.

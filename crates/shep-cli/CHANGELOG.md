@@ -237,6 +237,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this one so the new verb builds on a single copy instead of adding to the
   pile.
 
+- Add `shep save`, which asks the daemon to write the muster roll now,
+  bypassing the snapshot writer's debounce (`Request::SaveRoll` /
+  `Response::RollSaved`). `save` is pm2's own word, so the muscle memory
+  transfers directly. It takes **no selector**: the roll always records the
+  whole flock, so it is not one of the six verbs `SelectorArgs` gates.
+
+  The reply names the path the daemon wrote and how many apps that roll
+  records, and both ride the table — `FILE`/`APPS`, every field a column,
+  matching `EmptiedFiles`' own reason: a verb that wrote a file and would not
+  say which one has reported nothing. A failed save exits non-zero and names
+  why, rather than the silent no-op the verb exists to rule out.
+
+  Dispatched through `connect_client`, never `connect_or_spawn_client`:
+  saving the roll of a daemon that is not running is not a thing, and
+  autostarting one just to save an empty flock would overwrite a good roll
+  with an empty one.
+
 ### Fixes
 
 - Open the shepherd's own `shepd.out.log`/`shepd.err.log` `O_APPEND` in the

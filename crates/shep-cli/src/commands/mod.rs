@@ -7,6 +7,7 @@ pub mod bleats;
 pub mod daemon;
 pub mod lifecycle;
 pub mod logs;
+pub mod muster;
 pub mod query;
 pub(crate) mod selector;
 pub mod trigger;

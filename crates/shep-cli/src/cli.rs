@@ -116,6 +116,8 @@ pub enum Commands {
     Ping,
     /// Shut the shepherd down.
     Kill,
+    /// Write the muster roll now, so a reboot can bring this flock back.
+    Save,
     /// Print a shell completion script.
     ///
     /// Static only: sheep names, fold names and other daemon-side
@@ -529,6 +531,7 @@ mod tests {
             "trigger",
             "ping",
             "kill",
+            "save",
             "completions",
         ] {
             assert!(

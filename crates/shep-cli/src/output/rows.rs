@@ -318,6 +318,44 @@ impl Render for KillRow {
     const JSON_ONLY: &'static [&'static str] = &[];
 }
 
+/// `Response::RollSaved` — where the muster roll landed, and what it
+/// recorded.
+///
+/// Constructed by `commands/muster.rs`'s `save`, from a real `Response`.
+/// Every field is a column — `JSON_ONLY: &[]` — for [`EmptiedFiles`]' own
+/// stated reason: a verb that wrote a file and would not say which one has
+/// reported nothing.
+#[derive(Debug, Serialize)]
+pub struct SavedRollRow {
+    /// The roll's path, exactly as the daemon reported it.
+    pub file: String,
+    /// How many apps that roll records.
+    pub apps: u32,
+}
+
+impl Render for SavedRollRow {
+    fn headers() -> &'static [&'static str] {
+        &["FILE", "APPS"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        vec![vec![self.file.clone(), self.apps.to_string()]]
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "FILE" => "file",
+            "APPS" => "apps",
+            other => panic!("SavedRollRow::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
 /// `Response::Triggered(Vec<ActionReply>)` — one row per matched sheep, each
 /// carrying what happened when the daemon tried to deliver `shep trigger`'s
 /// action to it.
@@ -676,6 +714,18 @@ pub(crate) mod tests {
             |j| j,
             &[],
         );
+    }
+
+    /// fails if `SavedRollRow` grows a field that never reaches the table —
+    /// the same gate `flock_rows_do_not_drift` applies, instantiated for a
+    /// payload whose every field is a column.
+    #[test]
+    fn saved_roll_row_does_not_drift() {
+        let row = SavedRollRow {
+            file: "/home/rin/.shep/flock.json".to_string(),
+            apps: 9,
+        };
+        assert_no_drift(&row, |json| json, &[]);
     }
 
     /// `DeletedIds` is `#[serde(transparent)]` over `Vec<u32>`, so it
