@@ -363,6 +363,17 @@ pub(crate) fn bind_socket(paths: &ShepPaths, socket: &Path) -> Result<UnixListen
             // listener accepts at the kernel level even mid-accept, while a
             // file left behind by a crash (or a reboot) refuses. This is the
             // load-bearing step for the reboot-resurrect scenario (§13.4).
+            //
+            // Only one direction of that is proof, and the asymmetry is
+            // deliberate. A socket answers for as long as ANY descriptor for
+            // it stays open, and `fork` copies every descriptor a process
+            // holds: a child a dying daemon forked and has not yet exec'd
+            // goes on answering on its behalf until close-on-exec clears the
+            // copy. So a refusal proves staleness, while an answer is only
+            // grounds to refuse this boot — never evidence that a healthy
+            // peer is there. Refusing a boot that could have proceeded costs
+            // an operator one retry; binding over a socket a daemon is still
+            // serving on costs two daemons one flock.
             match std::os::unix::net::UnixStream::connect(socket) {
                 Ok(_) => Err(BootError::AlreadyRunning {
                     pid: read_pidfile(paths)?,
