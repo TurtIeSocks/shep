@@ -123,6 +123,10 @@ pub enum Request {
     },
     /// Write the muster roll now, bypassing the snapshot writer's debounce
     SaveRoll,
+    /// Assemble the flock from the muster roll on disk: start every app the
+    /// roll recorded running, leaving every app the flock already has exactly
+    /// as it stands
+    Muster,
     /// Graceful daemon shutdown
     KillDaemon,
     /// Subscribe this connection to bus topics (glob patterns)
@@ -288,6 +292,14 @@ pub enum Response {
         /// How many apps that roll records
         apps: u32,
     },
+    /// Answer to `Muster` — every sheep of every app the roll restored, not
+    /// only the ones this call spawned.
+    ///
+    /// The distinction is the whole point of the reply. Assembling a flock
+    /// that is already assembled starts nothing, so a listing of what this
+    /// call spawned would be empty there — indistinguishable from an empty
+    /// roll, which is the one outcome an operator needs to tell apart.
+    Mustered(Vec<ProcessInfo>),
     /// Answer to `Subscribe`
     Subscribed,
     /// Answer to `KillDaemon`
@@ -512,6 +524,15 @@ mod tests {
                 deadline_ms: None,
                 body: Request::SaveRoll,
             },
+            // Paired with the `save_roll` row above so the two halves of the
+            // roll — the direction that writes it and the direction that
+            // assembles from it — sit next to each other, differing by their
+            // `kind` and by nothing else.
+            Envelope {
+                id: 10,
+                deadline_ms: None,
+                body: Request::Muster,
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v1", requests);
     }
@@ -715,6 +736,26 @@ mod tests {
             apps: 3,
         };
         let wire = r#"{"kind":"roll_saved","data":{"path":"/tmp/flock.json","apps":3}}"#;
+        assert_eq!(serde_json::to_string(&reply).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<Response>(wire).unwrap(), reply);
+    }
+
+    /// fails if `Muster` or `Mustered` is given a `rename`, or if `Mustered`
+    /// is declared fieldless — any of the three changes one of these two
+    /// strings while every type-level test in this module keeps passing.
+    ///
+    /// The listing is empty on purpose. `Mustered` carries the same
+    /// `Vec<ProcessInfo>` `Flock` does, and `reply_wire_snapshots` already
+    /// pins that row field by field; what is unpinned until here is this
+    /// variant's own tag and whether its payload lands under `data` at all.
+    #[test]
+    fn muster_serializes_snake_case_with_its_listing_under_data() {
+        assert_eq!(
+            serde_json::to_string(&Request::Muster).unwrap(),
+            r#"{"kind":"muster"}"#
+        );
+        let reply = Response::Mustered(Vec::new());
+        let wire = r#"{"kind":"mustered","data":[]}"#;
         assert_eq!(serde_json::to_string(&reply).unwrap(), wire);
         assert_eq!(serde_json::from_str::<Response>(wire).unwrap(), reply);
     }

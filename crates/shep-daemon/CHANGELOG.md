@@ -51,6 +51,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Answer `Request::Muster` on the control socket, over the same restore the
+  daemon already runs at boot. `snapshot::muster` is now that one
+  implementation: `boot::restore_flock` is a line over it, and the request
+  handler calls it and turns the names it hands back into a listing. The
+  restore that runs unattended after a reboot is therefore the one an operator
+  exercises by hand, rather than a second path nobody has driven. It returns
+  names instead of a listing so the boot caller has nothing to report and no
+  reason to try.
+
+  An app the flock already has is left where it stands, and is still counted
+  as restored. Boot never meets that case, since its flock is empty by
+  construction; an operator meets it whenever a muster follows a partial
+  restore, or simply runs twice. Starting such an app again is not the no-op
+  it looks like — `instance_slots` allocates the lowest FREE slot, so a second
+  start of a one-instance app leaves it running two and the next roll records
+  the pair. Restarting it would drop live connections over a verb that never
+  claimed to be `restart`, and refusing the whole muster over it would break
+  the partial-restore case the verb is most useful for. The unit of the rule
+  is the app, not the instance count.
 - Answer `Request::SaveRoll` on the control socket: the daemon writes the
   muster roll immediately, bypassing the debounce the snapshot writer
   otherwise applies, and reports back the path it wrote and how many apps

@@ -142,6 +142,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grammar (`all`, `/regex/`, `fold:`) makes a mixed flock the normal case,
   and a channel-less sheep in that mix should not cost every other sheep its
   answer.
+- Add `Request::Muster` and `Response::Mustered`, asking a daemon to assemble
+  the flock from the muster roll on disk (`shep muster`). Additive under
+  `#[non_exhaustive]` on the same terms as `SaveRoll` below — `PROTOCOL_VERSION`
+  stays **1**, and an older daemon fails to decode the verb rather than
+  answering it. `Muster` carries no fields for the reason `SaveRoll` carries
+  none: the roll describes a whole flock, so there is nothing to select.
+  `Mustered` carries the same `Vec<ProcessInfo>` `Flock` does, and reports
+  every sheep of every app the roll restored rather than only the ones that
+  call spawned — assembling a flock that is already assembled starts nothing,
+  and an empty listing there would be indistinguishable from an empty roll,
+  which is the one outcome the reply exists to tell apart.
 - Add `Request::SaveRoll` and `Response::RollSaved`, asking a daemon to write
   the muster roll now, bypassing the snapshot writer's debounce
   (`shep save`). Additive under `#[non_exhaustive]` on the same terms as

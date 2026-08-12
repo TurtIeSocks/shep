@@ -128,5 +128,12 @@ expression: requests
     "body": {
       "kind": "save_roll"
     }
+  },
+  {
+    "id": 10,
+    "deadline_ms": null,
+    "body": {
+      "kind": "muster"
+    }
   }
 ]

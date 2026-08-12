@@ -669,40 +669,25 @@ fn max_cron_sleep(options: &BootOptions) -> Duration {
 
 /// Reads the muster roll (if one exists) and starts every app it restores.
 ///
-/// A missing roll is not restore's problem to report — a fresh `$SHEP_HOME`
-/// has none, and that's just a first boot, not a [`BootError`]. A roll that
-/// exists but fails to parse IS reported: something already corrupted or
-/// hand-edited it, and silently booting an empty flock instead would hide
-/// that from the operator.
+/// One line over [`snapshot::muster`], which holds the whole restore rule and
+/// its rationale — a missing roll, a corrupt one, a rejected entry, an app
+/// the flock already has. The `Muster` request an operator sends runs that
+/// same function, so the restore that happens unattended after a reboot is
+/// the one an operator exercises by hand.
+///
+/// What boot supplies that the operator's call does not is an empty flock:
+/// nothing here can already be running, so every restorable app is started
+/// and the names come back describing exactly what boot just did. It discards
+/// them because there is no one at this end of a boot to report them to.
 async fn restore_flock(
     paths: &ShepPaths,
     registry: &FlockRegistry,
     supervisor: &SupervisorHandle,
 ) -> Result<(), BootError> {
-    let saved = match snapshot::read(&paths.snapshot) {
-        Ok(saved) => saved,
-        Err(SnapshotError::Io(err)) if err.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(BootError::Snapshot(err)),
-    };
-    let restorable = snapshot::restorable(saved);
-    for (name, err) in &restorable.rejected {
-        tracing::warn!(name, %err, "muster roll entry rejected on restore");
-    }
-    if restorable.apps.is_empty() {
-        return Ok(());
-    }
-    // Recorded regardless of whether `start` below fully succeeds, matching
-    // `rpc::run`'s own Start handler: already-registered entries must
-    // persist even when a later spawn in the same batch fails.
-    registry.record(&restorable.apps);
-    if let Err(err) = supervisor.start(restorable.apps).await {
-        // A restore spawn failure must not sink the whole boot — the same
-        // "one bad entry doesn't sink the muster" policy `restorable`
-        // already applies at validation time. The sheep that failed to
-        // spawn is already recorded `Errored` by the supervisor itself.
-        tracing::warn!(%err, "muster roll restore failed to spawn one or more apps");
-    }
-    Ok(())
+    snapshot::muster(&paths.snapshot, registry, supervisor)
+        .await
+        .map(|_names| ())
+        .map_err(BootError::Snapshot)
 }
 
 /// A booted daemon, not yet serving: everything [`boot`] assembled, handed

@@ -300,6 +300,28 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
                 message: err.to_string(),
             })),
         },
+        // The same restore `boot` runs, called the same way — see
+        // `crate::snapshot::muster`, which is the whole of the rule.
+        Request::Muster => {
+            match crate::snapshot::muster(&ctx.snapshot_path, &ctx.registry, &ctx.supervisor).await
+            {
+                Err(err) => reply(Err(RpcError {
+                    code: RpcErrorCode::Internal,
+                    message: err.to_string(),
+                })),
+                Ok(names) => match ctx.supervisor.list_checked().await {
+                    Err(err) => reply(Err(rpc_error(&err))),
+                    // Every sheep of every app the roll restored, not only
+                    // the ones this call spawned — see `Response::Mustered`.
+                    Ok(infos) => reply(Ok(Response::Mustered(
+                        infos
+                            .into_iter()
+                            .filter(|info| names.contains(&info.name))
+                            .collect(),
+                    ))),
+                },
+            }
+        }
         Request::Subscribe { topics } => match TopicFilter::new(&topics) {
             Ok(filter) => Outcome::Subscribe {
                 reply: Reply {
@@ -1201,5 +1223,47 @@ mod tests {
             "the operator must be told why nothing was written: {}",
             err.message
         );
+    }
+
+    /// fails if `Muster` reports only what THIS call spawned. Assembling a
+    /// flock that is already assembled starts nothing, so an empty reply
+    /// there is indistinguishable from "the roll was empty" — the one thing
+    /// this reply exists to tell apart.
+    ///
+    /// One script, deliberately: `web`'s first start consumes it, so a muster
+    /// that started the roll's apps unconditionally would find the pool
+    /// exhausted on the duplicate `instance_slots` hands it, and
+    /// `ScriptedRunner` answers `SpawnFailed("script exhausted")` — which
+    /// lands as a second, `Errored` `web` in the listing rather than as a
+    /// failed reply. Both assertions below are what catch it; the count sees
+    /// the extra row and the name assertion pins which one survived.
+    #[tokio::test]
+    async fn a_second_muster_still_reports_the_flock_the_roll_restored() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        reply_of(dispatch(envelope(2, Request::SaveRoll), &h.ctx).await);
+
+        let reply = reply_of(dispatch(envelope(3, Request::Muster), &h.ctx).await);
+        let Ok(Response::Mustered(infos)) = reply.result else {
+            panic!("expected Mustered, got {:?}", reply.result)
+        };
+        assert_eq!(
+            infos.len(),
+            1,
+            "the sheep the roll restores, not the ones this call spawned"
+        );
+        assert_eq!(infos[0].name, "web");
+        assert_eq!(infos[0].status, ProcStatus::Online);
     }
 }
