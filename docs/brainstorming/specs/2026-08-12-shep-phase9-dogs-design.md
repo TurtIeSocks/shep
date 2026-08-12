@@ -96,10 +96,49 @@ Live config push is a v1.1 question, and one worth answering with two dogs'
 worth of evidence about what actually changes at runtime.
 
 Spawning is the **ordinary** path: the same runner, kill ladder, restart
-budget and log pumps a sheep gets. A marker on the process entry keeps dogs
-out of `shep flock` unless `--all` is passed, and **badges them when they are
-shown**, so a dog in a listing is never mistaken for one of the operator's own
-processes. `shep dogs` lists them directly.
+budget and log pumps a sheep gets.
+
+### Rendering: two tables, one registry
+
+A marker on the process entry is a **storage** decision; how a listing renders
+is a separate one, and conflating them costs something for nothing. pm2 keeps
+one registry — a module's id sits in the middle of the process ids — and still
+prints a second table beneath the first. shep does the same:
+
+```
+ID  NAME                STATUS   PID      RESTARTS  CPU    MEM     UPTIME  FOLD
+0   bpm                 online   2263800  11        0.0%   541.7M  6d      -
+4   bpm                 online   2019197  10        0.0%   646.7M  20d     -
+1   bpm_client          stopped  -        0         -      -       -       -
+2   ctm                 online   2263591  10        0.0%   216.5M  6d      -
+
+Dogs
+NAME     SOURCE    STATUS   PID      RESTARTS  CPU    MEM     UPTIME
+metrics  built-in  online   3321997  0         0.0%   14.1M   6d
+bark     built-in  online   3321998  12        0.0%   138.3M  6d
+```
+
+Two consequences, both departures from §8 as written and both deliberate:
+
+- **The dogs table shows by default**, rather than only under `--all`. §8 hides
+  dogs to keep the flock listing uncluttered, and a separate table already
+  achieves that. A bark dog that has died is precisely the thing an operator
+  needs to notice, and hiding it means finding out by *not* being paged.
+  `--all` instead widens both tables to include stopped entries.
+- **Dogs never share a table with sheep**, so the shared id space stops
+  mattering. Ids reflect spawn order and a dog booted alongside the flock will
+  land among them; nobody sees that, because the two populations are never
+  rendered together. This is what makes the marker cost nothing at the surface.
+
+`SOURCE` distinguishes a built-in from an adopted binary — the column an
+operator wants when a dog misbehaves. `shep dogs` prints the second table
+alone.
+
+### Listings sort by name
+
+Sorting by id scatters a clustered app's instances across the table; sorting by
+name groups them, which is what makes a four-instance app readable at a glance.
+This changes the existing listing, not just the new one.
 
 This is deliberately a marker rather than a second registry. Duplicating
 supervision would mean teaching every feature since Phase 2 — reload, watch,
