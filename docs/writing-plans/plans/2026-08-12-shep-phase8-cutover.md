@@ -92,7 +92,7 @@ Recorded so no task re-litigates them. Items marked (Rin) come from the approved
 | 4 | **An empty `Mustered` gets an explicit stderr notice from the CLI.** Same shape as decision 1, one layer up: a muster that restores nothing must say so rather than print an empty table. |
 | 5 | **One restore path, shared.** `boot::restore_flock` and the `Muster` handler call the same function in `snapshot.rs`. Two copies of "read the roll, re-validate, record, start" drift, and the one that drifts is the one nobody reboots to test. |
 | 6 | (Rin) **`import` reads the dump only**, writes a Flockfile, and **starts nothing**. No `ecosystem.config.js` overlay: reading it faithfully means evaluating JavaScript. |
-| 7 | **A dump row's fields are read from `pm2_env` when the row has one, else from the row itself.** The design spec records the field *names* from a real dump, not their nesting. Accepting both costs four lines; guessing wrong costs the whole verb on the one machine that matters. A row with no `pm_exec_path` under either is a **loud, named failure**, not a skipped row. |
+| 7 | **A dump row is flat; fields are read from the row itself.** Measured against a real dump on 2026-08-12, after this plan was drafted: no `pm2_env` key exists, `name`/`pm_exec_path`/`cwd` sit at the row's top level (71 keys), and the `env` dict duplicates the top-level string keys exactly — all 31 of them. The `pm2_env` fallback the plan originally carried is therefore dead code and is removed. A row with no `pm_exec_path` is still a **loud, named failure** carrying the keys it did find, not a skipped row: that guard is what would catch a dump shape this measurement did not cover. |
 | 8 | (Rin) **Declared env only, by construction.** The declared env is the union of the row's `env_<name>` maps — by construction those hold only what the ecosystem file declared. A key in `env` that is neither declared, nor a named session-junk pattern, nor pm2-injected is **named in the output and not written**. The operator decides; the evidence is in front of them. |
 | 9 | **The pm2-injected list being incomplete is safe by construction.** An injected key we do not recognise lands in the "named, not written" bucket — noise, never a silent wrong config. This is why the list may stay short rather than being guessed at length. |
 | 10 | **`NODE_APP_INSTANCE` becomes `increment_var`, never a literal env value.** Copying it verbatim would pin instance 0's value into every instance. Spec §14.8 assigns this mapping to the importer. *Beyond the design spec's field table — flagged for Rin.* |
@@ -939,7 +939,7 @@ Note the autostart interaction and state it in the verb's doc: when `connect_or_
 **Interfaces — produced, depended on by Tasks 7, 8, 9:**
 
 ```rust
-/// One instance row out of a pm2 dump, after the `pm2_env` unwrap.
+/// One instance row out of a pm2 dump.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DumpRow {
     pub name: String,
@@ -967,8 +967,8 @@ pub(crate) struct DumpRow {
 /// # Errors
 /// - [`DumpError::Json`] — the document is not valid JSON.
 /// - [`DumpError::NotAnArray`] — valid JSON, but not the array of instance rows a dump is.
-/// - [`DumpError::RowMissingName`] — a row carries no `name` under either shape.
-/// - [`DumpError::RowMissingScript`] — a row carries no `pm_exec_path` under either shape (carries the keys it did find).
+/// - [`DumpError::RowMissingName`] — a row carries no `name`.
+/// - [`DumpError::RowMissingScript`] — a row carries no `pm_exec_path` (carries the keys it did find).
 pub(crate) fn parse(source: &str) -> Result<Vec<DumpRow>, DumpError>;
 
 #[derive(Debug)]
@@ -991,25 +991,22 @@ Add to `crates/shep-cli/Cargo.toml`:
 toml.workspace = true
 ```
 
-### The nesting question, and why both shapes are read
+### The nesting question, settled by measurement
 
-The design spec records a dump row's field *names* — `name`, `pm_exec_path` + `args`, `exec_interpreter`, `exec_mode`, `max_memory_restart`, `env`, `env_production` — from a real dump read during design. It does not record whether they sit at the row's top level or under a `pm2_env` key. Guessing costs the whole verb on the one machine that matters, so both are read (decision 7):
+Measured against a real dump on 2026-08-12: a row is **flat**. There is no
+`pm2_env` key; `name`, `pm_exec_path`, `args`, `exec_interpreter`,
+`exec_mode`, `max_memory_restart` and `env_production` all sit at the row's
+top level, alongside the process environment splatted in as individual string
+keys. The `env` dict holds exactly that same environment — all 31 of its keys
+also appear at the top level — which is what makes it usable as the bound on
+"which top-level strings are environment rather than config".
 
-```rust
-/// The object a row's fields live in: `pm2_env` when the row has one, the
-/// row itself otherwise. A dump is a list of instance rows and this is the
-/// only structural variation between the shapes one can take.
-fn fields_of(row: &serde_json::Value) -> &serde_json::Value {
-    match row.get("pm2_env") {
-        Some(nested) if nested.is_object() => nested,
-        _ => row,
-    }
-}
-```
+So config is read from the row, declared env from `env_production`, and `env`
+is consulted only to name what was dropped (decision 7).
 
-Reading through `serde_json::Value` rather than `#[serde(flatten)]` is deliberate: flatten would need a catch-all map to collect `env_<name>` keys, a second flatten to express "nested or inline", and the two interact in ways nobody reading this later would enjoy re-deriving. Readability wins here (core principles), and the dump is a handful of rows.
+Reading through `serde_json::Value` rather than `#[serde(flatten)]` is deliberate: flatten would need a catch-all map to collect the `env_<name>` keys, and it interacts badly with a row that carries the whole process environment as sibling string keys. Readability wins here (core principles), and a dump is a handful of rows.
 
-**A row with no `pm_exec_path` under either shape is a named failure, not a skipped row.** That is the only thing standing between a wrong guess about the shape and a Flockfile full of apps with no script. `DumpError::RowMissingScript` carries the row's index, its name, and the keys it *did* find (sorted, truncated to the first 20) so the operator can see the shape and report it.
+**A row with no `pm_exec_path` is a named failure, not a skipped row.** It is what would catch a dump shape the 2026-08-12 measurement did not cover, rather than emitting a Flockfile full of apps with no script. `DumpError::RowMissingScript` carries the row's index, its name, and the keys it *did* find (sorted, truncated to the first 20) so the operator can see the shape and report it.
 
 **Env values are not always strings.** A declared `PORT: 3000` in an ecosystem file arrives as a JSON number. Strings pass through, numbers and booleans are stringified, and anything else (an object, an array, a null) is dropped into `unrepresentable` and named in the output — never silently.
 
@@ -1021,118 +1018,111 @@ Reading through `serde_json::Value` rather than `#[serde(flatten)]` is deliberat
     "name": "api",
     "pid": 41201,
     "pm_id": 0,
-    "pm2_env": {
-      "name": "api",
-      "pm_exec_path": "/srv/api/dist/server.js",
-      "args": ["--port", "8080"],
-      "pm_cwd": "/srv/api",
-      "exec_interpreter": "node",
-      "exec_mode": "cluster_mode",
-      "autorestart": true,
-      "merge_logs": false,
-      "max_memory_restart": 536870912,
-      "env": {
-        "NODE_ENV": "production",
-        "NODE_APP_INSTANCE": "0",
-        "PM2_HOME": "/home/deploy/.pm2",
-        "BUN_INSTALL": "/home/deploy/.bun",
-        "SSH_TTY": "/dev/pts/3",
-        "XDG_SESSION_ID": "914",
-        "MOTD_SHOWN": "pam",
-        "LS_COLORS": "rs=0:di=01;34:ln=01;36:",
-        "LANG": "en_US.UTF-8",
-        "SHLVL": "1",
-        "PATH": "/home/deploy/.bun/bin:/usr/local/bin:/usr/bin:/bin"
-      },
-      "env_production": { "NODE_ENV": "production" }
-    }
+    "pm_exec_path": "/srv/api/dist/server.js",
+    "args": ["--port", "8080"],
+    "pm_cwd": "/srv/api",
+    "exec_interpreter": "node",
+    "exec_mode": "cluster_mode",
+    "autorestart": true,
+    "merge_logs": false,
+    "max_memory_restart": 536870912,
+    "SSH_TTY": "/dev/pts/3",
+    "XDG_SESSION_ID": "914",
+    "BUN_INSTALL": "/home/deploy/.bun",
+    "env": {
+      "NODE_ENV": "production",
+      "NODE_APP_INSTANCE": "0",
+      "PM2_HOME": "/home/deploy/.pm2",
+      "BUN_INSTALL": "/home/deploy/.bun",
+      "SSH_TTY": "/dev/pts/3",
+      "XDG_SESSION_ID": "914",
+      "MOTD_SHOWN": "pam",
+      "LS_COLORS": "rs=0:di=01;34:ln=01;36:",
+      "LANG": "en_US.UTF-8",
+      "SHLVL": "1",
+      "PATH": "/home/deploy/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+    },
+    "env_production": { "NODE_ENV": "production" }
   },
   {
     "name": "api",
     "pid": 41202,
     "pm_id": 1,
-    "pm2_env": {
-      "name": "api",
-      "pm_exec_path": "/srv/api/dist/server.js",
-      "args": ["--port", "8080"],
-      "pm_cwd": "/srv/api",
-      "exec_interpreter": "node",
-      "exec_mode": "cluster_mode",
-      "autorestart": true,
-      "merge_logs": false,
-      "max_memory_restart": 536870912,
-      "env": {
-        "NODE_ENV": "production",
-        "NODE_APP_INSTANCE": "1",
-        "PM2_HOME": "/home/deploy/.pm2",
-        "BUN_INSTALL": "/home/deploy/.bun",
-        "SSH_TTY": "/dev/pts/3",
-        "XDG_SESSION_ID": "914",
-        "MOTD_SHOWN": "pam",
-        "LS_COLORS": "rs=0:di=01;34:ln=01;36:",
-        "LANG": "en_US.UTF-8",
-        "SHLVL": "1",
-        "PATH": "/home/deploy/.bun/bin:/usr/local/bin:/usr/bin:/bin"
-      },
-      "env_production": { "NODE_ENV": "production" }
-    }
+    "pm_exec_path": "/srv/api/dist/server.js",
+    "args": ["--port", "8080"],
+    "pm_cwd": "/srv/api",
+    "exec_interpreter": "node",
+    "exec_mode": "cluster_mode",
+    "autorestart": true,
+    "merge_logs": false,
+    "max_memory_restart": 536870912,
+    "env": {
+      "NODE_ENV": "production",
+      "NODE_APP_INSTANCE": "1",
+      "PM2_HOME": "/home/deploy/.pm2",
+      "BUN_INSTALL": "/home/deploy/.bun",
+      "SSH_TTY": "/dev/pts/3",
+      "XDG_SESSION_ID": "914",
+      "MOTD_SHOWN": "pam",
+      "LS_COLORS": "rs=0:di=01;34:ln=01;36:",
+      "LANG": "en_US.UTF-8",
+      "SHLVL": "1",
+      "PATH": "/home/deploy/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+    },
+    "env_production": { "NODE_ENV": "production" }
   },
   {
     "name": "worker",
     "pid": 41310,
     "pm_id": 2,
-    "pm2_env": {
-      "name": "worker",
-      "pm_exec_path": "/srv/worker/index.ts",
-      "args": [],
-      "pm_cwd": "/srv/worker",
-      "exec_interpreter": "bun",
-      "exec_mode": "fork_mode",
-      "autorestart": false,
-      "restart_delay": 5000,
-      "merge_logs": true,
-      "env": {
-        "QUEUE_URL": "redis://127.0.0.1:6379/2",
-        "JAVA_HOME": "/usr/lib/jvm/default",
-        "SSH_TTY": "/dev/pts/3",
-        "LANG": "en_US.UTF-8"
-      },
-      "env_staging": {
-        "QUEUE_URL": "redis://127.0.0.1:6379/2",
-        "QUEUE_CONCURRENCY": 4
-      }
+    "pm_exec_path": "/srv/worker/index.ts",
+    "args": [],
+    "pm_cwd": "/srv/worker",
+    "exec_interpreter": "bun",
+    "exec_mode": "fork_mode",
+    "autorestart": false,
+    "restart_delay": 5000,
+    "merge_logs": true,
+    "env": {
+      "QUEUE_URL": "redis://127.0.0.1:6379/2",
+      "JAVA_HOME": "/usr/lib/jvm/default",
+      "SSH_TTY": "/dev/pts/3",
+      "LANG": "en_US.UTF-8"
+    },
+    "env_staging": {
+      "QUEUE_URL": "redis://127.0.0.1:6379/2",
+      "QUEUE_CONCURRENCY": 4
     }
   },
   {
     "name": "migrate",
     "pid": 41455,
     "pm_id": 3,
-    "pm2_env": {
-      "name": "migrate",
-      "pm_exec_path": "/srv/migrate/bin/migrate",
-      "args": ["--once"],
-      "pm_cwd": "/srv/migrate",
-      "exec_interpreter": "none",
-      "exec_mode": "fork_mode",
-      "env": {
-        "DATABASE_URL": "postgres://localhost/app",
-        "TERM": "xterm-256color"
-      }
+    "pm_exec_path": "/srv/migrate/bin/migrate",
+    "args": ["--once"],
+    "pm_cwd": "/srv/migrate",
+    "exec_interpreter": "none",
+    "exec_mode": "fork_mode",
+    "env": {
+      "DATABASE_URL": "postgres://localhost/app",
+      "TERM": "xterm-256color"
     }
   }
 ]
 ```
 
-Every one of those values is invented. What each row is *for*: `api` covers cluster collapsing, `node`, a memory ceiling, a declared key, a pm2-injected instance number and an inherited toolchain path; `worker` covers `bun`, `autorestart: false`, `restart_delay`, `merge_logs`, a declared key with a **numeric** value that is absent from `env`, and an ambiguous `JAVA_HOME`; `migrate` covers `exec_interpreter: "none"`, an app started by hand with **no declared env at all**, and one session-junk key.
+Every one of those values is invented. What each row is *for*: `api` covers cluster collapsing, `node`, a memory ceiling, a declared key, a pm2-injected instance number and an inherited toolchain path; `worker` covers `bun`, `autorestart: false`, `restart_delay`, `merge_logs`, a declared key with a **numeric** value that is absent from `env`, and an ambiguous `JAVA_HOME`; `migrate` covers `exec_interpreter: "none"`, an app started by hand with **no declared env at all**, and one session-junk key. `api`'s first row additionally carries `SSH_TTY`, `XDG_SESSION_ID` and `BUN_INSTALL` splatted onto its own top level, sitting beside its config fields exactly as the 2026-08-12 measurement found them, and duplicated in `env` — the row a real dump produces, and proof the reader is not confused by config and session noise sharing one object.
 
 - [ ] **Step 2: Write the failing tests** in `dump.rs`:
 
 ```rust
     const FIXTURE: &str = include_str!("testdata/dump.pm2.json");
 
-    /// fails if the reader stops unwrapping `pm2_env`: every row in the
-    /// fixture nests, so a reader that only looked at the row's top level
-    /// would find no `pm_exec_path` at all and error instead of parsing.
+    /// fails if the reader stops reading a row's fields from its own top
+    /// level. Every row in the fixture is flat, and `api`'s first row also
+    /// carries splatted session keys beside its config fields — a reader
+    /// that expected a wrapper object would find no `pm_exec_path` at all
+    /// and error instead of parsing.
     #[test]
     fn the_fixture_parses_into_four_rows_with_their_fields() {
         let rows = parse(FIXTURE).unwrap();
@@ -1149,37 +1139,14 @@ Every one of those values is invented. What each row is *for*: `api` covers clus
         assert_eq!(rows[2].merge_logs, Some(true));
     }
 
-    /// fails if the reader only handles the nested shape. The design spec
-    /// records the field names, not their nesting, so both are read — see
-    /// this module's own note on the nesting question.
-    #[test]
-    fn a_flat_row_reads_the_same_as_a_nested_one() {
-        let flat = r#"[{"name":"web","pm_exec_path":"/srv/web","args":["-p","80"]}]"#;
-        let rows = parse(flat).unwrap();
-        assert_eq!(rows[0].name, "web");
-        assert_eq!(rows[0].pm_exec_path, "/srv/web");
-        assert_eq!(rows[0].args, ["-p", "80"]);
-    }
-
-    /// fails if `pm2_env` stops winning over the row's own keys. A row
-    /// carrying both must not silently import the outer one — that is the
-    /// shape where a wrong precedence produces a plausible, wrong Flockfile
-    /// instead of an error.
-    #[test]
-    fn pm2_env_wins_over_the_rows_own_keys() {
-        let both = r#"[{"name":"web","pm_exec_path":"/outer",
-                        "pm2_env":{"name":"web","pm_exec_path":"/inner"}}]"#;
-        assert_eq!(parse(both).unwrap()[0].pm_exec_path, "/inner");
-    }
-
-    /// fails if an unrecognisable row is skipped instead of reported. A
-    /// skipped row means a Flockfile missing an app the operator believes
+    /// fails if a row with no `pm_exec_path` is skipped instead of reported.
+    /// A skipped row means a Flockfile missing an app the operator believes
     /// they migrated, discovered after the reboot; the error names the
-    /// index, the app, and the keys the row did carry so the shape can be
-    /// reported.
+    /// index, the app, and the keys the row did carry, which is what would
+    /// catch a dump shape the 2026-08-12 measurement did not cover.
     #[test]
-    fn a_row_with_no_script_under_either_shape_is_a_named_failure() {
-        let odd = r#"[{"name":"web","pm2_env":{"name":"web","script":"/srv/web"}}]"#;
+    fn a_row_with_no_script_is_a_named_failure() {
+        let odd = r#"[{"name":"web","script":"/srv/web"}]"#;
         let err = parse(odd).unwrap_err();
         let DumpError::RowMissingScript { index, name, keys } = err else {
             panic!("expected RowMissingScript, got {err:?}")
@@ -1218,7 +1185,7 @@ Every one of those values is invented. What each row is *for*: `api` covers clus
 
 - [ ] **Step 3: Run, confirm failure.** `cargo test -p shep-cli --bins`
 
-- [ ] **Step 4: Implement.** `parse` is `serde_json::from_str::<serde_json::Value>` → `as_array` → per row: `fields_of`, then pull each field by name off the object, then a single pass over the object's keys collecting `env_<suffix>` maps. `DumpError` gets the per-module `Display` + `core::error::Error` impls house style requires (IR-18/19), each variant's doc naming the precise condition (IR-19).
+- [ ] **Step 4: Implement.** `parse` is `serde_json::from_str::<serde_json::Value>` → `as_array` → per row: pull each field by name directly off the row object, then a single pass over the object's keys collecting `env_<suffix>` maps. `DumpError` gets the per-module `Display` + `core::error::Error` impls house style requires (IR-18/19), each variant's doc naming the precise condition (IR-19).
 
 - [ ] **Step 5: Run tests, confirm pass.**
 
@@ -1293,7 +1260,7 @@ The mapping, one row per the design spec's table:
 
 **`normalize` runs on every mapped app before it is returned.** It is the same validation the daemon applies to peer input, and running it here means `shep import` fails at import time — with the app named — rather than writing a Flockfile that `shep start` refuses tomorrow. `ConvertError::Rejected` carries `NormalizeError`'s own message.
 
-**Instance count is the row count, never `pm2_env.instances`.** The dump records what is *running*; an app configured for 4 and running 2 should come across as the 2 that are up, matching the muster roll's own "was up when we saved" rule.
+**Instance count is the row count, never a configured `instances` field.** The dump records what is *running*; an app configured for 4 and running 2 should come across as the 2 that are up, matching the muster roll's own "was up when we saved" rule.
 
 - [ ] **Step 1: Write the failing tests** in `convert.rs`:
 
@@ -3154,7 +3121,7 @@ State the two failure signatures explicitly, because they are the ones this desi
 - [ ] **Step 6: Reconcile every CHANGELOG** (IR-45). Each entry should describe what an operator or an API consumer sees, not which task produced it (Rule 10). The four user-visible headlines: `save`/`muster`, `import`, `startup`/`unstartup`, and CPU/memory in `flock`.
 
 - [ ] **Step 7: Report to Rin** — every judgement call made on her behalf, anything left unfixed, and specifically:
-  - whether `pm2_env` nesting or the flat shape was the one the fixture models, and what a real dump would have to look like for Task 6's `RowMissingScript` to fire;
+  - whether `RowMissingScript` fires on a row with no `pm_exec_path`, and whether the fixture stayed synthesised rather than derived from a real dump;
   - decision 10 (`NODE_APP_INSTANCE` → `increment_var`), which is beyond the design spec's field table and rests on spec §14.8;
   - whether `systemd-analyze verify` ran or skipped, and on what;
   - the measured cost of the phase's slowest new test.
