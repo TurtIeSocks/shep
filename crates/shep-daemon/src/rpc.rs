@@ -25,8 +25,7 @@ use tokio::sync::{broadcast, watch};
 
 use shep_core::config::normalize_all;
 use shep_core::protocol::{
-    ActionOutcome, ActionReply, BusEvent, Envelope, ProcessInfo, Reply, Request, Response,
-    RpcError, RpcErrorCode, SelectorSpec,
+    BusEvent, Envelope, ProcessInfo, Reply, Request, Response, RpcError, RpcErrorCode, SelectorSpec,
 };
 use shep_core::selector::ProcessSelector;
 
@@ -38,6 +37,16 @@ use crate::supervisor::{SupervisorError, SupervisorHandle};
 pub(crate) const DEFAULT_DEADLINE_MS: u64 = 5_000;
 /// Ceiling on a client-supplied deadline — a peer cannot pin a daemon task open.
 pub(crate) const MAX_DEADLINE_MS: u64 = 60_000;
+/// How long an app gets to answer a triggered action before its row becomes
+/// [`ActionOutcome::TimedOut`](shep_core::protocol::ActionOutcome::TimedOut).
+///
+/// Deliberately under [`DEFAULT_DEADLINE_MS`], and by a margin rather than by
+/// a hair. The two bound different things — this one bounds the app, that one
+/// bounds the reply — and the honest per-row answer is only worth producing
+/// if it can still reach a caller who sent no deadline of its own. Reversed,
+/// every unanswered action would read as `DeadlineExceeded`, which says
+/// nothing about which sheep answered and which did not.
+const ACTION_TIMEOUT: Duration = Duration::from_millis(3_000);
 
 /// Everything a request handler may touch — one clone per connection.
 ///
@@ -370,16 +379,12 @@ where
 /// it: that helper is typed `Fut: Future<Output = Result<Vec<ProcessInfo>,
 /// SupervisorError>>` with `ok: fn(Vec<ProcessInfo>) -> Response`, and
 /// `Response::Triggered` carries `Vec<ActionReply>` — a distinct row
-/// `ProcessInfo` cannot hold a reply body on. This instead mirrors
-/// [`run`]'s `Describe` arm: resolve the selector, list the flock, filter by
-/// it, answer [`not_found`] on an empty match — the part every selector-in
-/// verb shares regardless of what its rows carry.
+/// `ProcessInfo` cannot hold a reply body on. Everything else about the shape
+/// is the same: convert the selector, call the supervisor, map the rows.
 ///
-/// Every match currently answers [`ActionOutcome::NoChannel`]. Nothing in
-/// this daemon build sends on a sheep's shepherd-channel sender or waits for
-/// a reply on it — `NoChannel` is the least specific of the four outcomes
-/// [`ActionOutcome`] can express, and the only one that claims nothing about
-/// a reply body, an elapsed wait, or a sheep's own lifecycle state.
+/// [`ACTION_TIMEOUT`] is one value for the whole flock rather than one per
+/// app. What decides it is its relationship with the request budget, not the
+/// number itself — see the constant's own doc.
 async fn trigger(
     id: u64,
     spec: SelectorSpec,
@@ -389,35 +394,12 @@ async fn trigger(
 ) -> Outcome {
     let result = match selector_of(spec) {
         Err(err) => Err(err),
-        Ok(selector) => match ctx.supervisor.list_checked().await {
-            Err(err) => Err(rpc_error(&err)),
-            Ok(infos) => {
-                let hits: Vec<_> = infos
-                    .into_iter()
-                    .filter(|i| selector.matches(&i.name, i.id, i.fold.as_deref()))
-                    .collect();
-                if hits.is_empty() {
-                    Err(not_found())
-                } else {
-                    tracing::debug!(
-                        action,
-                        params = ?params,
-                        matched = hits.len(),
-                        "resolved a trigger's selector, but no delivery path exists \
-                         for its action yet"
-                    );
-                    Ok(Response::Triggered(
-                        hits.into_iter()
-                            .map(|i| ActionReply {
-                                id: i.id,
-                                name: i.name,
-                                outcome: ActionOutcome::NoChannel,
-                            })
-                            .collect(),
-                    ))
-                }
-            }
-        },
+        Ok(selector) => ctx
+            .supervisor
+            .trigger(selector, action, params, ACTION_TIMEOUT)
+            .await
+            .map(Response::Triggered)
+            .map_err(|err| rpc_error(&err)),
     };
     Outcome::Reply(Reply { id, result })
 }
@@ -428,7 +410,9 @@ mod tests {
     use crate::fake::ProcScript;
     use crate::testing::harness;
     use shep_core::config::AppConfig;
-    use shep_core::protocol::{Request, Response, RpcErrorCode, SelectorSpec};
+    use shep_core::protocol::{
+        ActionOutcome, ActionReply, Request, Response, RpcErrorCode, SelectorSpec,
+    };
     use shep_core::status::ProcStatus;
 
     fn envelope(id: u64, body: Request) -> Envelope {
@@ -776,32 +760,39 @@ mod tests {
 
     /// Fails if `Trigger` is left to the catch-all arm at the bottom of
     /// `run` — a verb this daemon has never heard of — which answers
-    /// `Internal` for a request it in fact implements.
+    /// `Internal` for a request it in fact implements. Fails too if the row
+    /// stops carrying the sheep it is about.
     ///
-    /// `NoChannel` is every row's answer here because nothing in this
-    /// daemon build sends on a sheep's shepherd-channel sender or waits for
-    /// a reply — see `trigger`'s own doc. What this test actually pins is
-    /// everything ELSE: routing to `Response::Triggered` rather than
-    /// `Internal`, and one `ActionReply` row per matched sheep carrying that
-    /// sheep's real id and name rather than, say, an empty vec or a single
-    /// row per request.
+    /// `TimedOut` rather than `NoChannel` is the assertion that matters, and
+    /// it is two claims at once. The action was really delivered and really
+    /// waited on — `NoChannel` is what a build that never reached the sheep
+    /// would answer — and [`ACTION_TIMEOUT`] elapsed INSIDE the request's own
+    /// budget. Raise it past [`DEFAULT_DEADLINE_MS`] and this stops being a
+    /// row at all: `with_deadline` fires first and the reply becomes
+    /// `DeadlineExceeded`, which names no sheep and says nothing about which
+    /// of them answered. The ordering is what is pinned here; the constants
+    /// are pinned in `budgets_default_and_clamp`.
+    ///
+    /// Nothing answers because the harness keeps no handle on its runner, so
+    /// no case here can put a reply on a child's end of the channel. An app's
+    /// own words reaching a caller is pinned a tier down, in
+    /// `a_triggered_action_answers_with_the_apps_reply`.
     #[tokio::test(start_paused = true)]
-    async fn trigger_routes_to_the_flock_and_answers_no_channel_for_every_match() {
+    async fn trigger_routes_to_the_flock_and_reports_each_match_within_the_budget() {
         // Two apps, not one: ids start at 0, so a single-app harness would
         // give `web` id 0 — indistinguishable from a row-mapping bug that
         // drops the real id and leaves the field's default. Registering
         // `other` first pushes `web` to id 1, a value only the real mapping
         // produces.
         let h = harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        let mut web = AppConfig::minimal("web", "./srv");
+        web.channel = true;
         let started = reply_of(
             dispatch(
                 envelope(
                     1,
                     Request::Start {
-                        apps: vec![
-                            AppConfig::minimal("other", "./o"),
-                            AppConfig::minimal("web", "./srv"),
-                        ],
+                        apps: vec![AppConfig::minimal("other", "./o"), web],
                     },
                 ),
                 &h.ctx,
@@ -835,10 +826,14 @@ mod tests {
         let Response::Triggered(rows) = reply.result.unwrap() else {
             panic!("expected triggered")
         };
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, web_id);
-        assert_eq!(rows[0].name, "web");
-        assert_eq!(rows[0].outcome, ActionOutcome::NoChannel);
+        assert_eq!(
+            rows,
+            vec![ActionReply {
+                id: web_id,
+                name: "web".to_string(),
+                outcome: ActionOutcome::TimedOut,
+            }]
+        );
     }
 
     /// Fails if `Trigger` skips the selector conversion, or converts it

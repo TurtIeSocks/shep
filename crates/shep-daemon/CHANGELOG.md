@@ -52,15 +52,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Additions
 
 - Answer `Request::Trigger` on the control socket: the daemon resolves the
-  selector against the flock, same as `Describe`, and answers `NotFound` on
-  an empty match. `selector_call` (the helper every other selector-in verb
-  shares) is typed to `Vec<ProcessInfo>` and cannot carry `ActionReply`'s
-  reply body, so this is its own small dispatch path rather than a forced
-  fit. Every matched sheep currently answers `ActionOutcome::NoChannel`: no
-  code yet sends on a sheep's shepherd-channel sender or waits for a reply on
-  it, and `NoChannel` is the one outcome that claims nothing about a reply
-  body, an elapsed wait, or a sheep's own lifecycle state — the honest answer
-  until the daemon can actually deliver an action and wait for one back.
+  selector against the flock, puts the action on each matched sheep's
+  shepherd channel, and answers with one id-sorted `ActionReply` row per
+  match carrying what that app said back. An empty match is `NotFound`, as it
+  is for every other selector-in verb. `selector_call` (the helper those verbs
+  share) is typed to `Vec<ProcessInfo>` and cannot carry `ActionReply`'s reply
+  body, so this is its own small dispatch path rather than a forced fit.
+
+  The waits run alongside each other, so a whole flock costs one action
+  timeout rather than one per sheep, and the answer fires only once the last
+  of them has ended. A sheep that cannot take the action is refused in its own
+  row and the rest are still asked: `NoChannel` when nothing is receiving on
+  its channel — read off the channel itself, never off `channel = true`, so
+  there is no second copy of that fact to disagree — and `Skipped` for a
+  reload drainee, since both halves of a swap answer to the app's name and an
+  answer from the process being replaced is worse than no answer. Both
+  refusals are decided before any wait is armed, which is what keeps a refused
+  sheep from leaving a wait nothing will ever resolve.
+
+  A trigger no matched sheep could take is still a success — every match was
+  found, and every row says why nothing was delivered to it — and the daemon
+  logs a warning naming the action, because a whole request that delivered
+  nothing is usually one misconfiguration repeated across a flock rather than
+  a per-sheep surprise.
 - Add the reload state machine: the supervisor can replace each instance of an
   app with a fresh one, one instance at a time, so the app has a window in
   which it can stay reachable across the swap. A replacement registers under a

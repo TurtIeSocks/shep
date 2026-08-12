@@ -44,7 +44,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use shep_core::config::{AppConfig, ResolvedApp};
 use shep_core::paths::ShepPaths;
-use shep_core::protocol::{ActionOutcome, BusEvent, ProcessEventKind, ProcessInfo};
+use shep_core::protocol::{ActionOutcome, ActionReply, BusEvent, ProcessEventKind, ProcessInfo};
 use shep_core::selector::ProcessSelector;
 use shep_core::status::ProcStatus;
 
@@ -192,24 +192,27 @@ pub(crate) enum Command {
         /// own, never the actor loop (see [`Actor::handle_flush`]).
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     },
-    /// Puts one named action on a sheep's shepherd channel and answers with
-    /// what the app said back, or with why nothing came.
+    /// Puts one named action on the shepherd channel of every sheep matching
+    /// `selector` and answers with what each app said back, or with why
+    /// nothing came.
     ///
-    /// Keyed by id rather than by a selector, unlike every other verb here:
-    /// an answer is per-instance — one reply body from one process — so an
-    /// id is the unit the actor can actually resolve.
+    /// One row per matched sheep, because an answer is per-instance — one
+    /// reply body from one process — where every other selector-in verb has
+    /// one lifecycle outcome to report per sheep and can list them as a
+    /// flock.
     Trigger {
-        /// The sheep's id.
-        id: u32,
+        /// Which sheep.
+        selector: ProcessSelector,
         /// The action name, passed to the app verbatim.
         action: String,
         /// Argument text for the action, passed to the app verbatim.
         params: Option<String>,
-        /// How long the app gets to answer before the wait gives up.
+        /// How long each app gets to answer before its wait gives up.
         timeout: Duration,
-        /// Answers once the app replies or the timeout elapses — off a task
-        /// of its own, never the actor loop (see [`Actor::begin_action`]).
-        reply: oneshot::Sender<Result<ActionOutcome, SupervisorError>>,
+        /// Answers once every matched sheep has answered, timed out or been
+        /// refused — off a task of its own, never the actor loop (see
+        /// [`Actor::begin_action`]).
+        reply: oneshot::Sender<Result<Vec<ActionReply>, SupervisorError>>,
     },
     /// Graceful engine shutdown: kill ladder on every online sheep, then stop.
     Shutdown {
@@ -643,23 +646,32 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
     }
 
-    /// Sends `action` to one sheep over its shepherd channel and answers with
-    /// what its app said back.
+    /// Sends `action` over the shepherd channel of every sheep matching
+    /// `selector` and answers with one id-sorted row per match, carrying what
+    /// each app said back or why nothing came.
     ///
     /// Answers on completion rather than on acceptance: an action has no
     /// floor on how long it takes, so an acceptance would tell a caller
-    /// nothing it did not already know. `timeout` is what bounds that — the
-    /// app gets that long to reply before the answer becomes
+    /// nothing it did not already know. `timeout` is what bounds that — each
+    /// app gets that long to reply before its row becomes
     /// [`ActionOutcome::TimedOut`] — and it should be set below the caller's
     /// own budget, or the caller gives up before this honest answer reaches
-    /// it.
+    /// it. The waits run alongside each other, so a whole flock costs one
+    /// timeout rather than one per sheep.
+    ///
+    /// A sheep that cannot be reached is refused in its own row rather than
+    /// failing the whole request: spec §9's selector grammar (`all`,
+    /// `/regex/`, `fold:`) makes a mixed flock the normal case, and a refusal
+    /// that took the reachable sheep down with it would leave the operator
+    /// unable to tell which half was taken. [`ActionOutcome::NoChannel`] is
+    /// one such row, [`ActionOutcome::Skipped`] the other.
     ///
     /// `action` and `params` are passed to the app verbatim and are never
     /// read here. The daemon holds no list of an app's actions and does not
     /// validate the name against one: what an app does with an action it does
     /// not recognise, including replying to say so, is the app's to decide.
     ///
-    /// The outcome is a report and not a promise of delivery.
+    /// An outcome is a report and not a promise of delivery.
     /// [`ActionOutcome::Replied`] is the only one that proves the action
     /// reached the app, because a reply is the only proof there is — the
     /// daemon's own send says nothing, since the first one after a child has
@@ -667,19 +679,19 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
-    /// - [`SupervisorError::NotFound`] — no sheep is registered under `id`.
+    /// - [`SupervisorError::NotFound`] — nothing matched.
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
-    pub async fn trigger(
+    pub(crate) async fn trigger(
         &self,
-        id: u32,
+        selector: ProcessSelector,
         action: String,
         params: Option<String>,
         timeout: Duration,
-    ) -> Result<ActionOutcome, SupervisorError> {
+    ) -> Result<Vec<ActionReply>, SupervisorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Command(Command::Trigger {
-                id,
+                selector,
                 action,
                 params,
                 timeout,
@@ -984,8 +996,14 @@ struct PendingAction {
     /// reports what it made of the body, which is what keeps `reply` below
     /// reachable for the one message that resolves this wait.
     waiter: Option<oneshot::Sender<String>>,
-    /// Where this wait's outcome goes once it has one.
-    reply: oneshot::Sender<Result<ActionOutcome, SupervisorError>>,
+    /// Where this wait's outcome goes once it has one — the row-building
+    /// half of [`Actor::begin_action`], which turns it into one
+    /// [`ActionReply`].
+    ///
+    /// A bare outcome and not a `Result`: everything that could fail about
+    /// one sheep's action is decided before a wait is armed, by the selector
+    /// pass that found the sheep in the first place.
+    reply: oneshot::Sender<ActionOutcome>,
 }
 
 /// What one sheep still owes on its shepherd channel: the action waits armed
@@ -1047,10 +1065,7 @@ impl ActionWaits {
     /// `None` for a stamp no live wait carries, which is what a result for a
     /// sheep whose process has since gone looks like — [`Self::abandon_all`]
     /// answered it already.
-    fn resolve(
-        &mut self,
-        stamp: u64,
-    ) -> Option<oneshot::Sender<Result<ActionOutcome, SupervisorError>>> {
+    fn resolve(&mut self, stamp: u64) -> Option<oneshot::Sender<ActionOutcome>> {
         let at = self
             .live
             .iter()
@@ -1080,7 +1095,7 @@ impl ActionWaits {
     /// which is not what happened — the sheep's channel did.
     fn abandon_all(&mut self) {
         for pending in self.live.drain(..) {
-            let _ = pending.reply.send(Ok(ActionOutcome::NoChannel));
+            let _ = pending.reply.send(ActionOutcome::NoChannel);
         }
         self.abandoned.clear();
     }
@@ -1182,6 +1197,25 @@ struct SheepSlot {
     /// a reply nobody will ever write, and the debts it leaves behind belong
     /// to a process a replacement under this id never was.
     actions: ActionWaits,
+}
+
+impl SheepSlot {
+    /// This sheep's shepherd-channel sender while something is still there to
+    /// receive on it, and `None` when nothing is.
+    ///
+    /// The one fact that decides whether an action can be delivered at all,
+    /// read off the channel rather than off `AppConfig::channel` so there is
+    /// no second copy of it free to disagree. Both halves matter and neither
+    /// implies the other: [`Self::to_child`] is cleared when a process ends
+    /// under this id, while `is_closed` catches a sender whose far end went
+    /// first — which is what an app configured without a channel has from the
+    /// moment it spawns, since the runner drops the receiving end rather than
+    /// leaving it dangling.
+    fn open_channel(&self) -> Option<&mpsc::Sender<ShepherdMessage>> {
+        self.to_child
+            .as_ref()
+            .filter(|to_child| !to_child.is_closed())
+    }
 }
 
 /// Where a deferred `Stop`/`Restart`/`Delete`/`Shutdown` reply eventually
@@ -1336,13 +1370,13 @@ impl<R: ProcessRunner> Actor<R> {
             // taking down, and the wait's timeout is what bounds the answer
             // if that child stops reading its channel first.
             Command::Trigger {
-                id,
+                selector,
                 action,
                 params,
                 timeout,
                 reply,
             } => {
-                self.begin_action(id, action, params, timeout, reply);
+                self.begin_action(&selector, action, params, timeout, reply);
                 false
             }
             Command::Stop { selector, reply } => {
@@ -3548,8 +3582,20 @@ impl<R: ProcessRunner> Actor<R> {
         self.went_online(id, info, manually);
     }
 
-    /// Puts one action on `id`'s shepherd channel and arms the wait for its
-    /// reply, or answers straight away if there is no channel to put it on.
+    /// Resolves `selector`, puts one action on the shepherd channel of every
+    /// matched sheep that can take one, and answers with a row per match once
+    /// the last of those waits has ended.
+    ///
+    /// Shaped like [`Self::begin_manual`]: one request, N matched sheep, an
+    /// answer that carries every one of them and fires only when the last is
+    /// settled. What differs is where the aggregation lives. A manual
+    /// command's per-sheep outcome is an exit the actor itself handles, so it
+    /// is collected in `pending` and folded in from `handle_exited`; an
+    /// action's is a message from a task the actor spawned, already addressed
+    /// to a channel of its own. So the rows are joined up in a task rather
+    /// than in the actor's own state — see [`spawn_trigger_task`], which also
+    /// says why the waits do not run one after another despite being awaited
+    /// in a loop.
     ///
     /// # Why nothing here is awaited
     ///
@@ -3565,12 +3611,33 @@ impl<R: ProcessRunner> Actor<R> {
     /// to the task along with the wait, and this handler does nothing but
     /// record what it armed.
     ///
-    /// # What a sheep with no channel means
+    /// # Why a refusal is a row and not the answer
     ///
-    /// [`ActionOutcome::NoChannel`], answered here rather than waited out. A
-    /// slot whose [`SheepSlot::to_child`] is `None` has no process running
-    /// under it, so there is nothing to deliver to and no reply to wait for
-    /// — and a wait would answer the same thing one whole timeout later.
+    /// Spec §9's selector grammar (`all`, `/regex/`, `fold:`) makes a mixed
+    /// flock the normal case, so a sheep that cannot take the action refuses
+    /// in its own row and the rest are still asked. `Reopen` and `Flush` set
+    /// the precedent: a per-item failure inside a success, rather than a
+    /// refusal that takes every other match down with it and leaves the
+    /// operator unable to tell which half was taken.
+    ///
+    /// Both refusals are decided HERE, ahead of the wait, and that ordering
+    /// is load-bearing rather than tidy: a wait is resolved by a message from
+    /// the task that armed it, so a sheep refused after one was armed would
+    /// leave a wait nothing drives home.
+    ///
+    /// - **No channel to deliver over** — [`ActionOutcome::NoChannel`], read
+    ///   off [`SheepSlot::open_channel`] rather than off `AppConfig::channel`,
+    ///   because the channel is the fact that actually decides delivery and a
+    ///   second copy of it could disagree. Answered here rather than waited
+    ///   out: a wait would say the same thing one whole timeout later.
+    /// - **A reload drainee** — [`ActionOutcome::Skipped`]. Both halves of a
+    ///   swap match a name selector, so an operator asking for `web` reaches
+    ///   the process being replaced as well as the one replacing it, and an
+    ///   answer from a process on its way out is worse than no answer. It is
+    ///   also the half that would pay most for a wait: a sheep mid-kill-ladder
+    ///   has stopped reading its channel, so its row would cost a full
+    ///   timeout to say nothing. The replacement is not skipped — it is the
+    ///   instance that will still be there afterwards.
     ///
     /// A live sender is not proof of the opposite. `to_child.send` returning
     /// `Ok` says a message was queued for the writer task, not that a child
@@ -3580,21 +3647,103 @@ impl<R: ProcessRunner> Actor<R> {
     /// from the wait rather than from the send.
     fn begin_action(
         &mut self,
-        id: u32,
+        selector: &ProcessSelector,
         action: String,
         params: Option<String>,
         timeout: Duration,
-        reply: oneshot::Sender<Result<ActionOutcome, SupervisorError>>,
+        reply: oneshot::Sender<Result<Vec<ActionReply>, SupervisorError>>,
     ) {
-        let Some(slot) = self.sheep.get(&id) else {
+        let mut matched: Vec<u32> = self
+            .sheep
+            .iter()
+            .filter_map(|(id, slot)| {
+                let config = slot.entry.spec.config();
+                selector
+                    .matches(&config.name, *id, config.fold.as_deref())
+                    .then_some(*id)
+            })
+            .collect();
+        // Sorted so the actions go out in id order rather than in whatever
+        // order the map happened to yield them. The final sort in
+        // `spawn_trigger_task` is what the ANSWER's order rests on; this one
+        // only keeps delivery from being arbitrary as well.
+        matched.sort_unstable();
+
+        if matched.is_empty() {
             let _ = reply.send(Err(SupervisorError::NotFound));
             return;
-        };
-        let Some(to_child) = slot.to_child.clone() else {
-            let _ = reply.send(Ok(ActionOutcome::NoChannel));
-            return;
-        };
+        }
 
+        let mut refused = Vec::new();
+        let mut waits = Vec::new();
+        for id in matched {
+            let slot = self
+                .sheep
+                .get(&id)
+                .expect("begin_action: `matched` holds ids read off this map a moment ago");
+            let name = slot.entry.spec.config().name.clone();
+            if matches!(slot.entry.reload, ReloadState::Drainee { .. }) {
+                refused.push(ActionReply {
+                    id,
+                    name,
+                    outcome: ActionOutcome::Skipped,
+                });
+                continue;
+            }
+            let Some(to_child) = slot.open_channel().cloned() else {
+                refused.push(ActionReply {
+                    id,
+                    name,
+                    outcome: ActionOutcome::NoChannel,
+                });
+                continue;
+            };
+            let answer = self.arm_action(id, to_child, action.clone(), params.clone(), timeout);
+            waits.push((id, name, answer));
+        }
+
+        if waits.is_empty() {
+            // Not a silent success. The rows say what happened to each sheep,
+            // which is the half a caller reads; this is the half a daemon's
+            // own log reads, and it is here because a request that delivered
+            // NOTHING is worth one line even though no single row is
+            // surprising on its own. A flock where nothing is reachable is
+            // usually one misconfiguration — `channel` left unset — repeated
+            // across every app, and the operator sees a table of refusals
+            // rather than one cause.
+            let skipped = refused
+                .iter()
+                .filter(|row| row.outcome == ActionOutcome::Skipped)
+                .count();
+            tracing::warn!(
+                action,
+                matched = refused.len(),
+                skipped,
+                "no matched sheep could take this action; nothing was delivered"
+            );
+            let _ = reply.send(Ok(refused));
+            return;
+        }
+
+        spawn_trigger_task(refused, waits, reply);
+    }
+
+    /// Puts one action on `id`'s shepherd channel and arms the wait for its
+    /// reply, handing back the receiver that wait's outcome will arrive on.
+    ///
+    /// Infallible, and only reachable from [`Self::begin_action`]'s selector
+    /// pass: every question an action can be refused over — is there a sheep,
+    /// can it be reached, is it on its way out — is answered there, before
+    /// this is called.
+    fn arm_action(
+        &mut self,
+        id: u32,
+        to_child: mpsc::Sender<ShepherdMessage>,
+        action: String,
+        params: Option<String>,
+        timeout: Duration,
+    ) -> oneshot::Receiver<ActionOutcome> {
+        let (reply, answer) = oneshot::channel();
         let stamp = self.next_action_stamp;
         self.next_action_stamp += 1;
         let waiter = spawn_action_task(
@@ -3614,7 +3763,7 @@ impl<R: ProcessRunner> Actor<R> {
         // returns the actor to its loop.
         self.sheep
             .get_mut(&id)
-            .expect("begin_action: the slot was read a moment ago")
+            .expect("arm_action: the slot was read a moment ago")
             .actions
             .arm(PendingAction {
                 stamp,
@@ -3622,6 +3771,7 @@ impl<R: ProcessRunner> Actor<R> {
                 waiter: Some(waiter),
                 reply,
             });
+        answer
     }
 
     /// Forwards one shepherd-channel reply to the action wait it belongs to,
@@ -3652,7 +3802,7 @@ impl<R: ProcessRunner> Actor<R> {
             return;
         };
         if let Some(reply) = slot.actions.resolve(stamp) {
-            let _ = reply.send(Ok(outcome));
+            let _ = reply.send(outcome);
         }
     }
 
@@ -3964,6 +4114,47 @@ fn spawn_action_task(
             .await;
     });
     reply_tx
+}
+
+/// Spawns the task that collects one trigger's rows and answers its caller,
+/// folding the sheep already refused in [`Actor::begin_action`] in with the
+/// ones that have a wait to report.
+///
+/// # Why awaiting them in a loop is not serial
+///
+/// Every wait in `waits` is already running its own task, its own deadline
+/// started before this one existed — [`spawn_action_task`] spawns on the spot.
+/// So the loop is a join and not a queue: it settles when the LAST wait does,
+/// not when their timeouts add up, and a flock of ten unresponsive apps costs
+/// one timeout rather than ten. Written as a plain loop for the reason
+/// [`spawn_reopen_task`] gives for its own: one task with a `for` is a great
+/// deal easier to follow than a join over the flock, and here it buys nothing
+/// to give that up.
+///
+/// A wait whose sender is dropped rather than answered reports
+/// [`ActionOutcome::NoChannel`] — the same thing [`ActionWaits::abandon_all`]
+/// says, for the same event. The sender lives on the sheep's slot, so losing
+/// it means that slot let go of the wait, which is what a process ending
+/// under it does. The row is the honest one either way: no reply is coming.
+///
+/// Must be called from within a Tokio runtime context: it spawns immediately,
+/// like `spawn_readiness_task` and `spawn_reopen_task`.
+fn spawn_trigger_task(
+    mut rows: Vec<ActionReply>,
+    waits: Vec<(u32, String, oneshot::Receiver<ActionOutcome>)>,
+    reply: oneshot::Sender<Result<Vec<ActionReply>, SupervisorError>>,
+) {
+    tokio::spawn(async move {
+        for (id, name, answer) in waits {
+            let outcome = answer.await.unwrap_or(ActionOutcome::NoChannel);
+            rows.push(ActionReply { id, name, outcome });
+        }
+        // The refusals were collected in id order and the waits were armed in
+        // it, but a wait's row is appended when it settles, so this is what
+        // the answer's order actually rests on.
+        rows.sort_unstable_by_key(|row| row.id);
+        let _ = reply.send(Ok(rows));
+    });
 }
 
 /// Spawns the task that carries out one `Reopen` and answers its caller.
@@ -7992,19 +8183,20 @@ mod tests {
 
     /// Puts one action on the fixture's sheep and hands back the receiver its
     /// answer will arrive on.
+    ///
+    /// Arms the wait directly rather than going through `Command::Trigger`,
+    /// because what these cases are about is one sheep's wait — a selector
+    /// pass in front of it would only decide, again, the thing the fixture
+    /// already decided by building the slot the way it did.
     fn trigger_action(
         actor: &mut Actor<ScriptedRunner>,
         action: &str,
-    ) -> oneshot::Receiver<Result<ActionOutcome, SupervisorError>> {
-        let (reply, answer) = oneshot::channel();
-        actor.handle_command(Command::Trigger {
-            id: 0,
-            action: action.to_string(),
-            params: None,
-            timeout: ACTION_TIMEOUT,
-            reply,
-        });
-        answer
+    ) -> oneshot::Receiver<ActionOutcome> {
+        let to_child = actor.sheep[&0]
+            .to_child
+            .clone()
+            .expect("the fixture's sheep holds the daemon's end of a channel");
+        actor.arm_action(0, to_child, action.to_string(), None, ACTION_TIMEOUT)
     }
 
     /// Drives the one message an action wait sends home and applies it,
@@ -8060,7 +8252,7 @@ mod tests {
         let triggered = tokio::spawn(async move {
             handle
                 .trigger(
-                    0,
+                    ProcessSelector::Name("web".to_string()),
                     "gc".to_string(),
                     Some("--full".to_string()),
                     ACTION_TIMEOUT,
@@ -8087,9 +8279,13 @@ mod tests {
 
         assert_eq!(
             triggered.await.unwrap(),
-            Ok(ActionOutcome::Replied {
-                body: "swept 3".to_string()
-            }),
+            Ok(vec![ActionReply {
+                id: 0,
+                name: "web".to_string(),
+                outcome: ActionOutcome::Replied {
+                    body: "swept 3".to_string()
+                },
+            }]),
             "the app's reply body is what the caller is answered with"
         );
     }
@@ -8112,9 +8308,18 @@ mod tests {
 
         assert_eq!(
             handle
-                .trigger(0, "stats".to_string(), None, ACTION_TIMEOUT)
+                .trigger(
+                    ProcessSelector::Name("api".to_string()),
+                    "stats".to_string(),
+                    None,
+                    ACTION_TIMEOUT
+                )
                 .await,
-            Ok(ActionOutcome::TimedOut),
+            Ok(vec![ActionReply {
+                id: 0,
+                name: "api".to_string(),
+                outcome: ActionOutcome::TimedOut,
+            }]),
             "an app that says nothing is reported as saying nothing, not waited on forever"
         );
         assert_eq!(
@@ -8152,7 +8357,7 @@ mod tests {
             settle_action(&mut actor, &mut mailbox).await,
             ActionOutcome::TimedOut
         );
-        assert_eq!(first.await.unwrap(), Ok(ActionOutcome::TimedOut));
+        assert_eq!(first.await.unwrap(), ActionOutcome::TimedOut);
 
         let second = trigger_action(&mut actor, "gc");
         sent_action(&mut child_rx).await;
@@ -8163,7 +8368,7 @@ mod tests {
             ActionOutcome::TimedOut,
             "a reply the first `gc` was owed was handed to the second one"
         );
-        assert_eq!(second.await.unwrap(), Ok(ActionOutcome::TimedOut));
+        assert_eq!(second.await.unwrap(), ActionOutcome::TimedOut);
 
         // One reply per debt, and no more. Two `gc` waits have now given up,
         // and the reply above settled the first of them — so exactly one
@@ -8185,9 +8390,9 @@ mod tests {
         );
         assert_eq!(
             third.await.unwrap(),
-            Ok(ActionOutcome::Replied {
+            ActionOutcome::Replied {
                 body: "swept 11".to_string()
-            })
+            }
         );
     }
 
@@ -8219,9 +8424,9 @@ mod tests {
         );
         assert_eq!(
             answered.await.unwrap(),
-            Ok(ActionOutcome::Replied {
+            ActionOutcome::Replied {
                 body: "swept 3".to_string()
-            })
+            }
         );
 
         actor.handle_action_reply(0, "gc", "spent".to_string());
@@ -8233,7 +8438,7 @@ mod tests {
             ActionOutcome::TimedOut,
             "a spare reply was kept and used to answer a wait that came after it"
         );
-        assert_eq!(next.await.unwrap(), Ok(ActionOutcome::TimedOut));
+        assert_eq!(next.await.unwrap(), ActionOutcome::TimedOut);
     }
 
     /// Fails if two waits for the SAME action on one sheep are not answered
@@ -8262,16 +8467,16 @@ mod tests {
 
         assert_eq!(
             first.await.unwrap(),
-            Ok(ActionOutcome::Replied {
+            ActionOutcome::Replied {
                 body: "swept 3".to_string()
-            }),
+            },
             "the earlier trigger was answered with the later reply"
         );
         assert_eq!(
             second.await.unwrap(),
-            Ok(ActionOutcome::Replied {
+            ActionOutcome::Replied {
                 body: "swept 7".to_string()
-            }),
+            },
             "the second reply was dropped and its wait left waiting"
         );
     }
@@ -8311,55 +8516,326 @@ mod tests {
             ActionOutcome::TimedOut,
             "an action that never got onto the channel left its wait parked"
         );
-        assert_eq!(answer.await.unwrap(), Ok(ActionOutcome::TimedOut));
+        assert_eq!(answer.await.unwrap(), ActionOutcome::TimedOut);
     }
 
-    /// Fails if an action is delivered to a sheep with no live channel, or
-    /// waited out instead of refused.
-    ///
-    /// The fixture's own sheep is built with `to_child` clear, which is what
-    /// a registered-but-not-running instance looks like. Answering it takes
-    /// no wait at all — there is nothing to deliver to and no reply to expect
-    /// — so the assertion is the answer arriving without the mailbox ever
-    /// carrying a result.
-    #[tokio::test(start_paused = true)]
-    async fn an_action_for_a_sheep_with_no_channel_is_refused_on_the_spot() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut actor, mut mailbox) = actor_with_one_online_sheep(&dir, vec![]);
+    // --- Custom actions: one selector in, one row per matched sheep out ---
 
-        let answer = trigger_action(&mut actor, "gc");
-        // Bounded, because the failure this case guards against is a wait
-        // being armed for a channel that is not there — and a wait nothing
-        // drives home never resolves at all. An unbounded read would park the
-        // suite where this reddens it.
-        let answered = tokio::time::timeout(ACTION_WINDOW, answer)
+    /// Registers one more `Online` sheep under `name`, holding `to_child` as
+    /// its shepherd-channel sender, and hands back its id.
+    ///
+    /// Direct, like the fixtures it extends, because a flock whose sheep
+    /// differ in exactly one respect — whether the channel is there, whether
+    /// anything is reading it — is not reachable through `start`: the fake
+    /// runner wires a live channel for every spawn regardless of what the
+    /// app's `channel` says.
+    fn register_sheep(
+        actor: &mut Actor<ScriptedRunner>,
+        dir: &tempfile::TempDir,
+        name: &str,
+        to_child: Option<mpsc::Sender<ShepherdMessage>>,
+    ) -> u32 {
+        let id = actor.next_id;
+        actor.next_id += 1;
+        let paths = test_paths(dir);
+        let app = normalize(AppConfig::minimal(name, "./srv")).unwrap();
+        actor.sheep.insert(
+            id,
+            SheepSlot {
+                entry: armed_entry(id, 0, 2000 + id, app, &paths),
+                ctl: None,
+                log_ctl: None,
+                to_child,
+                manual: None,
+                pending_delete: false,
+                epoch: 0,
+                ready_tx: None,
+                actions: ActionWaits::default(),
+            },
+        );
+        id
+    }
+
+    /// Puts one action on every sheep matching `selector` and hands back the
+    /// receiver the whole answer will arrive on.
+    fn trigger_flock(
+        actor: &mut Actor<ScriptedRunner>,
+        selector: ProcessSelector,
+        action: &str,
+    ) -> oneshot::Receiver<Result<Vec<ActionReply>, SupervisorError>> {
+        let (reply, answer) = oneshot::channel();
+        actor.handle_command(Command::Trigger {
+            selector,
+            action: action.to_string(),
+            params: None,
+            timeout: ACTION_TIMEOUT,
+            reply,
+        });
+        answer
+    }
+
+    /// Reads one trigger's whole answer, failing rather than hanging if it
+    /// never comes.
+    ///
+    /// Bounded for the reason every read of an action's answer here is: a
+    /// request that armed a wait nothing will resolve never answers at all,
+    /// so an unbounded read would park the suite where this reddens it.
+    async fn triggered(
+        answer: oneshot::Receiver<Result<Vec<ActionReply>, SupervisorError>>,
+    ) -> Result<Vec<ActionReply>, SupervisorError> {
+        tokio::time::timeout(ACTION_WINDOW, answer)
             .await
-            .expect("a sheep with no channel was left waiting on an answer")
-            .unwrap();
-        assert_eq!(answered, Ok(ActionOutcome::NoChannel));
+            .expect("a trigger reported nothing within the window")
+            .expect("the trigger's reply channel was dropped")
+    }
+
+    /// One expected row, spelled out at the call site.
+    fn row(id: u32, name: &str, outcome: ActionOutcome) -> ActionReply {
+        ActionReply {
+            id,
+            name: name.to_string(),
+            outcome,
+        }
+    }
+
+    /// Fails if a trigger answers before every sheep it matched has been
+    /// heard from, if it drops any of them, or if the rows come back in
+    /// whatever order they settled in.
+    ///
+    /// The three sheep are the three shapes one selector routinely reaches at
+    /// once: one that answers, one with nothing to answer over, and one that
+    /// says nothing at all. The one that answers is asked FIRST and settles
+    /// FIRST, so a build that replied as soon as it had an answer would pass
+    /// every row assertion below — which is what the `try_recv` between the
+    /// two settlements is for.
+    ///
+    /// The id order and the order the rows are produced in genuinely differ,
+    /// so the final sort is load-bearing rather than incidental: the refused
+    /// sheep is collected before either wait is even armed, and the two waits
+    /// settle in the order the app and the clock decide. Delete the sort and
+    /// the rows come back `[1, 0, 2]`.
+    #[tokio::test(start_paused = true)]
+    async fn a_trigger_answers_every_sheep_it_matched_before_it_answers_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, mut mailbox, mut child_rx) = actor_with_an_open_channel(&dir);
+        register_sheep(&mut actor, &dir, "api", None);
+        let (silent_tx, mut silent_rx) = mpsc::channel(16);
+        register_sheep(&mut actor, &dir, "worker", Some(silent_tx));
+
+        let mut answer = trigger_flock(&mut actor, ProcessSelector::All, "gc");
+        sent_action(&mut child_rx).await;
+        sent_action(&mut silent_rx).await;
+
+        actor.handle_action_reply(0, "gc", "swept 3".to_string());
+        assert_eq!(
+            settle_action(&mut actor, &mut mailbox).await,
+            ActionOutcome::Replied {
+                body: "swept 3".to_string()
+            }
+        );
+        // Yielded first, and the assertion is worth nothing without it: the
+        // send that would answer early happens in the task collecting the
+        // rows, and `settle_action` returns without that task having been
+        // polled — so an unyielded `try_recv` reads `Empty` on a build that
+        // answers after every single row.
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(answer.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "a trigger answered while a sheep it matched was still being waited on"
+        );
+
+        assert_eq!(
+            settle_action(&mut actor, &mut mailbox).await,
+            ActionOutcome::TimedOut
+        );
+        assert_eq!(
+            triggered(answer).await,
+            Ok(vec![
+                row(
+                    0,
+                    "web",
+                    ActionOutcome::Replied {
+                        body: "swept 3".to_string()
+                    }
+                ),
+                row(1, "api", ActionOutcome::NoChannel),
+                row(2, "worker", ActionOutcome::TimedOut),
+            ])
+        );
+    }
+
+    /// Fails if a sheep with no live channel is waited out instead of refused
+    /// on the spot, or if that refusal is allowed to take the rest of the
+    /// selector's matches with it.
+    ///
+    /// The refused sheep is asked alongside one that answers, because the
+    /// mixed flock is the case the per-row shape exists for: a whole-request
+    /// refusal would deny an operator the answer the reachable sheep gave.
+    ///
+    /// Refusing takes no wait at all — there is nothing to deliver to and no
+    /// reply to expect — and the mailbox carrying exactly one result is what
+    /// says so. A refusal that armed a wait anyway would leave one nothing
+    /// ever resolves.
+    #[tokio::test(start_paused = true)]
+    async fn a_sheep_with_no_channel_is_refused_in_its_own_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, mut mailbox, mut child_rx) = actor_with_an_open_channel(&dir);
+        register_sheep(&mut actor, &dir, "api", None);
+
+        let answer = trigger_flock(&mut actor, ProcessSelector::All, "gc");
+        sent_action(&mut child_rx).await;
+        actor.handle_action_reply(0, "gc", "swept 3".to_string());
+        settle_action(&mut actor, &mut mailbox).await;
+
+        assert_eq!(
+            triggered(answer).await,
+            Ok(vec![
+                row(
+                    0,
+                    "web",
+                    ActionOutcome::Replied {
+                        body: "swept 3".to_string()
+                    }
+                ),
+                row(1, "api", ActionOutcome::NoChannel),
+            ])
+        );
         assert!(
             matches!(mailbox.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
             "a sheep with no channel armed a wait anyway"
         );
     }
 
-    /// Fails if an unknown id is answered with an outcome rather than an
-    /// error. Every [`ActionOutcome`] is a statement about a sheep, and there
-    /// is no sheep here to make one about.
+    /// Fails if "can this sheep be triggered" is answered off the presence of
+    /// a sender rather than off whether anything is still receiving on it.
+    ///
+    /// The two differ, and the difference is the whole of an app configured
+    /// without a channel: the runner drops the receiving end at spawn rather
+    /// than leaving it dangling, so its slot holds a sender whose far end is
+    /// already gone. Read as "there is a sender, so deliver", that app's
+    /// every action costs a full timeout to answer the same `NoChannel` this
+    /// gives at once.
     #[tokio::test(start_paused = true)]
-    async fn an_action_for_an_unregistered_id_is_an_error() {
+    async fn a_sheep_whose_channel_has_no_far_end_is_refused_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, mut mailbox) = actor_with_one_online_sheep(&dir, vec![]);
+        let (to_child, receiver) = mpsc::channel(16);
+        actor
+            .sheep
+            .get_mut(&0)
+            .expect("the fixture registers id 0")
+            .to_child = Some(to_child);
+        drop(receiver);
+
+        assert_eq!(
+            triggered(trigger_flock(&mut actor, ProcessSelector::All, "gc")).await,
+            Ok(vec![row(0, "web", ActionOutcome::NoChannel)])
+        );
+        assert!(
+            matches!(mailbox.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "a sheep whose channel has no far end armed a wait anyway"
+        );
+    }
+
+    /// Fails if a flock where NOTHING can be reached is answered as though
+    /// the action had been delivered.
+    ///
+    /// It is a success — every match was found and every match was told about
+    /// — and the rows are what stop it being a silent one: an operator reads
+    /// `no channel` against every sheep rather than an empty-looking `Ok`.
+    /// That is the whole difference from a reload that finds nothing to
+    /// replace, whose reply is a flock listing indistinguishable from one
+    /// that swapped every instance.
+    #[tokio::test(start_paused = true)]
+    async fn a_trigger_no_sheep_can_take_is_a_success_that_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, mut mailbox) = actor_with_one_online_sheep(&dir, vec![]);
+        register_sheep(&mut actor, &dir, "api", None);
+
+        assert_eq!(
+            triggered(trigger_flock(&mut actor, ProcessSelector::All, "gc")).await,
+            Ok(vec![
+                row(0, "web", ActionOutcome::NoChannel),
+                row(1, "api", ActionOutcome::NoChannel),
+            ])
+        );
+        assert!(
+            matches!(mailbox.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "a flock with nothing to deliver to armed a wait anyway"
+        );
+    }
+
+    /// Fails if a reload drainee is sent the action rather than skipped.
+    ///
+    /// Both halves of a swap answer to the app's name, and the drainee still
+    /// holds a live channel of its own — so without the skip an operator
+    /// asking `web` gets two rows for one instance, one of them from the
+    /// process being replaced. Deleting the skip does not merely add a row:
+    /// a drainee mid-kill-ladder has stopped reading its channel, so the row
+    /// it adds costs a whole timeout to say nothing.
+    ///
+    /// Built by hand rather than through a real swap because what decides the
+    /// skip is `ProcessEntry::reload`, which is crate-internal and never on
+    /// the wire — the same reason `actor_with_one_online_sheep` exists.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_drainee_is_skipped_and_its_replacement_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, mut mailbox, mut child_rx) = actor_with_an_open_channel(&dir);
+        let (replacement_tx, mut replacement_rx) = mpsc::channel(16);
+        let new_id = register_sheep(&mut actor, &dir, "web", Some(replacement_tx));
+        let drainee = actor.sheep.get_mut(&0).expect("the fixture registers id 0");
+        drainee.entry.status = ProcStatus::Stopping;
+        drainee.entry.reload = ReloadState::Drainee { new_id };
+        actor
+            .sheep
+            .get_mut(&new_id)
+            .expect("the replacement was just registered")
+            .entry
+            .reload = ReloadState::Replacement;
+
+        let answer = trigger_flock(&mut actor, ProcessSelector::Name("web".to_string()), "gc");
+        sent_action(&mut replacement_rx).await;
+        actor.handle_action_reply(new_id, "gc", "swept 3".to_string());
+        settle_action(&mut actor, &mut mailbox).await;
+
+        assert_eq!(
+            triggered(answer).await,
+            Ok(vec![
+                row(0, "web", ActionOutcome::Skipped),
+                row(
+                    new_id,
+                    "web",
+                    ActionOutcome::Replied {
+                        body: "swept 3".to_string()
+                    }
+                ),
+            ])
+        );
+        assert!(
+            matches!(child_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "an action was delivered to a process that is on its way out"
+        );
+    }
+
+    /// Fails if a selector matching nothing is answered with rows rather than
+    /// an error. Every [`ActionOutcome`] is a statement about a sheep, and
+    /// there is no sheep here to make one about — which is also what every
+    /// other selector-in verb answers, so a trigger differing would be a
+    /// second grammar for the same miss.
+    #[tokio::test(start_paused = true)]
+    async fn a_trigger_matching_no_sheep_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let (mut actor, _mailbox) = actor_with_one_online_sheep(&dir, vec![]);
 
-        let (reply, answer) = oneshot::channel();
-        actor.handle_command(Command::Trigger {
-            id: 4242,
-            action: "gc".to_string(),
-            params: None,
-            timeout: ACTION_TIMEOUT,
-            reply,
-        });
-        assert_eq!(answer.await.unwrap(), Err(SupervisorError::NotFound));
+        assert_eq!(
+            triggered(trigger_flock(
+                &mut actor,
+                ProcessSelector::Name("ghost".to_string()),
+                "gc"
+            ))
+            .await,
+            Err(SupervisorError::NotFound)
+        );
     }
 
     /// Fails if a wait armed against a process that then exits is left for
@@ -8384,7 +8860,7 @@ mod tests {
         let timed_out = trigger_action(&mut actor, "gc");
         sent_action(&mut child_rx).await;
         settle_action(&mut actor, &mut mailbox).await;
-        assert_eq!(timed_out.await.unwrap(), Ok(ActionOutcome::TimedOut));
+        assert_eq!(timed_out.await.unwrap(), ActionOutcome::TimedOut);
 
         let waiting = trigger_action(&mut actor, "stats");
         sent_action(&mut child_rx).await;
@@ -8405,7 +8881,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             answered,
-            Ok(ActionOutcome::NoChannel),
+            ActionOutcome::NoChannel,
             "a wait outlived the process it was waiting on"
         );
         assert!(
