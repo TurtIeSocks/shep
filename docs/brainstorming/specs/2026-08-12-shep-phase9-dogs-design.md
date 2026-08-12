@@ -22,10 +22,19 @@ covers `shep flock`.
 - **First-party dogs are argv branches of the same binary** — `shep dog
   metrics`, `shep dog bark` — the multi-call pattern the hidden `daemon`
   subcommand already uses.
-- **Third-party dogs are any binary**, registered with
-  `shep enable --exec <path> <name>`, running at the daemon's own trust level.
-  They get no sandboxing beyond that, which is the same trust a sheep already
-  has, and is stated rather than implied.
+- **Third-party dogs are any binary**, brought in with
+  `shep adopt <name> --exec <path>` and dropped with `shep rehome <name>`,
+  running at the daemon's own trust level. They get no sandboxing beyond that,
+  which is the same trust a sheep already has, and is stated rather than
+  implied.
+
+`adopt` is deliberately not `enable --exec`. Turning on a dog that already
+ships inside the binary and vetting a binary shep has never seen are different
+acts with different failure modes — a missing path, a file that is not
+executable, the wrong architecture — and one verb carrying both hides that.
+`enable`/`disable` stay for first-party dogs; `adopt`/`rehome` bring an
+outside one in and let it go. `enable --exec` survives as a hidden alias,
+because it is what someone arriving from pm2 would try first.
 
 ### Configuration travels over the socket, never the environment
 
@@ -59,7 +68,8 @@ bark subscribes to it. Neither has useful work before the connection exists.
 
 ## Lifecycle
 
-`shep enable <name>` writes `[dog.<name>]` into `shep.toml` and records the
+`shep enable <name>` (or `shep adopt <name> --exec <path>` for an outside
+binary) writes `[dog.<name>]` into `shep.toml` and records the
 dog as enabled. `shep disable <name>` removes it and stops the process.
 Enabled dogs are spawned when the daemon boots.
 
