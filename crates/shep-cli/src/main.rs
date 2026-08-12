@@ -2,10 +2,9 @@
 //! daemon launch/re-exec path. Module-by-module design:
 //! `docs/systematic-refactor/refactor-workspace/map.md`.
 //!
-//! A ratatui dashboard (`lookout`), a static file server (`serve`),
-//! startup-script generation (`startup`/`unstartup`), and the container
-//! (`shep runtime`) and dev (`shep dev`) execution modes are spec'd
-//! (`docs/specs/shep-v1.md` §9) but not built — this crate depends on
+//! A ratatui dashboard (`lookout`), a static file server (`serve`), and the
+//! container (`shep runtime`) and dev (`shep dev`) execution modes are
+//! spec'd (`docs/specs/shep-v1.md` §9) but not built — this crate depends on
 //! neither `ratatui`, `axum` nor `tower-http`, and there is no `[[bin]]`
 //! beyond `shep` itself. Recorded here as deliberately absent rather than
 //! letting them quietly read as shipped; full inventory:
@@ -45,6 +44,8 @@ use commands::logs;
 use commands::muster;
 #[cfg(unix)]
 use commands::query;
+#[cfg(unix)]
+use commands::startup;
 #[cfg(unix)]
 use commands::trigger;
 use exit::ExitCode;
@@ -123,6 +124,12 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
 /// re-exec'd `daemon` subcommand resolves its own paths independently, in
 /// [`run_daemon_command`], rather than through this shared gate. Requiring
 /// a resolvable home for either was a bug, not a deliberate restriction.
+///
+/// `Startup` and `Unstartup` are dispatched from the same early block, for
+/// a different reason: they resolve their own `$SHEP_HOME` from the TARGET
+/// user's passwd entry rather than from this process's environment, so the
+/// shared gate would both impose a requirement they do not have and hand
+/// them the wrong answer under `sudo`, which resets `$HOME` to root's.
 #[cfg(unix)]
 async fn run(cli: Cli) -> ExitCode {
     let fmt = cli.global.format;
@@ -167,6 +174,24 @@ async fn run(cli: Cli) -> ExitCode {
             return completions::completions(&mut out, args);
         }
         Commands::Daemon(ref args) => return run_daemon_command(fmt, &cli.global, args).await,
+        Commands::Startup(ref args) => {
+            let mut out = std::io::stdout().lock();
+            let mut err = std::io::stderr().lock();
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            return startup::startup(&mut streams, fmt, cli.global.home.as_deref(), args);
+        }
+        Commands::Unstartup(ref args) => {
+            let mut out = std::io::stdout().lock();
+            let mut err = std::io::stderr().lock();
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            return startup::unstartup(&mut streams, fmt, args);
+        }
         _ => {}
     }
 
@@ -283,8 +308,12 @@ async fn run(cli: Cli) -> ExitCode {
         // nothing to ask the socket. `logs::flush_daemon` is the other arm
         // that finishes without a client.
         Commands::Import(ref args) => import::import(&mut streams, fmt, args),
-        Commands::Completions(_) | Commands::Daemon(_) | Commands::Bleats(_) => {
-            unreachable!("handled above, on unlocked handles")
+        Commands::Completions(_)
+        | Commands::Daemon(_)
+        | Commands::Startup(_)
+        | Commands::Unstartup(_)
+        | Commands::Bleats(_) => {
+            unreachable!("handled above: before the shared $SHEP_HOME gate, or on unlocked handles")
         }
     }
 }
@@ -481,6 +510,86 @@ mod tests {
             Cli::try_parse_from(["shep", "import"]).unwrap().command,
             Commands::Import(_)
         ));
+    }
+
+    /// fails if `Commands::Startup` or `Commands::Unstartup` is wired to
+    /// another verb's function — the same gap
+    /// `save_parses_to_its_own_command` closes for `save`. This pins clap's
+    /// parse only; the dispatch arms themselves are covered by
+    /// `startup_and_unstartup_reach_their_own_verbs` below.
+    #[test]
+    fn startup_and_unstartup_parse_to_their_own_commands() {
+        use clap::Parser;
+        use cli::Commands;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "startup"]).unwrap().command,
+            Commands::Startup(_)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "unstartup"]).unwrap().command,
+            Commands::Unstartup(_)
+        ));
+        let named = Cli::try_parse_from(["shep", "startup", "--user", "deploy"])
+            .unwrap()
+            .command;
+        let Commands::Startup(args) = named else {
+            panic!("expected startup")
+        };
+        assert_eq!(args.user.as_deref(), Some("deploy"));
+    }
+
+    /// fails if either verb's dispatch arm calls the other's function, or is
+    /// moved below the shared `$SHEP_HOME` gate.
+    ///
+    /// The two verbs are told apart by what they do with `--home`, which is
+    /// the one observable difference that does not depend on the machine
+    /// this runs on: `startup` refuses a `$SHEP_HOME` that is not there
+    /// (`Usage`, the sudo-trap gate), and `unstartup` ignores `--home`
+    /// entirely, because a removal is addressed by the unit's path and label
+    /// alone. So a `Startup` arm calling `unstartup` stops returning
+    /// `Usage`, and an `Unstartup` arm calling `startup` starts returning
+    /// it. Routing either through the main dispatch below without adding it
+    /// there hits that block's `unreachable!` instead.
+    ///
+    /// What it cannot catch, honestly: with `$HOME` set — true of ordinary
+    /// dev machines and most CI — `resolve_paths` would succeed if these
+    /// arms were moved behind it, and both verbs would then reach the same
+    /// functions and return the same codes. That is
+    /// `completions_never_resolves_paths`'s own caveat, for the same reason
+    /// (mutating the environment is `unsafe` in edition 2024 and this crate
+    /// is `#![forbid(unsafe_code)]`); the gate matters under `sudo`, where
+    /// `$HOME` is root's rather than absent, and only the real binary can
+    /// be run that way.
+    ///
+    /// Skipped as root: `unstartup` would reach a real `systemctl`/
+    /// `launchctl` against whatever this machine actually has installed, and
+    /// no test in this phase may.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn startup_and_unstartup_reach_their_own_verbs() {
+        use clap::Parser;
+
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipping: as root these verbs really install and remove a system unit");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-created");
+        let missing = missing.to_str().unwrap();
+
+        let cli = Cli::try_parse_from(["shep", "--home", missing, "startup"]).unwrap();
+        assert_eq!(
+            run(cli).await,
+            ExitCode::Usage,
+            "startup must refuse a $SHEP_HOME that is not there"
+        );
+
+        let cli = Cli::try_parse_from(["shep", "--home", missing, "unstartup"]).unwrap();
+        assert_ne!(
+            run(cli).await,
+            ExitCode::Usage,
+            "unstartup removes a unit and never reads the home a --home names"
+        );
     }
 
     /// fails if `resurrect` stops reaching `muster`, or starts showing up in

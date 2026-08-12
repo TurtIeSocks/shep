@@ -24,8 +24,10 @@ Six deliberate scope cuts, not oversights — spec §2 carries the reasoning:
 
 ## Named as v1.0 in spec §2/§9, not yet built
 
-No phase plan has reached any of these yet — "why" is schedule, not design.
-See `docs/systematic-refactor/refactor-workspace/` for what phase is next.
+Schedule rather than design is what leaves these open. Where a phase has
+landed part of a spec section, the entry names the part still missing rather
+than the whole section. See `docs/systematic-refactor/refactor-workspace/`
+for what phase is next.
 
 **Dogs subsystem** (spec §8) — the whole thing: the dog contract, the
 `enable`/`disable`/`dogs`/`barks` verbs and hidden `dog <name>` dispatch,
@@ -60,9 +62,11 @@ file-locked JSON store.
 cutover companion to `shep import` (which now exists — Phase 8 Task 9).
 Does not exist yet.
 
-**`startup`/`unstartup`** (spec §9, §11) — the systemd (`Type=notify`)/
-launchd/openrc/rc.d unit generator, pm2's `startup` equivalent. No clap
-variant, no template.
+**openrc and BSD rc.d units** (spec §11) — `shep startup` writes a systemd
+unit (`Type=notify`) on Linux and a `LaunchDaemon` plist on macOS; spec §11
+names four init systems and there is no renderer for the other two. A machine
+running openrc or an rc.d script is refused by name rather than handed a unit
+for something it does not run.
 
 **Windows functional tier** (spec §11) — 0%, not partial. The Windows arm
 of `main.rs::run` prints "shep does not yet support Windows" and exits

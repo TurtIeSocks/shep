@@ -419,6 +419,72 @@ impl Render for ImportRows {
     const JSON_ONLY: &'static [&'static str] = &[];
 }
 
+/// One step `shep startup` or `shep unstartup` took.
+///
+/// Constructed by `commands/startup/mod.rs`, from the unit file it wrote or
+/// removed and the init-system commands it ran — not from any wire
+/// `Response`, since neither verb asks the shepherd anything.
+#[derive(Debug, Serialize)]
+pub struct StartupStep {
+    /// What was done: `wrote`, `removed`, `ran`.
+    pub action: &'static str,
+    /// The file or command it was done to.
+    pub target: String,
+    /// `ok`, `absent`, or the failure in one line.
+    ///
+    /// `absent` is the [`EmptiedFile`] spelling, and means the same thing
+    /// here: an `unstartup` found no unit to remove, which is the state it
+    /// was asked to produce rather than a failure.
+    pub result: String,
+}
+
+/// `shep startup`/`shep unstartup`: one row per step, in the order the steps
+/// were taken.
+///
+/// Every step is reported even when an earlier one failed — a half-installed
+/// unit is worse than a fully-attempted one, and the operator needs every row
+/// to know which half. `transparent` so the JSON is a plain array, matching
+/// every other payload that reports a list.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct StartupSteps(pub Vec<StartupStep>);
+
+impl Render for StartupSteps {
+    fn headers() -> &'static [&'static str] {
+        &["ACTION", "TARGET", "RESULT"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|step| {
+                vec![
+                    step.action.to_string(),
+                    step.target.clone(),
+                    step.result.clone(),
+                ]
+            })
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "ACTION" => "action",
+            "TARGET" => "target",
+            "RESULT" => "result",
+            other => panic!("StartupSteps::headers() does not include {other:?}"),
+        }
+    }
+
+    // Every field is a column, for [`EmptiedFiles`]' own reason: a verb that
+    // wrote or removed a system file and would not say which one has
+    // reported nothing.
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
 /// `Response::Triggered(Vec<ActionReply>)` — one row per matched sheep, each
 /// carrying what happened when the daemon tried to deliver `shep trigger`'s
 /// action to it.
@@ -808,6 +874,30 @@ pub(crate) mod tests {
                     script: "/srv/worker/dist/worker.js".to_string(),
                     instances: 1,
                     reuse_port: false,
+                },
+            ]),
+            |j| &j[0],
+            &[],
+        );
+    }
+
+    /// fails if `StartupStep` grows a field that never reaches the table —
+    /// the same gate every other payload has. The two rows cover both
+    /// shapes the payload carries: a file that was written, and a command
+    /// that was run and failed.
+    #[test]
+    fn startup_steps_do_not_drift() {
+        assert_no_drift(
+            &StartupSteps(vec![
+                StartupStep {
+                    action: "wrote",
+                    target: "/etc/systemd/system/shep-deploy.service".to_string(),
+                    result: "ok".to_string(),
+                },
+                StartupStep {
+                    action: "ran",
+                    target: "systemctl enable --now shep-deploy.service".to_string(),
+                    result: "Failed to enable unit: Unit file is masked.".to_string(),
                 },
             ]),
             |j| &j[0],

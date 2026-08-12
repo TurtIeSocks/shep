@@ -71,6 +71,15 @@ insta.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
 
+# `geteuid` (the privilege gate `shep startup` refuses on) and
+# `User::from_name`/`User::from_uid` (the target user's own passwd home, which
+# is NOT `$HOME` under sudo). Both are behind nix's `user` feature, which the
+# workspace entry already enables. A cfg(unix) table because nix does not build
+# on Windows and this crate's Windows leg compiles everything outside
+# `commands/`.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 # A process-group assertion and a teardown Drop guard both need to signal a
 # real pid; same cfg(unix) dev-only shape shep-daemon uses. The workspace
 # default nix features (signal, process, user) already cover `getpgid` and

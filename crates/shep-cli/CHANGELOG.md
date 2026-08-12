@@ -326,6 +326,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   service's `$NOTIFY_SOCKET` and stays silent on it. `launch_daemon` passes
   exactly one argument, `daemon`, and its own test pins that argument vector.
 
+- Add `shep startup` and `shep unstartup`, which install and remove the init
+  unit that brings the shepherd — and the flock it last saved — back after a
+  reboot. On Linux that is a systemd unit at
+  `/etc/systemd/system/shep-<user>.service`, `Type=notify` so the unit goes
+  green once the restore has finished rather than when the process execs; on
+  macOS a `LaunchDaemon` plist at
+  `/Library/LaunchDaemons/io.github.turtiesocks.shep.<user>.plist`. Both
+  carry this binary's resolved path, the target user's `$SHEP_HOME`, and the
+  `PATH` of the invocation that wrote them — the last of those is what makes
+  an interpreter installed under `~/.bun` or `~/.cargo` findable on a machine
+  that has only just booted.
+
+  **shep never escalates.** No `sudo`, no setuid, no privilege helper
+  anywhere on this path. Running as root it writes the unit and enables it;
+  running as anyone else it prints the exact command to run — fully resolved,
+  and quoted, so a `$SHEP_HOME` with a space in it survives the paste — and
+  exits non-zero, so a script notices instead of believing a unit was
+  installed. `unstartup` disables and removes under the same rule, and prints
+  its own command without a `--home`, since a removal is addressed by the
+  unit's path and label alone.
+
+  **Under `sudo` the unit is built for `$SUDO_USER`, never for root.** The
+  invoking user IS root there, so a unit resolved from it would supervise
+  root's flock while the operator's stayed down, and would look correct doing
+  it. The `$SHEP_HOME` follows the same rule and comes from the target user's
+  passwd entry rather than `$HOME`, which `sudo` has already reset to root's:
+  a unit carrying `/root/.shep` boots cleanly and restores nothing, and says
+  so months later or not at all. A `$SHEP_HOME` that does not exist is
+  refused rather than written into a unit, because that is what the same trap
+  produces when nobody catches it.
+
+  One caveat the verb cannot detect: `sudo` on most distributions replaces
+  `PATH` with its own `secure_path` before the command runs, so a unit
+  written by `sudo shep startup` carries that rather than the operator's
+  login `PATH`. `systemctl cat shep-<user>` shows what was actually written.
+
+  **An existing unit is never overwritten.** `shep startup` refuses and names
+  `shep unstartup`. Rewriting the file changes nothing about the service
+  already loaded on either init system, so an overwrite would leave the file
+  and the running unit disagreeing — and an operator who edited theirs in
+  place should be told, not have the edits replaced. `unstartup` then
+  `startup` closes both halves; a `--force` flag would close neither.
+
+  Output is one row per step, in the order the steps were taken: the file
+  written or removed, and each `systemctl`/`launchctl` invocation, with what
+  it answered. A step that fails does not stop the ones after it — a
+  half-installed unit is worse than a fully-attempted one, and the operator
+  needs every row to know which half they are holding — and the command exits
+  non-zero once they have all run. `shep unstartup` on a machine that never
+  ran `startup` reports the unit `absent` and exits 0, matching
+  `shep flush --daemon` on a log file that is not there.
+
+  openrc and the BSD rc.d scripts get no renderer: spec §11 names four init
+  systems and this pair covers two, so a machine running either of the others
+  is refused by name rather than handed a unit for something it does not run.
+
 ### Fixes
 
 - Open the shepherd's own `shepd.out.log`/`shepd.err.log` `O_APPEND` in the

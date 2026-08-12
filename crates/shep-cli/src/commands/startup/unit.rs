@@ -1,10 +1,9 @@
 //! Rendering a systemd unit and a launchd plist for the daemon.
 //!
 //! Both renderers are pure `format!` over a [`UnitSpec`]: no filesystem
-//! access, no environment reads, nothing that could fail. The verb that
-//! resolves a real `UnitSpec` (reading `$PATH`, resolving this binary's own
-//! path, deciding the target user) and writes the result to disk is
-//! Task 12.
+//! access, no environment reads, nothing that could fail. Resolving a real
+//! `UnitSpec` — reading `$PATH`, this binary's own path, the target user —
+//! and writing the result to disk is the parent module's.
 //!
 //! `ExecStart` names the daemon itself (`<exec> daemon --foreground`), not
 //! `shep muster`. Under `Type=notify` systemd supervises the process it
@@ -41,27 +40,27 @@ pub(crate) struct UnitSpec {
 /// Which init system this build targets. Linux is systemd, macOS is
 /// launchd; there is no runtime detection because there is nothing else
 /// either target could be, and openrc/rc.d are named as deferred in
-/// `docs/specs/deferred.md`.
-///
-/// Not constructed outside this module's own tests yet: Task 12 is what
-/// picks a variant with `#[cfg(target_os = ...)]` and dispatches on it.
-/// `#[allow(dead_code)]` says so explicitly rather than inventing a call
-/// site nothing needs yet.
-#[allow(dead_code)]
+/// `docs/specs/deferred.md`. The parent module's `current_init` is what
+/// picks the variant, with `#[cfg(target_os = ...)]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Init {
     /// Linux: a systemd unit, `Type=notify`.
+    ///
+    /// Constructed only on Linux. Both variants exist on every target so
+    /// both renderers, and the exact-match tests that pin them, compile and
+    /// run everywhere — which is the only way a macOS machine checks the
+    /// systemd unit at all. `dead_code` sees only the target it is
+    /// compiling, so the variant the other target constructs is narrowed
+    /// rather than blanket-allowed.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Systemd,
-    /// macOS: a `LaunchDaemon` plist.
+    /// macOS: a `LaunchDaemon` plist. Constructed only on macOS; see
+    /// [`Init::Systemd`] for why the other variant still exists here.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Launchd,
 }
 
 /// Renders the systemd unit, `Type=notify`.
-///
-/// Not called outside this module's own tests yet: the verb that resolves a
-/// real `UnitSpec` and writes this out is Task 12. `#[allow(dead_code)]`
-/// says so explicitly rather than inventing a call site nothing needs yet.
-#[allow(dead_code)]
 pub(crate) fn systemd_unit(spec: &UnitSpec) -> String {
     let home = systemd_environment_value(&spec.home.display().to_string());
     let path = systemd_environment_value(&spec.path.to_string_lossy());
@@ -94,11 +93,6 @@ pub(crate) fn systemd_unit(spec: &UnitSpec) -> String {
 /// Renders the launchd plist. `KeepAlive`/`SuccessfulExit=false` is
 /// launchd's `Restart=on-failure`; launchd has no `ExecReload` equivalent,
 /// so a reload goes through `shep reload all` same as any other client.
-///
-/// Not called outside this module's own tests yet: the verb that resolves a
-/// real `UnitSpec` and writes this out is Task 12. `#[allow(dead_code)]`
-/// says so explicitly rather than inventing a call site nothing needs yet.
-#[allow(dead_code)]
 pub(crate) fn launchd_plist(spec: &UnitSpec) -> String {
     let label = xml_text(&launchd_label(&spec.user));
     let exec = xml_text(&spec.exec.display().to_string());
@@ -136,32 +130,18 @@ pub(crate) fn launchd_plist(spec: &UnitSpec) -> String {
 }
 
 /// `/etc/systemd/system/shep-<user>.service`.
-///
-/// Not called outside this module's own tests yet: the verb that installs
-/// the rendered unit at this path is Task 12. `#[allow(dead_code)]` says so
-/// explicitly rather than inventing a call site nothing needs yet.
-#[allow(dead_code)]
 pub(crate) fn systemd_unit_path(user: &str) -> PathBuf {
     PathBuf::from(format!("/etc/systemd/system/shep-{user}.service"))
 }
 
 /// `io.github.turtiesocks.shep.<user>` — the launchd label, also the plist's
-/// own filename stem via [`launchd_plist_path`].
-///
-/// Not called outside this module's own tests yet: the verb that installs
-/// the rendered plist under this label is Task 12. `#[allow(dead_code)]`
-/// says so explicitly rather than inventing a call site nothing needs yet.
-#[allow(dead_code)]
+/// own filename stem via [`launchd_plist_path`] and the job label
+/// `launchctl bootout system/<label>` names.
 pub(crate) fn launchd_label(user: &str) -> String {
     format!("io.github.turtiesocks.shep.{user}")
 }
 
 /// `/Library/LaunchDaemons/<label>.plist`.
-///
-/// Not called outside this module's own tests yet: the verb that installs
-/// the rendered plist at this path is Task 12. `#[allow(dead_code)]` says so
-/// explicitly rather than inventing a call site nothing needs yet.
-#[allow(dead_code)]
 pub(crate) fn launchd_plist_path(user: &str) -> PathBuf {
     PathBuf::from(format!(
         "/Library/LaunchDaemons/{}.plist",
@@ -175,7 +155,6 @@ pub(crate) fn launchd_plist_path(user: &str) -> PathBuf {
 /// legal POSIX path), and the expansion is silent rather than a parse
 /// error. The caller wraps the whole `KEY=value` assignment in `"..."`, so
 /// a value containing a space needs nothing further from this function.
-#[allow(dead_code)]
 fn systemd_environment_value(value: &str) -> String {
     value.replace('%', "%%")
 }
@@ -185,7 +164,6 @@ fn systemd_environment_value(value: &str) -> String {
 /// XML metacharacters that end the current element early — a raw `&` in a
 /// path (legal in a POSIX filename) makes the whole plist unparseable, and
 /// launchd's own refusal names the file, not the character.
-#[allow(dead_code)]
 fn xml_text(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -335,8 +313,9 @@ mod tests {
     }
 
     /// `systemd_unit_path`/`launchd_label`/`launchd_plist_path` are simple
-    /// format strings, but Task 12 depends on their exact shape (the brief
-    /// names both paths and the label literally), so they get the same
+    /// format strings, but the verb that installs and removes a unit
+    /// addresses it by exactly these three — `systemctl enable` by the
+    /// file's name, `launchctl bootout` by the label — so they get the same
     /// exact-match treatment as the two renderers above.
     #[test]
     fn the_install_paths_and_label_match_the_spec_exactly() {

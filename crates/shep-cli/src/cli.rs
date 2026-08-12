@@ -138,6 +138,25 @@ pub enum Commands {
     /// recognizable session junk is named on stderr too, and left out of
     /// the Flockfile, for the operator to decide.
     Import(ImportArgs),
+    /// Install an init unit so the shepherd starts at boot.
+    ///
+    /// Writes a systemd unit (Linux) or a launchd plist (macOS) for the
+    /// target user, carrying this binary's own path, that user's
+    /// $SHEP_HOME, and the PATH of this invocation — which is what makes an
+    /// interpreter installed under ~/.bun or ~/.cargo findable after a
+    /// reboot.
+    ///
+    /// Needs root, and never asks for it: without it this prints the exact
+    /// command to run and exits non-zero, so a script notices. Under sudo
+    /// the unit is built for $SUDO_USER rather than root, so it supervises
+    /// the flock the operator actually has.
+    Startup(StartupArgs),
+    /// Disable and remove the unit `startup` installed.
+    ///
+    /// Needs root under the same rule: without it, prints the command to
+    /// run and exits non-zero. A unit that is not there is reported absent
+    /// rather than failing.
+    Unstartup(StartupArgs),
     /// Print a shell completion script.
     ///
     /// Static only: sheep names, fold names and other daemon-side
@@ -300,6 +319,19 @@ pub struct ImportArgs {
     /// Overwrite an existing Flockfile
     #[arg(long)]
     pub force: bool,
+}
+
+/// Arguments shared by `shep startup` and `shep unstartup`.
+///
+/// One struct for both verbs, and one field: the unit is named after the
+/// user it runs the shepherd as, so that user is the only thing either verb
+/// needs to be told. `--home` is read from [`GlobalArgs`] by `startup` and
+/// ignored by `unstartup`, which removes a unit rather than writing one.
+#[derive(Debug, clap::Args)]
+pub struct StartupArgs {
+    /// The user the unit runs the shepherd as (default: $SUDO_USER, else the invoking user)
+    #[arg(long)]
+    pub user: Option<String>,
 }
 
 /// Arguments to `shep completions`.
@@ -574,6 +606,8 @@ mod tests {
             "kill",
             "save",
             "muster",
+            "startup",
+            "unstartup",
             "completions",
         ] {
             assert!(

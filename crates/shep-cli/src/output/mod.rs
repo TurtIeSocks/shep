@@ -33,7 +33,7 @@ use crate::exit::ExitCode;
 #[cfg_attr(windows, allow(unused_imports))]
 pub use rows::{
     DeletedIds, EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, ImportRow, ImportRows, KillRow,
-    PingRow, SavedRollRow, TriggeredRows,
+    PingRow, SavedRollRow, StartupStep, StartupSteps, TriggeredRows,
 };
 pub use table::{human_duration, render_table};
 
