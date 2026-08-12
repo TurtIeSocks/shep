@@ -798,7 +798,7 @@ mod tests {
     ///
     /// Drives `report` with hand-built rows rather than a real `install`:
     /// producing a genuinely failing step would mean running a real
-    /// `systemctl`, which no test in this phase may.
+    /// `systemctl`, which no test in this crate may.
     #[test]
     fn a_failed_step_fails_the_verb_and_still_prints_every_row() {
         let step = |action, target: &str, result: &str| StartupStep {

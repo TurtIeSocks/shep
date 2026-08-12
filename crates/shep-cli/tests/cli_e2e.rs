@@ -2952,17 +2952,18 @@ fn trigger_reaches_the_trigger_verb_and_names_the_missing_channel() {
 
 /// `shep save` writes the muster roll and `shep muster` reads it back — the
 /// §13.4 flagship "import, muster, save, reboot" shape, minus the reboot: a
-/// muster against the same still-live daemon that just saved is Task 4's own
-/// idempotence case, since nothing here ever goes down in between.
+/// muster against the same still-live daemon that just saved exercises the
+/// already-running idempotence rule (`snapshot::restorable`) for real, since
+/// nothing here ever goes down in between.
 ///
 /// Both dispatch arms carried no coverage beyond a clap-parsing pin
 /// (`save_parses_to_its_own_command`/`muster_parses_to_its_own_command`,
-/// `main.rs`) until this case: Task 3 shipped `Commands::Save` routed to
-/// `query::ping` in `run`'s `match` and the crate's own unit suite still
-/// passed 126/126, because nothing below the parse layer ever calls the
-/// verb it parsed to. This case is what closes that gap for both verbs —
-/// see this task's own report for the two mutations that prove it (`Save`
-/// and `Muster` each rewired to the wrong function, in turn).
+/// `main.rs`) until this case: a dispatch arm in `run`'s `match` that calls
+/// the wrong verb's function still compiles and still passes every
+/// clap-parsing test, because nothing below the parse layer ever calls the
+/// verb it parsed to. This case closes that gap for both verbs — confirmed
+/// by rewiring `Commands::Save`/`Commands::Muster` to each other's function
+/// in turn and watching this case redden each time.
 ///
 /// What a broken implementation this would catch, beyond the dispatch
 /// misroute above: a `save` that reports the wrong app count (`data.apps`

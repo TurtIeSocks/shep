@@ -396,8 +396,20 @@ src/
   snapshot.rs        ← was ActionMethods.dumpProcessList + API/Startup resurrect path
       Action: port + fix
       Notes: serde Vec<AppSpec>, tempfile+rename atomic write (backup-dance deleted). Own
-             format (decision 7); pm2 dump.pm2 parsing lives in shep-cli import.rs only.
-             Resurrect (= muster) diff-by-name, spawn missing.
+             format (decision 7); pm2 dump.pm2 parsing lives in shep-cli's import/ only.
+      Drift (Phase 8, recorded): `muster` is the ONE restore implementation, not a diff-by-name
+             rewrite of `boot::restore_flock` — `restore_flock` is now four lines calling
+             `muster` and discarding the names it returns. Its two callers (`boot`, on an empty
+             flock by construction, and the `Muster` RPC arm in `rpc.rs`, against anything at
+             all) differ only in what they do with the names back. `restorable` selects by APP,
+             not instance count: an app the flock already has is left running rather than
+             restarted or duplicated, because `instance_slots` allocates the lowest FREE slot —
+             starting it again would leave a one-instance app running two and the next save
+             would persist the pair. `RpcContext::save_roll_now` is the on-demand write
+             `Request::SaveRoll` reaches, answering `Option<SavedRoll { path, apps }>` —
+             `None` on an already-stopped supervisor engine, which the RPC arm turns into a
+             refusal rather than a hollow success; `snapshot_now` (the debounced writer's own
+             call site) is now a one-line wrapper over it.
   rpc_server.rs      ← was lib/Daemon.js (RPC surface + boot)
       Action: port + redesign
       Drift (Phase 3/5, recorded in Phase 5): split three ways — `boot.rs` (the ritual and the
@@ -444,6 +456,22 @@ src/
              topic spec §6 promises for raw fd-3 traffic, is still unbuilt — trigger's own reply
              is not a substitute for it (`docs/specs/deferred.md`): a stale or unprompted
              `action-reply`, and `Ready`/`Metric` traffic, stay invisible either way.
+      Muster, SaveRoll, live stats and readiness (Phase 8): `Request::Muster`/`SaveRoll`
+             dispatch through `snapshot::muster`/`RpcContext::save_roll_now` (see
+             `snapshot.rs` above for the restore/save mechanism itself); neither gets a new
+             `RpcErrorCode` for the same reason `ReloadInFlight` didn't — a predating client
+             can't decode an unknown code, so the message carries the meaning. `ListFlock` and
+             `Describe` are the only two verbs that pay for a live CPU/memory read
+             (`rpc::with_live_stats`, over `Extras::stats: Arc<limits::stats::StatsState>`,
+             cloned onto `RpcContext` at boot); every other verb's `ProcessInfo` carries
+             `cpu_percent`/`memory_bytes` as `None`, straight off `supervisor::to_info`. New
+             unix-only `notify` module (`notify_ready`/`notify`, `NOTIFY_SOCKET_ENV`, `pub` —
+             `shep-cli` reads the env var) sends one `READY=1` datagram to `$NOTIFY_SOCKET` as
+             the LAST step of `boot`, after the muster restore and the control plane are both
+             up — the whole point being that a unit under `Type=notify` cannot go green over a
+             restore that is still running or has hung. An absent `$NOTIFY_SOCKET` (every
+             interactive run, every CLI-autostarted daemon, all of macOS) is a silent no-op; a
+             failed send is a `warn!`, never a failed boot.
   bus.rs             ← was God.bus (EventEmitter2) + axon pub/sub
       Action: rewrite
       Notes: tokio::sync::broadcast<BusEvent>; wire side: subscribe-with-topic-globs on connect,
@@ -474,8 +502,21 @@ src/
              `LimitEnforcer`/`PollingEnforcer` watch for a breach at MEMORY_POLL_INTERVAL (15s,
              benchmark-backed by benches/). DEVIATION from pm2: the ceiling is enforced against
              the process TREE (sheep + lambs via the ppid walk), not the root pid, because a
-             root-pid limit is trivially dodged by any app that forks workers. Wants a line in
-             docs/migration.md.
+             root-pid limit is trivially dodged by any app that forks workers. Noted in
+             docs/migration.md's field-mapping section.
+      Sampling split from enforcement (Phase 8, recorded): the polling loop used to run only
+             for the ids `max_memory` armed it against; `limits::stats` (`SheepStats`,
+             `StatsState`) makes sampling its own concern — every sheep with a pid is watched
+             from the moment it comes online, and a memory ceiling arms the enforcer ON TOP of
+             that rather than instead of it. Costs no extra process-table walk: the same
+             `TreeIndex` the polling tick already builds is handed to `StatsState::
+             record_baseline` before the enforcement pass runs. CPU is a counter, not a level,
+             so a percentage needs two readings and the wall time between them — the tick
+             writes one baseline per sheep and an on-demand read (`sample_now`) subtracts
+             against it without writing back, which is what stops two listings a moment apart
+             from dividing a near-zero counter delta by a near-zero window. A sheep with no
+             baseline yet reports no CPU at all, never a manufactured number from a sub-tick
+             window.
   extras.rs          ← new module (no pm2 counterpart)
       Action: write fresh
       Notes: the registry that arms all four subsystems above when a sheep goes live and disarms
@@ -582,6 +623,16 @@ src/
              `OUTCOME` is the stable `kind` tag, `DETAIL` the per-variant human text, and a
              `Replied` body is capped and newline-escaped for the table only — `--format json`
              carries it whole, exactly as the daemon sent it.
+      `shep save` / `shep muster` (Phase 8): `commands/muster.rs::save`/`muster`. Neither takes
+             a selector — the roll always records the whole flock. `save` dispatches through
+             `connect_client`, never `connect_or_spawn_client`: saving against a daemon that
+             is not running is not a thing, and autostarting one just to save an empty flock
+             would overwrite a good roll with an empty one. `muster` is the binary's SECOND
+             autostart path, after `start` — dispatched through `connect_or_spawn_client`,
+             because bringing a fresh daemon up is the point of running it after a reboot — and
+             sends `START_DEADLINE` rather than the 5s default, since a cold restore of a real
+             flock routinely outruns five seconds. An empty `Mustered` gets an explicit stderr
+             notice (`emit_notice`) rather than a silent empty table.
   runtime.rs         ← was lib/binaries/Runtime4Docker.js (+ Runtime.js dropped)
       Action: port + fix
       Notes: no-daemon mode = daemon event loop in-process. Exit-code contract exact
@@ -596,6 +647,14 @@ src/
       Notes: comfy-table (ANSI width correct — fitColumn workaround dies), owo-colors +
              anstream (NO_COLOR free), width-adaptive full/condensed/mini as layout enum.
              jlist gains versioned serde schema + global --format json|table (pm2 gap).
+      CPU/MEM columns (Phase 8): `FlockRows` gains `CPU`/`MEM` between `RESTARTS` and `UPTIME`
+             (`pm2 ls`'s own placement), reading `ProcessInfo::cpu_percent`/`memory_bytes`
+             (shep-daemon's `limits/`, above). New `human_bytes` (`table.rs`) — largest binary
+             unit keeping the leading digit ≥ 1, one decimal — is not `MemSize`'s own `Display`,
+             which only names a unit that divides the value exactly and would print a live RSS
+             as an unreadable raw byte count. `-`, not `0.0%`/`0B`, for a sheep with no reading
+             yet, matching the rule `PID`/`FOLD` already use: an empty cell is a claim the
+             daemon declined to make, not a claim of zero.
   tui.rs             ← was lib/API/Dashboard.js + Monit.js (merged)   [MUST-HAVE #5]
       Action: rewrite (ratatui + crossterm)
       Notes: 4-pane dash UX kept, event-driven redraw (300ms full-rerender dies), + host
@@ -629,12 +688,36 @@ src/
              from four near-identical copies (`lifecycle`, `logs`, `query`, `bleats`) into
              `commands/selector.rs::parse_selector`, shared by every verb — including
              `trigger` — that takes a selector off the command line.
-  startup.rs         ← was lib/API/Startup.js + lib/templates/
+  startup/           ← was lib/API/Startup.js + lib/templates/
       Action: port (reduced platforms)
-      Notes: systemd (Type=notify + sd_notify — upgrade from Type=forking), launchd, openrc,
-             freebsd/openbsd rc.d. upstart/systemv/smf dropped (dead platforms). Templates via
-             include_str! + typed context. Root check nix::geteuid. windows-service crate =
-             native Windows service (pm2 never had it).
+      Drift (Phase 8, recorded): shipped as a directory, not the single `startup.rs` this entry
+             named — `unit.rs` (pure `format!` rendering: `systemd_unit`/`launchd_plist` and
+             their path/label helpers, no filesystem or process access) and `mod.rs` (resolves
+             a real `UnitSpec`, decides privilege, writes/enables/disables/removes). No
+             `include_str!` templates — there is exactly one systemd unit shape and one plist
+             shape, and a compiled-in template needs the same escaping either way
+             (`systemd_environment_value` doubles `%`; `xml_text` escapes the plist's XML).
+      Notes: two of spec §11's four init systems ship — systemd (`Type=notify` + `sd_notify`,
+             an upgrade from pm2's `Type=forking`) on Linux, launchd (a `LaunchDaemon` plist) on
+             macOS — selected by COMPILE TARGET only (`current_init`), not by probing which
+             init system a Linux box actually runs; a Linux host running openrc still gets a
+             systemd unit and fails later, at the `systemctl` step. openrc and BSD rc.d are
+             named as deferred (`docs/specs/deferred.md`), not rendered; upstart/systemv/smf
+             dropped (dead platforms). No windows-service crate, no Windows unit of any kind —
+             Windows startup integration is unbuilt, not reduced.
+
+             shep never escalates: no setuid, no re-exec through a privilege helper. `startup`
+             reads `geteuid()` (`nix::unistd::geteuid`) once; run unprivileged, `install`/
+             `remove` print the exact `sudo <exec> startup --user <user> --home <home>` command
+             (quoted for a shell, `--home` omitted from `unstartup`'s) and exit non-zero rather
+             than trying to elevate. The unit is built for the TARGET user's passwd home
+             (`nix::unistd::User::from_uid`/`from_name`), never this process's own `$HOME` —
+             `sudo` resets that to root's, which is the trap a unit resolved from it falls into
+             silently, restoring nothing after a reboot. A `$SHEP_HOME` that does not exist is
+             refused before the privilege check even runs, and an existing unit is refused
+             rather than overwritten (`shep unstartup` first) — see docs/migration.md's
+             troubleshooting section for what a wrong `$SHEP_HOME` and a `sudo`-stripped `PATH`
+             each look like from the outside.
   serve.rs           ← was lib/API/Serve.js
       Action: port + harden
       Notes: axum + tower-http ServeDir (traversal/ranges free), SPA fallback, dir listing,
@@ -667,12 +750,20 @@ src/
              high-mem) → reqwest webhooks: Discord/Slack templates + generic JSON POST.
              Debounce/cooldown per rule. MUST handle bounded-bus drop notices + reconcile by
              polling — alerts never silently vanish.
-  import.rs          ← new module (decision 7's one exception)
+  import/            ← new module (decision 7's one exception)
       Action: write fresh
-      Notes: `shep import` — reads a box's existing pm2 state (dump.pm2, ecosystem
-             .json/.yaml; .js configs via `node -p JSON.stringify(require(p))`) and emits a
-             Flockfile + optional immediate start. Companion docs/migration.md guide.
-             ALL pm2 format knowledge is confined to this module.
+      Drift (Phase 8, recorded): shipped as a directory, not the single `import.rs` this entry
+             named — `dump.rs` (parses `dump.pm2` into `DumpRow`s), `env.rs` (splits one row's
+             environment into declared/inherited/instance-var), `convert.rs` (collapses rows
+             into `AppConfig`s by name, running each through `shep_core::config::normalize`),
+             `render.rs` (serializes the result as Flockfile TOML). `mod.rs::import` is the
+             verb, gluing all four and reporting what happened.
+      Notes: `shep import` reads ONLY `dump.pm2` (JSON) — not `ecosystem.config.js`/`.yaml`,
+             and no `node -p 'JSON.stringify(require(p))'` fallback; neither is read by this
+             build. No `--start`: the verb takes no `Client` and starts nothing, matching the
+             `--from`/`--out`/`--dry-run`/`--force` shape rather than the "optional immediate
+             start" this entry originally described. `docs/migration.md` is the companion
+             guide. ALL pm2 format knowledge is confined to this module.
 ```
 
 ## Tests (workspace-level)

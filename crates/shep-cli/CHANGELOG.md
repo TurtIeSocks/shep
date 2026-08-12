@@ -58,9 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each replaced by its own command module as that verb is implemented.
 - Exit code 2 (`Usage`) is clap's own convention for bad arguments and
   collides with the fail-fast code spec §9 reserves for the `runtime`
-  subcommand's own use. `runtime` is out of scope for this phase; whichever
-  task builds it resolves the collision deliberately, rather than
-  discovering it.
+  subcommand's own use. `runtime` does not exist yet; whichever change
+  builds it resolves the collision deliberately, rather than discovering it.
 - Carry `ProcessInfo`'s new `out_file`/`err_file` in every `--json` payload
   built from `FlockRows` (`flock`, `describe`, `fold`, `start`, `stop`,
   `restart`, `reload`, `reopen`). They are `JSON_ONLY` on those verbs, not
@@ -105,8 +104,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hard-codes the same number so `connect_or_spawn` can tell "a losing
   cold-start racer's daemon exited on purpose" apart from every other exit,
   which is what lets both sides of a concurrent `shep start` race exit 0
-  (Task 12's end-to-end tier proves this against two real, genuinely
-  concurrent invocations). Changing either side without the other
+  (`cli_e2e`'s `concurrent_cold_starts_produce_exactly_one_daemon` proves
+  this against two real, genuinely concurrent invocations). Changing either
+  side without the other
   reintroduces the race — `exit.rs`'s own test pins the two constants equal.
 - Render the daemon's own diagnostics. The hidden `daemon` subcommand now
   installs a `tracing-subscriber` on **stderr**, which `launch.rs` already
@@ -276,8 +276,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `shep import`, which reads a pm2 dump (`--from`, default
   `~/.pm2/dump.pm2`) and writes it out as a Flockfile (`--out`, default
-  `./Flockfile.toml`) — the last piece of the pm2 cutover path this phase
-  builds. **Starts nothing**: no client, no daemon round trip, just a file
+  `./Flockfile.toml`) — the last piece of the pm2 cutover path.
+  **Starts nothing**: no client, no daemon round trip, just a file
   read and a file write. `--dry-run` prints the rendered Flockfile to
   stdout instead of writing it, with no envelope, so
   `shep import --dry-run > Flockfile.toml` produces a byte-exact file;
@@ -379,8 +379,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `shep flush --daemon` on a log file that is not there.
 
   openrc and the BSD rc.d scripts get no renderer: spec §11 names four init
-  systems and this pair covers two, so a machine running either of the others
-  is refused by name rather than handed a unit for something it does not run.
+  systems and this pair covers two, chosen by compile target rather than by
+  probing which init system is actually running. A target that is neither
+  Linux nor macOS is refused before any file is written, with a
+  platform-level message; a Linux host running openrc still gets a systemd
+  unit, and the mismatch surfaces later, at the `systemctl` step.
 
 - `flock` and `describe` show each sheep's live CPU and memory. `CPU` and
   `MEM` land between `RESTARTS` and `UPTIME`, where `pm2 ls` puts them and

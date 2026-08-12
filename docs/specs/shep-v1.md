@@ -394,10 +394,28 @@ Trusted Publishing.
    `cargo check`, `cargo test` — green on tier-1 platforms + Windows
    functional tier.
 3. Wire fixtures committed; SECURITY.md, migration.md, Grafana asset shipped.
-4. `shep import && shep save && reboot` → systemd unit runs
-   `shep muster` and the flock survives on a Linux box (the flagship
-   migration scenario).
+4. `shep import && shep save && reboot` → the flock survives on a Linux box
+   (the flagship migration scenario; runbook in `docs/migration.md`).
 5. Spec↔implementation drift review before tagging.
+
+**Item 4 used to say the systemd unit runs `shep muster`, and that verb is
+wrong for what `Type=notify` requires.** `ExecStart` under `Type=notify`
+names the one process systemd supervises directly, and that process is the
+one expected to report its own readiness — it has to be the long-running
+daemon, not a command that runs once and exits. The unit's `ExecStart` is
+`shep daemon --foreground`; the flock comes back because that daemon
+restores the muster roll as part of its own boot, and `shep muster` stays
+what an operator runs by hand afterward, not what the unit invokes. That
+correction is recorded here, the way §9's `trigger` amendment is, because
+the reasoning is what stops a later reader reaching for the same wrong verb
+again: pm2 could write `ExecStart=pm2 resurrect` only because its unit ran
+under `Type=forking`, tracking the actual daemon through a PID file once
+the `ExecStart` command had already exited — two different processes, one
+named in the unit and one being supervised. shep has no such split. Under
+`Type=notify` they are the same process by construction, so the readiness
+signal (`READY=1`, sent once the restore has finished —
+`crates/shep-daemon/src/notify.rs`) can only ever come from the process
+systemd itself started.
 
 ## 14. Assumptions (delegate-mode calls — flag any to change)
 

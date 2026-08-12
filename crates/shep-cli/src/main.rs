@@ -563,7 +563,7 @@ mod tests {
     ///
     /// Skipped as root: `unstartup` would reach a real `systemctl`/
     /// `launchctl` against whatever this machine actually has installed, and
-    /// no test in this phase may.
+    /// no test in this crate may.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn startup_and_unstartup_reach_their_own_verbs() {
