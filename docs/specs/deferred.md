@@ -64,7 +64,7 @@ exists.
 launchd/openrc/rc.d unit generator, pm2's `startup` equivalent. No clap
 variant, no template.
 
-**`muster`** (spec §9, §13.4) — no `shep muster` / `shep muster save` /
+**`save` / `muster`** (spec §9, §13.4) — no `shep save` / `shep muster` /
 hidden `resurrect` verb exists. The mechanism they would sit on top of
 does: the daemon debounce-writes `flock.json` on every lifecycle change
 (`SnapshotWriter`, `crates/shep-daemon/src/snapshot.rs`) and restores from

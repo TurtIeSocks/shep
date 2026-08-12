@@ -410,7 +410,7 @@ Trusted Publishing.
    needs node present.
 4. Metrics dog default port 9615 (pm2's old web port — familiar, unclaimed
    by IANA; trivially configurable).
-5. `muster` = both save and restore (`muster save` / `muster`); `resurrect`
+5. `save` writes the roll, `muster` assembles the flock from it; `resurrect`
    kept as hidden alias.
 6. Dogs hidden in default `shep flock` output (badged under `--all`).
 7. Whistle control tools gated by daemon config, not CLI flag — config is
