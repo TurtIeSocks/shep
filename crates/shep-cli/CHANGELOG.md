@@ -357,10 +357,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused rather than written into a unit, because that is what the same trap
   produces when nobody catches it.
 
-  One caveat the verb cannot detect: `sudo` on most distributions replaces
-  `PATH` with its own `secure_path` before the command runs, so a unit
-  written by `sudo shep startup` carries that rather than the operator's
-  login `PATH`. `systemctl cat shep-<user>` shows what was actually written.
+  **`shep startup` warns when `PATH` may have been sanitized.** `sudo` on
+  most distributions replaces `PATH` with its own `secure_path` before the
+  command runs, so a unit written by `sudo shep startup` can end up
+  carrying that rather than the operator's login `PATH` — invisibly, since
+  the substitution happens before shep is even exec'd and there is nothing
+  left in the environment afterward to tell the two apart. What shep *can*
+  see is `$SUDO_USER`, which `sudo` sets on the same command line: when it
+  is present, `startup` prints a notice naming it and showing the exact
+  `PATH` about to go into the unit, so the operator can check it against
+  their own login `PATH` at install time rather than at the next reboot.
+  It is a warning, not a refusal — a sanitized `PATH` is often exactly what
+  the operator wants, and shep has no way to tell the two cases apart.
+  `systemctl cat shep-<user>` shows what was actually written, at install
+  time or any time after; `sudo --preserve-env=PATH shep startup ...`
+  (after `shep unstartup`, since an existing unit is never overwritten)
+  carries the login `PATH` through instead.
 
   **An existing unit is never overwritten.** `shep startup` refuses and names
   `shep unstartup`. Rewriting the file changes nothing about the service

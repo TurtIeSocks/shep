@@ -120,7 +120,8 @@ init system starts with, and any app whose interpreter lives outside
 `/usr/bin`/`/bin` would fail to spawn on the very first boot after the
 migration, silently, until someone reboots the box again to find out why.
 See the `sudo` trap in the troubleshooting section below — this is also
-the one place the capture can go wrong invisibly.
+the one place the capture can go wrong, and `shep startup` warns about it
+at install time rather than leaving it to surface at the next reboot.
 
 ## 4. The three commands
 
@@ -199,16 +200,21 @@ shows the `SHEP_HOME` the unit actually carries; compare it against the
 `$SHEP_HOME` step 6 saved into.
 
 **The wrong `PATH` was captured, and an app fails to spawn only after a
-reboot.** If step 7 was run as `sudo shep startup ...`, the `PATH` written
-into the unit is not necessarily your login `PATH`. `sudo` on most
+reboot.** Step 7 runs as `sudo shep startup ...`, and `sudo` on most
 distributions replaces `PATH` with its own `secure_path` before your
-command ever runs — and the `~/.bun` or `~/.cargo` entry the capture in
+command ever runs — the `~/.bun` or `~/.cargo` entry the capture in
 section 3 exists to preserve is exactly what `secure_path` tends to drop.
-shep cannot detect this: the sanitizing happens before `shep` is even
-exec'd, so there is nothing left in the environment to tell the good
-`PATH` from the stripped one. `systemctl cat shep-<user>` shows what was
-actually written; if an interpreter your app needs is missing from it,
-this is why.
+`shep startup` cannot tell a sanitized `PATH` from an untouched one after
+the fact — the substitution happens before `shep` is even exec'd, so
+there is nothing left in the environment to compare against — but it
+knows when it is running under `sudo` (`$SUDO_USER` is set) and prints a
+warning at step 7 itself naming the `PATH` about to go into the unit, so
+you can catch a missing interpreter directory before the reboot rather
+than after. If it is missing something, rerun as
+`sudo --preserve-env=PATH shep startup ...` (after `shep unstartup`, since
+`startup` refuses to overwrite the unit it just wrote) to carry your
+login `PATH` through instead. `systemctl cat shep-<user>` still shows
+what was actually written, at step 7 or any time after.
 
 ## 6. Rolling back
 
