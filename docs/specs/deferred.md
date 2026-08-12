@@ -90,7 +90,10 @@ today; the third, CLI-flag layer over the top does not exist.
 **`channel.*` bus topic** (spec §6) — spec'd as subscribable alongside
 `process.*`/`log.out`/`log.err`/`daemon.*`. No such topic variant exists
 (`BusEvent::topic` in `crates/shep-core/src/protocol/events.rs`) and
-nothing forwards shepherd-channel (fd 3) traffic to the bus.
+nothing forwards shepherd-channel (fd 3) traffic to the bus. `shep trigger`
+shipping (below) does not close this: its reply is scoped to the caller
+that sent one trigger, so `Ready`/`Metric` traffic and a stale or
+unprompted `action-reply` stay just as invisible as before.
 
 **Lambs in `describe`'s tree view** (spec §4) — a sheep's child processes
 (lambs) are killed with it via the process-group tree kill, but no wire
@@ -99,7 +102,14 @@ render the tree spec §4 promises.
 
 ## Not deferred
 
-`shep trigger` (custom actions over the shepherd channel, spec §7/§9) is
-**in progress**, not deferred — see this repo's `CLAUDE.md`,
-Status/workflow. fd-3 wire plumbing and the shepherd-channel handle are
-merged; the RPC and the verb itself are the open work.
+`shep trigger` (custom actions over the shepherd channel, spec §7/§9)
+**shipped**: the fd-3 wire (`ShepherdMessage::Action`/
+`ChildMessage::ActionReply`, `params` included), the RPC
+(`Request::Trigger`/`Response::Triggered`), the daemon's waiting model (one
+wait per matched sheep, run concurrently, bounded by each app's own
+`AppConfig::action_timeout`), and the verb itself
+(`shep trigger <selector> <action> [params]`) are all built and tested,
+including a real-child, two-round-trip end-to-end case
+(`crates/shep-daemon/tests/daemon_e2e.rs`). App-author-facing contract:
+`docs/shepherd-channel.md`. What §6 promises beyond it — the `channel.*`
+bus topic, above — is separate work and remains open.
