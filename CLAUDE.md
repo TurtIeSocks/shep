@@ -72,21 +72,11 @@ re-running that suite in isolation with the mutation still applied.
   plan spends its cost later, in review loops.
 - **Implementing a written plan:** Sonnet, high thinking. The design decisions
   are already made.
-- Reviews scale to the diff: a mechanical change needs no reviewer, a normal
-  task one, and anything touching a boot path, the wire, or concurrency gets
-  two with distinct lenses — at least one of which runs the code rather than
-  reading it.
 
 ## Architecture
 
-Four crates, one distributed binary (`shep`):
-
-| Crate | Role |
-|---|---|
-| `crates/shep-core` | shared types, config, paths, wire protocol — depends on no sibling |
-| `crates/shep-daemon` | supervisor lib (spawn/kill/reload/watch/metrics/alerts) — no bin; embedded in CLI |
-| `crates/shep-client` | async RPC client + programmatic API; re-exports shep-core |
-| `crates/shep-cli` | the `shep` binary: clap surface, TUI, serve, MCP, runtime/dev modes |
+Four crates, one distributed binary (`shep`): shep-core, shep-daemon,
+shep-client, shep-cli — each crate's Cargo.toml `description` states its role.
 
 Daemonization = the binary re-execs itself with a hidden `daemon` subcommand.
 Module-by-module design: map.md (see above).
@@ -118,8 +108,7 @@ never costs clarity.
 
 ## Gotchas
 
-- Workspace lints deny `missing_docs` and `missing_debug_implementations` —
-  every new public item needs docs and a deliberate Debug decision (redacted
+- Every new public item needs docs and a deliberate Debug decision (redacted
   for anything carrying env/secrets, with an exact-string test — IR-41).
 - `#![forbid(unsafe_code)]` planned for core/client/cli; unsafe only in
   `shep-daemon/src/sys.rs` with per-block `// SAFETY:` (IR-22/23).
