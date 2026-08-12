@@ -264,7 +264,7 @@ Core verbs: `start` (script | Flockfile | `-` stdin JSON), `stop`, `restart`,
 `reload`, `delete`, `scale`, `flock` (list; `list`/`ls` aliases), `describe`,
 `bleats` (logs; `logs` alias), `flush`, `reopen` (reopen log files for
 rotation; also SIGUSR2 to the daemon), `muster` (save + resurrect pair:
-`shep muster save` / `shep muster` restores; `resurrect` hidden alias),
+`shep save` / `shep muster` restores; `resurrect` hidden alias),
 `signal`, `sendline`, `trigger <target> <action> [params]` (custom actions via
 the shepherd channel `action`/`action-reply` messages), `enable`/`disable`
 (dogs), `dogs` (list dogs), `barks` (recent alert history), `fold <name>`
@@ -394,7 +394,7 @@ Trusted Publishing.
    `cargo check`, `cargo test` — green on tier-1 platforms + Windows
    functional tier.
 3. Wire fixtures committed; SECURITY.md, migration.md, Grafana asset shipped.
-4. `shep import && shep muster save && reboot` → systemd unit runs
+4. `shep import && shep save && reboot` → systemd unit runs
    `shep muster` and the flock survives on a Linux box (the flagship
    migration scenario).
 5. Spec↔implementation drift review before tagging.

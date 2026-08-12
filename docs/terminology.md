@@ -23,7 +23,8 @@ Free on crates.io (verified 2026-08-07): `shep`, `shepd`, plus reserves `bleat`,
 | webhook alert | alert/notification | **bark** 🐕 | `[bark]` config section, `shep barks` history, alert module |
 | MCP agentic interface | MCP server | **the whistle** | `shep whistle` (serves MCP), docs metaphor: agents whistle, the shepherd and dogs respond |
 | graceful shutdown | stop | **`shep thatlldo [target]`** | easter-egg alias for graceful stop — real herding command for "work's done" |
-| resurrect saved state | resurrect | **muster** | `shep muster`, snapshot = the muster roll |
+| freeze the running list | save | **save** | `shep save` writes the muster roll |
+| resurrect saved state | resurrect | **muster** | `shep muster` assembles the flock from the roll |
 | TUI dashboard | monit/dash | **lookout** | `shep lookout`; `shep dash` alias |
 | host machine | host | **the heft** (sheep bound to their hill) | subtle: docs + host-metrics naming |
 | graceful reload (an overlap, not zero downtime) | reload | reload (verb stays) — strategies **come-bye** / **away** if we ever name them | reload internals, maybe strategy flags |

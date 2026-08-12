@@ -1,11 +1,11 @@
 # Phase 8 — the pm2 cutover set
 
 **Goal:** make it possible to retire pm2 on a real machine. Four pieces:
-`shep muster save`, `shep import`, `shep startup`/`unstartup`, and inline
+`shep save`, `shep import`, `shep startup`/`unstartup`, and inline
 CPU/memory in `shep flock`.
 
 **Success criterion** is spec §13.4, and it is the one that matters:
-`shep import && shep muster save && reboot` leaves the flock running, started
+`shep import && shep save && reboot` leaves the flock running, started
 by the init system rather than by a login shell.
 
 ## What this phase is not
@@ -39,18 +39,19 @@ into config that then survives reboots. It also exposes the second trap: apps
 started by hand over SSH silently inherit things like `BUN_INSTALL` and
 `JAVA_HOME`, and an init-started daemon has neither.
 
-## `shep muster` / `shep muster save`
+## `shep save` / `shep muster`
 
 The debounced atomic snapshot writer and the boot-time restore both ship and
 are tested; neither is reachable by an operator.
 
-- `shep muster save` — `Request::MusterSave`. Writes the roll immediately,
+- `shep save` — `Request::SaveRoll`. Writes the roll immediately,
   bypassing the debounce, and replies with the path written and the number of
   apps recorded. The reply matters: a save that silently does nothing is the
   failure mode this verb exists to rule out.
-- `shep muster` — restores the roll into a running daemon, autostarting the
-  daemon if it is not up. This is the operator's equivalent of pm2's
-  `resurrect`. It is **not** what the init unit runs; see the startup section
+- `shep muster` — assembles the flock from the roll, autostarting the daemon
+  if it is not up. pm2's `resurrect`. The two verbs split the two directions
+  across the two words that already mean them: `save` writes the roll,
+  `muster` musters from it. It is **not** what the init unit runs; see the startup section
   for why `ExecStart` has to be the daemon itself.
 
 ## `shep import`
@@ -162,7 +163,7 @@ repository.
 
 Automated: import correctness against fixtures (instance collapsing, the field
 mapping, env filtering, the cluster warning firing), unit and plist generation,
-`shep muster save` writing when asked, the stats delta including the
+`shep save` writing when asked, the stats delta including the
 no-baseline and rapid-call cases.
 
 Manual, documented as a runbook in `migration.md`: the §13.4 scenario itself.
