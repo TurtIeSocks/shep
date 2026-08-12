@@ -64,15 +64,6 @@ exists.
 launchd/openrc/rc.d unit generator, pm2's `startup` equivalent. No clap
 variant, no template.
 
-**`save` / `muster`** (spec §9, §13.4) — no `shep save` / `shep muster` /
-hidden `resurrect` verb exists. The mechanism they would sit on top of
-does: the daemon debounce-writes `flock.json` on every lifecycle change
-(`SnapshotWriter`, `crates/shep-daemon/src/snapshot.rs`) and restores from
-it automatically at boot unless `daemon --no-restore` is passed. What's
-missing is the operator-facing verbs to force a save or a restore on
-demand — together with `import`, one of §13.4's flagship "import, muster
-save, reboot" scenario's two missing thirds.
-
 **Windows functional tier** (spec §11) — 0%, not partial. The Windows arm
 of `main.rs::run` prints "shep does not yet support Windows" and exits
 `Failure` for every verb; `boot`, `sys`, `server`, `tokio_runner` are all

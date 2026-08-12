@@ -103,12 +103,16 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
 /// to the verb's own module.
 ///
 /// Every command receives an already-connected client; no verb module
-/// itself connects or autostarts. `Start` is the one exception at this
-/// layer: [`connect_or_spawn_client`] autostarts a daemon if nothing
-/// answers, and is the *only* autostart path in the binary. Every other
-/// client-taking arm goes through [`connect_client`], which never spawns —
-/// `shep stop` against a dead daemon must not launch a supervisor in order
-/// to tell it to stop nothing.
+/// itself connects or autostarts. `Start` and `Muster` are the two
+/// exceptions at this layer: both dispatch through
+/// [`connect_or_spawn_client`], which autostarts a daemon if nothing
+/// answers — for `Start` because starting a sheep against a dead daemon
+/// means bringing one up first, and for `Muster` because that is the whole
+/// point of the verb: assembling the flock from the saved roll has to work
+/// against a freshly booted machine, where nothing is listening yet. Every
+/// other client-taking arm goes through [`connect_client`], which never
+/// spawns — `shep stop` against a dead daemon must not launch a supervisor
+/// in order to tell it to stop nothing.
 ///
 /// `resolve_paths` runs only for the arms that actually touch the socket.
 /// `Completions` and `Daemon` never do — shell completion generation is
@@ -249,6 +253,10 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => muster::save(&client, &mut streams, fmt).await,
             Err(code) => code,
         },
+        Commands::Muster => match connect_or_spawn_client(&mut streams, fmt, &paths).await {
+            Ok(client) => muster::muster(&client, &mut streams, fmt).await,
+            Err(code) => code,
+        },
         Commands::Reopen(ref args) => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => logs::reopen(&client, &mut streams, fmt, args).await,
             Err(code) => code,
@@ -298,8 +306,9 @@ fn emit_error_locked(fmt: Format, code: ExitCode, message: &str) {
 }
 
 /// Connects to the daemon at `paths.socket`, autostarting one via
-/// [`launch_daemon`] if nothing answers. The only autostart in the binary —
-/// see [`run`]'s own doc.
+/// [`launch_daemon`] if nothing answers. `Start` and `Muster` are the two
+/// arms that dispatch through this rather than [`connect_client`] — see
+/// [`run`]'s own doc.
 ///
 /// Not unit-tested here: its coverage is `shep_client::spawn::connect_or_spawn`'s
 /// own suite plus the real-binary end-to-end tier. What would need testing
@@ -436,6 +445,37 @@ mod tests {
             Cli::try_parse_from(["shep", "save"]).unwrap().command,
             Commands::Save
         ));
+    }
+
+    /// fails if `Commands::Muster` is wired to another verb's function —
+    /// the same gap `save_parses_to_its_own_command` closes for `save`.
+    #[test]
+    fn muster_parses_to_its_own_command() {
+        use clap::Parser;
+        use cli::Commands;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "muster"]).unwrap().command,
+            Commands::Muster
+        ));
+    }
+
+    /// fails if `resurrect` stops reaching `muster`, or starts showing up in
+    /// `--help`. It exists for a pm2 muscle-memory invocation, not to be
+    /// taught.
+    #[test]
+    fn resurrect_is_a_hidden_alias_for_muster() {
+        use clap::{CommandFactory, Parser};
+        use cli::Commands;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "resurrect"]).unwrap().command,
+            Commands::Muster
+        ));
+        let cmd = Cli::command();
+        let muster = cmd.find_subcommand("muster").unwrap();
+        assert!(
+            muster.get_visible_aliases().next().is_none(),
+            "resurrect must stay out of --help"
+        );
     }
 
     /// A `--home` that never reached `ShepPaths` is invisible from the

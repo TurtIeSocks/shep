@@ -118,6 +118,16 @@ pub enum Commands {
     Kill,
     /// Write the muster roll now, so a reboot can bring this flock back.
     Save,
+    /// Assemble the flock from the muster roll `save` wrote, starting the
+    /// shepherd first if none is running.
+    // Hidden alias `resurrect` (pm2's own word for this), so the muscle
+    // memory carries over: `alias`, not `visible_aliases`, so it stays out
+    // of `--help` rather than being taught by it. A plain `//` comment
+    // rather than `///` on purpose — the paragraph above already becomes
+    // this subcommand's own `--help` text, and naming the alias there would
+    // defeat the point of keeping it hidden.
+    #[command(alias = "resurrect")]
+    Muster,
     /// Print a shell completion script.
     ///
     /// Static only: sheep names, fold names and other daemon-side
@@ -532,6 +542,7 @@ mod tests {
             "ping",
             "kill",
             "save",
+            "muster",
             "completions",
         ] {
             assert!(

@@ -254,6 +254,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   autostarting one just to save an empty flock would overwrite a good roll
   with an empty one.
 
+- Add `shep muster` (hidden alias `resurrect`, pm2's own word), which asks
+  the daemon to assemble the flock from the roll `save` wrote
+  (`Request::Muster` / `Response::Mustered`), rendered the same way `flock`
+  is. Sent with `START_DEADLINE` rather than the client's 5s default, same
+  reasoning as `start`: a muster spawns every app in the roll, and a cold
+  restore of a real flock routinely outruns five seconds. An empty
+  `Mustered` — the roll restored nothing — gets an explicit notice on
+  stderr, so that answer is never a silent exit 0.
+
+  This is the binary's **second** autostart path, after `start`: dispatched
+  through `connect_or_spawn_client` rather than `connect_client`, because
+  bringing a fresh daemon up is the whole point of the verb on a machine
+  that just rebooted. When that autostart itself just spawned the daemon,
+  boot has already restored the roll before this request goes out, so the
+  `Muster` that follows spawns nothing new and simply reports the flock
+  restore produced — `Response::Mustered` always names every sheep of every
+  app the roll restored, not only what this particular call spawned, which
+  is what makes the verb idempotent for an init system that runs it more
+  than once.
+
 ### Fixes
 
 - Open the shepherd's own `shepd.out.log`/`shepd.err.log` `O_APPEND` in the

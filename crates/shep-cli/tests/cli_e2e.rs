@@ -2903,3 +2903,104 @@ fn trigger_reaches_the_trigger_verb_and_names_the_missing_channel() {
 
     graceful_kill(dir.path());
 }
+
+// --- Save / Muster ---------------------------------------------------------
+
+/// `shep save` writes the muster roll and `shep muster` reads it back — the
+/// §13.4 flagship "import, muster, save, reboot" shape, minus the reboot: a
+/// muster against the same still-live daemon that just saved is Task 4's own
+/// idempotence case, since nothing here ever goes down in between.
+///
+/// Both dispatch arms carried no coverage beyond a clap-parsing pin
+/// (`save_parses_to_its_own_command`/`muster_parses_to_its_own_command`,
+/// `main.rs`) until this case: Task 3 shipped `Commands::Save` routed to
+/// `query::ping` in `run`'s `match` and the crate's own unit suite still
+/// passed 126/126, because nothing below the parse layer ever calls the
+/// verb it parsed to. This case is what closes that gap for both verbs —
+/// see this task's own report for the two mutations that prove it (`Save`
+/// and `Muster` each rewired to the wrong function, in turn).
+///
+/// What a broken implementation this would catch, beyond the dispatch
+/// misroute above: a `save` that reports the wrong app count (`data.apps`
+/// pins it at 1); a `muster` that reports `Started`'s shape instead of
+/// `Mustered`'s, or that starts a *second* instance of `roundtrip` rather
+/// than recognising the one already running (`flock.len()` pins exactly
+/// one, `pid` pins it as the SAME process `start` reported, not a fresh
+/// one) — the exact failure decision 3/4 exist to rule out, since a
+/// duplicate or a restarted sheep here would silently double a real flock
+/// on every reboot.
+#[test]
+fn saving_the_roll_then_mustering_reports_the_same_flock() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("roundtrip")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&started);
+    let start_envelope: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert_eq!(
+        start_envelope["data"][0]["status"], "online",
+        "{start_envelope}"
+    );
+    let original_pid = start_envelope["data"][0]["pid"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("pid must be a real positive OS pid: {start_envelope}"));
+
+    let saved = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("save")
+        .output()
+        .unwrap();
+    assert_success(&saved);
+    let save_envelope: serde_json::Value = serde_json::from_slice(&saved.stdout).unwrap();
+    assert_eq!(
+        save_envelope["command"], "save",
+        "`shep save` must reach the save verb and no other: {save_envelope}"
+    );
+    assert_eq!(
+        save_envelope["data"]["apps"], 1,
+        "the roll must record the one app started above: {save_envelope}"
+    );
+
+    let mustered = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("muster")
+        .output()
+        .unwrap();
+    assert_success(&mustered);
+    let muster_envelope: serde_json::Value = serde_json::from_slice(&mustered.stdout).unwrap();
+    assert_eq!(
+        muster_envelope["command"], "muster",
+        "`shep muster` must reach the muster verb and no other: {muster_envelope}"
+    );
+    let flock = muster_envelope["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("muster data must be an array: {muster_envelope}"));
+    assert_eq!(
+        flock.len(),
+        1,
+        "muster against a daemon already running the flock the roll \
+         describes must not spawn a duplicate: {muster_envelope}"
+    );
+    assert_eq!(flock[0]["name"], "roundtrip", "{muster_envelope}");
+    assert_eq!(
+        flock[0]["pid"].as_i64().unwrap(),
+        original_pid,
+        "muster must leave an already-running sheep alone and report the \
+         SAME process, never restart it: {muster_envelope}"
+    );
+
+    graceful_kill(home);
+}
