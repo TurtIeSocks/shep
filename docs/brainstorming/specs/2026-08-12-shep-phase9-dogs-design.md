@@ -63,9 +63,25 @@ bark subscribes to it. Neither has useful work before the connection exists.
 dog as enabled. `shep disable <name>` removes it and stops the process.
 Enabled dogs are spawned when the daemon boots.
 
+**`enable` starts the dog immediately when a daemon is running**, rather than
+only arming it for the next boot — an operator who enables a dog and sees
+nothing happen has been given a puzzle rather than a feature. With no daemon
+running it writes the config and says so, and the dog comes up with the next
+boot.
+
+**A config change does not reach a running dog by itself.** The dog read its
+section once, at connect. Changing `[dog.bark.rules]` and expecting live rules
+would need either a push the contract does not have or a poll every dog would
+have to implement. So the rule is stated rather than left to be discovered:
+`shep disable <name> && shep enable <name>` re-reads it, and the docs say so.
+Live config push is a v1.1 question, and one worth answering with two dogs'
+worth of evidence about what actually changes at runtime.
+
 Spawning is the **ordinary** path: the same runner, kill ladder, restart
 budget and log pumps a sheep gets. A marker on the process entry keeps dogs
-out of `shep flock` unless `--all` is passed. `shep dogs` lists them.
+out of `shep flock` unless `--all` is passed, and **badges them when they are
+shown**, so a dog in a listing is never mistaken for one of the operator's own
+processes. `shep dogs` lists them directly.
 
 This is deliberately a marker rather than a second registry. Duplicating
 supervision would mean teaching every feature since Phase 2 — reload, watch,
