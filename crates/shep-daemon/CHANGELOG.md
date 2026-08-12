@@ -51,6 +51,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Answer `Request::SaveRoll` on the control socket: the daemon writes the
+  muster roll immediately, bypassing the debounce the snapshot writer
+  otherwise applies, and reports back the path it wrote and how many apps
+  that roll recorded — the count taken from the roll actually persisted, not
+  from the flock before it was filtered down to one entry per app. `Ok(None)`
+  — the supervisor engine has already stopped — answers `RpcErrorCode::Internal`
+  rather than a success carrying nothing: an operator running this verb wants
+  the roll on disk before a reboot, and a reply that said "saved" for a write
+  that never happened is exactly the failure the verb exists to rule out.
+  `RpcContext::save_roll_now` is the new entry point, returning
+  `Option<SavedRoll>`; `RpcContext::snapshot_now` becomes a one-line wrapper
+  over it that discards the count, keeping its own signature and its
+  engine-stopped `Ok(())` behaviour unchanged, since `boot::run`'s teardown
+  depends on both.
 - Answer `Request::Trigger` on the control socket: the daemon resolves the
   selector against the flock, puts the action on each matched sheep's
   shepherd channel, and answers with one id-sorted `ActionReply` row per

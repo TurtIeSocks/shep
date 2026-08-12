@@ -68,6 +68,15 @@ pub struct RpcContext {
     pub(crate) shutdown: Arc<watch::Sender<bool>>,
 }
 
+/// Where a muster roll landed and what it recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedRoll {
+    /// The path written.
+    pub path: PathBuf,
+    /// How many apps the roll records.
+    pub apps: u32,
+}
+
 impl RpcContext {
     /// Asks the daemon to begin graceful shutdown.
     ///
@@ -80,20 +89,34 @@ impl RpcContext {
         let _ = self.shutdown.send(true);
     }
 
-    /// Writes the muster roll now — the primitive Phase 3's `muster save` calls.
+    /// Writes the muster roll now, reporting what it recorded.
     ///
-    /// A no-op if the supervisor engine has already stopped: there is
-    /// nothing left to record, and the shutdown path has already written the
+    /// `None` means the supervisor engine has already stopped: there is
+    /// nothing left to record and the shutdown path has already written the
     /// final roll.
     ///
     /// # Errors
     /// - [`SnapshotError`] — as `write_atomic`.
-    pub async fn snapshot_now(&self) -> Result<(), SnapshotError> {
+    pub async fn save_roll_now(&self) -> Result<Option<SavedRoll>, SnapshotError> {
         let Ok(infos) = self.supervisor.list_checked().await else {
-            return Ok(());
+            return Ok(None);
         };
         let roll = self.registry.roll(&infos, crate::now_ms());
-        write_atomic(&self.snapshot_path, &roll)
+        write_atomic(&self.snapshot_path, &roll)?;
+        Ok(Some(SavedRoll {
+            path: self.snapshot_path.clone(),
+            // `u32` matches `SavedApp::instances_running`; a flock large
+            // enough to overflow it has other problems.
+            apps: u32::try_from(roll.apps.len()).unwrap_or(u32::MAX),
+        }))
+    }
+
+    /// Writes the muster roll now, discarding what it recorded.
+    ///
+    /// # Errors
+    /// - [`SnapshotError`] — as `write_atomic`.
+    pub async fn snapshot_now(&self) -> Result<(), SnapshotError> {
+        self.save_roll_now().await.map(|_| ())
     }
 }
 
@@ -259,6 +282,23 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
                 Ok(ids) => reply(Ok(Response::Deleted(ids))),
                 Err(err) => reply(Err(rpc_error(&err))),
             },
+        },
+        Request::SaveRoll => match ctx.save_roll_now().await {
+            Ok(Some(saved)) => reply(Ok(Response::RollSaved {
+                // Lossy on purpose, matching `to_info`'s treatment of log
+                // paths: a non-UTF-8 roll path must degrade one field, not
+                // abort the whole reply.
+                path: saved.path.to_string_lossy().into_owned(),
+                apps: saved.apps,
+            })),
+            Ok(None) => reply(Err(RpcError {
+                code: RpcErrorCode::Internal,
+                message: "the supervisor engine has stopped; no roll was written".to_string(),
+            })),
+            Err(err) => reply(Err(RpcError {
+                code: RpcErrorCode::Internal,
+                message: err.to_string(),
+            })),
         },
         Request::Subscribe { topics } => match TopicFilter::new(&topics) {
             Ok(filter) => Outcome::Subscribe {
@@ -1107,5 +1147,59 @@ mod tests {
         let err = reply.result.unwrap_err();
         assert_eq!(err.code, RpcErrorCode::DeadlineExceeded);
         assert!(err.message.contains("250 ms"), "{}", err.message);
+    }
+
+    /// fails if `SaveRoll` stops writing, or writes without reporting: the
+    /// assertion reads the file the reply named and compares its app count
+    /// against the number the reply claimed, so a handler that answered
+    /// `apps: 0` for a two-app flock — or named a path it never wrote —
+    /// reddens here rather than in an operator's terminal after a reboot.
+    #[tokio::test]
+    async fn save_roll_writes_the_file_it_names_and_counts_what_it_recorded() {
+        let h = harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![
+                            AppConfig::minimal("web", "./srv"),
+                            AppConfig::minimal("worker", "./work"),
+                        ],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        let reply = reply_of(dispatch(envelope(2, Request::SaveRoll), &h.ctx).await);
+        let Ok(Response::RollSaved { path, apps }) = reply.result else {
+            panic!("expected RollSaved, got {:?}", reply.result)
+        };
+        assert_eq!(apps, 2);
+
+        let roll = crate::snapshot::read(std::path::Path::new(&path)).unwrap();
+        assert_eq!(roll.apps.len(), 2, "the reply's count must match the file");
+        assert_eq!(path, h.ctx.snapshot_path.display().to_string());
+    }
+
+    /// fails if the handler forwards `snapshot_now`'s engine-stopped
+    /// `Ok(())` as a success. That is the whole reason this verb exists:
+    /// a save that wrote nothing and said "saved" is the failure mode an
+    /// operator reboots into.
+    #[tokio::test]
+    async fn save_roll_against_a_stopped_engine_is_an_error_not_a_silent_success() {
+        let h = harness(vec![]);
+        h.ctx.supervisor.shutdown().await;
+
+        let reply = reply_of(dispatch(envelope(1, Request::SaveRoll), &h.ctx).await);
+        let err = reply.result.unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::Internal);
+        assert!(
+            err.message.contains("engine"),
+            "the operator must be told why nothing was written: {}",
+            err.message
+        );
     }
 }
