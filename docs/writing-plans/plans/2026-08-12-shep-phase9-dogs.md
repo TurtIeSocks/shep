@@ -16,7 +16,7 @@
 - **Each dog's own logic** — a Prometheus exposition renderer plus a hand-rolled HTTP/1.1 server (metrics), and a rules engine plus webhook sinks plus a size-capped `barks.jsonl` ring (bark). Both are argv branches of the same binary, the multi-call pattern the hidden `daemon` subcommand already uses.
 - **The surface** — `enable`/`disable`, `adopt`/`rehome`, `dogs`, `barks`, and a second table under `shep flock`.
 
-**Tech stack:** one new *workspace* dependency, `reqwest` 0.13 over rustls (TLS for webhook POSTs — Task 19 states the reasoning and the exact feature list), plus `toml_edit`, which is already in `Cargo.lock` as `toml` 0.8's own dependency and so costs zero new crates. The metrics dog's HTTP server and every test's HTTP sink are still hand-rolled over `tokio::net::TcpListener`, and neither reaches for `hyper`, `axum`, or a `prometheus` crate — `reqwest` brings `hyper` in transitively as its own outbound transport for bark's webhook POSTs, but nothing shep writes itself sits on top of it.
+**Tech stack:** one new *workspace* dependency stack — `tokio-rustls` 0.26 plus `webpki-roots` 0.26, ten crates total (TLS for bark's webhook POSTs; Task 19 states the reasoning, the measurement behind it, and the exact feature list) — plus `toml_edit`, which is already in `Cargo.lock` as `toml` 0.8's own dependency and so costs zero new crates. The metrics dog's HTTP server, bark's webhook client, and every test's HTTP sink are all hand-rolled over `tokio::net::TcpListener`/`TcpStream`, and none of them reaches for `hyper`, `axum`, or a `prometheus` crate — `tokio-rustls` supplies only the TLS handshake and record layer underneath bark's own request; the HTTP/1.1 either side of that speaks is shep's own hundred-or-so lines, hand-rolled on the server in Task 13 and on bark's client in Task 19.
 
 ---
 
@@ -110,7 +110,7 @@ Recorded so no task re-litigates them. Items marked (Rin) come from the approved
 | 16 | (Rin) **Listings sort by name.** Sorting by id scatters a clustered app's instances; sorting by name groups them. Applied **once**, in the actor's `snapshot_all`, so every listing reply and every consumer — the CLI, the metrics dog, bark's reconciliation — sees one order. Sorted by `(name, instance, id)`: instance keeps a clustered app's slots in their own order, and id breaks the tie a reload's fresh id creates. |
 | 17 | **A dog is named by an exact `name` or `id` selector, and never by a wildcard one.** The design requires `reload all` to skip dogs; the same argument holds verbatim for `stop all` and `delete all`, where getting it wrong takes alerting down silently. Implemented once as `ProcessSelector::is_exact` plus a single selection helper in the actor, never as five copies of an `if`. |
 | 18 | **The dog marker rides `ProcessInfo` as `Option<DogSource>`, and `None` conflates "a sheep" with "a peer that predates the field" on purpose.** Unlike `cpu_percent`, that conflation is *correct*: a daemon that predates dogs has none, so "not a dog" is the true answer in both cases. Say so in the field's doc rather than letting a reader assume it was overlooked. |
-| 19 | (Rin) **Bark's sinks need TLS, so they need a dependency: `reqwest` 0.13.** Discord and Slack webhooks are HTTPS and there is no way around that. Rin has standardised on `reqwest` across her recent Rust projects, and consistency across the codebases she maintains outweighs a smaller crate count; an async client also fits a program that is tokio all the way down, where a blocking client would mean `spawn_blocking` around every webhook POST. `default-features = false` with only `rustls` named explicitly, matching the shape every dependency in this workspace already takes (Task 19 has the exact feature list and how it was confirmed). It ships in the binary unconditionally, for every user, by the same decided model that makes bark a dog rather than in-daemon code (`decision-briefs.md` §3b) — not a size tradeoff being accepted. The **test** server is hand-rolled over `tokio::net::TcpListener` and needs nothing. |
+| 19 | (Rin) **Bark's sinks need TLS, so they need a dependency — but Rin ruled against `reqwest`, for a hand-rolled HTTP/1.1 client over `tokio-rustls`.** Discord and Slack webhooks are HTTPS and there is no way around that, but the ruling on *how* was measured against this workspace's existing 196 crates, not argued: `reqwest` 0.13's default `rustls` feature costs +93 crates and a C build dependency (`aws-lc-sys`, `cmake`); `reqwest`'s `rustls-no-provider` feature plus `ring` drops the C toolchain but still costs +76; `tokio-rustls` + `webpki-roots`, named directly, costs +10 (Task 19 has the exact set and how it was confirmed). Four reasons past the number: `rustls` covers the one part that must not be hand-rolled, the TLS handshake and record layer, and nothing past it; the plan already hand-rolls an HTTP *server* for the metrics dog rather than reach for `axum`/`hyper` (Task 13), so hand-rolling the client is the same trade made twice, not a special case; bark's own needs are genuinely small — no redirects, no connection pooling, no HTTP/2, no cookies, no multipart; and no C toolchain, the same reasoning that put `rustls` over `native-tls` in the first place, which `reqwest`'s own default `rustls` feature reintroduces through `aws-lc-sys`. **The cost is recorded too, not only the win:** this diverges from Rin's own standardisation on `reqwest` across her other projects, and it is code she now owns outright — a library has other users who have already found its bugs, and a hand-rolled client will find its own. It still ships in the binary unconditionally, for every user, by the same decided model that makes bark a dog rather than in-daemon code (`decision-briefs.md` §3b) — not a size tradeoff being accepted. The **test** server stays hand-rolled over `tokio::net::TcpListener`, plaintext, and Task 19 says how a plaintext test still exercises the code path that matters. |
 | 20 | (Rin) **Restart-loop detection is two rule kinds, not one threshold.** "The daemon gave up" is keyed to budget exhaustion, is on by default, has nothing to tune, and cannot disagree with the daemon. The early warning ("N restarts in M seconds") is opt-in, because it is the one that pages at 3am for a blip. |
 | 21 | (Rin) **Bark reads `ProcessInfo.restarts` — the daemon's own count — rather than tallying bus events.** A private tally would drift from the number the daemon acts on, and the operator would be told a different story from the one the supervisor believes. |
 | 22 | (Rin) **When a dog dies, the daemon records it and metrics exposes it — and nothing watches across dogs.** Two dogs observing each other adds a failure mode without adding an independent observer, and fails hardest when both go down together. The daemon's record is written by a bus watcher at the *edge* of the supervisor, never by a branch inside `handle_exited` (decision 2). |
@@ -2717,31 +2717,132 @@ Cargo shape for this task: `-p shep-cli`.
 
 ### The dependency
 
-**Discord and Slack webhooks are HTTPS.** There is no way to POST to one without TLS, and TLS is not something to hand-roll. So bark needs an HTTP client, and this is the phase's one new workspace dependency.
+**Discord and Slack webhooks are HTTPS.** There is no way to POST to one without TLS, and TLS is not something to hand-roll. So bark needs a TLS dependency, and this is the phase's one new workspace dependency stack.
 
-**Chosen: `reqwest` 0.13, over rustls, async.** Rin has standardised on `reqwest` across her recent Rust projects; consistency across the codebases she maintains outweighs a smaller crate count, and an async client fits a program that is tokio all the way down — a blocking client would mean `spawn_blocking` around every webhook POST, for no benefit bark needs.
+**Chosen: a hand-rolled HTTP/1.1 client over `tokio-rustls`, not `reqwest`.** This was Rin's ruling, and it was measured rather than argued, against this workspace's existing 196 crates:
+
+| option | new crates | C build dependency |
+|---|---|---|
+| `reqwest` 0.13, default `rustls` feature | +93 | yes — `aws-lc-sys` and `cmake` |
+| `reqwest` 0.13, `rustls-no-provider` + `ring` | +76 | no |
+| `tokio-rustls` + `webpki-roots` | +10 | no |
+
+What `reqwest` adds beyond the +10 includes `quinn` (QUIC/HTTP3), `wasm-bindgen`/`js-sys`/`web-sys`, `jni` (Android), `icu_*` (Unicode for IDNA), `tower`/`tower-http`, `security-framework`, `schannel`, `openssl-probe` — none of it reachable from a Unix daemon POSTing to a webhook.
+
+Four reasons past the number:
+
+1. **`rustls` does the part that must not be gotten wrong.** What shep owns is HTTP/1.1 request framing for a POST — a request line, a handful of headers, a body, and reading back a status code. The TLS handshake and record layer are `rustls`'s job, not bark's.
+2. **The plan already hand-rolls an HTTP server** for the metrics dog over `tokio::net::TcpListener` rather than pulling `axum` or `hyper` (Task 13). Hand-rolling the client is the same trade made consistently within one phase, not a special case.
+3. **Bark's needs are genuinely small** — no redirects (webhooks do not redirect), no connection pooling (each delivery is fire-and-forget), no HTTP/2, no cookies, no multipart.
+4. **No C toolchain**, which matters for something operators build on servers. This is the same concern that motivated choosing `rustls` over `native-tls` in the first place, and `reqwest`'s *default* `rustls` configuration reintroduces it through `aws-lc-sys`.
+
+**The cost is recorded too, not only the win.** This diverges from Rin's standardisation on `reqwest` across her other projects, and it is code she now owns: a library has other users who have already found its bugs, and a hand-rolled client will find its own. That is the accepted trade.
 
 ```toml
 # Bark's sinks are Discord and Slack webhooks, which are HTTPS, so this is
-# the one thing in the workspace that needs TLS. reqwest 0.13, over rustls,
-# is what Rin standardises on across her Rust projects. Every dependency in
-# this workspace is default-features = false, so rustls is named explicitly
-# rather than inherited — reqwest 0.13 already defaults to it (native-tls,
-# an OpenSSL system dependency on some platforms, moved to opt-in), but the
-# workspace never leans on a crate's own defaults to get there. `json` is
-# not named: `render_body` already renders the templated body to a `String`,
-# and `deliver` sends it with an explicit `content-type` header rather than
-# through `.json()`, so nothing here needs reqwest's own (de)serialization.
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# the one thing in the workspace that needs TLS. Rin's ruling (2026-08-12)
+# is a hand-rolled HTTP/1.1 client over tokio-rustls rather than reqwest:
+# reqwest's default rustls feature costs +93 crates over this workspace's
+# existing 196 and a C build dependency (aws-lc-sys, cmake); tokio-rustls +
+# webpki-roots, named directly, costs +10 crates and none of it needs a C
+# toolchain. `ring`, not the default `aws_lc_rs`, is the crypto provider —
+# aws_lc_rs is exactly the C dependency this choice exists to avoid, and
+# tokio-rustls's own default features pull it in unless named away.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# Mozilla's compiled-in root store. rustls itself is reached through
+# tokio-rustls's own `pub use rustls;` (tokio-rustls-0.26.4/src/lib.rs) — a
+# direct `rustls` dependency is not named in crates/shep-cli/Cargo.toml
+# because nothing there needs to name the crate, only the types it
+# re-exports.
+webpki-roots = "0.26"
 ```
 
-**Confirmed against `reqwest`'s own `Cargo.toml` and its `src/lib.rs` feature-flag doc (0.13.4, the current 0.13 release, on the project's GitHub repository):** 0.12 spelled this feature `rustls-tls`; 0.13 renamed it to `rustls` and made it the crate's own default TLS backend, with `native-tls` moved to opt-in. `json` gates `RequestBuilder::json()`/`Response::json()` alone — `.header()`, `.body()` and `.timeout()` are core `RequestBuilder` methods gated behind no feature, so a POST carrying a hand-rendered JSON string, an explicit content-type header, and a timeout needs nothing beyond `rustls`. Paste `cargo tree -p shep-cli | wc -l` before and after into the report, so the real cost is a number rather than an estimate.
+**Confirmed against the vendored `tokio-rustls` 0.26.4, `rustls` 0.23.43, `rustls-pki-types` 1.14.0 and `webpki-roots` 0.26.11 sources in `~/.cargo/registry/src/`:**
 
-**The dependency ships unconditionally, in every `shep` binary, for every user including one who never enables bark — and that is the decided model, not a size tradeoff being accepted.** `docs/systematic-refactor/refactor-workspace/decision-briefs.md` §3b (Rin, 2026-08-07) settled the shape a first-party dog takes: cargo features are for build-slimming source builds, not runtime pluggability, because a feature-flagged dog is the weaker version of a dog — no crash isolation, no independent restart, and inert for most users anyway since the release binary is one binary. Runtime opt-in is `shep enable bark`, the process model doing the job a feature flag would do worse. `reqwest` sits in that one binary the same way the `bark` argv branch itself does, and for the same reason.
+- `tokio-rustls`'s own default features are `["logging", "tls12", "aws_lc_rs"]` — `default-features = false` here is load-bearing, not decorative, or the `aws-lc-sys` this whole choice exists to avoid comes back in through the client's own manifest. `ring` maps to `rustls/ring`; `tls12` maps to `rustls/tls12` (`tokio-rustls-0.26.4/Cargo.toml`).
+- `TlsConnector::from(Arc<rustls::ClientConfig>)`, then `.connect(domain: ServerName<'static>, stream: IO) -> Connect<IO>` where `Connect<IO>: Future<Output = io::Result<TlsStream<IO>>>` and `TlsStream<IO>: AsyncRead + AsyncWrite` whenever `IO` is (`tokio-rustls-0.26.4/src/client.rs`).
+- Without `aws_lc_rs`, the no-argument `ClientConfig::builder()` panics — it resolves a process-default `CryptoProvider` that only the `aws_lc_rs` feature auto-registers. The connector below is built from `ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))` instead, which takes the provider explicitly and cannot panic on a missing global (`rustls-0.23.43/src/client/client_conn.rs:315-363`, `src/crypto/ring/mod.rs:31`).
+- `RootCertStore` has a public `roots: Vec<TrustAnchor<'static>>` field and a `FromIterator<TrustAnchor<'static>>` impl (`rustls-0.23.43/src/webpki/anchors.rs`); `webpki_roots::TLS_SERVER_ROOTS` is `&'static [TrustAnchor<'static>]` and `TrustAnchor: Clone`, so `RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())` builds the store directly.
+- `webpki-roots` 0.26 is itself a semver-trick shim: its `Cargo.toml` depends on `webpki-roots` **1.x** under the local name `parent` and re-exports `TLS_SERVER_ROOTS` from it. That is very likely the missing tenth crate — the ruling's own list names nine — and worth confirming with `cargo tree -p shep-cli | wc -l` rather than trusting either number.
+- `ServerName::try_from(String) -> Result<ServerName<'static>, InvalidDnsNameError>` needs `rustls-pki-types`'s `alloc` feature, which its `std` feature implies and which rustls's own `std` feature (already on, transitively, through `tokio-rustls`'s own dependency line on rustls) turns on (`rustls-pki-types-1.14.0/Cargo.toml`).
+- Neither `rustls` nor `rustls-pki-types` needs naming in `crates/shep-cli/Cargo.toml`: `tokio-rustls` re-exports the first as `tokio_rustls::rustls` (`pub use rustls;`), and `rustls::pki_types` re-exports the second (`rustls-0.23.43/src/lib.rs:677-679`). Only `tokio-rustls` and `webpki-roots` are named crates — `tokio-rustls.workspace = true` and `webpki-roots.workspace = true` under `[dependencies]`.
+
+Paste `cargo tree -p shep-cli | wc -l` before and after into the report, so the real cost is a number rather than an estimate.
+
+**The dependency ships unconditionally, in every `shep` binary, for every user including one who never enables bark — and that is the decided model, not a size tradeoff being accepted.** `docs/systematic-refactor/refactor-workspace/decision-briefs.md` §3b (Rin, 2026-08-07) settled the shape a first-party dog takes: cargo features are for build-slimming source builds, not runtime pluggability, because a feature-flagged dog is the weaker version of a dog — no crash isolation, no independent restart, and inert for most users anyway since the release binary is one binary. Runtime opt-in is `shep enable bark`, the process model doing the job a feature flag would do worse. `tokio-rustls` sits in that one binary the same way the `bark` argv branch itself does, and for the same reason.
+
+### The client
+
+**A TLS connector, built once, not per request.** `TlsConnector` wraps an `Arc<rustls::ClientConfig>`; building a fresh one per delivery would mean re-walking the root store and re-deriving the cipher suite set on every bark. It is instead a module-level lazy static, built on first use and shared for the process's lifetime. MSRV 1.88 has had `std::sync::LazyLock` since Rust 1.80, so this needs no dependency beyond the two above:
+
+```rust
+fn tls_connector() -> &'static tokio_rustls::TlsConnector {
+    static CONNECTOR: std::sync::LazyLock<tokio_rustls::TlsConnector> =
+        std::sync::LazyLock::new(|| {
+            let roots = tokio_rustls::rustls::RootCertStore::from_iter(
+                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+            );
+            let provider =
+                std::sync::Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+            let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("ring's default cipher suites cover rustls's own default protocol versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+        });
+    &CONNECTOR
+}
+```
+
+The one `.expect()` in this module is not a constructor IR-21 governs — `tls_connector` is private plumbing, not a public constructor — but it earns the same bar anyway: `with_safe_default_protocol_versions` fails only when the provider's cipher suites and the requested versions share nothing, which cannot happen between `ring`'s own default provider and rustls's own default versions, built from the same crate at the same version. A mismatch here would mean `ring` and `rustls` shipped incompatible defaults against each other, not a condition a bad sink config could trigger.
+
+**The sink's URL is parsed by hand, not with a `url` crate** — narrow by construction, since a sink's URL is never more than a scheme, a host, an optional port, and a path:
+
+```rust
+struct SinkTarget {
+    https: bool,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+fn parse_sink_url(url: &str) -> Result<SinkTarget, SinkError> {
+    let (https, rest) = match url.strip_prefix("https://") {
+        Some(rest) => (true, rest),
+        None => match url.strip_prefix("http://") {
+            Some(rest) => (false, rest),
+            None => return Err(SinkError::Transport { .. }), // scheme is neither
+        },
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().map_err(|_| SinkError::Transport { .. })?),
+        None => (authority, if https { 443 } else { 80 }),
+    };
+    if host.is_empty() {
+        return Err(SinkError::Transport { .. });
+    }
+    Ok(SinkTarget { https, host: host.to_string(), port, path: path.to_string() })
+}
+```
+
+**`http://` is supported, not rejected.** Discord and Slack are always `https://`, but `Sink::Json` can name any operator-configured endpoint — an internal alerting sink with no TLS in front of it is exactly the case this is for — and Task 19's own test suite already depends on the scheme being accepted: `a_delivery_posts_json_to_the_url_it_was_given` and every other delivery test point their sink at `http://{addr}/...`, the plaintext local test server (below). Rejecting `http://` outright would mean either those tests reach for a TLS-terminating test server they do not otherwise need, or `Sink::Discord`/`Sink::Slack` get a second, TLS-only code path the tests never exercise — both worse than honouring the scheme a sink's own URL already names.
+
+**Framing the request** follows the same header set `write_response` (Task 13) answers a reply with, aimed the other way — a POST line, `Host` (carrying the port only when it is off the scheme's default of 443/80; every test in this task binds an ephemeral port, so this branch is exercised by all of them, not a hypothetical), `Content-Type: application/json`, `Content-Length: {body.len()}`, `Connection: close`, a blank line, then the body. No redirect is ever followed (reason 3 above), so any response is read exactly once, off exactly one connection.
+
+**Reading the response** stops as soon as it has answered the question `deliver`'s own doc comment already commits to: `SinkError::Status` carries the status and the first line of the body, nothing else. A `BufReader::read_line` over the response gets the status line; a full line back at all is what "the request completed" means here, so a 2xx reply is read no further — Discord's and Slack's own success bodies carry nothing bark acts on. A non-2xx reads past the remaining header lines to the blank line that ends them (or to EOF, gracefully — no body line to report is not an error), then takes one more line for the diagnostic. On the TLS branch, the write is followed by an explicit `.flush()` before that read: tokio-rustls buffers writes in rustls's own record layer, and its module doc says so directly — "you must call `poll_flush` to ensure that it is written to `TcpStream`" — so skipping the flush on `https://` can leave the request sitting in a buffer the peer never sees, while the same skip on `http://` is merely redundant.
+
+One `tokio::time::timeout(timeout, ...)` wraps the connect, the write, and the read together, so a sink that accepts the TCP connection and then says nothing cannot wedge bark past `timeout` regardless of which stage stalls. `deliver` picks the stream once, from `parse_sink_url`'s `https` flag — a bare `TcpStream` for `http://`, `tls_connector().connect(ServerName::try_from(host.clone())?, tcp).await?` for `https://` — and runs the same write/read logic over either, generic the same way Task 13's `read_request` is over `AsyncRead`/`AsyncWrite`.
 
 ### The test server
 
 **Hand-rolled over `tokio::net::TcpListener`, reading with Task 13's `read_request`.** It binds port 0, reports the port back through a `oneshot`, accepts one connection, captures the request, and answers whatever status the test asked for. Never a real webhook, and — because the sink is URL-driven — the Discord and Slack bodies are tested by pointing those variants' `url` at the local `http://` server. That is the whole reason the body renderer is a separate pure function: what is being asserted is the *shape Discord expects*, and reaching Discord to learn it would be a test of the network.
+
+**The test server is plaintext; a real sink is TLS, and that gap is real rather than papered over.** Every test in this task exercises `http://` — the URL parser's plaintext branch, the request framing, the status-line read, the `SinkError::Status` diagnostic path — and none of it drives `tls_connector()`, `ClientConfig`, or the root store built from `webpki-roots`. A rustls upgrade or a typo'd feature that broke only the `https://` branch would pass this task's suite in full. What the tests do cover is everything bark writes itself: the request line, the headers, the body, reading the status back, timing out on a peer that says nothing — which is the code this task actually owns. The TLS handshake and record layer are `rustls`'s own tested surface, not bark's (the first of the four reasons above), and closing the remaining gap would mean the test harness terminating TLS itself — a self-signed certificate and a way to make bark trust it instead of the real root store, a second dependency shape for one task's tests. Out of scope here; note it in the report as a known, accepted gap rather than a check that quietly never ran.
 
 - [ ] **Step 1: Write the failing tests.**
 
@@ -2838,11 +2939,11 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 - [ ] **Step 2: Run, confirm failure.**
 
-- [ ] **Step 3: Implement.** `render_body` (pure), `deliver` (an async `reqwest::Client`, POSTing the rendered body with an explicit `content-type: application/json` header and `RequestBuilder::timeout(timeout)` — a per-request timeout that cancels the request future itself, with no separate thread for it to abandon), the hand-written `Debug`, and `one_shot_sink` in the test module.
+- [ ] **Step 3: Implement.** `render_body` (pure); `deliver` per "### The client" above — `parse_sink_url`, the once-built `tls_connector()`, the scheme branch, and the write/read helper, all under one `tokio::time::timeout(timeout, ...)` wrapping connect through the status-line read. `SinkError` is a per-module enum, IR-18/19 shape: `Transport` wraps the underlying `io::Error` (a timeout included, via `tokio::time::timeout`'s own `Elapsed` mapped in) and implements `source()`; its `Debug` needs no redaction — it carries an OS error or a status line, never a sink's URL, which is `Sink`'s own job to hide. Also the hand-written `Debug` on `Sink`, and `one_shot_sink` in the test module — unchanged, still hand-rolled plaintext over `tokio::net::TcpListener`, reading with Task 13's `read_request`.
 
 - [ ] **Step 4: Mutation check.** Swap `content` and `text` between the Discord and Slack renderers and watch `each_webhook_gets_the_body_its_own_endpoint_expects` redden on **both** the positive and the negative assertion — if only the positive fails, the negative one is not sharp enough. Restore from a `cp` snapshot; paste the failure.
 
-- [ ] **Step 5: CHANGELOG** — shep-cli: the three sink kinds, the templated body's substitutions, the new dependency and why it exists.
+- [ ] **Step 5: CHANGELOG** — shep-cli: the three sink kinds, the templated body's substitutions, the two new dependencies (`tokio-rustls`, `webpki-roots`), and why a hand-rolled client over `tokio-rustls` rather than `reqwest`.
 
 - [ ] **Step 6: Task gate, then commit** — `feat(cli): deliver a bark to a webhook`
 
