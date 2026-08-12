@@ -9,6 +9,7 @@
 
 #![cfg(unix)]
 
+use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt as _;
 use std::time::Duration;
 
@@ -1172,6 +1173,64 @@ async fn assert_reaped(pid: i32) {
     );
 }
 
+/// Waits until `socket` is stale in the sense `bind_socket` means it —
+/// nothing answers a connection there — failing at [`RECV_TIMEOUT`].
+///
+/// Polls rather than sleeping a fixed guess, and bounded rather than
+/// unbounded (IR-39): the descriptor this waits on belongs to another
+/// process, so there is no event to subscribe to, only a question to keep
+/// asking until the deadline answers it.
+///
+/// Dropping a daemon's `UnixListener` stops THAT daemon accepting, but does
+/// not on its own unbind the socket: a socket lives exactly as long as its
+/// last descriptor, and `fork` hands the child a copy of every descriptor
+/// open at that instant. A child parked between `fork` and `exec` therefore
+/// keeps a dead daemon's listening socket bound, and connectable, for as
+/// long as that window lasts — close-on-exec clears the copy, but not until
+/// the `exec`. `bind_socket`'s stale-socket probe reads a socket that
+/// answers as a live daemon and refuses the boot with `AlreadyRunning`, so
+/// a reboot landing inside that window is turned away by a daemon that no
+/// longer exists.
+///
+/// The window is reachable here because this tier runs many daemons inside
+/// ONE process, concurrently with tests that spawn real children: a reboot
+/// on one home can land inside an unrelated test's fork. Waiting for the
+/// refusal makes the precondition a stale-socket reboot rests on asserted
+/// rather than assumed. Not theorised — a child whose `pre_exec` sleeps
+/// holds a just-crashed daemon's socket open by exactly this route, and a
+/// reboot racing one is refused on every single run without this wait.
+///
+/// A daemon that is genuinely serving can never satisfy this wait: it
+/// accepts, so every probe connects and the budget runs out. Only a socket
+/// with nothing behind it refuses — because its last descriptor closed, or
+/// because these probes filled a backlog nobody is draining, which some
+/// Unixes report as a refusal too. Both are the answer `bind_socket` acts
+/// on, which is what makes either an honest stopping point.
+async fn await_stale_socket(socket: &std::path::Path) {
+    let refused = tokio::time::timeout(RECV_TIMEOUT, async {
+        // tokio's connector, not `std`'s blocking one, and that is
+        // load-bearing rather than stylistic: nothing accepts on the socket
+        // this waits out, so every probe leaves a connection queued, and a
+        // full backlog is reported differently across Unixes — some refuse
+        // it, some park the caller until a slot frees. A blocking `connect`
+        // that parks holds the runtime thread inside a syscall no timer can
+        // interrupt, and this fn would then outlive the very budget it
+        // exists to enforce.
+        while !matches!(
+            UnixStream::connect(socket).await,
+            Err(err) if matches!(err.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound)
+        ) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        refused.is_ok(),
+        "{}: a crashed daemon's socket is still answering connections",
+        socket.display()
+    );
+}
+
 #[tokio::test]
 async fn a_socket_left_behind_by_a_crash_does_not_block_the_next_boot() {
     let mut fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
@@ -1180,10 +1239,8 @@ async fn a_socket_left_behind_by_a_crash_does_not_block_the_next_boot() {
     // Simulate a crash: abort the run loop instead of asking for its
     // ordered teardown, so neither the socket file nor the pidfile is ever
     // unlinked. Awaiting the now-aborted handle (rather than a fixed sleep)
-    // is what makes this deterministic: it only resolves once the task —
-    // and the `UnixListener` it owned — has actually finished dropping, so
-    // the reboot below's stale-socket probe can never race a listener that
-    // hasn't finished closing yet.
+    // is what makes the DROP deterministic: it only resolves once the task
+    // — and the `UnixListener` it owned — has actually finished dropping.
     let run = fixture.run.take().expect("run is only ever taken once");
     run.abort();
     let outcome = run.await;
@@ -1195,6 +1252,11 @@ async fn a_socket_left_behind_by_a_crash_does_not_block_the_next_boot() {
         socket.exists(),
         "sanity: a crash leaves the socket file behind"
     );
+    // Dropping that listener is not the same as the socket going dead, and
+    // the reboot below needs the second: see `await_stale_socket`'s own doc
+    // for what else can hold a crashed daemon's socket open, and why
+    // awaiting the aborted task does not by itself rule it out.
+    await_stale_socket(&socket).await;
 
     // Same `$SHEP_HOME`: `dir` is taken out of `fixture` here rather than
     // dropped alongside it, so the directory (and the leftover socket file
