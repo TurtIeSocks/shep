@@ -27,10 +27,12 @@ src/
   config/
     app_spec.rs      ← was lib/API/schema.json + tools/Config.js + types/index.d.ts
       Action: rewrite as typed serde
-      Notes: AppConfig struct, #[serde(alias)] per camelCase alias, MemSize ("100M") +
+      Notes: AppConfig struct, sheep-native field names only — no pm2 #[serde(alias)]s
+             (superseded by the later "no pm2 baggage" decision below: own CLI verbs,
+             own field names, pm2 formats confined to the importer). MemSize ("100M") +
              Duration ("30s") newtypes via FromStr, ExecMode enum, env_* flatten map,
-             shlex string→args. schemars JSON-schema export for docs. THE compat contract —
-             every key ported; APM knobs (trace/v8/pmx/io/...) dropped.
+             shlex string→args. schemars JSON-schema export for docs. THE compat
+             contract — every key ported; APM knobs (trace/v8/pmx/io/...) dropped.
              `channel` (Phase 5) is the one key with no pm2 ancestor: it opens the fd-3 shepherd
              channel for an app that wants one without also wanting `wait_ready` or
              `shutdown_with_message`, which were previously the only ways to get one. Defaults
