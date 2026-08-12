@@ -41,6 +41,8 @@ use commands::lifecycle;
 use commands::logs;
 #[cfg(unix)]
 use commands::query;
+#[cfg(unix)]
+use commands::trigger;
 use exit::ExitCode;
 #[cfg(unix)]
 use launch::launch_daemon;
@@ -215,6 +217,10 @@ async fn run(cli: Cli) -> ExitCode {
         },
         Commands::Delete(ref args) => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => lifecycle::delete(&client, &mut streams, fmt, args).await,
+            Err(code) => code,
+        },
+        Commands::Trigger(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => trigger::trigger(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
         Commands::Flock => match connect_client(&mut streams, fmt, &paths).await {

@@ -25,13 +25,15 @@ use crate::exit::ExitCode;
 
 // Re-exported for `commands/`, which names every one of these at its own
 // crate-root import (`crate::output::{Streams, emit, FlockRows, ...}`).
-// Tasks 7-11 have landed and every one of the four is genuinely used there
-// on unix. `commands/` itself is `#[cfg(unix)]`-gated (main.rs), so on
-// Windows none of the four is named anywhere and `unused_imports` (a
-// name-resolution lint, unlike `dead_code`'s reachability one) still flags
-// it there — narrowed to that target rather than dropped.
+// Tasks 7-11 have landed and every one of them is genuinely used there on
+// unix. `commands/` itself is `#[cfg(unix)]`-gated (main.rs), so on Windows
+// none of them is named anywhere and `unused_imports` (a name-resolution
+// lint, unlike `dead_code`'s reachability one) still flags it there —
+// narrowed to that target rather than dropped.
 #[cfg_attr(windows, allow(unused_imports))]
-pub use rows::{DeletedIds, EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, KillRow, PingRow};
+pub use rows::{
+    DeletedIds, EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, KillRow, PingRow, TriggeredRows,
+};
 pub use table::{human_duration, render_table};
 
 use crate::cli::Format;

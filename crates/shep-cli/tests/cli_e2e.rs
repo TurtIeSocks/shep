@@ -2835,3 +2835,71 @@ fn reload_swaps_a_sheep_for_a_fresh_instance_under_a_new_id() {
 
     graceful_kill(dir.path());
 }
+
+// --- Trigger ---------------------------------------------------------------
+
+/// `shep trigger` reaches the trigger verb and no other, against a real
+/// daemon and a real sheep.
+///
+/// The envelope's `command` is the only thing anywhere that pins which
+/// handler `Commands::Trigger` reaches — `main`'s dispatch arms have no unit
+/// coverage (this file's own `reload_swaps_a_sheep_for_a_fresh_instance_
+/// under_a_new_id` names the same gap for `Commands::Reload`) — so an arm
+/// wired to some other verb's module would answer plausibly here (most of
+/// them accept a selector, some even accept a second positional the shell
+/// would happily supply) while never sending `Request::Trigger` at all.
+///
+/// The sheep here is started with no `channel`/`wait_ready`/
+/// `shutdown_with_message`, so its own real reply is deterministic without
+/// a companion process that speaks the shepherd channel: `no_channel`,
+/// every time, on real wall-clock and a real daemon. That is also this
+/// crate's own `output/rows.rs` `TriggeredRows` rendering exercised for
+/// real, end to end, for the one outcome an operator hits by default —
+/// building and driving a channel-speaking companion process for the other
+/// three outcomes is real work of its own, left for later.
+///
+/// What a broken implementation this would catch: the dispatch misroute
+/// above (verified by hand — routing `Commands::Trigger` to `query::ping`
+/// instead of `trigger::trigger` leaves every unit test in the crate green
+/// and only this case red); `TriggerArgs`'s `action` positional silently
+/// dropped before it reaches `Request::Trigger`; and `no_channel`'s own
+/// `DETAIL` text losing its `channel = true` callout.
+#[test]
+fn trigger_reaches_the_trigger_verb_and_names_the_missing_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("sheep")
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    let triggered = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("trigger")
+        .arg("sheep")
+        .arg("reload-config")
+        .output()
+        .unwrap();
+    assert_success(&triggered);
+    let envelope: serde_json::Value = serde_json::from_slice(&triggered.stdout).unwrap();
+    assert_eq!(
+        envelope["command"], "trigger",
+        "`shep trigger` must reach the trigger verb and no other: {envelope}"
+    );
+    assert_eq!(envelope["data"][0]["name"], "sheep", "{envelope}");
+    assert_eq!(
+        envelope["data"][0]["outcome"]["kind"], "no_channel",
+        "a sheep with no channel/wait_ready/shutdown_with_message must answer \
+         no_channel, never a reply it never opened a pipe to receive: {envelope}"
+    );
+
+    graceful_kill(dir.path());
+}

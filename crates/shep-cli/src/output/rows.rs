@@ -11,7 +11,7 @@
 //! kind, so this really is pure tier.
 
 use serde::Serialize;
-use shep_core::protocol::ProcessInfo;
+use shep_core::protocol::{ActionOutcome, ActionReply, ProcessInfo};
 
 use super::Render;
 
@@ -318,6 +318,153 @@ impl Render for KillRow {
     const JSON_ONLY: &'static [&'static str] = &[];
 }
 
+/// `Response::Triggered(Vec<ActionReply>)` — one row per matched sheep, each
+/// carrying what happened when the daemon tried to deliver `shep trigger`'s
+/// action to it.
+///
+/// `EmptiedFile`'s own doc gives the reason this exists rather than
+/// implementing [`Render`] on [`ActionReply`] directly: the orphan rule
+/// forbids it (`ActionReply` is shep-core's), so every payload here is a
+/// newtype this crate owns instead.
+///
+/// `transparent` over `Vec<ActionReply>`, so `--format json` carries every
+/// reply exactly as the daemon sent it — `id`, `name`, and the `outcome`
+/// object verbatim, `body` included, in full, un-truncated and with
+/// embedded newlines intact. The table cannot make the same promise; see
+/// [`Self::rows`]'s own doc for why, and for what it does instead.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct TriggeredRows(pub Vec<ActionReply>);
+
+/// A `Replied` body longer than this many `char`s is truncated in the
+/// table — never in JSON, where [`TriggeredRows`]'s own doc explains the
+/// body always rides whole. Picked to leave room for `ID`/`NAME`/`OUTCOME`
+/// on an ordinary terminal without either column doing its own wrapping,
+/// which `render_table` does not support.
+const TRIGGER_BODY_PREVIEW_CHARS: usize = 80;
+
+impl Render for TriggeredRows {
+    fn headers() -> &'static [&'static str] {
+        &["ID", "NAME", "OUTCOME", "DETAIL"]
+    }
+
+    /// One row per matched sheep. `OUTCOME` is the short, stable kind
+    /// (`replied`, `no_channel`, `skipped`, `timed_out` — [`ActionOutcome`]'s
+    /// own `kind` tag); `DETAIL` is where the four variants actually differ,
+    /// via [`describe_outcome`]:
+    ///
+    /// - `Replied` — the reply body, through [`preview_body`].
+    /// - `NoChannel` — names the config field that would have opened one,
+    ///   because nothing else user-facing does (see this crate's own
+    ///   `cli.rs` for the same reasoning on `--help`'s side).
+    /// - `Skipped` — why: a reload drainee, mid-swap.
+    /// - `TimedOut` — why: no reply inside the app's own `action_timeout`.
+    ///
+    /// # Why `Replied`'s body is collapsed for the table
+    ///
+    /// `body` is arbitrary, app-chosen text of unknown length — unlike every
+    /// other cell this crate renders, nothing bounds it. Two problems, both
+    /// [`preview_body`] answers: `render_table` pads every cell in a column
+    /// to its widest (`table.rs`), so one sheep answering with a long
+    /// diagnostic dump would stretch DETAIL for every row in the table to
+    /// match it; and `render_table` writes exactly one line per row
+    /// (`write_row`), so an unescaped newline in a body would split that row
+    /// across output lines and desync every column beneath it for the rest
+    /// of the render. Capping the length and escaping embedded newlines
+    /// fixes both without touching what `--format json` carries.
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|reply| {
+                let (outcome, detail) = describe_outcome(&reply.outcome);
+                vec![
+                    reply.id.to_string(),
+                    reply.name.clone(),
+                    outcome.to_string(),
+                    detail,
+                ]
+            })
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "ID" => "id",
+            "NAME" => "name",
+            // Both table columns are read off the one `outcome` object:
+            // OUTCOME is its `kind` tag, DETAIL is a rendering of the rest.
+            // Neither is a bare echo of a JSON scalar the way every other
+            // header here is, which is why both are in `assert_no_drift`'s
+            // own `formatted` list rather than compared cell-for-cell.
+            "OUTCOME" | "DETAIL" => "outcome",
+            other => panic!("TriggeredRows::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
+/// [`TriggeredRows::rows`]'s per-outcome split: the short, stable `OUTCOME`
+/// label and the human `DETAIL` text.
+///
+/// `ActionOutcome` is `#[non_exhaustive]` (shep-core's own Global
+/// Constraints — a future outcome must not need a protocol version bump),
+/// so this carries a wildcard arm: a variant this client predates renders
+/// as `unknown` with its `Debug` form, rather than failing to compile.
+fn describe_outcome(outcome: &ActionOutcome) -> (&'static str, String) {
+    match outcome {
+        ActionOutcome::Replied { body } => ("replied", preview_body(body)),
+        // Names the config field: nothing else user-facing says a trigger
+        // needs one, so the row that hits this is the one place an
+        // operator learns why. `cli.rs`'s `Trigger` variant doc names it
+        // too, on the `--help` side.
+        ActionOutcome::NoChannel => (
+            "no_channel",
+            "no shepherd channel — set channel = true, or wait_ready / \
+             shutdown_with_message, which imply it"
+                .to_string(),
+        ),
+        ActionOutcome::Skipped => (
+            "skipped",
+            "mid-reload — a fresh instance is replacing this one".to_string(),
+        ),
+        ActionOutcome::TimedOut => (
+            "timed_out",
+            "no reply within the app's own action_timeout".to_string(),
+        ),
+        other => ("unknown", format!("{other:?}")),
+    }
+}
+
+/// Collapses a `Replied` body to one line, capped at
+/// [`TRIGGER_BODY_PREVIEW_CHARS`] `char`s — see [`TriggeredRows::rows`]'s
+/// own doc for why both are needed. Embedded `\n`/`\r` become the
+/// two-character escapes `\n`/`\r` (never a literal newline, which is the
+/// thing being escaped); a cap that cuts the body off leaves a trailing
+/// `...` so the cell reads as partial rather than complete.
+fn preview_body(body: &str) -> String {
+    let mut preview = String::new();
+    let mut truncated = false;
+    for (seen, ch) in body.chars().enumerate() {
+        if seen == TRIGGER_BODY_PREVIEW_CHARS {
+            truncated = true;
+            break;
+        }
+        match ch {
+            '\n' => preview.push_str("\\n"),
+            '\r' => preview.push_str("\\r"),
+            other => preview.push(other),
+        }
+    }
+    if truncated {
+        preview.push_str("...");
+    }
+    preview
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::BTreeSet;
@@ -574,5 +721,137 @@ pub(crate) mod tests {
             4
         );
         assert_eq!(ids.rows().len(), 4);
+    }
+
+    fn sample_replies() -> TriggeredRows {
+        TriggeredRows(vec![
+            ActionReply {
+                id: 1,
+                name: "web".to_string(),
+                outcome: ActionOutcome::Replied {
+                    body: "pong".to_string(),
+                },
+            },
+            ActionReply {
+                id: 2,
+                name: "worker".to_string(),
+                outcome: ActionOutcome::NoChannel,
+            },
+        ])
+    }
+
+    /// OUTCOME and DETAIL both derive from `outcome`, a nested JSON object
+    /// rather than a scalar — the reason both are in `assert_no_drift`'s own
+    /// `formatted` list, per this fn's doc on the third check it otherwise
+    /// runs. What this still catches: a field added to `ActionReply`'s
+    /// `Serialize` (or `ActionOutcome`'s) with no column and no `JSON_ONLY`
+    /// entry, and a row whose cell count drifts from `headers()`'s.
+    #[test]
+    fn triggered_rows_do_not_drift() {
+        assert_no_drift(&sample_replies(), |j| &j[0], &["OUTCOME", "DETAIL"]);
+    }
+
+    #[test]
+    fn triggered_rows_render_id_name_and_outcome_kind() {
+        let rows = sample_replies().rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], "1");
+        assert_eq!(rows[0][1], "web");
+        assert_eq!(rows[0][2], "replied");
+        assert_eq!(rows[1][0], "2");
+        assert_eq!(rows[1][1], "worker");
+        assert_eq!(rows[1][2], "no_channel");
+    }
+
+    /// An operator reading a `no_channel` row must find the config field
+    /// that would have avoided it, right there in the row — not just in
+    /// `--help`.
+    #[test]
+    fn a_no_channel_detail_names_the_config_field() {
+        let rows = sample_replies().rows();
+        let detail = &rows[1][3];
+        assert!(
+            detail.contains("channel = true"),
+            "a no_channel row must name the field that opens one: {detail}"
+        );
+        assert!(
+            detail.contains("wait_ready") && detail.contains("shutdown_with_message"),
+            "and the two fields that imply it: {detail}"
+        );
+    }
+
+    #[test]
+    fn skipped_and_timed_out_details_say_why() {
+        let skipped = describe_outcome(&ActionOutcome::Skipped).1;
+        assert!(skipped.to_lowercase().contains("reload"), "{skipped}");
+
+        let timed_out = describe_outcome(&ActionOutcome::TimedOut).1;
+        assert!(
+            timed_out.to_lowercase().contains("action_timeout"),
+            "{timed_out}"
+        );
+    }
+
+    #[test]
+    fn a_short_single_line_body_previews_unchanged() {
+        assert_eq!(preview_body("pong"), "pong");
+    }
+
+    /// A body exactly at the cap is not truncated — only a body that has a
+    /// character *past* it is, per [`preview_body`]'s own `seen ==
+    /// TRIGGER_BODY_PREVIEW_CHARS` check firing one character too late for
+    /// an exact-length body to reach it.
+    #[test]
+    fn a_body_exactly_at_the_cap_is_not_truncated() {
+        let exact = "x".repeat(TRIGGER_BODY_PREVIEW_CHARS);
+        assert_eq!(preview_body(&exact), exact);
+    }
+
+    #[test]
+    fn a_body_past_the_cap_is_truncated_with_a_trailing_marker() {
+        let over = "x".repeat(TRIGGER_BODY_PREVIEW_CHARS + 1);
+        let preview = preview_body(&over);
+        let expected = "x".repeat(TRIGGER_BODY_PREVIEW_CHARS) + "...";
+        assert_eq!(preview, expected);
+    }
+
+    /// A multi-line body would otherwise split a table row across output
+    /// lines (`TriggeredRows::rows`'s own doc) — this pins that an embedded
+    /// newline never reaches the table cell as a literal newline.
+    #[test]
+    fn embedded_newlines_and_carriage_returns_are_escaped_not_literal() {
+        let preview = preview_body("line one\nline two\r\nline three");
+        assert!(!preview.contains('\n'));
+        assert!(!preview.contains('\r'));
+        assert!(preview.contains("\\n"));
+        assert!(preview.contains("\\r"));
+    }
+
+    /// `--format json` carries the real body verbatim — untruncated and with
+    /// real newlines — even though the table cell for the same row is
+    /// collapsed. This is the assertion that would fail if truncation or
+    /// escaping ever leaked into `Serialize` instead of staying in
+    /// [`TriggeredRows::rows`] alone.
+    #[test]
+    fn json_carries_the_real_body_the_table_cannot() {
+        let long_body = format!(
+            "{}\nsecond line",
+            "x".repeat(TRIGGER_BODY_PREVIEW_CHARS * 2)
+        );
+        let replies = TriggeredRows(vec![ActionReply {
+            id: 1,
+            name: "web".to_string(),
+            outcome: ActionOutcome::Replied {
+                body: long_body.clone(),
+            },
+        }]);
+        let json = serde_json::to_value(&replies).unwrap();
+        assert_eq!(json[0]["outcome"]["body"], long_body);
+
+        let table_cell = &replies.rows()[0][3];
+        assert_ne!(
+            *table_cell, long_body,
+            "the table cell must be the collapsed preview, not the real body"
+        );
     }
 }

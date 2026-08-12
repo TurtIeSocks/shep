@@ -62,7 +62,11 @@ change to any of it is a `[Unreleased]` entry of its own, not a silent diff.
   outruns the default), `LOG_PLANE_DEADLINE` (longer for its own reason — the
   daemon walks the matched flock file by file for `Reopen` and `Flush` alike,
   one sheep at a time with no bound of its own on a wedged or NFS-backed log
-  directory), `DEADLINE_GRACE`, `HANDSHAKE_TIMEOUT`, `SPAWN_DEADLINE`,
+  directory), `TRIGGER_DEADLINE` (60s — an app's own `action_timeout` can be
+  configured up to 58s, so anything shorter would abandon a `Request::Trigger`
+  reply the daemon was still honestly building; the daemon clamps any
+  deadline a caller asks for to the same 60s regardless, so asking for more
+  buys nothing), `DEADLINE_GRACE`, `HANDSHAKE_TIMEOUT`, `SPAWN_DEADLINE`,
   `BACKOFF_START`, `BACKOFF_CAP`. `LOG_PLANE_DEADLINE` was briefly named
   `REOPEN_DEADLINE`, before `Flush` gave the same 30 seconds a second reader
   and the reopen-specific name stopped being true; both verbs read the one
