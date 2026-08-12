@@ -20,9 +20,12 @@
 //! `instances`, plus an [`ImportNote::ClusterMode`] the operator hears
 //! about at import time instead of discovering it at the first restart.
 //!
-//! `env` is deliberately left empty on every app this module returns, and
-//! `notes` carries no env entries — filtering inherited environment noise
-//! out of declared config is a later importer stage's job, not this one's.
+//! `env` comes from [`super::env::split`], called on the group's first row:
+//! an app's declared env does not differ per instance, any more than its
+//! script or cwd do. The same call supplies `increment_var` and the
+//! [`ImportNote::InstanceVar`]/[`ImportNote::InheritedEnv`] notes; the
+//! first row's [`DumpRow::unrepresentable`] becomes
+//! [`ImportNote::UnrepresentableEnv`] notes alongside them.
 
 use std::collections::HashMap;
 
@@ -30,10 +33,7 @@ use shep_core::config::{AppConfig, normalize};
 use shep_core::values::{MemSize, UpDuration};
 
 use super::dump::DumpRow;
-
-/// The pm2 env key that carries an instance's slot number, mapped to
-/// `increment_var` rather than copied — see [`ImportNote::InstanceVar`].
-const NODE_APP_INSTANCE: &str = "NODE_APP_INSTANCE";
+use super::env;
 
 /// What one dump became: the apps to write, and everything the operator has
 /// to be told about them.
@@ -63,13 +63,6 @@ pub(crate) enum ImportNote {
     },
     /// An env key the app inherited from the shell that started it, which
     /// was neither declared nor a known session-shell or pm2 key.
-    ///
-    /// Not constructed here: collapsing instances and mapping fields is
-    /// this module's whole job, and filtering inherited environment noise
-    /// out of declared config belongs to a later stage of this importer.
-    /// `#[allow(dead_code)]` says so explicitly rather than inventing a
-    /// call site nothing here needs yet.
-    #[allow(dead_code)]
     InheritedEnv {
         /// The app's name.
         app: String,
@@ -77,10 +70,6 @@ pub(crate) enum ImportNote {
         key: String,
     },
     /// An env value a Flockfile cannot hold.
-    ///
-    /// Not constructed here, for the same reason as
-    /// [`ImportNote::InheritedEnv`].
-    #[allow(dead_code)]
     UnrepresentableEnv {
         /// The app's name.
         app: String,
@@ -126,10 +115,6 @@ impl core::error::Error for ConvertError {}
 /// knows how to map. Every returned [`AppConfig`] has already been through
 /// [`shep_core::config::normalize()`].
 ///
-/// `env` is left empty on every returned app and `notes` carries no env
-/// entries: filtering inherited environment noise out of declared config
-/// belongs to a later importer stage, not this one.
-///
 /// Not called outside this module's own tests yet: no verb wires this
 /// converter into the CLI. `#[allow(dead_code)]` says so explicitly rather
 /// than inventing a call site nothing needs yet.
@@ -171,6 +156,9 @@ pub(crate) fn convert(rows: Vec<DumpRow>) -> Result<Imported, ConvertError> {
 /// Builds one [`AppConfig`] from a name's instance rows, plus the notes the
 /// mapping produced. `rows` is never empty: every group [`convert`] builds
 /// was created by pushing at least one row into it.
+///
+/// Env is split from the first row only, same as every other scalar: an
+/// app's declared env does not differ per instance.
 fn convert_group(name: &str, rows: &[DumpRow]) -> (AppConfig, Vec<ImportNote>) {
     let mut notes = Vec::new();
     // A dump naming anywhere near u32::MAX instances of one app does not
@@ -210,11 +198,25 @@ fn convert_group(name: &str, rows: &[DumpRow]) -> (AppConfig, Vec<ImportNote>) {
         });
     }
 
-    if first.env.contains_key(NODE_APP_INSTANCE) {
-        app.increment_var = Some(NODE_APP_INSTANCE.to_string());
+    let app_env = env::split(first);
+    app.env = app_env.env;
+    if let Some(var) = app_env.instance_var {
+        app.increment_var = Some(var.clone());
         notes.push(ImportNote::InstanceVar {
             app: name.to_string(),
-            var: NODE_APP_INSTANCE.to_string(),
+            var,
+        });
+    }
+    for key in app_env.inherited {
+        notes.push(ImportNote::InheritedEnv {
+            app: name.to_string(),
+            key,
+        });
+    }
+    for key in &first.unrepresentable {
+        notes.push(ImportNote::UnrepresentableEnv {
+            app: name.to_string(),
+            key: key.clone(),
         });
     }
 
