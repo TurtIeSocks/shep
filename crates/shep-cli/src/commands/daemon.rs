@@ -165,13 +165,48 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
     stderr_is_terminal && no_color.is_none_or(OsStr::is_empty)
 }
 
+/// Whether `config` sets a dog-related knob this build has no code to act
+/// on: `[daemon] enabled_dogs` or any `[dog.<name>]` section.
+///
+/// Both parse, validate and round-trip today ([`DaemonConfig::load`],
+/// [`DaemonSection`]) — spec §8's dogs infrastructure is not built yet, so
+/// nothing in this binary reads either one. An operator who writes
+/// `enabled_dogs = ["metrics"]` gets a daemon that boots and does nothing
+/// with it.
+///
+/// [`DaemonSection`]: shep_core::config::daemon::DaemonSection
+fn dog_config_is_inert(config: &DaemonConfig) -> bool {
+    !config.daemon.enabled_dogs.is_empty() || !config.dog.is_empty()
+}
+
+/// Warns once, at boot, if [`dog_config_is_inert`] — never refuses to boot.
+///
+/// A hard error here would be disproportionate to what the field actually
+/// does (nothing) and would break a daemon that boots cleanly today the
+/// moment dogs infrastructure lands and starts reading the same field for
+/// real — a config author has no way to know from the file alone which of
+/// those two worlds they are in. A log line trades that all-or-nothing
+/// choice for what the gap actually is: worth knowing about, not worth
+/// stopping for.
+fn warn_on_inert_dog_config(config: &DaemonConfig) {
+    if dog_config_is_inert(config) {
+        tracing::warn!(
+            enabled_dogs = config.daemon.enabled_dogs.len(),
+            dog_sections = config.dog.len(),
+            "shep.toml configures dogs, but this build has no dogs infrastructure yet \
+             — enabled_dogs and [dog.*] sections have no effect",
+        );
+    }
+}
+
 /// Runs the supervisor in this process until a signal or `KillDaemon`.
 ///
 /// Loads `shep.toml` (a missing file is not an error — see
 /// [`read_daemon_config_source`]) plus `SHEP_*` environment overrides, installs
 /// the log subscriber those two knobs configure (see
-/// [`install_log_subscriber`]), folds `args` in via [`boot_options`], then
-/// boots and serves. The re-exec'd child inherits a real environment on
+/// [`install_log_subscriber`]), warns if the loaded config is [dog-inert]
+/// (see [`warn_on_inert_dog_config`]), folds `args` in via [`boot_options`],
+/// then boots and serves. The re-exec'd child inherits a real environment on
 /// purpose (`launch::launch_command` deliberately does not `.env_clear()`), so
 /// `SHEP_LOG_JSON`, `SHEP_LOG_LEVEL`, `SHEP_SOCKET`, and
 /// `SHEP_MAX_CRON_SLEEP` are read straight from `std::env::var`.
@@ -189,12 +224,15 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
 ///   to boot.
 /// - [`DaemonRunError::Run`] — the supervisor came up and served, then
 ///   failed during its run loop or teardown.
+///
+/// [dog-inert]: dog_config_is_inert
 pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), DaemonRunError> {
     let env = |key: &str| std::env::var(key).ok();
     let file_source = read_daemon_config_source(&paths)?;
     let config =
         DaemonConfig::load(file_source.as_deref(), &env).map_err(DaemonRunError::Config)?;
     install_log_subscriber(&config);
+    warn_on_inert_dog_config(&config);
     let options = boot_options(&config, args);
     boot(TokioRunner::new(), paths, options)
         .await
@@ -274,6 +312,31 @@ mod tests {
             !ansi_enabled(false, Some(OsStr::new("1"))),
             "the two reasons to suppress colour must not cancel out"
         );
+    }
+
+    /// `dog_config_is_inert` is what [`warn_on_inert_dog_config`] gates on,
+    /// so this pins the predicate directly rather than capturing a global
+    /// tracing subscriber to observe the log line it drives.
+    ///
+    /// Three cases: a config with neither knob set is not inert (nothing to
+    /// warn about); `enabled_dogs` alone trips it; a `[dog.<name>]` section
+    /// with `enabled_dogs` left empty trips it too — an operator writing
+    /// per-dog config ahead of `enable`-ing it is exactly as inert as one
+    /// who only enabled a dog, and a predicate that checked just one field
+    /// would miss half of what this function exists to catch.
+    #[test]
+    fn dog_config_is_inert_catches_either_knob_alone() {
+        let neither = DaemonConfig::load(None, &|_| None).unwrap();
+        assert!(!dog_config_is_inert(&neither));
+
+        let enabled_only =
+            DaemonConfig::load(Some("[daemon]\nenabled_dogs = [\"metrics\"]\n"), &|_| None)
+                .unwrap();
+        assert!(dog_config_is_inert(&enabled_only));
+
+        let section_only =
+            DaemonConfig::load(Some("[dog.metrics]\nport = 9615\n"), &|_| None).unwrap();
+        assert!(dog_config_is_inert(&section_only));
     }
 
     #[test]
