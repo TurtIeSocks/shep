@@ -49,6 +49,18 @@ in zsh a pipeline's `$?` is the last command's and `${PIPESTATUS[0]}` is empty.
 lock, so concurrent runs block rather than parallelise. (A separate worktree,
 or `benches/`, has its own lock and may run alongside.)
 
+### Doctests are not the cost here — do not split them out
+
+Measured 2026-08-12 on this machine: bare `cargo test --workspace
+--all-features` **89.3s**; `--all-targets` (same minus doctests) **82.7s**;
+the three crates' doctests run alone **30.9s**. They overlap rather than add,
+so splitting them out of the task gate buys ~6.5s and costs a second command.
+
+The global rule to prefer `--lib --bins` over bare `--workspace` was measured
+on a project where doctests dominated. It does not transfer: this workspace's
+cost is the integration tier (`cli_e2e` ~47s, `daemon_e2e` ~22s), which
+`--lib --bins` would skip entirely rather than speed up. Keep the bare form.
+
 ### The phase gate — run at a merge, not per task
 
 The four above, plus `cargo test --workspace --all-features -- --test-threads=1`
