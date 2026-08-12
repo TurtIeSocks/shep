@@ -8,3 +8,4 @@ pub mod daemon;
 pub mod lifecycle;
 pub mod logs;
 pub mod query;
+pub(crate) mod selector;

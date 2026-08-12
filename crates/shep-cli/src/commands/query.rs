@@ -17,9 +17,9 @@
 
 use shep_client::Client;
 use shep_core::protocol::{Request, Response, SelectorSpec};
-use shep_core::selector::ProcessSelector;
 
 use crate::cli::{FoldArgs, Format, SelectorArgs};
+use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
 use crate::output::{FlockRows, PingRow, Render, Streams, emit, emit_error, write_outcome};
 
@@ -63,31 +63,6 @@ where
             let code = ExitCode::from(&err);
             let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
             code
-        }
-    }
-}
-
-/// Parses `raw` client-side, so a malformed selector is a fast local usage
-/// error rather than a round trip to the daemon (the daemon re-parses it
-/// too, but only after this one already succeeded). The same reasoning
-/// `commands::lifecycle::parse_selector` documents on its own copy — kept
-/// as a small per-module duplicate rather than a shared abstraction, since
-/// there is no third caller yet to justify one.
-fn parse_selector(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    raw: &str,
-) -> Result<SelectorSpec, ExitCode> {
-    match ProcessSelector::parse(raw) {
-        Ok(selector) => Ok(SelectorSpec::from(&selector)),
-        Err(err) => {
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Usage.code_str(),
-                &err.to_string(),
-            );
-            Err(ExitCode::Usage)
         }
     }
 }
@@ -141,7 +116,7 @@ pub async fn describe(
     args: &SelectorArgs,
 ) -> ExitCode {
     let selector = match parse_selector(streams, fmt, &args.selector) {
-        Ok(selector) => selector,
+        Ok(selector) => SelectorSpec::from(&selector),
         Err(code) => return code,
     };
     describe_selector(client, streams, fmt, "describe", selector).await

@@ -15,9 +15,9 @@ use std::time::Duration;
 use shep_client::{Client, START_DEADLINE};
 use shep_core::config::{AppConfig, FlockFormat, Flockfile, FlockfileError};
 use shep_core::protocol::{Request, Response, SelectorSpec};
-use shep_core::selector::ProcessSelector;
 
 use crate::cli::{Format, SelectorArgs, StartArgs};
+use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
 use crate::output::{DeletedIds, FlockRows, Render, Streams, emit, emit_error, write_outcome};
 
@@ -192,28 +192,6 @@ where
     }
 }
 
-/// Parses `raw` client-side, so a malformed selector is a fast local usage
-/// error rather than a round trip to the daemon (the daemon re-parses it
-/// too, but only after this one already succeeded).
-fn parse_selector(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    raw: &str,
-) -> Result<SelectorSpec, ExitCode> {
-    match ProcessSelector::parse(raw) {
-        Ok(selector) => Ok(SelectorSpec::from(&selector)),
-        Err(err) => {
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Usage.code_str(),
-                &err.to_string(),
-            );
-            Err(ExitCode::Usage)
-        }
-    }
-}
-
 /// Renders `err` and returns the exit code `start` reports it as.
 fn fail_target(streams: &mut Streams<'_>, fmt: Format, err: &TargetError) -> ExitCode {
     let code = target_exit_code(err);
@@ -277,7 +255,7 @@ pub async fn stop(
     args: &SelectorArgs,
 ) -> ExitCode {
     let selector = match parse_selector(streams, fmt, &args.selector) {
-        Ok(selector) => selector,
+        Ok(selector) => SelectorSpec::from(&selector),
         Err(code) => return code,
     };
     request_and_render(
@@ -303,7 +281,7 @@ pub async fn restart(
     args: &SelectorArgs,
 ) -> ExitCode {
     let selector = match parse_selector(streams, fmt, &args.selector) {
-        Ok(selector) => selector,
+        Ok(selector) => SelectorSpec::from(&selector),
         Err(code) => return code,
     };
     request_and_render(
@@ -338,7 +316,7 @@ pub async fn reload(
     args: &SelectorArgs,
 ) -> ExitCode {
     let selector = match parse_selector(streams, fmt, &args.selector) {
-        Ok(selector) => selector,
+        Ok(selector) => SelectorSpec::from(&selector),
         Err(code) => return code,
     };
     request_and_render(
@@ -364,7 +342,7 @@ pub async fn delete(
     args: &SelectorArgs,
 ) -> ExitCode {
     let selector = match parse_selector(streams, fmt, &args.selector) {
-        Ok(selector) => selector,
+        Ok(selector) => SelectorSpec::from(&selector),
         Err(code) => return code,
     };
     request_and_render(

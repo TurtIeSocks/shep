@@ -64,6 +64,7 @@ use shep_core::protocol::{BusEvent, ProcessInfo, Request, Response};
 use shep_core::selector::ProcessSelector;
 
 use crate::cli::{BleatsArgs, Format};
+use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
 use crate::output::{self, Streams, write_outcome};
 
@@ -83,33 +84,6 @@ struct BleatLine<'a> {
     stream: &'static str,
     /// The line itself, no trailing newline.
     line: &'a str,
-}
-
-/// Parses `raw` client-side, so a malformed selector is a fast local usage
-/// error rather than a round trip to the daemon.
-///
-/// Returns a [`ProcessSelector`] rather than a `SelectorSpec`: unlike every
-/// other selector-taking verb, `bleats` never puts the selector on the
-/// wire at all (the daemon's topic filter has no sheep identity to match
-/// one against) — it only ever matches locally, against the id/name cache
-/// [`resolve_names`] builds.
-fn parse_selector(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    raw: &str,
-) -> Result<ProcessSelector, ExitCode> {
-    match ProcessSelector::parse(raw) {
-        Ok(selector) => Ok(selector),
-        Err(err) => {
-            let _ = output::emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Usage.code_str(),
-                &err.to_string(),
-            );
-            Err(ExitCode::Usage)
-        }
-    }
 }
 
 /// Issues the one `Request::ListFlock` `bleats` sends, before it ever
