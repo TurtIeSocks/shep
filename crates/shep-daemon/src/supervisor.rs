@@ -44,7 +44,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use shep_core::config::{AppConfig, ResolvedApp};
 use shep_core::paths::ShepPaths;
-use shep_core::protocol::{BusEvent, ProcessEventKind, ProcessInfo};
+use shep_core::protocol::{ActionOutcome, BusEvent, ProcessEventKind, ProcessInfo};
 use shep_core::selector::ProcessSelector;
 use shep_core::status::ProcStatus;
 
@@ -86,6 +86,20 @@ const SHEEP_CTL_CAPACITY: usize = 4;
 /// it is. What is lost either way is the rest of the reload, and the event
 /// says so.
 const RELOAD_DEADLINE_SLACK: Duration = Duration::from_secs(5);
+
+/// How many replies one sheep may still owe from actions that stopped
+/// waiting before the oldest of them is forgotten (see [`ActionWaits`]).
+///
+/// Sized against what it defends, not measured: each entry is one action
+/// name, and an entry is only created when an app misses an action's deadline
+/// and only removed when that app finally answers. An app that answers late
+/// needs one or two; an app that never answers at all accumulates one per
+/// trigger for as long as its process lives, which is what the cap is for. A
+/// dropped entry costs one late reply going to a wait it does not belong to
+/// — the failure this whole mechanism exists to prevent — so the cap is set
+/// far above any plausible number of triggers an operator has outstanding
+/// against one instance rather than at the one or two the honest case needs.
+const MAX_ABANDONED_ACTION_REPLIES: usize = 64;
 
 // ---------------------------------------------------------------------
 // Public command / handle surface
@@ -178,6 +192,25 @@ pub(crate) enum Command {
         /// own, never the actor loop (see [`Actor::handle_flush`]).
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     },
+    /// Puts one named action on a sheep's shepherd channel and answers with
+    /// what the app said back, or with why nothing came.
+    ///
+    /// Keyed by id rather than by a selector, unlike every other verb here:
+    /// an answer is per-instance — one reply body from one process — so an
+    /// id is the unit the actor can actually resolve.
+    Trigger {
+        /// The sheep's id.
+        id: u32,
+        /// The action name, passed to the app verbatim.
+        action: String,
+        /// Argument text for the action, passed to the app verbatim.
+        params: Option<String>,
+        /// How long the app gets to answer before the wait gives up.
+        timeout: Duration,
+        /// Answers once the app replies or the timeout elapses — off a task
+        /// of its own, never the actor loop (see [`Actor::begin_action`]).
+        reply: oneshot::Sender<Result<ActionOutcome, SupervisorError>>,
+    },
     /// Graceful engine shutdown: kill ladder on every online sheep, then stop.
     Shutdown {
         /// Answers once every online sheep is terminal, right before the
@@ -235,6 +268,32 @@ pub(crate) enum Msg {
         /// already ended and is dropped — the same staleness rule
         /// [`Self::RestartDue`] applies with an epoch.
         new_id: u32,
+    },
+    /// The sheep's shepherd channel carried a reply to an action.
+    ///
+    /// Routed to the waiting action task, if one is waiting — dropped
+    /// silently otherwise, exactly as `Msg::Ready` is. The correlation an
+    /// app gives us is the action NAME and nothing else, so which wait this
+    /// belongs to is a question [`ActionWaits::answer`] answers rather than
+    /// one the message carries.
+    ActionReply {
+        /// The sheep's id.
+        id: u32,
+        /// The action the app is answering.
+        action: String,
+        /// The reply body, exactly as the app sent it.
+        body: String,
+    },
+    /// An action wait resolved.
+    ActionResult {
+        /// The sheep's id.
+        id: u32,
+        /// Which wait on that sheep this is the answer to. A stamp of its
+        /// own, not an existing never-reused fact, for the reason
+        /// [`PendingAction::stamp`] gives.
+        stamp: u64,
+        /// The app's reply, or why none arrived.
+        outcome: ActionOutcome,
     },
     /// A readiness wait resolved.
     ReadyResult {
@@ -584,6 +643,53 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
     }
 
+    /// Sends `action` to one sheep over its shepherd channel and answers with
+    /// what its app said back.
+    ///
+    /// Answers on completion rather than on acceptance: an action has no
+    /// floor on how long it takes, so an acceptance would tell a caller
+    /// nothing it did not already know. `timeout` is what bounds that — the
+    /// app gets that long to reply before the answer becomes
+    /// [`ActionOutcome::TimedOut`] — and it should be set below the caller's
+    /// own budget, or the caller gives up before this honest answer reaches
+    /// it.
+    ///
+    /// `action` and `params` are passed to the app verbatim and are never
+    /// read here. The daemon holds no list of an app's actions and does not
+    /// validate the name against one: what an app does with an action it does
+    /// not recognise, including replying to say so, is the app's to decide.
+    ///
+    /// The outcome is a report and not a promise of delivery.
+    /// [`ActionOutcome::Replied`] is the only one that proves the action
+    /// reached the app, because a reply is the only proof there is — the
+    /// daemon's own send says nothing, since the first one after a child has
+    /// exited is accepted and discarded.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::NotFound`] — no sheep is registered under `id`.
+    /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    pub async fn trigger(
+        &self,
+        id: u32,
+        action: String,
+        params: Option<String>,
+        timeout: Duration,
+    ) -> Result<ActionOutcome, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::Trigger {
+                id,
+                action,
+                params,
+                timeout,
+                reply,
+            }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
     /// Full flock listing, id-sorted.
     ///
     /// # Errors
@@ -675,6 +781,7 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
             tx: tx.clone(),
             sheep: HashMap::new(),
             next_id: 0,
+            next_action_stamp: 0,
             pending: Vec::new(),
             shutting_down: false,
             extras: self.extras,
@@ -850,6 +957,135 @@ struct PendingManual {
     origin: CommandOrigin,
 }
 
+/// One action the daemon has put on a sheep's shepherd channel and has not
+/// finished waiting on.
+#[derive(Debug)]
+struct PendingAction {
+    /// Which wait this is, for the whole life of the daemon.
+    ///
+    /// A counter of its own, where a reload's deadline stamps itself with the
+    /// replacement's `new_id` instead (see [`Msg::ReloadDeadline`]). That
+    /// swap could reuse an id because a swap IS a replacement id — one fact
+    /// serving two purposes, with no second copy free to drift. An action has
+    /// no such fact to borrow. The sheep's id names the instance, not the
+    /// action, and so does [`SheepSlot::epoch`]: both stay put while a
+    /// process is triggered a dozen times, so either would stamp a dozen
+    /// waits identically. The counter is not a duplicate of anything, because
+    /// there was nothing to duplicate.
+    stamp: u64,
+    /// The action name this is waiting for a reply to. What
+    /// [`ActionWaits::answer`] matches on, because an app's reply carries the
+    /// name and nothing else.
+    action: String,
+    /// Wakes the waiting task with the app's reply body.
+    ///
+    /// Taken by the reply that answers it, so the second reply to one action
+    /// finds nothing to hand a body to. The entry stays behind until the task
+    /// reports what it made of the body, which is what keeps `reply` below
+    /// reachable for the one message that resolves this wait.
+    waiter: Option<oneshot::Sender<String>>,
+    /// Where this wait's outcome goes once it has one.
+    reply: oneshot::Sender<Result<ActionOutcome, SupervisorError>>,
+}
+
+/// What one sheep still owes on its shepherd channel: the action waits armed
+/// against it, and the replies its app can still send that no wait wants.
+///
+/// # Why the second half exists
+///
+/// An app is free to answer an action after that action's wait has given up,
+/// and a reply carries the action NAME and nothing else — no request id, no
+/// stamp the daemon chose, and adding one would be a silent break for every
+/// deployed app, since the shepherd channel has no version to negotiate. So
+/// a late reply to a `gc` that timed out is byte-identical to a prompt reply
+/// to a `gc` triggered afterwards, and handing it to the second wait answers
+/// an operator's question with another operator's answer — a wrong answer,
+/// not an error, and the sharpest failure this type exists to prevent.
+///
+/// What separates them is order, which is the one thing the channel does
+/// preserve: a child reads its actions in the order they were written and its
+/// replies arrive in the order it wrote them. So a wait that ends without its
+/// reply leaves its action's name in `abandoned`, and the next reply naming
+/// that action pays off that debt instead of the live wait. Only once the
+/// debt is settled does a reply of that name reach a wait again.
+#[derive(Debug, Default)]
+struct ActionWaits {
+    /// Waits still expecting a message about them, oldest first.
+    live: Vec<PendingAction>,
+    /// One entry per reply the app still owes a wait that has already ended,
+    /// oldest first, capped at [`MAX_ABANDONED_ACTION_REPLIES`].
+    abandoned: VecDeque<String>,
+}
+
+impl ActionWaits {
+    /// Records a wait the caller has already armed a task for.
+    fn arm(&mut self, pending: PendingAction) {
+        self.live.push(pending);
+    }
+
+    /// Routes one reply to `action`: hands back the waiter it belongs to, or
+    /// `None` if it belongs to nothing.
+    ///
+    /// `None` covers the three ways a reply can arrive with nowhere to go,
+    /// and they are all ordinary rather than errors: it settles a debt left
+    /// by a wait that already gave up, it is a second reply to an action
+    /// answered once already, or the app volunteered it without being asked.
+    fn answer(&mut self, action: &str) -> Option<oneshot::Sender<String>> {
+        if let Some(owed) = self.abandoned.iter().position(|name| name == action) {
+            self.abandoned.remove(owed);
+            return None;
+        }
+        self.live
+            .iter_mut()
+            .find(|pending| pending.action == action && pending.waiter.is_some())
+            .and_then(|pending| pending.waiter.take())
+    }
+
+    /// Ends the wait `stamp` names, recording the reply it never got if it
+    /// never got one; hands back where its outcome goes.
+    ///
+    /// `None` for a stamp no live wait carries, which is what a result for a
+    /// sheep whose process has since gone looks like — [`Self::abandon_all`]
+    /// answered it already.
+    fn resolve(
+        &mut self,
+        stamp: u64,
+    ) -> Option<oneshot::Sender<Result<ActionOutcome, SupervisorError>>> {
+        let at = self
+            .live
+            .iter()
+            .position(|pending| pending.stamp == stamp)?;
+        let pending = self.live.remove(at);
+        // A waiter still sitting here is a wait that ended without the reply
+        // it asked for. The app owes that reply for as long as its process
+        // lives, and the debt is what stops the reply being read as an answer
+        // to something else.
+        if pending.waiter.is_some() {
+            self.abandoned.push_back(pending.action);
+            if self.abandoned.len() > MAX_ABANDONED_ACTION_REPLIES {
+                self.abandoned.pop_front();
+            }
+        }
+        Some(pending.reply)
+    }
+
+    /// Answers every live wait [`ActionOutcome::NoChannel`] and forgets every
+    /// debt — what a sheep's process ending does to both halves at once.
+    ///
+    /// The debts go because they are owed by a process that no longer exists:
+    /// a replacement under the same id has written none of those replies, and
+    /// keeping the entries would have it swallow the first few answers it
+    /// gives. The live waits are answered rather than dropped because a
+    /// dropped `reply` reaches its caller as the engine having gone away,
+    /// which is not what happened — the sheep's channel did.
+    fn abandon_all(&mut self) {
+        for pending in self.live.drain(..) {
+            let _ = pending.reply.send(Ok(ActionOutcome::NoChannel));
+        }
+        self.abandoned.clear();
+    }
+}
+
 /// One registered instance: its lifecycle state plus a live control sender
 /// (`None` once its sheep task has ended).
 #[derive(Debug)]
@@ -938,6 +1174,14 @@ struct SheepSlot {
     /// arriving late takes a sender whose receiver is gone, and the send
     /// simply fails, which is the same silent drop an unarmed slot gets.
     ready_tx: Option<oneshot::Sender<()>>,
+    /// The action waits armed against this sheep and the replies its app
+    /// still owes ones that have ended — see [`ActionWaits`].
+    ///
+    /// Cleared with [`Self::to_child`], and for a sharper version of the same
+    /// reason: a wait armed against a process that has exited is waiting for
+    /// a reply nobody will ever write, and the debts it leaves behind belong
+    /// to a process a replacement under this id never was.
+    actions: ActionWaits,
 }
 
 /// Where a deferred `Stop`/`Restart`/`Delete`/`Shutdown` reply eventually
@@ -982,6 +1226,9 @@ struct Actor<R: ProcessRunner> {
     sheep: HashMap<u32, SheepSlot>,
     /// Monotonic id counter — ids are never reused.
     next_id: u32,
+    /// Monotonic stamp counter for action waits — see
+    /// [`PendingAction::stamp`] for why an action needs one of its own.
+    next_action_stamp: u64,
     /// Deferred command replies still waiting on matched sheep.
     pending: Vec<PendingReply>,
     /// Set once a `Shutdown` command starts (CRITICAL-1). While `true`:
@@ -1026,6 +1273,14 @@ impl<R: ProcessRunner> Actor<R> {
                 }
                 Msg::ReloadDeadline { name, new_id } => {
                     self.handle_reload_deadline(&name, new_id);
+                    false
+                }
+                Msg::ActionReply { id, action, body } => {
+                    self.handle_action_reply(id, &action, body);
+                    false
+                }
+                Msg::ActionResult { id, stamp, outcome } => {
+                    self.handle_action_result(id, stamp, outcome);
                     false
                 }
                 Msg::ReadyResult {
@@ -1073,6 +1328,21 @@ impl<R: ProcessRunner> Actor<R> {
             }
             Command::Flush { selector, reply } => {
                 self.handle_flush(&selector, reply);
+                false
+            }
+            // Not rejected while `shutting_down` either, for the reason
+            // above: an action registers nothing and spawns nothing. What it
+            // reaches is a child the shutdown's own kill ladder is already
+            // taking down, and the wait's timeout is what bounds the answer
+            // if that child stops reading its channel first.
+            Command::Trigger {
+                id,
+                action,
+                params,
+                timeout,
+                reply,
+            } => {
+                self.begin_action(id, action, params, timeout, reply);
                 false
             }
             Command::Stop { selector, reply } => {
@@ -1260,6 +1530,7 @@ impl<R: ProcessRunner> Actor<R> {
                         pending_delete: false,
                         epoch: 0,
                         ready_tx,
+                        actions: ActionWaits::default(),
                     },
                 );
                 self.emit(ProcessEventKind::Start, info.clone(), true);
@@ -1300,6 +1571,7 @@ impl<R: ProcessRunner> Actor<R> {
                         pending_delete: false,
                         epoch: 0,
                         ready_tx: None,
+                        actions: ActionWaits::default(),
                     },
                 );
                 self.emit(ProcessEventKind::Errored, info, true);
@@ -2048,6 +2320,7 @@ impl<R: ProcessRunner> Actor<R> {
                         pending_delete: false,
                         epoch: 0,
                         ready_tx: Some(ready_tx),
+                        actions: ActionWaits::default(),
                     },
                 );
                 // The instance being replaced announces itself BEFORE its
@@ -2820,6 +3093,11 @@ impl<R: ProcessRunner> Actor<R> {
         // quietly, and would sit on `recv()` holding the daemon's half of the
         // socketpair for as long as the entry lived. See `SheepSlot::to_child`.
         slot.to_child = None;
+        // The one site that clears these, because it is the one place a
+        // process under a registered id stops existing: every respawn and
+        // every deregistration is downstream of an exit handled here, so a
+        // wait cannot survive into a second process's life by any route.
+        slot.actions.abandon_all();
         slot.entry.pid = None;
         // Split the moment the marker is taken, because the two halves answer
         // different questions. `kind` decides what this exit BECOMES, and
@@ -3270,6 +3548,114 @@ impl<R: ProcessRunner> Actor<R> {
         self.went_online(id, info, manually);
     }
 
+    /// Puts one action on `id`'s shepherd channel and arms the wait for its
+    /// reply, or answers straight away if there is no channel to put it on.
+    ///
+    /// # Why nothing here is awaited
+    ///
+    /// Both halves of an action are awaits, and neither may happen in the
+    /// actor loop. Awaiting one closes the permanent cycle
+    /// [`Self::handle_reopen`] sets out in full: the actor stops draining its
+    /// mailbox, so a sheep task blocks in `actor_tx.send`, so nothing drains
+    /// that sheep — and here that sheep is precisely the party being waited
+    /// on, since its reply reaches the actor through `run_sheep` and that
+    /// same mailbox. A `try_send` would keep the loop moving but would answer
+    /// a busy child by dropping its action, which is the one thing an
+    /// operator cannot be told from a child that ignored it. So the send goes
+    /// to the task along with the wait, and this handler does nothing but
+    /// record what it armed.
+    ///
+    /// # What a sheep with no channel means
+    ///
+    /// [`ActionOutcome::NoChannel`], answered here rather than waited out. A
+    /// slot whose [`SheepSlot::to_child`] is `None` has no process running
+    /// under it, so there is nothing to deliver to and no reply to wait for
+    /// — and a wait would answer the same thing one whole timeout later.
+    ///
+    /// A live sender is not proof of the opposite. `to_child.send` returning
+    /// `Ok` says a message was queued for the writer task, not that a child
+    /// read it: the first send after a child has exited is accepted and
+    /// vanishes, and only the second one fails. The app's reply is the only
+    /// proof an action landed, which is why every other outcome here comes
+    /// from the wait rather than from the send.
+    fn begin_action(
+        &mut self,
+        id: u32,
+        action: String,
+        params: Option<String>,
+        timeout: Duration,
+        reply: oneshot::Sender<Result<ActionOutcome, SupervisorError>>,
+    ) {
+        let Some(slot) = self.sheep.get(&id) else {
+            let _ = reply.send(Err(SupervisorError::NotFound));
+            return;
+        };
+        let Some(to_child) = slot.to_child.clone() else {
+            let _ = reply.send(Ok(ActionOutcome::NoChannel));
+            return;
+        };
+
+        let stamp = self.next_action_stamp;
+        self.next_action_stamp += 1;
+        let waiter = spawn_action_task(
+            id,
+            stamp,
+            ShepherdMessage::Action {
+                name: action.clone(),
+                params,
+            },
+            to_child,
+            timeout,
+            self.tx.clone(),
+        );
+        // After the task is spawned, and safely: the task's own first act is
+        // a send that has to reach a child, be read, and come back through
+        // `run_sheep`, none of which can be observed before this handler
+        // returns the actor to its loop.
+        self.sheep
+            .get_mut(&id)
+            .expect("begin_action: the slot was read a moment ago")
+            .actions
+            .arm(PendingAction {
+                stamp,
+                action,
+                waiter: Some(waiter),
+                reply,
+            });
+    }
+
+    /// Forwards one shepherd-channel reply to the action wait it belongs to,
+    /// if it belongs to one. A reply with nowhere to go is dropped silently,
+    /// exactly as an unwanted `Msg::Ready` is — see [`ActionWaits::answer`]
+    /// for the three shapes that takes, none of which is an error.
+    fn handle_action_reply(&mut self, id: u32, action: &str, body: String) {
+        let Some(slot) = self.sheep.get_mut(&id) else {
+            return;
+        };
+        if let Some(waiter) = slot.actions.answer(action) {
+            let _ = waiter.send(body);
+        }
+    }
+
+    /// An action wait resolved: answer its caller.
+    ///
+    /// Guarded on the stamp alone, where [`Self::handle_ready_result`] guards
+    /// on four things. The difference is what the two results decide. A
+    /// readiness result drives a status transition, so it has to be refused
+    /// by a slot that has moved on since; an action's result is a message to
+    /// one caller who is still holding the phone, and answering it changes no
+    /// flock state at all. So the only question worth asking is whether this
+    /// wait is still one of the sheep's own, which the stamp answers and no
+    /// respawn can make ambiguous.
+    fn handle_action_result(&mut self, id: u32, stamp: u64, outcome: ActionOutcome) {
+        let Some(slot) = self.sheep.get_mut(&id) else {
+            return;
+        };
+        if let Some(reply) = slot.actions.resolve(stamp) {
+            let _ = reply.send(Ok(outcome));
+        }
+    }
+
     /// Spawns the backoff timer for a scheduled restart; `None` still hops
     /// through a task + mailbox send rather than respawning inline, so
     /// "immediate" restarts remain observable as a distinct scheduling step.
@@ -3513,6 +3899,71 @@ fn spawn_readiness_task(
             .await;
     });
     ready_tx
+}
+
+/// Spawns the task that delivers one action to `id`'s child and waits for
+/// the reply, returning the oneshot sender the actor stores
+/// (`PendingAction::waiter`) so a later [`Msg::ActionReply`] can wake it. The
+/// task reports its result back through `actor_tx` as a
+/// [`Msg::ActionResult`], which `Actor::handle_action_result` drops if no
+/// live wait carries `stamp` any more.
+///
+/// The send is in here rather than at the call site because both it and the
+/// wait are awaits, and the actor loop may do neither — `Actor::begin_action`
+/// gives the argument in full. `deadline` covers the two together, since a
+/// child that has stopped reading its channel can stall either one.
+///
+/// The ways this can end map onto outcomes as follows:
+///
+/// - the reply arrives — [`ActionOutcome::Replied`], the only outcome that
+///   proves the action landed;
+/// - `deadline` elapses first — [`ActionOutcome::TimedOut`], which says the
+///   app did not answer in time and nothing about whether it ever will;
+/// - the send fails, or the waiter's other half is dropped —
+///   [`ActionOutcome::NoChannel`]. The first means the writer task on the far
+///   end is gone, so the message reached no child; the second means the
+///   sheep's slot let go of this wait, which is what a process ending under
+///   it does. Both leave no reply to come, which is what a sheep with no live
+///   channel is told in the first place.
+///
+/// A send that SUCCEEDS proves nothing — the first one after a child exits is
+/// accepted and discarded — so it is not reported at all.
+///
+/// Must be called from within a Tokio runtime context: it spawns the waiting
+/// task immediately, the same way `spawn_readiness_task` already documents
+/// for itself.
+fn spawn_action_task(
+    id: u32,
+    stamp: u64,
+    message: ShepherdMessage,
+    to_child: mpsc::Sender<ShepherdMessage>,
+    deadline: Duration,
+    actor_tx: mpsc::Sender<Msg>,
+) -> oneshot::Sender<String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let delivered = tokio::time::timeout(deadline, async move {
+            // The send is inside the deadline rather than ahead of it. A
+            // child that has stopped reading fd 3 backs its socket up, the
+            // writer task stops draining this sender, and a send with no
+            // bound on it would then park this task — and the caller waiting
+            // on it — for as long as that child stays wedged.
+            if to_child.send(message).await.is_err() {
+                return None;
+            }
+            reply_rx.await.ok()
+        })
+        .await;
+        let outcome = match delivered {
+            Ok(Some(body)) => ActionOutcome::Replied { body },
+            Ok(None) => ActionOutcome::NoChannel,
+            Err(_elapsed) => ActionOutcome::TimedOut,
+        };
+        let _ = actor_tx
+            .send(Msg::ActionResult { id, stamp, outcome })
+            .await;
+    });
+    reply_tx
 }
 
 /// Spawns the task that carries out one `Reopen` and answers its caller.
@@ -3849,7 +4300,7 @@ async fn run_sheep<P: RunningProcess>(
                         tracing::debug!(id, name, value, "child metric (the metrics dog reads these; not built yet)");
                     }
                     Some(ChildMessage::ActionReply { action, body }) => {
-                        tracing::debug!(id, action, body, "child action reply (custom actions are not built yet)");
+                        let _ = actor_tx.send(Msg::ActionReply { id, action, body }).await;
                     }
                     None => from_child_open = false,
                 }
@@ -5486,6 +5937,7 @@ mod tests {
             pending_delete: false,
             epoch,
             ready_tx: None,
+            actions: ActionWaits::default(),
         };
         let mut sheep = HashMap::new();
         sheep.insert(0, slot);
@@ -5498,6 +5950,7 @@ mod tests {
             tx,
             sheep,
             next_id: 1,
+            next_action_stamp: 0,
             pending: Vec::new(),
             shutting_down: false,
             extras: None,
@@ -5630,6 +6083,7 @@ mod tests {
                 pending_delete: false,
                 epoch: 0,
                 ready_tx: None,
+                actions: ActionWaits::default(),
             },
         );
         let (events, _events_rx) = broadcast::channel(64);
@@ -5641,6 +6095,7 @@ mod tests {
             tx,
             sheep,
             next_id: 1,
+            next_action_stamp: 0,
             pending: Vec::new(),
             shutting_down: false,
             extras: None,
@@ -7489,6 +7944,474 @@ mod tests {
         assert!(
             actor.sheep[&new_id].to_child.is_some(),
             "a reload's replacement holds the daemon's end of its own channel"
+        );
+    }
+
+    // --- Custom actions: one action out, one answer back or none ---
+
+    /// What an action gets to answer in. Virtual time, so a case that reaches
+    /// it costs nothing; long enough that no scheduling order inside a case
+    /// can reach it by accident, which matters because every "the app
+    /// answered" assertion below would read as a timeout if it did.
+    const ACTION_TIMEOUT: Duration = Duration::from_secs(20);
+
+    /// A window generous enough for any action wait to report home, so a case
+    /// whose result never arrives fails instead of parking the suite.
+    const ACTION_WINDOW: Duration = Duration::from_secs(120);
+
+    /// A bare actor holding one sheep whose shepherd channel is open, plus
+    /// the two ends an action travels over: the mailbox every spawned wait
+    /// reports to, and the child's end of the channel.
+    ///
+    /// Direct, like `actor_with_one_online_sheep` (which it builds on), and
+    /// for one reason the reload cases do not have: driving the actor by hand
+    /// is what lets a case put a reply on the channel at an exact point
+    /// relative to a wait's deadline. Through `SupervisorHandle` the two are
+    /// only orderable when they are far apart, and the cases that matter most
+    /// here are the ones where they are not.
+    fn actor_with_an_open_channel(
+        dir: &tempfile::TempDir,
+    ) -> (
+        Actor<ScriptedRunner>,
+        mpsc::Receiver<Msg>,
+        mpsc::Receiver<ShepherdMessage>,
+    ) {
+        // No scripts: nothing in these cases spawns, so an empty list turns a
+        // spawn that should not have happened into a loud failure.
+        let (mut actor, mailbox) = actor_with_one_online_sheep(dir, vec![]);
+        // Wide enough that no case can fill it, so a `send` that blocks means
+        // a bug rather than a fixture too small for the traffic.
+        let (to_child, child_rx) = mpsc::channel(16);
+        actor
+            .sheep
+            .get_mut(&0)
+            .expect("the fixture registers id 0")
+            .to_child = Some(to_child);
+        (actor, mailbox, child_rx)
+    }
+
+    /// Puts one action on the fixture's sheep and hands back the receiver its
+    /// answer will arrive on.
+    fn trigger_action(
+        actor: &mut Actor<ScriptedRunner>,
+        action: &str,
+    ) -> oneshot::Receiver<Result<ActionOutcome, SupervisorError>> {
+        let (reply, answer) = oneshot::channel();
+        actor.handle_command(Command::Trigger {
+            id: 0,
+            action: action.to_string(),
+            params: None,
+            timeout: ACTION_TIMEOUT,
+            reply,
+        });
+        answer
+    }
+
+    /// Drives the one message an action wait sends home and applies it,
+    /// returning what it carried.
+    async fn settle_action(
+        actor: &mut Actor<ScriptedRunner>,
+        mailbox: &mut mpsc::Receiver<Msg>,
+    ) -> ActionOutcome {
+        let msg = tokio::time::timeout(ACTION_WINDOW, mailbox.recv())
+            .await
+            .expect("an action wait reported nothing within the window")
+            .expect("the actor's mailbox closed");
+        match msg {
+            Msg::ActionResult { id, stamp, outcome } => {
+                actor.handle_action_result(id, stamp, outcome.clone());
+                outcome
+            }
+            other => panic!("expected an action result, got {other:?}"),
+        }
+    }
+
+    /// Reads the action the daemon put on the child's end of the channel,
+    /// failing rather than hanging if nothing was sent.
+    async fn sent_action(child_rx: &mut mpsc::Receiver<ShepherdMessage>) -> ShepherdMessage {
+        tokio::time::timeout(ACTION_WINDOW, child_rx.recv())
+            .await
+            .expect("nothing reached the child's end of the channel")
+            .expect("the child's end of the channel closed")
+    }
+
+    /// Fails if a reply stops reaching the wait that asked for it — the whole
+    /// path, from `SupervisorHandle::trigger` through the actor, the writer's
+    /// end of the channel, `run_sheep`'s relay of a `ChildMessage` and back.
+    ///
+    /// Driven through the handle rather than the actor because it is the one
+    /// case here whose subject IS the wiring: a `run_sheep` arm that dropped
+    /// an `action-reply` on the floor again would leave every direct case
+    /// below green.
+    ///
+    /// `params` are asserted on the wire, not just the name. They are passed
+    /// to the app verbatim and read nowhere in the daemon, so nothing else
+    /// would notice them being dropped between the command and the channel.
+    #[tokio::test(start_paused = true)]
+    async fn a_triggered_action_answers_with_the_apps_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.channel = true;
+        let (handle, runner, _events) = started(&dir, app, vec![ProcScript::never_exits()]).await;
+        let mut io = runner.io_handles(0);
+
+        // Spawned rather than awaited: the reply below is what ends this
+        // wait, and it cannot be sent from a task already parked on it.
+        let triggered = tokio::spawn(async move {
+            handle
+                .trigger(
+                    0,
+                    "gc".to_string(),
+                    Some("--full".to_string()),
+                    ACTION_TIMEOUT,
+                )
+                .await
+        });
+
+        assert_eq!(
+            sent_action(&mut io.to_child_rx).await,
+            ShepherdMessage::Action {
+                name: "gc".to_string(),
+                params: Some("--full".to_string()),
+            },
+            "the action reaches the child's end of the channel as it was asked for"
+        );
+
+        io.from_child_tx
+            .send(ChildMessage::ActionReply {
+                action: "gc".to_string(),
+                body: "swept 3".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            triggered.await.unwrap(),
+            Ok(ActionOutcome::Replied {
+                body: "swept 3".to_string()
+            }),
+            "the app's reply body is what the caller is answered with"
+        );
+    }
+
+    /// Fails if a wait for an app that never answers does not end on its own
+    /// — the failure that makes a `PendingReply`-shaped trigger unusable,
+    /// since nothing about a custom action guarantees a message ever comes
+    /// back to resolve it.
+    ///
+    /// The action is read off the channel AFTER the answer, which is the
+    /// half that makes the timeout mean anything: a build that never sent the
+    /// action at all would time out too, and look identical here without it.
+    #[tokio::test(start_paused = true)]
+    async fn a_triggered_action_times_out_when_the_app_never_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppConfig::minimal("api", "./api");
+        app.channel = true;
+        let (handle, runner, _events) = started(&dir, app, vec![ProcScript::never_exits()]).await;
+        let mut io = runner.io_handles(0);
+
+        assert_eq!(
+            handle
+                .trigger(0, "stats".to_string(), None, ACTION_TIMEOUT)
+                .await,
+            Ok(ActionOutcome::TimedOut),
+            "an app that says nothing is reported as saying nothing, not waited on forever"
+        );
+        assert_eq!(
+            sent_action(&mut io.to_child_rx).await,
+            ShepherdMessage::Action {
+                name: "stats".to_string(),
+                params: None,
+            },
+            "the timeout is an app that did not answer, not an action that was never sent"
+        );
+    }
+
+    /// Fails if a reply owed by a wait that already timed out is allowed to
+    /// answer a later wait for the same action.
+    ///
+    /// This is the one failure that produces a WRONG answer rather than an
+    /// error: an app's reply names the action and nothing else, so a `gc`
+    /// reply written after the first `gc` gave up is byte-identical to one
+    /// written for the second. Delete the `abandoned` bookkeeping in
+    /// `ActionWaits::resolve` and the second trigger is answered `Replied`
+    /// with the first trigger's body.
+    ///
+    /// The last two steps are not decoration. Without them the case would
+    /// also pass on a build that swallowed every reply forever, which is the
+    /// opposite bug and just as wrong: the debt has to be settled by one
+    /// reply, not by all of them.
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_owed_by_a_timed_out_action_never_answers_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, mut mailbox, mut child_rx) = actor_with_an_open_channel(&dir);
+
+        let first = trigger_action(&mut actor, "gc");
+        sent_action(&mut child_rx).await;
+        assert_eq!(
+            settle_action(&mut actor, &mut mailbox).await,
+            ActionOutcome::TimedOut
+        );
+        assert_eq!(first.await.unwrap(), Ok(ActionOutcome::TimedOut));
+
+        let second = trigger_action(&mut actor, "gc");
+        sent_action(&mut child_rx).await;
+        // The app finally answers the FIRST `gc`, having no way to say so.
+        actor.handle_action_reply(0, "gc", "swept 3".to_string());
+        assert_eq!(
+            settle_action(&mut actor, &mut mailbox).await,
+            ActionOutcome::TimedOut,
+            "a reply the first `gc` was owed was handed to the second one"
+        );
+        assert_eq!(second.await.unwrap(), Ok(ActionOutcome::TimedOut));
+
+        // One reply per debt, and no more. Two `gc` waits have now given up,
+        // and the reply above settled the first of them — so exactly one
+        // reply stands between a third trigger and an answer. Sending both
+        // here is what separates a debt that is settled from one that is
+        // permanent: a build that swallowed every `gc` reply for the life of
+        // the process would leave the sheep unanswerable, and would pass
+        // every assertion above.
+        let third = trigger_action(&mut actor, "gc");
+        sent_action(&mut child_rx).await;
+        actor.handle_action_reply(0, "gc", "swept 7".to_string());
+        actor.handle_action_reply(0, "gc", "swept 11".to_string());
+        assert_eq!(
+            settle_action(&mut actor, &mut mailbox).await,
+            ActionOutcome::Replied {
+                body: "swept 11".to_string()
+            },
+            "the debts outlived the replies that settled them"
+        );
+        assert_eq!(
+            third.await.unwrap(),
+            Ok(ActionOutcome::Replied {
+                body: "swept 11".to_string()
+            })
+        );
+    }
+
+    /// Fails if a second reply to an action that has already been answered is
+    /// kept for anything.
+    ///
+    /// An app is free to write two replies to one action, and the daemon asked
+    /// for one. The second is not an error and not a debt — nothing is owed,
+    /// because the wait that asked got its answer — so the only correct thing
+    /// to do with it is nothing at all.
+    ///
+    /// Proved by what happens NEXT rather than by the second reply itself,
+    /// which produces no observable effect on its own: a wait armed after it
+    /// must still time out. A build that parked the spare reply somewhere
+    /// would answer that wait with `spent` instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_reply_to_an_answered_action_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, mut mailbox, mut child_rx) = actor_with_an_open_channel(&dir);
+
+        let answered = trigger_action(&mut actor, "gc");
+        sent_action(&mut child_rx).await;
+        actor.handle_action_reply(0, "gc", "swept 3".to_string());
+        assert_eq!(
+            settle_action(&mut actor, &mut mailbox).await,
+            ActionOutcome::Replied {
+                body: "swept 3".to_string()
+            }
+        );
+        assert_eq!(
+            answered.await.unwrap(),
+            Ok(ActionOutcome::Replied {
+                body: "swept 3".to_string()
+            })
+        );
+
+        actor.handle_action_reply(0, "gc", "spent".to_string());
+
+        let next = trigger_action(&mut actor, "gc");
+        sent_action(&mut child_rx).await;
+        assert_eq!(
+            settle_action(&mut actor, &mut mailbox).await,
+            ActionOutcome::TimedOut,
+            "a spare reply was kept and used to answer a wait that came after it"
+        );
+        assert_eq!(next.await.unwrap(), Ok(ActionOutcome::TimedOut));
+    }
+
+    /// Fails if two waits for the SAME action on one sheep are not answered
+    /// in the order they were asked — most sharply, if the second reply is
+    /// handed back to the wait the first one already answered and the second
+    /// wait is left to time out with its answer discarded.
+    ///
+    /// Two triggers of one action can be in flight at once because two
+    /// operators can each run one, and neither reply says which is which.
+    /// Order is the only thing that does, and it is a property of the channel
+    /// rather than of anything the daemon records.
+    #[tokio::test(start_paused = true)]
+    async fn two_waits_for_one_action_are_answered_in_the_order_they_were_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, mut mailbox, mut child_rx) = actor_with_an_open_channel(&dir);
+
+        let first = trigger_action(&mut actor, "gc");
+        sent_action(&mut child_rx).await;
+        let second = trigger_action(&mut actor, "gc");
+        sent_action(&mut child_rx).await;
+
+        actor.handle_action_reply(0, "gc", "swept 3".to_string());
+        actor.handle_action_reply(0, "gc", "swept 7".to_string());
+        settle_action(&mut actor, &mut mailbox).await;
+        settle_action(&mut actor, &mut mailbox).await;
+
+        assert_eq!(
+            first.await.unwrap(),
+            Ok(ActionOutcome::Replied {
+                body: "swept 3".to_string()
+            }),
+            "the earlier trigger was answered with the later reply"
+        );
+        assert_eq!(
+            second.await.unwrap(),
+            Ok(ActionOutcome::Replied {
+                body: "swept 7".to_string()
+            }),
+            "the second reply was dropped and its wait left waiting"
+        );
+    }
+
+    /// Fails if the deadline stops covering the DELIVERY of an action and
+    /// only covers the reply to it.
+    ///
+    /// A child that has stopped reading fd 3 backs its socket up, the writer
+    /// task stops draining the daemon's end, and a send onto a full channel
+    /// then waits for room that is not coming. Outside the deadline that
+    /// parks the wait's task and its caller for good — the same permanent
+    /// wait a custom action's whole timeout exists to rule out, one step
+    /// earlier than the case that names it.
+    ///
+    /// The channel here is deliberately built full and left unread, which is
+    /// that wedged child expressed at the one seam a paused-clock case can
+    /// reach: a real child holding its socket unread is not reproducible
+    /// without a real child.
+    #[tokio::test(start_paused = true)]
+    async fn an_action_that_cannot_even_be_delivered_still_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, mut mailbox) = actor_with_one_online_sheep(&dir, vec![]);
+
+        // Held, never read: dropping it would make the send fail outright,
+        // which is the OTHER outcome and would pass this case vacuously.
+        let (to_child, _wedged) = mpsc::channel(1);
+        to_child.try_send(ShepherdMessage::Shutdown).unwrap();
+        actor
+            .sheep
+            .get_mut(&0)
+            .expect("the fixture registers id 0")
+            .to_child = Some(to_child);
+
+        let answer = trigger_action(&mut actor, "gc");
+        assert_eq!(
+            settle_action(&mut actor, &mut mailbox).await,
+            ActionOutcome::TimedOut,
+            "an action that never got onto the channel left its wait parked"
+        );
+        assert_eq!(answer.await.unwrap(), Ok(ActionOutcome::TimedOut));
+    }
+
+    /// Fails if an action is delivered to a sheep with no live channel, or
+    /// waited out instead of refused.
+    ///
+    /// The fixture's own sheep is built with `to_child` clear, which is what
+    /// a registered-but-not-running instance looks like. Answering it takes
+    /// no wait at all — there is nothing to deliver to and no reply to expect
+    /// — so the assertion is the answer arriving without the mailbox ever
+    /// carrying a result.
+    #[tokio::test(start_paused = true)]
+    async fn an_action_for_a_sheep_with_no_channel_is_refused_on_the_spot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, mut mailbox) = actor_with_one_online_sheep(&dir, vec![]);
+
+        let answer = trigger_action(&mut actor, "gc");
+        // Bounded, because the failure this case guards against is a wait
+        // being armed for a channel that is not there — and a wait nothing
+        // drives home never resolves at all. An unbounded read would park the
+        // suite where this reddens it.
+        let answered = tokio::time::timeout(ACTION_WINDOW, answer)
+            .await
+            .expect("a sheep with no channel was left waiting on an answer")
+            .unwrap();
+        assert_eq!(answered, Ok(ActionOutcome::NoChannel));
+        assert!(
+            matches!(mailbox.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "a sheep with no channel armed a wait anyway"
+        );
+    }
+
+    /// Fails if an unknown id is answered with an outcome rather than an
+    /// error. Every [`ActionOutcome`] is a statement about a sheep, and there
+    /// is no sheep here to make one about.
+    #[tokio::test(start_paused = true)]
+    async fn an_action_for_an_unregistered_id_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _mailbox) = actor_with_one_online_sheep(&dir, vec![]);
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_command(Command::Trigger {
+            id: 4242,
+            action: "gc".to_string(),
+            params: None,
+            timeout: ACTION_TIMEOUT,
+            reply,
+        });
+        assert_eq!(answer.await.unwrap(), Err(SupervisorError::NotFound));
+    }
+
+    /// Fails if a wait armed against a process that then exits is left for
+    /// its own deadline to end, or dropped without an answer.
+    ///
+    /// Dropping it is the subtler half: the caller's receiver would resolve
+    /// `Err`, which `SupervisorHandle::trigger` reports as the engine having
+    /// gone away — a claim about the daemon, made because a single child
+    /// exited.
+    ///
+    /// The debts go with the waits, and for a reason the exit itself does not
+    /// make obvious: a replacement under this id has written none of the
+    /// replies the dead process owed, so a debt left behind would have it
+    /// swallow the first answer it gives.
+    #[tokio::test(start_paused = true)]
+    async fn a_sheep_exiting_answers_every_action_waiting_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, mut mailbox, mut child_rx) = actor_with_an_open_channel(&dir);
+
+        // One wait that will be left waiting, and one debt for a wait that
+        // already gave up — the two halves the exit has to clear.
+        let timed_out = trigger_action(&mut actor, "gc");
+        sent_action(&mut child_rx).await;
+        settle_action(&mut actor, &mut mailbox).await;
+        assert_eq!(timed_out.await.unwrap(), Ok(ActionOutcome::TimedOut));
+
+        let waiting = trigger_action(&mut actor, "stats");
+        sent_action(&mut child_rx).await;
+
+        actor.handle_exited(
+            0,
+            ExitOutcome {
+                code: Some(0),
+                signal: None,
+            },
+        );
+        // Bounded for the same reason the no-channel case above is: a wait
+        // the exit failed to answer is a wait nothing else will, so an
+        // unbounded read would park the suite instead of reddening here.
+        let answered = tokio::time::timeout(ACTION_WINDOW, waiting)
+            .await
+            .expect("a wait outlived the process it was waiting on")
+            .unwrap();
+        assert_eq!(
+            answered,
+            Ok(ActionOutcome::NoChannel),
+            "a wait outlived the process it was waiting on"
+        );
+        assert!(
+            actor.sheep[&0].actions.abandoned.is_empty(),
+            "a debt owed by a process that has exited outlived it, and would \
+             have swallowed a reply from whatever runs under this id next"
         );
     }
 
