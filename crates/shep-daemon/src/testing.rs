@@ -245,6 +245,57 @@ impl ProcessRunner for SharedRunner {
     }
 }
 
+/// A [`ProcessRunner`] that announces each spawn on a unix datagram socket
+/// before delegating, so a test can assert on the ORDER of two events rather
+/// than on the presence of one.
+///
+/// It exists for `boot`'s readiness-ordering case. Both the announcement and
+/// `boot`'s own `READY=1` land on the same socket, and AF_UNIX `SOCK_DGRAM`
+/// enqueues synchronously, so the queue order a test reads back after `boot`
+/// returns *is* the program order — which reading only `READY=1` could never
+/// establish, because the kernel keeps that datagram queued however early it
+/// was sent.
+///
+/// Unix-only, like the socket it writes to and the `boot` module it serves.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct AnnouncingRunner<R> {
+    inner: R,
+    target: PathBuf,
+}
+
+#[cfg(unix)]
+impl<R> AnnouncingRunner<R> {
+    /// Wraps `inner`, announcing every spawn to the socket bound at `target`.
+    pub(crate) fn new(inner: R, target: &Path) -> Self {
+        Self {
+            inner,
+            target: target.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl<R: ProcessRunner> ProcessRunner for AnnouncingRunner<R> {
+    type Proc = R::Proc;
+
+    /// # Panics
+    ///
+    /// If the announcement cannot be sent — the socket the test bound is
+    /// gone, or was never bound. Panicking beats swallowing it: the case
+    /// this runner exists for would otherwise block on a datagram that is
+    /// never coming and report a timeout instead of the real fault.
+    #[track_caller]
+    fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
+        let socket = std::os::unix::net::UnixDatagram::unbound()
+            .expect("a test must be able to open an unbound datagram socket");
+        socket
+            .send_to(b"SPAWNED\n", &self.target)
+            .expect("the test's listening socket must be bound before the spawn");
+        self.inner.spawn(spec)
+    }
+}
+
 /// A proptest configuration running `local_cases` by default, and whatever
 /// `PROPTEST_CASES` names when the environment sets it (IR-37: "case count
 /// capped in CI via env").

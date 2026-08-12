@@ -40,6 +40,7 @@
 
 use core::fmt;
 use core::time::Duration;
+use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -477,6 +478,27 @@ pub struct BootOptions {
     /// nowhere else) — the same `Option` shape [`Self::socket`] uses, so
     /// nothing between `shep.toml` and here invents a value.
     pub max_cron_sleep: Option<Duration>,
+    /// Where to report readiness once the muster restore has finished, for
+    /// an init system supervising this process directly. `None` — the
+    /// ordinary case — reports nothing.
+    ///
+    /// The resolved address rather than a bool, and not read from the
+    /// environment inside this crate: `std::env::set_var` is `unsafe` in
+    /// edition 2024 and this crate is `#![deny(unsafe_code)]`, so a boot
+    /// test could not establish an ambient `$NOTIFY_SOCKET` to observe the
+    /// ordering against. The CLI reads the variable
+    /// ([`crate::notify::NOTIFY_SOCKET_ENV`]) once, where it already reads
+    /// every other `SHEP_*` override.
+    ///
+    /// Distinct from [`Self::ready_fd`], which the two share nothing with
+    /// but a name: that one answers a *parent shep process* that daemonized
+    /// this one and is waiting to exit, and it is written the moment the
+    /// socket binds so a slow muster cannot make that parent think the boot
+    /// failed. This one answers an init system that is supervising this
+    /// process itself, and is written last, so the unit goes green only
+    /// once the flock is actually back. Both may be set, but in practice
+    /// never are: whichever one is supervising, the other is not.
+    pub notify_socket: Option<OsString>,
 }
 
 /// Brings the daemon up: signal handlers, layout, roll restore, bus,
@@ -506,7 +528,13 @@ pub struct BootOptions {
 ///    reopens through, this being the first moment one exists. See
 ///    `install_signals`'s own doc, next to its definition in this file, for
 ///    why that seam is a channel rather than an argument, and why the gap
-///    between the two steps drops no signal.
+///    between the two steps drops no signal;
+/// 5. report readiness to an init system supervising this process directly
+///    ([`BootOptions::notify_socket`], [`crate::notify`]) — last of all,
+///    which is the opposite of step 3 and deliberately so: that one answers
+///    a parent shep waiting to exit, this one decides when a unit goes
+///    green, and a unit that goes green at exec time describes a flock that
+///    is not up yet.
 ///
 /// # Errors
 /// - [`BootError::Io`] — a boot filesystem step failed, or the OS refused
@@ -619,6 +647,21 @@ pub async fn boot<R: ProcessRunner>(
         pid,
         shutdown,
     };
+
+    // 5. The flock is back and the plane is assembled, so this daemon is
+    //    now what a unit ordered `After=` it expects to find. A failure is
+    //    a `warn!` and the boot continues: the daemon is fully functional
+    //    and only systemd's knowledge of it is wrong, which systemd's own
+    //    `TimeoutStartSec` reports honestly — killing a working daemon over
+    //    an undeliverable datagram would be the worse outcome.
+    if let Some(target) = options.notify_socket.as_deref()
+        && let Err(err) = crate::notify::notify(target)
+    {
+        tracing::warn!(
+            %err,
+            "readiness could not be reported to $NOTIFY_SOCKET; the flock is up regardless"
+        );
+    }
 
     Ok(RunningDaemon {
         ctx,
@@ -1077,7 +1120,7 @@ mod tests {
     use crate::fake::{ProcScript, ScriptedRunner};
     use crate::snapshot::{FlockSnapshot, SNAPSHOT_VERSION, SavedApp};
     // the one crate-root fixture (IR-33)
-    use crate::testing::{SharedRunner, test_paths};
+    use crate::testing::{AnnouncingRunner, SharedRunner, test_paths};
     use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, normalize};
     use shep_core::protocol::ProcessEventKind;
     use shep_core::values::UpDuration;
@@ -1596,6 +1639,135 @@ mod tests {
             "the socket is unlinked on a clean exit"
         );
         assert_eq!(read_pidfile(&paths).unwrap(), None);
+    }
+
+    /// fails if the notification is sent before the muster restore finishes.
+    /// That ordering is the entire reason `Type=notify` was chosen over
+    /// `Type=simple`: a unit that goes green at exec time reports a flock
+    /// that is not up yet, and a restore that hangs reads as a healthy
+    /// service supervising nothing.
+    ///
+    /// **How it tells the two orders apart**, since a test that only checks
+    /// the notification arrived would prove nothing about when: the restore
+    /// announces its own spawn on the SAME socket, so what is asserted is
+    /// the queue order of two datagrams rather than the presence of one.
+    /// Reading only `READY=1` after `boot` returns would pass on a notify
+    /// moved to the very top of `boot`, because the kernel keeps that
+    /// datagram queued however early it was sent — confirmed by moving the
+    /// send above step 4 and watching this case fail on the first `recv`.
+    /// The flock is asserted afterwards too, so a `SPAWNED` from something
+    /// other than a completed restore could not carry the case.
+    #[tokio::test]
+    async fn readiness_is_reported_only_once_the_roll_is_restored() {
+        // Real time: binds a real socket, so this obeys SIGNAL_TEST_LOCK's
+        // rule like every other successful `boot()` in this module.
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        crate::snapshot::write_atomic(
+            &paths.snapshot,
+            &FlockSnapshot {
+                version: SNAPSHOT_VERSION,
+                saved_at_ms: 0,
+                apps: vec![SavedApp {
+                    app: AppConfig::minimal("web", "./srv"),
+                    instances_running: 1,
+                }],
+            },
+        )
+        .unwrap();
+
+        // Inside the TempDir and short: macOS caps a unix socket path near
+        // 97 characters, which `test_paths` already keeps this under.
+        let notify_path = dir.path().join("n.sock");
+        let listener = std::os::unix::net::UnixDatagram::bind(&notify_path).unwrap();
+        // Bounded: a datagram that never arrives must fail this case, not
+        // park it.
+        listener
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Both events land on the SAME socket, so the assertion is on their
+        // ORDER rather than on their presence. This is the whole design of
+        // the case: reading only READY=1 after `boot` returns would pass on
+        // a notify moved to the TOP of `boot`, because the datagram is
+        // queued by the kernel and is still there whenever the test looks.
+        // A marker sent from inside the restore's own spawn is the only
+        // thing that distinguishes the two orders. AF_UNIX SOCK_DGRAM
+        // enqueues synchronously, and these two sends are strictly
+        // sequential in program order, so the queue order is the program
+        // order.
+        let runner = AnnouncingRunner::new(
+            ScriptedRunner::new(vec![ProcScript::never_exits()]),
+            &notify_path,
+        );
+
+        let daemon = boot(
+            runner,
+            paths.clone(),
+            BootOptions {
+                restore: true,
+                notify_socket: Some(notify_path.clone().into_os_string()),
+                ..BootOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut buf = [0u8; 64];
+        let read = listener.recv(&mut buf).unwrap();
+        assert_eq!(
+            &buf[..read],
+            b"SPAWNED\n",
+            "READY=1 arrived before the roll was restored: a unit that goes \
+             green at exec time reports a flock that is not up yet, and a \
+             restore that hangs reads as a healthy service supervising nothing"
+        );
+        let read = listener.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..read], b"READY=1\n");
+
+        let ctx = daemon.context();
+        let flock = ctx.supervisor.list_checked().await.unwrap();
+        assert_eq!(flock.len(), 1, "the roll was actually restored");
+        assert_eq!(flock[0].name, "web");
+
+        ctx.shutdown();
+        daemon.run().await.unwrap();
+    }
+
+    /// fails if an undeliverable readiness datagram takes the daemon down
+    /// with it. Nothing is bound at the address, so the send errors — and
+    /// the boot must still succeed, because what failed is the init
+    /// system's *knowledge* of a daemon that is otherwise fully up. Systemd
+    /// reports that honestly through its own `TimeoutStartSec`; killing a
+    /// working supervisor over one datagram would be the worse outcome, and
+    /// on a `?` here a reboot would leave the flock down instead of merely
+    /// unannounced.
+    #[tokio::test]
+    async fn a_readiness_datagram_that_cannot_be_delivered_does_not_fail_the_boot() {
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+
+        let daemon = boot(
+            ScriptedRunner::new(vec![]),
+            paths.clone(),
+            BootOptions {
+                // Bound by nothing, and never created by anything: the send
+                // is an error, which is the whole premise of the case.
+                notify_socket: Some(dir.path().join("nobody.sock").into_os_string()),
+                ..BootOptions::default()
+            },
+        )
+        .await
+        .expect("a daemon nobody could be told about is still a daemon");
+
+        // Up enough to serve, not merely constructed.
+        assert!(daemon.context().supervisor.list_checked().await.is_ok());
+
+        daemon.context().shutdown();
+        daemon.run().await.unwrap();
     }
 
     #[tokio::test]

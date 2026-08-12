@@ -1,10 +1,30 @@
-//! The hidden `daemon` subcommand: runs the supervisor in the foreground.
+//! The hidden `daemon` subcommand: runs the supervisor in this process.
 //!
-//! This is the re-exec target `crate::launch::launch_daemon` spawns
-//! detached — `shep daemon` is never meant to be typed by a person, only
-//! run as the child half of the CLI's own autostart. [`run_daemon`] loads
-//! `shep.toml`, boots `shep_daemon::boot`'s supervisor, and blocks in
-//! `RunningDaemon::run` until a signal or `KillDaemon` tears it down.
+//! [`run_daemon`] loads `shep.toml`, boots `shep_daemon::boot`'s
+//! supervisor, and blocks in `RunningDaemon::run` until a signal or
+//! `KillDaemon` tears it down. Two things reach it, and they are different
+//! arrangements rather than different code:
+//!
+//! - **Autostart** — the re-exec target `crate::launch::launch_daemon`
+//!   spawns detached, which is how a `shep start` typed at a terminal gets
+//!   a daemon. The parent exits; this process is orphaned deliberately.
+//!   `launch_daemon` passes exactly one argument, `daemon`.
+//! - **`--foreground`** — an init system `exec`s this itself and stays the
+//!   parent, so nothing may exit out from under it, and it wants to be told
+//!   when the flock is actually back. The flag adds that report (see
+//!   [`boot_options`]) and nothing else: it does not fork, re-exec, or
+//!   change a single step of the boot the autostart path takes. Everything
+//!   that makes this process survivable on its own — detaching from the
+//!   parent's process group and terminal, redirecting stderr into
+//!   `shepd.err.log` — already lives in `launch.rs`, on the *parent's* side
+//!   of a re-exec that this arrangement never performs. Systemd does those
+//!   jobs itself.
+//!
+//! Neither arrangement can be reached by accident from the other:
+//! `launch_daemon` never passes `--foreground` (its own test pins the
+//! argument vector), and the flag is the only thing that turns readiness
+//! reporting on, so an inherited `$NOTIFY_SOCKET` cannot make an
+//! autostarted daemon answer some other service's unit.
 
 use std::ffi::OsStr;
 use std::io::IsTerminal;
@@ -13,6 +33,7 @@ use shep_core::config::{DaemonConfig, DaemonConfigError};
 use shep_core::paths::ShepPaths;
 use shep_core::values::UpDuration;
 use shep_daemon::boot::{BootError, BootOptions, boot};
+use shep_daemon::notify::NOTIFY_SOCKET_ENV;
 use shep_daemon::tokio_runner::TokioRunner;
 use tracing_subscriber::EnvFilter;
 
@@ -210,6 +231,10 @@ fn warn_on_inert_dog_config(config: &DaemonConfig) {
 /// purpose (`launch::launch_command` deliberately does not `.env_clear()`), so
 /// `SHEP_LOG_JSON`, `SHEP_LOG_LEVEL`, `SHEP_SOCKET`, and
 /// `SHEP_MAX_CRON_SLEEP` are read straight from `std::env::var`.
+/// `$NOTIFY_SOCKET` is read here too — the one read of it in the workspace
+/// — and is the one variable in that list shep does not own the name of:
+/// an init system sets it, and `--foreground` is what decides whether it is
+/// acted on.
 ///
 /// The subscriber goes in *here* and never in `shep_daemon::boot`: a global
 /// subscriber can be installed once per process, and `boot` is called many
@@ -233,7 +258,11 @@ pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), Daemo
         DaemonConfig::load(file_source.as_deref(), &env).map_err(DaemonRunError::Config)?;
     install_log_subscriber(&config);
     warn_on_inert_dog_config(&config);
-    let options = boot_options(&config, args);
+    // The one read of this variable in the workspace, here beside every
+    // `SHEP_*` override rather than inside shep-daemon — see
+    // `shep_daemon::notify::NOTIFY_SOCKET_ENV`'s own doc.
+    let notify_socket = std::env::var_os(NOTIFY_SOCKET_ENV);
+    let options = boot_options(&config, args, notify_socket.as_deref());
     boot(TokioRunner::new(), paths, options)
         .await
         .map_err(DaemonRunError::Boot)?
@@ -242,8 +271,8 @@ pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), Daemo
         .map_err(DaemonRunError::Run)
 }
 
-/// Builds [`BootOptions`] from `config` and the `daemon` subcommand's own
-/// flags.
+/// Builds [`BootOptions`] from `config`, the `daemon` subcommand's own
+/// flags, and whatever `$NOTIFY_SOCKET` held.
 ///
 /// `ready_fd` stays `None` unconditionally: readiness is established by a
 /// completed handshake in this phase's design, never by an inherited
@@ -252,13 +281,28 @@ pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), Daemo
 /// `max_cron_sleep` stays an `Option` the whole way through: the daemon owns
 /// the default and applies it once, so nothing here invents a value on the
 /// way past.
+///
+/// `notify_socket` is taken as a parameter rather than read here, so the
+/// environment read stays at the one call site in [`run_daemon`] and this
+/// function stays testable — `std::env::set_var` is `unsafe` in edition
+/// 2024, which this crate forbids outright. `--foreground` gates it: a shep
+/// the CLI autostarted from *inside* some other notify-type service
+/// inherits that service's `$NOTIFY_SOCKET`, and must not report its
+/// readiness by accident.
 #[must_use]
-pub fn boot_options(config: &DaemonConfig, args: &DaemonArgs) -> BootOptions {
+pub fn boot_options(
+    config: &DaemonConfig,
+    args: &DaemonArgs,
+    notify_socket: Option<&OsStr>,
+) -> BootOptions {
     BootOptions {
         socket: config.daemon.socket.clone(),
         ready_fd: None,
         restore: !args.no_restore,
         max_cron_sleep: config.daemon.max_cron_sleep.map(UpDuration::as_duration),
+        notify_socket: notify_socket
+            .filter(|_| args.foreground)
+            .map(OsStr::to_os_string),
     }
 }
 
@@ -344,7 +388,14 @@ mod tests {
         let config =
             DaemonConfig::load(Some("[daemon]\nsocket = \"/tmp/custom.sock\"\n"), &|_| None)
                 .unwrap();
-        let opts = boot_options(&config, &DaemonArgs { no_restore: false });
+        let opts = boot_options(
+            &config,
+            &DaemonArgs {
+                no_restore: false,
+                foreground: false,
+            },
+            None,
+        );
         assert!(
             opts.ready_fd.is_none(),
             "readiness is a handshake in this phase"
@@ -366,13 +417,29 @@ mod tests {
         let configured =
             DaemonConfig::load(Some("[daemon]\nmax_cron_sleep = \"5m\"\n"), &|_| None).unwrap();
         assert_eq!(
-            boot_options(&configured, &DaemonArgs { no_restore: false }).max_cron_sleep,
+            boot_options(
+                &configured,
+                &DaemonArgs {
+                    no_restore: false,
+                    foreground: false
+                },
+                None
+            )
+            .max_cron_sleep,
             Some(core::time::Duration::from_secs(300))
         );
 
         let unset = DaemonConfig::load(None, &|_| None).unwrap();
         assert_eq!(
-            boot_options(&unset, &DaemonArgs { no_restore: false }).max_cron_sleep,
+            boot_options(
+                &unset,
+                &DaemonArgs {
+                    no_restore: false,
+                    foreground: false
+                },
+                None
+            )
+            .max_cron_sleep,
             None,
             "an unset knob must stay None: the daemon owns the default"
         );
@@ -385,8 +452,90 @@ mod tests {
     #[test]
     fn no_restore_boots_without_the_muster_roll() {
         let config = DaemonConfig::load(None, &|_| None).unwrap();
-        let opts = boot_options(&config, &DaemonArgs { no_restore: true });
+        let opts = boot_options(
+            &config,
+            &DaemonArgs {
+                no_restore: true,
+                foreground: false,
+            },
+            None,
+        );
         assert!(!opts.restore);
+    }
+
+    /// fails if `--foreground` stops reaching the boot option. The flag is
+    /// the only thing that turns readiness reporting on, and a unit whose
+    /// ExecStart lost it hangs until TimeoutStartSec with nothing to say why.
+    #[test]
+    fn the_foreground_flag_reaches_the_boot_options() {
+        let config = DaemonConfig::load(None, &|_| None).unwrap();
+        let bare = boot_options(
+            &config,
+            &DaemonArgs {
+                no_restore: false,
+                foreground: false,
+            },
+            None,
+        );
+        assert!(
+            bare.notify_socket.is_none(),
+            "an autostarted daemon reports to nobody"
+        );
+
+        let supervised = boot_options(
+            &config,
+            &DaemonArgs {
+                no_restore: false,
+                foreground: true,
+            },
+            Some(OsStr::new("/run/systemd/notify")),
+        );
+        assert_eq!(
+            supervised.notify_socket.as_deref(),
+            Some(OsStr::new("/run/systemd/notify"))
+        );
+
+        // Without the flag the address is ignored, so a shep the CLI
+        // autostarted from inside some other notify-type service cannot
+        // report ITS readiness by accident.
+        let unflagged = boot_options(
+            &config,
+            &DaemonArgs {
+                no_restore: false,
+                foreground: true,
+            },
+            None,
+        );
+        assert!(unflagged.notify_socket.is_none());
+
+        let inherited = boot_options(
+            &config,
+            &DaemonArgs {
+                no_restore: false,
+                foreground: false,
+            },
+            Some(OsStr::new("/run/systemd/notify")),
+        );
+        assert!(inherited.notify_socket.is_none());
+    }
+
+    /// fails if `--foreground` ever starts implying `--no-restore`, or the
+    /// other way round. The two are independent, and a foreground daemon
+    /// that skipped the restore would report a unit ready while supervising
+    /// an empty flock — the exact outcome the readiness ordering exists to
+    /// rule out.
+    #[test]
+    fn foreground_and_no_restore_are_independent() {
+        let config = DaemonConfig::load(None, &|_| None).unwrap();
+        let opts = boot_options(
+            &config,
+            &DaemonArgs {
+                no_restore: false,
+                foreground: true,
+            },
+            Some(OsStr::new("/run/systemd/notify")),
+        );
+        assert!(opts.restore, "a supervised daemon still musters its roll");
     }
 
     #[test]

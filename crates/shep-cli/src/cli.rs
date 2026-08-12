@@ -316,6 +316,10 @@ pub struct DaemonArgs {
     /// Boot without restoring the saved muster roll
     #[arg(long)]
     pub no_restore: bool,
+    /// Run supervised by an init system: do not expect to have been
+    /// daemonized, and report readiness once the flock is back
+    #[arg(long)]
+    pub foreground: bool,
 }
 
 #[cfg(test)]

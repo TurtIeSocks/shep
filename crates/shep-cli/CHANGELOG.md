@@ -307,6 +307,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_memory`/`restart_delay` render in their string forms (`"512M"`,
   `"5s"`), never as raw integers a Flockfile parser would reject.
 
+- Add `shep daemon --foreground`, for an init system that runs the shepherd
+  itself rather than letting the CLI autostart one. It reports readiness on
+  `$NOTIFY_SOCKET` once the muster restore has finished, which is what lets a
+  `Type=notify` unit go green when the flock is actually back instead of when
+  the process execs.
+
+  It is a second arrangement, not a second code path. `shep daemon` already
+  runs the supervisor in this process; the flag adds the readiness report and
+  nothing else — no fork, no re-exec, not one step of the boot changed.
+  Everything that makes an autostarted daemon survivable on its own — the new
+  process group, the detached terminal, stderr redirected into
+  `shepd.err.log` — lives in `launch.rs`, on the *parent's* side of a re-exec
+  this arrangement never performs, and systemd does those jobs itself.
+
+  The flag is also the only thing that turns the report on, so a `shep` the
+  CLI autostarts from inside some other notify-type service inherits that
+  service's `$NOTIFY_SOCKET` and stays silent on it. `launch_daemon` passes
+  exactly one argument, `daemon`, and its own test pins that argument vector.
+
 ### Fixes
 
 - Open the shepherd's own `shepd.out.log`/`shepd.err.log` `O_APPEND` in the

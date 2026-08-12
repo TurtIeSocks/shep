@@ -51,6 +51,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Report readiness to an init system that supervises the shepherd directly:
+  one `READY=1` datagram to whatever `$NOTIFY_SOCKET` names, sent as the
+  **last** step of `boot`, after the muster restore has finished and the
+  control plane is assembled. New unix-only `notify` module.
+
+  The ordering is the whole feature. A unit that goes green when the process
+  execs describes a flock that is not up yet, so a restore that hangs reads
+  as a healthy service supervising nothing, and anything ordered after that
+  unit starts against apps that do not exist. Reporting last turns the same
+  hang into a failed start. This is deliberately the opposite of the
+  readiness pipe filed further down, and the two answer different parents:
+  that one tells a `shep` process that daemonized this one it may now exit,
+  and is written the moment the socket binds so a slow muster cannot make it
+  think the boot failed; this one decides when a unit goes green. Both may
+  be set, but whichever is supervising, the other is not.
+
+  No new dependency and no unsafe: `std` addresses both shapes systemd can
+  hand a service — a filesystem path through `UnixDatagram::send_to`, and an
+  `@`-prefixed abstract name through `SocketAddrExt::from_abstract_name` plus
+  `UnixDatagram::send_to_addr`, stable since 1.70. Off Linux an `@` address is
+  `NotifyError::Unsupported` rather than a path, because there is no abstract
+  namespace to reach and writing into a file literally named `@…` would
+  succeed while telling nobody anything. An **absent** `$NOTIFY_SOCKET` is
+  the ordinary case — every interactive run, the daemon the CLI autostarts
+  for itself, and macOS, whose launchd has no readiness protocol at all — and
+  it is a silent no-op, never an error.
+
+  A failed send is a `warn!` and the boot continues. The daemon is fully
+  functional; what failed is the init system's knowledge of it, which
+  systemd's own `TimeoutStartSec` reports honestly. Killing a working
+  supervisor over one undeliverable datagram would leave the flock down after
+  a reboot instead of merely unannounced.
+
+  `notify` is public because `shep-cli` names `NOTIFY_SOCKET_ENV` — the
+  environment read belongs where every `SHEP_*` override is already read, and
+  what crosses the crate boundary is the resolved address (see Changes).
 - Answer `Request::Muster` on the control socket, over the same restore the
   daemon already runs at boot. `snapshot::muster` is now that one
   implementation: `boot::restore_flock` is a line over it, and the request
@@ -573,6 +609,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changes
 
+- `BootOptions` gains a `notify_socket: Option<OsString>` field, carrying the
+  address the readiness datagram above goes to; `None` — the ordinary case —
+  reports nothing. Filed as a change rather than an addition for the same
+  reason `max_cron_sleep` below is: the struct carries no
+  `#[non_exhaustive]`, so any downstream literal naming every field stops
+  compiling until it names this one (`..Default::default()` is unaffected).
+
+  It carries the **resolved address** rather than a bool because a boot test
+  could not otherwise observe the ordering it exists to guarantee:
+  `std::env::set_var` is `unsafe` in edition 2024 and this crate is
+  `#![deny(unsafe_code)]`, so no test here can establish an ambient
+  `$NOTIFY_SOCKET` to watch against. The CLI reads the variable once, beside
+  every `SHEP_*` override it already reads, and hands the value down.
 - `ShepherdMessage::Action` gains a `params: Option<String>` field: the
   argument text an operator passes after an action name, handed to the child
   verbatim. The daemon never parses it, validates it, or holds a schema for
