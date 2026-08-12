@@ -3004,3 +3004,74 @@ fn saving_the_roll_then_mustering_reports_the_same_flock() {
 
     graceful_kill(home);
 }
+
+// --- Import -----------------------------------------------------------
+
+/// `shep import` reads a pm2 dump and writes a Flockfile shep can read
+/// back, without ever touching a daemon.
+///
+/// The envelope's `command` is asserted for the same reason
+/// `saving_the_roll_then_mustering_reports_the_same_flock` asserts it on
+/// `save`/`muster`: `run`'s dispatch arms carry no unit coverage of their
+/// own, and an arm reaching the wrong function (or handing it the wrong
+/// args) would still exit 0 here without this. The written file is checked
+/// against the REAL parser (`shep_core::config::Flockfile::parse`), not
+/// merely "the process exited 0" — a Flockfile shep itself refuses to read
+/// back is not an import. That no socket ever appears is the other half:
+/// `import` takes no `Client` and starts nothing, and a dispatch arm that
+/// somehow reached `connect_or_spawn_client` first would autostart a
+/// daemon this verb never needs.
+///
+/// What a broken implementation this would catch: the dispatch misroute
+/// above; a source resolution that ignores `--from` and reads the real
+/// `~/.pm2/dump.pm2` instead; an `--out` silently ignored in favour of the
+/// default `./Flockfile.toml`; and a renderer whose output this crate's own
+/// `Flockfile::parse` refuses.
+#[test]
+fn import_writes_a_flockfile_shep_can_read_back_and_starts_no_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let out = home.join("Flockfile.toml");
+    let dump = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/commands/import/testdata/dump.pm2.json"
+    );
+    let mut guard = DaemonGuard::default();
+
+    let output = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("import")
+        .arg("--from")
+        .arg(dump)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&output);
+
+    assert!(
+        !home.join("run/shep.sock").exists(),
+        "`shep import` reads a file and writes a file; it must never \
+         autostart a daemon"
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["command"], "import",
+        "`shep import` must reach the import verb and no other: {envelope}"
+    );
+    let rows = envelope["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("import data must be an array: {envelope}"));
+    assert_eq!(rows.len(), 3, "{envelope}");
+
+    let written = std::fs::read_to_string(&out).unwrap();
+    let parsed =
+        shep_core::config::Flockfile::parse(&written, shep_core::config::FlockFormat::Toml)
+            .unwrap_or_else(|e| {
+                panic!("shep import wrote a Flockfile shep cannot read back: {e}\n{written}")
+            });
+    assert_eq!(parsed.apps.len(), 3, "{written}");
+}

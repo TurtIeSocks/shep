@@ -56,9 +56,9 @@ one `[[bin]]`.
 **`set`/`get`/`unset`** (spec §5, the KV store) — no clap variant, no
 file-locked JSON store.
 
-**`import` + migration guide** (spec §2, §9, §13.4) — reads a box's pm2
-state and emits a Flockfile; `docs/migration.md` is its companion. Neither
-exists.
+**migration guide** (spec §2, §9, §13.4) — `docs/migration.md`, the pm2
+cutover companion to `shep import` (which now exists — Phase 8 Task 9).
+Does not exist yet.
 
 **`startup`/`unstartup`** (spec §9, §11) — the systemd (`Type=notify`)/
 launchd/openrc/rc.d unit generator, pm2's `startup` equivalent. No clap

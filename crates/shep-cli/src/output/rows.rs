@@ -356,6 +356,69 @@ impl Render for SavedRollRow {
     const JSON_ONLY: &'static [&'static str] = &[];
 }
 
+/// One app `shep import` read out of a pm2 dump.
+///
+/// Constructed by `commands/import/mod.rs`'s `import`, from the apps a
+/// dump was converted into — not from any wire `Response`, since this verb
+/// asks the daemon nothing. `REUSE_PORT` is the column an operator scans
+/// for at a glance; `import`'s own stderr notes are where they learn what
+/// to do about a `true` one (`shep` binds nothing, so the app itself has to
+/// set `SO_REUSEPORT`).
+#[derive(Debug, Serialize)]
+pub struct ImportRow {
+    /// The app's name, which is also the key its instance rows were grouped by.
+    pub name: String,
+    /// The script the app runs.
+    pub script: String,
+    /// How many instances of it the dump recorded running.
+    pub instances: u32,
+    /// Whether the app has to set `SO_REUSEPORT` itself (pm2 cluster mode).
+    pub reuse_port: bool,
+}
+
+/// `shep import`: one row per app the dump was collapsed into.
+///
+/// `transparent` so the JSON is a plain array, matching every other payload
+/// that reports a list.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct ImportRows(pub Vec<ImportRow>);
+
+impl Render for ImportRows {
+    fn headers() -> &'static [&'static str] {
+        &["NAME", "SCRIPT", "INSTANCES", "REUSE_PORT"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|row| {
+                vec![
+                    row.name.clone(),
+                    row.script.clone(),
+                    row.instances.to_string(),
+                    row.reuse_port.to_string(),
+                ]
+            })
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "NAME" => "name",
+            "SCRIPT" => "script",
+            "INSTANCES" => "instances",
+            "REUSE_PORT" => "reuse_port",
+            other => panic!("ImportRows::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
 /// `Response::Triggered(Vec<ActionReply>)` — one row per matched sheep, each
 /// carrying what happened when the daemon tried to deliver `shep trigger`'s
 /// action to it.
@@ -726,6 +789,30 @@ pub(crate) mod tests {
             apps: 9,
         };
         assert_no_drift(&row, |json| json, &[]);
+    }
+
+    /// fails if `ImportRow` grows a field that never reaches the table —
+    /// the same gate every other payload has.
+    #[test]
+    fn import_rows_do_not_drift() {
+        assert_no_drift(
+            &ImportRows(vec![
+                ImportRow {
+                    name: "api".to_string(),
+                    script: "/srv/api/dist/server.js".to_string(),
+                    instances: 2,
+                    reuse_port: true,
+                },
+                ImportRow {
+                    name: "worker".to_string(),
+                    script: "/srv/worker/dist/worker.js".to_string(),
+                    instances: 1,
+                    reuse_port: false,
+                },
+            ]),
+            |j| &j[0],
+            &[],
+        );
     }
 
     /// `DeletedIds` is `#[serde(transparent)]` over `Vec<u32>`, so it

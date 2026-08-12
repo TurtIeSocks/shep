@@ -128,6 +128,16 @@ pub enum Commands {
     // defeat the point of keeping it hidden.
     #[command(alias = "resurrect")]
     Muster,
+    /// Write a Flockfile from a pm2 dump. Starts nothing.
+    ///
+    /// Reads `--from`, or `~/.pm2/dump.pm2` if it names nothing — whichever
+    /// `pm2 save` last wrote. Every clustered app is named on stderr: shep
+    /// binds nothing, so N instances on one port need the app to set
+    /// `SO_REUSEPORT` itself, or the second instance hits EADDRINUSE at
+    /// start. Every env key the dump carried that was neither declared nor
+    /// recognizable session junk is named on stderr too, and left out of
+    /// the Flockfile, for the operator to decide.
+    Import(ImportArgs),
     /// Print a shell completion script.
     ///
     /// Static only: sheep names, fold names and other daemon-side
@@ -273,6 +283,23 @@ pub struct ReopenArgs {
     /// Which sheep (default: all)
     #[arg(default_value = DEFAULT_SELECTOR)]
     pub selector: String,
+}
+
+/// Arguments to `shep import`.
+#[derive(Debug, clap::Args)]
+pub struct ImportArgs {
+    /// Read this pm2 dump instead of `~/.pm2/dump.pm2`
+    #[arg(long)]
+    pub from: Option<PathBuf>,
+    /// Write the Flockfile here instead of `./Flockfile.toml`
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+    /// Print the Flockfile that would be written, and write nothing
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Overwrite an existing Flockfile
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments to `shep completions`.

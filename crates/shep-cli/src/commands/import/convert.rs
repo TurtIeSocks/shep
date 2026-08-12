@@ -38,11 +38,9 @@ use super::env;
 /// What one dump became: the apps to write, and everything the operator has
 /// to be told about them.
 ///
-/// Its fields are read only by this module's own tests today: no verb reads
-/// an `Imported` back out yet. `#[allow(dead_code)]` says so explicitly
-/// rather than inventing a call site nothing needs yet.
+/// Read by `commands/import/mod.rs`'s `import`, which renders `apps` as the
+/// Flockfile and every `notes` entry as its own stderr line.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct Imported {
     /// One entry per app name, in the order the dump first mentions it.
     pub apps: Vec<AppConfig>,
@@ -115,13 +113,8 @@ impl core::error::Error for ConvertError {}
 /// knows how to map. Every returned [`AppConfig`] has already been through
 /// [`shep_core::config::normalize()`].
 ///
-/// Not called outside this module's own tests yet: no verb wires this
-/// converter into the CLI. `#[allow(dead_code)]` says so explicitly rather
-/// than inventing a call site nothing needs yet.
-///
 /// # Errors
 /// - [`ConvertError::Rejected`] — a mapped app does not normalize (carries the app name and the reason).
-#[allow(dead_code)]
 pub(crate) fn convert(rows: Vec<DumpRow>) -> Result<Imported, ConvertError> {
     let mut order: Vec<String> = Vec::new();
     let mut groups: HashMap<String, Vec<DumpRow>> = HashMap::new();

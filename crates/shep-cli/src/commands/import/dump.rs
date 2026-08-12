@@ -101,16 +101,11 @@ impl core::error::Error for DumpError {}
 
 /// Parses a whole dump document.
 ///
-/// Not called outside this module's own tests yet: no verb wires a pm2 dump
-/// reader into the CLI. `#[allow(dead_code)]` says so explicitly rather than
-/// inventing a call site nothing needs yet.
-///
 /// # Errors
 /// - [`DumpError::Json`] — the document is not valid JSON.
 /// - [`DumpError::NotAnArray`] — valid JSON, but not the array of instance rows a dump is.
 /// - [`DumpError::RowMissingName`] — a row carries no `name`.
 /// - [`DumpError::RowMissingScript`] — a row carries no `pm_exec_path` (carries the keys it did find).
-#[allow(dead_code)]
 pub(crate) fn parse(source: &str) -> Result<Vec<DumpRow>, DumpError> {
     let document: Value =
         serde_json::from_str(source).map_err(|err| DumpError::Json(err.to_string()))?;

@@ -32,8 +32,8 @@ use crate::exit::ExitCode;
 // narrowed to that target rather than dropped.
 #[cfg_attr(windows, allow(unused_imports))]
 pub use rows::{
-    DeletedIds, EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, KillRow, PingRow, SavedRollRow,
-    TriggeredRows,
+    DeletedIds, EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, ImportRow, ImportRows, KillRow,
+    PingRow, SavedRollRow, TriggeredRows,
 };
 pub use table::{human_duration, render_table};
 

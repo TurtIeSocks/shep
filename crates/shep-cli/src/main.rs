@@ -36,6 +36,8 @@ use commands::bleats;
 #[cfg(unix)]
 use commands::daemon::{daemon_exit_code, run_daemon};
 #[cfg(unix)]
+use commands::import;
+#[cfg(unix)]
 use commands::lifecycle;
 #[cfg(unix)]
 use commands::logs;
@@ -277,6 +279,10 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => admin::kill(client, &mut streams, fmt).await,
             Err(code) => code,
         },
+        // Reads a file and writes a file; starts nothing, so there is
+        // nothing to ask the socket. `logs::flush_daemon` is the other arm
+        // that finishes without a client.
+        Commands::Import(ref args) => import::import(&mut streams, fmt, args),
         Commands::Completions(_) | Commands::Daemon(_) | Commands::Bleats(_) => {
             unreachable!("handled above, on unlocked handles")
         }
@@ -456,6 +462,24 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["shep", "muster"]).unwrap().command,
             Commands::Muster
+        ));
+    }
+
+    /// fails if `Commands::Import` is wired to another verb's function — the
+    /// same gap `save_parses_to_its_own_command` closes for `save`. This
+    /// pins clap's own parse only; it cannot see a dispatch arm in `run`
+    /// that parses correctly and then calls the wrong function — that class
+    /// of bug needs a real invocation of the compiled binary, which is what
+    /// `cli_e2e.rs`'s own import case (asserting the envelope's `command`
+    /// field, the way `saving_the_roll_then_mustering_reports_the_same_flock`
+    /// already does for `save`/`muster`) is for.
+    #[test]
+    fn import_parses_to_its_own_command() {
+        use clap::Parser;
+        use cli::Commands;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "import"]).unwrap().command,
+            Commands::Import(_)
         ));
     }
 

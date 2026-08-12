@@ -274,6 +274,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is what makes the verb idempotent for an init system that runs it more
   than once.
 
+- Add `shep import`, which reads a pm2 dump (`--from`, default
+  `~/.pm2/dump.pm2`) and writes it out as a Flockfile (`--out`, default
+  `./Flockfile.toml`) — the last piece of the pm2 cutover path this phase
+  builds. **Starts nothing**: no client, no daemon round trip, just a file
+  read and a file write. `--dry-run` prints the rendered Flockfile to
+  stdout instead of writing it, with no envelope, so
+  `shep import --dry-run > Flockfile.toml` produces a byte-exact file;
+  without it, an existing output path is left alone unless `--force`.
+
+  A pm2 dump is per-instance — one row per running process — so the
+  conversion collapses same-named rows back into one app each, taking the
+  first row's scalars (script, cwd, interpreter, ...) and the row count as
+  `instances`. **Every clustered app is named on stderr**: shep binds
+  nothing, so N instances on one port is `EADDRINUSE` at start unless the
+  app itself sets `SO_REUSEPORT` (Node's `reusePort: true`, needing Node
+  >= 22.12) — the warning exists so that is discovered at import time, not
+  at the first restart. **Every ambiguous env key is named on stderr and
+  left out of the Flockfile**: a key that is neither declared in an
+  ecosystem file's `env_<name>` block nor recognizable login-shell or pm2
+  session junk is the operator's to decide, never guessed at — an
+  inherited `BUN_INSTALL` or `DATABASE_URL` is exactly the kind of thing a
+  heuristic would eventually get wrong, silently. `NODE_APP_INSTANCE`
+  becomes `increment_var` rather than a copied value, since copying it
+  would pin instance 0's number into every instance.
+
+  The renderer serializes a purpose-built projection of `AppConfig`, not
+  the type itself — `AppConfig` is `#[serde(default)]` across roughly forty
+  fields and would bury the handful that matter under the rest, each
+  written out at its own spec default. Every field this importer can
+  produce is skipped when it already matches that default, and
+  `max_memory`/`restart_delay` render in their string forms (`"512M"`,
+  `"5s"`), never as raw integers a Flockfile parser would reject.
+
 ### Fixes
 
 - Open the shepherd's own `shepd.out.log`/`shepd.err.log` `O_APPEND` in the
