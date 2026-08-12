@@ -103,6 +103,24 @@ pub enum Request {
         /// log data, so the operator names the target (see `shep flush`).
         selector: SelectorSpec,
     },
+    /// Send a named action to every matched sheep over its shepherd channel
+    /// and report what each app says back (see `shep trigger`).
+    Trigger {
+        /// Which sheep. No default anywhere in the stack, matching
+        /// `stop`/`restart`/`reload`/`delete`/`flush`: an operator names the
+        /// target rather than trigger an action against the whole flock by
+        /// accident.
+        selector: SelectorSpec,
+        /// The action name. Free-form — the daemon never declares, parses,
+        /// or validates it; an app that does not recognize the name is
+        /// expected to say so in its own reply rather than stay silent.
+        action: String,
+        /// Argument text for the action, passed through to the app
+        /// verbatim. One opaque string, not structured data: the daemon
+        /// holds no schema for it, matching the shepherd channel's own
+        /// `action` message this ultimately becomes.
+        params: Option<String>,
+    },
     /// Graceful daemon shutdown
     KillDaemon,
     /// Subscribe this connection to bus topics (glob patterns)
@@ -162,6 +180,54 @@ pub struct ProcessInfo {
     pub err_file: Option<String>,
 }
 
+/// What happened when the daemon tried to deliver one sheep's triggered
+/// action.
+///
+/// `#[non_exhaustive]`: a future outcome — distinguishing a malformed reply
+/// from a well-formed one, say, or a second trigger already in flight for
+/// the same sheep — must not need a protocol version bump (IR-20).
+// wire format: changing existing variants is a breaking change
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ActionOutcome {
+    /// The app answered on the shepherd channel.
+    Replied {
+        /// The reply body, exactly as the app sent it.
+        body: String,
+    },
+    /// The sheep had no reachable shepherd channel for the daemon to
+    /// deliver the action over.
+    NoChannel,
+    /// The sheep is a reload drainee — mid-swap, on its way out — and the
+    /// daemon skipped it rather than deliver the action to a process
+    /// already being replaced.
+    Skipped,
+    /// The daemon delivered the action, but no reply arrived before the
+    /// app's configured action timeout elapsed.
+    TimedOut,
+}
+
+/// One matched sheep's row in a `Trigger` reply.
+///
+/// `EmptiedFile` (`crates/shep-cli/src/output/rows.rs`) is the precedent for
+/// a non-`ProcessInfo` row: a reply body has nowhere to live on
+/// [`ProcessInfo`], and [`Self::outcome`] is per-row rather than a
+/// whole-request refusal because spec §9's selector grammar (`all`,
+/// `/regex/`, `fold:`) makes a mixed flock the normal case — the same reason
+/// `Reopen`/`Flush` report per-item failure inside a success rather than
+/// failing the whole request.
+// wire format: changing this is a breaking change
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionReply {
+    /// The sheep's stable id.
+    pub id: u32,
+    /// The sheep's name.
+    pub name: String,
+    /// What happened when the daemon tried to deliver the action.
+    pub outcome: ActionOutcome,
+}
+
 /// One RPC response (pairs with [`Request`] variants)
 // wire format: changing existing variants is a breaking change
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -209,6 +275,10 @@ pub enum Response {
     /// selector names sheep, so the answer names sheep, and the count here
     /// matches what `Describe` would return for the same selector.
     Flushed(Vec<ProcessInfo>),
+    /// Answer to `Trigger` — one [`ActionReply`] row per matched sheep,
+    /// carrying what each one answered rather than a flock listing:
+    /// `ProcessInfo` has nowhere to hold a reply body.
+    Triggered(Vec<ActionReply>),
     /// Answer to `Subscribe`
     Subscribed,
     /// Answer to `KillDaemon`
@@ -408,6 +478,21 @@ mod tests {
                     selector: SelectorSpec::Name("web".to_string()),
                 },
             },
+            // `action`/`params` here match the spec's own §9 example
+            // (`trigger web set-log-level debug`) and channel.rs's
+            // with-params fixture verbatim, so a reader tracing a trigger
+            // from the CLI through the client↔daemon wire to the fd-3 wire
+            // sees the same two strings at every hop rather than three
+            // unrelated examples.
+            Envelope {
+                id: 8,
+                deadline_ms: None,
+                body: Request::Trigger {
+                    selector: SelectorSpec::Name("web".to_string()),
+                    action: "set-log-level".to_string(),
+                    params: Some("debug".to_string()),
+                },
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v1", requests);
     }
@@ -429,6 +514,24 @@ mod tests {
                     code: RpcErrorCode::NotFound,
                     message: "no sheep matches `web`".to_string(),
                 }),
+            },
+            // Unlike `Reopened`/`Flushed`/`Reloading` above (all wire-identical
+            // to `Flock`, just under a different `kind` tag, so pinning `Flock`
+            // once already covers their shape), `Triggered` carries a genuinely
+            // different row — `ActionReply` is not a `ProcessInfo` — so it earns
+            // its own entry. `Replied` is the struct-shaped variant of
+            // `ActionOutcome`, and so the one worth pinning here: the three
+            // unit variants serialize as bare `{"kind":"..."}`, a shape already
+            // proven by every fieldless variant elsewhere on this wire.
+            Reply {
+                id: 4,
+                result: Ok(Response::Triggered(vec![ActionReply {
+                    id: 3,
+                    name: "web".to_string(),
+                    outcome: ActionOutcome::Replied {
+                        body: "ok".to_string(),
+                    },
+                }])),
             },
         ];
         insta::assert_json_snapshot!("reply_wire_v1", replies);
@@ -535,5 +638,37 @@ mod tests {
             serde_json::from_str::<RpcErrorCode>("\"deadline_exceeded\"").unwrap(),
             RpcErrorCode::DeadlineExceeded
         );
+    }
+
+    #[test]
+    fn action_outcome_kinds_serialize_snake_case_and_round_trip() {
+        // The shared snapshots above exercise exactly one `ActionOutcome`
+        // variant (`Replied`, the only struct-shaped one, in
+        // `reply_wire_snapshots`) — nothing else there would catch a rename
+        // of `no_channel`, `skipped`, or `timed_out`. Pinned here instead,
+        // the same way `deadline_exceeded_code_serializes_snake_case` pins a
+        // lone `RpcErrorCode` variant above.
+        let cases = [
+            (
+                ActionOutcome::Replied {
+                    body: "pong".to_string(),
+                },
+                r#"{"kind":"replied","body":"pong"}"#,
+            ),
+            (ActionOutcome::NoChannel, r#"{"kind":"no_channel"}"#),
+            (ActionOutcome::Skipped, r#"{"kind":"skipped"}"#),
+            (ActionOutcome::TimedOut, r#"{"kind":"timed_out"}"#),
+        ];
+        for (outcome, wire) in cases {
+            assert_eq!(
+                serde_json::to_string(&outcome).unwrap(),
+                wire,
+                "{outcome:?}"
+            );
+            assert_eq!(
+                serde_json::from_str::<ActionOutcome>(wire).unwrap(),
+                outcome
+            );
+        }
     }
 }

@@ -107,5 +107,18 @@ expression: requests
         "value": "web"
       }
     }
+  },
+  {
+    "id": 8,
+    "deadline_ms": null,
+    "body": {
+      "kind": "trigger",
+      "selector": {
+        "kind": "name",
+        "value": "web"
+      },
+      "action": "set-log-level",
+      "params": "debug"
+    }
   }
 ]

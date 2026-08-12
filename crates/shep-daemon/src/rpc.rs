@@ -25,7 +25,8 @@ use tokio::sync::{broadcast, watch};
 
 use shep_core::config::normalize_all;
 use shep_core::protocol::{
-    BusEvent, Envelope, ProcessInfo, Reply, Request, Response, RpcError, RpcErrorCode, SelectorSpec,
+    ActionOutcome, ActionReply, BusEvent, Envelope, ProcessInfo, Reply, Request, Response,
+    RpcError, RpcErrorCode, SelectorSpec,
 };
 use shep_core::selector::ProcessSelector;
 
@@ -248,6 +249,11 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
         Request::Flush { selector } => {
             selector_call(id, selector, |s| ctx.supervisor.flush(s), Response::Flushed).await
         }
+        Request::Trigger {
+            selector,
+            action,
+            params,
+        } => trigger(id, selector, action, params, ctx).await,
         Request::Delete { selector } => match selector_of(selector) {
             Err(err) => reply(Err(err)),
             Ok(selector) => match ctx.supervisor.delete(selector).await {
@@ -356,6 +362,62 @@ where
     let result = match selector_of(spec) {
         Ok(selector) => call(selector).await.map(ok).map_err(|err| rpc_error(&err)),
         Err(err) => Err(err),
+    };
+    Outcome::Reply(Reply { id, result })
+}
+
+/// `Trigger`'s own resolve-then-map path. [`selector_call`] cannot serve
+/// it: that helper is typed `Fut: Future<Output = Result<Vec<ProcessInfo>,
+/// SupervisorError>>` with `ok: fn(Vec<ProcessInfo>) -> Response`, and
+/// `Response::Triggered` carries `Vec<ActionReply>` — a distinct row
+/// `ProcessInfo` cannot hold a reply body on. This instead mirrors
+/// [`run`]'s `Describe` arm: resolve the selector, list the flock, filter by
+/// it, answer [`not_found`] on an empty match — the part every selector-in
+/// verb shares regardless of what its rows carry.
+///
+/// Every match currently answers [`ActionOutcome::NoChannel`]. Nothing in
+/// this daemon build sends on a sheep's shepherd-channel sender or waits for
+/// a reply on it — `NoChannel` is the least specific of the four outcomes
+/// [`ActionOutcome`] can express, and the only one that claims nothing about
+/// a reply body, an elapsed wait, or a sheep's own lifecycle state.
+async fn trigger(
+    id: u64,
+    spec: SelectorSpec,
+    action: String,
+    params: Option<String>,
+    ctx: &RpcContext,
+) -> Outcome {
+    let result = match selector_of(spec) {
+        Err(err) => Err(err),
+        Ok(selector) => match ctx.supervisor.list_checked().await {
+            Err(err) => Err(rpc_error(&err)),
+            Ok(infos) => {
+                let hits: Vec<_> = infos
+                    .into_iter()
+                    .filter(|i| selector.matches(&i.name, i.id, i.fold.as_deref()))
+                    .collect();
+                if hits.is_empty() {
+                    Err(not_found())
+                } else {
+                    tracing::debug!(
+                        action,
+                        params = ?params,
+                        matched = hits.len(),
+                        "resolved a trigger's selector, but no delivery path exists \
+                         for its action yet"
+                    );
+                    Ok(Response::Triggered(
+                        hits.into_iter()
+                            .map(|i| ActionReply {
+                                id: i.id,
+                                name: i.name,
+                                outcome: ActionOutcome::NoChannel,
+                            })
+                            .collect(),
+                    ))
+                }
+            }
+        },
     };
     Outcome::Reply(Reply { id, result })
 }
@@ -710,6 +772,120 @@ mod tests {
             .await,
         );
         assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
+    }
+
+    /// Fails if `Trigger` is left to the catch-all arm at the bottom of
+    /// `run` — a verb this daemon has never heard of — which answers
+    /// `Internal` for a request it in fact implements.
+    ///
+    /// `NoChannel` is every row's answer here because nothing in this
+    /// daemon build sends on a sheep's shepherd-channel sender or waits for
+    /// a reply — see `trigger`'s own doc. What this test actually pins is
+    /// everything ELSE: routing to `Response::Triggered` rather than
+    /// `Internal`, and one `ActionReply` row per matched sheep carrying that
+    /// sheep's real id and name rather than, say, an empty vec or a single
+    /// row per request.
+    #[tokio::test(start_paused = true)]
+    async fn trigger_routes_to_the_flock_and_answers_no_channel_for_every_match() {
+        // Two apps, not one: ids start at 0, so a single-app harness would
+        // give `web` id 0 — indistinguishable from a row-mapping bug that
+        // drops the real id and leaves the field's default. Registering
+        // `other` first pushes `web` to id 1, a value only the real mapping
+        // produces.
+        let h = harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        let started = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![
+                            AppConfig::minimal("other", "./o"),
+                            AppConfig::minimal("web", "./srv"),
+                        ],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Response::Started(started) = started.result.unwrap() else {
+            panic!("expected started")
+        };
+        let web_id = started
+            .iter()
+            .find(|i| i.name == "web")
+            .expect("web registered")
+            .id;
+        assert_ne!(web_id, 0, "the test's own premise: web must not be id 0");
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::Trigger {
+                        selector: SelectorSpec::Name("web".to_string()),
+                        action: "gc".to_string(),
+                        params: None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Response::Triggered(rows) = reply.result.unwrap() else {
+            panic!("expected triggered")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, web_id);
+        assert_eq!(rows[0].name, "web");
+        assert_eq!(rows[0].outcome, ActionOutcome::NoChannel);
+    }
+
+    /// Fails if `Trigger` skips the selector conversion, or converts it
+    /// without reporting the failure: a peer regex the daemon cannot compile
+    /// is the client's usage error, not an internal one.
+    #[tokio::test(start_paused = true)]
+    async fn a_bad_trigger_selector_is_invalid_config() {
+        let h = harness(vec![]);
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Trigger {
+                        selector: SelectorSpec::Regex("((".to_string()),
+                        action: "gc".to_string(),
+                        params: None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
+    }
+
+    /// A selector matching no registered sheep is a whole-request `NotFound`
+    /// — same as every other selector-in verb, `a_selector_matching_nothing_is_not_found`
+    /// pins it for `Stop` — kept separate from a per-row `NoChannel`, which
+    /// only ever appears inside a non-empty match and never on its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_trigger_matching_nothing_is_not_found() {
+        let h = harness(vec![]);
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Trigger {
+                        selector: SelectorSpec::Name("ghost".to_string()),
+                        action: "gc".to_string(),
+                        params: None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::NotFound);
     }
 
     /// The whole of an operator's feedback loop for a rotation that failed:

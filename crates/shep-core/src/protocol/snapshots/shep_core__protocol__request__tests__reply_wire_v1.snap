@@ -40,5 +40,23 @@ expression: replies
         "message": "no sheep matches `web`"
       }
     }
+  },
+  {
+    "id": 4,
+    "result": {
+      "Ok": {
+        "kind": "triggered",
+        "data": [
+          {
+            "id": 3,
+            "name": "web",
+            "outcome": {
+              "kind": "replied",
+              "body": "ok"
+            }
+          }
+        ]
+      }
+    }
   }
 ]

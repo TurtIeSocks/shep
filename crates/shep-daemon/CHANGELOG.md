@@ -51,6 +51,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Answer `Request::Trigger` on the control socket: the daemon resolves the
+  selector against the flock, same as `Describe`, and answers `NotFound` on
+  an empty match. `selector_call` (the helper every other selector-in verb
+  shares) is typed to `Vec<ProcessInfo>` and cannot carry `ActionReply`'s
+  reply body, so this is its own small dispatch path rather than a forced
+  fit. Every matched sheep currently answers `ActionOutcome::NoChannel`: no
+  code yet sends on a sheep's shepherd-channel sender or waits for a reply on
+  it, and `NoChannel` is the one outcome that claims nothing about a reply
+  body, an elapsed wait, or a sheep's own lifecycle state — the honest answer
+  until the daemon can actually deliver an action and wait for one back.
 - Add the reload state machine: the supervisor can replace each instance of an
   app with a fresh one, one instance at a time, so the app has a window in
   which it can stay reachable across the swap. A replacement registers under a

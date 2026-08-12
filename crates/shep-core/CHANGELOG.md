@@ -118,6 +118,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the only place its outcome is reported at all; reusing `Start`/`Stop` and
   leaving subscribers to infer a reload from a doubled name would make the
   outcome unreadable to a new client as well as an old one.
+- Add `Request::Trigger` and `Response::Triggered`, asking a daemon to send a
+  named action to every matched sheep over its shepherd channel and report
+  what each app says back (`shep trigger <target> <action> [params]`).
+  Additive under `#[non_exhaustive]` on the same terms as `Reopen` above —
+  `PROTOCOL_VERSION` stays **1**, and an older daemon fails to decode the
+  verb rather than answering it. `Trigger` carries a `SelectorSpec` with no
+  default anywhere in the stack, matching `stop`/`restart`/`reload`/`delete`/
+  `flush`. `action` is a free-form `String` the daemon never parses or
+  validates, and `params` an `Option<String>` matching the shepherd channel's
+  own `action` message.
+
+  `Triggered` carries `Vec<ActionReply>`, not `Vec<ProcessInfo>`: a reply
+  body has nowhere to live on `ProcessInfo`, and `EmptiedFile`
+  (`shep-cli`'s own non-`ProcessInfo` row) is the precedent for a row built
+  for what one verb needs rather than reused from the flock-listing shape.
+  Each `ActionReply` carries the sheep's id and name plus a new
+  `#[non_exhaustive]` `ActionOutcome`: `Replied { body }` when the app
+  answered, `NoChannel` when the daemon had no shepherd channel to deliver
+  over, `Skipped` for a reload drainee, or `TimedOut` when nothing came back
+  before the app's action timeout. Per-row rather than a whole-request
+  refusal, matching `Reopen`/`Flush`'s own precedent: spec §9's selector
+  grammar (`all`, `/regex/`, `fold:`) makes a mixed flock the normal case,
+  and a channel-less sheep in that mix should not cost every other sheep its
+  answer.
 - Add `MemSize` and `UpDuration` config value newtypes, parsing the strict
   Flockfile grammars `^\d+(G|M|K)?$` and `^\d+(h|m|s)?$`.
 - Add `ProcStatus` with stable wire strings for the process lifecycle states.
