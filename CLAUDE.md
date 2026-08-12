@@ -29,10 +29,11 @@ is one class of test.
 cargo test -p shep-daemon --lib --all-features -- --skip watch:: --skip extras::
 ```
 
-**1.3s, 316 of 395 lib tests.** The 79 it skips are filesystem-watch tests that
-wait on `fseventsd`; 26 of them burn 281s of CPU between them, and they are the
-entire reason a full run costs two minutes. A mutation in `supervisor.rs` does
-not need them.
+**1.25s, 333 of 412 lib tests.** The 79 it skips are filesystem-watch tests
+that wait on `fseventsd`; 26 of them burn 281s of CPU between them, and they
+are the entire reason the unfiltered lib run costs 23s. A mutation in
+`supervisor.rs` does not need them — but a change to `extras.rs` or the
+sampler does, so run the unfiltered lib suite when touching either.
 
 ### The task gate — run once, when the task is otherwise done
 
