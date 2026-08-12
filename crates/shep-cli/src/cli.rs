@@ -150,6 +150,10 @@ pub enum Commands {
     /// command to run and exits non-zero, so a script notices. Under sudo
     /// the unit is built for $SUDO_USER rather than root, so it supervises
     /// the flock the operator actually has.
+    ///
+    /// Under sudo this also warns that PATH may have been replaced by
+    /// sudo's own secure_path before shep ever saw it, and shows the exact
+    /// PATH about to go into the unit so you can check it yourself.
     Startup(StartupArgs),
     /// Disable and remove the unit `startup` installed.
     ///

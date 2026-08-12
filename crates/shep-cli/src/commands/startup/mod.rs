@@ -22,7 +22,9 @@ use unit::{Init, UnitSpec};
 
 use crate::cli::{Format, StartupArgs};
 use crate::exit::ExitCode;
-use crate::output::{StartupStep, StartupSteps, Streams, emit, emit_error, write_outcome};
+use crate::output::{
+    StartupStep, StartupSteps, Streams, emit, emit_error, emit_notice, write_outcome,
+};
 
 /// `$SHEP_HOME`'s own directory name under a user's home, mirroring
 /// `ShepPaths::resolve`'s `home_dir.join(".shep")`. A literal there and a
@@ -69,6 +71,12 @@ pub(crate) struct StartupPlan {
     pub unit_path: PathBuf,
     /// The launchd label, unused on systemd.
     pub label: String,
+    /// `$SUDO_USER`, resolved once in [`plan`] the same way [`Privilege`]
+    /// is: a value [`install`] reads rather than an environment lookup of
+    /// its own, so a test can drive the sanitised-`PATH` warning below
+    /// without `std::env::set_var` — `unsafe` in edition 2024, and this
+    /// crate is `#![forbid(unsafe_code)]`.
+    pub sudo_user: Option<String>,
 }
 
 /// A refusal that never got as far as a step: the exit code to return, and
@@ -155,6 +163,14 @@ pub(crate) fn target_home(explicit: Option<&Path>, user_home: &Path) -> PathBuf 
 ///    [`ExitCode::Failure`] — non-zero so a script notices. shep never
 ///    escalates on its own.
 ///
+/// Past that point the unit is going to be written, and if [`plan`] saw
+/// `$SUDO_USER` set, [`secure_path_warning`] prints a notice naming the
+/// `PATH` about to go into it — `sudo` on most distributions replaces
+/// `PATH` with its own `secure_path` before shep ever runs, and that
+/// substitution happens before shep is exec'd, so this is a "may have"
+/// rather than a refusal: shep has no login `PATH` left to compare against,
+/// only the operator does.
+///
 /// The privilege is a parameter rather than a `geteuid()` call in here for
 /// the reason [`Privilege`]'s own doc gives, and `plan.unit_path` is a field
 /// rather than a call to `unit::systemd_unit_path` for the matching one: a
@@ -200,6 +216,9 @@ pub(crate) fn install(
             ),
         );
     }
+    if let Some(message) = secure_path_warning(plan.sudo_user.as_deref(), &plan.spec) {
+        let _ = emit_notice(&mut *streams.err, fmt, "secure_path", &message);
+    }
 
     let mut steps = vec![write_unit(plan)];
     match plan.init {
@@ -216,6 +235,30 @@ pub(crate) fn install(
         )),
     }
     report(streams, fmt, "startup", steps)
+}
+
+/// The notice [`install`] prints when `$SUDO_USER` was set: `None` if it
+/// was not, else a message naming `sudo_user` and showing `spec.path` in
+/// full, so the operator can check it against that user's login `PATH`
+/// without a second lookup.
+///
+/// A pure function of the two values rather than an environment read of its
+/// own, matching [`target_user`]/[`target_home`]'s own shape: this crate is
+/// `#![forbid(unsafe_code)]` (`cli.rs`), so nothing in its test suite can
+/// call the `unsafe`-in-edition-2024 `std::env::set_var` to establish an
+/// ambient `$SUDO_USER` and watch [`plan`] read it. Driving this function
+/// directly with a resolved `sudo_user` is the next best thing, and the
+/// thing that actually matters: the text the operator reads.
+fn secure_path_warning(sudo_user: Option<&str>, spec: &UnitSpec) -> Option<String> {
+    let sudo_user = sudo_user?;
+    Some(format!(
+        "sudo may have replaced PATH with its own secure_path before shep ever saw it \
+         (SUDO_USER={sudo_user}); the unit now carries PATH={}; compare it against \
+         {sudo_user}'s login PATH, and if a directory such as ~/.bun/bin or ~/.cargo/bin \
+         is missing, run shep unstartup then sudo --preserve-env=PATH shep startup to \
+         carry it through instead",
+        spec.path.to_string_lossy(),
+    ))
 }
 
 /// Disables and removes the unit, or prints the command that would.
@@ -492,6 +535,7 @@ fn plan(explicit_home: Option<&Path>, args: &StartupArgs) -> Result<StartupPlan,
             working_dir: passwd_home,
         },
         unit_path,
+        sudo_user,
     })
 }
 
@@ -553,6 +597,7 @@ mod tests {
             },
             unit_path: home.with_file_name("shep-deploy.service"),
             label: unit::launchd_label("deploy"),
+            sudo_user: None,
         }
     }
 
@@ -580,6 +625,39 @@ mod tests {
         assert_eq!(
             target_home(Some(Path::new("/srv/shep")), Path::new("/home/rin")),
             Path::new("/srv/shep")
+        );
+    }
+
+    /// fails if the warning fires without `$SUDO_USER`, or if it fires with
+    /// one and drops the name or the exact `PATH` about to be written. The
+    /// first would warn an operator who never touched `sudo`; the second
+    /// would leave the one who did with nothing to check the captured
+    /// `PATH` against.
+    #[test]
+    fn secure_path_warning_names_the_sudo_user_and_the_full_path_only_under_sudo() {
+        let spec = UnitSpec {
+            user: "deploy".to_string(),
+            exec: PathBuf::from("/usr/local/bin/shep"),
+            home: PathBuf::from("/home/deploy/.shep"),
+            path: OsString::from("/usr/local/sbin:/usr/local/bin:/usr/bin:/bin"),
+            working_dir: PathBuf::from("/home/deploy"),
+        };
+        assert_eq!(
+            secure_path_warning(None, &spec),
+            None,
+            "no $SUDO_USER means shep was never run through sudo at all"
+        );
+
+        let message =
+            secure_path_warning(Some("rin"), &spec).expect("$SUDO_USER was set, so this warns");
+        assert!(message.contains("SUDO_USER=rin"), "{message}");
+        assert!(
+            message.contains("/usr/local/sbin:/usr/local/bin:/usr/bin:/bin"),
+            "the full captured PATH must be readable without a second lookup: {message}"
+        );
+        assert!(
+            message.contains("--preserve-env=PATH"),
+            "the operator needs a way to get the PATH they meant: {message}"
         );
     }
 
@@ -615,6 +693,32 @@ mod tests {
             !plan_for_test(&home).unit_path.exists(),
             "an unprivileged startup writes no unit"
         );
+    }
+
+    /// fails if the secure-`PATH` warning is checked before the privilege
+    /// gate rather than after it. Nothing is written on this path — there
+    /// is no `PATH` yet to show — so a plan carrying `$SUDO_USER` must stay
+    /// as silent about it as the plain refusal above.
+    #[test]
+    fn an_unprivileged_startup_under_sudo_still_prints_no_secure_path_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".shep");
+        std::fs::create_dir_all(&home).unwrap();
+        let plan = StartupPlan {
+            sudo_user: Some("rin".to_string()),
+            ..plan_for_test(&home)
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            install(&mut streams, Format::Table, &plan, Privilege::Unprivileged);
+        }
+        let printed = String::from_utf8(err).unwrap();
+        assert!(!printed.contains("secure_path"), "{printed}");
     }
 
     /// fails if a `$SHEP_HOME` that does not exist is accepted. That is what
@@ -664,7 +768,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join(".shep");
         std::fs::create_dir_all(&home).unwrap();
-        let plan = plan_for_test(&home);
+        let plan = StartupPlan {
+            sudo_user: Some("rin".to_string()),
+            ..plan_for_test(&home)
+        };
         std::fs::write(&plan.unit_path, "# hand-edited\n").unwrap();
 
         let mut out = Vec::new();
@@ -683,6 +790,11 @@ mod tests {
             "{printed}"
         );
         assert!(printed.contains("unstartup"), "{printed}");
+        assert!(
+            !printed.contains("secure_path"),
+            "a plan carrying $SUDO_USER still warns nothing on a refusal path \
+             that wrote no unit: {printed}"
+        );
         assert_eq!(
             std::fs::read_to_string(&plan.unit_path).unwrap(),
             "# hand-edited\n",
