@@ -144,10 +144,22 @@ This is deliberately a marker rather than a second registry. Duplicating
 supervision would mean teaching every feature since Phase 2 — reload, watch,
 cron, limits, the log plane, the muster roll — about a second population, or
 excluding it from each. The risk this accepts is a `dog` flag accumulating
-special cases until it is a second system wearing the first one's clothes;
-**if `dog` starts appearing in match arms across `supervisor.rs`, that is the
-signal the choice was wrong**, and it is worth saying so now while it is
-cheap to notice.
+special cases until it is a second system wearing the first one's clothes. The
+signal is narrower than "a `dog` branch appears somewhere", which would fire on
+correct code:
+
+- **A `dog` branch is expected where it answers *where did this come from* or
+  *who should see this*.** Configured in `shep.toml` rather than the Flockfile,
+  absent from the muster roll, kept out of the sheep table, skipped by
+  `reload all`. That is the lifecycle difference doing its job.
+- **A `dog` branch is a warning where it answers *how is this supervised*.** A
+  different kill ladder, a different backoff curve, a different restart budget,
+  a different meaning for `Errored`. At that point a dog has stopped being a
+  process with a marker and become a second kind of thing, and the honest move
+  is the separate registry this section declined.
+
+Checkable as: does `dog` reach *inside* the supervision machinery, or only its
+edges — selection, listing, persistence?
 
 ## The metrics dog
 
