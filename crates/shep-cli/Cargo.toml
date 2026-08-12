@@ -53,6 +53,10 @@ futures-util.workspace = true
 # serializer — `serde_json` alone does not bring either.
 serde.workspace = true
 serde_json.workspace = true
+# Rendering the Flockfile `shep import` writes. `parse` is unused here — the
+# CLI reads Flockfiles through shep-core — but the workspace entry names both
+# and a per-crate feature narrowing would be the only difference.
+toml.workspace = true
 
 [dev-dependencies]
 # The same shep-client the `[dependencies]` entry above pulls in, asking for

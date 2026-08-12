@@ -5,6 +5,7 @@
 pub mod admin;
 pub mod bleats;
 pub mod daemon;
+pub(crate) mod import;
 pub mod lifecycle;
 pub mod logs;
 pub mod muster;

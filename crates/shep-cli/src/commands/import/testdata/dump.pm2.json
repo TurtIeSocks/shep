@@ -1,0 +1,96 @@
+[
+  {
+    "name": "api",
+    "pid": 41201,
+    "pm_id": 0,
+    "pm_exec_path": "/srv/api/dist/server.js",
+    "args": ["--port", "8080"],
+    "pm_cwd": "/srv/api",
+    "exec_interpreter": "node",
+    "exec_mode": "cluster_mode",
+    "autorestart": true,
+    "merge_logs": false,
+    "max_memory_restart": 536870912,
+    "SSH_TTY": "/dev/pts/3",
+    "XDG_SESSION_ID": "914",
+    "BUN_INSTALL": "/home/deploy/.bun",
+    "env": {
+      "NODE_ENV": "production",
+      "NODE_APP_INSTANCE": "0",
+      "PM2_HOME": "/home/deploy/.pm2",
+      "BUN_INSTALL": "/home/deploy/.bun",
+      "SSH_TTY": "/dev/pts/3",
+      "XDG_SESSION_ID": "914",
+      "MOTD_SHOWN": "pam",
+      "LS_COLORS": "rs=0:di=01;34:ln=01;36:",
+      "LANG": "en_US.UTF-8",
+      "SHLVL": "1",
+      "PATH": "/home/deploy/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+    },
+    "env_production": { "NODE_ENV": "production" }
+  },
+  {
+    "name": "api",
+    "pid": 41202,
+    "pm_id": 1,
+    "pm_exec_path": "/srv/api/dist/server.js",
+    "args": ["--port", "8080"],
+    "pm_cwd": "/srv/api",
+    "exec_interpreter": "node",
+    "exec_mode": "cluster_mode",
+    "autorestart": true,
+    "merge_logs": false,
+    "max_memory_restart": 536870912,
+    "env": {
+      "NODE_ENV": "production",
+      "NODE_APP_INSTANCE": "1",
+      "PM2_HOME": "/home/deploy/.pm2",
+      "BUN_INSTALL": "/home/deploy/.bun",
+      "SSH_TTY": "/dev/pts/3",
+      "XDG_SESSION_ID": "914",
+      "MOTD_SHOWN": "pam",
+      "LS_COLORS": "rs=0:di=01;34:ln=01;36:",
+      "LANG": "en_US.UTF-8",
+      "SHLVL": "1",
+      "PATH": "/home/deploy/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+    },
+    "env_production": { "NODE_ENV": "production" }
+  },
+  {
+    "name": "worker",
+    "pid": 41310,
+    "pm_id": 2,
+    "pm_exec_path": "/srv/worker/index.ts",
+    "args": [],
+    "pm_cwd": "/srv/worker",
+    "exec_interpreter": "bun",
+    "exec_mode": "fork_mode",
+    "autorestart": false,
+    "restart_delay": 5000,
+    "merge_logs": true,
+    "env": {
+      "QUEUE_URL": "redis://127.0.0.1:6379/2",
+      "JAVA_HOME": "/usr/lib/jvm/default",
+      "SSH_TTY": "/dev/pts/3",
+      "LANG": "en_US.UTF-8"
+    },
+    "env_staging": {
+      "QUEUE_URL": "redis://127.0.0.1:6379/2",
+      "QUEUE_CONCURRENCY": 4
+    }
+  },
+  {
+    "name": "migrate",
+    "pid": 41455,
+    "pm_id": 3,
+    "pm_exec_path": "/srv/migrate/bin/migrate",
+    "args": ["--once"],
+    "pm_cwd": "/srv/migrate",
+    "exec_interpreter": "none",
+    "exec_mode": "fork_mode",
+    "env": {
+      "DATABASE_URL": "postgres://localhost/app",
+      "TERM": "xterm-256color"
+    }
+  }
+]
