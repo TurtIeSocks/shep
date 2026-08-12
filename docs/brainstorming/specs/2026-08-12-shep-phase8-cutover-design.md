@@ -48,8 +48,10 @@ are tested; neither is reachable by an operator.
   bypassing the debounce, and replies with the path written and the number of
   apps recorded. The reply matters: a save that silently does nothing is the
   failure mode this verb exists to rule out.
-- `shep muster` — restores the roll, autostarting the daemon if it is not up.
-  This is what the init unit runs, and pm2's `resurrect`.
+- `shep muster` — restores the roll into a running daemon, autostarting the
+  daemon if it is not up. This is the operator's equivalent of pm2's
+  `resurrect`. It is **not** what the init unit runs; see the startup section
+  for why `ExecStart` has to be the daemon itself.
 
 ## `shep import`
 
@@ -96,10 +98,19 @@ resolved exec path, `SHEP_HOME`, the target user, and **`PATH` captured from
 the invoking environment** — the mechanism that makes interpreters installed
 under `~/.bun` or `~/.cargo` findable after a reboot.
 
-systemd unit: `Type=notify`, `ExecStart` runs `shep muster` in the foreground,
+systemd unit: `Type=notify`, `ExecStart=shep daemon --foreground`,
 `ExecReload=shep reload all`, `ExecStop=shep kill`, `Restart=on-failure`,
 `WantedBy=multi-user.target`. macOS: a `LaunchDaemon` plist with the same
 content.
+
+**`ExecStart` is the daemon, not `shep muster`.** Under `Type=notify` systemd
+supervises the process it starts, so `ExecStart` has to be the long-running
+daemon; `shep muster` is a client verb that talks to one. pm2 can write
+`ExecStart=pm2 resurrect` only because it uses `Type=forking` and tracks the
+forked child through a PID file. The restore still happens — the daemon
+already restores the roll at boot — so spec §13.4's "systemd unit runs
+`shep muster`" describes the effect rather than the literal argv, and §13.4
+should be reworded to say so.
 
 Two new daemon behaviours fall out of this:
 
