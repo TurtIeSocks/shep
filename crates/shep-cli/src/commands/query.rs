@@ -21,7 +21,9 @@ use shep_core::protocol::{Request, Response, SelectorSpec};
 use crate::cli::{FoldArgs, Format, SelectorArgs};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
-use crate::output::{FlockRows, PingRow, Render, Streams, emit, emit_error, write_outcome};
+use crate::output::{
+    DogRows, FlockRows, PingRow, Render, Streams, emit, emit_error, emit_flock, write_outcome,
+};
 
 /// Sends `body`, renders whatever the daemon answers through [`emit`], and
 /// maps every way that can go wrong to its exit code.
@@ -92,16 +94,64 @@ async fn describe_selector(
     .await
 }
 
-/// Lists the whole flock.
+/// Lists the whole flock: the sheep table, then the dogs table beneath it
+/// whenever any dog is registered — [`emit_flock`]'s own job.
+///
+/// Not routed through [`request_and_render`]: that helper renders exactly
+/// one [`Render`] type per verb, through [`emit`]. A flock listing renders
+/// through two tables built from one `Vec<ProcessInfo>`, which no single
+/// `Render` impl can express — `emit_flock` is the small path this verb
+/// needs instead of widening that helper into a second renderer, keeping
+/// the same connect/request/extract/render shape every other query verb
+/// here has.
 pub async fn flock(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> ExitCode {
+    match client.request(Request::ListFlock).await {
+        Ok(Response::Flock(procs)) => {
+            write_outcome(emit_flock(&mut *streams.out, fmt, "flock", procs))
+        }
+        Ok(_) => {
+            let message = "the daemon answered with a response this client does not understand";
+            let _ = emit_error(
+                &mut *streams.err,
+                fmt,
+                ExitCode::Internal.code_str(),
+                message,
+            );
+            ExitCode::Internal
+        }
+        Err(err) => {
+            let code = ExitCode::from(&err);
+            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
+            code
+        }
+    }
+}
+
+/// Lists the dogs, and nothing else: the same `Request::ListFlock` `flock`
+/// sends, filtered to the entries carrying a `dog` marker and rendered as
+/// [`DogRows`] through the ordinary [`request_and_render`] path every other
+/// query verb here uses — `DogRows` is a [`Render`] impl like any other, so
+/// no bespoke render path is needed the way `flock`'s own split is.
+///
+/// Deliberately not [`emit_flock`]: that function's contract is a MIXED
+/// listing, sheep table first: handing it a dogs-only `Vec<ProcessInfo>`
+/// would still print the sheep table's header row for zero sheep, which is
+/// exactly what this verb's own doc comment (`Commands::Dogs`, "and nothing
+/// else") rules out. The two call sites still share one table renderer —
+/// `render_table::<DogRows>`, reached here through `emit` and from inside
+/// `emit_flock`'s own dogs section — so there is exactly one place that
+/// knows how to lay out a dogs table.
+pub async fn dogs(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> ExitCode {
     request_and_render(
         client,
         streams,
         fmt,
-        "flock",
+        "dogs",
         Request::ListFlock,
         |response| match response {
-            Response::Flock(procs) => Some(FlockRows(procs)),
+            Response::Flock(procs) => Some(DogRows(
+                procs.into_iter().filter(|p| p.dog.is_some()).collect(),
+            )),
             _ => None,
         },
     )

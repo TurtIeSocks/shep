@@ -260,6 +260,10 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => query::flock(&client, &mut streams, fmt).await,
             Err(code) => code,
         },
+        Commands::Dogs => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => query::dogs(&client, &mut streams, fmt).await,
+            Err(code) => code,
+        },
         Commands::Describe(ref args) => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => query::describe(&client, &mut streams, fmt, args).await,
             Err(code) => code,
@@ -479,6 +483,19 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["shep", "save"]).unwrap().command,
             Commands::Save
+        ));
+    }
+
+    /// fails if `Commands::Dogs` is wired to another verb's function. The
+    /// dispatch arms carried no unit coverage at all until recently, and a
+    /// verb pointed at the wrong handler was invisible workspace-wide.
+    #[test]
+    fn dogs_parses_to_its_own_command() {
+        use clap::Parser;
+        use cli::Commands;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "dogs"]).unwrap().command,
+            Commands::Dogs
         ));
     }
 

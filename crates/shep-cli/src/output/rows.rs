@@ -11,7 +11,7 @@
 //! kind, so this really is pure tier.
 
 use serde::Serialize;
-use shep_core::protocol::{ActionOutcome, ActionReply, ProcessInfo};
+use shep_core::protocol::{ActionOutcome, ActionReply, DogSource, ProcessInfo};
 
 use super::Render;
 
@@ -93,6 +93,94 @@ impl Render for FlockRows {
         // with its own SOURCE column; this field rides the JSON only so a
         // consumer that switches on `ProcessInfo` shape alone still sees it.
         "dog",
+    ];
+}
+
+/// The dogs half of a flock listing: the `ProcessInfo`s whose `dog` marker
+/// is set, rendered by where they came from rather than by their place in
+/// the flock.
+///
+/// No `ID` column, and that is the point of the split rather than an
+/// omission: ids reflect spawn order across one registry, so a dog booted
+/// alongside the flock lands among the sheep's numbers. Nobody sees that,
+/// because the two populations are never rendered together — which is what
+/// makes the shared id space cost nothing at the surface.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct DogRows(pub Vec<ProcessInfo>);
+
+impl Render for DogRows {
+    fn headers() -> &'static [&'static str] {
+        &[
+            "NAME", "SOURCE", "STATUS", "PID", "RESTARTS", "CPU", "MEM", "UPTIME",
+        ]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|p| {
+                vec![
+                    p.name.clone(),
+                    // `built-in` or `adopted`, never the adopted path — see
+                    // `Self::JSON_ONLY`'s sibling reasoning on `FlockRows`
+                    // for why a path stays out of the table. `None` reads
+                    // as `-`: this row only exists because some caller
+                    // filtered on `dog.is_some()`, so a `None` here is a
+                    // caller bug, not a value this type should panic over.
+                    // `DogSource` is `#[non_exhaustive]` (IR-20), so a kind
+                    // this client predates renders `unknown` rather than
+                    // failing to compile against a future daemon.
+                    match &p.dog {
+                        Some(DogSource::BuiltIn) => "built-in".to_string(),
+                        Some(DogSource::Adopted { .. }) => "adopted".to_string(),
+                        Some(_) => "unknown".to_string(),
+                        None => "-".to_string(),
+                    },
+                    p.status.to_string(),
+                    p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+                    p.restarts.to_string(),
+                    p.cpu_percent
+                        .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
+                    p.memory_bytes
+                        .map_or_else(|| "-".to_string(), super::human_bytes),
+                    super::human_duration(p.uptime_ms),
+                ]
+            })
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "NAME" => "name",
+            "SOURCE" => "dog",
+            "STATUS" => "status",
+            "PID" => "pid",
+            "RESTARTS" => "restarts",
+            "CPU" => "cpu_percent",
+            "MEM" => "memory_bytes",
+            "UPTIME" => "uptime_ms",
+            other => panic!("DogRows::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[
+        // Ids reflect spawn order across the one registry shared with the
+        // sheep half; a dog booted alongside the flock lands among the
+        // sheep's own numbers. No column, because the two populations are
+        // never rendered together for that number to be compared against —
+        // see this type's own doc comment.
+        "id",
+        // Fold membership is a sheep concept — a dog is supervised, never
+        // grouped for a selector to match by fold.
+        "fold",
+        // Same reason `FlockRows` keeps them out of its own table: absolute
+        // paths, often longer than every other column put together. They
+        // ride the JSON so a programmatic consumer can still find them.
+        "out_file", "err_file",
     ];
 }
 
@@ -666,7 +754,7 @@ pub(crate) mod tests {
 
     use super::*;
 
-    fn sample_info(id: u32, name: &str, uptime_ms: u64) -> ProcessInfo {
+    pub(crate) fn sample_info(id: u32, name: &str, uptime_ms: u64) -> ProcessInfo {
         ProcessInfo {
             id,
             name: name.to_string(),
@@ -710,6 +798,19 @@ pub(crate) mod tests {
 
     pub(crate) fn info_with_uptime_ms(uptime_ms: u64) -> ProcessInfo {
         sample_info(1, "web", uptime_ms)
+    }
+
+    /// A dog-shaped `ProcessInfo`: `sample_info` with `dog` set to `source`.
+    /// The id is fixed rather than threaded through as a parameter, like
+    /// `fold`/`cpu_percent` in `sample_info` itself — `DogRows` has no `ID`
+    /// column (its own doc comment says why), so no test needs one that
+    /// varies. `pub(crate)` so `output::mod`'s own tests can build a mixed
+    /// sheep-and-dog listing without a second copy of this helper.
+    pub(crate) fn dog_info(name: &str, source: DogSource) -> ProcessInfo {
+        ProcessInfo {
+            dog: Some(source),
+            ..sample_info(1, name, 60_000)
+        }
     }
 
     /// The anti-drift gate, written once and instantiated three times — once
@@ -811,6 +912,50 @@ pub(crate) mod tests {
         // not raw echoes of `uptime_ms`/`cpu_percent`/`memory_bytes` — see
         // the doc comment on `assert_no_drift` above.
         assert_no_drift(&sample_flock(), |j| &j[0], &["UPTIME", "CPU", "MEM"]);
+    }
+
+    /// fails if `SOURCE` renders the adopted binary's path into the table.
+    /// A path is wider than every other column combined and would push
+    /// UPTIME off a terminal — the same reason `FlockRows` keeps the log
+    /// paths out of its own table, and the path is still one `--format
+    /// json` away.
+    #[test]
+    fn the_source_column_names_a_kind_and_leaves_the_path_to_json() {
+        let rows = DogRows(vec![
+            dog_info("metrics", DogSource::BuiltIn),
+            dog_info(
+                "otel",
+                DogSource::Adopted {
+                    path: "/usr/local/bin/shep-otel".to_string(),
+                },
+            ),
+        ]);
+        let headers = DogRows::headers();
+        let at = |cells: &[String], h: &str| {
+            cells[headers.iter().position(|x| *x == h).unwrap()].clone()
+        };
+        assert_eq!(at(&rows.rows()[0], "SOURCE"), "built-in");
+        assert_eq!(at(&rows.rows()[1], "SOURCE"), "adopted");
+
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[1]["dog"]["path"], "/usr/local/bin/shep-otel");
+    }
+
+    /// The anti-drift gate for this type. Fails if a `ProcessInfo` field is
+    /// serialized with neither a column nor a `JSON_ONLY` entry.
+    ///
+    /// `SOURCE` joins `formatted` alongside `UPTIME`/`CPU`/`MEM`: its own
+    /// JSON value is the tagged `DogSource` object (`{"kind": "built_in"}`
+    /// or `{"kind": "adopted", "path": ...}`), not a plain string this
+    /// gate's cell comparison knows how to stringify — the test above pins
+    /// that mapping instead.
+    #[test]
+    fn dog_rows_do_not_drift() {
+        assert_no_drift(
+            &DogRows(vec![dog_info("metrics", DogSource::BuiltIn)]),
+            |j| &j[0],
+            &["UPTIME", "CPU", "MEM", "SOURCE"],
+        );
     }
 
     /// fails if a sheep with no reading renders an empty cell or a zero. A

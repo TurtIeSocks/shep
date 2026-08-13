@@ -88,6 +88,8 @@ pub enum Commands {
     /// List the flock.
     #[command(visible_aliases = ["list", "ls"])]
     Flock,
+    /// List the dogs, and nothing else.
+    Dogs,
     /// Describe one sheep in detail.
     Describe(SelectorArgs),
     /// Send a named action to matched sheep and report what each app

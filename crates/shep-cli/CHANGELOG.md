@@ -12,6 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- `shep flock` prints a second table beneath the flock's own whenever any
+  dog is registered, captioned `Dogs` — headers `NAME`, `SOURCE`, `STATUS`,
+  `PID`, `RESTARTS`, `CPU`, `MEM`, `UPTIME`. No `ID` column: ids reflect
+  spawn order across the one registry the sheep and dogs share, and the two
+  populations are never rendered together, so that shared id space costs
+  nothing at the surface. `SOURCE` renders `built-in` or `adopted`; an
+  adopted binary's own path stays JSON-only, the same reason `flock`'s own
+  table already keeps `out_file`/`err_file` off it.
+
+  `shep dogs` lists the dogs and nothing else, through that same table
+  renderer. Neither verb gained a flag to opt in or out — a flock listing
+  always shows every sheep and every dog.
+
+  `--format json` is unchanged in shape: one `data` array, every entry,
+  each still carrying its own `dog` marker. The table split is a rendering
+  decision only.
+
 - Add the clap command tree (`Cli`, `Commands`, and every argument struct
   the CLI will ever parse — `Start`, `Stop`/`Restart`/`Reload`/`Delete`/
   `Describe`, `Trigger`, `Flock` (aliases `list`/`ls`), `Fold`, `Bleats`
