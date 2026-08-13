@@ -61,8 +61,9 @@ for what phase is next.
 
 **Dogs subsystem** (spec §8) — the whole thing: the dog contract, the
 `enable`/`disable`/`dogs`/`barks` verbs and hidden `dog <name>` dispatch,
-the metrics dog (Prometheus on `127.0.0.1:9615`) and its Grafana dashboard
-JSON, the bark dog (Discord/Slack/JSON webhook sinks, alert rules).
+the metrics dog (Prometheus on `127.0.0.1:9615`; its reference Grafana
+dashboard shipped in `assets/grafana/`, see Task 16), the bark dog
+(Discord/Slack/JSON webhook sinks, alert rules).
 `[daemon] enabled_dogs` and `[dog.<name>]` (`DaemonSection`,
 `crates/shep-core/src/config/daemon.rs`) parse and validate today but have
 no reader — daemon boot now warns if either is set
