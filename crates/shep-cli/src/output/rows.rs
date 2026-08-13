@@ -201,8 +201,10 @@ impl Render for DogRows {
 pub struct DogEnabledRow {
     /// The dog's name.
     pub name: String,
-    /// Where its binary comes from — always [`DogSource::BuiltIn`] for this
-    /// verb; `shep adopt` is the one that carries a path.
+    /// Where its binary comes from, as `commands/dogs.rs`'s `dog_source`
+    /// read it out of `shep.toml`: [`DogSource::Adopted`], carrying the
+    /// path `shep adopt` recorded, for a name in `[daemon] adopted_dogs`,
+    /// and [`DogSource::BuiltIn`] for any name that is not.
     pub source: DogSource,
     /// Whether a shepherd was reached and asked to start the dog. `false`
     /// means only the config changed — decision 11: `enable` never
@@ -249,10 +251,9 @@ impl Render for DogEnabledRow {
 ///
 /// Constructed by `commands/dogs.rs`'s `disable`. [`Self::source`] is not
 /// echoed from any RPC reply — `Request::DisableDog` answers
-/// `Response::Deleted`, which carries only ids — so this repeats the same
-/// [`DogSource::BuiltIn`] every `disable` sends, for the same reason
-/// [`DogEnabledRow::source`] does: `shep rehome` is the verb that deals in
-/// an adopted dog's own path.
+/// `Response::Deleted`, which carries only ids — so it comes from the same
+/// `shep.toml` lookup [`DogEnabledRow::source`] uses: an adopted dog
+/// reports as adopted here, whichever of the two verbs stopped it.
 #[derive(Debug, Serialize)]
 pub struct DogDisabledRow {
     /// The dog's name.
@@ -300,9 +301,9 @@ impl Render for DogDisabledRow {
 /// running, the resulting `EnableDog` RPC actually did.
 ///
 /// Constructed by `commands/dogs.rs`'s `adopt`. [`Self::source`] is always
-/// [`DogSource::Adopted`] — the mirror of [`DogEnabledRow::source`], which
-/// is always [`DogSource::BuiltIn`] for the same reason: this is the one
-/// verb whose own path this session actually has.
+/// [`DogSource::Adopted`] — this is the verb that vetted the path in the
+/// first place, so it never has to look one up the way
+/// [`DogEnabledRow::source`] does.
 #[derive(Debug, Serialize)]
 pub struct DogAdoptedRow {
     /// The dog's name.
@@ -353,10 +354,11 @@ impl Render for DogAdoptedRow {
 /// `shep rehome <name>`: what the config edit and, if a shepherd is
 /// running, the resulting `DisableDog` RPC actually did.
 ///
-/// Constructed by `commands/dogs.rs`'s `rehome`. Unlike [`DogEnabledRow`]/
-/// [`DogDisabledRow`], [`Self::source`] is not a constant this verb always
-/// sends — `rehome` reads `shep.toml`'s own `[daemon] adopted_dogs` entry
-/// before erasing it, so this carries whatever that read found:
+/// Constructed by `commands/dogs.rs`'s `rehome`, which reads `shep.toml`'s
+/// own `[daemon] adopted_dogs` entry before erasing it — the same lookup
+/// [`DogEnabledRow`]/[`DogDisabledRow`] make, except that here it is an
+/// [`Option`], because `rehome` reports what it FORGOT and a name it never
+/// adopted is nothing forgotten. So this carries whatever that read found:
 /// [`DogSource::Adopted`] for a dog `shep adopt` registered, or `None` for
 /// a name `shep.toml` never had an entry for (a built-in dog, or a name
 /// this document has never heard of) — `rehome` still runs in that case,

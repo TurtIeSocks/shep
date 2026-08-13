@@ -535,6 +535,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixes
 
+- `shep enable <name>` sends the source `shep.toml` actually records, not a
+  hardcoded `built-in`. A name in `[daemon] adopted_dogs` is an adopted dog
+  and the path recorded there is its binary; a name absent from that map is
+  a built-in one — the same rule the daemon's own boot path already applies
+  to `enabled_dogs`. `enable` claimed `built-in` for every name, so
+  `shep adopt otel /opt/otel-dog` followed by `shep enable otel` had the
+  shepherd spawn `shep dog otel`, an argv branch of the shep binary,
+  instead of the operator's binary: the adopted dog never ran, and nothing
+  reported an error anywhere. `shep adopt` itself was unaffected — it
+  carries the path it just vetted — so the gap was only in enabling an
+  adopted dog afterwards, which is exactly what a reboot-time `enable` or
+  a `disable` then `enable` does.
+
+  `enable` and `disable` report the source they found, so an adopted dog
+  now renders `adopted` in their `SOURCE` column and carries its path in
+  `--format json`, where both used to print `built-in` for everything.
+
 - Open the shepherd's own `shepd.out.log`/`shepd.err.log` `O_APPEND` in the
   launcher. The daemon inherits both as fds 1 and 2 and never opens them
   itself, so `File::create`'s plain `O_WRONLY|O_CREAT|O_TRUNC` left both

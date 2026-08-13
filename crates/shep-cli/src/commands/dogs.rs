@@ -74,6 +74,23 @@ fn fail_config(streams: &mut Streams<'_>, fmt: Format, err: &ShepTomlError) -> E
     code
 }
 
+/// Where `name`'s binary comes from, according to `cfg`.
+///
+/// A name present in `[daemon] adopted_dogs` is an adopted dog, and the
+/// path recorded there is its binary; a name absent from that map is a
+/// built-in dog, an argv branch of this binary. That presence-or-absence is
+/// the whole of the distinction — `shep-core`'s CHANGELOG records it as the
+/// rule, and `shep.toml` is the only place either verb can learn it, since
+/// neither `enable` nor `disable` is given a path to carry. It is the same
+/// lookup [`crate::commands::daemon::boot_options`] makes over
+/// `[daemon] enabled_dogs` when the shepherd starts its dogs at boot.
+fn dog_source(cfg: &ShepToml, name: &str) -> DogSource {
+    cfg.adopted_dog_path(name)
+        .map_or(DogSource::BuiltIn, |path| DogSource::Adopted {
+            path: path.display().to_string(),
+        })
+}
+
 /// `shep enable <name>`: writes the config, and starts the dog if a
 /// shepherd is running.
 pub async fn enable(
@@ -86,12 +103,17 @@ pub async fn enable(
         Ok(cfg) => cfg,
         Err(err) => return fail_config(streams, fmt, &err),
     };
+    // Read from the config rather than assumed: `shep adopt` records the
+    // binary and `shep enable` is what starts it afterwards, so a hardcoded
+    // `BuiltIn` here sends the shepherd off to spawn `shep dog <name>` and
+    // the adopted binary never runs at all.
+    let source = dog_source(&cfg, name);
     cfg.enable_dog(name);
     if let Err(err) = cfg.save() {
         return fail_config(streams, fmt, &err);
     }
     let client = Client::connect(&paths.socket).await.ok();
-    enable_after_config(streams, fmt, name, client.as_ref()).await
+    enable_after_config(streams, fmt, name, &source, client.as_ref()).await
 }
 
 /// `enable`'s daemon half, split out from [`enable`] so a test can drive it
@@ -109,32 +131,32 @@ async fn enable_after_config(
     streams: &mut Streams<'_>,
     fmt: Format,
     name: &str,
+    source: &DogSource,
     client: Option<&Client>,
 ) -> ExitCode {
     let Some(client) = client else {
         let row = DogEnabledRow {
             name: name.to_string(),
-            source: DogSource::BuiltIn,
+            source: source.clone(),
             shepherd_acted: false,
             status: NO_SHEPHERD_ENABLE_STATUS.to_string(),
         };
         return write_outcome(emit(&mut *streams.out, fmt, "enable", row));
     };
-    // Always `BuiltIn`: `shep adopt` (a later verb) is the one that carries
-    // a path. An `EnableDog` reaching a name a sheep already holds comes
-    // back as `RpcErrorCode::InvalidConfig` with the daemon's own message
-    // naming the collision (`shep-daemon/src/rpc.rs`'s `EnableDog` arm) —
-    // the `Err` arm below surfaces that message verbatim rather than a bare
+    // An `EnableDog` reaching a name a sheep already holds comes back as
+    // `RpcErrorCode::InvalidConfig` with the daemon's own message naming
+    // the collision (`shep-daemon/src/rpc.rs`'s `EnableDog` arm) — the
+    // `Err` arm below surfaces that message verbatim rather than a bare
     // code, which is already the clear report an operator needs.
     let request = Request::EnableDog {
         name: name.to_string(),
-        source: DogSource::BuiltIn,
+        source: source.clone(),
     };
     match client.request(request).await {
         Ok(Response::DogStarted(info)) => {
             let row = DogEnabledRow {
                 name: name.to_string(),
-                source: DogSource::BuiltIn,
+                source: source.clone(),
                 shepherd_acted: true,
                 status: info.status.to_string(),
             };
@@ -170,12 +192,17 @@ pub async fn disable(
         Ok(cfg) => cfg,
         Err(err) => return fail_config(streams, fmt, &err),
     };
+    // `disable_dog` leaves `[daemon] adopted_dogs` alone — that is the
+    // difference between `disable` and `rehome` — so this reads the same
+    // answer before or after the edit. It is read for the report only:
+    // `DisableDog` carries a name and nothing else.
+    let source = dog_source(&cfg, name);
     cfg.disable_dog(name);
     if let Err(err) = cfg.save() {
         return fail_config(streams, fmt, &err);
     }
     let client = Client::connect(&paths.socket).await.ok();
-    disable_after_config(streams, fmt, name, client.as_ref()).await
+    disable_after_config(streams, fmt, name, &source, client.as_ref()).await
 }
 
 /// `disable`'s daemon half — see [`enable_after_config`]'s own doc for why
@@ -184,12 +211,13 @@ async fn disable_after_config(
     streams: &mut Streams<'_>,
     fmt: Format,
     name: &str,
+    source: &DogSource,
     client: Option<&Client>,
 ) -> ExitCode {
     let Some(client) = client else {
         let row = DogDisabledRow {
             name: name.to_string(),
-            source: DogSource::BuiltIn,
+            source: source.clone(),
             shepherd_acted: false,
             status: NO_SHEPHERD_DISABLE_STATUS.to_string(),
         };
@@ -208,7 +236,7 @@ async fn disable_after_config(
         Ok(Response::Deleted(_ids)) => {
             let row = DogDisabledRow {
                 name: name.to_string(),
-                source: DogSource::BuiltIn,
+                source: source.clone(),
                 shepherd_acted: true,
                 status: DISABLED_STATUS.to_string(),
             };
@@ -693,7 +721,10 @@ async fn rehome_after_config(
 
 #[cfg(test)]
 mod tests {
-    use shep_client::testing::{fake_client_capturing_envelopes, fake_client_replying_err};
+    use shep_client::testing::{
+        fake_client_capturing_envelopes, fake_client_replying_err, sample_ack, sample_info,
+        serve_one_request,
+    };
     use shep_core::protocol::RpcErrorCode;
 
     use super::*;
@@ -702,9 +733,11 @@ mod tests {
         Streams { out, err }
     }
 
-    /// fails if `enable` sends anything but `EnableDog` with the name it was
-    /// given and a `BuiltIn` source — the class of bug that left `restart`
-    /// and `delete` sending `Request::Stop` with every test green.
+    /// fails if `enable` sends anything but `EnableDog` with the name and
+    /// the source it was given — the class of bug that left `restart` and
+    /// `delete` sending `Request::Stop` with every test green.
+    /// `enable_of_an_adopted_dog_sends_the_path_the_config_recorded` is the
+    /// half that pins where the source comes from in the first place.
     #[tokio::test]
     async fn enable_asks_the_shepherd_to_start_that_dog_as_a_built_in() {
         let dir = tempfile::tempdir().unwrap();
@@ -716,6 +749,7 @@ mod tests {
             &mut streams(&mut out, &mut err),
             Format::Table,
             "metrics",
+            &DogSource::BuiltIn,
             Some(&client),
         )
         .await;
@@ -727,6 +761,63 @@ mod tests {
                 name: "metrics".to_string(),
                 source: DogSource::BuiltIn,
             }
+        );
+    }
+
+    /// The defect this test exists for: `shep adopt otel <path>` recorded
+    /// the binary, and the `shep enable otel` after it sent `BuiltIn`
+    /// regardless — so the shepherd spawned `shep dog otel`, an argv branch
+    /// of this binary, the operator's own binary never ran, and nothing
+    /// reported an error anywhere.
+    ///
+    /// Driven through `enable` end to end rather than through
+    /// [`enable_after_config`], because the lookup that was missing lives
+    /// in the config half; a fixture that only binds the socket
+    /// ([`serve_one_request`], not `fake_client_*`) is what lets `enable`
+    /// perform its own `Client::connect` the way it does in production.
+    #[tokio::test]
+    async fn enable_of_an_adopted_dog_sends_the_path_the_config_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        std::fs::create_dir_all(&paths.run).unwrap();
+        let mut seed = ShepToml::open(&paths.daemon_config).unwrap();
+        seed.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
+        seed.save().unwrap();
+        let handle = serve_one_request(
+            &paths.socket,
+            sample_ack(),
+            Response::DogStarted(sample_info()),
+        )
+        .await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = enable(
+            &mut streams(&mut out, &mut err),
+            Format::Table,
+            &paths,
+            "otel",
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::Success);
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("enable must reach the wire; it hung instead of connecting")
+            .unwrap();
+        assert_eq!(
+            envelope.body,
+            Request::EnableDog {
+                name: "otel".to_string(),
+                source: DogSource::Adopted {
+                    path: "/usr/local/bin/shep-otel".to_string(),
+                },
+            }
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("adopted"),
+            "the row must render an adopted dog as adopted: {text}"
         );
     }
 
@@ -782,6 +873,7 @@ mod tests {
             &mut streams(&mut out, &mut err),
             Format::Table,
             "bark",
+            &DogSource::BuiltIn,
             Some(&client),
         )
         .await;
@@ -808,6 +900,7 @@ mod tests {
             &mut streams(&mut out, &mut err),
             Format::Table,
             "bark",
+            &DogSource::BuiltIn,
             Some(&client),
         )
         .await;
@@ -867,6 +960,7 @@ mod tests {
             &mut streams(&mut out, &mut err),
             Format::Table,
             "ghost",
+            &DogSource::BuiltIn,
             Some(&client),
         )
         .await;
