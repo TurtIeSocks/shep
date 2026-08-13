@@ -8,6 +8,36 @@ passing locally, 1 ignored). A spec section is a plan, not a shipped-state
 claim — drift between the two is what this file exists to stop hiding.
 Linked from spec §2.
 
+## Scope decision, 2026-08-12: everything below §2's six cuts ships in v1
+
+Rin's call, after the five v1.1 audits came back: *"we should probably fix
+everything in v1. We're not in a rush to release this to the public. We want
+a hot looking app right off the bat if we have to compete with well
+established apps like pm2 and other rust attempts."*
+
+So this file now holds two different kinds of thing, and the section headings
+say which is which. The six items under "Committed to v1.1+ by design" are
+still deferred — they are scope cuts the spec argues for. Everything under
+"Named as v1.0 in spec §2/§9, not yet built" is a **build queue**, in this
+order:
+
+1. **Dogs** (spec §8) — in flight on `feat/phase9-dogs`.
+2. **The audit debt** — what the five 2026-08-12 audits turned up. Real bugs
+   first (`kill_signal` accepts a typo and then sends the wrong signal
+   forever; an on-time `ActionReply` can be matched to the wrong request),
+   then the wire and config asymmetries, then the tooling and doc staleness.
+3. **The rest of the v1.0 surface** — lookout, whistle, serve, dev/runtime,
+   scale/signal/sendline, the KV store, `.js` Flockfile, schemars, the
+   daemon-config flags layer, the `channel.*` topic, lambs in describe, and
+   openrc + BSD rc.d.
+4. **The Windows functional tier — last** (Rin, 2026-08-12). It is the one
+   item whose cost estimate is mostly guesswork: the decision brief put it at
+   +30-40% on the daemon's process-control layer, and that number gets much
+   better once nothing else is in flight to confound it.
+
+Ordering is not priority. Windows is last because its estimate is the
+weakest, not because it matters least.
+
 ## Committed to v1.1+ by design (spec §2)
 
 Six deliberate scope cuts, not oversights — spec §2 carries the reasoning:
