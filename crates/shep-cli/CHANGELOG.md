@@ -12,6 +12,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add the hidden `shep dog <name>` subcommand — the re-exec target a
+  built-in dog runs as, the same shape `shep daemon` already is: not for
+  direct use, spawned by the shepherd when it starts an enabled dog.
+
+  A dog inherits exactly one thing from the shepherd's own environment,
+  `$SHEP_HOME`, and nothing else it did not already need in order to exec
+  — no `[dog.<name>]` value ever rides along, since the environment is
+  readable from the process table, inherited by every child a dog spawns,
+  and captured into crash dumps. Instead `DogRuntime::start` connects to
+  the socket `$SHEP_HOME` names and asks for its own section over the
+  wire, and `DogRuntime::config` parses it into whatever shape the dog
+  expects — refusing to run on a section it cannot read rather than
+  silently falling back to defaults an operator did not ask for.
+
+  `shep dog <name>` refuses an unrecognised name before ever touching the
+  socket (`usage`, naming the two built-ins), and neither `"metrics"` nor
+  `"bark"` does anything yet — each is a stub reporting which task lands
+  it. A dog's own diagnostics go to stderr, plain text: it is a supervised
+  process, and the shepherd's log pump already captures that into
+  `$SHEP_HOME/logs/<name>-0-err.log` like any sheep's — `shep bleats
+  <name>` is how an operator reads it.
+
 - Add `shep enable <name>` and `shep disable <name>`, the operator verbs
   that turn a registered dog on and off. Both write `$SHEP_HOME/shep.toml`
   first and only then, if a shepherd is reachable, ask it to act — so a

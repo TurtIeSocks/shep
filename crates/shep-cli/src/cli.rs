@@ -204,6 +204,10 @@ pub enum Commands {
     /// Run the supervisor in the foreground. Spawned by the CLI; not for direct use.
     #[command(hide = true)]
     Daemon(DaemonArgs),
+    /// Run one built-in dog in the foreground. Spawned by the shepherd as
+    /// `<this binary> dog <name>`; not for direct use.
+    #[command(hide = true)]
+    Dog(DogArgs),
 }
 
 /// Arguments to `shep start`.
@@ -302,14 +306,15 @@ pub struct FoldArgs {
     pub name: String,
 }
 
-/// Arguments to `shep disable`/`shep rehome`.
+/// Arguments to `shep disable`/`shep rehome`, and to the hidden `shep dog`
+/// re-exec target.
 ///
-/// One struct for both verbs, matching [`StartupArgs`]'s own precedent: a
+/// One struct for all three, matching [`StartupArgs`]'s own precedent: a
 /// dog is named, never selected — `SelectorArgs`' grammar (`all`, `/regex/`,
 /// `fold:<name>`) answers "which of the flock", and a dog is not the flock.
 /// `shep enable` shares this shape too, but carries a second, hidden field
-/// ([`EnableArgs`]) that neither `disable` nor `rehome` has any use for, so
-/// it gets a struct of its own rather than widening this one for verbs that
+/// ([`EnableArgs`]) that none of the three below has any use for, so it
+/// gets a struct of its own rather than widening this one for verbs that
 /// would never touch the extra field.
 #[derive(Debug, clap::Args)]
 pub struct DogArgs {
@@ -680,7 +685,7 @@ mod tests {
         let bleats = cmd.find_subcommand("bleats").unwrap();
         assert_eq!(bleats.get_visible_aliases().collect::<Vec<_>>(), ["logs"]);
 
-        for hidden in ["thatlldo", "daemon"] {
+        for hidden in ["thatlldo", "daemon", "dog"] {
             assert!(
                 cmd.find_subcommand(hidden).unwrap().is_hide_set(),
                 "{hidden} must stay hidden from --help"
@@ -711,6 +716,27 @@ mod tests {
                 "{visible} must stay visible in --help"
             );
         }
+    }
+
+    /// fails if `Commands::Dog` is wired to another verb, or if it is not
+    /// hidden. It is a re-exec target, not something an operator runs.
+    #[test]
+    fn the_dog_subcommand_parses_and_stays_hidden() {
+        use clap::{CommandFactory, Parser};
+
+        let parsed = Cli::try_parse_from(["shep", "dog", "metrics"])
+            .unwrap()
+            .command;
+        let Commands::Dog(args) = parsed else {
+            panic!("expected dog")
+        };
+        assert_eq!(args.name, "metrics");
+
+        let cmd = Cli::command();
+        assert!(
+            cmd.find_subcommand("dog").unwrap().is_hide_set(),
+            "dog must stay hidden from --help"
+        );
     }
 
     /// Fails if `enable`'s pm2-spelled `--exec` alias loses its `hide =

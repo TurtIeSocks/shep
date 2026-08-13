@@ -16,6 +16,8 @@ mod cli;
 #[cfg(unix)]
 mod commands;
 mod completions;
+#[cfg(unix)]
+mod dog;
 mod exit;
 #[cfg(unix)]
 mod launch;
@@ -132,6 +134,14 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
 /// user's passwd entry rather than from this process's environment, so the
 /// shared gate would both impose a requirement they do not have and hand
 /// them the wrong answer under `sudo`, which resets `$HOME` to root's.
+///
+/// `Dog` DOES go through this shared gate, unlike `Completions`/`Daemon`: a
+/// dog resolves `$SHEP_HOME` exactly the way every ordinary verb does (the
+/// daemon sets it as the one environment variable a dog's child inherits).
+/// It is still dispatched immediately after, ahead of the locked-streams
+/// block below, for the unrelated reason that block's own comment gives —
+/// it runs until signalled, so it may not hold a stdout/stderr guard for a
+/// process lifetime.
 #[cfg(unix)]
 async fn run(cli: Cli) -> ExitCode {
     let fmt = cli.global.format;
@@ -142,14 +152,17 @@ async fn run(cli: Cli) -> ExitCode {
     // both across the dispatch buys one lock acquisition instead of one per
     // write, and no interleaving with anything.
     //
-    // Two verbs are not that shape. `daemon` runs until a signal, with
+    // Three verbs are not that shape. `daemon` runs until a signal, with
     // `commands::daemon::install_log_subscriber` rendering the daemon's own
     // records to `std::io::stderr()` from tokio worker threads; `bleats`
-    // without `--no-follow` follows until Ctrl-C. Neither may hold a guard
-    // across that, so `bleats` takes unlocked handles and `daemon` takes none
-    // at all. (`completions` is dispatched early as well, for the unrelated
-    // reason this function's own doc gives — it must work where no `$HOME`
-    // resolves — and is a millisecond verb like the rest.)
+    // without `--no-follow` follows until Ctrl-C; `dog` runs until it is
+    // signalled too, the same re-exec shape as `daemon`. None of the three
+    // may hold a guard across that, so `bleats` takes unlocked handles and
+    // `daemon`/`dog` take none at all — `dog::run_dog` writes its own
+    // diagnostics straight to `eprintln!`, needing no `Streams` value in the
+    // first place. (`completions` is dispatched early as well, for the
+    // unrelated reason this function's own doc gives — it must work where no
+    // `$HOME` resolves — and is a millisecond verb like the rest.)
     //
     // `Stderr`'s lock is re-entrant only for the thread that took it, so a
     // guard held here — on the runtime's main thread, for one of those
@@ -204,6 +217,15 @@ async fn run(cli: Cli) -> ExitCode {
             return code;
         }
     };
+
+    // `dog` is a re-exec target like `daemon` — long-lived until signalled —
+    // and, per `dog::run_dog`'s own doc, writes its own diagnostics straight
+    // to stderr rather than through a `Streams`/`--format json` envelope, so
+    // unlike every verb below it needs no `Streams` value at all, let alone
+    // a locked one.
+    if let Commands::Dog(ref args) = cli.command {
+        return dog::run_dog(&args.name, paths).await;
+    }
 
     // Split out of the dispatch below only to keep its handles unlocked, for
     // the reason the block comment above gives; it is otherwise an arm like
@@ -348,7 +370,8 @@ async fn run(cli: Cli) -> ExitCode {
         | Commands::Daemon(_)
         | Commands::Startup(_)
         | Commands::Unstartup(_)
-        | Commands::Bleats(_) => {
+        | Commands::Bleats(_)
+        | Commands::Dog(_) => {
             unreachable!("handled above: before the shared $SHEP_HOME gate, or on unlocked handles")
         }
     }

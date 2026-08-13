@@ -63,6 +63,37 @@ pub async fn fake_daemon(path: &Path, reply: HelloReply) -> JoinHandle<Hello> {
     })
 }
 
+/// Binds `path`, accepts one connection, handshakes with `ack`, answers the
+/// first request it receives with `response`, and returns the envelope it
+/// received.
+///
+/// Unlike [`fake_client_on`] and its siblings below, this does not connect a
+/// [`Client`] of its own — it only listens, so the caller's OWN connect is
+/// the first and only thing that ever dials it. That is the shape
+/// `shep-cli`'s `DogRuntime::start` needs to be tested against: it performs
+/// its own `Client::connect`, so a fixture that already holds a connected
+/// `Client` (every `fake_client_*` helper below) cannot stand in for the
+/// peer on the other end of it.
+///
+/// Panics on any accept/handshake/decode/encode failure, same as
+/// [`fake_daemon`] — test scaffolding, meant to fail the test loudly rather
+/// than surface a `Result` nobody would check.
+pub async fn serve_one_request(
+    path: &Path,
+    ack: HelloAck,
+    response: Response,
+) -> JoinHandle<Envelope> {
+    let listener = UnixListener::bind(path).unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut frames = Framed::new(stream, codec());
+        handshake(&mut frames, ack).await;
+        let envelope = read_envelope(&mut frames).await;
+        write_reply(&mut frames, envelope.id, response).await;
+        envelope
+    })
+}
+
 /// A `HelloAck` with a distinctive version and pid, so a test that asserts
 /// on either can tell a real read from a default.
 #[must_use]
