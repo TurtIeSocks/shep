@@ -536,12 +536,35 @@ src/
              Online — three guards `restart_automatic` does not carry (`handle_extra_restart`).
              Both doors declare CommandOrigin::Automatic, so an operator's stop or delete
              displaces either one mid-ladder.
-  dog_support.rs    ← new module (decision #3: dog architecture)
+  dogs.rs            ← new module (decision #3: dog architecture)
       Action: write fresh
-      Notes: daemon-side dog plumbing ONLY: enabled-dogs list in daemon_config → autostart
-             as supervised internal-tagged processes; typed [dog.<name>] config sections
-             passed through. Metrics + bark logic themselves are dogs in shep-cli (below) —
-             the daemon just exposes bus + monitoring RPCs they consume.
+      Drift (Phase 9, recorded): shipped as `dogs.rs`, not the `dog_support.rs` this entry
+             originally named — a single file, since there is exactly one daemon-side concern
+             here, unlike the two-dog split shep-cli needed for `metrics`/`bark` themselves
+             (below).
+      Notes: daemon-side dog plumbing ONLY, same division this entry always intended: `DogSpec`/
+             `DogError`, `dog_app` (assembles the same `ResolvedApp` a Flockfile entry would,
+             from a built-in argv branch or an adopted binary's own already-canonicalized path
+             — never re-vetting it; `commands::dogs::vet_binary` in shep-cli already did that
+             once, at `adopt` time), `dog_section` (renders `[dog.<name>]` back to TOML text,
+             re-reading `shep.toml` on every call rather than serving a copy cached at boot —
+             what makes `shep disable X && shep enable X` pick up an edited section),
+             `spawn_enabled_dogs` (starts every `[daemon] enabled_dogs` entry at boot, warning
+             and moving on rather than failing the boot over one bad dog), and `spawn_dog_watch`
+             (a bus subscriber, not a supervisor branch, appending to `barks.jsonl` when a dog's
+             own restart budget is exhausted — the shepherd's own trail for the one alert a dead
+             bark dog cannot raise about itself). Metrics + bark logic themselves are dogs in
+             shep-cli (below) — this crate exposes bus + monitoring RPCs they consume and
+             nothing more. A dog is not a second kind of supervised process: `ProcessEntry::dog`
+             is a marker `supervisor.rs` reads to decide who should see an entry or where it
+             came from, never how to supervise it. `kill.rs`, `backoff.rs`, `runner.rs` and
+             `tokio_runner.rs` never mention a dog; `snapshot.rs` mentions one twice, both in a
+             doc comment (what the metrics dog reads off the wire) and once as a marker field's
+             default in a test fixture — never in a branch that changes what happens to the
+             process. Flagged rather than passed over silently: a grep-based tripwire looking
+             for exactly this kind of leak cannot itself tell a doc comment from a supervision
+             branch, so those three lines are worth a human's second look even though nothing
+             here actually changes how a dog is supervised.
   host_metrics.rs    ← was lib/tools/SysMetrics.js
       Action: replace-with-crate (sysinfo)
       Notes: keep axm_monitor snapshot shape + metric names (pm2 ls renderer compat);
@@ -745,18 +768,52 @@ src/
              default; start/stop/restart/reload tools only with --allow-control. Thin layer
              over shep-client — zero daemon changes needed. Decision 6: stdio ships v1
              (dev/debug), HTTP/SSE transport is a committed v1.1 feature.
-  dogs/             ← new modules (decision #3: dog architecture; hidden `shep dog <name>`)
-    metrics.rs       [MUST-HAVE #6]
+  dog/              ← new modules (decision #3: dog architecture; hidden `shep dog <name>`)
+      Drift (Phase 9, recorded): shipped singular, `dog/`, not the `dogs/` this entry
+             originally named; carries one file this entry didn't anticipate, `http.rs`
+             (below), plus `mod.rs` at this level for `run_dog`'s own dispatch — refuse a
+             name that is not one of the two built-ins before the socket is ever touched,
+             then hand off to `metrics::run` or `run_bark`. `DogRuntime` is a dog's own
+             connection and config: `$SHEP_HOME` is the one variable it inherits, everything
+             else is asked for over the wire via `Request::DogConfig`.
+    http.rs
+      Notes: the metrics dog's own tiny hand-rolled HTTP/1.1 request reader (request line +
+             headers, no body) — no axum/hyper pulled in to serve one route.
+    metrics/         [MUST-HAVE #6]
       Action: write fresh
-      Notes: shep-client consumer: polls monitoring RPC + host metrics, serves prometheus
-             /metrics on 127.0.0.1 (port from [dog.metrics]). Reference Grafana dashboard
-             JSON in assets/. OTLP export behind "otel" feature. Enabled: `shep enable metrics`.
-    bark.rs          [MUST-HAVE #7]
+      Drift (Phase 9, recorded): shipped as a directory — `mod.rs` (`MetricsConfig`, `Reading`,
+             `run`) plus `exposition.rs` (the pure Prometheus-text renderer) — not the single
+             `metrics.rs` this entry named.
+      Notes: `MetricsConfig` (`[dog.metrics]`) binds loopback (`127.0.0.1:9615`) by default;
+             widening it is an explicit operator choice the dog will not make for itself, since
+             every series carries a sheep's name as a label. `Reading` rebuilds fresh off
+             `ListFlock` + a host sample on every scrape — nothing cached between them, so no
+             stale reading and no state a slow scraper could hold open. `exposition::render`:
+             per-sheep cpu/mem/restart_total/status/uptime, `shep_dog_up`, daemon self metrics,
+             host metrics. Reference Grafana dashboard JSON in assets/grafana/. OTLP export
+             (`otel` cargo feature) is spec'd but not built — `docs/specs/deferred.md`. Enabled:
+             `shep enable metrics`.
+    bark/            [MUST-HAVE #7]
       Action: write fresh
-      Notes: bus subscriber → rule engine ([dog.bark] thresholds: crash, restart-loop,
-             high-mem) → reqwest webhooks: Discord/Slack templates + generic JSON POST.
-             Debounce/cooldown per rule. MUST handle bounded-bus drop notices + reconcile by
-             polling — alerts never silently vanish.
+      Drift (Phase 9, recorded): shipped as a directory — `mod.rs` (`BarkConfig`, `run_loop`),
+             `rules.rs` (`Rule`/`Trigger`/`Rules`), `sinks.rs` (`Sink`, delivery) — not the
+             single `bark.rs` this entry named. Delivery is hand-rolled HTTP/1.1 over
+             `tokio-rustls`, not reqwest (Rin's ruling, 2026-08-12: fewer transitive
+             dependencies, no C toolchain from `aws-lc-sys`).
+      Notes: `run_loop` subscribes the bus AND polls the flock (`poll`, 30s default) as
+             reconciliation, so a bus drop under load still fires the alert it would have
+             carried; the two routes share one debounce record per subject, which is what lets
+             an `Errored` seen by both routes fire once rather than twice. `[dog.bark.rules]`:
+             `GaveUp` (on by default with no configuration, keyed to the shepherd's own
+             decision rather than a threshold) and `RestartRate` (opt-in threshold, the early
+             warning) are the two restart-loop rules; `MemoryAbove` reads the reconciliation
+             poll rather than the bus, since memory is a level and the bus carries events.
+             Debounce is per rule per subject, never global. `[dog.bark.sinks]`: Discord/Slack
+             webhook, generic JSON POST with a templated body; `Sink`'s `Debug` is hand-written
+             and redacted (IR-41) since a webhook URL is a bearer credential; Discord and Slack
+             refuse `http://` at config load, `Sink::Json` does not. Fired alerts append to
+             `$SHEP_HOME/barks.jsonl` via `shep_core::barks::append`, a size-capped ring the
+             shepherd's own dog-restart-budget record shares.
   import/            ← new module (decision 7's one exception)
       Action: write fresh
       Drift (Phase 8, recorded): shipped as a directory, not the single `import.rs` this entry

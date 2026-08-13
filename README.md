@@ -84,11 +84,11 @@ The whole vocabulary, and whether it exists yet.
 | muster | bring a saved flock back | `shep save`, then `shep muster` | yes |
 | the shepherd channel | a private pipe on fd 3 between daemon and app | `channel = true`, `shep trigger` | yes |
 | a lamb | a child process of a sheep | tree-kill today, `describe` tree view later | partly |
-| a dog | a plugin process the shepherd supervises | `shep enable metrics`, `shep dogs` | in progress |
-| a bark | a webhook alert | `[bark]` config, `shep barks` | no |
+| a dog | a plugin process the shepherd supervises | `shep enable metrics`, `shep dogs` | yes |
+| a bark | a webhook alert | `[dog.bark.sinks]` config, `shep barks` | yes |
 | the whistle | the MCP interface agents talk to | `shep whistle` | no |
 | the lookout | the terminal dashboard | `shep lookout` (alias `dash`) | no |
-| adopt / rehome | register or drop a third-party dog | `shep adopt <name> <path>` | no |
+| adopt / rehome | register or drop a third-party dog | `shep adopt <name> <path>` | yes |
 | that'll do | graceful stop, after the real herding command | `shep thatlldo` | no |
 
 Sheepdogs and sheep were separate ideas from the start, so "dog" never means
@@ -136,6 +136,15 @@ installs a systemd unit (`Type=notify`) or a launchd plist that runs
 `shep muster` at boot. It never escalates its own privileges: without root it
 prints the exact command you should run and exits non-zero.
 
+**Dogs.** `shep enable metrics` turns on a Prometheus endpoint at
+`127.0.0.1:9615`; `shep enable bark` watches the flock and posts alerts to
+Discord, Slack, or a JSON endpoint you name under `[dog.bark.sinks]`. Both
+ship inside the binary. `shep adopt <name> <path>` runs anyone else's
+binary the same way — vetted once when you adopt it, and served its own
+`[dog.<name>]` config over the same socket `shep` itself talks to rather
+than through its environment, so a webhook credential never ends up in a
+process listing or a crash dump. [docs/dogs.md](docs/dogs.md) is the guide.
+
 **Coming from pm2.** `shep import` reads a real `dump.pm2` and writes a
 Flockfile. It starts nothing, names every clustered app on stderr because
 cluster mode does not survive the trip unchanged, and refuses to silently
@@ -144,15 +153,10 @@ the walkthrough.
 
 ## What's not built yet
 
-Dogs are the current phase: the daemon can start one, serve it its config over
-the socket instead of through the environment, and keep it out of sweeps that
-should only touch sheep. No operator-facing verb exists yet, so there is
-nothing to enable.
-
-Not started: the metrics dog (Prometheus) and the bark dog (webhooks), the
-lookout TUI, the whistle MCP server, `shep serve`, `shep dev` and
-`shep runtime`, `scale` / `signal` / `sendline`, the key-value store, `.js`
-Flockfiles, openrc and BSD `rc.d` units, and lambs in `describe`'s output.
+Not started: the lookout TUI, the whistle MCP server, `shep serve`,
+`shep dev` and `shep runtime`, `scale` / `signal` / `sendline`, the
+key-value store, `.js` Flockfiles, openrc and BSD `rc.d` units, and lambs
+in `describe`'s output.
 
 Windows is last, and it is genuinely zero rather than partial. The crate
 compiles and its unit tests pass there in CI, which is not the same thing as
@@ -176,7 +180,7 @@ over a pipe once its socket is bound. Four crates build it: `shep-core`
 (types, config, wire protocol), `shep-daemon` (the supervision engine),
 `shep-client` (async client), and `shep-cli` (the binary).
 
-**Tested by trying to break it.** 904 tests, and every task ends with a
+**Tested by trying to break it.** 1027 tests, and every task ends with a
 mutation pass: break a line on purpose, confirm a test goes red, put the line
 back. It keeps turning up tests that could not fail, which is the reason to
 do it.
@@ -193,6 +197,7 @@ a redacted `Debug`, with a test pinning the exact string it prints.
 - [docs/terminology.md](docs/terminology.md): the lexicon and the rules for using it
 - [docs/migration.md](docs/migration.md): coming from pm2
 - [docs/shepherd-channel.md](docs/shepherd-channel.md): the fd-3 protocol, for app authors
+- [docs/dogs.md](docs/dogs.md): the metrics and bark dogs, and writing your own
 - [docs/specs/shep-v1.md](docs/specs/shep-v1.md): the behavior contract
 - [docs/specs/deferred.md](docs/specs/deferred.md): what is not built, and the order it lands in
 - [docs/idiomatic-rust.md](docs/idiomatic-rust.md): the 45 house style rules

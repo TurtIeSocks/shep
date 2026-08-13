@@ -27,12 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently falling back to defaults an operator did not ask for.
 
   `shep dog <name>` refuses an unrecognised name before ever touching the
-  socket (`usage`, naming the two built-ins). `"metrics"` runs the metrics
-  dog below; `"bark"` doesn't do anything yet — it's a stub reporting
-  which task lands it. A dog's own diagnostics go to stderr, plain text:
-  it is a supervised process, and the shepherd's log pump already captures
-  that into `$SHEP_HOME/logs/<name>-0-err.log` like any sheep's — `shep
-  bleats <name>` is how an operator reads it.
+  socket (`usage`, naming the two built-ins): `"metrics"` runs the metrics
+  dog below, `"bark"` the bark dog further down this file. A dog's own
+  diagnostics go to stderr, plain text: it is a supervised process, and the
+  shepherd's log pump already captures that into
+  `$SHEP_HOME/logs/<name>-0-err.log` like any sheep's — `shep bleats <name>`
+  is how an operator reads it.
 
 - Add `shep enable <name>` and `shep disable <name>`, the operator verbs
   that turn a registered dog on and off. Both write `$SHEP_HOME/shep.toml`

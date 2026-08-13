@@ -233,12 +233,16 @@ tweaks; file-locked JSON; not the primary config path.
 ## 8. Dogs (plugins)
 
 Contract: a dog is a process speaking the client wire protocol,
-supervised by the daemon, tagged `dog` (badged in `shep flock`, hidden by
-default in user listings unless `--all`). First-party dogs live in the
+supervised by the daemon, tagged `dog` (badged in `shep flock`, shown in
+its own table by default — a flock with no dogs prints exactly what it
+printed before this section existed). First-party dogs live in the
 multi-call binary as `shep dog <name>`. Lifecycle: `shep enable <name>` →
 daemon config entry → autostart with the daemon; `shep disable <name>`
-removes. Config: `[dog.<name>]` in shep.toml. Third-party dog = any binary
-speaking the protocol, registered with `shep enable --exec <path> <name>`.
+removes. Config: `[dog.<name>]` in shep.toml, read by the dog over the
+Unix socket rather than through its environment. Third-party dog = any
+binary speaking the protocol, registered with `shep adopt <name> <path>`
+(`shep enable --exec <path> <name>` is a hidden alias, kept for pm2 muscle
+memory); `shep rehome <name>` forgets the registration.
 
 **metrics dog (v1):** serves Prometheus exposition on 127.0.0.1:9615
 (configurable): per-sheep cpu/mem/restart_total/status/uptime, daemon self
@@ -255,8 +259,47 @@ per-rule debounce/cooldown; **each rule routes to one or more named sinks**
 `shep barks` and the whistle's `list_barks`.
 
 Third-party extensions are treated as dogs once enabled: any binary
-speaking the client wire protocol, registered via
-`shep enable --exec <path> <name>`.
+speaking the client wire protocol, registered via `shep adopt <name>
+<path>`.
+
+**This section carried three departures from what shipped, each decided
+against the spec as written rather than found as an oversight in it — the
+same posture §9's `trigger` amendment and §13's item 4 correction take,
+recorded here for the same reason: what a later reader needs is the
+reasoning, not just the corrected sentence.**
+
+Dogs are not hidden behind `--all`. The original contract modeled a dog
+listing on pm2's own "internal module" convention: a category ordinary
+operators rarely care about, so bury it behind a flag the way `ps aux`
+buries kernel threads. That model does not fit what a dog turned out to
+be here — the metrics dog and the bark dog are the flock's own
+observability layer, and an operator who just enabled one wants to see it
+came up without reaching for a flag `shep enable`'s own output never
+mentioned. `shep flock` prints dogs as a second table, present only when
+at least one is registered, and `shep dogs` prints that table alone; a
+flock with none still renders exactly as it did before this section
+existed.
+
+`enable --exec` is a hidden alias, and `adopt`/`rehome` are the verbs.
+The spec as written had one lifecycle for a built-in dog and folded a
+third-party one into `enable`'s own flag. Registering a third-party
+binary needed to do more than a built-in dog's `enable` ever did — a
+path to vet, refuse, and remember beyond the boolean question of whether
+the dog is on — and `disable` needed a counterpart that answers "forget
+this dog existed" rather than just "stop it for now." `enable --exec`
+survives only because it is pm2's own spelling and muscle memory
+transfers; `adopt`/`rehome` are what an operator reading `--help` is
+pointed at.
+
+A dog's configuration reaches it over the socket, not the environment.
+The spec as written left this unstated, reading like an ordinary
+`AppConfig`-shaped config passthrough. `[dog.bark.sinks]` routinely holds
+a webhook URL, and a webhook URL is a bearer credential — the same
+reasoning `SECURITY.md`'s redaction rule already applies to a sheep's own
+`env` map, extended here rather than left as a second, quieter exposure:
+an environment variable is readable from the process table, inherited by
+every child a dog spawns, and captured into a crash dump, none of which
+is true of a value the dog only ever asks the daemon for directly.
 
 ## 9. CLI surface (sheep-native)
 
@@ -430,7 +473,9 @@ systemd itself started.
    by IANA; trivially configurable).
 5. `save` writes the roll, `muster` assembles the flock from it; `resurrect`
    kept as hidden alias.
-6. Dogs hidden in default `shep flock` output (badged under `--all`).
+6. Dogs print as their own table in default `shep flock` output — reversed
+   from this list's original "hidden under `--all`"; see §8's own amendment
+   for why.
 7. Whistle control tools gated by daemon config, not CLI flag — config is
    auditable, flags are per-invocation.
 8. `SHEP_INSTANCE` replaces `NODE_APP_INSTANCE` (sheep-native env; importer
@@ -441,6 +486,6 @@ systemd itself started.
     of these if v1 should slim down.
 11. Daemon idle-footprint goal (single-digit MB RSS) tracked via criterion
     benches + a CI-reported RSS number, not gated in the DoD.
-12. vcs metadata deferred to v1.1; `shep web` deferred to v1.1-if-demand
-    (metrics dog covers observability) — both were map modules without a
-    ruled version.
+12. vcs metadata deferred to v1.1; `shep web` deferred to v1.1 — the
+    metrics dog turned out not to cover it (see `docs/specs/deferred.md`)
+    — both were map modules without a ruled version.
