@@ -19,6 +19,13 @@ shep-core.workspace = true
 # dependency edge.
 shep-daemon.workspace = true
 shep-client.workspace = true
+# `dog::metrics`'s host reading (`shep_host_*`). Adds zero crates to the
+# tree: shep-daemon already carries `sysinfo` for its own tree sampler
+# (`limits/sample.rs`), and this is the same workspace-pinned version —
+# confirmed with `cargo tree -p shep-cli | grep sysinfo` showing exactly one
+# resolved version, matching `Cargo.lock`'s single `sysinfo` entry both
+# before and after this change.
+sysinfo.workspace = true
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "env", "wrap_help"] }
 # `default-features = false` is a no-op here — clap_complete's own default
 # feature set is empty — kept for consistency with the workspace rule.

@@ -14,11 +14,11 @@
 //! down the stack.
 //!
 //! [`run_dog`] is `main`'s whole `Commands::Dog` arm: validate the name is
-//! one of the two built-ins, connect, and dispatch. Tasks 15 and 21 fill in
-//! what `"metrics"` and `"bark"` actually do; until then each is a stub that
-//! reports which task owns it and exits [`ExitCode::Failure`] — never
-//! `todo!()`, which would abort a supervised process with a panic and a
-//! confusing log line instead of a plain, restartable failure.
+//! one of the two built-ins, connect, and dispatch. `"metrics"` reaches
+//! [`metrics::run`]; `"bark"` (Task 21) is still a stub that reports which
+//! task owns it and exits [`ExitCode::Failure`] — never `todo!()`, which
+//! would abort a supervised process with a panic and a confusing log line
+//! instead of a plain, restartable failure.
 
 pub mod http;
 pub mod metrics;
@@ -96,18 +96,11 @@ pub enum DogRunError {
     /// `shep-daemon/src/rpc.rs`'s `DogConfig` arm has exactly one success
     /// reply. Kept as a reportable error rather than `unreachable!()`,
     /// for the same reason [`run_dog`]'s own doc gives for not using
-    /// `todo!()` in its two built-in stubs — a dog is a process the
-    /// shepherd restarts, and a clean exit code beats a panic.
+    /// `todo!()` in [`stub`] — a dog is a process the shepherd restarts,
+    /// and a clean exit code beats a panic.
     UnexpectedReply,
     /// The section does not fit the shape [`DogRuntime::config`] was asked
     /// to parse it as.
-    ///
-    /// `#[allow(dead_code)]`: no call site constructs this yet — nothing in
-    /// this crate calls [`DogRuntime::config`] until Task 15/21's own built-in
-    /// dogs do, the same reasoning `output::emit`'s own doc gives for
-    /// `ShepToml::adopt_dog`/`rehome_dog` between Tasks 10 and 11. Covered by
-    /// this module's own unit test in the meantime.
-    #[allow(dead_code)]
     Section {
         /// The dog's own name.
         name: String,
@@ -200,14 +193,6 @@ impl DogRuntime {
     ///   the dog and the parser's own message. A dog refuses to run on
     ///   configuration it cannot read rather than silently falling back to
     ///   defaults an operator did not ask for.
-    ///
-    /// `#[allow(dead_code)]`: no call site in this crate calls this yet —
-    /// `run_dog`'s two stubs don't need config until Task 15/21's own
-    /// built-in dogs land, matching `ShepToml::adopt_dog`/`rehome_dog`'s own
-    /// precedent between Tasks 10 and 11. Covered by this module's own unit
-    /// test (`a_section_that_does_not_fit_is_refused_rather_than_defaulted`)
-    /// in the meantime.
-    #[allow(dead_code)]
     pub fn config<T>(&self) -> Result<T, DogRunError>
     where
         T: serde::de::DeserializeOwned + Default,
@@ -267,7 +252,7 @@ pub async fn run_dog(name: &str, paths: ShepPaths) -> ExitCode {
         }
     };
     match name {
-        "metrics" => stub(&runtime, "Task 15", "crates/shep-cli/src/dog/metrics.rs"),
+        "metrics" => metrics::run(runtime).await,
         "bark" => stub(&runtime, "Task 21", "crates/shep-cli/src/dog/bark.rs"),
         _ => unreachable!("checked against BUILT_IN_DOGS above"),
     }
@@ -399,35 +384,76 @@ mod tests {
         assert_eq!(code, ExitCode::Usage);
     }
 
-    /// fails if either built-in name stops reaching [`DogRuntime::start`],
-    /// or the stub's `Failure` exit turns into a panic (`todo!()`) — both
-    /// silent regressions `run_dog`'s own doc warns against.
+    /// fails if `"bark"` stops reaching [`DogRuntime::start`], or its
+    /// stub's `Failure` exit turns into a panic (`todo!()`) — both silent
+    /// regressions `run_dog`'s own doc warns against.
+    ///
+    /// `"metrics"` used to be covered by this same loop, back when both
+    /// built-ins were stubs that returned promptly. It no longer does:
+    /// [`metrics::run`] is a real server that blocks on a shutdown signal,
+    /// so awaiting it to completion here would hang the test. The dispatch
+    /// path metrics also depends on is covered by the sibling test below
+    /// instead (spawned, then aborted rather than awaited); what the
+    /// server actually does once it's up is `dog::metrics`'s own test
+    /// module's job.
     #[tokio::test]
-    async fn run_dog_reaches_the_stub_for_each_built_in_dog() {
-        for name in BUILT_IN_DOGS {
-            let dir = tempfile::tempdir().unwrap();
-            let socket = dir.path().join("s.sock");
-            let response = Response::DogSection {
-                toml: String::new().into(),
-            };
-            let handle = serve_one_request(&socket, sample_ack(), response).await;
-            let paths = test_paths(dir.path(), socket);
+    async fn run_dog_reaches_the_stub_for_bark() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.sock");
+        let response = Response::DogSection {
+            toml: String::new().into(),
+        };
+        let handle = serve_one_request(&socket, sample_ack(), response).await;
+        let paths = test_paths(dir.path(), socket);
 
-            let code = run_dog(name, paths).await;
-            assert_eq!(code, ExitCode::Failure, "{name}");
+        let code = run_dog("bark", paths).await;
+        assert_eq!(code, ExitCode::Failure);
 
-            let envelope = tokio::time::timeout(Duration::from_secs(5), handle)
-                .await
-                .expect("run_dog must reach the wire")
-                .unwrap();
-            assert_eq!(
-                envelope.body,
-                Request::DogConfig {
-                    name: name.to_string()
-                },
-                "{name}"
-            );
-        }
+        let envelope = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run_dog must reach the wire")
+            .unwrap();
+        assert_eq!(
+            envelope.body,
+            Request::DogConfig {
+                name: "bark".to_string()
+            }
+        );
+    }
+
+    /// fails if `"metrics"` stops reaching [`DogRuntime::start`] — proof
+    /// that dispatch still gets there, nothing more: [`metrics::run`]
+    /// blocks on a shutdown signal once it is up, so this spawns it,
+    /// waits only for the `DogConfig` request to land on the wire, then
+    /// aborts the task rather than awaiting a return that never comes on
+    /// its own. The section answers `bind = "127.0.0.1:0"` — an
+    /// OS-assigned port, never [`metrics::MetricsConfig::default`]'s fixed
+    /// `9615`, which a developer's own running shepherd (or a leftover
+    /// process from a prior hung run) could already hold.
+    #[tokio::test]
+    async fn run_dog_reaches_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.sock");
+        let response = Response::DogSection {
+            toml: "bind = \"127.0.0.1:0\"\n".to_string().into(),
+        };
+        let handle = serve_one_request(&socket, sample_ack(), response).await;
+        let paths = test_paths(dir.path(), socket);
+
+        let task = tokio::spawn(run_dog("metrics", paths));
+
+        let envelope = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run_dog must reach the wire")
+            .unwrap();
+        assert_eq!(
+            envelope.body,
+            Request::DogConfig {
+                name: "metrics".to_string()
+            }
+        );
+
+        task.abort();
     }
 
     /// fails if `run_dog` swallows a connect failure instead of reporting

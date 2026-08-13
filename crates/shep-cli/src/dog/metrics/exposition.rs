@@ -1,10 +1,7 @@
 //! Renders a [`super::Reading`] as Prometheus text exposition.
 //!
-//! `#[allow(dead_code)]` sits on [`render`]: nothing in this crate calls it
-//! yet, since the metrics dog that serves it over HTTP (`dog::http`, a
-//! later task) is Task 15's, not this one's. It goes away the moment that
-//! task lands, the same shape `dog::http`'s own module doc records for its
-//! own functions.
+//! [`render`] is what `dog::metrics::handle_connection` calls to answer
+//! `/metrics`.
 
 use core::fmt::{self, Write as _};
 
@@ -131,7 +128,6 @@ fn dog_source_label(source: &DogSource) -> &'static str {
 /// so an unescaped quote in one name would corrupt every series after it in
 /// the same response.
 #[must_use]
-#[allow(dead_code)]
 pub fn render(reading: &Reading) -> String {
     let mut cpu = MetricGroup::new(
         "shep_sheep_cpu_percent",

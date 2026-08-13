@@ -11,14 +11,8 @@
 //!
 //! Generic over [`AsyncRead`]/[`AsyncWrite`] rather than `TcpStream`, so a
 //! test drives [`read_request`]/[`write_response`] over a `tokio::io::duplex`
-//! pair with no socket at all. The metrics dog (a later task) is the one
-//! caller that binds a real [`tokio::net::TcpListener`].
-//!
-//! `#[allow(dead_code)]` sits on every item below: nothing in this crate
-//! calls into this module yet, since the metrics dog that serves through it
-//! is a later task. Each carries its own copy — a `dead_code` warning is
-//! per-item, not per-module — but the reason is this one paragraph, and it
-//! goes away the moment that task lands.
+//! pair with no socket at all. `dog::metrics` is the one caller that binds a
+//! real [`tokio::net::TcpListener`].
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -28,16 +22,13 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 
 /// Ceiling on a request's head. Generous for a real client, small enough
 /// that a hostile one cannot grow a dog's memory with it.
-#[allow(dead_code)]
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 /// Ceiling on a declared `content-length`. The metrics dog reads no bodies
 /// at all; this exists so a test sink can, and so the ceiling is one number
 /// rather than a per-caller decision.
-#[allow(dead_code)]
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// One HTTP/1.1 request, as much of it as a dog needs.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub struct HttpRequest {
     /// The method, uppercased as it arrived.
@@ -56,7 +47,6 @@ pub struct HttpRequest {
 /// field here is a size or a fixed reason string, never a header value — and
 /// a header value is where an `Authorization` would be. A derived `Debug`
 /// stays safe to log.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum HttpError {
     /// The underlying read or write failed, or the peer closed the
@@ -123,7 +113,6 @@ impl core::error::Error for HttpError {
 ///   the declared `content-length` exceeded [`MAX_BODY_BYTES`].
 /// - [`HttpError::Timeout`] — the request did not arrive within
 ///   `read_timeout`.
-#[allow(dead_code)]
 pub async fn read_request<R: AsyncRead + Unpin>(
     stream: &mut R,
     read_timeout: Duration,
@@ -136,7 +125,6 @@ pub async fn read_request<R: AsyncRead + Unpin>(
 
 /// [`read_request`]'s body, split out so the timeout wraps exactly this and
 /// nothing else.
-#[allow(dead_code)]
 async fn read_request_unbounded_time<R: AsyncRead + Unpin>(
     stream: &mut R,
 ) -> Result<HttpRequest, HttpError> {
@@ -185,7 +173,6 @@ async fn read_request_unbounded_time<R: AsyncRead + Unpin>(
 /// [`MAX_HEADER_BYTES`]. `reader`'s own size ceiling ([`read_request_unbounded_time`]'s
 /// `Take`) is what makes that refusal happen at all rather than hanging: see
 /// this module's tests for the flood case this guards against.
-#[allow(dead_code)]
 async fn read_head<S: AsyncRead + Unpin>(reader: &mut BufReader<S>) -> Result<Vec<u8>, HttpError> {
     let mut head = Vec::new();
     loop {
@@ -218,7 +205,6 @@ async fn read_head<S: AsyncRead + Unpin>(reader: &mut BufReader<S>) -> Result<Ve
 
 /// Parses a complete head (as [`read_head`] returns it) into the method,
 /// target and header map [`HttpRequest`] carries.
-#[allow(dead_code)]
 fn parse_head(head: &[u8]) -> Result<(String, String, BTreeMap<String, String>), HttpError> {
     let mut lines = head.split(|&b| b == b'\n');
     let request_line = lines
@@ -257,7 +243,6 @@ fn parse_head(head: &[u8]) -> Result<(String, String, BTreeMap<String, String>),
 
 /// Strips one trailing `\r` left by splitting on `\n` alone; a bare `\n`
 /// line (no `\r`) is returned unchanged.
-#[allow(dead_code)]
 fn strip_trailing_cr(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\r").unwrap_or(line)
 }
@@ -273,7 +258,6 @@ fn strip_trailing_cr(line: &[u8]) -> &[u8] {
 ///
 /// # Errors
 /// - The underlying write failed.
-#[allow(dead_code)]
 pub async fn write_response<W: AsyncWrite + Unpin>(
     stream: &mut W,
     status: u16,

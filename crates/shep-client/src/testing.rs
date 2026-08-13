@@ -17,6 +17,7 @@
 //! [`child_exiting_with`] serve the autostart tests, where the peer has to
 //! be brought into existence from a synchronous launcher closure.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -277,6 +278,7 @@ enum OutOfOrder {
 pub struct FakeDaemon {
     script: mpsc::Sender<ScriptCommand>,
     armed_list: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
+    armed_list_sequence: Arc<Mutex<VecDeque<Vec<ProcessInfo>>>>,
     armed_describe: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
     armed_reply_then_event: Arc<Mutex<Option<(Response, BusEvent)>>>,
     armed_shutdown_then_unlink: Arc<Mutex<Option<Duration>>>,
@@ -296,6 +298,25 @@ impl FakeDaemon {
     /// lets this stay a plain fn instead.
     pub fn reply_to_list(&self, flock: Vec<ProcessInfo>) {
         *self.armed_list.lock().unwrap() = Some(flock);
+    }
+
+    /// Arms a whole sequence of `Request::ListFlock` answers at once: the
+    /// first call gets `responses[0]`, the second `responses[1]`, and so on.
+    ///
+    /// For a test proving a caller re-asks on every scrape rather than
+    /// caching the first reading — the shep-cli metrics dog's own
+    /// `every_scrape_asks_the_shepherd_again` test. [`Self::reply_to_list`]
+    /// only arms ONE answer at a time (consumed on the next `ListFlock`), so
+    /// a test with two scrapes that must see two DIFFERENT listings would
+    /// otherwise need to re-arm between them with no hook to do it from —
+    /// the caller does not control when its own second request lands on the
+    /// wire. Once this queue empties, [`Self::reply_to_list`]'s own
+    /// single-slot arming (or the `Flock(vec![])` default) takes back over.
+    ///
+    /// Synchronous for the same reason [`Self::reply_to_list`] is: every
+    /// call site invokes it without `.await`.
+    pub fn reply_to_list_sequence(&self, responses: Vec<Vec<ProcessInfo>>) {
+        *self.armed_list_sequence.lock().unwrap() = responses.into();
     }
 
     /// Arms the answer to the next `Request::Describe { .. }` this
@@ -436,7 +457,9 @@ impl FakeDaemon {
 /// is answered with `Response::Subscribed`, flips this connection into the
 /// subscribed state, and flushes anything [`ScriptCommand::PushEvent`]
 /// queued before now; else `ListFlock` is answered per
-/// [`FakeDaemon::reply_to_list`] (or `Flock(vec![])` if nothing is armed);
+/// [`FakeDaemon::reply_to_list_sequence`]'s queue first (one entry consumed
+/// per call), falling back to [`FakeDaemon::reply_to_list`] (or
+/// `Flock(vec![])` if nothing is armed) once the queue is empty;
 /// else `Describe { .. }` is answered per [`FakeDaemon::reply_to_describe`]
 /// (or `Described(vec![])` if nothing is armed); else `Response::Pong`.
 ///
@@ -444,7 +467,7 @@ impl FakeDaemon {
 /// written straight to the wire once subscribed, or buffered until then —
 /// see [`FakeDaemon::push`].
 ///
-/// Ten parameters: `listener`, `socket_path` and `ack` set up the one served
+/// Eleven parameters: `listener`, `socket_path` and `ack` set up the one served
 /// connection, `script` carries every command a `FakeDaemon` handle can send
 /// after that, and the rest are one `Arc<Mutex<..>>` slot per independently
 /// armable behavior, cloned straight from [`FakeDaemon`]'s own fields —
@@ -457,6 +480,7 @@ async fn serve_scripted(
     ack: HelloAck,
     mut script: mpsc::Receiver<ScriptCommand>,
     armed_list: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
+    armed_list_sequence: Arc<Mutex<VecDeque<Vec<ProcessInfo>>>>,
     armed_describe: Arc<Mutex<Option<Vec<ProcessInfo>>>>,
     armed_reply_then_event: Arc<Mutex<Option<(Response, BusEvent)>>>,
     armed_shutdown_then_unlink: Arc<Mutex<Option<Duration>>>,
@@ -574,7 +598,18 @@ async fn serve_scripted(
                         } else {
                             let response = if matches!(envelope.body, Request::ListFlock) {
                                 list_flock_count.fetch_add(1, Ordering::SeqCst);
-                                Response::Flock(armed_list.lock().unwrap().take().unwrap_or_default())
+                                // The sequence queue (`reply_to_list_sequence`)
+                                // takes priority: a test scripting a whole
+                                // sequence at once still means it, even if
+                                // `reply_to_list`'s single slot happens to be
+                                // armed too (it should never be armed
+                                // alongside the sequence in practice, but the
+                                // queue winning is the least surprising order
+                                // either way).
+                                let next = armed_list_sequence.lock().unwrap().pop_front();
+                                Response::Flock(next.unwrap_or_else(|| {
+                                    armed_list.lock().unwrap().take().unwrap_or_default()
+                                }))
                             } else if matches!(envelope.body, Request::Describe { .. }) {
                                 Response::Described(
                                     armed_describe.lock().unwrap().take().unwrap_or_default(),
@@ -604,6 +639,7 @@ pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDa
     let listener = UnixListener::bind(path).unwrap();
     let (script_tx, script_rx) = mpsc::channel(SCRIPT_CHANNEL_CAPACITY);
     let armed_list = Arc::new(Mutex::new(None));
+    let armed_list_sequence = Arc::new(Mutex::new(VecDeque::new()));
     let armed_describe = Arc::new(Mutex::new(None));
     let armed_reply_then_event = Arc::new(Mutex::new(None));
     let armed_shutdown_then_unlink = Arc::new(Mutex::new(None));
@@ -615,6 +651,7 @@ pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDa
         ack,
         script_rx,
         Arc::clone(&armed_list),
+        Arc::clone(&armed_list_sequence),
         Arc::clone(&armed_describe),
         Arc::clone(&armed_reply_then_event),
         Arc::clone(&armed_shutdown_then_unlink),
@@ -627,6 +664,7 @@ pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDa
         FakeDaemon {
             script: script_tx,
             armed_list,
+            armed_list_sequence,
             armed_describe,
             armed_reply_then_event,
             armed_shutdown_then_unlink,

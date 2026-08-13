@@ -27,12 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently falling back to defaults an operator did not ask for.
 
   `shep dog <name>` refuses an unrecognised name before ever touching the
-  socket (`usage`, naming the two built-ins), and neither `"metrics"` nor
-  `"bark"` does anything yet — each is a stub reporting which task lands
-  it. A dog's own diagnostics go to stderr, plain text: it is a supervised
-  process, and the shepherd's log pump already captures that into
-  `$SHEP_HOME/logs/<name>-0-err.log` like any sheep's — `shep bleats
-  <name>` is how an operator reads it.
+  socket (`usage`, naming the two built-ins). `"metrics"` runs the metrics
+  dog below; `"bark"` doesn't do anything yet — it's a stub reporting
+  which task lands it. A dog's own diagnostics go to stderr, plain text:
+  it is a supervised process, and the shepherd's log pump already captures
+  that into `$SHEP_HOME/logs/<name>-0-err.log` like any sheep's — `shep
+  bleats <name>` is how an operator reads it.
 
 - Add `shep enable <name>` and `shep disable <name>`, the operator verbs
   that turn a registered dog on and off. Both write `$SHEP_HOME/shep.toml`
@@ -534,11 +534,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already covers why lifecycle and resource fields stay JSON-only there.
 
 - Add `dog::metrics::exposition::render`, which turns a flock snapshot into
-  Prometheus text exposition (format version 0.0.4). The metrics dog (a
-  later task) serves this over `dog::http` at whatever path and interval an
-  operator configures; this task is the renderer alone. No `prometheus`
-  crate: the format is one line per series over data that already arrives
-  as a plain `Vec<ProcessInfo>` per scrape, never accumulated, so a
+  Prometheus text exposition (format version 0.0.4), and `shep dog metrics`
+  (below), the dog that serves it. No `prometheus` crate: the format is one
+  line per series over data that already arrives as a plain
+  `Vec<ProcessInfo>` per scrape, never accumulated, so a
   registry/collector/gatherer stack would buy nothing this function
   doesn't already do directly.
 
@@ -571,6 +570,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unavailable. Label values are escaped per the exposition format
   (backslash, double quote, newline) — a sheep's name is operator-supplied
   and reaches the renderer verbatim.
+
+- `shep dog metrics` (spawned by the shepherd when `metrics` is enabled)
+  serves the exposition above over plain HTTP. `[dog.metrics] bind`
+  chooses the listen address, defaulting to `127.0.0.1:9615` —
+  loopback, and only loopback, unless the operator names a wider one
+  explicitly: a metrics endpoint carries every sheep's name, and on many
+  hosts a sheep's name is the name of an internal service, so this dog
+  never widens its own exposure as a side effect of `shep enable`. An
+  unrecognised key under `[dog.metrics]` is a startup error naming it,
+  not a dog silently serving on a port the operator didn't choose.
+
+  `/metrics` answers the exposition; every other path answers `404`
+  naming `/metrics`, so a scrape config that happens to work against `/`
+  doesn't quietly break the day that path is honoured. Each scrape is a
+  live `ListFlock` against the shepherd — never a cached reading
+  refreshed on a timer — so a scrape faster than the shepherd's own
+  sampling window sees the same number twice, honestly: that's the
+  resolution the underlying sample has. A shepherd that doesn't answer
+  gets a `503`, not a stale exposition or an empty `200` a scraper would
+  read as "the flock is empty." A bind failure (`EADDRINUSE`, most often
+  a second shepherd or the operator's own Prometheus pushgateway) is a
+  fatal, named exit, not a warning — this dog's whole purpose is that
+  port. `shep disable metrics` stops it on `SIGTERM`, the shepherd's own
+  first rung of its kill ladder, rather than riding it all the way to
+  `SIGKILL`.
 
 ### Fixes
 

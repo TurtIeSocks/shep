@@ -1081,6 +1081,7 @@ dependencies = [
  "shep-client",
  "shep-core",
  "shep-daemon",
+ "sysinfo",
  "tempfile",
  "tokio",
  "toml",
