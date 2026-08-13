@@ -51,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Every shepherd-channel message a sheep writes is forwarded to the bus,
+  including an `action-reply` no trigger is waiting for.
 - `ShepherdMessage::Action` carries `id`; `ChildMessage::ActionReply`
   accepts an optional `id` echo. Additive — an app that ignores both is
   matched by name and order exactly as before.

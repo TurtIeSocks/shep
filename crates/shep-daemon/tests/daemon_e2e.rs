@@ -22,7 +22,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use shep_core::config::AppConfig;
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
-    ActionOutcome, BusEvent, Envelope, Hello, HelloAck, HelloReply, PROTOCOL_VERSION,
+    ActionOutcome, BusEvent, ChildMessage, Envelope, Hello, HelloAck, HelloReply, PROTOCOL_VERSION,
     ProcessEventKind, ProcessInfo, Reply, Request, Response, RpcErrorCode, SelectorSpec,
     ServerFrame, codec, decode_frame, encode_frame,
 };
@@ -923,6 +923,59 @@ async fn a_triggered_action_reaches_a_real_child_and_answers_it_twice() {
             },
             "round {round} must carry its own reply, not a leftover from the other one"
         );
+    }
+
+    fixture.shutdown().await;
+}
+
+/// A real child writing on a real fd 3, observed by a real subscriber over a
+/// real socket. The engine-tier cases prove the actor forwards; only this
+/// proves the whole path — socketpair, newline framing, the bus, the topic
+/// filter, and the frame encoder — carries a `channel.metric` to a client that
+/// asked for `channel.*` and nothing else.
+#[tokio::test]
+async fn a_childs_metric_reaches_a_channel_subscriber_over_the_socket() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+
+    // Subscribe BEFORE starting: the bus delivers from the moment you join.
+    let subscribed = client
+        .request(Request::Subscribe {
+            topics: vec!["channel.*".to_string()],
+        })
+        .await;
+    assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
+
+    let mut app = AppConfig::minimal("chatty", "/bin/sh");
+    app.interpreter = Some("none".to_string());
+    app.channel = true;
+    // Writes one metric on fd 3 and then sleeps, so the sheep is still alive
+    // when the assertion runs.
+    app.args = vec![
+        "-c".to_string(),
+        r#"printf '{"kind":"metric","name":"rps","value":42}\n' >&3; sleep 30"#.to_string(),
+    ];
+    client.request(Request::Start { apps: vec![app] }).await;
+
+    // Bounded (IR-46): a subscriber that never receives would otherwise hang
+    // this test rather than fail it.
+    let frame = tokio::time::timeout(RECV_TIMEOUT, async {
+        loop {
+            if let ServerFrame::Event(BusEvent::Channel { message, .. }) = client.next_frame().await
+            {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("no channel.* frame within the timeout");
+
+    match frame {
+        ChildMessage::Metric { name, value } => {
+            assert_eq!(name, "rps");
+            assert!((value - 42.0).abs() < f64::EPSILON, "{value}");
+        }
+        other => panic!("subscribed to channel.*, received {other:?}"),
     }
 
     fixture.shutdown().await;

@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `BusEvent::Channel` and the `channel.ready` / `channel.metric` /
+  `channel.action_reply` topics (spec §6).
 - Add `protocol::ProcessInfoBuilder`.
 - Add `config::KillSignal`, the four-signal grammar `kill_signal` accepts.
 - Add `barks` module: `Bark`, `SinkOutcome`, `append`, `read`, and

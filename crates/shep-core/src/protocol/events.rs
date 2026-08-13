@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::protocol::channel::ChildMessage;
 use crate::protocol::request::ProcessInfo;
 
 /// What happened to a sheep
@@ -98,6 +99,34 @@ pub enum BusEvent {
         /// The line
         line: String,
     },
+    /// One message a sheep wrote on its shepherd channel (fd 3).
+    ///
+    /// Child->shepherd only. The shepherd's own writes — the
+    /// `{"kind":"shutdown"}` of `shutdown_with_message`, and an `action` a
+    /// `Trigger` dispatched — are deliberately not here. Every one of them is
+    /// something an operator or the daemon just did and already has a
+    /// reporter: a shutdown message is followed by `process.stop`, and an
+    /// action is answered to the caller that sent it by
+    /// `Response::Triggered`. Putting them here as well would make this the
+    /// only event on the bus reporting a REQUEST rather than an outcome, and
+    /// would loop a dog that both subscribes and triggers back onto its own
+    /// dispatches. Adding the outbound half later stays additive — another
+    /// variant, more `channel.` topics, no version bump — so this is a
+    /// narrowing, not a door closed.
+    ///
+    /// `message` is the app's own text, whole and unredacted, unlike the
+    /// `[dog.<name>]` config that travels as [`DogSectionToml`]. Nothing on
+    /// this wire is a credential: `Ready` is empty, `Metric` is a name and a
+    /// float, and an `ActionReply` body is text the app chose to publish to
+    /// whoever triggered it. That is what makes a derived `Debug` safe here.
+    ///
+    /// [`DogSectionToml`]: crate::protocol::DogSectionToml
+    Channel {
+        /// The sheep that wrote it.
+        id: u32,
+        /// The message, exactly as it came off fd 3.
+        message: ChildMessage,
+    },
     /// The bounded queue dropped this many events for this subscriber
     Dropped {
         /// Dropped-event count since last notice
@@ -126,6 +155,16 @@ impl BusEvent {
             },
             Self::LogOut { .. } => "log.out",
             Self::LogErr { .. } => "log.err",
+            // Total over `ChildMessage`, with no wildcard, and that is the
+            // point of leaving that enum exhaustive (see its module doc): a
+            // fourth kind on fd 3 fails to compile here until someone decides
+            // what its topic is, rather than defaulting into a topic no
+            // subscriber ever asked for.
+            Self::Channel { message, .. } => match message {
+                ChildMessage::Ready => "channel.ready",
+                ChildMessage::Metric { .. } => "channel.metric",
+                ChildMessage::ActionReply { .. } => "channel.action_reply",
+            },
             Self::Dropped { .. } => "daemon.dropped",
             Self::DaemonShutdown => "daemon.shutdown",
         }
@@ -199,6 +238,34 @@ mod tests {
         });
 
         events.extend(lifecycle);
+
+        // All three shepherd-channel topics, over one sheep id, because the
+        // adjacent-tagged shape puts the message's own `kind` INSIDE `data`
+        // next to `id` — a nesting that is easy to get wrong by hand and
+        // invisible in a round-trip test, which only proves this crate agrees
+        // with itself.
+        events.extend([
+            BusEvent::Channel {
+                id: 3,
+                message: ChildMessage::Ready,
+            },
+            BusEvent::Channel {
+                id: 3,
+                message: ChildMessage::Metric {
+                    name: "rps".to_string(),
+                    value: 42.0,
+                },
+            },
+            BusEvent::Channel {
+                id: 3,
+                message: ChildMessage::ActionReply {
+                    action: "gc".to_string(),
+                    body: "freed 12MB".to_string(),
+                    id: Some(7),
+                },
+            },
+        ]);
+
         insta::assert_json_snapshot!("bus_event_wire_v1", events);
     }
 
@@ -270,5 +337,83 @@ mod tests {
         let fixture = r#"{"event":"log_out","data":{"id":3,"line":"ready"}}"#;
         let ev: BusEvent = serde_json::from_str(fixture).unwrap();
         assert!(matches!(ev, BusEvent::LogOut { id: 3, .. }));
+    }
+
+    /// fails if a shepherd-channel message maps to the wrong dotted topic. A
+    /// subscriber that asked for `channel.metric` and silently receives nothing
+    /// has no other way to find out, and `channel.*` matches whatever typo is
+    /// there — so the exact strings are the contract, not the prefix.
+    #[test]
+    fn every_shepherd_channel_message_has_its_own_topic() {
+        for (message, topic) in [
+            (ChildMessage::Ready, "channel.ready"),
+            (
+                ChildMessage::Metric {
+                    name: "rps".to_string(),
+                    value: 42.0,
+                },
+                "channel.metric",
+            ),
+            (
+                ChildMessage::ActionReply {
+                    action: "gc".to_string(),
+                    body: "ok".to_string(),
+                    id: Some(7),
+                },
+                "channel.action_reply",
+            ),
+        ] {
+            let event = BusEvent::Channel {
+                id: 3,
+                message: message.clone(),
+            };
+            assert_eq!(event.topic(), topic, "{message:?}");
+        }
+    }
+
+    /// fails if `channel.*` stops reaching every one of the three. The glob a
+    /// dashboard writes is the prefix, so a topic that drifted out from under it
+    /// (`channel_ready`, say) would be unreachable by the only pattern anyone
+    /// actually subscribes with.
+    #[test]
+    fn the_channel_glob_reaches_all_three_topics() {
+        for message in [
+            ChildMessage::Ready,
+            ChildMessage::Metric {
+                name: "rps".to_string(),
+                value: 1.0,
+            },
+            ChildMessage::ActionReply {
+                action: "gc".to_string(),
+                body: String::new(),
+                id: None,
+            },
+        ] {
+            let topic = BusEvent::Channel { id: 1, message }.topic();
+            assert!(
+                topic.starts_with("channel."),
+                "`{topic}` is not under the channel.* glob"
+            );
+        }
+    }
+
+    /// fails if the event stops carrying the message body. The whole argument for
+    /// putting the real message on the bus rather than a summary is that nothing
+    /// on this wire is a credential — a reply body that arrived truncated or
+    /// replaced would make the topic useless for the case it exists for, a
+    /// dashboard watching what apps actually say.
+    #[test]
+    fn a_channel_event_carries_the_message_verbatim() {
+        let event = BusEvent::Channel {
+            id: 3,
+            message: ChildMessage::ActionReply {
+                action: "gc".to_string(),
+                body: "freed 12MB".to_string(),
+                id: Some(7),
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("freed 12MB"), "{json}");
+        assert_eq!(serde_json::from_str::<BusEvent>(&json).unwrap(), event);
     }
 }

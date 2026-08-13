@@ -169,5 +169,37 @@ expression: events
       "manually": false,
       "at_ms": 1700000000000
     }
+  },
+  {
+    "event": "channel",
+    "data": {
+      "id": 3,
+      "message": {
+        "kind": "ready"
+      }
+    }
+  },
+  {
+    "event": "channel",
+    "data": {
+      "id": 3,
+      "message": {
+        "kind": "metric",
+        "name": "rps",
+        "value": 42.0
+      }
+    }
+  },
+  {
+    "event": "channel",
+    "data": {
+      "id": 3,
+      "message": {
+        "kind": "action-reply",
+        "action": "gc",
+        "body": "freed 12MB",
+        "id": 7
+      }
+    }
   }
 ]

@@ -4677,28 +4677,44 @@ async fn run_sheep<P: RunningProcess>(
             }
             maybe_msg = from_child.recv(), if from_child_open => {
                 match maybe_msg {
-                    Some(ChildMessage::Ready) => {
-                        let _ = actor_tx.send(Msg::Ready { id }).await;
-                    }
-                    Some(ChildMessage::Metric { name, value }) => {
-                        tracing::debug!(id, name, value, "child metric (the metrics dog reads these; not built yet)");
-                    }
-                    Some(ChildMessage::ActionReply {
-                        action,
-                        body,
-                        // The child's `id` is the DISPATCH's, not the sheep's;
-                        // `id` below is the sheep's. Renamed at the boundary
-                        // so no line downstream has to hold both meanings.
-                        id: stamp,
-                    }) => {
-                        let _ = actor_tx
-                            .send(Msg::ActionReply {
-                                id,
+                    Some(message) => {
+                        // Forwarded BEFORE it is acted on, and unconditionally.
+                        // A subscriber's view of fd 3 must not depend on
+                        // whether this daemon happens to have a consumer for
+                        // that kind: an `action-reply` nobody is waiting for
+                        // is dropped a few lines below, and `deferred.md`
+                        // names exactly that message as the traffic the bus
+                        // exists to stop losing.
+                        let _ = events.send(BusEvent::Channel {
+                            id,
+                            message: message.clone(),
+                        });
+                        match message {
+                            ChildMessage::Ready => {
+                                let _ = actor_tx.send(Msg::Ready { id }).await;
+                            }
+                            ChildMessage::Metric { name, value } => {
+                                tracing::debug!(
+                                    id,
+                                    name,
+                                    value,
+                                    "child metric forwarded to the bus as channel.metric"
+                                );
+                            }
+                            ChildMessage::ActionReply {
                                 action,
                                 body,
-                                stamp,
-                            })
-                            .await;
+                                // The child's `id` is the DISPATCH's, not the
+                                // sheep's; `id` above is the sheep's. Renamed
+                                // at the boundary so no line downstream has to
+                                // hold both meanings.
+                                id: stamp,
+                            } => {
+                                let _ = actor_tx
+                                    .send(Msg::ActionReply { id, action, body, stamp })
+                                    .await;
+                            }
+                        }
                     }
                     None => from_child_open = false,
                 }
@@ -8860,6 +8876,125 @@ mod tests {
             }]),
             "the app's reply body is what the caller is answered with"
         );
+    }
+
+    /// fails if a `ready` on fd 3 reaches only the readiness machinery and never
+    /// the bus. Readiness already had a consumer, which is exactly why it is the
+    /// case worth pinning: forwarding must be a SECOND thing the arm does, not a
+    /// replacement for the first.
+    #[tokio::test(start_paused = true)]
+    async fn a_ready_on_the_channel_reaches_both_the_bus_and_the_readiness_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.channel = true;
+        app.wait_ready = true;
+        // `started` hands back the bus receiver as its third element — subscribed
+        // BEFORE the start, so nothing this case cares about is missed.
+        let (handle, runner, mut events) =
+            started(&dir, app, vec![ProcScript::never_exits()]).await;
+        let io = runner.io_handles(0);
+
+        io.from_child_tx.send(ChildMessage::Ready).await.unwrap();
+
+        // Bounded (IR-46): a bus that never receives would park this case rather
+        // than fail it, and there is no other failure mode to give it.
+        let seen = tokio::time::timeout(ACTION_WINDOW, async {
+            loop {
+                if let BusEvent::Channel { id, message } = events.recv().await.unwrap() {
+                    break (id, message);
+                }
+            }
+        })
+        .await
+        .expect("no channel event within the window");
+
+        assert_eq!(seen, (0, ChildMessage::Ready));
+
+        // The readiness half still works: the sheep goes Online off this same
+        // message, which is what it did before the bus ever saw one.
+        let listed = handle.list().await;
+        assert_eq!(listed[0].status, ProcStatus::Online);
+    }
+
+    /// fails if a metric is still only a `tracing::debug!`. That log line was the
+    /// whole of what a metric ever produced, and a subscriber could not read it —
+    /// this is the case that says the topic exists for a reason.
+    #[tokio::test(start_paused = true)]
+    async fn a_metric_on_the_channel_reaches_the_bus_with_its_name_and_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.channel = true;
+        let (_handle, runner, mut events) =
+            started(&dir, app, vec![ProcScript::never_exits()]).await;
+        let io = runner.io_handles(0);
+
+        io.from_child_tx
+            .send(ChildMessage::Metric {
+                name: "rps".to_string(),
+                value: 42.0,
+            })
+            .await
+            .unwrap();
+
+        let seen = tokio::time::timeout(ACTION_WINDOW, async {
+            loop {
+                if let BusEvent::Channel { id, message } = events.recv().await.unwrap() {
+                    break (id, message);
+                }
+            }
+        })
+        .await
+        .expect("no channel event within the window");
+
+        assert_eq!(
+            seen,
+            (
+                0,
+                ChildMessage::Metric {
+                    name: "rps".to_string(),
+                    value: 42.0,
+                }
+            )
+        );
+    }
+
+    /// fails if an `action-reply` nobody is waiting for is dropped before the bus
+    /// sees it. This is the case `deferred.md`'s `channel.*` entry names by name:
+    /// an unprompted or late reply "stays just as invisible as before". No trigger
+    /// is armed here, so `handle_action_reply` finds no wait and discards it — and
+    /// the bus must still have carried it.
+    #[tokio::test(start_paused = true)]
+    async fn an_action_reply_no_trigger_is_waiting_for_still_reaches_the_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.channel = true;
+        let (_handle, runner, mut events) =
+            started(&dir, app, vec![ProcScript::never_exits()]).await;
+        let io = runner.io_handles(0);
+
+        io.from_child_tx
+            .send(ChildMessage::ActionReply {
+                action: "gc".to_string(),
+                body: "unprompted".to_string(),
+                id: None,
+            })
+            .await
+            .unwrap();
+
+        let seen = tokio::time::timeout(ACTION_WINDOW, async {
+            loop {
+                if let BusEvent::Channel { message, .. } = events.recv().await.unwrap() {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("no channel event within the window");
+
+        let ChildMessage::ActionReply { body, .. } = seen else {
+            panic!("expected an action reply, got {seen:?}");
+        };
+        assert_eq!(body, "unprompted");
     }
 
     /// Fails if a wait for an app that never answers does not end on its own
