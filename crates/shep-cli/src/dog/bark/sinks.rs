@@ -280,12 +280,42 @@ pub fn render_body(sink: &Sink, bark: &Bark) -> Result<String, SinkError> {
 /// the template's own literal quotes already surround the token, the same
 /// way an operator writes `"{message}"`, not `{message}`), `at_ms` as a bare
 /// number.
+///
+/// A SINGLE forward pass over `template`, never four sequential
+/// whole-string `.replace()` calls: `rest` only ever shrinks from the
+/// front, and once a substituted value is pushed onto `out` it is never
+/// looked at again. A sheep named `{at_ms}` makes `bark.message` literally
+/// contain the text `{at_ms}` — sequential replaces would paste that in
+/// during the `{message}` pass and then rewrite it during the `{at_ms}`
+/// pass that follows, corrupting the sheep's name inside the rendered
+/// alert. This pass structurally cannot do that: `{at_ms}` only ever
+/// matches inside `rest`, which is what remains of the *template*, not
+/// what has already been written to `out`.
 fn substitute(template: &str, bark: &Bark) -> String {
-    template
-        .replace("{subject}", &json_escape(&bark.subject))
-        .replace("{rule}", &json_escape(&bark.rule))
-        .replace("{message}", &json_escape(&bark.message))
-        .replace("{at_ms}", &bark.at_ms.to_string())
+    let tokens: [(&str, String); 4] = [
+        ("{subject}", json_escape(&bark.subject)),
+        ("{rule}", json_escape(&bark.rule)),
+        ("{message}", json_escape(&bark.message)),
+        ("{at_ms}", bark.at_ms.to_string()),
+    ];
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(brace) = rest.find('{') {
+        out.push_str(&rest[..brace]);
+        rest = &rest[brace..];
+        match tokens.iter().find(|(token, _)| rest.starts_with(token)) {
+            Some((token, value)) => {
+                out.push_str(value);
+                rest = &rest[token.len()..];
+            }
+            None => {
+                out.push('{');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `s`, escaped for use inside a JSON string's quotes — not a JSON string
@@ -623,6 +653,37 @@ mod tests {
         let rendered = render_body(&sink, &bark).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(value["text"], bark.message);
+    }
+
+    /// fails if a placeholder token that ends up INSIDE an already
+    /// substituted field's own value gets rewritten by a later
+    /// substitution pass. Bark builds its "gave up" messages by
+    /// interpolating a sheep's own name, so a sheep literally named
+    /// `{at_ms}` makes `bark.message` contain that exact text; a naive
+    /// sequential `.replace()` per field pastes that text in during the
+    /// `{message}` pass and then rewrites it during the `{at_ms}` pass that
+    /// follows — silently corrupting the sheep's name inside an alert
+    /// someone is reading during an incident.
+    #[test]
+    fn a_placeholder_inside_a_substituted_value_survives_later_passes() {
+        let bark = Bark {
+            at_ms: 12_345,
+            rule: "gave_up".to_string(),
+            subject: "web".to_string(),
+            message: "{at_ms} gave up: restart budget exhausted".to_string(),
+            sinks: Vec::new(),
+        };
+        let sink = Sink::Json {
+            url: "http://127.0.0.1:1/".to_string(),
+            body: Some(r#"{"text": "{message}", "stamp": {at_ms}}"#.to_string()),
+        };
+        let rendered = render_body(&sink, &bark).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(
+            value["text"], "{at_ms} gave up: restart budget exhausted",
+            "the literal {{at_ms}} carried inside the message must not be rewritten"
+        );
+        assert_eq!(value["stamp"], 12_345);
     }
 
     /// The delivery half, against a local server and never a real webhook.
