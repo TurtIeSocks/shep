@@ -37,14 +37,14 @@ use nix::unistd::Pid;
 use shep_core::signals::OperatorSignal;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWriteExt as _, BufReader, Lines};
 use tokio::net::UnixStream;
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use crate::boot::DIR_MODE;
 use crate::channel::{CHANNEL_VERSION, ChildMessage, ShepherdMessage};
 use crate::runner::{
     ExitOutcome, FlushError, LogCtl, LogLine, ProcIo, ProcessRunner, ReopenError, RunnerError,
-    RunningProcess, SpawnSpec, StopSignal, check_log_ancestry, open_log_path,
+    RunningProcess, SpawnSpec, StdinWrite, StopSignal, check_log_ancestry, open_log_path,
 };
 
 /// Capacity of every channel a spawn wires up — generous enough that a
@@ -242,7 +242,15 @@ impl ProcessRunner for TokioRunner {
         // ambient env by default otherwise.
         command.env_clear();
         command.envs(&spec.env);
-        command.stdin(Stdio::null());
+        // `/dev/null` unless the app asked for a pipe. Piping unconditionally
+        // would change how a great many programs behave — a closed fd 0 is how
+        // they decide they are non-interactive — so this follows `spec.channel`
+        // in being opened only on request. See `AppConfig::stdin`.
+        command.stdin(if spec.stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         // New process group rooted at the child itself, so kill_tree's
@@ -353,11 +361,23 @@ impl ProcessRunner for TokioRunner {
             log_ctl_rx,
         );
 
+        let (to_stdin_tx, to_stdin_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        if spec.stdin {
+            spawn_stdin_pump(child.stdin.take(), to_stdin_rx);
+        } else {
+            // Dropped rather than left dangling, so a caller's `is_closed()`
+            // says "no pipe here" immediately instead of the send silently
+            // buffering into a channel nobody will drain — the same choice the
+            // no-channel arm above makes for fd 3.
+            drop(to_stdin_rx);
+        }
+
         let io = ProcIo {
             logs: logs_rx,
             from_child: from_child_rx,
             to_child: to_child_tx,
             log_ctl: log_ctl_tx,
+            to_stdin: to_stdin_tx,
         };
         Ok((TokioProc { pid, child }, io))
     }
@@ -860,6 +880,47 @@ async fn open_append(path: &Path) -> io::Result<tokio::fs::File> {
     open_log_path(&mut options, path)
         .await
         .inspect_err(|error| tracing::error!(?path, %error, "log file open failed"))
+}
+
+/// Writes lines to one child's stdin, one at a time, acknowledging each.
+///
+/// Serial on purpose: two concurrent writers to one pipe can interleave
+/// mid-line, and a REPL reading the result would see a command neither caller
+/// sent. Serial also means a line queued behind one the app is not reading
+/// waits — which is correct, and which is why the caller bounds its own wait
+/// rather than this task bounding the write (a write abandoned halfway would
+/// leave a partial line in the pipe, which is worse than a slow one).
+///
+/// Ends when the last sender drops, which closes the child's stdin and gives
+/// the app EOF. That is the sheep task letting go of `ProcIo`, i.e. the child
+/// exiting — never before.
+fn spawn_stdin_pump(stdin: Option<ChildStdin>, mut rx: mpsc::Receiver<StdinWrite>) {
+    tokio::spawn(async move {
+        let Some(mut stdin) = stdin else {
+            // `Stdio::piped()` was set and `child.stdin` was still `None`,
+            // which std does not do — but answering nothing would hang every
+            // caller, so the requests are drained and refused instead.
+            while let Some(StdinWrite { done, .. }) = rx.recv().await {
+                let _ = done.send(Err(RunnerError::WriteFailed(
+                    "this child has no stdin pipe".to_string(),
+                )));
+            }
+            return;
+        };
+        while let Some(StdinWrite { line, done }) = rx.recv().await {
+            let mut bytes = line.into_bytes();
+            // Exactly one terminator, appended here and nowhere else. The wire
+            // carries the line without one (`Request::SendLine::line`), so this
+            // is the single place the question "is a newline included" is ever
+            // answered.
+            bytes.push(b'\n');
+            let result = match stdin.write_all(&bytes).await {
+                Ok(()) => stdin.flush().await,
+                Err(error) => Err(error),
+            };
+            let _ = done.send(result.map_err(|error| RunnerError::WriteFailed(error.to_string())));
+        }
+    });
 }
 
 /// Wires the daemon side of the shepherd channel: a reader task decodes

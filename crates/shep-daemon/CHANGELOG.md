@@ -51,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- `SpawnSpec::stdin` and `ProcIo::to_stdin` — an opt-in pipe on a sheep's
+  stdin, with a per-line acknowledgement.
 - `Request::Scale` — set an app's instance count. Scale-up takes the lowest
   free slots, scale-down releases the highest, and the new count is written
   back to the muster roll.

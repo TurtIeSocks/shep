@@ -5209,6 +5209,13 @@ async fn run_sheep<P: RunningProcess>(
         mut from_child,
         to_child,
         log_ctl: _log_ctl,
+        to_stdin: _to_stdin,
+        //        ^ bound, not `_`: `to_stdin: _` drops the sender inside the
+        // `let`, which closes the child's stdin at spawn and gives an
+        // opted-in app immediate EOF. That survives today only because Task
+        // 10 puts a clone on `SheepSlot` — i.e. the bug would be invisible
+        // in the fast loop and would surface as "the app saw EOF" in an
+        // e2e. Same `_log_ctl` precedent, one line up.
     } = io;
     let mut ctl_open = true;
     let mut logs_open = true;
@@ -5974,6 +5981,7 @@ mod tests {
             obeys_signal: true,
             obeys_kill: true,
             lamb_holds_the_pipe: false,
+            reads_stdin: true,
         }]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -12089,6 +12097,7 @@ mod tests {
             out_file: std::path::PathBuf::from("out.log"),
             err_file: std::path::PathBuf::from("err.log"),
             channel: false,
+            stdin: false,
             credentials: None,
         }
     }

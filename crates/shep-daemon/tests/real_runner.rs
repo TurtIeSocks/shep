@@ -16,7 +16,9 @@ use std::time::Duration;
 use shep_core::signals::OperatorSignal;
 use shep_daemon::channel::{ChildMessage, ShepherdMessage};
 use shep_daemon::privilege::Credentials;
-use shep_daemon::runner::{ProcIo, ProcessRunner, RunningProcess, SpawnSpec, StopSignal};
+use shep_daemon::runner::{
+    ProcIo, ProcessRunner, RunningProcess, SpawnSpec, StdinWrite, StopSignal,
+};
 use shep_daemon::tokio_runner::TokioRunner;
 
 /// Builds a `/bin/sh -c <script>` spec writing logs into a fresh tempdir.
@@ -33,6 +35,7 @@ fn sh_spec(script: &str, channel: bool, out_file: PathBuf, err_file: PathBuf) ->
         out_file,
         err_file,
         channel,
+        stdin: false,
         credentials: None,
     }
 }
@@ -53,6 +56,7 @@ fn spec_for(dir: &tempfile::TempDir, program: &str, args: &[&str]) -> SpawnSpec 
         out_file: dir.path().join("out.log"),
         err_file: dir.path().join("err.log"),
         channel: false,
+        stdin: false,
         credentials: None,
     }
 }
@@ -908,5 +912,54 @@ async fn a_bare_interpreter_resolves_via_the_seeded_path() {
     assert_eq!(line.line, "shim-exec-ok");
     assert!(!line.err);
     let outcome = proc.wait().await;
+    assert_eq!(outcome.code, Some(0));
+}
+
+/// A real pipe on a real fd 0. `cat` echoes whatever is written to it, so the
+/// line coming back on stdout is proof the whole path worked — the pipe was
+/// created, mapped to fd 0, written, flushed, and read by the child.
+///
+/// Bounded (IR-46): a line that never arrives must fail this test, not hang it.
+#[tokio::test]
+async fn a_real_child_reads_a_line_written_to_its_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = spec_for(&dir, "/bin/cat", &[]);
+    spec.stdin = true;
+    let runner = TokioRunner::new();
+    let (_proc, mut io) = runner.spawn(&spec).unwrap();
+
+    let (done, ack) = tokio::sync::oneshot::channel();
+    io.to_stdin
+        .send(StdinWrite {
+            line: "hello sheep".to_string(),
+            done,
+        })
+        .await
+        .unwrap();
+    ack.await.unwrap().unwrap();
+
+    let line = tokio::time::timeout(Duration::from_secs(10), io.logs.recv())
+        .await
+        .expect("no stdout line within 10s")
+        .expect("log channel closed");
+    assert!(!line.err);
+    assert_eq!(line.line, "hello sheep");
+}
+
+/// fails if a spec that did not ask for a pipe gets one anyway. `/dev/null` on
+/// fd 0 is what every sheep has had until now, and `cat` reading EOF
+/// immediately — exiting rather than waiting — is the observable difference.
+#[tokio::test]
+async fn a_child_that_did_not_ask_for_stdin_gets_eof_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = spec_for(&dir, "/bin/cat", &[]);
+    spec.stdin = false;
+    let runner = TokioRunner::new();
+    let (mut proc, io) = runner.spawn(&spec).unwrap();
+
+    assert!(io.to_stdin.is_closed());
+    let outcome = tokio::time::timeout(Duration::from_secs(10), proc.wait())
+        .await
+        .expect("cat did not exit on EOF within 10s");
     assert_eq!(outcome.code, Some(0));
 }

@@ -598,6 +598,38 @@ pub struct ProcIo {
     /// [`LogCtl::Reopen`]'s acknowledgement resolving `Err` says the same
     /// thing about a request that was accepted and then never served.
     pub log_ctl: mpsc::Sender<LogCtl>,
+    /// The shepherd's writing end of this sheep's stdin.
+    ///
+    /// Always present, and closed rather than absent when the app did not ask
+    /// for a pipe: the runner drops the receiving end in that case, so
+    /// `is_closed()` is the one question a caller has to ask — the same shape
+    /// [`Self::to_child`] uses for a sheep configured without a shepherd
+    /// channel.
+    ///
+    /// Hold it only for as long as the child is alive. The task on the far end
+    /// parks on `recv()` and has no other way to finish, so a sender kept past
+    /// the child's exit parks that task and holds the pipe's write end with it.
+    pub to_stdin: mpsc::Sender<StdinWrite>,
+}
+
+/// One line to write to a sheep's stdin, and where the answer goes.
+///
+/// The acknowledgement is the point, exactly as it is on [`LogCtl`]: an
+/// `mpsc::send` only proves the message was queued, and a caller told "sent"
+/// on that basis would be told it about a line still sitting in a channel
+/// behind a pipe the app has stopped reading. The `oneshot` fires after the
+/// bytes are written AND flushed, which is the strongest claim this side of
+/// the pipe can honestly make.
+#[derive(Debug)]
+pub struct StdinWrite {
+    /// The line, without its terminator — the writer appends exactly one `\n`.
+    pub line: String,
+    /// Fires once the line has landed, or with why it could not.
+    ///
+    /// A dropped sender means the writer task ended before serving this
+    /// request, which happens when the child's stdin closed — the caller reads
+    /// that as the pipe being gone.
+    pub done: oneshot::Sender<Result<(), RunnerError>>,
 }
 
 /// A live child.
@@ -728,6 +760,10 @@ pub struct SpawnSpec {
     pub err_file: PathBuf,
     /// Open the shepherd channel (fd 3 socketpair)
     pub channel: bool,
+    /// Pipe the child's stdin, so `shep sendline` can write to it. `false`
+    /// gives the child `/dev/null` on fd 0, which is what every sheep gets
+    /// unless its config sets `stdin = true`.
+    pub stdin: bool,
     /// Unix uid/gid to drop to before exec (`None` inherits the daemon's own
     /// identity). Resolved once per `Start` by `crate::privilege::resolve`;
     /// see that module for how `user`/`group` config names become this.
@@ -736,12 +772,12 @@ pub struct SpawnSpec {
 
 /// Error type returned from spawn and process control
 ///
-/// `#[non_exhaustive]`: today's two variants cover spawn and signal
-/// delivery, and a future process-control primitive — a cgroup freeze, or a
-/// Windows job-object failure — would need its own variant rather than
-/// stretching [`Self::SignalFailed`] to mean something Unix signals do not
-/// cover, and shep-daemon is a published library an out-of-tree matcher
-/// should not break for (IR-20).
+/// `#[non_exhaustive]`: today's three variants cover spawn, signal delivery
+/// and a stdin write, and a future process-control primitive — a cgroup
+/// freeze, or a Windows job-object failure — would need its own variant
+/// rather than stretching one of these to mean something it does not cover,
+/// and shep-daemon is a published library an out-of-tree matcher should not
+/// break for (IR-20).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunnerError {
@@ -749,6 +785,9 @@ pub enum RunnerError {
     SpawnFailed(String),
     /// Signal delivery failed (already reaped, `EPERM`)
     SignalFailed(String),
+    /// A write to a child's stdin failed (carries the OS message, or the
+    /// shepherd's own bound when the app was not reading).
+    WriteFailed(String),
 }
 
 impl fmt::Display for RunnerError {
@@ -756,6 +795,7 @@ impl fmt::Display for RunnerError {
         match self {
             Self::SpawnFailed(msg) => write!(f, "process spawn failed: {msg}"),
             Self::SignalFailed(msg) => write!(f, "signal delivery failed: {msg}"),
+            Self::WriteFailed(msg) => write!(f, "stdin write failed: {msg}"),
         }
     }
 }

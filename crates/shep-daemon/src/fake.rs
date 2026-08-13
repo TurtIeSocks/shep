@@ -16,7 +16,7 @@ use tokio::time::{Duration, Instant, sleep_until};
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::runner::{
     ExitOutcome, LogCtl, LogLine, ProcIo, ProcessRunner, RunnerError, RunningProcess, SpawnSpec,
-    StopSignal,
+    StdinWrite, StopSignal,
 };
 
 /// Capacity of every channel the fake wires up — generous enough that no
@@ -49,6 +49,11 @@ pub struct ProcScript {
     /// the child's own exit, so neither stream ever reaches EOF. See
     /// [`ProcScript::with_a_lamb_holding_the_pipe`].
     pub lamb_holds_the_pipe: bool,
+    /// Whether a stdin write to this proc is acknowledged. `true` for every
+    /// ordinary process, and `false` only for
+    /// [`ProcScript::never_reads_its_stdin`], which models an app that has
+    /// stopped reading fd 0.
+    pub reads_stdin: bool,
 }
 
 impl ProcScript {
@@ -64,6 +69,7 @@ impl ProcScript {
             obeys_signal: true,
             obeys_kill: true,
             lamb_holds_the_pipe: false,
+            reads_stdin: true,
         }
     }
 
@@ -79,6 +85,7 @@ impl ProcScript {
             obeys_signal: true,
             obeys_kill: true,
             lamb_holds_the_pipe: false,
+            reads_stdin: true,
         }
     }
 
@@ -94,6 +101,7 @@ impl ProcScript {
             obeys_signal: true,
             obeys_kill: true,
             lamb_holds_the_pipe: false,
+            reads_stdin: true,
         }
     }
 
@@ -142,6 +150,21 @@ impl ProcScript {
         Self {
             lamb_holds_the_pipe: true,
             ..self
+        }
+    }
+
+    /// Accepts every stdin write and answers none of them.
+    ///
+    /// Models the one thing a bounded stdin write exists for: an app that has
+    /// stopped reading fd 0, so the pipe fills at 64 KiB and the write blocks
+    /// until it reads, which it never does. The counterpart of
+    /// [`Self::never_reports_its_exit`] for the stdin path — the request is
+    /// delivered and recorded, what is withheld is the acknowledgement.
+    #[must_use]
+    pub fn never_reads_its_stdin() -> Self {
+        Self {
+            reads_stdin: false,
+            ..Self::never_exits()
         }
     }
 }
@@ -344,6 +367,9 @@ struct SpawnedProc {
     /// How many [`LogCtl::Flush`] requests it has answered — read back via
     /// [`ScriptedRunner::flushes`].
     flushes: Arc<AtomicU32>,
+    /// Every line written to this spawn's stdin, in write order — read back
+    /// via [`ScriptedRunner::stdin_lines`].
+    stdin_lines: Arc<Mutex<Vec<String>>>,
 }
 
 /// The pid [`ScriptedRunner`] gives the first proc it spawns; each later
@@ -496,6 +522,26 @@ impl ScriptedRunner {
         self.spawned.lock().unwrap()[spawn_index]
             .flushes
             .load(Ordering::SeqCst)
+    }
+
+    /// Every line the daemon has written to the stdin of the proc spawned at
+    /// `spawn_index`, in write order.
+    ///
+    /// The fake writes to no real pipe, so this proves only that the line
+    /// reached this spawn's end of [`ProcIo::to_stdin`] with its content
+    /// intact. That a real `\n`-terminated line lands in a real child's fd 0
+    /// is `tests/real_runner.rs`'s question.
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[must_use]
+    pub fn stdin_lines(&self, spawn_index: usize) -> Vec<String> {
+        self.spawned.lock().unwrap()[spawn_index]
+            .stdin_lines
+            .lock()
+            .unwrap()
+            .clone()
     }
 
     /// Takes the [`FakeIo`] test-side handles for the proc spawned at `spawn_index`
@@ -670,6 +716,44 @@ impl ProcessRunner for ScriptedRunner {
             (stand_in_tx, dead_rx)
         };
 
+        // Gated on `spec.stdin`, mirroring `spec.channel`'s own `else` branch
+        // above: the fake writes to no real pipe, so what it must get right
+        // is the one fact the engine tier treats as load-bearing — whether
+        // this sheep has a stdin pipe at all. `spec.stdin == false` drops the
+        // receiver right here, exactly as the real runner does at spawn, so
+        // `ProcIo::to_stdin.is_closed()` answers immediately rather than a
+        // task that will never run silently accepting the send.
+        let (to_stdin_tx, to_stdin_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let stdin_lines = Arc::new(Mutex::new(Vec::new()));
+        if spec.stdin {
+            let reads_stdin = script.reads_stdin;
+            let lines = Arc::clone(&stdin_lines);
+            let mut rx = to_stdin_rx;
+            tokio::spawn(async move {
+                // Withheld acknowledgements are held here rather than
+                // dropped, so a caller awaiting one hangs — the same shape a
+                // real write blocked on a full, unread pipe leaves its
+                // caller in — instead of resolving at once with a spurious
+                // "channel closed" error that no bounded-wait test could
+                // distinguish from a real answer.
+                let mut withheld = Vec::new();
+                while let Some(StdinWrite { line, done }) = rx.recv().await {
+                    // Recorded either way: `never_reads_its_stdin` withholds
+                    // the acknowledgement, not the delivery — the write still
+                    // reaches the app, which is the whole point of modelling
+                    // a pipe that fills rather than one that errors.
+                    lines.lock().unwrap().push(line);
+                    if reads_stdin {
+                        let _ = done.send(Ok(()));
+                    } else {
+                        withheld.push(done);
+                    }
+                }
+            });
+        } else {
+            drop(to_stdin_rx);
+        }
+
         let mut spawned = self.spawned.lock().unwrap();
         let index = spawned.len();
         spawned.push(SpawnedProc {
@@ -682,6 +766,7 @@ impl ProcessRunner for ScriptedRunner {
             log_ctl_live,
             reopens,
             flushes,
+            stdin_lines,
         });
         drop(spawned);
 
@@ -690,6 +775,7 @@ impl ProcessRunner for ScriptedRunner {
             from_child: from_child_rx,
             to_child: to_child_tx,
             log_ctl: log_ctl_tx,
+            to_stdin: to_stdin_tx,
         };
         // Arbitrary but deterministic — real pids come from the OS in the real runner.
         let pid = FIRST_SCRIPTED_PID + u32::try_from(index).unwrap_or(u32::MAX);
@@ -719,6 +805,7 @@ mod tests {
             out_file: PathBuf::from("/tmp/shep-test-out.log"),
             err_file: PathBuf::from("/tmp/shep-test-err.log"),
             channel: true,
+            stdin: false,
             credentials: None,
         }
     }
@@ -1023,5 +1110,37 @@ mod tests {
                 signal: None
             }
         );
+    }
+
+    /// fails if the scripted runner answers a stdin write for a spec that
+    /// asked for no pipe. A fake that accepted every write would make
+    /// `no_stdin` unreachable from the engine tier and every test of it
+    /// vacuous — the same trap `spec.channel` already had to be taught
+    /// about.
+    #[tokio::test(start_paused = true)]
+    async fn a_spawn_without_stdin_hands_back_a_closed_writer() {
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let (_proc, io) = runner
+            .spawn(&SpawnSpec {
+                stdin: false,
+                ..spec()
+            })
+            .unwrap();
+        assert!(io.to_stdin.is_closed());
+    }
+
+    /// fails if a spawn that DID ask for a pipe also hands back a closed
+    /// writer — which would make the case above pass for the wrong reason,
+    /// since a fake that closed every writer satisfies it.
+    #[tokio::test(start_paused = true)]
+    async fn a_spawn_with_stdin_hands_back_a_live_writer() {
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let (_proc, io) = runner
+            .spawn(&SpawnSpec {
+                stdin: true,
+                ..spec()
+            })
+            .unwrap();
+        assert!(!io.to_stdin.is_closed());
     }
 }

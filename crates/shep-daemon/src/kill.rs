@@ -144,6 +144,7 @@ mod tests {
             out_file: PathBuf::from("/tmp/shep-kill-test-out.log"),
             err_file: PathBuf::from("/tmp/shep-kill-test-err.log"),
             channel: true,
+            stdin: false,
             credentials: None,
         }
     }

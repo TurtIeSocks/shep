@@ -101,6 +101,13 @@ fn base_env() -> BTreeMap<String, String> {
 /// When `merge_logs = true`, they become `logs/<name>-out.log` and `-err.log`
 /// (shared across all instances). Explicit `out_file`/`err_file` config
 /// always win over defaults.
+///
+/// # Stdin
+///
+/// `SpawnSpec::stdin` carries `config.stdin` straight through. Nothing else
+/// turns it on: unlike `channel`, which `wait_ready` and
+/// `shutdown_with_message` both imply, no other flag needs fd 0 — so a sheep
+/// gets a piped stdin only when its own config asks for one.
 #[must_use]
 pub fn assemble(
     app: &ResolvedApp,
@@ -176,6 +183,7 @@ pub fn assemble(
         out_file,
         err_file,
         channel,
+        stdin: config.stdin,
         credentials,
     }
 }
@@ -498,5 +506,32 @@ mod tests {
             spec.env.get("PATH").map(String::as_str),
             Some("/opt/custom/bin")
         );
+    }
+
+    /// fails if `stdin` does not reach the spec. It is the one field on the
+    /// way to the runner whose default is "closed", so a spec assembled
+    /// without it would silently give an opted-in app `/dev/null` and make
+    /// every sendline row read `no_stdin` with nothing to point at.
+    #[test]
+    fn the_stdin_flag_reaches_the_spawn_spec() {
+        let mut app = AppConfig::minimal("repl", "./repl");
+        app.stdin = true;
+        let spec = assemble(&normalize(app).unwrap(), 0, &test_paths(), None);
+        assert!(spec.stdin);
+    }
+
+    /// fails if `stdin` is implied by something. `channel` is implied by
+    /// `wait_ready` and `shutdown_with_message` because both need fd 3;
+    /// nothing in shep needs fd 0, so nothing may turn it on behind the
+    /// operator's back.
+    #[test]
+    fn nothing_else_turns_stdin_on() {
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.channel = true;
+        app.wait_ready = true;
+        app.shutdown_with_message = true;
+        let spec = assemble(&normalize(app).unwrap(), 0, &test_paths(), None);
+        assert!(spec.channel, "the fixture should still open a channel");
+        assert!(!spec.stdin);
     }
 }
