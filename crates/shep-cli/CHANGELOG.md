@@ -533,6 +533,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column. `shep flush`'s own table is untouched — its CHANGELOG entry
   already covers why lifecycle and resource fields stay JSON-only there.
 
+- Add `dog::metrics::exposition::render`, which turns a flock snapshot into
+  Prometheus text exposition (format version 0.0.4). The metrics dog (a
+  later task) serves this over `dog::http` at whatever path and interval an
+  operator configures; this task is the renderer alone. No `prometheus`
+  crate: the format is one line per series over data that already arrives
+  as a plain `Vec<ProcessInfo>` per scrape, never accumulated, so a
+  registry/collector/gatherer stack would buy nothing this function
+  doesn't already do directly.
+
+  | Metric | Type | Labels | Meaning |
+  |---|---|---|---|
+  | `shep_sheep_cpu_percent` | gauge | `sheep`, `id`, `fold` | tree CPU, omitted when the daemon has no sample |
+  | `shep_sheep_memory_bytes` | gauge | `sheep`, `id`, `fold` | tree RSS, omitted when the daemon has no sample |
+  | `shep_sheep_restart_total` | counter | `sheep`, `id`, `fold` | restarts since registration |
+  | `shep_sheep_uptime_seconds` | gauge | `sheep`, `id`, `fold` | seconds since last successful start |
+  | `shep_sheep_status` | gauge | `sheep`, `id`, `fold`, `status` | one series per lifecycle state, `1` for the current one |
+  | `shep_dog_up` | gauge | `dog`, `source` | `1` when the dog is online, `0` otherwise |
+  | `shep_daemon_up` | gauge | `version` | always `1` — the scrape reached the shepherd |
+  | `shep_daemon_pid` | gauge | — | the shepherd's own pid |
+  | `shep_host_memory_total_bytes` | gauge | — | total physical memory on the host |
+  | `shep_host_memory_used_bytes` | gauge | — | memory in use on the host |
+  | `shep_host_processes` | gauge | — | processes running on the host, the flock included |
+  | `shep_host_uptime_seconds` | gauge | — | seconds since the host booted |
+
+  A sheep with no CPU/memory sample contributes no series for those two
+  metrics rather than a `0` — a zero is a claim the daemon declined to
+  make, and a dashboard averaging invented zeros would report a flock
+  idler than it actually is. `shep_sheep_status` is one series per state
+  with a `status` label, not a single gauge holding an enum ordinal, so an
+  alert can name `status="errored"` without the enum's declaration order
+  in front of it. `shep_dog_up` covers every *registered* dog, including
+  one that never spawned or exhausted its restart budget — both report
+  `0` rather than going missing, because "is the monitoring itself up" is
+  the one question monitoring cannot answer with a missing series. The
+  `shep_host_*` group is omitted entirely when the host sample is
+  unavailable. Label values are escaped per the exposition format
+  (backslash, double quote, newline) — a sheep's name is operator-supplied
+  and reaches the renderer verbatim.
+
 ### Fixes
 
 - `shep enable <name>` sends the source `shep.toml` actually records, not a

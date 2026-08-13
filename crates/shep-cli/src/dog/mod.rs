@@ -21,6 +21,7 @@
 //! confusing log line instead of a plain, restartable failure.
 
 pub mod http;
+pub mod metrics;
 
 use core::fmt;
 
