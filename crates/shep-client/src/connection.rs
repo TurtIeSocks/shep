@@ -254,6 +254,27 @@ mod tests {
         );
     }
 
+    /// fails if a daemon that accepts and immediately closes is reported as
+    /// anything other than "unreachable". Deliberately asserts the OUTCOME
+    /// BUCKET rather than one `ConnectError` variant, because which variant
+    /// this produces is a kernel-semantics question and the two kernels shep
+    /// runs on answer it differently:
+    ///
+    /// - macOS lets the `Hello` write succeed and delivers the close to the
+    ///   following read, which is `HandshakeClosed`;
+    /// - Linux delivers the peer's close to the pending write, so
+    ///   `frames.send` fails first and the error is `Io`.
+    ///
+    /// Both are correct. Nothing downstream distinguishes them either —
+    /// `shep-cli`'s `exit.rs` folds `Io`, `HandshakeClosed`, `Connect`,
+    /// `Wire` and `HandshakeTimeout` alike into `DaemonUnreachable`, and
+    /// `spawn.rs`'s `connect_or_spawn_with` special-cases only `Connect` and
+    /// `HandshakeTimeout`. Pinning the variant here asserted a platform, not
+    /// a contract, and was red on linux/arm64 for exactly that reason
+    /// (platform.md #1).
+    ///
+    /// What must NOT happen is a silent success, and that is what this still
+    /// guards: an `Ok(Connection)` from a peer that answered nothing.
     #[tokio::test]
     async fn a_daemon_that_closes_without_answering_is_not_a_silent_success() {
         let dir = tempfile::tempdir().unwrap();
@@ -264,10 +285,14 @@ mod tests {
             drop(stream);
         });
 
-        assert!(matches!(
-            Connection::open(&path, HANDSHAKE_TIMEOUT).await,
-            Err(ConnectError::HandshakeClosed)
-        ));
+        let err = Connection::open(&path, HANDSHAKE_TIMEOUT)
+            .await
+            .expect_err("a peer that closed without a HelloReply is not a connection");
+
+        assert!(
+            matches!(err, ConnectError::HandshakeClosed | ConnectError::Io(_)),
+            "a peer that closed mid-handshake must report as unreachable, got {err:?}"
+        );
     }
 
     #[tokio::test]

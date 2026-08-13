@@ -54,6 +54,39 @@ in zsh a pipeline's `$?` is the last command's and `${PIPESTATUS[0]}` is empty.
 lock, so concurrent runs block rather than parallelise. (A separate worktree,
 or `benches/`, has its own lock and may run alongside.)
 
+### The two cross-checks — run once per phase, not per task
+
+```bash
+cargo check -p shep-daemon --all-targets --all-features --target x86_64-unknown-linux-gnu
+cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu
+```
+
+One cargo command at a time, as everywhere else, and give them their own
+`CARGO_TARGET_DIR` if you want the host cache left alone.
+
+**Linux.** `notify.rs`'s abstract-namespace branch and its test are both
+`#[cfg(target_os = "linux")]`, so a macOS `cargo test` compiles neither. That
+branch is what a systemd `Type=notify` unit — the unit `shep startup` installs
+— depends on for readiness reporting, and it went five phases without a
+compiler ever reading it (platform audit #3). `--all-targets` is what reaches
+the test. shep-daemon has no `ring` in its tree, so this needs no cross C
+toolchain; `-p shep-cli` would, and is not in this gate.
+
+**Windows.** Every plan through Phase 6 carried this one; Phases 7-9 dropped
+it without saying so, and it never reached this file, which is why nothing
+noticed for three phases. Restored in Phase 10 after being measured green
+(`EXIT=0`, 8.42s, 2026-08-13). It needs a C toolchain for the target —
+`brew install mingw-w64` — because `ring`'s build script runs `cc`; a host
+without `x86_64-w64-mingw32-gcc` cannot run it, and that is presumably how it
+came to be dropped.
+
+`cargo check`, deliberately, not `clippy -- -D warnings`: shep-daemon's
+`boot`/`sys`/`server`/`tokio_runner` are `cfg(unix)`-gated, so on Windows 51
+dead-code warnings fall out of code that is not dead anywhere we ship. The
+question this gate asks is whether the tree still compiles for a target nobody
+has implemented yet. Silencing those warnings would mean `#[allow(dead_code)]`
+on live code.
+
 ### Doctests are not the cost here — do not split them out
 
 Measured 2026-08-12 on this machine: bare `cargo test --workspace

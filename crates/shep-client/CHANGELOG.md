@@ -83,3 +83,9 @@ change to any of it is a `[Unreleased]` entry of its own, not a silent diff.
   leaving in the tree to avoid one Cargo feature.
 - Re-export `shep_core` at the crate root, so downstream users need a single
   dependency rather than naming both crates themselves.
+
+### Fixes
+
+- The handshake-close test asserts the unreachable outcome rather than one
+  `ConnectError` variant, so it passes on Linux, where the peer's close
+  surfaces on the write rather than the read.
