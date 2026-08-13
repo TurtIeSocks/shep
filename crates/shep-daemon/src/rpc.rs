@@ -322,6 +322,18 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
                 Err(err) => reply(Err(rpc_error(&err))),
             },
         },
+        Request::Scale { name, count } => match ctx.supervisor.scale(&name, count).await {
+            Ok(scaled) => {
+                // Re-recorded here, and this line is the whole reason `scale`
+                // hands back the config at all: without it `shep scale web 4`
+                // followed by `shep save` writes a roll saying `instances = 2`,
+                // and the scale is silently undone by the next reboot — a bug
+                // that cannot be seen until the machine comes back.
+                ctx.registry.record(&[scaled.app]);
+                reply(Ok(Response::Scaled(scaled.instances)))
+            }
+            Err(err) => reply(Err(rpc_error(&err))),
+        },
         Request::SaveRoll => match ctx.save_roll_now().await {
             Ok(Some(saved)) => reply(Ok(Response::RollSaved {
                 // Lossy on purpose, matching `to_info`'s treatment of log
@@ -503,6 +515,15 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
         SupervisorError::ReloadInFlight(_) => RpcError {
             code: RpcErrorCode::Internal,
             message: err.to_string(),
+        },
+        // Unlike the two `Internal`-under-protest mappings above, this one
+        // needs no revisiting: every `InvalidScale` is something the caller
+        // asked for that it can ask differently — a count of `0`, a dog, or
+        // (unreachably, through this path) a rescaled config `normalize`
+        // itself refused.
+        SupervisorError::InvalidScale(msg) => RpcError {
+            code: RpcErrorCode::InvalidConfig,
+            message: msg.clone(),
         },
         SupervisorError::EngineStopped => RpcError {
             code: RpcErrorCode::Internal,
@@ -1381,6 +1402,38 @@ mod tests {
         let roll = crate::snapshot::read(std::path::Path::new(&path)).unwrap();
         assert_eq!(roll.apps.len(), 2, "the reply's count must match the file");
         assert_eq!(path, h.ctx.snapshot_path.display().to_string());
+    }
+
+    /// fails if the muster roll keeps the pre-scale count. This is the test for the
+    /// bug that is invisible until a reboot: the roll is what `shep muster` reads,
+    /// so a scale missing from it is a scale that silently reverts.
+    #[tokio::test]
+    async fn a_scale_is_recorded_in_the_roll_the_next_muster_reads() {
+        let h = harness(vec![ProcScript::never_exits(); 4]);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.instances = 2;
+        reply_of(dispatch(envelope(1, Request::Start { apps: vec![app] }), &h.ctx).await);
+
+        reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::Scale {
+                        name: "web".to_string(),
+                        count: 4,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        let reply = reply_of(dispatch(envelope(3, Request::SaveRoll), &h.ctx).await);
+        let Ok(Response::RollSaved { path, .. }) = reply.result else {
+            panic!("expected RollSaved, got {:?}", reply.result)
+        };
+        let roll = crate::snapshot::read(std::path::Path::new(&path)).unwrap();
+        assert_eq!(roll.apps[0].app.instances, 4);
     }
 
     /// fails if the handler forwards `snapshot_now`'s engine-stopped

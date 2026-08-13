@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- `Request::Scale` — set an app's instance count. Scale-up takes the lowest
+  free slots, scale-down releases the highest, and the new count is written
+  back to the muster roll.
 - `RunningProcess::signal_process` (defaulted, so it is additive for an
   out-of-tree implementor) and `Request::Signal` — one signal to one sheep's
   own process, not its group.

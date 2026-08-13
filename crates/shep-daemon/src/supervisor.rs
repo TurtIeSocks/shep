@@ -33,6 +33,7 @@
 //! terminal before answering the caller. The crash loop's own restarts go
 //! through the same exit path without ever registering a deferred reply.
 
+use core::cmp::Ordering;
 use core::fmt;
 use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -42,7 +43,7 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use shep_core::config::{AppConfig, ResolvedApp};
+use shep_core::config::{AppConfig, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
     ActionOutcome, ActionReply, BusEvent, DogSource, ProcessEventKind, ProcessInfo, SignalOutcome,
@@ -203,6 +204,16 @@ pub(crate) enum Command {
         selector: ProcessSelector,
         /// Answers with the deleted ids once every matched sheep is terminal.
         reply: oneshot::Sender<Result<Vec<u32>, SupervisorError>>,
+    },
+    /// Sets one app's instance count. See [`Actor::handle_scale`].
+    Scale {
+        /// The app's name, exactly as its config spells it. Not a selector —
+        /// see [`shep_core::protocol::Request::Scale`] for why.
+        name: String,
+        /// How many instances the app has when this returns.
+        count: u32,
+        /// Answers with the app's surviving instances and its new config.
+        reply: oneshot::Sender<Result<Scaled, SupervisorError>>,
     },
     /// Full flock listing, name-grouped (see [`Actor::snapshot_all`]).
     List {
@@ -365,12 +376,14 @@ pub(crate) enum Msg {
 
 /// Error type returned from supervisor commands.
 ///
-/// `#[non_exhaustive]`: six variants today cover lookup, spawn, reload
-/// overlap, and the two log-maintenance failure classes, and a future
-/// supervisor command — a scale or pause verb — would add its own failure
-/// variant rather than overloading one meant for a different command, and
-/// shep-daemon is a published library an out-of-tree matcher should not
-/// break for (IR-20).
+/// `#[non_exhaustive]`: seven variants today cover lookup, spawn, reload
+/// overlap, an invalid scale, and the two log-maintenance failure classes.
+/// The doc here used to forecast "a scale or pause verb" adding its own
+/// failure variant; the scale half of that has now landed as
+/// [`Self::InvalidScale`], and a pause verb, if one is ever built, is the
+/// next candidate for the same treatment rather than a reason to overload an
+/// existing variant. shep-daemon is a published library an out-of-tree
+/// matcher should not break for (IR-20).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorError {
@@ -388,6 +401,21 @@ pub enum SupervisorError {
     /// it — a partly-accepted selector leaves the caller unable to tell which
     /// half was taken.
     ReloadInFlight(String),
+    /// A `Scale` the engine will not perform; carries the refusal in plain
+    /// English, naming what to do instead.
+    ///
+    /// Three shapes reach it: a count of `0` (`normalize` refuses
+    /// `instances == 0`, so accepting it here would admit a config the
+    /// engine's own validator rejects — `shep delete` is the verb), a target
+    /// that is a dog (one process by contract, spec §8), and a rescaled
+    /// config that failed `normalize`, which is unreachable through this
+    /// path and is carried rather than `expect`ed because a supervisor does
+    /// not panic on peer input.
+    ///
+    /// Maps to [`RpcErrorCode::InvalidConfig`](shep_core::protocol::RpcErrorCode::InvalidConfig),
+    /// not `Internal`: every one of those is something the caller asked for
+    /// that it can ask differently.
+    InvalidScale(String),
     /// At least one log pump could not open a log path again, so that stream
     /// has no file to write to. Carries one
     /// `"<name> (id <id>): <paths and reasons>"` entry per such sheep,
@@ -432,6 +460,7 @@ impl fmt::Display for SupervisorError {
             Self::NotFound => f.write_str("selector matched no registered sheep"),
             Self::SpawnFailed(msg) => write!(f, "spawn failed: {msg}"),
             Self::ReloadInFlight(name) => write!(f, "{name} is already being reloaded"),
+            Self::InvalidScale(msg) => write!(f, "cannot scale: {msg}"),
             Self::ReopenFailed(msg) => write!(f, "log reopen failed: {msg}"),
             Self::FlushFailed(msg) => write!(f, "log flush failed: {msg}"),
             Self::EngineStopped => f.write_str("supervisor engine has shut down"),
@@ -661,6 +690,30 @@ impl SupervisorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Command(Command::Delete { selector, reply }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
+    /// Sets `name`'s instance count.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::NotFound`] — no app of that name is registered.
+    /// - [`SupervisorError::InvalidScale`] — a count of `0`, or a target that
+    ///   is a dog.
+    /// - [`SupervisorError::ReloadInFlight`] — the app is mid-reload.
+    /// - [`SupervisorError::SpawnFailed`] — an instance would not spawn.
+    ///   Instances already spawned by this call stay running.
+    /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    pub(crate) async fn scale(&self, name: &str, count: u32) -> Result<Scaled, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::Scale {
+                name: name.to_string(),
+                count,
+                reply,
+            }))
             .await
             .map_err(|_| SupervisorError::EngineStopped)?;
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
@@ -1407,6 +1460,22 @@ enum ReplyKind {
     Shutdown(oneshot::Sender<()>),
 }
 
+/// What a completed [`Command::Scale`] produced.
+///
+/// Two things, because two different layers need one each:
+/// [`Actor::handle_scale`]'s caller replies with `instances` and re-records
+/// `app` in the muster roll. Returning the config rather than having the
+/// actor reach into the roll keeps [`crate::snapshot::FlockRegistry`] a
+/// thing the rpc layer owns, which is where `Request::Start` already keeps
+/// it.
+#[derive(Debug)]
+pub(crate) struct Scaled {
+    /// The app's surviving instances, in instance-slot order.
+    pub(crate) instances: Vec<ProcessInfo>,
+    /// The app's config as it now stands, with the new `instances` count.
+    pub(crate) app: ResolvedApp,
+}
+
 /// One command's aggregation state: which ids are still outstanding, the
 /// terminal snapshots collected so far, and where to reply once `remaining`
 /// is empty.
@@ -1536,6 +1605,10 @@ impl<R: ProcessRunner> Actor<R> {
             Command::StartDog { app, source, reply } => {
                 let result = self.do_start_dog(*app, source);
                 let _ = reply.send(result);
+                false
+            }
+            Command::Scale { name, count, reply } => {
+                self.handle_scale(&name, count, reply);
                 false
             }
             Command::List { reply } => {
@@ -2114,6 +2187,24 @@ impl<R: ProcessRunner> Actor<R> {
             return;
         }
 
+        self.begin_manual_ids(matched, kind, origin, reply);
+    }
+
+    /// [`Self::begin_manual`]'s per-id aggregation, taking the matched ids
+    /// directly rather than resolving a [`ProcessSelector`] into them.
+    ///
+    /// The seam [`Self::handle_scale`]'s scale-down needs: the ids it is
+    /// deregistering are the highest instance slots of one already-resolved
+    /// app, not a fresh selector match, and re-deriving a selector that
+    /// happens to match exactly those ids would be a second, fragile way to
+    /// say what `handle_scale` already knows directly.
+    fn begin_manual_ids(
+        &mut self,
+        matched: Vec<u32>,
+        kind: ManualKind,
+        origin: CommandOrigin,
+        reply: ReplyKind,
+    ) {
         let mut remaining = HashSet::new();
         let mut results = Vec::new();
 
@@ -2267,6 +2358,212 @@ impl<R: ProcessRunner> Actor<R> {
                 Some(self.respawn(id, manually))
             }
         }
+    }
+
+    /// Sets `name`'s instance count to `count`.
+    ///
+    /// # Slot allocation, both ways
+    ///
+    /// Up: [`instance_slots`] hands out the lowest free slots, exactly as a
+    /// `Start` does. Down: the HIGHEST-numbered slots are deregistered first,
+    /// which is what makes the two symmetric — scale a two-instance app to
+    /// four and back and it is running slots 0 and 1 again, with the same log
+    /// paths and the same `SHEP_INSTANCE` values it started with. Taking the
+    /// lowest first would leave slots 2 and 3: the same count, a different
+    /// flock.
+    ///
+    /// # What a scale-down does to the instances it removes
+    ///
+    /// Deregisters them — the same thing `Delete` does, through the same
+    /// machinery, because a `Stop` would leave them registered and still
+    /// holding their slots, and the next `Start` of the app would then find
+    /// four slots taken and allocate a fifth.
+    ///
+    /// # Why the reply does not wait for them
+    ///
+    /// Each removal runs a kill ladder capped by the app's own `kill_timeout`,
+    /// and a caller's RPC budget is capped at 60s (`crate::rpc`'s
+    /// `MAX_DEADLINE_MS`), so a large scale-down cannot be covered by any reply
+    /// a caller is allowed to wait for. The answer is the survivors; the
+    /// departures report themselves on the bus as `process.delete`. Same split
+    /// [`Self::handle_reload`] already makes.
+    fn handle_scale(
+        &mut self,
+        name: &str,
+        count: u32,
+        reply: oneshot::Sender<Result<Scaled, SupervisorError>>,
+    ) {
+        let mut slots: Vec<(u32, u32)> = self
+            .sheep
+            .iter()
+            .filter(|(_, slot)| slot.entry.spec.config().name == name)
+            .map(|(id, slot)| (slot.entry.instance, *id))
+            .collect();
+        if slots.is_empty() {
+            let _ = reply.send(Err(SupervisorError::NotFound));
+            return;
+        }
+        slots.sort_unstable();
+
+        if count == 0 {
+            let _ = reply.send(Err(SupervisorError::InvalidScale(format!(
+                "an app runs at least one instance; use `shep delete {name}` to remove it"
+            ))));
+            return;
+        }
+        if self
+            .sheep
+            .get(&slots[0].1)
+            .is_some_and(|slot| slot.entry.dog.is_some())
+        {
+            let _ = reply.send(Err(SupervisorError::InvalidScale(format!(
+                "{name} is a dog, and a dog runs one process"
+            ))));
+            return;
+        }
+        if self.reloads.contains_key(name) {
+            let _ = reply.send(Err(SupervisorError::ReloadInFlight(name.to_string())));
+            return;
+        }
+
+        // Re-normalized rather than mutated in place: `ResolvedApp` keeps its
+        // config private precisely so that holding one proves it passed
+        // `normalize` (`normalize.rs`'s own note), and a scale that edited the
+        // field behind that door would be the first thing in the tree to hold
+        // one that had not.
+        let mut config = self
+            .sheep
+            .get(&slots[0].1)
+            .expect("handle_scale: id read off this map a moment ago")
+            .entry
+            .spec
+            .config()
+            .clone();
+        config.instances = count;
+        let rescaled = match normalize(config) {
+            Ok(app) => app,
+            Err(err) => {
+                let _ = reply.send(Err(SupervisorError::InvalidScale(err.to_string())));
+                return;
+            }
+        };
+
+        let current = u32::try_from(slots.len()).unwrap_or(u32::MAX);
+        let credentials = self
+            .sheep
+            .get(&slots[0].1)
+            .expect("handle_scale: id read off this map a moment ago")
+            .entry
+            .credentials;
+
+        // The spawn/remove pass runs FIRST and the config write-back second,
+        // which is the opposite of the obvious order and is the whole of this
+        // function's care about a partial scale. Writing `rescaled` onto every
+        // slot up front and then failing a spawn leaves every survivor
+        // claiming `instances = 4` in a flock of three: `shep describe` and the
+        // next `respawn` read the new number, `shep save` writes it, the muster
+        // roll never hears about the failure (rpc.rs records only on `Ok`), and
+        // nothing in the tree notices until a reboot brings up a count that was
+        // never running.
+        let mut failure = None;
+        // The one slot `spawn_fresh` registers on a failed attempt itself
+        // (its own doc: it "always inserts a `SheepSlot`... `Errored` with no
+        // task on failure"). Kept out of `survivors` — it is not a running
+        // instance, and `Scaled::instances` must not claim it is — but the
+        // config write-back below still has to reach it, or this one
+        // registered slot is left holding `rescaled` (the COUNT ASKED FOR)
+        // forever, which is exactly the lie this function exists to prevent
+        // on every OTHER slot.
+        let mut orphaned_by_failed_spawn = None;
+        let survivors: Vec<u32> = match count.cmp(&current) {
+            Ordering::Equal => slots.iter().map(|(_, id)| *id).collect(),
+            Ordering::Greater => {
+                let existing: Vec<u32> = slots.iter().map(|(instance, _)| *instance).collect();
+                let mut ids: Vec<u32> = slots.iter().map(|(_, id)| *id).collect();
+                for instance in instance_slots(&existing, count - current) {
+                    let attempted_id = self.next_id;
+                    match self.spawn_fresh(&rescaled, instance, credentials, None) {
+                        Ok(info) => ids.push(info.id),
+                        Err(message) => {
+                            // Partial, and said so. The instances already
+                            // spawned stay: they are real processes serving
+                            // real traffic, and unwinding them would turn one
+                            // failed spawn into an outage of everything this
+                            // call had already brought up. What they do NOT
+                            // keep is the requested count — see the write-back
+                            // below.
+                            orphaned_by_failed_spawn = Some(attempted_id);
+                            failure = Some(message);
+                            break;
+                        }
+                    }
+                }
+                ids
+            }
+            Ordering::Less => {
+                let cut = usize::try_from(count).unwrap_or(usize::MAX);
+                let (keep, remove) = slots.split_at(cut);
+                let removed: Vec<u32> = remove.iter().map(|(_, id)| *id).collect();
+                self.begin_manual_ids(
+                    removed,
+                    ManualKind::Delete,
+                    CommandOrigin::Operator,
+                    // The removals' own terminal snapshots go nowhere: this
+                    // reply is the survivors, and the departures report
+                    // themselves on the bus.
+                    ReplyKind::Ids(oneshot::channel().0),
+                );
+                keep.iter().map(|(_, id)| *id).collect()
+            }
+        };
+
+        // The count actually achieved — `count` on every path but a partial
+        // scale-up. Re-normalized rather than assigned for the same reason
+        // `rescaled` was: a `ResolvedApp` is a proof token, and the one place
+        // in the tree holding one that had not passed `normalize` would be
+        // here.
+        let achieved = u32::try_from(survivors.len()).unwrap_or(u32::MAX);
+        let stored = if achieved == count {
+            rescaled
+        } else {
+            let mut config = rescaled.config().clone();
+            config.instances = achieved;
+            match normalize(config) {
+                Ok(app) => app,
+                Err(err) => {
+                    let _ = reply.send(Err(SupervisorError::InvalidScale(err.to_string())));
+                    return;
+                }
+            }
+        };
+
+        // Every surviving slot, the ones this call just spawned included, plus
+        // the one `Errored` slot a failed spawn attempt registered for
+        // itself: `respawn` reassembles from a slot's own stored spec, and a
+        // future `handle_scale` reads `current` off every registered slot of
+        // this name regardless of status, so any slot left holding a stale
+        // config keeps lying to everything that reads it, `shep describe`
+        // included.
+        for id in survivors.iter().chain(orphaned_by_failed_spawn.iter()) {
+            if let Some(slot) = self.sheep.get_mut(id) {
+                slot.entry.spec = stored.clone();
+            }
+        }
+
+        if let Some(message) = failure {
+            let _ = reply.send(Err(SupervisorError::SpawnFailed(message)));
+            return;
+        }
+
+        let mut instances: Vec<ProcessInfo> = survivors
+            .iter()
+            .filter_map(|id| self.sheep.get(id).map(|slot| to_info(&slot.entry)))
+            .collect();
+        instances.sort_unstable_by_key(|info| info.id);
+        let _ = reply.send(Ok(Scaled {
+            instances,
+            app: stored,
+        }));
     }
 
     /// Accepts a reload: answers the caller at once, then starts one swap per
@@ -6924,6 +7221,381 @@ mod tests {
             .start(vec![normalize(app).unwrap()])
             .await
             .unwrap()
+    }
+
+    /// The instance slot of every registered instance of `name`, ascending.
+    ///
+    /// Read off `out_file` rather than off the entry, because it is the number
+    /// an OPERATOR sees: `logs/web-2-out.log` is the file they tail and
+    /// `SHEP_INSTANCE=2` is what the process reads. Asserting on the internal
+    /// field would pass on a build that allocated the slot correctly and then
+    /// derived the log path from something else.
+    ///
+    /// # Panics
+    ///
+    /// If a matched row carries no `out_file`, or one this fixture cannot
+    /// parse — both mean the fixture stopped describing what it thinks it
+    /// does.
+    async fn instance_slots_of(h: &Harness, name: &str) -> Vec<u32> {
+        let mut slots: Vec<u32> = h
+            .ctx
+            .supervisor
+            .list()
+            .await
+            .iter()
+            .filter(|info| info.name == name)
+            .map(|info| {
+                let out = info
+                    .out_file
+                    .as_deref()
+                    .expect("a listed sheep has a log path");
+                let stem = out
+                    .rsplit('/')
+                    .next()
+                    .and_then(|file| file.strip_suffix("-out.log"))
+                    .and_then(|stem| stem.strip_prefix(&format!("{name}-")))
+                    .expect("a derived log path is `<name>-<instance>-out.log`");
+                stem.parse().expect("the instance slot is a number")
+            })
+            .collect();
+        slots.sort_unstable();
+        slots
+    }
+
+    /// Waits until `name` has exactly `count` registered instances, or fails.
+    ///
+    /// A scale-down's reply is the SURVIVORS and deliberately does not wait
+    /// for the departures (`handle_scale`'s own doc says why), so a case that
+    /// asserts on the flock afterwards has to wait for the kill ladders it
+    /// started. Bounded (IR-46) because the only other failure mode is a poll
+    /// loop that never ends.
+    async fn settle_to(h: &Harness, name: &str, count: usize) {
+        let settled = tokio::time::timeout(SWAP_WINDOW, async {
+            loop {
+                let live = h
+                    .ctx
+                    .supervisor
+                    .list()
+                    .await
+                    .iter()
+                    .filter(|info| info.name == name)
+                    .count();
+                if live == count {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(settled.is_ok(), "{name} never settled to {count} instances");
+    }
+
+    /// A bare actor holding `instances` online instances of one app, all
+    /// carrying the same normalized spec — the fixture the two stored-count
+    /// cases need, because that field reaches no reply.
+    ///
+    /// Built on the same hand-written `SheepSlot` literal every other actor
+    /// fixture in this module uses, so a field added to that struct breaks
+    /// this in the same visible way it breaks the others.
+    fn actor_with_a_scaled_app(
+        dir: &tempfile::TempDir,
+        instances: u32,
+        scripts: Vec<ProcScript>,
+    ) -> Actor<ScriptedRunner> {
+        let paths = test_paths(dir);
+        let app = normalize(AppConfig {
+            instances,
+            ..AppConfig::minimal("web", "./srv")
+        })
+        .unwrap();
+        let mut sheep = HashMap::new();
+        for instance in 0..instances {
+            sheep.insert(
+                instance,
+                SheepSlot {
+                    entry: armed_entry(instance, instance, 1111 + instance, app.clone(), &paths),
+                    ctl: None,
+                    log_ctl: None,
+                    to_child: None,
+                    signals: None,
+                    manual: None,
+                    pending_delete: false,
+                    epoch: 0,
+                    ready_tx: None,
+                    actions: ActionWaits::default(),
+                },
+            );
+        }
+        let (events, _events_rx) = broadcast::channel(64);
+        let (tx, _rx) = mpsc::channel(MAILBOX_CAPACITY);
+        Actor {
+            runner: ScriptedRunner::new(scripts),
+            paths,
+            events,
+            tx,
+            sheep,
+            next_id: instances,
+            next_action_stamp: 0,
+            pending: Vec::new(),
+            shutting_down: false,
+            extras: None,
+            registry: ExtrasRegistry::default(),
+            reloads: HashMap::new(),
+        }
+    }
+
+    /// Every registered slot's STORED instance count, ascending by id.
+    fn stored_instance_counts(actor: &Actor<ScriptedRunner>) -> Vec<u32> {
+        let mut ids: Vec<u32> = actor.sheep.keys().copied().collect();
+        ids.sort_unstable();
+        ids.iter()
+            .map(|id| actor.sheep[id].entry.spec.config().instances)
+            .collect()
+    }
+
+    /// A `ReloadJob` built the way `advance_reload` builds one (`:2435`), for
+    /// a case that only needs `self.reloads` to hold an entry under `name` —
+    /// no full swap is driven. `name` names the app only for the call site's
+    /// readability: the map key the caller inserts under is what actually
+    /// associates the job with `name`, and `ReloadJob` itself carries no
+    /// name.
+    fn reload_job_for(name: &str) -> ReloadJob {
+        let _ = name;
+        ReloadJob {
+            queue: VecDeque::new(),
+            swap: ReloadSwap {
+                old_id: 0,
+                new_id: 1,
+                phase: ReloadPhase::AwaitReady,
+            },
+        }
+    }
+
+    /// fails if scaling up does not take the lowest free slots. Slot numbers are
+    /// visible to the app (`SHEP_INSTANCE`) and to the filesystem
+    /// (`web-2-out.log`), so which ones a scale hands out is a contract, not an
+    /// implementation detail.
+    #[tokio::test(start_paused = true)]
+    async fn scaling_up_fills_the_lowest_free_slots() {
+        let h = harness(vec![ProcScript::never_exits(); 4]);
+        start_app(
+            &h,
+            AppConfig {
+                instances: 2,
+                ..AppConfig::minimal("web", "./srv")
+            },
+        )
+        .await;
+
+        let scaled = h.ctx.supervisor.scale("web", 4).await.unwrap();
+
+        assert_eq!(scaled.instances.len(), 4);
+        assert_eq!(instance_slots_of(&h, "web").await, vec![0, 1, 2, 3]);
+    }
+
+    /// fails if scaling down takes the LOWEST slots. Taking the highest is what
+    /// makes 2 -> 4 -> 2 a round trip back to slots 0 and 1; taking the lowest
+    /// would leave 2 and 3 — the same count, a different flock, different log
+    /// files, and a different SHEP_INSTANCE for every survivor.
+    #[tokio::test(start_paused = true)]
+    async fn scaling_down_removes_the_highest_slots_so_a_round_trip_returns() {
+        let h = harness(vec![ProcScript::never_exits(); 4]);
+        start_app(
+            &h,
+            AppConfig {
+                instances: 2,
+                ..AppConfig::minimal("web", "./srv")
+            },
+        )
+        .await;
+
+        h.ctx.supervisor.scale("web", 4).await.unwrap();
+        let scaled = h.ctx.supervisor.scale("web", 2).await.unwrap();
+
+        assert_eq!(scaled.instances.len(), 2);
+        // The reply is the survivors; the two removals run kill ladders this case
+        // has to let finish before it can read the flock.
+        settle_to(&h, "web", 2).await;
+        assert_eq!(instance_slots_of(&h, "web").await, vec![0, 1]);
+    }
+
+    /// fails if scaling to the count an app already has does anything at all.
+    /// Idempotence is the whole argument for an absolute count over a delta, and
+    /// an operator re-running a provisioning script must not restart the flock.
+    #[tokio::test(start_paused = true)]
+    async fn scaling_to_the_current_count_is_a_no_op() {
+        let h = harness(vec![ProcScript::never_exits(); 2]);
+        start_app(
+            &h,
+            AppConfig {
+                instances: 2,
+                ..AppConfig::minimal("web", "./srv")
+            },
+        )
+        .await;
+        let before = h.ctx.supervisor.list().await;
+
+        let scaled = h.ctx.supervisor.scale("web", 2).await.unwrap();
+
+        assert_eq!(scaled.instances.len(), 2);
+        let after = h.ctx.supervisor.list().await;
+        assert_eq!(
+            after.iter().map(|i| i.id).collect::<Vec<_>>(),
+            before.iter().map(|i| i.id).collect::<Vec<_>>(),
+            "a no-op scale replaced processes"
+        );
+        // Two scripts for two spawns: a scale that respawned would need a third
+        // and would fail loudly rather than quietly, but the id check is what
+        // says WHICH failure this is.
+    }
+
+    /// fails if `scale <name> 0` is accepted. `normalize` refuses `instances == 0`
+    /// on every other path into the daemon, so accepting it here would put a config
+    /// through the engine that the engine's own validator rejects.
+    #[tokio::test(start_paused = true)]
+    async fn scaling_to_zero_is_refused_and_names_delete() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_app(&h, AppConfig::minimal("web", "./srv")).await;
+
+        let err = h.ctx.supervisor.scale("web", 0).await.unwrap_err();
+
+        let SupervisorError::InvalidScale(message) = err else {
+            panic!("expected InvalidScale, got {err:?}");
+        };
+        assert!(message.contains("delete"), "{message}");
+    }
+
+    /// fails if an unregistered name is anything but NotFound. `shep scale typo 4`
+    /// exiting 0 would be the worst answer available.
+    #[tokio::test(start_paused = true)]
+    async fn scaling_an_unregistered_app_is_not_found() {
+        let h = harness(vec![]);
+        assert_eq!(
+            h.ctx.supervisor.scale("ghost", 2).await.unwrap_err(),
+            SupervisorError::NotFound
+        );
+    }
+
+    /// fails if a dog can be scaled. A dog is one process by contract (spec §8) —
+    /// two metrics dogs would race for the same listen port, and two bark dogs
+    /// would double every alert.
+    ///
+    /// Actor-tier, on the existing sheep-and-dog fixture: `DogSource` is written
+    /// by `start_dog` and the two entries in that fixture differ in the marker and
+    /// in nothing else, which is what makes a refusal here attributable to the
+    /// marker rather than to a status or a fold.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_cannot_be_scaled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _mailbox) = actor_with_a_sheep_and_a_dog(&dir);
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_command(Command::Scale {
+            name: "bark".to_string(),
+            count: 2,
+            reply,
+        });
+
+        let SupervisorError::InvalidScale(message) = answer.await.unwrap().unwrap_err() else {
+            panic!("expected InvalidScale");
+        };
+        assert!(message.contains("dog"), "{message}");
+    }
+
+    /// fails if an app mid-reload can be scaled. A reload holds two live processes
+    /// in one instance slot; a scale-down picking that slot removes one of them and
+    /// leaves the swap with nothing to finish.
+    ///
+    /// Actor-tier, and the guard it pins reads `Actor::reloads` — a map with no
+    /// reply-side spelling at all, so this is the only tier that can put an entry
+    /// in it without driving a whole swap.
+    #[tokio::test(start_paused = true)]
+    async fn an_app_mid_reload_refuses_a_scale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_a_scaled_app(&dir, 2, vec![]);
+        actor
+            .reloads
+            .insert("web".to_string(), reload_job_for("web"));
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_command(Command::Scale {
+            name: "web".to_string(),
+            count: 4,
+            reply,
+        });
+
+        assert_eq!(
+            answer.await.unwrap().unwrap_err(),
+            SupervisorError::ReloadInFlight("web".to_string())
+        );
+    }
+
+    /// fails if a scale forgets to write the new count back onto the app. Without
+    /// this, `shep scale web 4 && shep save` records `instances = 2` and the next
+    /// reboot silently reverts the scale — the bug is invisible until the machine
+    /// comes back.
+    ///
+    /// Actor-tier: the stored count is `SheepSlot::entry.spec`, which reaches no
+    /// reply and no bus event. `Scaled::app` is the other half and is checked here
+    /// too, because a build that returned the right config and stored the wrong
+    /// one would pass either assertion alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_scale_updates_the_stored_instance_count_on_every_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_a_scaled_app(&dir, 2, vec![ProcScript::never_exits(); 2]);
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_command(Command::Scale {
+            name: "web".to_string(),
+            count: 4,
+            reply,
+        });
+
+        let scaled = answer.await.unwrap().unwrap();
+        assert_eq!(scaled.app.config().instances, 4);
+        assert_eq!(stored_instance_counts(&actor), vec![4, 4, 4, 4]);
+    }
+
+    /// fails if a PARTIAL scale-up stores the count it asked for rather than the
+    /// one it got. The instances that did spawn stay — unwinding them would turn
+    /// one failed spawn into an outage of everything the call had already brought
+    /// up — but every registered slot must then claim the number really running,
+    /// or `shep describe` reads 4 while `shep save` writes 4 for a flock of 3 and
+    /// the discrepancy surfaces at the next reboot.
+    ///
+    /// One script for two requested spawns: `ScriptedRunner` answers the first and
+    /// fails the second with `script exhausted`, which is this module's standing
+    /// way to make exactly one spawn fail.
+    ///
+    /// Three entries, not two: `spawn_fresh`'s own contract registers an
+    /// `Errored` slot for the attempt that failed, exactly as it does for
+    /// `Start` (`spawn_fresh`'s doc: "always inserts a `SheepSlot`... regardless
+    /// of the outcome"). That third slot is still registered under `web`, so a
+    /// FUTURE scale call counts it as part of `current` — it must not be left
+    /// holding the count this call asked for either, or it is one more place
+    /// the same discrepancy can surface from.
+    #[tokio::test(start_paused = true)]
+    async fn a_partial_scale_up_stores_the_count_it_achieved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_a_scaled_app(&dir, 1, vec![ProcScript::never_exits()]);
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_command(Command::Scale {
+            name: "web".to_string(),
+            count: 3,
+            reply,
+        });
+
+        assert!(matches!(
+            answer.await.unwrap(),
+            Err(SupervisorError::SpawnFailed(_))
+        ));
+        assert_eq!(
+            stored_instance_counts(&actor),
+            vec![2, 2, 2],
+            "the flock achieved two, so every registered slot — including the \
+             errored attempt — must say two"
+        );
     }
 
     /// fails if the listing comes back in id order. Built so id order and
