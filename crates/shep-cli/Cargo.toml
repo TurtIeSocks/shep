@@ -105,8 +105,14 @@ predicates.workspace = true
 # workspace entry already enables. A cfg(unix) table because nix does not build
 # on Windows and this crate's Windows leg compiles everything outside
 # `commands/`.
+#
+# "fs" on top of the workspace defaults is `launch.rs`'s descriptor sweep:
+# `nix::fcntl::fcntl` and `FcntlArg::F_SETFD`/`FdFlag` all live behind it. Named
+# here rather than left to feature unification with shep-daemon (which enables
+# it for `sys.rs`) — a crate that uses a feature says so, or it breaks the day
+# the other crate stops needing it.
 [target.'cfg(unix)'.dependencies]
-nix.workspace = true
+nix = { workspace = true, features = ["fs"] }
 
 # A process-group assertion and a teardown Drop guard both need to signal a
 # real pid; same cfg(unix) dev-only shape shep-daemon uses. The workspace

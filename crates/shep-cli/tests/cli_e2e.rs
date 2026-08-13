@@ -58,6 +58,25 @@ use tempfile::TempDir;
 const CMD_TIMEOUT: Duration =
     Duration::from_secs(shep_client::spawn::SPAWN_DEADLINE.as_secs() + 15);
 
+/// Bound on how long [`concurrent_cold_starts_produce_exactly_one_daemon`]
+/// waits for one of its two racers, after which the case FAILS.
+///
+/// [`CMD_TIMEOUT`] does not cover this, and the gap is not academic — it is
+/// the one that let a real daemon bug stall the suite for minutes at a time
+/// rather than report anything. `assert_cmd`'s timeout bounds the *process*
+/// wait; the reader threads it joins afterwards are bounded only by EOF on
+/// the child's stdout and stderr, and EOF waits for the last copy of the
+/// write end to close — including a copy held by a daemon that inherited it
+/// (`shep-cli/src/launch.rs`'s `seal_inherited_fds`). A racer that never
+/// comes back has to be given up on from out here, by the only thread that
+/// can still fail the case.
+///
+/// Sized off [`CMD_TIMEOUT`] the way that constant is sized off
+/// `SPAWN_DEADLINE`: strictly longer, so a racer that is merely slow (a
+/// loaded machine, the full autostart budget) still reports its own outcome
+/// and this bound only ever fires on a racer that is genuinely stuck.
+const RACER_DEADLINE: Duration = Duration::from_secs(CMD_TIMEOUT.as_secs() + 15);
+
 /// How long [`bleats_no_follow_until_written`] keeps retrying.
 const BLEATS_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -1122,7 +1141,13 @@ fn a_second_command_reuses_the_daemon_rather_than_spawning_a_second() {
 /// error instead of "keep probing" — the losing invocation would exit
 /// non-zero, failing `assert_success`; two daemons somehow both surviving —
 /// `flock` would show one racer's sheep missing (whichever daemon that
-/// query happened to reach would only know about its own).
+/// query happened to reach would only know about its own); and a daemon
+/// that inherits a racer's stdout pipe and holds it for life — that racer's
+/// `.output()` never returns, and [`RACER_DEADLINE`] fails the case instead
+/// of letting it stall. Each racer is collected over a channel rather than
+/// by joining its thread for exactly that reason: `JoinHandle::join` has no
+/// bounded form, so a stuck racer joined directly stops the suite rather
+/// than reporting.
 #[test]
 fn concurrent_cold_starts_produce_exactly_one_daemon() {
     let dir = tempfile::tempdir().unwrap();
@@ -1136,28 +1161,36 @@ fn concurrent_cold_starts_produce_exactly_one_daemon() {
 
     let names = ["racer-a", "racer-b"];
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(names.len()));
-    let handles: Vec<_> = names
-        .iter()
-        .map(|name| {
-            let home = home.clone();
-            let script = script.clone();
-            let name = (*name).to_string();
-            let barrier = std::sync::Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait(); // both racers launch together
-                shep(&home)
-                    .arg("start")
-                    .arg(&script)
-                    .arg("--name")
-                    .arg(&name)
-                    .output()
-                    .unwrap()
-            })
+    let (finished, racers) = std::sync::mpsc::channel();
+    for name in names {
+        let home = home.clone();
+        let script = script.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        let finished = finished.clone();
+        std::thread::spawn(move || {
+            barrier.wait(); // both racers launch together
+            let output = shep(&home)
+                .arg("start")
+                .arg(&script)
+                .arg("--name")
+                .arg(name)
+                .output()
+                .unwrap();
+            // A closed receiver means the case already gave up on this
+            // racer and failed; there is no one left to report to.
+            let _ = finished.send((name, output));
+        });
+    }
+    drop(finished); // the racers hold the only senders that matter
+
+    let outputs: Vec<(&str, Output)> = (0..names.len())
+        .map(|_| {
+            racers
+                .recv_timeout(RACER_DEADLINE)
+                .expect("a racer never came back; see RACER_DEADLINE")
         })
         .collect();
-
-    let outputs: Vec<Output> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    for (name, output) in names.iter().zip(&outputs) {
+    for (name, output) in &outputs {
         assert!(
             output.status.success(),
             "{name}: {}",

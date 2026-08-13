@@ -7,14 +7,22 @@
 //! for the daemon to survive the parent process exiting and its
 //! controlling terminal closing, without any `unsafe` — and this crate is
 //! `#![forbid(unsafe_code)]`.
+//!
+//! Redirecting stdio is not by itself enough to make the daemon *clean* of
+//! its launcher, though: only fds 0/1/2 are replaced, and anything above
+//! them that this process happens to hold without `FD_CLOEXEC` survives the
+//! `exec` and is then held for the daemon's whole life. [`seal_inherited_fds`]
+//! is what closes that, and its own doc carries the bug it was written for.
 
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::DirBuilderExt as _;
+use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use shep_core::paths::ShepPaths;
 
 /// The shepherd's own stdout, inside `$SHEP_HOME/logs/`.
@@ -123,11 +131,114 @@ fn emptied_appending(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Lowest descriptor [`seal_inherited_fds`] touches. 0/1/2 are stdio, which
+/// [`launch_command`] replaces wholesale for the child and which this
+/// process still needs for its own output afterwards — marking those
+/// close-on-exec would change what every OTHER `exec` from this process
+/// sees, to fix nothing the redirects have not already fixed.
+const FIRST_NON_STDIO_FD: RawFd = 3;
+
+/// The directory whose entries name this process's own open descriptors.
+/// `/dev/fd` on macOS (the `fdesc` filesystem), a symlink to
+/// `/proc/self/fd` on Linux; both list exactly the numbers this process
+/// holds.
+const FD_DIR: &str = "/dev/fd";
+
+/// Marks every descriptor this process holds above stdio close-on-exec, so
+/// the daemon inherits none of them.
+///
+/// # The bug this exists for
+///
+/// A daemon lives for as long as `$SHEP_HOME` has a flock, so ANY
+/// descriptor it inherits by accident is held open for that whole time —
+/// and the launcher's own stdio is exactly the kind of descriptor that
+/// leaks in. `shep start` is normally run with its stdout and stderr on a
+/// pipe (a CI runner, `$(shep start …)`, a test harness, a shell reading
+/// the output). Whoever holds the read end waits for EOF, and EOF arrives
+/// only when the LAST copy of the write end closes — so a copy sitting in
+/// the daemon means the reader never returns, long after `shep start`
+/// itself has exited and printed everything it had to say. The reader is
+/// then blocked, at 0% CPU, on a process that finished minutes ago.
+///
+/// Reproduced against `cli_e2e`'s `concurrent_cold_starts_produce_exactly_one_daemon`,
+/// which is where it was found: under load the case would stall
+/// indefinitely — not fail — with both `shep start` processes exited, the
+/// surviving daemon holding the write end of one racer's stdout pipe, and
+/// the harness parked in `read_to_end` waiting for an EOF that could not
+/// come. `assert_cmd`'s `.timeout()` does not bound it: that bounds the
+/// *process* wait, and the reader-thread join happens after it.
+///
+/// # Why the sweep, rather than closing one known descriptor
+///
+/// Because the leak is not this process's to enumerate. A descriptor
+/// arrives without `FD_CLOEXEC` when something `dup2`'d it into place —
+/// which is what every parent does to hand us our own stdio, and what a
+/// `fork` in a multi-threaded parent can leave behind at other numbers
+/// besides. The launcher cannot know which of the numbers it holds are
+/// its own and which are a caller's leftovers, so it stops asking: above
+/// stdio, nothing at all crosses this `exec`. The daemon receives its
+/// stdio through [`launch_command`]'s redirects and opens everything else
+/// (socket, pidfile, log files) for itself, so there is nothing left for
+/// it to legitimately want.
+///
+/// Marking rather than closing, and marking *here* rather than in the
+/// daemon: this process still needs those descriptors — it is a live
+/// client that will go on to connect and print — so closing them is not on
+/// offer. `FD_CLOEXEC` costs it nothing and takes effect at exactly the
+/// boundary that matters. The daemon cannot do this job for itself either:
+/// by the time any of its own code runs, a tokio runtime has already
+/// opened descriptors of its own, and nothing in the process can then tell
+/// an inherited number from one it just allocated (the same
+/// recycled-number hazard `shep_daemon::sys`'s rationale essay works
+/// through for `adopt_fd`).
+///
+/// # Best-effort, deliberately
+///
+/// Every failure is ignored and the launch proceeds. An unreadable
+/// `/dev/fd`, an entry that is not a number, a descriptor closed between
+/// the listing and the `fcntl` — none of them is a reason to refuse to
+/// start a daemon, because the worst case of doing nothing here is the
+/// pre-existing behaviour this function improves on, not a corrupt one.
+/// The sweep's own directory handle is in the listing and gets marked
+/// along with everything else, which is harmless: it is closed before this
+/// function returns.
+///
+/// Process-wide, so it belongs at a spawn site and not in a builder: a
+/// concurrent thread that wanted a descriptor of its own inherited by a
+/// child would be defeated by it. Nothing in this binary spawns anything
+/// but the daemon.
+fn seal_inherited_fds() {
+    let Ok(entries) = std::fs::read_dir(FD_DIR) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<RawFd>().ok())
+        else {
+            continue;
+        };
+        if fd < FIRST_NON_STDIO_FD {
+            continue;
+        }
+        let _ = fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC));
+    }
+}
+
 /// Spawns `shep daemon`, detached from this process's group and terminal.
 ///
 /// Returns the child so the caller (`shep_client::spawn::connect_or_spawn`)
 /// can `try_wait()` it while probing for readiness, rather than blocking on
 /// it directly.
+///
+/// [`seal_inherited_fds`] runs first, so the daemon crosses the `exec` with
+/// nothing but the stdio [`launch_command`] gives it — see that function's
+/// own doc for the hang that motivates it. Ordered before [`launch_command`]
+/// rather than after so the two log files it opens are never in the sweep's
+/// path at all: they are already close-on-exec (std opens every file that
+/// way) and reach the child as stdio through `dup2`, which clears the flag
+/// on the descriptor it creates.
 ///
 /// # Errors
 /// Whatever [`launch_command`] can fail with, plus the spawn itself.
@@ -136,6 +247,7 @@ fn emptied_appending(path: &Path) -> io::Result<File> {
 /// `shep_client::spawn::connect_or_spawn`, so a cold `$SHEP_HOME` gets a
 /// daemon on the first command that needs one.
 pub fn launch_daemon(paths: &ShepPaths) -> io::Result<Child> {
+    seal_inherited_fds();
     launch_command(paths)?.spawn()
 }
 
@@ -281,5 +393,57 @@ mod tests {
         let _cmd = launch_command(&paths).unwrap();
 
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    /// Whether `fd` is marked close-on-exec right now.
+    fn is_close_on_exec(fd: RawFd) -> bool {
+        let flags = fcntl(fd, FcntlArg::F_GETFD).unwrap();
+        FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC)
+    }
+
+    /// The sweep reaches a descriptor in the state an inherited one is
+    /// actually in — open, and NOT close-on-exec — which is the state a
+    /// `dup2` leaves behind and the only state that can survive an `exec`.
+    ///
+    /// `UnixStream::pair` alone would not test anything: std opens every
+    /// descriptor close-on-exec already, so the flag is cleared here first
+    /// to build the fixture the bug needs. What a broken implementation
+    /// this catches: a sweep that skipped the numbers it could not
+    /// attribute, or that read the wrong directory and quietly marked
+    /// nothing — the daemon would then go on holding this descriptor for
+    /// life, which is the hang `seal_inherited_fds`' own doc describes.
+    #[test]
+    fn the_sweep_marks_an_inherited_descriptor_close_on_exec() {
+        let (leaked, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&leaked);
+        fcntl(fd, FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+        assert!(!is_close_on_exec(fd), "the fixture must start inheritable");
+
+        seal_inherited_fds();
+
+        assert!(
+            is_close_on_exec(fd),
+            "fd {fd} would cross the exec and be held for the daemon's whole life"
+        );
+    }
+
+    /// Stdio is the launcher's own output and the child's, replaced by
+    /// `launch_command`'s redirects — the sweep must leave all three alone.
+    ///
+    /// Asserted on stdin rather than stdout/stderr because the test harness
+    /// is entitled to do what it likes with the latter two. What a broken
+    /// implementation this catches: a sweep that started from fd 0, which
+    /// would change what every other `exec` from this process inherits, to
+    /// fix nothing — the daemon replaces all three regardless.
+    #[test]
+    fn the_sweep_leaves_stdio_alone() {
+        assert!(
+            !is_close_on_exec(0),
+            "fixture: this process's own stdin is inherited and inheritable"
+        );
+
+        seal_inherited_fds();
+
+        assert!(!is_close_on_exec(0), "the sweep must start above stdio");
     }
 }
