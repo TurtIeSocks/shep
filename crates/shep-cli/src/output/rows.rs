@@ -1067,35 +1067,30 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn sample_info(id: u32, name: &str, uptime_ms: u64) -> ProcessInfo {
-        ProcessInfo {
-            id,
-            name: name.to_string(),
-            status: ProcStatus::Online,
-            // Every `Option` field `Some`: `flock_rows_do_not_drift` below
-            // pins each cell against its own JSON value, and a `None`
-            // serializes as `null`, which that check skips rather than
-            // compares — so a field left empty here is a column the drift
-            // test stops watching.
-            pid: Some(1000 + id),
-            restarts: id,
-            uptime_ms,
-            fold: Some("backend".to_string()),
-            out_file: Some(format!("/logs/{name}-0-out.log")),
-            err_file: Some(format!("/logs/{name}-0-err.log")),
+        // Every `Option` field `Some`: `flock_rows_do_not_drift` below pins
+        // each cell against its own JSON value, and a `None` serializes as
+        // `null`, which that check skips rather than compares — so a field
+        // left empty here is a column the drift test stops watching. `dog`
+        // is the one exception, left at the builder's `None` default: it is
+        // `JSON_ONLY` (see `FlockRows::JSON_ONLY`), not a column, so
+        // `assert_no_drift`'s cell check never reads it — and `None` is the
+        // honest value besides, since every row `sample_flock` builds is a
+        // sheep.
+        ProcessInfo::builder(id, name, ProcStatus::Online)
+            .pid(Some(1000 + id))
+            .restarts(id)
+            .uptime_ms(uptime_ms)
+            .fold(Some("backend".to_string()))
+            .out_file(Some(format!("/logs/{name}-0-out.log")))
+            .err_file(Some(format!("/logs/{name}-0-err.log")))
             // Fixed rather than id-derived, like `fold` above: every sample
             // sheep shares one reading. `memory_bytes` is the same value
             // `human_bytes`'s own doc uses to show it is not `MemSize`'s
             // `Display` — 50 462 720 bytes is not a round number of MiB, and
             // rendering it as "48.1M" is the whole point of that function.
-            cpu_percent: Some(12.5),
-            memory_bytes: Some(50_462_720),
-            // The one field this fixture deliberately leaves `None`, unlike
-            // every other `Option` above: `dog` is `JSON_ONLY` (see
-            // `FlockRows::JSON_ONLY`), not a column, so `assert_no_drift`'s
-            // cell check never reads it — and `None` is the honest value
-            // besides, since every row `sample_flock` builds is a sheep.
-            dog: None,
-        }
+            .cpu_percent(Some(12.5))
+            .memory_bytes(Some(50_462_720))
+            .build()
     }
 
     /// Three fully-populated sheep, shared by every test in this module and
@@ -1119,10 +1114,9 @@ pub(crate) mod tests {
     /// varies. `pub(crate)` so `output::mod`'s own tests can build a mixed
     /// sheep-and-dog listing without a second copy of this helper.
     pub(crate) fn dog_info(name: &str, source: DogSource) -> ProcessInfo {
-        ProcessInfo {
-            dog: Some(source),
-            ..sample_info(1, name, 60_000)
-        }
+        let mut info = sample_info(1, name, 60_000);
+        info.dog = Some(source);
+        info
     }
 
     /// The anti-drift gate, written once and instantiated three times — once

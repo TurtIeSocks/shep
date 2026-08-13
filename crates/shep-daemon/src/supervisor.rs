@@ -4102,29 +4102,26 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
             .saturating_duration_since(started_at)
             .as_millis() as u64
     });
-    ProcessInfo {
-        id: entry.id,
-        name: entry.spec.config().name.clone(),
-        status: entry.status,
-        pid: entry.pid,
-        restarts: entry.restarts,
-        uptime_ms,
-        fold: entry.spec.config().fold.clone(),
+    ProcessInfo::builder(entry.id, entry.spec.config().name.clone(), entry.status)
+        .pid(entry.pid)
+        .restarts(entry.restarts)
+        .uptime_ms(uptime_ms)
+        .fold(entry.spec.config().fold.clone())
         // Lossy on purpose: `ProcessInfo` carries paths as strings, and a
         // non-UTF-8 log path must not be allowed to fail serialization of
         // the whole reply and blank the listing for every other sheep.
-        out_file: Some(entry.out_file.to_string_lossy().into_owned()),
-        err_file: Some(entry.err_file.to_string_lossy().into_owned()),
+        .out_file(Some(entry.out_file.to_string_lossy().into_owned()))
+        .err_file(Some(entry.err_file.to_string_lossy().into_owned()))
         // Left empty here, and filled in by the RPC layer for the two
         // verbs an operator reads resource usage from. Reading them is a
         // syscall walk over the host's whole process table, and the
         // actor must never block; every other caller of this function
         // answers a lifecycle verb, where the numbers would be paid for
         // and never read.
-        cpu_percent: None,
-        memory_bytes: None,
-        dog: entry.dog.clone(),
-    }
+        .cpu_percent(None)
+        .memory_bytes(None)
+        .dog(entry.dog.clone())
+        .build()
 }
 
 /// The prober a gated readiness task — or a sheep's liveness loop — probes

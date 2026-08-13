@@ -207,20 +207,11 @@ mod tests {
     fn process_event(id: u32, event: ProcessEventKind) -> BusEvent {
         BusEvent::Process {
             event,
-            info: ProcessInfo {
-                id,
-                name: format!("sheep-{id}"),
-                status: ProcStatus::Online,
-                pid: Some(1000 + id),
-                restarts: 0,
-                uptime_ms: 0,
-                fold: None,
-                out_file: Some(format!("/logs/sheep-{id}-0-out.log")),
-                err_file: Some(format!("/logs/sheep-{id}-0-err.log")),
-                cpu_percent: None,
-                memory_bytes: None,
-                dog: None,
-            },
+            info: ProcessInfo::builder(id, format!("sheep-{id}"), ProcStatus::Online)
+                .pid(Some(1000 + id))
+                .out_file(Some(format!("/logs/sheep-{id}-0-out.log")))
+                .err_file(Some(format!("/logs/sheep-{id}-0-err.log")))
+                .build(),
             manually: false,
             at_ms: 0,
         }

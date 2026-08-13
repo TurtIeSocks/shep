@@ -570,20 +570,11 @@ mod tests {
     use crate::cli::{Cli, Commands};
 
     fn info(id: u32, name: &str) -> ProcessInfo {
-        ProcessInfo {
-            id,
-            name: name.to_string(),
-            status: ProcStatus::Online,
-            pid: Some(1000 + id),
-            restarts: 0,
-            uptime_ms: 0,
-            fold: None,
-            out_file: Some(format!("/logs/{name}-0-out.log")),
-            err_file: Some(format!("/logs/{name}-0-err.log")),
-            cpu_percent: None,
-            memory_bytes: None,
-            dog: None,
-        }
+        ProcessInfo::builder(id, name, ProcStatus::Online)
+            .pid(Some(1000 + id))
+            .out_file(Some(format!("/logs/{name}-0-out.log")))
+            .err_file(Some(format!("/logs/{name}-0-err.log")))
+            .build()
     }
 
     fn bleats_args(selector: &str, no_follow: bool, err: bool, out: bool) -> BleatsArgs {
@@ -1330,10 +1321,8 @@ mod tests {
         let out_path = write_log(dir.path(), "web-out.log", "from-the-file\n");
 
         let (client, daemon) = fake_client_with_push(&sock).await;
-        let sheep = ProcessInfo {
-            out_file: Some(out_path),
-            ..info(1, "web")
-        };
+        let mut sheep = info(1, "web");
+        sheep.out_file = Some(out_path);
         daemon.reply_to_list(vec![sheep]);
         daemon
             .push(BusEvent::LogOut {
@@ -1382,10 +1371,8 @@ mod tests {
         let out_path = write_log(dir.path(), "web-out.log", &content);
 
         let (client, daemon) = fake_client_with_push(&sock).await;
-        let sheep = ProcessInfo {
-            out_file: Some(out_path),
-            ..info(1, "web")
-        };
+        let mut sheep = info(1, "web");
+        sheep.out_file = Some(out_path);
         daemon.reply_to_list(vec![sheep]);
 
         let mut out = Vec::new();
@@ -1439,10 +1426,8 @@ mod tests {
         let out_path = write_log(dir.path(), "web-out.log", &content);
 
         let (client, daemon) = fake_client_with_push(&sock).await;
-        let sheep = ProcessInfo {
-            out_file: Some(out_path),
-            ..info(1, "web")
-        };
+        let mut sheep = info(1, "web");
+        sheep.out_file = Some(out_path);
         daemon.reply_to_list(vec![sheep]);
 
         let mut out = Vec::new();
@@ -1487,11 +1472,9 @@ mod tests {
             let err_path = write_log(dir.path(), "web-err.log", "stderr-line\n");
 
             let (client, daemon) = fake_client_with_push(&sock).await;
-            let sheep = ProcessInfo {
-                out_file: Some(out_path),
-                err_file: Some(err_path),
-                ..info(1, "web")
-            };
+            let mut sheep = info(1, "web");
+            sheep.out_file = Some(out_path);
+            sheep.err_file = Some(err_path);
             daemon.reply_to_list(vec![sheep]);
 
             let mut out = Vec::new();
@@ -1540,14 +1523,10 @@ mod tests {
         let b_path = write_log(dir.path(), "b-out.log", "line-from-b\n");
 
         let (client, daemon) = fake_client_with_push(&sock).await;
-        let sheep_a = ProcessInfo {
-            out_file: Some(a_path),
-            ..info(1, "a")
-        };
-        let sheep_b = ProcessInfo {
-            out_file: Some(b_path),
-            ..info(2, "b")
-        };
+        let mut sheep_a = info(1, "a");
+        sheep_a.out_file = Some(a_path);
+        let mut sheep_b = info(2, "b");
+        sheep_b.out_file = Some(b_path);
         daemon.reply_to_list(vec![sheep_b, sheep_a]);
 
         let mut out = Vec::new();
@@ -1600,14 +1579,10 @@ mod tests {
             .to_string();
 
         let (client, daemon) = fake_client_with_push(&sock).await;
-        let ghost = ProcessInfo {
-            out_file: Some(missing_path),
-            ..info(1, "ghost")
-        };
-        let real = ProcessInfo {
-            out_file: Some(real_path),
-            ..info(2, "web")
-        };
+        let mut ghost = info(1, "ghost");
+        ghost.out_file = Some(missing_path);
+        let mut real = info(2, "web");
+        real.out_file = Some(real_path);
         daemon.reply_to_list(vec![ghost, real]);
 
         let mut out = Vec::new();
@@ -1654,14 +1629,10 @@ mod tests {
         let real_path = write_log(dir.path(), "web-out.log", "still-here\n");
 
         let (client, daemon) = fake_client_with_push(&sock).await;
-        let bad = ProcessInfo {
-            out_file: Some(bad_dir.clone()),
-            ..info(1, "bad")
-        };
-        let real = ProcessInfo {
-            out_file: Some(real_path),
-            ..info(2, "web")
-        };
+        let mut bad = info(1, "bad");
+        bad.out_file = Some(bad_dir.clone());
+        let mut real = info(2, "web");
+        real.out_file = Some(real_path);
         daemon.reply_to_list(vec![bad, real]);
 
         let mut out = Vec::new();
@@ -1704,11 +1675,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("s.sock");
         let (client, daemon) = fake_client_with_push(&sock).await;
-        let sheep = ProcessInfo {
-            out_file: None,
-            err_file: None,
-            ..info(1, "web")
-        };
+        let mut sheep = info(1, "web");
+        sheep.out_file = None;
+        sheep.err_file = None;
         daemon.reply_to_list(vec![sheep]);
 
         let mut out = Vec::new();
@@ -1753,10 +1722,8 @@ mod tests {
         let out_path = write_log(dir.path(), "web-out.log", "hello-from-disk\n");
 
         let (client, daemon) = fake_client_with_push(&sock).await;
-        let sheep = ProcessInfo {
-            out_file: Some(out_path),
-            ..info(1, "web")
-        };
+        let mut sheep = info(1, "web");
+        sheep.out_file = Some(out_path);
         daemon.reply_to_list(vec![sheep]);
 
         let mut out = Vec::new();

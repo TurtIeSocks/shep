@@ -276,20 +276,14 @@ mod tests {
     /// spell out (`id="3"`, `fold="backend"`) stay true regardless of which
     /// test calls this.
     fn sample_info(name: &str) -> ProcessInfo {
-        ProcessInfo {
-            id: 3,
-            name: name.to_string(),
-            status: ProcStatus::Online,
-            pid: Some(4242),
-            restarts: 2,
-            uptime_ms: 65_000,
-            fold: Some("backend".to_string()),
-            out_file: None,
-            err_file: None,
-            cpu_percent: Some(1.5),
-            memory_bytes: Some(2048),
-            dog: None,
-        }
+        ProcessInfo::builder(3, name, ProcStatus::Online)
+            .pid(Some(4242))
+            .restarts(2)
+            .uptime_ms(65_000)
+            .fold(Some("backend".to_string()))
+            .cpu_percent(Some(1.5))
+            .memory_bytes(Some(2048))
+            .build()
     }
 
     /// A baseline [`Reading`] with an empty flock, a real handshake and a

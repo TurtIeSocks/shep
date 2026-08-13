@@ -313,20 +313,8 @@ mod tests {
     }
 
     fn info_with_name(name: &str) -> shep_core::protocol::ProcessInfo {
-        shep_core::protocol::ProcessInfo {
-            id: 1,
-            name: name.to_string(),
-            status: shep_core::status::ProcStatus::Online,
-            pid: None,
-            restarts: 0,
-            uptime_ms: 0,
-            fold: None,
-            out_file: None,
-            err_file: None,
-            cpu_percent: None,
-            memory_bytes: None,
-            dog: None,
-        }
+        shep_core::protocol::ProcessInfo::builder(1, name, shep_core::status::ProcStatus::Online)
+            .build()
     }
 
     /// fails if `human_bytes` renders a live RSS as raw digits. `MemSize`'s

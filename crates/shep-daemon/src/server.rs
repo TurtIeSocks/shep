@@ -582,20 +582,11 @@ mod tests {
 
         let event = |kind| BusEvent::Process {
             event: kind,
-            info: ProcessInfo {
-                id: 0,
-                name: "web".to_string(),
-                status: shep_core::status::ProcStatus::Online,
-                pid: Some(1000),
-                restarts: 0,
-                uptime_ms: 0,
-                fold: None,
-                out_file: Some("/logs/web-0-out.log".to_string()),
-                err_file: Some("/logs/web-0-err.log".to_string()),
-                cpu_percent: None,
-                memory_bytes: None,
-                dog: None,
-            },
+            info: ProcessInfo::builder(0, "web", shep_core::status::ProcStatus::Online)
+                .pid(Some(1000))
+                .out_file(Some("/logs/web-0-out.log".to_string()))
+                .err_file(Some("/logs/web-0-err.log".to_string()))
+                .build(),
             manually: false,
             at_ms: 0,
         };

@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `protocol::ProcessInfoBuilder`.
 - Add `barks` module: `Bark`, `SinkOutcome`, `append`, `read`, and
   `DEFAULT_MAX_BYTES` — the `barks.jsonl` ring both the bark dog (a rule
   fired) and the shepherd itself (an enabled dog gave up) append to, and
@@ -368,6 +369,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changes
 
+- `protocol::ProcessInfo` is `#[non_exhaustive]` — construct it with
+  `ProcessInfo::builder`. Fields remain `pub`; reading and assigning are
+  unchanged. A future field is no longer a breaking change for downstream
+  crates.
 - `ProcessInfo` no longer derives `Eq`. `cpu_percent` is an `f32` and floats
   are only partially ordered, so the derive could not survive the field.
   `PartialEq` stays, which is everything `assert_eq!` and a `==` comparison

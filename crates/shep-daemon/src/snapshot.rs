@@ -493,20 +493,11 @@ mod tests {
     use std::time::Duration;
 
     fn info(id: u32, name: &str, status: ProcStatus) -> ProcessInfo {
-        ProcessInfo {
-            id,
-            name: name.to_string(),
-            status,
-            pid: Some(1000 + id),
-            restarts: 0,
-            uptime_ms: 0,
-            fold: None,
-            out_file: Some(format!("/logs/{name}-0-out.log")),
-            err_file: Some(format!("/logs/{name}-0-err.log")),
-            cpu_percent: None,
-            memory_bytes: None,
-            dog: None,
-        }
+        ProcessInfo::builder(id, name, status)
+            .pid(Some(1000 + id))
+            .out_file(Some(format!("/logs/{name}-0-out.log")))
+            .err_file(Some(format!("/logs/{name}-0-err.log")))
+            .build()
     }
 
     // fails if `is_running` starts counting `ProcStatus::Stopping` — the

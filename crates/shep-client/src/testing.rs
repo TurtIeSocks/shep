@@ -110,20 +110,17 @@ pub fn sample_ack() -> HelloAck {
 /// payload type's anti-drift test sees every serialized field.
 #[must_use]
 pub fn sample_info() -> ProcessInfo {
-    ProcessInfo {
-        id: 1,
-        name: "web".to_string(),
-        status: ProcStatus::Online,
-        pid: Some(4242),
-        restarts: 3,
-        uptime_ms: 60_000,
-        fold: Some("backend".to_string()),
-        out_file: Some("/home/rin/.shep/logs/web-0-out.log".to_string()),
-        err_file: Some("/home/rin/.shep/logs/web-0-err.log".to_string()),
-        cpu_percent: Some(12.5),
-        memory_bytes: Some(48 * 1024 * 1024),
-        dog: Some(DogSource::BuiltIn),
-    }
+    ProcessInfo::builder(1, "web", ProcStatus::Online)
+        .pid(Some(4242))
+        .restarts(3)
+        .uptime_ms(60_000)
+        .fold(Some("backend".to_string()))
+        .out_file(Some("/home/rin/.shep/logs/web-0-out.log".to_string()))
+        .err_file(Some("/home/rin/.shep/logs/web-0-err.log".to_string()))
+        .cpu_percent(Some(12.5))
+        .memory_bytes(Some(48 * 1024 * 1024))
+        .dog(Some(DogSource::BuiltIn))
+        .build()
 }
 
 /// Depth of a [`FakeDaemon`]'s script channel and of

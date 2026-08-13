@@ -526,20 +526,11 @@ mod tests {
     }
 
     fn base_info(name: &str, status: ProcStatus, restarts: u32) -> ProcessInfo {
-        ProcessInfo {
-            id: 1,
-            name: name.to_owned(),
-            status,
-            pid: Some(4242),
-            restarts,
-            uptime_ms: 1_000,
-            fold: None,
-            out_file: None,
-            err_file: None,
-            cpu_percent: None,
-            memory_bytes: None,
-            dog: None,
-        }
+        ProcessInfo::builder(1, name, status)
+            .pid(Some(4242))
+            .restarts(restarts)
+            .uptime_ms(1_000)
+            .build()
     }
 
     fn errored_info(name: &str, restarts: u32) -> ProcessInfo {

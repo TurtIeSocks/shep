@@ -282,20 +282,12 @@ mod tests {
     /// A minimal, online sheep fixture — enough for the exposition to name
     /// it in a `sheep="..."` label, nothing more precise than that.
     fn sample_info(name: &str) -> ProcessInfo {
-        ProcessInfo {
-            id: 1,
-            name: name.to_string(),
-            status: ProcStatus::Online,
-            pid: Some(4242),
-            restarts: 0,
-            uptime_ms: 1_000,
-            fold: None,
-            out_file: None,
-            err_file: None,
-            cpu_percent: Some(0.5),
-            memory_bytes: Some(1024),
-            dog: None,
-        }
+        ProcessInfo::builder(1, name, ProcStatus::Online)
+            .pid(Some(4242))
+            .uptime_ms(1_000)
+            .cpu_percent(Some(0.5))
+            .memory_bytes(Some(1024))
+            .build()
     }
 
     /// A running metrics dog bound to an OS-assigned loopback port, backed

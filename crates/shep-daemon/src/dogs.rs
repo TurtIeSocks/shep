@@ -437,20 +437,10 @@ mod tests {
     fn process_event(name: &str, kind: ProcessEventKind, dog: Option<DogSource>) -> BusEvent {
         BusEvent::Process {
             event: kind,
-            info: ProcessInfo {
-                id: 1,
-                name: name.to_string(),
-                status: ProcStatus::Errored,
-                pid: None,
-                restarts: 16,
-                uptime_ms: 0,
-                fold: None,
-                out_file: None,
-                err_file: None,
-                cpu_percent: None,
-                memory_bytes: None,
-                dog,
-            },
+            info: ProcessInfo::builder(1, name, ProcStatus::Errored)
+                .restarts(16)
+                .dog(dog)
+                .build(),
             manually: false,
             at_ms: 1_700_000_000_000,
         }

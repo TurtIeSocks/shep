@@ -219,6 +219,17 @@ pub enum DogSource {
 // compares a `ProcessInfo` for total equality — `assert_eq!` needs only
 // `PartialEq`, and no listing is keyed on, hashed by, or sorted by a whole
 // row.
+/// `#[non_exhaustive]`: this struct has grown a field in three separate
+/// phases (`out_file`/`err_file`, then `cpu_percent`/`memory_bytes`, then
+/// `dog`), and `deferred.md` already names the next one — `lambs`, for
+/// `describe`'s tree view. Each of those additions was a hand-edit sweep
+/// across every construction site in the workspace because any crate could
+/// write the literal. Under the attribute the compiler names only the sites
+/// that must decide something, and an out-of-tree consumer cannot be broken
+/// by an addition at all (IR-20 — growth here is not anticipated, it is
+/// scheduled). Use [`ProcessInfo::builder`] to construct one; the fields stay
+/// `pub`, so reading them and assigning to them are both unchanged.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessInfo {
     /// Stable numeric id
@@ -262,6 +273,121 @@ pub struct ProcessInfo {
     /// entry is genuinely a sheep — there is no resource-usage-style claim
     /// a stale zero could get wrong. Do not "fix" this into three cases.
     pub dog: Option<DogSource>,
+}
+
+impl ProcessInfo {
+    /// Starts a builder for one sheep's row.
+    ///
+    /// The three required arguments are the three fields no row can omit and
+    /// no reader can default: which sheep this is, what it is called, and
+    /// what state it is in. Everything else is optional, derived, or
+    /// meaningfully absent, which is exactly the shape a builder is for —
+    /// a nine-argument `new` would put `Option<String>, Option<String>,
+    /// Option<f32>, Option<u64>` next to each other at every call site and
+    /// invite a silent transposition the type system could not catch.
+    ///
+    /// No `#[must_use]` here: [`ProcessInfoBuilder`] already carries one,
+    /// which clippy's `double_must_use` lint treats as covering this
+    /// function's return too.
+    pub fn builder(id: u32, name: impl Into<String>, status: ProcStatus) -> ProcessInfoBuilder {
+        ProcessInfoBuilder {
+            info: Self {
+                id,
+                name: name.into(),
+                status,
+                pid: None,
+                restarts: 0,
+                uptime_ms: 0,
+                fold: None,
+                out_file: None,
+                err_file: None,
+                cpu_percent: None,
+                memory_bytes: None,
+                dog: None,
+            },
+        }
+    }
+}
+
+/// Builds a [`ProcessInfo`], which is `#[non_exhaustive]` and so cannot be
+/// written as a struct literal outside this crate.
+///
+/// Every setter takes the field's own type, `Option` included, rather than
+/// the unwrapped value. That is deliberate and it is the difference between a
+/// straight port and a rewrite: the daemon already holds `Option<u32>` for a
+/// pid and `Option<f32>` for a CPU reading, so `.pid(entry.pid())` carries
+/// across unchanged where `.pid(u32)` would put an `if let` ladder at every
+/// call site. A setter is skipped, not passed `None`, when a row genuinely
+/// has nothing to say about that field.
+///
+/// Defaults for the skipped fields are the ones a not-yet-running sheep has:
+/// no pid, no uptime, no restarts, no resource reading, not a dog.
+#[derive(Debug, Clone)]
+#[must_use = "a builder that is never `build`-ed produces no ProcessInfo"]
+pub struct ProcessInfoBuilder {
+    info: ProcessInfo,
+}
+
+impl ProcessInfoBuilder {
+    /// Sets the OS pid; `None` while the sheep is not running.
+    pub fn pid(mut self, pid: Option<u32>) -> Self {
+        self.info.pid = pid;
+        self
+    }
+
+    /// Sets the restart count since registration.
+    pub fn restarts(mut self, restarts: u32) -> Self {
+        self.info.restarts = restarts;
+        self
+    }
+
+    /// Sets milliseconds since the last successful start.
+    pub fn uptime_ms(mut self, uptime_ms: u64) -> Self {
+        self.info.uptime_ms = uptime_ms;
+        self
+    }
+
+    /// Sets fold membership.
+    pub fn fold(mut self, fold: Option<String>) -> Self {
+        self.info.fold = fold;
+        self
+    }
+
+    /// Sets the resolved stdout log path.
+    pub fn out_file(mut self, out_file: Option<String>) -> Self {
+        self.info.out_file = out_file;
+        self
+    }
+
+    /// Sets the resolved stderr log path.
+    pub fn err_file(mut self, err_file: Option<String>) -> Self {
+        self.info.err_file = err_file;
+        self
+    }
+
+    /// Sets tree CPU as a percentage of one core.
+    pub fn cpu_percent(mut self, cpu_percent: Option<f32>) -> Self {
+        self.info.cpu_percent = cpu_percent;
+        self
+    }
+
+    /// Sets tree resident set size in bytes.
+    pub fn memory_bytes(mut self, memory_bytes: Option<u64>) -> Self {
+        self.info.memory_bytes = memory_bytes;
+        self
+    }
+
+    /// Marks this row a dog and names where the dog came from.
+    pub fn dog(mut self, dog: Option<DogSource>) -> Self {
+        self.info.dog = dog;
+        self
+    }
+
+    /// Finishes the row.
+    #[must_use]
+    pub fn build(self) -> ProcessInfo {
+        self.info
+    }
 }
 
 /// What happened when the daemon tried to deliver one sheep's triggered
@@ -577,6 +703,72 @@ mod tests {
             memory_bytes: Some(48 * 1024 * 1024),
             dog: None,
         }
+    }
+
+    /// fails if the builder's defaults drift from what a registered-but-not-yet
+    /// running sheep actually looks like. A builder that quietly defaulted
+    /// `uptime_ms` to something non-zero, or `restarts` to 1, would put a wrong
+    /// number in front of an operator with nothing to compare it against.
+    #[test]
+    fn a_builder_with_nothing_set_is_a_sheep_that_has_not_run() {
+        let info = ProcessInfo::builder(3, "web", ProcStatus::Stopped).build();
+
+        assert_eq!(info.id, 3);
+        assert_eq!(info.name, "web");
+        assert_eq!(info.status, ProcStatus::Stopped);
+        assert_eq!(info.pid, None);
+        assert_eq!(info.restarts, 0);
+        assert_eq!(info.uptime_ms, 0);
+        assert_eq!(info.fold, None);
+        assert_eq!(info.out_file, None);
+        assert_eq!(info.err_file, None);
+        assert_eq!(info.cpu_percent, None);
+        assert_eq!(info.memory_bytes, None);
+        assert_eq!(info.dog, None);
+    }
+
+    /// fails if any setter writes a field other than its own — the failure a
+    /// twelve-field builder is most likely to ship, and one no individual
+    /// round-trip test would catch. Every field is given a value distinct from
+    /// every other field's default, so a copy-pasted setter body shows up as a
+    /// mismatch rather than as a coincidence.
+    #[test]
+    fn every_setter_writes_its_own_field_and_no_other() {
+        let built = ProcessInfo::builder(3, "web", ProcStatus::Online)
+            .pid(Some(4242))
+            .restarts(1)
+            .uptime_ms(60_000)
+            .fold(Some("backend".to_string()))
+            .out_file(Some("/home/rin/.shep/logs/web-0-out.log".to_string()))
+            .err_file(Some("/home/rin/.shep/logs/web-0-err.log".to_string()))
+            .cpu_percent(Some(12.5))
+            .memory_bytes(Some(48 * 1024 * 1024))
+            .dog(None)
+            .build();
+
+        // `sample_info()` is still a struct literal, on purpose: it is the one
+        // place in the workspace that names every field by hand, so this
+        // comparison fails the day the struct grows a field the builder cannot
+        // set. That is the point of comparing against it rather than against
+        // another builder call.
+        assert_eq!(built, sample_info());
+
+        // `dog` is the one field the comparison above cannot speak for, and it
+        // is the field the whole dogs subsystem reads. `sample_info()`'s `dog`
+        // is `None`, which is also the builder's default, so a `dog` setter with
+        // an EMPTY BODY passes the assert_eq! above and passes it for the wrong
+        // reason. `sample_info()` cannot be changed to `Some(..)` to fix that —
+        // it feeds `reply_wire_snapshots` and `bus_event_wire_snapshots`, so
+        // altering it moves pinned bytes. So the field gets its own line, with a
+        // value nothing defaults to.
+        assert_eq!(
+            ProcessInfo::builder(1, "metrics", ProcStatus::Online)
+                .dog(Some(DogSource::BuiltIn))
+                .build()
+                .dog,
+            Some(DogSource::BuiltIn),
+            "an empty `dog` setter body is invisible to the comparison above"
+        );
     }
 
     /// fails if `DogSource` loses its `tag = "kind"` or its snake_case
