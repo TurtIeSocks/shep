@@ -20,6 +20,7 @@
 #![doc(test(attr(deny(warnings))))]
 #![forbid(unsafe_code)]
 
+pub mod barks;
 pub mod config;
 pub mod paths;
 pub mod protocol;

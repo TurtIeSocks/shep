@@ -12,6 +12,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `barks` module: `Bark`, `SinkOutcome`, `append`, `read`, and
+  `DEFAULT_MAX_BYTES` — the `barks.jsonl` ring both the bark dog (a rule
+  fired) and the shepherd itself (an enabled dog gave up) append to, and
+  `shep barks` will read. One JSON object per line, because a
+  line-delimited format is the one shape where a writer dying mid-append
+  costs the reader one record rather than the file. `append` keeps the
+  ring under a byte cap by evicting whole lines oldest-first, rewriting
+  the survivors plus the new record to a sibling temp file and `rename`ing
+  it over the original — the same atomic-replace shape
+  `shep-daemon::snapshot::write_atomic` uses, so an interrupted rewrite
+  never leaves a truncated line behind. A single record bigger than the
+  whole cap is written anyway, over cap, rather than dropped — the
+  alternative silently loses the alert that was too interesting to fit.
+  `read` is the forgiving half: a line that will not parse — a partial
+  write from a dead writer, or a record from a future shep — costs that
+  one record, not the whole history, because this file is read during an
+  incident and refusing it over one bad line is the wrong failure mode.
+  Lives in shep-core, not shep-daemon, because it has two writers in two
+  different processes and neither is the other's crate; one implementation
+  of the cap keeps them from evicting differently. `Bark`'s `Debug` is
+  derived, not redacted: it carries a rule name, a subject and a message,
+  all shep's own prose, and `SinkOutcome` names a sink by its
+  `[dog.bark.sinks]` config key, never by its webhook URL or token — the
+  file itself is still created owner-only (unix `0600`) as a matter of
+  posture, not because it holds a secret today.
+
 - Add `ProcessSelector::is_exact`, which answers whether a selector names one
   entry the caller already knew of — by its name or its id — rather than
   sweeping whatever matches. `Regex` and `Fold` are wildcards by this
