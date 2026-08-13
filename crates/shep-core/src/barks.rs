@@ -112,6 +112,12 @@ pub struct SinkOutcome {
 /// [`core::error::Error::source`] — the cost is that this enum cannot
 /// derive `Clone`/`PartialEq`/`Eq` (IR-19's documented exception for
 /// variants wrapping `io::Error`).
+///
+/// `#[non_exhaustive]`: shep-core is a published library and this enum is
+/// reachable from it, so a third failure shape — a ring whose on-disk format
+/// this build does not recognise, say — must not break an out-of-tree
+/// consumer's `match` (IR-20).
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum BarkError {
     /// The ring file could not be read, written, or replaced.

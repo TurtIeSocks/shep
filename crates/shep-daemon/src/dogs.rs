@@ -67,6 +67,13 @@ pub struct DogSpec {
 /// rather than rendering it, so a caller keeps the OS diagnostic through
 /// [`core::error::Error::source`]; that costs this enum `Clone`/`PartialEq`/
 /// `Eq` (IR-19's documented exception).
+///
+/// `#[non_exhaustive]` on this enum too, and not only on the [`DogSource`] it
+/// discusses above: `shep-daemon`'s `dogs` module is `pub`, a dog gains a
+/// failure shape every time it gains a source or a config surface, and an
+/// out-of-tree consumer matching exhaustively today would face a breaking
+/// change the day it does (IR-20).
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum DogError {
     /// [`std::env::current_exe`] failed, so a built-in dog has no program to

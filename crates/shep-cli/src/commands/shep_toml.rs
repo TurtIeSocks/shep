@@ -409,6 +409,16 @@ fn lock_path(path: &Path) -> PathBuf {
 }
 
 /// What [`ShepToml::edit`] can fail with. Module-scoped per IR-18.
+///
+/// Deliberately NOT `#[non_exhaustive]`, and this is the comment IR-20 asks
+/// for in the negative case. shep-cli is `[[bin]]`-only — no `lib.rs`, no
+/// published surface — so nothing outside this binary can match on this enum
+/// and there is no downstream `match` for the attribute to protect. Adding it
+/// would tax only this crate's own exhaustive matches, which are the ones we
+/// WANT the compiler to break when `ShepToml::edit` grows a new failure mode.
+/// Same reasoning as [`CronScheduleError`](shep_core::config::CronScheduleError)'s
+/// own omission, for a different reason: that one is closed, this one is
+/// unexported.
 pub enum ShepTomlError {
     /// A read or write of `path` itself failed.
     Io {

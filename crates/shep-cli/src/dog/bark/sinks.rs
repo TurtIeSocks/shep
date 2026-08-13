@@ -126,6 +126,15 @@ impl Sink {
 ///
 /// `Debug` needs no redaction, unlike [`Sink`]'s own: the only field this
 /// carries is the sink's config key, never its url.
+///
+/// Deliberately NOT `#[non_exhaustive]`, and this is the comment IR-20 asks
+/// for in the negative case. shep-cli is `[[bin]]`-only — no `lib.rs`, no
+/// published surface — so nothing outside this binary can match on this enum
+/// and there is no downstream `match` for the attribute to protect. Adding it
+/// would tax only this crate's own exhaustive matches, which are the ones we
+/// WANT the compiler to break when a new sink kind arrives. Same reasoning as
+/// [`CronScheduleError`](shep_core::config::CronScheduleError)'s own omission,
+/// for a different reason: that one is closed, this one is unexported.
 #[derive(Debug)]
 pub enum SinkConfigError {
     /// Sink `name` is a [`Sink::Discord`] or [`Sink::Slack`] (`kind`)

@@ -422,3 +422,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Wire fixtures now pin every `SelectorSpec` variant, every
   `ProcessEventKind`, and every `Response` tag. No wire string changed —
   this closes coverage, not behaviour.
+- `FlockfileError`, `DaemonConfigError` and `BarkError` are `#[non_exhaustive]`.
+  Match on them with a wildcard arm.

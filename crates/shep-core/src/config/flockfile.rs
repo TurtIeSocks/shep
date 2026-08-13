@@ -197,6 +197,12 @@ pub fn discover(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Error type returned from [`Flockfile::parse`]
+///
+/// `#[non_exhaustive]`: a fifth backend is the named next step for this type
+/// — `deferred.md` lists `.js` Flockfiles — and it brings its own rejection
+/// reason with it, which must not be a breaking change for a consumer
+/// matching on this enum (IR-20).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlockfileError {
     /// TOML backend rejected the source (carries its message)

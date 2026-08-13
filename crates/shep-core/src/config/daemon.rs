@@ -219,6 +219,13 @@ impl DaemonConfig {
 }
 
 /// Error type returned from [`DaemonConfig::load`]
+///
+/// `#[non_exhaustive]`: every `[daemon]` key this crate learns to validate
+/// brings its own rejection reason, and `deferred.md`'s daemon-config flags
+/// layer is a whole set of them at once (IR-20 — the same reasoning
+/// [`NormalizeError`](crate::config::NormalizeError) states for the per-app
+/// side).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonConfigError {
     /// `shep.toml` is invalid TOML (carries the parser message)
