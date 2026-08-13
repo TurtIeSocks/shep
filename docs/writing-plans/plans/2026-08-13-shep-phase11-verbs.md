@@ -103,6 +103,109 @@ find crates -name '*.snap' | wc -l                   # 4
 find crates/shep-core/src/protocol/snapshots -name '*.snap' | wc -l   # 3
 ```
 
+Every one of those was re-run at `d8bd4af` and prints what it says.
+
+#### Two more shapes a dead check takes, both found reviewing this plan
+
+The first draft of this plan shipped one of each. They are written down here
+because the fix is not obvious from reading the check.
+
+**A `git diff` filtered on `^-` can never print `0`.** Unified diff opens each
+file's hunk with a `--- a/<path>` header, and `grep '^-'` matches it. So
+`git diff <dir> | grep -c '^-'` is at least `1` for any change at all, and a
+pure-addition change to two files prints `2`. The same trap is in prose: "one
+`+` line and zero `-` lines" is false in both directions, since `+++ b/<path>`
+starts with a `+`. Use one of these instead, both verified in a scratch repo
+against a one-line pure addition:
+
+```bash
+git diff --numstat <paths>          # "1<TAB>0<TAB>path" — column 2 is DELETIONS
+git diff -U0 <paths> | grep -c '^-[^-]'   # 0 for a pure addition
+```
+
+`--numstat`'s columns are `added`, `deleted`, `path` — deletions are the
+**second** column, not the third. Assert on that column, not on a line count.
+
+**A `tokio::time::timeout` around a SYNCHRONOUS call can never fire.** The
+future completes on its first poll, so the timer is never even armed:
+
+```rust
+// Decoration, not a bound. `lambs_of` is a plain `fn`.
+tokio::time::timeout(Duration::from_secs(5), async { stats.lambs_of(100) }).await
+```
+
+A genuinely non-terminating synchronous walk hangs exactly as it would with no
+wrapper at all — while the wrapper tells every later reader the case is
+bounded. There is no in-process way to bound a synchronous call on the same
+thread; the honest options are to give the case a **live assertion** the
+mutation step reddens (which is what Step 16.1 now does), or to move the call
+onto another thread and bound the join. Do not add the wrapper to satisfy
+IR-46: IR-46 asks for a bound on a test that can *only* fail by hanging, and
+the answer to that is usually to give it a way to fail that is not hanging.
+
+### The four supervisor test tiers, and the real names in each
+
+**Read this before writing a single test body in Tasks 2, 4, 6, 9, 10 or 16.**
+The first draft of this plan invented a fifth tier that does not exist —
+`harness_with_runner(SharedRunner::new(..))` plus an `async register_sheep(&h,
+app)` — and wrote about twenty-five bodies against it. Every name below was
+read off the tree at `d8bd4af`. Use these; do not invent a sixth.
+
+| Tier | Entry point | What you get back | Use it when |
+|---|---|---|---|
+| **Handle + readable runner** | `started(&dir, app, scripts).await` — `supervisor.rs:6448` | `(SupervisorHandle, Arc<ScriptedRunner>, broadcast::Receiver<BusEvent>)` | the case drives the real API **and** reads the runner back afterwards |
+| **Harness** | `harness(scripts)` / `harness_with_stats` / `harness_with_extras` — `testing.rs:374/392/458` | `Harness { ctx: RpcContext, stats, breaches, liveness, .. }` | the case goes through `RpcContext` (every `rpc.rs` dispatch test), or needs no runner read-back |
+| **Bare actor** | `actor_with_one_online_sheep(&dir, scripts)` — `:6470`; `actor_with_a_sheep_and_a_dog(&dir)` — `:6522`; `actor_with_an_open_channel(&dir)` — `:8726`; `actor_with_stopping_drainee(&dir, pid, epoch)` — `:6323` | an `Actor<ScriptedRunner>` plus the receivers the case has to drive by hand | the state under test is not reachable from outside — a hand-set `ReloadState`, an exact ordering against a wait's deadline |
+| **Real child** | `tests/real_runner.rs`, `tests/daemon_e2e.rs`, `tests/cli_e2e.rs` | a real `TokioRunner` / a booted daemon | a real pipe, a real `kill(2)`, real newline framing |
+
+Exact signatures, since three of them are nothing like the sketches the first
+draft used:
+
+```rust
+// supervisor.rs test module — SYNCHRONOUS, Actor-tier, four arguments.
+fn register_sheep(actor: &mut Actor<ScriptedRunner>, dir: &TempDir,
+                  name: &str, to_child: Option<mpsc::Sender<ShepherdMessage>>) -> u32;
+
+// supervisor.rs test module — Harness-tier start. This is the "register an app
+// and get its instances" the first draft meant by `register_sheep(&h, app)`.
+async fn start_app(h: &Harness, app: AppConfig) -> Vec<ProcessInfo>;   // :6627
+
+fn actor_with_stopping_drainee(dir: &TempDir, pid: u32, epoch: u64)
+    -> (Actor<ScriptedRunner>, mpsc::Receiver<SheepCtl>);              // :6323
+
+// testing.rs — a TUPLE STRUCT. No `::new`, no `Clone`, no accessors.
+pub(crate) struct SharedRunner(pub(crate) Arc<ScriptedRunner>);        // :241
+```
+
+`ScriptedRunner`'s read-back accessors are exactly: `kill_counts()`,
+`signals(i)`, `log_ctl_live(i)`, `reopens(i)`, `flushes(i)`, `io_handles(i)`
+(`fake.rs:353-475`). `ProcScript`'s constructors are exactly `const_exit`,
+`stable_then_exit`, `never_exits`, `ignores_signals`,
+`never_reports_its_exit`, `with_a_lamb_holding_the_pipe` (`fake.rs:53-140`).
+There is no `runs_forever`.
+
+**The seam for pushing a child→shepherd message already exists**, and it is
+the one Task 2 needs: `runner.io_handles(spawn_index)` hands back a `FakeIo`
+whose `from_child_tx` is the sending half of that spawn's `ProcIo::from_child`
+(`fake.rs:151-162`, `:632-638`). `a_triggered_action_answers_with_the_apps_reply`
+(`:8806`) already does exactly this. **No new supervisor method is needed and
+none may be added** — see Step 2.5.
+
+Where a case genuinely needs a helper that does not exist, this plan now says
+so in the task that first needs it, with the helper's signature and body as a
+numbered step. Those are, in full, and there are no others:
+
+- Step 4.2 — `ScriptedRunner::process_signals(i)` and `ProcState::record_process_signal`.
+- Step 4.3 — `actor_with_a_drainee_holding_a_signal_mailbox`.
+- Step 6.1a — `instance_slots_of`, `settle_to`, `actor_with_a_scaled_app`,
+  `stored_instance_counts`.
+- Step 9.3 — `ScriptedRunner::stdin_lines(i)` and `ProcScript::never_reads_its_stdin`.
+- Step 16.1a — `identity(..)` and `ScriptedSampler::identifying(..)`.
+- Step 16.2 — `LambIndex` and `StatsState::lamb_index`, which are production
+  code rather than helpers but are named here because Step 16.1's tests are
+  written against them before they exist.
+- Step 16.3 — `harness_identifying(..)`.
+
 ---
 
 ## What this phase builds
@@ -378,16 +481,66 @@ changes.
 ## Task order and dependencies
 
 Tasks 1–2 (channel), 3–4 (signal), 5–7 (scale), 8–11 (sendline), 12–14 (KV) and
-15–17 (lambs) are six independent chains. Within a chain the order is binding.
-Across chains it is not, with two exceptions:
+15–17 (lambs) are six chains. Within a chain the order is binding. **The chains
+are NOT all independent**, and the first draft of this plan said they were,
+which would have cost a batch: four of these tasks rewrite the same three
+things.
+
+### The binding landing order
+
+```
+Task 1 → Task 2 → Task 3 → Task 4 → Task 8 → Task 9 → Task 10 → Task 11
+                                 └→ Task 5 → Task 6 → Task 7
+Task 12 → Task 13 → Task 14        (independent of everything above)
+Task 15 → Task 16 → Task 17        (independent EXCEPT the Task 8 snapshot)
+Task 18                            (last, always)
+```
+
+Read it as: **the channel chain, the signal chain and the sendline chain are
+serialised against each other in that order.** Everything else in the diagram
+is a within-chain dependency the tasks already state.
+
+### Why — the three shared edit sites
+
+| Site | Task 2 | Task 4 | Task 9 | Task 10 |
+|---|---|---|---|---|
+| `run_sheep`'s `select!` body (`supervisor.rs:4638`) | replaces the `from_child` arm | **adds a fourth branch** | binds `to_stdin` out of the `ProcIo` destructure | wires the stdin sender |
+| `SheepSlot` (`:1252`) | — | **adds `signals`** | — | **adds `to_stdin`** |
+| `spawn_sheep_task` (`:4577`) | — | **return type becomes `SheepHandles`** | — | adds a third handle to it |
+| the `match request` in `rpc.rs` | — | adds an arm | — | adds an arm |
+
+Run in two worktrees these do not merge; run out of order, whichever lands
+second has to re-derive the other's shape from a conflicted `select!`. So:
+
+- **Task 4 lands before Task 10.** Task 10 **inherits `SheepHandles`** from
+  Task 4 and adds a third field to it. It does not invent a second return
+  shape, and it does not go back to a bare `mpsc::Sender<SheepCtl>`.
+- **Task 2 lands before Task 4**, because Task 2 rewrites the `from_child`
+  arm wholesale and Task 4's new branch sits beside it.
+- **Task 9 lands before Task 10**, which the sendline chain already said, and
+  after Task 4 for the `select!`.
+- Tasks 4, 6, 10 and 16 each add an arm to `rpc.rs`'s dispatch `match`. That
+  one is a cheap textual conflict rather than a semantic one, but it is still
+  four agents in one `match`: same rule, run them in the order above.
+
+### The two constraints the first draft did have, still binding
 
 - **Task 8 and Task 15 both change a pinned snapshot** (`request_wire_v1` gains
-  a field on `AppConfig`; `reply_wire_v1` and `bus_event_wire_v1` gain a field
-  on `ProcessInfo`). Do not run them concurrently in two worktrees — the second
-  will land on a snapshot the first already moved and the diff stops being
-  reviewable.
+  a field on `AppConfig`; `reply_wire_v1`, `bus_event_wire_v1` **and**
+  shep-cli's `the_json_envelope_shape_is_pinned` gain a field on
+  `ProcessInfo` — see Task 15's own file list). Do not run them concurrently in
+  two worktrees — the second will land on a snapshot the first already moved
+  and the diff stops being reviewable.
 - **Task 1 moves types between crates.** Land it before anything else touches
   `crates/shep-daemon/src/channel.rs`.
+
+### What CAN be batched
+
+Tasks 12–14 (KV) touch `shep-core/src/kv.rs`, `paths.rs`, three `ShepPaths`
+struct literals and a new CLI module — nothing any other chain edits. Tasks
+15–17 (lambs) touch `protocol/request.rs`, `limits/`, and `rows.rs`. Those two
+chains and the serialised trunk above are three genuinely parallel lanes, and
+that is the whole of the available parallelism in this phase.
 
 ---
 
@@ -532,10 +685,17 @@ Baseline for the "nothing else changed" check — run **before** the move:
 grep -rn "crate::channel::" crates/shep-daemon/src | wc -l
 ```
 
-At `f73d4df` this prints a non-zero count. Run it again after Step 1.3 and it
-must print **the same number**: the re-export means no call site moves. A
-smaller number means someone "helpfully" rewrote imports to point at shep-core,
-which is not this task and makes the diff unreviewable.
+At `d8bd4af` this prints **7**. Run it again after Step 1.3 and it must print
+**7** again: the re-export means no call site moves. A smaller number means
+someone "helpfully" rewrote imports to point at shep-core, which is not this
+task and makes the diff unreviewable; a larger one means the move added call
+sites it should not have.
+
+This is one of two checks in the plan whose expected output is *unchanged* by
+the task — the other is Step 18.3's `Over a thousand tests`. That is not the
+dead-check shape: a dead check is one that cannot print anything else, and this
+one moves in both directions. Stated explicitly so the two are not confused
+during review.
 
 ### Step 1.5 — MUTATION
 
@@ -795,12 +955,15 @@ and **no change to any existing row**. Then accept:
 
 ```bash
 INSTA_UPDATE=always cargo test -p shep-core --lib --all-features
-git diff --stat crates/shep-core/src/protocol/snapshots/
+git diff --numstat crates/shep-core/src/protocol/snapshots/
 ```
 
-The `git diff --stat` must show exactly one file changed, with insertions and
-**zero deletions**. Deletions mean an existing pinned row moved, which this
-task does not do.
+`--numstat` prints `added<TAB>deleted<TAB>path` per changed file. Exactly one
+row, and its **second column must be `0`** — deletions. A non-zero one means an
+existing pinned row moved, which this task does not do. (`--numstat` rather
+than `--stat` so the check is a column read rather than a prose read, and
+rather than `| grep -c '^-'`, which counts the `--- a/<path>` header and can
+never print `0`.)
 
 Baseline check that the accept did not leave a stray pending file:
 
@@ -815,8 +978,16 @@ check and it could not fail.)
 
 ### Step 2.4 — RED: the shepherd does not forward
 
-Add to `crates/shep-daemon/src/supervisor.rs`'s `#[cfg(test)] mod tests`, near
-the existing action-reply cases (`actor_with_an_open_channel` is at line 8726):
+**Tier: handle + readable runner.** These cases need the real `run_sheep` arm
+(the mutation in Step 2.7 deletes a line inside it) and they need to push a
+message into `ProcIo::from_child`, which only the fake's own `FakeIo` half can
+do. `started(..)` gives all three: a live `SupervisorHandle`, the
+`Arc<ScriptedRunner>` to take `io_handles(0)` off, and a bus subscriber.
+`a_triggered_action_answers_with_the_apps_reply` (`supervisor.rs:8806`) is the
+case to copy line for line.
+
+Add to `crates/shep-daemon/src/supervisor.rs`'s `#[cfg(test)] mod tests`, in
+the custom-actions section beside that case:
 
 ```rust
 /// fails if a `ready` on fd 3 reaches only the readiness machinery and never
@@ -825,65 +996,21 @@ the existing action-reply cases (`actor_with_an_open_channel` is at line 8726):
 /// replacement for the first.
 #[tokio::test(start_paused = true)]
 async fn a_ready_on_the_channel_reaches_both_the_bus_and_the_readiness_wait() {
-    let h = harness(vec![ProcScript::runs_forever()]);
-    let mut events = h.ctx.events.subscribe();
+    let dir = tempfile::tempdir().unwrap();
     let mut app = AppConfig::minimal("web", "./srv");
     app.channel = true;
     app.wait_ready = true;
-    let id = register_sheep(&h, app).await;
+    // `started` hands back the bus receiver as its third element — subscribed
+    // BEFORE the start, so nothing this case cares about is missed.
+    let (handle, runner, mut events) =
+        started(&dir, app, vec![ProcScript::never_exits()]).await;
+    let io = runner.io_handles(0);
 
-    h.ctx
-        .supervisor
-        .deliver_child_message_for_test(id, ChildMessage::Ready)
-        .await;
+    io.from_child_tx.send(ChildMessage::Ready).await.unwrap();
 
-    // Bounded (IR-46): without the timeout this case can only fail by
-    // hanging on a bus that never receives.
-    let seen = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match events.recv().await.unwrap() {
-                BusEvent::Channel { id, message } => break (id, message),
-                _ => continue,
-            }
-        }
-    })
-    .await
-    .expect("no channel event within 5s");
-
-    assert_eq!(seen, (id, ChildMessage::Ready));
-
-    // The readiness half still works: the sheep goes Online off this same
-    // message, which is what it did before the bus ever saw one.
-    let listed = h.ctx.supervisor.list().await;
-    assert_eq!(
-        listed.iter().find(|i| i.id == id).unwrap().status,
-        ProcStatus::Online
-    );
-}
-
-/// fails if a metric is still only a `tracing::debug!`. That log line was the
-/// whole of what a metric ever produced, and a subscriber could not read it —
-/// this is the case that says the topic exists for a reason.
-#[tokio::test(start_paused = true)]
-async fn a_metric_on_the_channel_reaches_the_bus_with_its_name_and_value() {
-    let h = harness(vec![ProcScript::runs_forever()]);
-    let mut events = h.ctx.events.subscribe();
-    let mut app = AppConfig::minimal("web", "./srv");
-    app.channel = true;
-    let id = register_sheep(&h, app).await;
-
-    h.ctx
-        .supervisor
-        .deliver_child_message_for_test(
-            id,
-            ChildMessage::Metric {
-                name: "rps".to_string(),
-                value: 42.0,
-            },
-        )
-        .await;
-
-    let seen = tokio::time::timeout(Duration::from_secs(5), async {
+    // Bounded (IR-46): a bus that never receives would park this case rather
+    // than fail it, and there is no other failure mode to give it.
+    let seen = tokio::time::timeout(ACTION_WINDOW, async {
         loop {
             if let BusEvent::Channel { id, message } = events.recv().await.unwrap() {
                 break (id, message);
@@ -891,12 +1018,50 @@ async fn a_metric_on_the_channel_reaches_the_bus_with_its_name_and_value() {
         }
     })
     .await
-    .expect("no channel event within 5s");
+    .expect("no channel event within the window");
+
+    assert_eq!(seen, (0, ChildMessage::Ready));
+
+    // The readiness half still works: the sheep goes Online off this same
+    // message, which is what it did before the bus ever saw one.
+    let listed = handle.list().await;
+    assert_eq!(listed[0].status, ProcStatus::Online);
+}
+
+/// fails if a metric is still only a `tracing::debug!`. That log line was the
+/// whole of what a metric ever produced, and a subscriber could not read it —
+/// this is the case that says the topic exists for a reason.
+#[tokio::test(start_paused = true)]
+async fn a_metric_on_the_channel_reaches_the_bus_with_its_name_and_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = AppConfig::minimal("web", "./srv");
+    app.channel = true;
+    let (_handle, runner, mut events) =
+        started(&dir, app, vec![ProcScript::never_exits()]).await;
+    let io = runner.io_handles(0);
+
+    io.from_child_tx
+        .send(ChildMessage::Metric {
+            name: "rps".to_string(),
+            value: 42.0,
+        })
+        .await
+        .unwrap();
+
+    let seen = tokio::time::timeout(ACTION_WINDOW, async {
+        loop {
+            if let BusEvent::Channel { id, message } = events.recv().await.unwrap() {
+                break (id, message);
+            }
+        }
+    })
+    .await
+    .expect("no channel event within the window");
 
     assert_eq!(
         seen,
         (
-            id,
+            0,
             ChildMessage::Metric {
                 name: "rps".to_string(),
                 value: 42.0,
@@ -904,11 +1069,58 @@ async fn a_metric_on_the_channel_reaches_the_bus_with_its_name_and_value() {
         )
     );
 }
+
+/// fails if an `action-reply` nobody is waiting for is dropped before the bus
+/// sees it. This is the case `deferred.md`'s `channel.*` entry names by name:
+/// an unprompted or late reply "stays just as invisible as before". No trigger
+/// is armed here, so `handle_action_reply` finds no wait and discards it — and
+/// the bus must still have carried it.
+#[tokio::test(start_paused = true)]
+async fn an_action_reply_no_trigger_is_waiting_for_still_reaches_the_bus() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = AppConfig::minimal("web", "./srv");
+    app.channel = true;
+    let (_handle, runner, mut events) =
+        started(&dir, app, vec![ProcScript::never_exits()]).await;
+    let io = runner.io_handles(0);
+
+    io.from_child_tx
+        .send(ChildMessage::ActionReply {
+            action: "gc".to_string(),
+            body: "unprompted".to_string(),
+            id: None,
+        })
+        .await
+        .unwrap();
+
+    let seen = tokio::time::timeout(ACTION_WINDOW, async {
+        loop {
+            if let BusEvent::Channel { message, .. } = events.recv().await.unwrap() {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("no channel event within the window");
+
+    let ChildMessage::ActionReply { body, .. } = seen else {
+        panic!("expected an action reply, got {seen:?}");
+    };
+    assert_eq!(body, "unprompted");
+}
 ```
 
-`deliver_child_message_for_test` does not exist. It is the seam this test
-needs: the scripted fake owns the `from_child` sender and nothing in the actor
-API can push one. Add it in Step 2.5 alongside the forwarding.
+Three notes, each of which the first draft got wrong:
+
+- **The sheep's id is `0`, not a value read back from a helper.** `started`
+  runs one `start` against a fresh actor whose `next_id` begins at 0, which is
+  the same literal the existing action cases assert (`ActionReply { id: 0, .. }`
+  at `:8853`). Written deliberately, not discovered.
+- **`ACTION_WINDOW`** (`supervisor.rs:8714`, 120 virtual seconds) is the bound
+  every other case in this section uses. Reuse it rather than introducing a
+  second number.
+- **`io_handles(0)` may be taken only once per spawn** — it `take()`s the
+  bundle and panics on a second call. One binding per test.
 
 Run:
 
@@ -916,10 +1128,12 @@ Run:
 cargo test -p shep-daemon --lib --all-features -- --skip ::slow::
 ```
 
-**Expected failure — for the stated reason:** compile error, ``no method named
-`deliver_child_message_for_test` found for struct `SupervisorHandle` ``.
+**Expected failure — for the stated reason:** compile error, ``no variant or
+associated item named `Channel` found for enum `BusEvent` `` (the shep-core
+half of Step 2.2 is what makes it exist; if Task 2's core steps already landed,
+the red is instead three timeouts at the window bound, which is also correct).
 
-### Step 2.5 — GREEN: forward, and the test seam
+### Step 2.5 — GREEN: forward
 
 In `crates/shep-daemon/src/supervisor.rs`, `run_sheep`'s `from_child` arm
 (currently lines 4678–4705). Replace the whole `match maybe_msg` body's three
@@ -977,34 +1191,24 @@ The `message.clone()` is one allocation per fd-3 line. That is the same cost
 `BusEvent::LogOut` already pays per log line a few arms up, on traffic that is
 orders of magnitude heavier; say so in review rather than reaching for an `Arc`.
 
-Then the test seam. Add to `impl SupervisorHandle`, beside the other
-crate-private command methods:
+**No test seam is added, and none may be.** The first draft of this step
+offered two routes — a `Msg::DeliverChildMessage` variant with a
+`SupervisorHandle::deliver_child_message_for_test`, or the fake's own
+`from_child` sender — and left the choice open. It is not open, for two
+reasons:
 
-```rust
-    /// Delivers `message` to `id`'s sheep task as though the child had written
-    /// it on fd 3.
-    ///
-    /// Test-only, and it exists because the scripted fake owns the sending
-    /// half of `ProcIo::from_child` and hands a test no way to reach it. The
-    /// real path is proven against a real child in `tests/daemon_e2e.rs`; this
-    /// is what lets the engine-tier cases run under the paused clock.
-    #[cfg(test)]
-    pub(crate) async fn deliver_child_message_for_test(&self, id: u32, message: ChildMessage) {
-        let _ = self
-            .tx
-            .send(Msg::DeliverChildMessage { id, message })
-            .await;
-    }
-```
-
-with a matching `Msg` variant and an actor arm that hands it to the sheep's own
-task. **Read `Msg` and the actor's `run` loop before writing this**: if a
-simpler seam exists by the time you get here — the fake growing a
-`ScriptedRunner::child_message(spawn_index, msg)` that pushes straight into the
-`from_child` sender it already holds — prefer it. That is the better shape,
-because it exercises `run_sheep`'s real arm rather than a second path into it.
-Take the fake route if `ScriptedRunner` already retains the sender; take the
-`Msg` route only if it does not.
+1. **Only the fake route can fail.** Step 2.7's mutation deletes the
+   `events.send(BusEvent::Channel { .. })` line from *this arm*. A message
+   injected through a new `Msg` variant never passes through this arm at all,
+   so under that route the mutation is invisible and both new cases stay green
+   on a daemon that forwards nothing. A seam that routes around the code under
+   test is not a seam.
+2. **The fake already has it.** `SpawnedProc.io` retains
+   `FakeIo { from_child_tx, .. }` (`fake.rs:151-162`, `:632-638`), reachable
+   as `runner.io_handles(i).from_child_tx`. There is nothing to build, so a
+   test-only variant on the production `Msg` enum would be a new public-ish
+   surface bought for nothing — which YAGNI and this repo's own IR rules both
+   argue against.
 
 Run:
 
@@ -1012,7 +1216,7 @@ Run:
 cargo test -p shep-daemon --lib --all-features -- --skip ::slow::
 ```
 
-Expect green, **+2** tests.
+Expect green, **+3** tests.
 
 ### Step 2.6 — GREEN: a real child, end to end
 
@@ -1101,11 +1305,18 @@ delete the `let _ = events.send(BusEvent::Channel { … });` line from
 `run_sheep`'s `from_child` arm. Run
 `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`.
 
-**Must go red:** both new supervisor cases time out at their 5s bound and fail
-with `no channel event within 5s` — a *failure*, not a hang, which is the
-whole reason the bound is there. Every pre-existing action-reply and readiness
-case must stay **green**: the forward is additive and removing it must not
-disturb what the arm already did.
+**Must go red: all three** new supervisor cases time out at `ACTION_WINDOW` and
+fail with `no channel event within the window` — a *failure*, not a hang,
+which is the whole reason the bound is there. This mutation is the reason Step
+2.5 forbids a `Msg`-routed test seam: injected through a second path into the
+actor, all three would stay green with the forward deleted.
+
+Every pre-existing action-reply and readiness case must stay **green**: the
+forward is additive and removing it must not disturb what the arm already did.
+In particular `a_triggered_action_answers_with_the_apps_reply` (`:8806`) is the
+control — it drives the same arm through the same `from_child_tx` and asserts
+on the *reply path*, so if it reddens here the edit was a rewrite, not an
+addition.
 
 Revert.
 
@@ -1154,8 +1365,13 @@ pub struct SignalReply { pub id: u32, pub name: String, pub outcome: SignalOutco
 
 ### Step 3.1 — RED: the grammar
 
-Create `crates/shep-core/src/signals.rs` with only the test module first, so
-the red is a compile error against a type that does not exist:
+Create `crates/shep-core/src/signals.rs` with the test module and **its `//!`
+module doc**, so the red is a compile error against a type that does not exist
+and nothing else. `missing_docs = "deny"` is workspace-wide
+(`Cargo.toml:233-235`), so `pub mod signals;` over an undocumented file is a
+denied-lint *error* in its own right — a correct red, but a second one, and an
+implementer who expects only "cannot find type `OperatorSignal`" will read it
+as a problem with the test:
 
 ```rust
 #[cfg(test)]
@@ -1532,8 +1748,12 @@ Add to `request_wire_snapshots`, after the `Trigger` envelope:
             },
 ```
 
-(renumber to whatever the next free envelope id in that vector is — read it;
-the ids are sequential and the last one is not `11` by guarantee.)
+**Renumber every id you add.** Both vectors' ids are sequential and neither
+last one is `11` by guarantee — at `d8bd4af` `request_wire_snapshots` runs to
+16 and `reply_wire_snapshots` to 19. Read the last id in the vector you are
+appending to and use the next. Tasks 3, 5, 8 and 15 each append to one or both
+of these, in whatever order those four chains land, and two rows sharing an id
+still pass the snapshot — so nothing catches a collision but this instruction.
 
 And to `reply_wire_snapshots`, one `Reply` carrying
 `Response::Signalled(vec![…])` with all three outcomes, mirroring the
@@ -1543,7 +1763,8 @@ Run, review the insta diff (**appended rows only, zero deletions**), accept
 with `INSTA_UPDATE=always`, then:
 
 ```bash
-git diff --stat crates/shep-core/src/protocol/snapshots/
+# `added<TAB>deleted<TAB>path`; column TWO must be 0 on every row.
+git diff --numstat crates/shep-core/src/protocol/snapshots/
 find crates -name '*.snap.new' | wc -l      # 0 at HEAD, must be 0 after
 ```
 
@@ -1622,6 +1843,9 @@ happened. Signals get a mailbox of their own, on the same task.
 
 ### Step 4.1 — RED: the runner seam
 
+**Tier: fake, direct.** No supervisor involved — this is one `ScriptedRunner`,
+one spawn, two method calls.
+
 Add to `crates/shep-daemon/src/fake.rs`'s test module:
 
 ```rust
@@ -1631,8 +1855,8 @@ Add to `crates/shep-daemon/src/fake.rs`'s test module:
 /// one counter could not tell a reviewer which one the supervisor called.
 #[tokio::test(start_paused = true)]
 async fn a_process_signal_is_recorded_apart_from_a_group_signal() {
-    let runner = ScriptedRunner::new(vec![ProcScript::runs_forever()]);
-    let (mut proc, _io) = runner.spawn(&spec_for("web")).unwrap();
+    let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+    let (mut proc, _io) = runner.spawn(&spec()).unwrap();
 
     proc.signal_process(OperatorSignal::Hup).unwrap();
     proc.signal_process(OperatorSignal::Usr1).unwrap();
@@ -1646,10 +1870,32 @@ async fn a_process_signal_is_recorded_apart_from_a_group_signal() {
         "a per-process signal must not be counted as a group signal"
     );
 }
+
+/// fails if `signal_process` resolves the scripted proc's `wait()`. It must
+/// not: `signal` does (it is the stop ladder's polite rung, and this script
+/// obeys it), and a nudge that ended the sheep would make every supervisor
+/// case in Step 4.3 vacuous — the row would read `Delivered` off a process
+/// that had just died.
+#[tokio::test(start_paused = true)]
+async fn a_process_signal_does_not_end_the_scripted_proc() {
+    let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+    let (proc, _io) = runner.spawn(&spec()).unwrap();
+    let mut waiter = proc.clone();
+    let mut signaller = proc;
+    let waiting = tokio::spawn(async move { waiter.wait().await });
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    signaller.signal_process(OperatorSignal::Hup).unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+
+    assert!(!waiting.is_finished(), "signal_process resolved the wait");
+    waiting.abort();
+}
 ```
 
-(`spec_for` — reuse whatever spec helper that module's tests already use; read
-them first.)
+The module's spec fixture is called **`spec()`** and takes no arguments
+(`fake.rs:669`); `signal_during_pending_wait_resolves` (`:727`) is the
+clone-then-signal shape the second case copies.
 
 Run `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`.
 
@@ -1715,10 +1961,46 @@ In `crates/shep-daemon/src/fake.rs`, on `impl RunningProcess for FakeProc`:
     }
 ```
 
-with `process_signals: Mutex<Vec<OperatorSignal>>` on `ProcState`, a
-`record_process_signal` beside `record_signal`, and a
-`ScriptedRunner::process_signals(&self, spawn_index: usize) -> Vec<OperatorSignal>`
-reader beside the existing `signals`.
+**The three fake-side additions this needs, spelled out** — they do not exist
+and Step 4.1's red is against them:
+
+```rust
+// on `ProcState` (fake.rs:164), beside the existing `signals` field:
+    /// Every `signal_process` call, in call order. Separate from `signals`,
+    /// which records group deliveries — see `ScriptedRunner::process_signals`.
+    process_signals: Mutex<Vec<OperatorSignal>>,
+
+// on `impl ProcState` (:209), beside `record_signal`:
+    fn record_process_signal(&self, sig: OperatorSignal) {
+        self.process_signals.lock().unwrap().push(sig);
+    }
+
+// on `impl ScriptedRunner` (:353), beside `signals` (:377) — copy that
+// method's doc shape, including its `# Panics` section:
+    /// Every [`OperatorSignal`] a `signal_process` call has recorded for the
+    /// proc spawned at `spawn_index`, in call order.
+    ///
+    /// The counterpart to [`Self::signals`], which records the group-wide
+    /// deliveries the stop ladder makes. Two lists rather than one because
+    /// which of the two the supervisor called is exactly what a test of
+    /// `shep signal` is asking.
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[must_use]
+    pub fn process_signals(&self, spawn_index: usize) -> Vec<OperatorSignal> {
+        self.spawned.lock().unwrap()[spawn_index]
+            .state
+            .process_signals
+            .lock()
+            .unwrap()
+            .clone()
+    }
+```
+
+`ProcState` has a hand-written `Debug` (`fake.rs:233`) rather than a derive —
+add the new field to it, or leave it out deliberately and say which.
 
 In `crates/shep-daemon/src/tokio_runner.rs`, on `impl RunningProcess for TokioProc`:
 
@@ -1767,9 +2049,14 @@ fn to_nix_operator_signal(sig: OperatorSignal) -> Signal {
 ```
 
 Run `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`.
-Expect green, **+1**.
+Expect green, **+2**.
 
 ### Step 4.3 — RED: the supervisor delivers
+
+**Tiers, decided per case** — three of these go through the handle and one has
+to be built at the actor tier, because the state it is about (a
+`ReloadState::Drainee` marker) is crate-internal and not reachable from
+outside.
 
 Add to `crates/shep-daemon/src/supervisor.rs`'s test module:
 
@@ -1780,21 +2067,23 @@ Add to `crates/shep-daemon/src/supervisor.rs`'s test module:
 /// other respect and would deliver SIGHUP to every lamb.
 #[tokio::test(start_paused = true)]
 async fn a_signal_reaches_the_sheeps_own_process_and_not_its_group() {
-    let runner = SharedRunner::new(vec![ProcScript::runs_forever()]);
-    let h = harness_with_runner(runner.clone());
-    let id = register_sheep(&h, AppConfig::minimal("web", "./srv")).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, runner, _events) = started(
+        &dir,
+        AppConfig::minimal("web", "./srv"),
+        vec![ProcScript::never_exits()],
+    )
+    .await;
 
-    let rows = h
-        .ctx
-        .supervisor
-        .signal(ProcessSelector::Id(id), OperatorSignal::Hup)
+    let rows = handle
+        .signal(ProcessSelector::Id(0), OperatorSignal::Hup)
         .await
         .unwrap();
 
     assert_eq!(
         rows,
         vec![SignalReply {
-            id,
+            id: 0,
             name: "web".to_string(),
             outcome: SignalOutcome::Delivered,
         }]
@@ -1811,18 +2100,17 @@ async fn a_signal_reaches_the_sheeps_own_process_and_not_its_group() {
 /// sheep answering it would be the report lying about the one thing it says.
 #[tokio::test(start_paused = true)]
 async fn a_stopped_sheep_answers_not_running_rather_than_delivered() {
-    let h = harness(vec![ProcScript::runs_forever()]);
-    let id = register_sheep(&h, AppConfig::minimal("web", "./srv")).await;
-    h.ctx
-        .supervisor
-        .stop(ProcessSelector::Id(id))
-        .await
-        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, _runner, _events) = started(
+        &dir,
+        AppConfig::minimal("web", "./srv"),
+        vec![ProcScript::never_exits()],
+    )
+    .await;
+    handle.stop(ProcessSelector::Id(0)).await.unwrap();
 
-    let rows = h
-        .ctx
-        .supervisor
-        .signal(ProcessSelector::Id(id), OperatorSignal::Hup)
+    let rows = handle
+        .signal(ProcessSelector::Id(0), OperatorSignal::Hup)
         .await
         .unwrap();
 
@@ -1839,36 +2127,100 @@ async fn a_selector_that_matches_nothing_is_not_found() {
     let err = h
         .ctx
         .supervisor
-        .signal(ProcessSelector::Name("ghost".to_string()), OperatorSignal::Hup)
+        .signal(
+            ProcessSelector::Name("ghost".to_string()),
+            OperatorSignal::Hup,
+        )
         .await
         .unwrap_err();
     assert_eq!(err, SupervisorError::NotFound);
 }
 
-/// fails if a reload drainee is skipped. `trigger` skips one because an action
-/// expects a reply from a process on its way out; a signal expects nothing
-/// back, and the drainee is a live process the operator's selector matched.
-/// Holding it back would be a silent refusal with no channel in which to
-/// explain itself.
+/// fails if a reload drainee is skipped. `begin_action` skips one, because an
+/// action expects a reply from a process on its way out; a signal expects
+/// nothing back, and the drainee is a live process the operator's selector
+/// matched. Holding it back would be a silent refusal with no channel in which
+/// to explain itself.
+///
+/// Actor-tier, and it has to be: a `ReloadState::Drainee` marker lives on
+/// `ProcessEntry::reload`, which is crate-internal and deliberately never on
+/// the wire, so there is no way to put one sheep in that state through the
+/// handle without driving a whole swap and losing the ability to say which
+/// half the signal reached.
 #[tokio::test(start_paused = true)]
 async fn a_reload_drainee_is_signalled_like_any_other_live_sheep() {
-    let (h, runner, drainee) = actor_with_stopping_drainee().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut actor, mut signal_rx) = actor_with_a_drainee_holding_a_signal_mailbox(&dir);
 
-    let rows = h
-        .ctx
-        .supervisor
-        .signal(ProcessSelector::Id(drainee), OperatorSignal::Hup)
+    let (reply, answer) = oneshot::channel();
+    actor.handle_command(Command::Signal {
+        selector: ProcessSelector::Id(0),
+        sig: OperatorSignal::Hup,
+        reply,
+    });
+
+    // The request really left the actor for the sheep task's mailbox — the
+    // half that proves the drainee was not filtered out before the fan-out.
+    let request = tokio::time::timeout(ACTION_WINDOW, signal_rx.recv())
         .await
-        .unwrap();
+        .expect("no signal reached the drainee's mailbox within the window")
+        .expect("the drainee's signal mailbox closed");
+    assert_eq!(request.sig, OperatorSignal::Hup);
+    // Answer it as a live sheep task would, so the fan-out can settle.
+    let _ = request.done.send(Ok(()));
 
+    let rows = tokio::time::timeout(ACTION_WINDOW, answer)
+        .await
+        .expect("the signal reported nothing within the window")
+        .expect("the signal's reply channel was dropped")
+        .unwrap();
     assert_eq!(rows[0].outcome, SignalOutcome::Delivered);
-    assert!(runner.process_signals(0).contains(&OperatorSignal::Hup));
 }
 ```
 
-`harness_with_runner` / `SharedRunner` / `actor_with_stopping_drainee` all
-exist in that module (`actor_with_stopping_drainee` at line 6323); adapt names
-and return shapes to what is actually there rather than to these sketches.
+**Step 4.3a — the one new fixture this needs.** `actor_with_stopping_drainee`
+(`:6323`) is close but wrong for this case twice over: it sets
+`entry.status = ProcStatus::Stopping` and leaves `entry.reload` at its default
+(so it is not a drainee at all, only a stopping sheep), and its slot carries no
+signal mailbox. Add a sibling beside it:
+
+```rust
+    /// One sheep marked as a reload's drainee — `Stopping` on `status` AND
+    /// `ReloadState::Drainee` on `reload`, which is the pair a real swap
+    /// writes — holding a live signal mailbox whose receiver the caller keeps.
+    ///
+    /// Both halves are load-bearing. `actor_with_stopping_drainee` sets only
+    /// the status, which is what the guards it serves read; a signal has to be
+    /// tested against the MARKER, because that is the field `begin_action`
+    /// filters on and the field `begin_signal` must not.
+    fn actor_with_a_drainee_holding_a_signal_mailbox(
+        dir: &tempfile::TempDir,
+    ) -> (Actor<ScriptedRunner>, mpsc::Receiver<SignalRequest>) {
+        // No scripts: nothing here spawns, so an empty list turns a spawn that
+        // should not have happened into a loud `SpawnFailed`.
+        let (mut actor, _mailbox) = actor_with_one_online_sheep(dir, vec![]);
+        let slot = actor.sheep.get_mut(&0).expect("the fixture registers id 0");
+        slot.entry.status = ProcStatus::Stopping;
+        slot.entry.reload = ReloadState::Drainee { new_id: 1 };
+        // Wide enough that no case can fill it, so a `try_send` that comes
+        // back `Full` means a bug rather than a fixture too small.
+        let (signals, signal_rx) = mpsc::channel(16);
+        slot.signals = Some(signals);
+        (actor, signal_rx)
+    }
+```
+
+`actor_with_one_online_sheep` (`:6470`) is the base, exactly as
+`actor_with_an_open_channel` (`:8726`) builds on it to attach a `to_child`
+sender. Follow that function line for line — it is the precedent for
+"take the bare actor, attach one channel, hand back its far end".
+
+Two things read off the tree rather than assumed:
+
+- **the sheep's id is `0`** in every fixture in this module (`next_id` starts
+  at 0), which is why the cases above assert the literal rather than binding it.
+- **`ACTION_WINDOW`** (`:8714`) is the bound this module already uses for
+  "a request that armed a wait nothing will resolve never answers at all".
 
 Run `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`.
 
@@ -1919,7 +2271,20 @@ struct SheepHandles {
 successful spawn and **cleared exactly where `to_child` is cleared** — for the
 same reason `to_child`'s own doc gives: the receiving task parks on `recv()`
 and a sender left on a dead slot parks it for as long as the sheep stays
-registered.
+registered. The two clearing sites are `supervisor.rs:1893` and `:3304`, where
+`slot.to_child = None` already appears; the compiler will not find them for you
+because the field is an `Option` with a `None` default at every literal.
+
+The field breaks four hand-written `SheepSlot` literals in this file's own test
+module — `actor_with_stopping_drainee` (`:6323`), `actor_with_one_online_sheep`
+(`:6470`), `actor_with_a_sheep_and_a_dog` (`:6522`) and `register_sheep`
+(`:9220`) — and the compiler *will* name those, since they are struct literals
+on a crate-private type. Set `signals: None` at each; the one fixture that needs
+a live mailbox builds it in Step 4.3a by assignment afterwards.
+
+**`spawn_sheep_task`'s new `SheepHandles` return type is inherited by Task 10,
+not reinvented there.** Task 10 adds a third field (`to_stdin`) to this struct.
+Land Task 4 first — see "Task order and dependencies".
 
 `run_sheep` grows a fourth `select!` branch, guarded the same way the others
 are:
@@ -2426,11 +2791,19 @@ with a comment on the request row noting that this is the one verb in the enum
 whose body has no `selector` key, so a reader comparing it against `stop`'s row
 sees the whole difference in one place.
 
+**Renumber every id you add.** Both vectors' ids are sequential and neither
+last one is `11` by guarantee — at `d8bd4af` `request_wire_snapshots` runs to
+16 and `reply_wire_snapshots` to 19. Read the last id in the vector you are
+appending to and use the next. Tasks 3, 5, 8 and 15 each append to one or both
+of these, in whatever order those four chains land, and two rows sharing an id
+still pass the snapshot — so nothing catches a collision but this instruction.
+
 Review the insta diff (appended rows only, **zero deletions**), accept with
 `INSTA_UPDATE=always`, then:
 
 ```bash
-git diff --stat crates/shep-core/src/protocol/snapshots/
+# `added<TAB>deleted<TAB>path`; column TWO must be 0 on every row.
+git diff --numstat crates/shep-core/src/protocol/snapshots/
 find crates -name '*.snap.new' | wc -l      # 0 at HEAD, must be 0 after
 ```
 
@@ -2484,7 +2857,154 @@ SupervisorError::InvalidScale(String)   // -> RpcErrorCode::InvalidConfig
 
 ### Step 6.1 — RED
 
-Add to `crates/shep-daemon/src/supervisor.rs`'s test module:
+**Tiers, decided per case.** Six of these are observable through the handle —
+counts, ids, and the instance slot, which is readable off `ProcessInfo::out_file`
+(`logs/<name>-<instance>-out.log`, `assemble.rs:145-152`, pinned by
+`listed_log_paths_are_the_derived_defaults` at `supervisor.rs:5241`). Two are
+not: the STORED instance count lives on `SheepSlot::entry.spec`, which is
+crate-internal and reaches no reply, and a dog/drainee refusal needs a slot in
+a state no `start` produces. Those go at the actor tier.
+
+**Step 6.1a — the four helpers, first.** None of them exist. Add them to the
+test module beside the existing `start_app` (`:6627`):
+
+```rust
+    /// The instance slot of every registered instance of `name`, ascending.
+    ///
+    /// Read off `out_file` rather than off the entry, because it is the number
+    /// an OPERATOR sees: `logs/web-2-out.log` is the file they tail and
+    /// `SHEP_INSTANCE=2` is what the process reads. Asserting on the internal
+    /// field would pass on a build that allocated the slot correctly and then
+    /// derived the log path from something else.
+    ///
+    /// # Panics
+    ///
+    /// If a matched row carries no `out_file`, or one this fixture cannot
+    /// parse — both mean the fixture stopped describing what it thinks it
+    /// does.
+    async fn instance_slots_of(h: &Harness, name: &str) -> Vec<u32> {
+        let mut slots: Vec<u32> = h
+            .ctx
+            .supervisor
+            .list()
+            .await
+            .iter()
+            .filter(|info| info.name == name)
+            .map(|info| {
+                let out = info.out_file.as_deref().expect("a listed sheep has a log path");
+                let stem = out
+                    .rsplit('/')
+                    .next()
+                    .and_then(|file| file.strip_suffix("-out.log"))
+                    .and_then(|stem| stem.strip_prefix(&format!("{name}-")))
+                    .expect("a derived log path is `<name>-<instance>-out.log`");
+                stem.parse().expect("the instance slot is a number")
+            })
+            .collect();
+        slots.sort_unstable();
+        slots
+    }
+
+    /// Waits until `name` has exactly `count` registered instances, or fails.
+    ///
+    /// A scale-down's reply is the SURVIVORS and deliberately does not wait
+    /// for the departures (`handle_scale`'s own doc says why), so a case that
+    /// asserts on the flock afterwards has to wait for the kill ladders it
+    /// started. Bounded (IR-46) because the only other failure mode is a poll
+    /// loop that never ends.
+    async fn settle_to(h: &Harness, name: &str, count: usize) {
+        let settled = tokio::time::timeout(SWAP_WINDOW, async {
+            loop {
+                let live = h
+                    .ctx
+                    .supervisor
+                    .list()
+                    .await
+                    .iter()
+                    .filter(|info| info.name == name)
+                    .count();
+                if live == count {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(settled.is_ok(), "{name} never settled to {count} instances");
+    }
+
+    /// A bare actor holding `instances` online instances of one app, all
+    /// carrying the same normalized spec — the fixture the two stored-count
+    /// cases need, because that field reaches no reply.
+    ///
+    /// Built on the same hand-written `SheepSlot` literal every other actor
+    /// fixture in this module uses, so a field added to that struct breaks
+    /// this in the same visible way it breaks the others.
+    fn actor_with_a_scaled_app(
+        dir: &tempfile::TempDir,
+        instances: u32,
+        scripts: Vec<ProcScript>,
+    ) -> Actor<ScriptedRunner> {
+        let paths = test_paths(dir);
+        let app = normalize(AppConfig {
+            instances,
+            ..AppConfig::minimal("web", "./srv")
+        })
+        .unwrap();
+        let mut sheep = HashMap::new();
+        for instance in 0..instances {
+            sheep.insert(
+                instance,
+                SheepSlot {
+                    entry: armed_entry(instance, instance, 1111 + instance, app.clone(), &paths),
+                    ctl: None,
+                    log_ctl: None,
+                    to_child: None,
+                    signals: None,
+                    manual: None,
+                    pending_delete: false,
+                    epoch: 0,
+                    ready_tx: None,
+                    actions: ActionWaits::default(),
+                },
+            );
+        }
+        let (events, _events_rx) = broadcast::channel(64);
+        let (tx, _rx) = mpsc::channel(MAILBOX_CAPACITY);
+        Actor {
+            runner: ScriptedRunner::new(scripts),
+            paths,
+            events,
+            tx,
+            sheep,
+            next_id: instances,
+            next_action_stamp: 0,
+            pending: Vec::new(),
+            shutting_down: false,
+            extras: None,
+            registry: ExtrasRegistry::default(),
+            reloads: HashMap::new(),
+        }
+    }
+
+    /// Every registered slot's STORED instance count, ascending by id.
+    fn stored_instance_counts(actor: &Actor<ScriptedRunner>) -> Vec<u32> {
+        let mut ids: Vec<u32> = actor.sheep.keys().copied().collect();
+        ids.sort_unstable();
+        ids.iter()
+            .map(|id| actor.sheep[id].entry.spec.config().instances)
+            .collect()
+    }
+```
+
+`SWAP_WINDOW` is `supervisor.rs:6424` (30 virtual seconds) and is already this
+module's bound for "drive virtual time until the flock reaches a state".
+`MAILBOX_CAPACITY`, `armed_entry`, `ActionWaits` and `ExtrasRegistry` are all
+already in scope in that module — `actor_with_one_online_sheep` (`:6470`) is
+the literal to copy, field for field, including the `signals: None` Task 4 adds
+to it.
+
+**Step 6.1b — the cases.**
 
 ```rust
 /// fails if scaling up does not take the lowest free slots. Slot numbers are
@@ -2493,10 +3013,15 @@ Add to `crates/shep-daemon/src/supervisor.rs`'s test module:
 /// implementation detail.
 #[tokio::test(start_paused = true)]
 async fn scaling_up_fills_the_lowest_free_slots() {
-    let h = harness(vec![ProcScript::runs_forever(); 4]);
-    let mut app = AppConfig::minimal("web", "./srv");
-    app.instances = 2;
-    register_app(&h, app).await;
+    let h = harness(vec![ProcScript::never_exits(); 4]);
+    start_app(
+        &h,
+        AppConfig {
+            instances: 2,
+            ..AppConfig::minimal("web", "./srv")
+        },
+    )
+    .await;
 
     let scaled = h.ctx.supervisor.scale("web", 4).await.unwrap();
 
@@ -2510,41 +3035,24 @@ async fn scaling_up_fills_the_lowest_free_slots() {
 /// files, and a different SHEP_INSTANCE for every survivor.
 #[tokio::test(start_paused = true)]
 async fn scaling_down_removes_the_highest_slots_so_a_round_trip_returns() {
-    let h = harness(vec![ProcScript::runs_forever(); 4]);
-    let mut app = AppConfig::minimal("web", "./srv");
-    app.instances = 2;
-    register_app(&h, app).await;
+    let h = harness(vec![ProcScript::never_exits(); 4]);
+    start_app(
+        &h,
+        AppConfig {
+            instances: 2,
+            ..AppConfig::minimal("web", "./srv")
+        },
+    )
+    .await;
 
     h.ctx.supervisor.scale("web", 4).await.unwrap();
     let scaled = h.ctx.supervisor.scale("web", 2).await.unwrap();
 
     assert_eq!(scaled.instances.len(), 2);
-    // Settle the two kill ladders the scale-down started.
-    settle(&h).await;
+    // The reply is the survivors; the two removals run kill ladders this case
+    // has to let finish before it can read the flock.
+    settle_to(&h, "web", 2).await;
     assert_eq!(instance_slots_of(&h, "web").await, vec![0, 1]);
-}
-
-/// fails if a scale forgets to write the new count back onto the app. Without
-/// this, `shep scale web 4 && shep save` records `instances = 2` and the next
-/// reboot silently reverts the scale — the bug is invisible until the machine
-/// comes back.
-#[tokio::test(start_paused = true)]
-async fn a_scale_updates_the_stored_instance_count() {
-    let h = harness(vec![ProcScript::runs_forever(); 4]);
-    let mut app = AppConfig::minimal("web", "./srv");
-    app.instances = 2;
-    register_app(&h, app).await;
-
-    let scaled = h.ctx.supervisor.scale("web", 4).await.unwrap();
-
-    assert_eq!(scaled.app.config().instances, 4);
-    // And on every surviving slot, not only on the returned copy: `respawn`
-    // reassembles from the slot's own stored spec, so a slot left at 2 would
-    // keep saying 2 to everything that reads it.
-    assert!(
-        stored_instance_counts(&h, "web").await.iter().all(|n| *n == 4),
-        "a slot kept the pre-scale count"
-    );
 }
 
 /// fails if scaling to the count an app already has does anything at all.
@@ -2552,10 +3060,15 @@ async fn a_scale_updates_the_stored_instance_count() {
 /// an operator re-running a provisioning script must not restart the flock.
 #[tokio::test(start_paused = true)]
 async fn scaling_to_the_current_count_is_a_no_op() {
-    let h = harness(vec![ProcScript::runs_forever(); 2]);
-    let mut app = AppConfig::minimal("web", "./srv");
-    app.instances = 2;
-    register_app(&h, app).await;
+    let h = harness(vec![ProcScript::never_exits(); 2]);
+    start_app(
+        &h,
+        AppConfig {
+            instances: 2,
+            ..AppConfig::minimal("web", "./srv")
+        },
+    )
+    .await;
     let before = h.ctx.supervisor.list().await;
 
     let scaled = h.ctx.supervisor.scale("web", 2).await.unwrap();
@@ -2567,6 +3080,9 @@ async fn scaling_to_the_current_count_is_a_no_op() {
         before.iter().map(|i| i.id).collect::<Vec<_>>(),
         "a no-op scale replaced processes"
     );
+    // Two scripts for two spawns: a scale that respawned would need a third
+    // and would fail loudly rather than quietly, but the id check is what
+    // says WHICH failure this is.
 }
 
 /// fails if `scale <name> 0` is accepted. `normalize` refuses `instances == 0`
@@ -2574,8 +3090,8 @@ async fn scaling_to_the_current_count_is_a_no_op() {
 /// through the engine that the engine's own validator rejects.
 #[tokio::test(start_paused = true)]
 async fn scaling_to_zero_is_refused_and_names_delete() {
-    let h = harness(vec![ProcScript::runs_forever()]);
-    register_app(&h, AppConfig::minimal("web", "./srv")).await;
+    let h = harness(vec![ProcScript::never_exits()]);
+    start_app(&h, AppConfig::minimal("web", "./srv")).await;
 
     let err = h.ctx.supervisor.scale("web", 0).await.unwrap_err();
 
@@ -2583,33 +3099,6 @@ async fn scaling_to_zero_is_refused_and_names_delete() {
         panic!("expected InvalidScale, got {err:?}");
     };
     assert!(message.contains("delete"), "{message}");
-}
-
-/// fails if a dog can be scaled. A dog is one process by contract (spec §8) —
-/// two metrics dogs would race for the same listen port, and two bark dogs
-/// would double every alert.
-#[tokio::test(start_paused = true)]
-async fn a_dog_cannot_be_scaled() {
-    let (h, _sheep, dog_name) = actor_with_a_sheep_and_a_dog().await;
-
-    let err = h.ctx.supervisor.scale(&dog_name, 2).await.unwrap_err();
-
-    let SupervisorError::InvalidScale(message) = err else {
-        panic!("expected InvalidScale, got {err:?}");
-    };
-    assert!(message.contains("dog"), "{message}");
-}
-
-/// fails if an app mid-reload can be scaled. A reload holds two live processes
-/// in one instance slot; a scale-down picking that slot removes one of them and
-/// leaves the swap with nothing to finish.
-#[tokio::test(start_paused = true)]
-async fn an_app_mid_reload_refuses_a_scale() {
-    let (h, _runner, _drainee) = actor_with_stopping_drainee().await;
-
-    let err = h.ctx.supervisor.scale("web", 4).await.unwrap_err();
-
-    assert_eq!(err, SupervisorError::ReloadInFlight("web".to_string()));
 }
 
 /// fails if an unregistered name is anything but NotFound. `shep scale typo 4`
@@ -2622,17 +3111,134 @@ async fn scaling_an_unregistered_app_is_not_found() {
         SupervisorError::NotFound
     );
 }
+
+/// fails if a dog can be scaled. A dog is one process by contract (spec §8) —
+/// two metrics dogs would race for the same listen port, and two bark dogs
+/// would double every alert.
+///
+/// Actor-tier, on the existing sheep-and-dog fixture: `DogSource` is written
+/// by `start_dog` and the two entries in that fixture differ in the marker and
+/// in nothing else, which is what makes a refusal here attributable to the
+/// marker rather than to a status or a fold.
+#[tokio::test(start_paused = true)]
+async fn a_dog_cannot_be_scaled() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut actor, _mailbox) = actor_with_a_sheep_and_a_dog(&dir);
+
+    let (reply, answer) = oneshot::channel();
+    actor.handle_command(Command::Scale {
+        name: "bark".to_string(),
+        count: 2,
+        reply,
+    });
+
+    let SupervisorError::InvalidScale(message) = answer.await.unwrap().unwrap_err() else {
+        panic!("expected InvalidScale");
+    };
+    assert!(message.contains("dog"), "{message}");
+}
+
+/// fails if an app mid-reload can be scaled. A reload holds two live processes
+/// in one instance slot; a scale-down picking that slot removes one of them and
+/// leaves the swap with nothing to finish.
+///
+/// Actor-tier, and the guard it pins reads `Actor::reloads` — a map with no
+/// reply-side spelling at all, so this is the only tier that can put an entry
+/// in it without driving a whole swap.
+#[tokio::test(start_paused = true)]
+async fn an_app_mid_reload_refuses_a_scale() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor = actor_with_a_scaled_app(&dir, 2, vec![]);
+    // The one line that makes this app mid-reload. Build the `ReloadJob` the
+    // way `handle_reload` does — read it (`:2217`) rather than inventing a
+    // literal, and if its fields are awkward to fill by hand, drive
+    // `actor.handle_reload(..)` instead and assert on the same refusal.
+    actor.reloads.insert("web".to_string(), reload_job_for("web"));
+
+    let (reply, answer) = oneshot::channel();
+    actor.handle_command(Command::Scale {
+        name: "web".to_string(),
+        count: 4,
+        reply,
+    });
+
+    assert_eq!(
+        answer.await.unwrap().unwrap_err(),
+        SupervisorError::ReloadInFlight("web".to_string())
+    );
+}
+
+/// fails if a scale forgets to write the new count back onto the app. Without
+/// this, `shep scale web 4 && shep save` records `instances = 2` and the next
+/// reboot silently reverts the scale — the bug is invisible until the machine
+/// comes back.
+///
+/// Actor-tier: the stored count is `SheepSlot::entry.spec`, which reaches no
+/// reply and no bus event. `Scaled::app` is the other half and is checked here
+/// too, because a build that returned the right config and stored the wrong
+/// one would pass either assertion alone.
+#[tokio::test(start_paused = true)]
+async fn a_scale_updates_the_stored_instance_count_on_every_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor =
+        actor_with_a_scaled_app(&dir, 2, vec![ProcScript::never_exits(); 2]);
+
+    let (reply, answer) = oneshot::channel();
+    actor.handle_command(Command::Scale {
+        name: "web".to_string(),
+        count: 4,
+        reply,
+    });
+
+    let scaled = answer.await.unwrap().unwrap();
+    assert_eq!(scaled.app.config().instances, 4);
+    assert_eq!(stored_instance_counts(&actor), vec![4, 4, 4, 4]);
+}
+
+/// fails if a PARTIAL scale-up stores the count it asked for rather than the
+/// one it got. The instances that did spawn stay — unwinding them would turn
+/// one failed spawn into an outage of everything the call had already brought
+/// up — but every surviving slot must then claim the number really running, or
+/// `shep describe` reads 4 while `shep save` writes 4 for a flock of 3 and the
+/// discrepancy surfaces at the next reboot.
+///
+/// One script for two requested spawns: `ScriptedRunner` answers the first and
+/// fails the second with `script exhausted`, which is this module's standing
+/// way to make exactly one spawn fail.
+#[tokio::test(start_paused = true)]
+async fn a_partial_scale_up_stores_the_count_it_achieved() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor = actor_with_a_scaled_app(&dir, 1, vec![ProcScript::never_exits()]);
+
+    let (reply, answer) = oneshot::channel();
+    actor.handle_command(Command::Scale {
+        name: "web".to_string(),
+        count: 3,
+        reply,
+    });
+
+    assert!(matches!(
+        answer.await.unwrap(),
+        Err(SupervisorError::SpawnFailed(_))
+    ));
+    assert_eq!(
+        stored_instance_counts(&actor),
+        vec![2, 2],
+        "the flock is two, so every slot must say two"
+    );
+}
 ```
 
-`register_app`, `instance_slots_of`, `stored_instance_counts` and `settle` are
-small helpers to add in this module beside the existing `register_sheep` /
-`actor_with_a_sheep_and_a_dog` (line 6522) / `actor_with_stopping_drainee`
-(line 6323). Read those first and follow their shapes.
+`reload_job_for` is a stand-in: read `handle_reload` (`:2217`) and either build
+the map entry the way it does, or drive `handle_reload` itself and assert the
+same refusal. Do not invent a `ReloadJob` literal whose fields the real code
+does not produce.
 
 Run `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`.
 
-**Expected failure — for the stated reason:** compile error, ``no method named
-`scale` found for struct `SupervisorHandle` ``.
+**Expected failure — for the stated reason:** compile error, ``no variant named
+`Scale` found for enum `Command` `` (and ``no method named `scale` found for
+struct `SupervisorHandle` `` for the handle-tier cases).
 
 ### Step 6.2 — GREEN: the error variant
 
@@ -2656,6 +3262,22 @@ Run `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`.
 ```
 
 with a `Display` arm: `Self::InvalidScale(msg) => write!(f, "cannot scale: {msg}")`.
+
+**Rewrite `SupervisorError`'s `#[non_exhaustive]` rationale in the same edit.**
+It currently reads (`supervisor.rs:343-350`):
+
+> six variants today cover lookup, spawn, reload overlap, and the two
+> log-maintenance failure classes, and a future supervisor command — **a scale
+> or pause verb** — would add its own failure variant rather than overloading
+> one meant for a different command
+
+That sentence is a forecast this task fulfils, so leaving it makes the doc
+claim seven variants are six and predict a verb that has landed. IR-20's
+rationale is mandatory *and* has to be true; CLAUDE.md names rationale drift as
+a top risk and Phase 10 spent a commit fixing exactly this class. Rewrite it to
+the new count and fold the arrival in — the scale verb it forecast landed under
+the attribute with no sweep, which is the attribute paying for itself — and
+name whatever the next candidate is, or say there is none.
 
 ### Step 6.3 — GREEN: the handler
 
@@ -2765,16 +3387,6 @@ pub(crate) struct Scaled {
             }
         };
 
-        // Every surviving slot, not just the ones this call touches: `respawn`
-        // reassembles from the slot's own stored spec, so a slot left holding
-        // the pre-scale config would keep reporting the old count to
-        // everything that reads it, `shep describe` included.
-        for (_, id) in &slots {
-            if let Some(slot) = self.sheep.get_mut(id) {
-                slot.entry.spec = rescaled.clone();
-            }
-        }
-
         let current = u32::try_from(slots.len()).unwrap_or(u32::MAX);
         let credentials = self
             .sheep
@@ -2783,6 +3395,16 @@ pub(crate) struct Scaled {
             .entry
             .credentials;
 
+        // The spawn/remove pass runs FIRST and the config write-back second,
+        // which is the opposite of the obvious order and is the whole of this
+        // function's care about a partial scale. Writing `rescaled` onto every
+        // slot up front and then failing a spawn leaves every survivor
+        // claiming `instances = 4` in a flock of three: `shep describe` and the
+        // next `respawn` read the new number, `shep save` writes it, the muster
+        // roll never hears about the failure (rpc.rs records only on `Ok`), and
+        // nothing in the tree notices until a reboot brings up a count that was
+        // never running.
+        let mut failure = None;
         let survivors: Vec<u32> = match count.cmp(&current) {
             Ordering::Equal => slots.iter().map(|(_, id)| *id).collect(),
             Ordering::Greater => {
@@ -2796,9 +3418,11 @@ pub(crate) struct Scaled {
                             // spawned stay: they are real processes serving
                             // real traffic, and unwinding them would turn one
                             // failed spawn into an outage of everything this
-                            // call had already brought up.
-                            let _ = reply.send(Err(SupervisorError::SpawnFailed(message)));
-                            return;
+                            // call had already brought up. What they do NOT
+                            // keep is the requested count — see the write-back
+                            // below.
+                            failure = Some(message);
+                            break;
                         }
                     }
                 }
@@ -2821,6 +3445,41 @@ pub(crate) struct Scaled {
             }
         };
 
+        // The count actually achieved — `count` on every path but a partial
+        // scale-up. Re-normalized rather than assigned for the same reason
+        // `rescaled` was: a `ResolvedApp` is a proof token, and the one place
+        // in the tree holding one that had not passed `normalize` would be
+        // here.
+        let achieved = u32::try_from(survivors.len()).unwrap_or(u32::MAX);
+        let stored = if achieved == count {
+            rescaled
+        } else {
+            let mut config = rescaled.config().clone();
+            config.instances = achieved;
+            match normalize(config) {
+                Ok(app) => app,
+                Err(err) => {
+                    let _ = reply.send(Err(SupervisorError::InvalidScale(err.to_string())));
+                    return;
+                }
+            }
+        };
+
+        // Every surviving slot, the ones this call just spawned included:
+        // `respawn` reassembles from the slot's own stored spec, so a slot left
+        // holding a stale config would keep reporting the wrong count to
+        // everything that reads it, `shep describe` included.
+        for id in &survivors {
+            if let Some(slot) = self.sheep.get_mut(id) {
+                slot.entry.spec = stored.clone();
+            }
+        }
+
+        if let Some(message) = failure {
+            let _ = reply.send(Err(SupervisorError::SpawnFailed(message)));
+            return;
+        }
+
         let mut instances: Vec<ProcessInfo> = survivors
             .iter()
             .filter_map(|id| self.sheep.get(id).map(|slot| to_info(&slot.entry)))
@@ -2828,10 +3487,19 @@ pub(crate) struct Scaled {
         instances.sort_unstable_by_key(|info| info.id);
         let _ = reply.send(Ok(Scaled {
             instances,
-            app: rescaled,
+            app: stored,
         }));
     }
 ```
+
+**What an operator sees after a partial scale-up, stated so it is a decision
+and not a discovery.** `shep scale web 4` against a flock of two, where the
+fourth instance will not spawn, leaves three instances running, all three
+storing `instances = 3`, and answers `SpawnFailed` with the runner's message.
+The muster roll is untouched (`rpc.rs` records only on `Ok`), so it still holds
+whatever the last successful command wrote — which is now consistent with the
+slots in the only way available, since the call did not succeed.
+`a_partial_scale_up_stores_the_count_it_achieved` (Step 6.1b) pins it.
 
 **`begin_manual_ids` does not exist yet.** Extract it from `begin_manual`
 (`supervisor.rs:2018`): `begin_manual` becomes `matching_ids` + `NotFound` +
@@ -2859,7 +3527,7 @@ those to be fixed in only one.
 ```
 
 Run `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`.
-Expect green, **+8**, and every pre-existing `stop`/`restart`/`delete` case
+Expect green, **+9**, and every pre-existing `stop`/`restart`/`delete` case
 green too — `begin_manual`'s extraction is the risky part of this task, and
 those are what prove it was a move rather than a rewrite.
 
@@ -2893,7 +3561,7 @@ Add a dispatch-tier test that a scale survives a save:
 /// so a scale missing from it is a scale that silently reverts.
 #[tokio::test]
 async fn a_scale_is_recorded_in_the_roll_the_next_muster_reads() {
-    let h = harness(vec![ProcScript::runs_forever(); 4]);
+    let h = harness(vec![ProcScript::never_exits(); 4]);
     let mut app = AppConfig::minimal("web", "./srv");
     app.instances = 2;
     reply_of(dispatch(envelope(1, Request::Start { apps: vec![app] }), &h.ctx).await);
@@ -2948,12 +3616,24 @@ still right, which is exactly why a test asserting only `len()` could not catch
 this and why the slot assertion is the one that matters.
 
 Second mutation: delete the
-`for (_, id) in &slots { … slot.entry.spec = rescaled.clone(); }` loop.
+`for id in &survivors { … slot.entry.spec = stored.clone(); }` loop.
 
-**Must go red:** `a_scale_updates_the_stored_instance_count` fails on its
-`stored_instance_counts` assertion while `scaled.app.config().instances` is
-still 4 — proving the returned copy and the stored slots are two different
-facts and the test checks both.
+**Must go red:** `a_scale_updates_the_stored_instance_count_on_every_slot`
+fails on its `stored_instance_counts` assertion while
+`scaled.app.config().instances` is still 4 — proving the returned copy and the
+stored slots are two different facts and the test checks both.
+`a_partial_scale_up_stores_the_count_it_achieved` reddens too, on the same
+assertion.
+
+Revert. Third mutation, for the partial-scale write-back specifically: move the
+write-back loop back ABOVE the `match count.cmp(&current)` and change `stored`
+to `rescaled` in it, which is the shape the first draft of this plan specified.
+
+**Must go red:** `a_partial_scale_up_stores_the_count_it_achieved` fails with
+`vec![3, 3]` against `vec![2, 2]` — two slots claiming a flock of three.
+`a_scale_updates_the_stored_instance_count_on_every_slot` stays **green**,
+because on a scale that fully succeeds the two orders are identical. That is
+the point of having both: the successful case cannot see this at all.
 
 Revert.
 
@@ -3291,10 +3971,18 @@ nothing else** — then accept:
 
 ```bash
 INSTA_UPDATE=always cargo test -p shep-core --lib --all-features
-git diff crates/shep-core/src/protocol/snapshots/shep_core__protocol__request__tests__request_wire_v1.snap
+git diff --numstat crates/shep-core/src/protocol/snapshots/shep_core__protocol__request__tests__request_wire_v1.snap
 ```
 
-The `git diff` must show one `+` line and zero `-` lines. Then green, **+2**.
+`--numstat` prints `added<TAB>deleted<TAB>path`. It must read `1<TAB>0<TAB>…`:
+one line added, **zero deleted**. Do **not** check this with
+`git diff | grep -c '^-'` — a unified diff opens with a `--- a/<path>` header
+that `^-` matches, so that count is never `0` and the check can never fail.
+(Same trap in the other direction: `+++ b/<path>` is a line starting with `+`,
+so "one `+` line" is false too. This plan shipped both spellings in its first
+draft; see "Two more shapes a dead check takes".)
+
+Then green, **+2**.
 
 ### Step 8.3 — RED: the wire
 
@@ -3452,11 +4140,13 @@ pub struct LineReply {
 ```
 
 Export both from `protocol/mod.rs`. Add a `Request::SendLine` envelope and a
-`Response::SentLine` reply to the two wire snapshots, review the appended-rows
-diff, accept, then:
+`Response::SentLine` reply to the two wire snapshots — **renumbering both ids
+per Step 3.5's note; Tasks 3, 5, 8 and 15 all append here and may land in any
+order** — review the appended-rows diff, accept, then:
 
 ```bash
-git diff --stat crates/shep-core/src/protocol/snapshots/
+# `added<TAB>deleted<TAB>path`; column TWO must be 0 on every row.
+git diff --numstat crates/shep-core/src/protocol/snapshots/
 find crates -name '*.snap.new' | wc -l      # 0 at HEAD, must be 0 after
 ```
 
@@ -3495,7 +4185,10 @@ Then the full task gate.
 - `crates/shep-daemon/src/assemble.rs` — carry the flag onto the spec.
 - `crates/shep-daemon/src/tokio_runner.rs` — the pipe and its pump.
 - `crates/shep-daemon/src/fake.rs` — the scripted half.
-- `crates/shep-daemon/tests/real_runner.rs` — one real-child case.
+- `crates/shep-daemon/src/supervisor.rs` — **`run_sheep`'s `ProcIo`
+  destructure only** (`:4638`). Named because the compiler forces the edit but
+  not the right one; see Step 9.2.
+- `crates/shep-daemon/tests/real_runner.rs` — two real-child cases.
 
 **Consumes from Task 8:** `AppConfig::stdin`.
 
@@ -3573,11 +4266,25 @@ And to `crates/shep-daemon/src/fake.rs`'s test module:
 /// `spec.channel` already had to be taught about.
 #[tokio::test(start_paused = true)]
 async fn a_spawn_without_stdin_hands_back_a_closed_writer() {
-    let runner = ScriptedRunner::new(vec![ProcScript::runs_forever()]);
-    let (_proc, io) = runner.spawn(&spec_for("web")).unwrap();
+    let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+    let (_proc, io) = runner.spawn(&SpawnSpec { stdin: false, ..spec() }).unwrap();
     assert!(io.to_stdin.is_closed());
 }
+
+/// fails if a spawn that DID ask for a pipe also hands back a closed writer —
+/// which would make the case above pass for the wrong reason, since a fake
+/// that closed every writer satisfies it.
+#[tokio::test(start_paused = true)]
+async fn a_spawn_with_stdin_hands_back_a_live_writer() {
+    let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+    let (_proc, io) = runner.spawn(&SpawnSpec { stdin: true, ..spec() }).unwrap();
+    assert!(!io.to_stdin.is_closed());
+}
 ```
+
+That module's spec fixture is **`spec()`**, no arguments (`fake.rs:669`), and
+it sets `channel: true`. The struct-update form above is what keeps these two
+cases differing in one field and nothing else.
 
 Run `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`.
 
@@ -3652,11 +4359,44 @@ assembled spec, beside the existing `channel: config.channel || config.wait_read
 -style doc block with a short "Stdin" note saying the flag is carried straight
 through and implied by nothing.
 
+**Rewrite `RunnerError`'s `#[non_exhaustive]` rationale in the same edit.** It
+currently reads "today's **two** variants cover spawn and signal delivery"
+(`runner.rs:702-708`). `WriteFailed` makes that three and adds a third failure
+class the sentence does not describe. IR-20 makes the comment mandatory; a
+mandatory comment that is false is worse than none, and Phase 10 spent a commit
+on exactly this class. Same instruction as Step 6.2's for `SupervisorError`.
+
 Run. **Expect a wall of "missing field `stdin`" and "missing field `to_stdin`"
 errors** at every `SpawnSpec`/`ProcIo` literal in the tree. That is the
 compiler doing the sweep; fix each site. `SpawnSpec` has no builder and this
 task deliberately does not add one — it is one bool, and `ProcessInfo`'s own
 builder exists because that struct had grown a field in three separate phases.
+
+**One of those sites is not mechanical, and the compiler will not tell you
+which.** `run_sheep` destructures `ProcIo` at `supervisor.rs:4638`:
+
+```rust
+let ProcIo { mut logs, mut from_child, to_child, log_ctl: _log_ctl } = io;
+```
+
+That statement carries its own warning three lines above it — a pattern that
+drops what it binds "stops every child in the flock" — and `log_ctl` is bound
+as `_log_ctl` rather than `_` for exactly that reason. Bind the new field the
+same way:
+
+```rust
+let ProcIo { mut logs, mut from_child, to_child, log_ctl: _log_ctl, to_stdin: _to_stdin } = io;
+//                                                                  ^ bound, not `_`:
+// `to_stdin: _` drops the sender inside the `let`, which closes the child's
+// stdin at spawn and gives an opted-in app immediate EOF. That survives today
+// only because Task 10 puts a clone on `SheepSlot` — i.e. the bug would be
+// invisible in the fast loop and would surface as "the app saw EOF" in an
+// e2e. Same `_log_ctl` precedent, one line up.
+```
+
+Task 10 then replaces `_to_stdin` with a real binding wired into the `select!`.
+Leave the underscore-prefixed name here so this task compiles clean under
+`-D warnings` on its own.
 
 ### Step 9.3 — GREEN: the real pipe
 
@@ -3735,16 +4475,81 @@ fn spawn_stdin_pump(stdin: Option<ChildStdin>, mut rx: mpsc::Receiver<StdinWrite
 
 with `use tokio::io::AsyncWriteExt as _;` and `use tokio::process::ChildStdin;`.
 
+Note the pump serialises writes and does **not** bound them. That is
+deliberate and it is Task 10's `STDIN_WRITE_TIMEOUT` that provides the bound —
+a write abandoned halfway would leave a partial line in the pipe, which to a
+REPL is a command nobody typed. Say so here so the two halves are not read as
+one missing bound.
+
 `crates/shep-daemon/src/fake.rs` — mirror `spec.channel`'s handling: when
 `spec.stdin` is set, spawn a task that answers every `StdinWrite` with `Ok(())`
-and records the line on a `Vec<String>` a test can read back
-(`ScriptedRunner::stdin_lines(spawn_index)`); when it is not, drop the receiver.
-Document, in the same voice as the `spec.channel` note already there, that the
-fake writes to no real pipe and that back-pressure and a real EOF are
-`tests/real_runner.rs`'s tier.
+and records the line; when it is not, drop the receiver. Document, in the same
+voice as the `spec.channel` note already there, that the fake writes to no real
+pipe and that back-pressure and a real EOF are `tests/real_runner.rs`'s tier.
+
+**The two fake-side additions, spelled out** — neither exists, and Task 10's
+Step 10.1 is written against both:
+
+```rust
+// on `SpawnedProc` (fake.rs:314), beside `reopens`/`flushes`:
+    /// Every line written to this spawn's stdin, in write order — read back
+    /// via [`ScriptedRunner::stdin_lines`].
+    stdin_lines: Arc<Mutex<Vec<String>>>,
+
+// on `impl ScriptedRunner` (:353), copying `reopens`' doc shape including its
+// `# Panics`:
+    /// Every line the daemon has written to the stdin of the proc spawned at
+    /// `spawn_index`, in write order.
+    ///
+    /// The fake writes to no real pipe, so this proves only that the line
+    /// reached this spawn's end of [`ProcIo::to_stdin`] with its content
+    /// intact. That a real `\n`-terminated line lands in a real child's fd 0
+    /// is `tests/real_runner.rs`'s question.
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[must_use]
+    pub fn stdin_lines(&self, spawn_index: usize) -> Vec<String> {
+        self.spawned.lock().unwrap()[spawn_index]
+            .stdin_lines
+            .lock()
+            .unwrap()
+            .clone()
+    }
+```
+
+**And one new `ProcScript` constructor**, which Task 10's timeout case needs
+and which belongs here beside the behaviour it models:
+
+```rust
+    /// Accepts every stdin write and answers none of them.
+    ///
+    /// Models the one thing a bounded stdin write exists for: an app that has
+    /// stopped reading fd 0, so the pipe fills at 64 KiB and the write blocks
+    /// until it reads, which it never does. The counterpart of
+    /// [`Self::never_reports_its_exit`] for the stdin path — the request is
+    /// delivered and recorded, what is withheld is the acknowledgement.
+    #[must_use]
+    pub fn never_reads_its_stdin() -> Self {
+        Self {
+            reads_stdin: false,
+            ..Self::never_exits()
+        }
+    }
+```
+
+with `reads_stdin: bool` on `ProcScript` (default `true` at every existing
+constructor — `ProcScript` is `Copy` and its five constructors are struct
+literals, so the compiler names all of them) and the fake's stdin task
+consulting it: record the line either way, send the `done` answer only when
+`reads_stdin`. **This, not a `SharedRunner::silent_stdin`** — `SharedRunner` is
+a tuple struct with no constructor and no methods (`testing.rs:241`), and
+per-spawn behaviour belongs on `ProcScript` where every other per-spawn
+behaviour in this fake already lives.
 
 Run `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`.
-Expect green, **+3**.
+Expect green, **+4**.
 
 ### Step 9.4 — GREEN: a real child reads a real line
 
@@ -3799,7 +4604,10 @@ async fn a_child_that_did_not_ask_for_stdin_gets_eof_at_once() {
 }
 ```
 
-Adapt `spec_for_program` to whatever that file's own spec helper is called.
+`spec_for_program` is a stand-in — read `tests/real_runner.rs`'s own spec
+helper and use it. Whatever it is called, set `stdin` explicitly in both cases
+rather than relying on a default, so neither case silently changes meaning the
+next time the field's default is revisited.
 
 Run `cargo test -p shep-daemon --test real_runner --all-features`. Expect
 green, **+2**.
@@ -3821,10 +4629,20 @@ to
 Run `cargo test -p shep-daemon --test real_runner --all-features`.
 
 **Must go red:** `a_real_child_reads_a_line_written_to_its_stdin` times out at
-its 10s bound with `no stdout line within 10s` — `cat` is line-buffered against
-a pipe and never sees a terminator. That the failure is a *bounded timeout*
-rather than a hang is the reason the bound is written; without it this mutation
-would wedge the suite.
+its 10s bound with `no stdout line within 10s`.
+
+**The reason, stated correctly**, because the obvious one is wrong and an
+implementer who chases it will chase the child: `cat` does no stdio buffering
+at all — it `read(2)`/`write(2)`s straight through, so it echoes `hello sheep `
+to its stdout immediately. What never completes is the **daemon's own log
+pump**, which frames stdout with `BufReader::lines()` (`tokio_runner.rs`'s
+`spawn_log_pump`). No `\n` means no completed line, so no `LogLine` is ever
+produced while the child is alive, and the bounded read expires. Get this
+wrong in the plan and the debugging goes to `cat`; the fix is in the pump's
+framing.
+
+That the failure is a *bounded timeout* rather than a hang is the reason the
+bound is written; without it this mutation would wedge the suite.
 
 Second mutation: change the `command.stdin(…)` conditional to
 `command.stdin(Stdio::piped());` unconditionally. Run
@@ -3861,6 +4679,11 @@ Then the full task gate.
 
 ### Step 10.1 — RED
 
+**Tier: handle + readable runner**, for the three cases that assert on what the
+sheep received; **harness** for the not-found case. `started(..)` gives the
+handle and the `Arc<ScriptedRunner>` together, which is what
+`runner.stdin_lines(0)` needs — see "The four supervisor test tiers".
+
 Add to `crates/shep-daemon/src/supervisor.rs`'s test module:
 
 ```rust
@@ -3868,23 +4691,21 @@ Add to `crates/shep-daemon/src/supervisor.rs`'s test module:
 /// was handed, so this asserts the line and not merely that something happened.
 #[tokio::test(start_paused = true)]
 async fn a_line_reaches_a_sheep_that_asked_for_stdin() {
-    let runner = SharedRunner::new(vec![ProcScript::runs_forever()]);
-    let h = harness_with_runner(runner.clone());
+    let dir = tempfile::tempdir().unwrap();
     let mut app = AppConfig::minimal("repl", "./repl");
     app.stdin = true;
-    let id = register_sheep(&h, app).await;
+    let (handle, runner, _events) =
+        started(&dir, app, vec![ProcScript::never_exits()]).await;
 
-    let rows = h
-        .ctx
-        .supervisor
-        .send_line(ProcessSelector::Id(id), "reload-config".to_string())
+    let rows = handle
+        .send_line(ProcessSelector::Id(0), "reload-config".to_string())
         .await
         .unwrap();
 
     assert_eq!(
         rows,
         vec![LineReply {
-            id,
+            id: 0,
             name: "repl".to_string(),
             outcome: LineOutcome::Sent,
         }]
@@ -3897,13 +4718,16 @@ async fn a_line_reaches_a_sheep_that_asked_for_stdin() {
 /// somewhere that has no pipe at all.
 #[tokio::test(start_paused = true)]
 async fn a_sheep_without_stdin_answers_no_stdin() {
-    let h = harness(vec![ProcScript::runs_forever()]);
-    let id = register_sheep(&h, AppConfig::minimal("web", "./srv")).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, _runner, _events) = started(
+        &dir,
+        AppConfig::minimal("web", "./srv"),
+        vec![ProcScript::never_exits()],
+    )
+    .await;
 
-    let rows = h
-        .ctx
-        .supervisor
-        .send_line(ProcessSelector::Id(id), "hello".to_string())
+    let rows = handle
+        .send_line(ProcessSelector::Id(0), "hello".to_string())
         .await
         .unwrap();
 
@@ -3916,23 +4740,31 @@ async fn a_sheep_without_stdin_answers_no_stdin() {
 /// same rule `Reopen`, `Flush`, `Trigger` and `Signal` all follow.
 #[tokio::test(start_paused = true)]
 async fn a_mixed_flock_reports_per_sheep_rather_than_failing() {
-    let runner = SharedRunner::new(vec![ProcScript::runs_forever(); 2]);
-    let h = harness_with_runner(runner.clone());
+    let dir = tempfile::tempdir().unwrap();
     let mut piped = AppConfig::minimal("repl", "./repl");
     piped.stdin = true;
-    let piped_id = register_sheep(&h, piped).await;
-    let plain_id = register_sheep(&h, AppConfig::minimal("web", "./srv")).await;
+    // `started` starts one app; the second goes on through the handle, which
+    // is what makes the two spawn indices 0 and 1 and the two ids 0 and 1.
+    let (handle, runner, _events) = started(
+        &dir,
+        piped,
+        vec![ProcScript::never_exits(), ProcScript::never_exits()],
+    )
+    .await;
+    handle
+        .start(vec![normalize(AppConfig::minimal("web", "./srv")).unwrap()])
+        .await
+        .unwrap();
 
-    let rows = h
-        .ctx
-        .supervisor
+    let rows = handle
         .send_line(ProcessSelector::All, "hello".to_string())
         .await
         .unwrap();
 
     let outcome = |id| rows.iter().find(|r| r.id == id).unwrap().outcome.clone();
-    assert_eq!(outcome(piped_id), LineOutcome::Sent);
-    assert_eq!(outcome(plain_id), LineOutcome::NoStdin);
+    assert_eq!(outcome(0), LineOutcome::Sent);
+    assert_eq!(outcome(1), LineOutcome::NoStdin);
+    assert_eq!(runner.stdin_lines(1), Vec::<String>::new());
     // id-sorted, like every other row-shaped reply, so the answer's order is
     // the selector's and not the scheduler's.
     assert!(rows.windows(2).all(|w| w[0].id < w[1].id));
@@ -3944,19 +4776,17 @@ async fn a_mixed_flock_reports_per_sheep_rather_than_failing() {
 /// "the app is not reading" and "the pipe broke" have different fixes.
 #[tokio::test(start_paused = true)]
 async fn a_write_that_never_lands_times_out_and_says_so() {
-    let runner = SharedRunner::new(vec![ProcScript::runs_forever()]);
-    // A runner whose stdin task accepts requests and never answers them —
-    // exactly what a full pipe looks like from this side.
-    let h = harness_with_runner(runner.silent_stdin());
+    let dir = tempfile::tempdir().unwrap();
     let mut app = AppConfig::minimal("stuck", "./stuck");
     app.stdin = true;
-    let id = register_sheep(&h, app).await;
+    // `never_reads_its_stdin` (Step 9.3) accepts the write and answers
+    // nothing — exactly what a full pipe looks like from this side.
+    let (handle, _runner, _events) =
+        started(&dir, app, vec![ProcScript::never_reads_its_stdin()]).await;
 
     let rows = tokio::time::timeout(
         STDIN_WRITE_TIMEOUT * 4,
-        h.ctx
-            .supervisor
-            .send_line(ProcessSelector::Id(id), "hello".to_string()),
+        handle.send_line(ProcessSelector::Id(0), "hello".to_string()),
     )
     .await
     .expect("send_line did not honour its own bound")
@@ -3966,6 +4796,53 @@ async fn a_write_that_never_lands_times_out_and_says_so() {
         panic!("expected NotWritten, got {:?}", rows[0].outcome);
     };
     assert!(reason.contains("read"), "{reason}");
+}
+
+/// fails if a flock of wedged sheep costs STDIN_WRITE_TIMEOUT **each**.
+///
+/// This is the case the constant's own doc rests on: two seconds is chosen to
+/// sit under the 5s an RPC caller gets by default, and that argument is only
+/// true if the waits run CONCURRENTLY. Awaited in a `for` loop — which is what
+/// `spawn_trigger_task` (`supervisor.rs:4341`) does, and what this task was
+/// first written to copy — three wedged sheep cost six seconds, the caller's
+/// budget expires first, and `shep sendline all` answers `DeadlineExceeded`
+/// instead of the three honest `not_written` rows the outcome enum exists to
+/// deliver.
+///
+/// Asserted against `Instant`, not against the row contents: the rows are the
+/// same either way, and the elapsed time is the whole difference.
+#[tokio::test(start_paused = true)]
+async fn a_flock_of_wedged_sheep_is_bounded_once_and_not_once_each() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = AppConfig::minimal("stuck", "./stuck");
+    app.stdin = true;
+    app.instances = 3;
+    let (handle, _runner, _events) = started(
+        &dir,
+        app,
+        vec![ProcScript::never_reads_its_stdin(); 3],
+    )
+    .await;
+
+    let started_at = tokio::time::Instant::now();
+    let rows = handle
+        .send_line(ProcessSelector::All, "hello".to_string())
+        .await
+        .unwrap();
+    let elapsed = started_at.elapsed();
+
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows.iter()
+            .all(|row| matches!(row.outcome, LineOutcome::NotWritten { .. })),
+        "{rows:?}"
+    );
+    // Under the paused clock the auto-advance is exact, so this is a real
+    // ceiling rather than a flaky one: sequential waits would read 6s.
+    assert!(
+        elapsed < STDIN_WRITE_TIMEOUT * 2,
+        "three wedged sheep cost {elapsed:?}; the bound is per-CALL, not per-sheep"
+    );
 }
 
 /// fails if a selector matching nothing is answered with an empty success.
@@ -3982,10 +4859,6 @@ async fn a_selector_that_matches_nothing_is_not_found_for_send_line() {
     );
 }
 ```
-
-`SharedRunner::silent_stdin` is a small variant to add in `fake.rs` beside the
-existing scripted behaviours — the counterpart of `never_reports_its_exit`,
-which is the precedent for "accepts the request, answers nothing".
 
 Run. **Expected failure — for the stated reason:** compile error, ``no method
 named `send_line` found for struct `SupervisorHandle` ``.
@@ -4007,14 +4880,29 @@ named `send_line` found for struct `SupervisorHandle` ``.
 /// that is not reading its stdin to start. Comfortably under the 5s an RPC
 /// caller gets when it sends no deadline of its own, so the honest
 /// `not_written` row reaches the caller rather than racing its budget.
+///
+/// **That last sentence is only true because the waits run concurrently.** One
+/// `sendline` costs at most this, whatever the selector matched; it is a bound
+/// on the CALL, not on each sheep. Awaited one after another, `sendline all`
+/// against three wedged sheep would cost six seconds and the caller's budget
+/// would expire first. See [`Actor::begin_send_line`].
 const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 ```
 
 `SheepSlot` gains `to_stdin: Option<mpsc::Sender<StdinWrite>>`, written on every
-successful spawn from `io.to_stdin.clone()` and **cleared wherever `to_child`
-is cleared** — the compiler will name both sites once the field exists, and the
-field's own doc should say "cleared with [`Self::to_child`], for the reason
-that field's doc gives" rather than restating the argument.
+successful spawn from `io.to_stdin.clone()` — in `run_sheep`'s destructure this
+is where `_to_stdin` from Step 9.2 becomes a real binding — and **cleared at the
+two sites where `to_child` is cleared**: `supervisor.rs:1893` and `:3304`, both
+`slot.to_child = None`. The compiler will NOT find those for you (the field is
+an `Option` and every literal can leave it `None`), which is why they are named
+here. The field's own doc should say "cleared with [`Self::to_child`], for the
+reason that field's doc gives" rather than restating the argument.
+
+It also breaks the same four hand-written `SheepSlot` literals Task 4's
+`signals` broke — `actor_with_stopping_drainee`, `actor_with_one_online_sheep`,
+`actor_with_a_sheep_and_a_dog`, `register_sheep`, plus Task 6's
+`actor_with_a_scaled_app` — and the compiler does name those. `to_stdin: None`
+at each.
 
 Add `SheepSlot::open_stdin`, the twin of `open_channel`:
 
@@ -4035,18 +4923,119 @@ Add `SheepSlot::open_stdin`, the twin of `open_channel`:
     }
 ```
 
-`Actor::begin_send_line` is `begin_action`'s shape, simplified: match, `NotFound`
-on empty, one row per id, `NoStdin` where `open_stdin()` is `None`, and the
-rest fanned out onto a task that awaits each `done` under
-`tokio::time::timeout(STDIN_WRITE_TIMEOUT, …)`:
+#### The two rules `begin_send_line` must follow, and why
 
-- `Ok(Ok(Ok(())))` → `Sent`
-- `Ok(Ok(Err(err)))` → `NotWritten { reason: err.to_string() }`
-- `Ok(Err(_recv))` → `NoStdin` (the writer task ended; the process is gone)
-- `Err(_elapsed)` → `NotWritten { reason: format!("the app did not read its
-  stdin within {}s", STDIN_WRITE_TIMEOUT.as_secs()) }`
+The first draft of this step said only "`begin_action`'s shape, simplified …
+the rest fanned out onto a task that awaits each `done`". That leaves both of
+the decisions that matter unmade, and both default to something dangerous.
 
-Rows sorted by id, exactly as `spawn_trigger_task` does.
+**Rule 1 — the enqueue is `try_send`, and NOTHING on the actor loop may
+`.await` on `to_stdin`.** This is not a style preference. A sheep whose app has
+stopped reading fd 0 fills its 64 KiB pipe; the writer task then blocks in
+`write_all`, stops draining its `mpsc`, and the channel fills at
+`CHANNEL_CAPACITY`. A `.send().await` into a full channel parks whatever task is
+executing it — and on the actor loop that task is **the actor**, which means
+one application that stopped reading its stdin stops the shepherd supervising
+every other sheep in the flock: no exits reaped, no restarts, no `list`. Follow
+`begin_signal`'s already-explicit shape (Step 4.4), which makes the same call
+for the same reason:
+
+```rust
+            let (done, answer) = oneshot::channel();
+            match to_stdin.try_send(StdinWrite { line: line.clone(), done }) {
+                Ok(()) => waits.push((id, name, answer)),
+                // The queue is full: this sheep's writer is blocked on a pipe
+                // the app is not draining. That is precisely the condition
+                // `NotWritten` names, and reporting it here costs no round
+                // trip at all.
+                Err(mpsc::error::TrySendError::Full(_)) => settled.push(LineReply {
+                    id,
+                    name,
+                    outcome: LineOutcome::NotWritten {
+                        reason: format!(
+                            "the app is not reading its stdin (its queue is full \
+                             after {}s)",
+                            STDIN_WRITE_TIMEOUT.as_secs()
+                        ),
+                    },
+                }),
+                // Closed: the writer task is gone, so the process is too.
+                Err(mpsc::error::TrySendError::Closed(_)) => settled.push(LineReply {
+                    id,
+                    name,
+                    outcome: LineOutcome::NoStdin,
+                }),
+            }
+```
+
+State the rule in the function's own doc, not only here: **no `.await` on a
+`to_stdin` sender may appear on the actor loop.** The same sentence belongs on
+`SheepSlot::to_stdin`'s doc, beside the clearing note, because that is where
+the next person adding a caller will read.
+
+**Rule 2 — the fan-out task awaits the rows CONCURRENTLY.** `spawn_trigger_task`
+is a plain `for (id, name, answer) in waits { answer.await … }`
+(`supervisor.rs:4341-4342`), and copying it here multiplies the bound by the
+match count: `STDIN_WRITE_TIMEOUT * N`. That destroys the constant's own stated
+argument and makes `shep sendline all` against a few wedged sheep answer
+`DeadlineExceeded` rather than the honest rows. `spawn_signal_task` can copy
+the sequential shape, because a `kill(2)` returns immediately and there is no
+bound to multiply; this one cannot.
+
+```rust
+/// Awaits every write's acknowledgement, each under its own
+/// [`STDIN_WRITE_TIMEOUT`], and answers `reply` with `settled` and the results
+/// in id order.
+///
+/// The waits run CONCURRENTLY — `join_all`, not a `for` loop. Unlike
+/// `spawn_trigger_task`, whose per-row waits carry no shared bound, every wait
+/// here is bounded by the same constant, so awaiting them one after another
+/// would make the total `STDIN_WRITE_TIMEOUT * matched` and put a flock-wide
+/// `sendline` over an RPC caller's default budget. `a_flock_of_wedged_sheep_is_
+/// bounded_once_and_not_once_each` is the test that says so.
+fn spawn_send_line_task(
+    settled: Vec<LineReply>,
+    waits: Vec<(u32, String, oneshot::Receiver<Result<(), RunnerError>>)>,
+    reply: oneshot::Sender<Result<Vec<LineReply>, SupervisorError>>,
+) {
+    tokio::spawn(async move {
+        let mut rows = settled;
+        rows.extend(
+            futures_util::future::join_all(waits.into_iter().map(|(id, name, answer)| async move {
+                let outcome = match tokio::time::timeout(STDIN_WRITE_TIMEOUT, answer).await {
+                    Ok(Ok(Ok(()))) => LineOutcome::Sent,
+                    Ok(Ok(Err(err))) => LineOutcome::NotWritten {
+                        reason: err.to_string(),
+                    },
+                    // The sender was dropped: the writer task ended before it
+                    // served this request, which means the process did too.
+                    Ok(Err(_recv)) => LineOutcome::NoStdin,
+                    Err(_elapsed) => LineOutcome::NotWritten {
+                        reason: format!(
+                            "the app did not read its stdin within {}s",
+                            STDIN_WRITE_TIMEOUT.as_secs()
+                        ),
+                    },
+                };
+                LineReply { id, name, outcome }
+            }))
+            .await,
+        );
+        rows.sort_unstable_by_key(|row| row.id);
+        let _ = reply.send(Ok(rows));
+    });
+}
+```
+
+`futures-util` is already on shep-daemon's own `[dependencies]`
+(`crates/shep-daemon/Cargo.toml:25`, `futures-util.workspace = true`, workspace
+version `0.3` with `default-features = false` and features `["sink", "std"]`).
+`future::join_all` is in that feature set. No dependency change; if it turns
+out otherwise, use `tokio::task::JoinSet` rather than widening features for one
+call site.
+
+The rest of `begin_send_line` is `begin_action`'s shape: `matching_ids`,
+`NotFound` on empty, one row per id, `NoStdin` where `open_stdin()` is `None`.
 
 **A reload drainee gets the line**, not a `Skipped`, for the reason Task 4 gives
 for a signal: the reply is not a conversation and the drainee is a live process
@@ -4056,7 +5045,7 @@ comparing it against `begin_action` sees the difference is deliberate.
 `SupervisorHandle::send_line(selector, line)` with the usual `# Errors` block.
 
 Run `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`.
-Expect green, **+5**.
+Expect green, **+6**.
 
 ### Step 10.3 — GREEN: the RPC arm
 
@@ -4113,7 +5102,39 @@ a sender whose receiver the runner dropped, so the send fails and the row comes
 back `NotWritten` instead of `NoStdin`. That is exactly the "second copy of the
 fact" the `open_channel` doc warns about, caught.
 
-Revert both.
+Third mutation, and it is the one this task's whole design rests on: in
+`spawn_send_line_task`, replace the `join_all` with the sequential loop
+`spawn_trigger_task` uses —
+
+```rust
+        for (id, name, answer) in waits {
+            let outcome = match tokio::time::timeout(STDIN_WRITE_TIMEOUT, answer).await { /* … */ };
+            rows.push(LineReply { id, name, outcome });
+        }
+```
+
+**Must go red:** `a_flock_of_wedged_sheep_is_bounded_once_and_not_once_each`
+fails on its elapsed assertion at 6s against a 4s ceiling.
+`a_write_that_never_lands_times_out_and_says_so` stays **green** — one sheep
+costs the same either way — which is exactly why the multi-sheep case exists
+and why the single-sheep one could not stand in for it.
+
+Fourth mutation, for the actor-loop rule: change `begin_send_line`'s
+`to_stdin.try_send(..)` to `to_stdin.send(..).await`, making `begin_send_line`
+an `async fn` and awaiting it from `handle_command`.
+
+**Must go red** — and if it does not, say so and stop, because that means
+nothing in the suite covers actor liveness during a stuck write, which is the
+worst failure this task can ship. Expect
+`a_flock_of_wedged_sheep_is_bounded_once_and_not_once_each` to hang or to fail
+its elapsed ceiling once the fake's queue fills. If it passes because
+`CHANNEL_CAPACITY` is wide enough that a test never fills it, add a case that
+does: one sheep on `never_reads_its_stdin`, `CHANNEL_CAPACITY + 1` sendlines
+issued without awaiting, then a bounded `handle.list()` that must still answer.
+The assertion is that **the actor is still serving**, which is the property at
+risk and the one no existing case makes.
+
+Revert all four.
 
 ### Step 10.5 — CHANGELOG and gate
 
@@ -4449,6 +5470,19 @@ Then the full task gate.
 **Files modified:**
 - `crates/shep-core/src/lib.rs` — declare the module.
 - `crates/shep-core/src/paths.rs` — `ShepPaths::kv`.
+- **Three `ShepPaths` struct literals in two other crates**, which the new
+  field breaks: `crates/shep-daemon/src/assemble.rs:189`,
+  `crates/shep-daemon/tests/real_runner.rs:823`,
+  `crates/shep-cli/src/dog/mod.rs:383`. `ShepPaths` is a plain `pub struct`
+  with no `#[non_exhaustive]` and no `Default` (`paths.rs:13-30`), so any crate
+  may write the literal and three do. (The other three `test_paths` helpers —
+  `shep-daemon/src/testing.rs:226`, `shep-cli/src/launch.rs:264`,
+  `shep-cli/src/commands/logs.rs:598` — call `ShepPaths::resolve` and are
+  untouched. Verified at `d8bd4af`.)
+
+**This makes Task 12 a three-crate task**, which matters twice: its stated
+verification below is not enough on its own, and it conflicts with any
+concurrent task touching those three files.
 
 **Produces, for Tasks 13–14:**
 
@@ -4516,11 +5550,39 @@ is pinned.)
     pub kv: PathBuf,
 ```
 
-set in `resolve` as `kv: home.join("kv.json"),`. Run; green.
+set in `resolve` as `kv: home.join("kv.json"),`.
+
+Then the sweep. `cargo test -p shep-core --lib --all-features` is **green while
+shep-daemon and shep-cli do not compile**, so the three broken literals first
+appear at the task gate unless this step goes looking. Run all three, one cargo
+command at a time:
+
+```bash
+cargo test -p shep-core   --lib  --all-features
+cargo test -p shep-daemon --lib  --all-features -- --skip ::slow::
+cargo test -p shep-cli    --bins --all-features
+```
+
+The daemon and CLI runs fail to compile with `missing field \`kv\`` at
+`assemble.rs:189` and `dog/mod.rs:383`; `real_runner.rs:823` is an integration
+target and needs `cargo test -p shep-daemon --test real_runner --all-features`
+(or the task gate's `--all-targets` clippy) to surface. Add
+`kv: <home>.join("kv.json")` at each, matching how that literal spells its
+other paths. Then all three green.
 
 ### Step 12.3 — RED: the store
 
-Create `crates/shep-core/src/kv.rs` with only its test module:
+Create `crates/shep-core/src/kv.rs` with only its test module — **and its
+`//!` module doc**. `missing_docs = "deny"` is set workspace-wide
+(`Cargo.toml:233-235`), so `pub mod kv;` over an undocumented file is itself a
+denied-lint *error*, not a warning, and it lands alongside the "cannot find
+function" this step expects. The red is correct either way, but it is noisier
+than a bare "the functions do not exist" and an implementer who has not been
+told will go looking for a second problem. Write the `//!` block from Step 12.4
+now and the function bodies later. Same note applies to Task 3's `signals.rs`
+(Step 3.1).
+
+The test module:
 
 ```rust
 #[cfg(test)]
@@ -4849,6 +5911,72 @@ fn check_key(key: &str) -> Result<(), KvError> {
 }
 ```
 
+**The five public functions each need their own `# Errors` section**, naming
+which `KvError` variants they can return. `missing_errors_doc = "deny"` is on
+workspace-wide (`Cargo.toml:244`), CLAUDE.md lists missing `# Errors` sections
+as a top drift risk, and Task 13's exit-code table is built directly off this
+mapping — so getting it approximately right here becomes a wrong exit code
+there. Spelled out rather than left to the implementer:
+
+```rust
+/// Every key/value pair in the store, in key order.
+///
+/// # Errors
+///
+/// - [`KvError::Io`] — the store could not be opened or read. A store that is
+///   simply absent is not an error: it reads as empty.
+/// - [`KvError::Decode`] — the file is not the JSON this module writes.
+/// - [`KvError::FutureVersion`] — the file's `version` is newer than
+///   [`KV_VERSION`]. Nothing is read and nothing is written.
+pub fn all(path: &Path) -> Result<BTreeMap<String, String>, KvError>;
+
+/// One key's value, or `None` if it is not in the store.
+///
+/// # Errors
+///
+/// [`KvError::InvalidKey`] for a key outside the grammar (refused before the
+/// file is opened, so a malformed key never creates one), plus `Io`, `Decode`
+/// and `FutureVersion` exactly as [`all`] returns them.
+pub fn get(path: &Path, key: &str) -> Result<Option<String>, KvError>;
+
+/// Stores `value` under `key`, replacing any previous value.
+///
+/// # Errors
+///
+/// - [`KvError::InvalidKey`] — the key is outside the grammar.
+/// - [`KvError::ValueTooLong`] — the value exceeds [`MAX_VALUE_BYTES`].
+/// - [`KvError::FutureVersion`] — the store on disk is newer than this build
+///   understands. **Nothing is written**; a downgrade that overwrote an
+///   operator's store has no undo.
+/// - [`KvError::Decode`] — the existing file could not be parsed. Refused
+///   rather than replaced, for the same reason.
+/// - [`KvError::Io`] — the lock, the temp file, the `fsync` or the `rename`
+///   failed. Either the whole write landed or none of it did.
+pub fn set(path: &Path, key: &str, value: &str) -> Result<(), KvError>;
+
+/// Removes `key`, returning whether it was there.
+///
+/// # Errors
+///
+/// The same set [`set`] returns, minus [`KvError::ValueTooLong`]: `InvalidKey`,
+/// `FutureVersion`, `Decode`, `Io`.
+pub fn unset(path: &Path, key: &str) -> Result<bool, KvError>;
+
+/// Empties the store, returning how many keys were removed.
+///
+/// # Errors
+///
+/// [`KvError::FutureVersion`], [`KvError::Decode`] and [`KvError::Io`]. A
+/// store that does not exist clears to `0` rather than failing — `shep unset
+/// --all` on a fresh machine is a success that removed nothing.
+pub fn clear(path: &Path) -> Result<u32, KvError>;
+```
+
+Every one of those is a `pub` item in a published library, so the sections are
+enforced, not advisory. `check_key`'s own `# Errors` (above) stays as well —
+it is private, so the lint does not reach it, and it is documented because the
+five public sections all point at it.
+
 `read_file` returns `KvFile::default()` for a missing file (`ErrorKind::NotFound`
 only — every other io error propagates), refuses a higher `version`, and is
 called under the lock by every mutating function. `write_file` is `barks`'
@@ -5174,7 +6302,25 @@ Full task gate.
 
 **Files modified:**
 - `crates/shep-core/src/protocol/request.rs` — `Lamb`, the field, the builder
-  setter, fixtures.
+  setter, `sample_info()`'s struct literal (`:699`), the two inline
+  `ProcessInfo` literals in `reply_wire_snapshots` (`:1028`, `:1052`), and the
+  two builder tests.
+- `crates/shep-core/src/protocol/events.rs` — two `ProcessInfo` literals
+  (`:146`, `:245`).
+- `crates/shep-core/src/protocol/frame.rs` — one `ProcessInfo` literal (`:53`).
+- `crates/shep-core/src/protocol/mod.rs` — export `Lamb`.
+- `crates/shep-core/tests/process_info_builder_from_outside_the_crate.rs` —
+  extend the every-field test. See Step 15.2b; **this file does not fail on its
+  own**, which is the reason it is listed.
+- `crates/shep-cli/src/output/snapshots/shep__output__tests__the_json_envelope_shape_is_pinned.snap`
+  — a **third** pinned snapshot, in a crate this task otherwise does not touch.
+  It serializes three full `ProcessInfo` rows and gains `"lambs": null` three
+  times. It is invisible to `cargo test -p shep-core`, so it first appears at
+  the task gate unless Step 15.2 runs the CLI suite too.
+- `crates/shep-client/src/testing.rs` — `sample_info()`'s doc (`:109-110`)
+  claims "every `Option` is `Some`, so a payload type's anti-drift test sees
+  every serialized field". Adding `lambs` makes that false unless the builder
+  chain there sets it. Either set it or rewrite the sentence; do not leave it.
 
 **Produces, for Tasks 16–17:**
 
@@ -5339,30 +6485,53 @@ Add `lambs: None` to `ProcessInfo::builder`'s initializer, and the setter:
     }
 ```
 
-Extend the `#[non_exhaustive]` rationale on `ProcessInfo` — it currently says
-"`deferred.md` already names the next one — `lambs`, for `describe`'s tree
-view". That sentence is now history rather than a forecast; rewrite it to say
-the field landed under the attribute without a sweep, which is the attribute
-paying for itself, and name whatever the next candidate is (or say there is
-none).
+Extend the `#[non_exhaustive]` rationale on `ProcessInfo` (`request.rs:222-231`)
+— it currently says the struct "has grown a field in three separate phases" and
+that "`deferred.md` already names the next one — `lambs`, for `describe`'s tree
+view". Both halves are now stale: it is four phases, and the forecast has
+landed. Rewrite it to say the field arrived under the attribute with no sweep,
+which is the attribute paying for itself, and name whatever the next candidate
+is or say there is none. Same class of edit as Steps 6.2 and 9.2 make to
+`SupervisorError` and `RunnerError`; CLAUDE.md names IR-20 rationale drift as a
+top risk.
 
 Export `Lamb` from `protocol/mod.rs`.
 
 Run `cargo test -p shep-core --lib --all-features`.
 
-**Expect two snapshot failures**, `reply_wire_v1` and `bus_event_wire_v1`. Review
-both diffs: each must be **`"lambs": null` added once per `ProcessInfo` object
-and nothing else**. Then accept and check:
+**Expect two snapshot failures in shep-core**, `reply_wire_v1` and
+`bus_event_wire_v1`. Review both diffs: each must be **`"lambs": null` added
+once per `ProcessInfo` object and nothing else**. Then accept and check:
 
 ```bash
 INSTA_UPDATE=always cargo test -p shep-core --lib --all-features
-git diff crates/shep-core/src/protocol/snapshots/ | grep -c '^-'
+git diff --numstat crates/shep-core/src/protocol/snapshots/
 ```
 
-That last command's baseline at HEAD is `0` (a clean tree diffs to nothing), and
-after the accept it must **still print 0** — every changed line is an addition.
-A non-zero count means an existing pinned line moved, which this task does not
-do.
+`--numstat` prints `added<TAB>deleted<TAB>path` per changed file. **Every row's
+SECOND column must be `0`** — deletions. A non-zero one means an existing
+pinned line moved, which this task does not do.
+
+Do **not** check this with `git diff … | grep -c '^-'`, which is what the first
+draft of this plan said. That count can never be `0`: unified diff opens each
+file with a `--- a/<path>` header and `^-` matches it, so a correct
+two-file pure-addition accept prints `2` and the implementer concludes a correct
+snapshot moved pinned bytes. Confirmed empirically. If a line count is wanted
+rather than `--numstat`, the working spelling is
+`git diff -U0 <paths> | grep -c '^-[^-]'`.
+
+**Then the third snapshot, in shep-cli.** It is not reached by any command
+above:
+
+```bash
+cargo test -p shep-cli --bins --all-features
+```
+
+`the_json_envelope_shape_is_pinned` (`shep-cli/src/output/mod.rs:373`) fails —
+its three `ProcessInfo` rows each gain `"lambs": null`. Review, accept with
+`INSTA_UPDATE=always`, and run the same `--numstat` check over
+`crates/shep-cli/src/output/snapshots/`. **Three snapshot failures across this
+task, not two.**
 
 Then add one row to `reply_wire_snapshots` carrying a `ProcessInfo` with a
 **populated** `lambs`, so the non-null shape is pinned as well as the null one:
@@ -5373,7 +6542,15 @@ Then add one row to `reply_wire_snapshots` carrying a `ProcessInfo` with a
         // sheep serializes as, which is the shape a `describe` consumer
         // actually parses.
         replies.push(Reply {
-            id: 12,
+            // RENUMBER THIS. The ids in that vector are sequential and the
+            // last one is not `11` by guarantee — at `d8bd4af` the vector
+            // already runs to 19, and Tasks 3, 5 and 8 each append a row of
+            // their own, in whatever order those chains land. Read the last id
+            // in the vector as it stands and use the next one. Two rows
+            // sharing an id still pass the snapshot, so nothing catches this
+            // but reading. (Tasks 3, 5 and 8 carry the same instruction; the
+            // first draft gave this one a hardcoded `12`.)
+            id: <next free>,
             result: Ok(Response::Described(vec![
                 ProcessInfo::builder(3, "web", ProcStatus::Online)
                     .pid(Some(4242))
@@ -5383,7 +6560,81 @@ Then add one row to `reply_wire_snapshots` carrying a `ProcessInfo` with a
         });
 ```
 
-Accept, re-check the deletion count, then green, **+3**.
+Accept, re-check both `--numstat` outputs, then green, **+3**.
+
+### Step 15.2b — the tests that do not fail on their own
+
+Three assertions elsewhere in the tree become **quietly false** when this field
+lands. None of them breaks the build; none of them reddens; each simply stops
+meaning what it says. That is the class Phase 10 spent a task fixing, and the
+reason they are a numbered step rather than a note.
+
+**One — `crates/shep-core/tests/process_info_builder_from_outside_the_crate.rs`.**
+Its whole claim, in its own module doc, is that `ProcessInfo::builder` reaches
+**every** field from outside shep-core; it enumerates all twelve setters and
+reads all twelve fields back. A thirteenth field and a thirteenth setter leave
+it compiling and passing while its title stops being true, and the next phase
+that adds a field inherits a test that has already stopped guarding anything.
+It is also shep-core's one permitted `tests/` file (an explicit IR-38 exception
+argued in its own header), so no new-test-file sweep will find it. Add to the
+chain and to the read-back block:
+
+```rust
+        .lambs(Some(vec![Lamb::new(4243, "node")]))
+```
+```rust
+    assert_eq!(info.lambs, Some(vec![Lamb::new(4243, "node")]));
+```
+
+**A non-default value, for the reason that file already gives for `dog`**:
+`None` is the builder's default, so `.lambs(None)` would pass against an
+empty setter body. Import `Lamb` beside `DogSource`.
+
+**Two — `a_builder_with_nothing_set_is_a_sheep_that_has_not_run`**
+(`request.rs:722`). It enumerates every field's default. Add
+`assert_eq!(info.lambs, None);`, per that test's own convention.
+
+**Three — `every_setter_writes_its_own_field_and_no_other`**
+(`request.rs:746`) is the subtle one. It compares a full builder chain against
+`sample_info()`'s struct literal, and its own comment explains the trap: the
+comparison "fails the day the struct grows a field the builder cannot set", but
+a setter whose body is EMPTY still passes whenever the literal's value equals
+the builder's default. `sample_info()` will carry `lambs: None` — the default —
+so `.lambs(..)` is exactly the `dog` case again. That test already carries a
+second, standalone assertion for `dog` with a comment saying why
+(`sample_info()` feeds two pinned snapshots and cannot be changed to a `Some`).
+Add the twin, in the same shape and with the same reasoning:
+
+```rust
+        // `lambs` is the second field the comparison above cannot speak for,
+        // for the identical reason `dog` is the first: `sample_info()`'s value
+        // is `None`, which is also the builder's default, so an EMPTY `lambs`
+        // setter body passes the `assert_eq!` above. And `sample_info()` still
+        // cannot be changed to a `Some(..)` — it feeds `reply_wire_snapshots`
+        // and `bus_event_wire_snapshots`, so altering it moves pinned bytes.
+        assert_eq!(
+            ProcessInfo::builder(1, "web", ProcStatus::Online)
+                .lambs(Some(vec![Lamb::new(4243, "node")]))
+                .build()
+                .lambs,
+            Some(vec![Lamb::new(4243, "node")]),
+            "an empty `lambs` setter body is invisible to the comparison above"
+        );
+```
+
+**Verify all three are live before moving on**, by giving `ProcessInfoBuilder::lambs`
+an empty body (`pub fn lambs(self, _lambs: Option<Vec<Lamb>>) -> Self { self }`)
+and running:
+
+```bash
+cargo test -p shep-core --lib --all-features
+cargo test -p shep-core --test process_info_builder_from_outside_the_crate --all-features
+```
+
+Both must fail. If either passes, the assertion added above is the decorative
+kind this plan exists to stop shipping — fix it before restoring the body.
+`lambs_distinguishes_not_walked_from_walked_and_empty` (Step 15.1) also
+reddens here, which is the cross-check that the empty body really is in place.
 
 ### Step 15.3 — MUTATION
 
@@ -5439,7 +6690,38 @@ command, not a poll, and `with_live_stats` already does one; say so in the
 method's doc rather than sharing a table between two callers with different
 lifetimes.
 
+### Step 16.0b — one signature for `lambs_of`, decided here
+
+The first draft of this task specified two incompatible signatures for the same
+function and never resolved them: Steps 16.1, 16.2 and 16.4 used
+`lambs_of(&self, root_pid: u32)` calling `self.sampler.identify()` internally,
+and Step 16.3 then said to "hoist the refresh" onto a `LambIndex` — a type it
+named and never defined — without saying how the six tests and the mutation
+target move onto the two-argument form. An implementer would ship either the
+quadratic version the plan forbids or a mutation step pointing at a body that
+no longer exists.
+
+**The signature is `lambs_of(&self, index: &LambIndex, root_pid: u32)`, and
+`LambIndex` is defined below.** Write the six RED tests against that form from
+the start; there is no single-argument phase. This mirrors
+`TreeIndex::build` + `TreeIndex::sum_from` (`limits/sample.rs:146-201`), which
+this project already split for exactly this reason — its own doc says "build
+one `TreeIndex` per table and call `sum_from` per root instead, so the index —
+the expensive part, since it scans the whole table — is shared across every
+root's walk". `shep describe all` on a large flock is the caller that makes
+that argument, and it is the caller this task adds.
+
+No `lambs_of_now(root_pid)` convenience wrapper. Every caller in this phase
+walks at least one root through `with_lambs`, which builds the index once
+either way, so a wrapper would be one call site's worth of sugar hiding the
+cost the split exists to expose.
+
 ### Step 16.1 — RED
+
+Every case below is written against the two-argument form Step 16.0b settled,
+and every one is a plain `#[test]` — `lambs_of` and `lamb_index` are both
+synchronous, so `#[tokio::test]` would buy nothing and, in one case, would
+actively mislead (see the cycle case).
 
 Add to `crates/shep-daemon/src/limits/stats.rs`'s test module:
 
@@ -5447,8 +6729,8 @@ Add to `crates/shep-daemon/src/limits/stats.rs`'s test module:
 /// fails if the walk includes the sheep's own pid. They are LAMBS — the sheep
 /// is the row this list hangs off, and repeating it there would double it in
 /// every rendering.
-#[tokio::test]
-async fn the_lamb_walk_excludes_the_sheeps_own_pid() {
+#[test]
+fn the_lamb_walk_excludes_the_sheeps_own_pid() {
     let table = vec![
         identity(100, None, "srv"),
         identity(101, Some(100), "node"),
@@ -5456,7 +6738,7 @@ async fn the_lamb_walk_excludes_the_sheeps_own_pid() {
     ];
     let stats = StatsState::new(Arc::new(ScriptedSampler::identifying(vec![table])));
 
-    let lambs = stats.lambs_of(100);
+    let lambs = stats.lambs_of(&stats.lamb_index(), 100);
 
     assert_eq!(
         lambs,
@@ -5468,8 +6750,8 @@ async fn the_lamb_walk_excludes_the_sheeps_own_pid() {
 /// fails if the walk stops at the first generation. A `sh` wrapper that execs a
 /// runtime that forks workers is three deep and is the ordinary case, not an
 /// exotic one.
-#[tokio::test]
-async fn the_lamb_walk_reaches_every_generation() {
+#[test]
+fn the_lamb_walk_reaches_every_generation() {
     let table = vec![
         identity(100, None, "sh"),
         identity(101, Some(100), "node"),
@@ -5477,14 +6759,18 @@ async fn the_lamb_walk_reaches_every_generation() {
         identity(103, Some(102), "node"),
     ];
     let stats = StatsState::new(Arc::new(ScriptedSampler::identifying(vec![table])));
-    assert_eq!(stats.lambs_of(100).len(), 3);
+    assert_eq!(stats.lambs_of(&stats.lamb_index(), 100).len(), 3);
 }
 
 /// fails if a sibling subtree leaks in. Two sheep of the same app run side by
 /// side, so a walk that took everything with a parent would report each one's
 /// children under the other.
-#[tokio::test]
-async fn a_sibling_subtree_is_not_this_sheeps() {
+///
+/// Both roots are walked off ONE index, which is also the case for the split
+/// Step 16.0b makes: `shep describe all` builds the index once and calls
+/// `lambs_of` per row.
+#[test]
+fn a_sibling_subtree_is_not_this_sheeps() {
     let table = vec![
         identity(100, None, "srv"),
         identity(101, Some(100), "mine"),
@@ -5492,30 +6778,44 @@ async fn a_sibling_subtree_is_not_this_sheeps() {
         identity(201, Some(200), "theirs"),
     ];
     let stats = StatsState::new(Arc::new(ScriptedSampler::identifying(vec![table])));
-    assert_eq!(stats.lambs_of(100), vec![Lamb::new(101, "mine")]);
+    let index = stats.lamb_index();
+    assert_eq!(stats.lambs_of(&index, 100), vec![Lamb::new(101, "mine")]);
+    assert_eq!(stats.lambs_of(&index, 200), vec![Lamb::new(201, "theirs")]);
 }
 
-/// fails if a cycle in the parent links spins forever. The kernel does not
-/// produce one, but a fixture can and a truncated `/proc` read might —
-/// `TreeIndex::total_over` already terminates on this and the lamb walk must
-/// too.
+/// fails if a cycle in the parent links is walked twice, or spins forever. The
+/// kernel does not produce one, but a fixture can and a truncated `/proc` read
+/// might — `TreeIndex::total_over` already terminates on this and the lamb walk
+/// must too.
 ///
-/// Bounded (IR-46): this case's only failure mode without a bound is a hang.
-#[tokio::test]
-async fn a_parent_link_cycle_terminates() {
+/// **No IR-46 bound, deliberately, and do not add one back.** `lambs_of` is a
+/// synchronous `fn`: `tokio::time::timeout(_, async { stats.lambs_of(..) })`
+/// runs the whole body on its first poll, so the timer is never armed and a
+/// genuinely non-terminating walk hangs exactly as it would bare — while the
+/// wrapper tells every later reader the case is bounded. The first draft of
+/// this plan shipped precisely that. IR-46 asks for a bound on a case that can
+/// ONLY fail by hanging; the `assert_eq!` below is a live failure mode, and
+/// Step 16.4's mutation reddens it. That, not a decorative wrapper, is what
+/// makes this case able to fail.
+#[test]
+fn a_parent_link_cycle_terminates_and_reports_each_pid_once() {
     let table = vec![identity(100, Some(101), "a"), identity(101, Some(100), "b")];
     let stats = StatsState::new(Arc::new(ScriptedSampler::identifying(vec![table])));
-    let lambs = tokio::time::timeout(Duration::from_secs(5), async { stats.lambs_of(100) })
-        .await
-        .expect("the lamb walk did not terminate within 5s");
-    assert_eq!(lambs, vec![Lamb::new(101, "b")]);
+
+    let lambs = stats.lambs_of(&stats.lamb_index(), 100);
+
+    assert_eq!(
+        lambs,
+        vec![Lamb::new(101, "b")],
+        "the root is its own descendant through the cycle and must not be listed"
+    );
 }
 
 /// fails if the rows come back in whatever order the map yielded. `describe`'s
 /// output is read by people and diffed by scripts; an unstable order makes both
 /// worse for no gain.
-#[tokio::test]
-async fn lambs_come_back_in_pid_order() {
+#[test]
+fn lambs_come_back_in_pid_order() {
     let table = vec![
         identity(100, None, "srv"),
         identity(103, Some(100), "c"),
@@ -5524,7 +6824,11 @@ async fn lambs_come_back_in_pid_order() {
     ];
     let stats = StatsState::new(Arc::new(ScriptedSampler::identifying(vec![table])));
     assert_eq!(
-        stats.lambs_of(100).iter().map(|l| l.pid).collect::<Vec<_>>(),
+        stats
+            .lambs_of(&stats.lamb_index(), 100)
+            .iter()
+            .map(|l| l.pid)
+            .collect::<Vec<_>>(),
         vec![101, 102, 103]
     );
 }
@@ -5532,21 +6836,49 @@ async fn lambs_come_back_in_pid_order() {
 /// fails if a sampler that cannot report names produces bogus rows instead of
 /// none. The trait's default `identify` returns nothing, and every consumer has
 /// to read that as "unknown", never as "this sheep has no lambs".
-#[tokio::test]
-async fn a_sampler_that_cannot_identify_reports_no_lambs() {
-    // ScriptedSampler::new(..) implements only `sample`, taking the default
+#[test]
+fn a_sampler_that_cannot_identify_reports_no_lambs() {
+    // `ScriptedSampler::new(..)` implements only `sample`, taking the default
     // `identify`.
     let stats = StatsState::new(Arc::new(ScriptedSampler::new(vec![vec![]])));
-    assert!(stats.lambs_of(100).is_empty());
+    assert!(stats.lambs_of(&stats.lamb_index(), 100).is_empty());
 }
 ```
 
-`identity(..)` and `ScriptedSampler::identifying(..)` are new test helpers
-beside the existing `rss`/`rss_cpu` and `ScriptedSampler::new`.
+**Step 16.1a — the two new test helpers**, beside the existing `rss`/`rss_cpu`
+and `ScriptedSampler::new` (`testing.rs:657-681`):
+
+```rust
+    /// One row of a scripted identity table.
+    fn identity(pid: u32, parent: Option<u32>, name: &str) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            parent,
+            name: name.to_string(),
+        }
+    }
+```
+
+```rust
+impl ScriptedSampler {
+    /// A sampler that answers `identify` from `tables`, one per call, and
+    /// `sample` from an empty machine.
+    ///
+    /// A separate constructor rather than a field on [`Self::new`] because the
+    /// two halves are scripted independently and every existing caller of
+    /// `new` wants the DEFAULT `identify` — which is itself the subject of one
+    /// case above.
+    pub(crate) fn identifying(tables: Vec<Vec<ProcessIdentity>>) -> Self { /* … */ }
+}
+```
+
+Read `ScriptedSampler::new`'s existing body first: it asserts on an empty
+`readings` vec (a fixture bug the constructor catches, per `harness`'s own
+comment at `testing.rs:369`). Keep that discipline for `tables`.
 
 Run `cargo test -p shep-daemon --lib --all-features`. **Not the fast loop** —
-this touches the sampler, and CLAUDE.md's own note says the unfiltered lib suite
-is the one to run when it does.
+this touches the sampler, and CLAUDE.md's own note says the unfiltered lib
+suite is the one to run when it does.
 
 **Expected failure — for the stated reason:** compile error, ``cannot find
 function `identity` `` / ``no method named `lambs_of` ``.
@@ -5608,28 +6940,67 @@ operator command as expensive as the poll.
 `crates/shep-daemon/src/limits/stats.rs`:
 
 ```rust
-    /// Every process the OS reports as a descendant of `root_pid`, in pid
+    /// An indexed snapshot of the machine's process table: who each process
+    /// is, and which processes name it as their parent.
+    ///
+    /// Split out of [`StatsState::lambs_of`] rather than rebuilt per root, for
+    /// the reason [`TreeIndex`]'s own doc already gives about the polling
+    /// enforcer: the index is the expensive part — it scans the whole table —
+    /// and a caller walking several roots (`shep describe all`, one root per
+    /// row) builds it once and reuses it. Building per root would multiply a
+    /// whole-machine scan by flock size on an operator's command.
+    ///
+    /// One refresh of the process table happens per [`StatsState::lamb_index`]
+    /// call, and none inside [`StatsState::lambs_of`], so the whole of a
+    /// `describe`'s answer describes ONE instant rather than one instant per
+    /// row.
+    #[derive(Debug)]
+    pub(crate) struct LambIndex {
+        /// Every process by pid — the name a lamb row carries.
+        by_pid: HashMap<u32, ProcessIdentity>,
+        /// Child pids per parent pid.
+        children_of: HashMap<u32, Vec<u32>>,
+    }
+```
+
+```rust
+    /// Indexes one fresh walk of the machine's process table.
+    ///
+    /// The table refresh lives here rather than in [`Self::lambs_of`], so a
+    /// caller answering several sheep pays for it once. See [`LambIndex`].
+    pub(crate) fn lamb_index(&self) -> LambIndex {
+        let table = self.sampler.identify();
+        let mut by_pid = HashMap::with_capacity(table.len());
+        let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+        for entry in table {
+            if let Some(parent) = entry.parent {
+                children_of.entry(parent).or_default().push(entry.pid);
+            }
+            by_pid.insert(entry.pid, entry);
+        }
+        LambIndex {
+            by_pid,
+            children_of,
+        }
+    }
+
+    /// Every process `index` reports as a descendant of `root_pid`, in pid
     /// order, excluding `root_pid` itself.
     ///
-    /// A parent-pid walk, with the same cycle-safe shape
-    /// [`TreeIndex::total_over`] uses and for the same reason: the kernel does
-    /// not produce a cycle in the parent links, but a fixture can and a torn
-    /// `/proc` read might, and a walk that spun on one would hang a request
-    /// rather than answer it.
+    /// Takes the index rather than building one, so several roots share one
+    /// walk of the process table — the same split [`TreeIndex::build`] and
+    /// [`TreeIndex::sum_from`] already make, and for the same reason.
+    ///
+    /// Cycle-safe, with the same shape [`TreeIndex::total_over`] uses: the
+    /// kernel does not produce a cycle in the parent links, but a fixture can
+    /// and a torn `/proc` read might, and a walk that spun on one would hang a
+    /// request rather than answer it.
     ///
     /// **This is not the set of processes a stop kills.** The kill acts on the
     /// process group, which diverges from the ppid tree in both directions —
     /// this module's own doc has the account. Anything rendering this list owes
     /// the operator that caveat where they can see it.
-    pub(crate) fn lambs_of(&self, root_pid: u32) -> Vec<Lamb> {
-        let table = self.sampler.identify();
-        let mut children_of: HashMap<u32, Vec<usize>> = HashMap::new();
-        for (index, entry) in table.iter().enumerate() {
-            if let Some(parent) = entry.parent {
-                children_of.entry(parent).or_default().push(index);
-            }
-        }
-
+    pub(crate) fn lambs_of(&self, index: &LambIndex, root_pid: u32) -> Vec<Lamb> {
         // `visited` seeded with the root, which does two things at once: it
         // keeps the sheep out of its own lamb list, and it terminates a cycle
         // that leads back to it.
@@ -5637,24 +7008,27 @@ operator command as expensive as the poll.
         let mut stack = vec![root_pid];
         let mut lambs = Vec::new();
         while let Some(pid) = stack.pop() {
-            for index in children_of.get(&pid).into_iter().flatten() {
-                let entry = &table[*index];
-                if !visited.insert(entry.pid) {
+            for child in index.children_of.get(&pid).into_iter().flatten() {
+                if !visited.insert(*child) {
                     continue;
                 }
-                lambs.push(Lamb::new(entry.pid, entry.name.clone()));
-                stack.push(entry.pid);
+                if let Some(entry) = index.by_pid.get(child) {
+                    lambs.push(Lamb::new(entry.pid, entry.name.clone()));
+                }
+                stack.push(*child);
             }
         }
-        lambs.sort_unstable_by_key(Lamb::pid_key);
+        lambs.sort_unstable_by_key(|lamb| lamb.pid);
         lambs
     }
 ```
 
-(`Lamb` is `#[non_exhaustive]` but its fields are `pub`, so
-`lambs.sort_unstable_by_key(|lamb| lamb.pid)` works directly — use that rather
-than inventing a `pid_key` helper; the sketch above names one only to keep the
-line short.)
+`&self` is unused in `lambs_of` once the index carries the table — take it
+anyway. It keeps `stats.lambs_of(&index, pid)` reading as one subsystem's
+question rather than a free function, and it leaves room for the walk to
+consult live state later without a call-site change. If clippy objects
+(`unused_self` is not in this workspace's deny list — check), say so rather
+than restructuring around the lint.
 
 Run `cargo test -p shep-daemon --lib --all-features`. Expect green, **+6**.
 
@@ -5682,8 +7056,12 @@ async fn with_lambs(stats: &Arc<StatsState>, mut infos: Vec<ProcessInfo>) -> Vec
     let stats = Arc::clone(stats);
     let pids: Vec<u32> = infos.iter().filter_map(|info| info.pid).collect();
     let Ok(walked) = tokio::task::spawn_blocking(move || {
+        // ONE index for the whole reply — `describe all` on a large flock
+        // walks the machine's process table once, not once per row. This is
+        // the split `LambIndex`'s own doc argues for; see Step 16.0b.
+        let index = stats.lamb_index();
         pids.into_iter()
-            .map(|pid| (pid, stats.lambs_of(pid)))
+            .map(|pid| (pid, stats.lambs_of(&index, pid)))
             .collect::<HashMap<u32, Vec<Lamb>>>()
     })
     .await
@@ -5702,16 +7080,9 @@ async fn with_lambs(stats: &Arc<StatsState>, mut infos: Vec<ProcessInfo>) -> Vec
 }
 ```
 
-`stats.lambs_of` is called once per matched row, and each call refreshes the
-table. For a `describe` of one sheep that is one refresh; for
-`shep describe all` on a large flock it is one per row. **Hoist the refresh**:
-have `lambs_of` take a pre-built index, and add
-`StatsState::lamb_index(&self) -> LambIndex` that walks once — the same split
-`TreeIndex` already makes for exactly this reason ("summing several roots out of
-the same table … build one `TreeIndex` per table and call `sum_from` per root").
-Do this in the same step, not as a follow-up: `TreeIndex`'s own doc is the
-in-tree argument for it and shipping the quadratic version would be shipping
-against a lesson already written down.
+The index is built once and every row's walk reads it — the shape Step 16.0b
+settled and Step 16.2 implemented. Nothing is hoisted here; there is no
+single-argument `lambs_of` at any point in this task.
 
 Wire it into the `Request::Describe` arm alongside `with_live_stats`, and add a
 dispatch test:
@@ -5727,7 +7098,7 @@ async fn only_describe_carries_a_lamb_tree() {
     // that runs finds something and a walk that does not is distinguishable
     // from one that found nothing.
     let h = harness_identifying(
-        vec![ProcScript::runs_forever()],
+        vec![ProcScript::never_exits()],
         vec![
             identity(FIRST_SCRIPTED_PID, None, "srv"),
             identity(FIRST_SCRIPTED_PID + 1, Some(FIRST_SCRIPTED_PID), "node"),
@@ -5777,9 +7148,40 @@ async fn only_describe_carries_a_lamb_tree() {
 }
 ```
 
-`harness_identifying` is a sibling of the existing `harness_sampling`
-(`crates/shep-daemon/src/testing.rs:409`), taking an identity table alongside
-the scripted memory readings.
+**`harness_identifying` does not exist — build it in this step.** It is a
+sibling of the private `harness_sampling` (`crates/shep-daemon/src/testing.rs:409`),
+taking an identity table alongside the scripted memory readings:
+
+```rust
+/// [`harness`], over a process table that reports both resource readings and
+/// process identities.
+///
+/// The one fixture that can answer a lamb walk. `harness_sampling`'s sampler
+/// takes the trait's default `identify` (which returns nothing), so a
+/// `describe` driven through `harness` finds no lambs however the walk is
+/// implemented — which would make a dispatch test of `with_lambs` vacuous.
+pub(crate) fn harness_identifying(
+    scripts: Vec<ProcScript>,
+    identities: Vec<ProcessIdentity>,
+) -> Harness {
+    harness_with_extras(scripts, |reports| { /* … as `harness_sampling`, but with
+        `ScriptedSampler::identifying` in place of `ScriptedSampler::new` … */ })
+}
+```
+
+Read `harness_sampling` and copy its body — it is the one place `Extras` is
+assembled for a test and duplicating that assembly wrong is how a fixture ends
+up with a `stats` the RPC layer does not share (`harness_with_extras`'s own doc
+explains what that costs). `identity(..)` is the same helper Step 16.1a adds;
+it will need to be `pub(crate)` in `testing.rs` rather than private to
+`stats.rs`'s test module if both use it — pick one home and import it from the
+other.
+
+The dispatch test also needs `ScriptedSampler::identifying`'s tables to hold
+`FIRST_SCRIPTED_PID` and a child of it: the pid a `ScriptedRunner` hands the
+first spawn is what the started sheep's `ProcessInfo::pid` carries, so a table
+naming any other pid gives a walk that correctly finds nothing and a test that
+cannot fail.
 
 Run `cargo test -p shep-daemon --lib --all-features`. Expect green, **+1**.
 
@@ -5799,12 +7201,24 @@ to
 
 Run `cargo test -p shep-daemon --lib --all-features`.
 
-**Must go red:** `a_parent_link_cycle_terminates` fails at its 5s bound — pid
-100's parent is 101 and 101's is 100, so the walk revisits the root and never
-settles. `the_lamb_walk_excludes_the_sheeps_own_pid` stays **green** here,
-because that fixture's root has no parent and never comes back around; the two
-tests cover the two things the seeding does and neither one alone would notice
-this.
+**Must go red:** `a_parent_link_cycle_terminates_and_reports_each_pid_once`
+fails on its `assert_eq!`, returning `[Lamb(100, "a"), Lamb(101, "b")]` where
+it expects `[Lamb(101, "b")]` — the root is re-entered as its own descendant
+through the cycle and listed among its own lambs.
+
+**Not a timeout, and the distinction matters.** The first draft of this plan
+claimed this mutation made the case "fail at its 5s bound". It does not: traced
+against the fixture `[{100, parent: 101}, {101, parent: 100}]`, the mutated walk
+still terminates — `visited` dedupes 101, then 100, then the third pop finds
+101 already visited and stops. Only the RESULT is wrong. An implementer told to
+expect a timeout who sees an assertion diff will assume the mutation was
+misapplied and go looking for a second bug. (This is also why the case carries
+no `tokio::time::timeout`: it was decoration, and it was hiding the fact that
+the live assertion is what does the work here. See Step 16.1.)
+
+`the_lamb_walk_excludes_the_sheeps_own_pid` stays **green**, because that
+fixture's root has no parent and the walk never comes back around to it. The
+two cases cover the two things the seeding does and neither alone notices this.
 
 Revert. Second mutation: in `rpc.rs`, apply `with_lambs` to the `ListFlock` arm
 as well.
@@ -5812,7 +7226,15 @@ as well.
 **Must go red:** `only_describe_carries_a_lamb_tree` fails on the `ListFlock`
 half.
 
-Revert.
+Revert. Third mutation, for the index split: in `with_lambs`, move
+`stats.lamb_index()` inside the `map` closure so a fresh index is built per row.
+
+**Every test must stay GREEN**, and that is the point — nothing in this plan's
+suite can distinguish the two, because the difference is cost and not
+behaviour. Record that here rather than inventing a timing assertion that would
+be flaky on a loaded machine: the argument for the split is `TreeIndex`'s own
+doc and `shep describe all`'s row count, and it is carried by review, not by a
+test. Restore the hoisted form.
 
 ### Step 16.5 — CHANGELOG and gate
 
@@ -6131,7 +7553,13 @@ What each of those does NOT do, recorded so it is not rediscovered as drift:
   `Response::Triggered`; adding them stays additive if that changes.
 ```
 
-Add one new entry under "Known debt, recorded rather than built":
+Add one new entry under the known-debt section — **and retitle that heading
+first**. It reads `## Known debt, recorded rather than built (Phase 10)`
+(`deferred.md:130`, verified at `d8bd4af`), so a Phase 11 entry filed under it
+lands beneath a Phase 10 label. Drop the phase qualifier from the heading (the
+section is not phase-scoped and the entries under it already name their own
+phase where it matters), or add a `### Phase 11` subsection. Either is fine;
+leaving it is not.
 
 ```markdown
 ### `shep signal` cannot reach a sheep's lambs, on purpose
@@ -6181,9 +7609,13 @@ information for someone choosing what to put in a reply.
 
 - add the six verbs to the verb list;
 - link `docs/kv.md` beside `docs/dogs.md`;
-- update the test count. Its current figure decays every phase — Phase 10
-  already fixed it once. Take the new number from the actual gate run in Step
-  18.4, not from this plan's arithmetic.
+- **check the test count rather than editing it.** There is no decaying figure
+  to update: line 184 reads "Over a thousand tests", which stays true as the
+  count grows and needs no edit at all. Confirm the prose is still true against
+  Step 18.4's gate run, and replace it with a specific number only if Rin asks
+  for one — a hard figure is precisely the thing that would then decay every
+  phase. (The first draft of this plan said the opposite and named a figure
+  that is not in the file.)
 
 `CLAUDE.md`'s "Status / workflow" paragraph currently ends at Phase 10. Replace
 the "Phase 7 … in flight" style sentence with a Phase 11 line naming the six
@@ -6196,9 +7628,14 @@ Baselines, run before editing:
 grep -c "shep scale" README.md            # 0 at HEAD
 grep -c "docs/kv.md" README.md            # 0 at HEAD
 grep -c "Phase 11" CLAUDE.md              # 0 at HEAD
+grep -c "recorded rather than built (Phase 10)" docs/specs/deferred.md   # 1 at HEAD
+grep -c "Over a thousand tests" README.md # 1 at HEAD, and 1 afterwards
 ```
 
-Each must be non-zero afterwards.
+The first three must be non-zero afterwards; the fourth must be **0** (the
+heading was retitled); the fifth is the one check here that is meant to be
+unchanged, and it is stated so that "I left it alone" and "I forgot to look" are
+distinguishable. All five re-run at `d8bd4af` and print what they say.
 
 ### Step 18.4 — the phase gate
 
@@ -6218,11 +7655,15 @@ Plus both `benches/` gates.
 
 Record the final counts here, in this file, replacing this sentence: the
 baseline was **1044 passed / 0 failed / 3 ignored across 16 result lines**, and
-the phase's own delta is roughly **+97** across the workspace — summing this
-plan's own per-task figures: shep-core ~+34, shep-daemon lib ~+27 (net of the
+the phase's own delta is roughly **+105** across the workspace — summing this
+plan's own per-task figures: shep-core ~+34, shep-daemon lib ~+34 (net of the
 six fd-3 fixtures Task 1 moves OUT of it and into shep-core), shep-cli ~+26,
-and the integration tiers ~+10 between `cli_e2e`, `daemon_e2e` and
-`real_runner`.
+and the integration tiers ~+11 between `cli_e2e`, `daemon_e2e` and
+`real_runner`. The daemon figure went up by seven in this plan's revision:
+Tasks 2, 4, 6, 9 and 10 each gained a case the review found missing (a
+forwarded reply nobody is waiting for, a signal that must not end the proc, a
+partial scale-up's stored count, a live stdin writer, and a flock-wide bound
+that is per-call rather than per-sheep).
 
 Treat that as a shape, not a checksum. Two things matter more than the number:
 `failed` is `0` on all sixteen lines, on both the parallel and the serial run;
