@@ -1,8 +1,10 @@
 name: test
 # Manual-only while the repository is private. Actions minutes on a private
-# repo bill macOS at 10x and Windows at 2x, and one run of this file is 15
-# jobs — six of them on those two platforms. Run it from the Actions tab
-# when you want it.
+# repo bill macOS at 10x and Windows at 2x, and one run of this file is
+# 19 jobs — five of them on those two platforms (two macOS and two Windows
+# in `test`, one Windows in `features`). The full arithmetic, and what
+# turning the triggers on would cost, is in docs/specs/deferred.md. Run it
+# from the Actions tab when you want it.
 #
 # Restore the automatic triggers when the repository goes public, where
 # Actions is free:
@@ -20,7 +22,11 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.93 --profile minimal --component clippy,rustfmt
       - run: cargo +1.93 fmt --all -- --check
-      - run: cargo +1.93 clippy --workspace --all-targets -- -D warnings
+      # `--all-features` mirrors the project's own task gate (CLAUDE.md).
+      # Without it, everything behind shep-daemon's `test-fakes` feature is
+      # unlinted, and clippy's whole value here is that it sees what the
+      # local gate sees.
+      - run: cargo +1.93 clippy --workspace --all-targets --all-features -- -D warnings
   docs:
     runs-on: ubuntu-latest
     steps:
@@ -37,13 +43,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # `ubuntu-24.04-arm` is the leg that matters most and the one this
+        # matrix went nine phases without: shep-client's handshake-close test
+        # was red on linux/arm64 for five phases (platform audit #1) and
+        # nothing here would have said so. Billed as a standard Linux runner,
+        # not at the macOS/Windows multiplier.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
         toolchain: [stable, "1.88"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
-      - run: cargo +${{ matrix.toolchain }} test --workspace --locked
+      # `--all-features` mirrors the task gate, as in `lint` above.
+      - run: cargo +${{ matrix.toolchain }} test --workspace --locked --all-features
   minimal-versions:
     runs-on: ubuntu-latest
     steps:
@@ -97,3 +109,27 @@ jobs:
       # point on a shared runner is proving the harness still compiles and
       # executes, not collecting a timing (see benches/benches/memory_sample.rs).
       - run: cargo +${{ matrix.toolchain }} bench --manifest-path benches/Cargo.toml -- --test
+  privileged:
+    # The one `#[ignore]`d test that is ignored for want of privilege rather
+    # than by design: `real_runner.rs`'s privilege-drop case needs a real uid
+    # change and a real supplementary-group clear, which needs root. The other
+    # two ignores in the workspace are child halves of cross-process race
+    # tests, re-exec'd by their own parents, and must stay ignored.
+    #
+    # A container, not `sudo` on the runner: the test asserts a root daemon
+    # can drop to `nobody` and that std cleared root's supplementary groups
+    # on the way, so it has to actually START as root. A throwaway container
+    # filesystem is the cheap way to have that.
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.88
+    steps:
+      - uses: actions/checkout@v4
+      # `--exact` with the one path, not a bare `--ignored`: the other two
+      # `#[ignore]`s in the workspace (`barks.rs`'s `bark_race_child`,
+      # `shep_toml.rs`'s `config_race_child`) are child halves that assert
+      # nothing and are re-exec'd by their own parents. Running them here
+      # would add two green lines that mean nothing.
+      - run: >
+          cargo test -p shep-daemon --test real_runner --locked --all-features
+          -- --ignored --exact a_dropped_child_runs_as_the_requested_user

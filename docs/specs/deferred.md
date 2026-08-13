@@ -127,6 +127,43 @@ unprompted `action-reply` stay just as invisible as before.
 field carries them and lamb pids are not persisted, so `describe` cannot
 render the tree spec §4 promises.
 
+## Known debt, recorded rather than built (Phase 10)
+
+Not scope cuts and not unbuilt spec surface — these are things that exist and
+work, or that are known to be missing, and that Phase 10 decided to write down
+rather than change. Each says what it is, why it was not done, and what would
+force it.
+
+### Automatic CI, and what it would cost to turn on
+
+`.github/workflows/test.yml` is `on: workflow_dispatch:` — manual only. It is
+correct and ready; the trigger is the only thing missing, and it is missing on
+purpose while the repository is private.
+
+The arithmetic, so the decision is about money rather than about whether the
+jobs work. GitHub bills private-repository Actions minutes with a multiplier
+per platform: Linux ×1, Windows ×2, macOS ×10. One run of this file is:
+
+- `test`: 4 runners × 2 toolchains = 8 jobs — 2 of them macOS (×10), 2 Windows
+  (×2), 4 Linux (×1)
+- `features`: 2 jobs — 1 Windows (×2), 1 Linux
+- `lint`, `docs`, `typos`, `minimal-versions`, `musl`, `coverage`,
+  `privileged`: 7 Linux jobs
+- `bench`: 2 Linux jobs
+
+so 19 jobs, of which the two macOS legs dominate the bill at ten times their
+wall-clock. A `push`+`pull_request` trigger runs the whole file on every commit
+to a branch with a PR open; a `schedule` row adds one run a week regardless.
+
+**The decision is Rin's and has been made for now: leave it manual until the
+base phases ship.** Recorded here so the next person to read the workflow does
+not "fix" the missing trigger, and so that every "all gates green" claim in
+this project's history is understood for what it is — self-reported by the
+agent that wrote the code, never independently re-run.
+
+The job count here and the one in `.github/workflows/test.yml`'s header
+comment are one fact written in two places. Change a matrix and both move.
+
 ## Not deferred
 
 **Dogs** (spec §8) **shipped**: the dog contract (`shep_daemon::dogs`,
