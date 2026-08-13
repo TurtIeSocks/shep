@@ -675,6 +675,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A reply to a live trigger is no longer swallowed as a previous trigger's
   timeout debt when the app echoes the dispatch `id`.
+- The stop ladder no longer clamps an unrecognized `kill_signal` to SIGTERM —
+  `normalize` refuses it first.
 - Let a child block on the shepherd channel. Every fd 3 handed to a child was
   non-blocking, and nothing meant it to be: `UnixStream::pair()` sets
   `O_NONBLOCK` on both ends for the sake of the daemon's own half, `into_std`

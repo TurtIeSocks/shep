@@ -5,6 +5,7 @@ pub mod app;
 pub mod cron;
 pub mod daemon;
 pub mod flockfile;
+pub mod kill_signal;
 pub mod normalize;
 pub mod probe;
 
@@ -12,5 +13,6 @@ pub use app::{AppConfig, ProbeConfig, ProbeKind};
 pub use cron::{CronParseError, CronSchedule, CronScheduleError};
 pub use daemon::{DaemonConfig, DaemonConfigError, LogLevel};
 pub use flockfile::{FlockFormat, Flockfile, FlockfileError, discover};
+pub use kill_signal::KillSignal;
 pub use normalize::{NormalizeError, ResolvedApp, normalize, normalize_all};
 pub use probe::{ProbeTarget, ProbeTargetError};

@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Additions
 
 - Add `protocol::ProcessInfoBuilder`.
+- Add `config::KillSignal`, the four-signal grammar `kill_signal` accepts.
 - Add `barks` module: `Bark`, `SinkOutcome`, `append`, `read`, and
   `DEFAULT_MAX_BYTES` — the `barks.jsonl` ring both the bark dog (a rule
   fired) and the shepherd itself (an enabled dog gave up) append to, and
@@ -341,6 +342,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixes
 
+- `normalize` refuses a `kill_signal` shep cannot send instead of leaving the
+  daemon to substitute SIGTERM at every stop.
 - Give the workspace's path dependencies (`shep-core`, `shep-daemon`,
   `shep-client`) a version alongside their `path`, which `cargo publish`
   requires — it strips `path` from a dependency at publish time and refuses

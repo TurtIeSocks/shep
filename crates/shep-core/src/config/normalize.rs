@@ -9,7 +9,9 @@ use std::collections::BTreeSet;
 
 use globset::Glob;
 
-use crate::config::{AppConfig, CronParseError, CronSchedule, ProbeConfig, ProbeTarget};
+use crate::config::{
+    AppConfig, CronParseError, CronSchedule, KillSignal, ProbeConfig, ProbeTarget,
+};
 use crate::values::UpDuration;
 
 /// Shortest `interval` a `liveness_probe` may name.
@@ -102,6 +104,8 @@ impl ResolvedApp {
 /// - [`NormalizeError::ActionTimeoutTooLong`] — `action_timeout` is at or
 ///   above the ceiling no RPC caller could ever be given room to wait past
 ///   (carries the app name, the value and the ceiling).
+/// - [`NormalizeError::InvalidKillSignal`] — `kill_signal` names a signal the
+///   daemon's stop ladder cannot send (carries the app name and the value).
 /// - [`NormalizeError::WatchWithoutCwd`] — `watch` is `true` with no `cwd`
 ///   set.
 /// - [`NormalizeError::ZeroWatchDelay`] — `watch_delay` is `0`.
@@ -154,6 +158,22 @@ pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
         // RESETS the restart budget rather than spending it. `max_restarts`
         // cannot end that loop, so it has to be refused here.
         return Err(NormalizeError::ZeroMaxMemory { name: app.name });
+    }
+    if let Some(name) = &app.kill_signal
+        && KillSignal::parse(name).is_none()
+    {
+        // Rejected rather than clamped, and this one is the sharpest case of
+        // that trade in the file. The daemon's stop ladder used to fall back
+        // to SIGTERM and log a warning, which meant a typo cost the operator
+        // every stop and every reload for the life of the process, with the
+        // only evidence in a detached daemon's log at the moment of a stop.
+        // `max_cron_sleep` and `MIN_LIVENESS_INTERVAL` reject for the same
+        // reason at lower stakes: the user's file is the only place a
+        // silently-substituted value could ever be noticed.
+        return Err(NormalizeError::InvalidKillSignal {
+            name: app.name,
+            value: name.clone(),
+        });
     }
     if app.action_timeout > MAX_ACTION_TIMEOUT {
         // Rejected rather than clamped, the same trade `MIN_LIVENESS_INTERVAL`
@@ -362,6 +382,14 @@ pub enum NormalizeError {
         /// The ceiling it failed.
         max: UpDuration,
     },
+    /// `kill_signal` names a signal the daemon's stop ladder cannot send.
+    /// Carries the app name and the value as written.
+    InvalidKillSignal {
+        /// The sheep name, so the error names which Flockfile entry to edit.
+        name: String,
+        /// The value as the user wrote it.
+        value: String,
+    },
     /// `watch` is enabled but the app sets no `cwd`, so there is no
     /// directory to watch. Carries the app name.
     WatchWithoutCwd {
@@ -426,6 +454,13 @@ impl fmt::Display for NormalizeError {
                     f,
                     "sheep `{name}` has action_timeout = {value}: must be at most {max}, \
                      the longest wait any caller's deadline could ever cover"
+                )
+            }
+            Self::InvalidKillSignal { name, value } => {
+                write!(
+                    f,
+                    "`{name}`: kill_signal `{value}` is not one shep can send (accepted: {})",
+                    KillSignal::ACCEPTED.join(", ")
                 )
             }
             Self::WatchWithoutCwd { name } => {
@@ -740,6 +775,59 @@ mod tests {
         // configures a limit, which is the whole feature
         let mut app = AppConfig::minimal("web", "./srv");
         app.max_memory = Some("512M".parse().unwrap());
+        assert!(normalize(app).is_ok());
+    }
+
+    /// fails if a `kill_signal` shep cannot send is accepted here. Accepting it
+    /// is what put SIGTERM on the wire for the life of the process with nothing
+    /// but one daemon log line to say so — the clamp this rejection replaces.
+    #[test]
+    fn a_kill_signal_shep_cannot_send_is_refused_by_name() {
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.kill_signal = Some("SIGUSR1".to_string());
+
+        let err = normalize(app).unwrap_err();
+
+        assert_eq!(
+            err,
+            NormalizeError::InvalidKillSignal {
+                name: "web".to_string(),
+                value: "SIGUSR1".to_string(),
+            }
+        );
+        // The message has to name the accepted set, because the operator's next
+        // move is picking a different word and there is nowhere else to look.
+        let rendered = err.to_string();
+        assert!(rendered.contains("SIGUSR1"), "{rendered}");
+        assert!(rendered.contains("SIGTERM"), "{rendered}");
+        assert!(rendered.contains("SIGUSR2"), "{rendered}");
+    }
+
+    /// fails if the four supported names, their bare forms, or a lowercase
+    /// spelling stop being accepted. This is the compatibility half: every
+    /// spelling `stop_signal` accepted before this task must still normalize.
+    #[test]
+    fn every_spelling_the_daemon_already_accepted_still_normalizes() {
+        for name in [
+            "SIGTERM", "TERM", "sigterm", "term", "SIGINT", "INT", "SIGQUIT", "QUIT", "SIGUSR2",
+            "USR2", "sigusr2",
+        ] {
+            let mut app = AppConfig::minimal("web", "./srv");
+            app.kill_signal = Some(name.to_string());
+            assert!(
+                normalize(app).is_ok(),
+                "`{name}` was accepted before this task and must still be"
+            );
+        }
+    }
+
+    /// fails if an unset `kill_signal` is refused — the overwhelmingly common
+    /// case, and the one a validation pass is most likely to break by treating
+    /// `None` as an empty string.
+    #[test]
+    fn an_unset_kill_signal_is_not_a_config_error() {
+        let app = AppConfig::minimal("web", "./srv");
+        assert!(app.kill_signal.is_none());
         assert!(normalize(app).is_ok());
     }
 

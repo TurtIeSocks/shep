@@ -96,7 +96,13 @@ pub struct AppConfig {
     pub restart_delay: Option<UpDuration>,
     /// Initial backoff delay; grows ×1.5 capped at 15s (spec §4)
     pub exp_backoff_restart_delay: Option<UpDuration>,
-    /// Stop signal (default SIGTERM; parsed daemon-side into StopSignal)
+    /// Stop signal, one of `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGUSR2` (the `SIG`
+    /// prefix and the case are both optional). Unset means `SIGTERM`.
+    ///
+    /// A `String` rather than a [`KillSignal`](crate::config::KillSignal) so
+    /// the Flockfile schema and this struct's wire form stay plain text;
+    /// `normalize` is what refuses a name outside that set, the same split
+    /// `cron_restart` and the watch globs already use.
     pub kill_signal: Option<String>,
     /// Grace period between stop signal and SIGKILL
     pub kill_timeout: UpDuration,

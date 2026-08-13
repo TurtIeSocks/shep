@@ -11,7 +11,7 @@ use core::time::Duration;
 
 use tokio::sync::mpsc;
 
-use shep_core::config::AppConfig;
+use shep_core::config::{AppConfig, KillSignal};
 
 use crate::channel::ShepherdMessage;
 use crate::runner::{ExitOutcome, RunningProcess, StopSignal};
@@ -81,28 +81,37 @@ pub async fn kill_process<P: RunningProcess>(
     }
 }
 
-/// Parses `app.kill_signal` into a [`StopSignal`]; unset defaults to `SIGTERM`.
+/// Maps `app.kill_signal` onto a [`StopSignal`]; unset defaults to `SIGTERM`.
 ///
-/// Recognized names (case-insensitive, with or without the `SIG` prefix):
-/// `SIGTERM`/`TERM`, `SIGINT`/`INT`, `SIGQUIT`/`QUIT`, `SIGUSR2`/`USR2`. An
-/// unrecognized name falls back to `SIGTERM` and logs a warning rather than
-/// failing the stop ladder over a config typo.
+/// Total over [`KillSignal`], with no fallback branch, because the grammar
+/// and the rejection both live in shep-core now: a config that reached the
+/// daemon at all came through `normalize`, which refuses any name this cannot
+/// map. The `_ => Term` clamp this replaced is the whole of config.md #2 — it
+/// turned a typo into SIGTERM for the life of the process and said so only in
+/// a log line no detached daemon has a reader for.
+///
+/// The one branch that is still defensive is the unparseable name below. It
+/// is unreachable through `normalize`, and it is an `error!` rather than a
+/// `warn!` for that reason: reaching it means a config bypassed validation,
+/// which is a bug in the daemon's own wiring and not something an operator
+/// can fix by editing a file.
 fn stop_signal(app: &AppConfig) -> StopSignal {
     let Some(name) = app.kill_signal.as_deref() else {
         return StopSignal::Term;
     };
-    match name.to_ascii_uppercase().as_str() {
-        "SIGTERM" | "TERM" => StopSignal::Term,
-        "SIGINT" | "INT" => StopSignal::Int,
-        "SIGQUIT" | "QUIT" => StopSignal::Quit,
-        "SIGUSR2" | "USR2" => StopSignal::Usr2,
-        _ => {
-            tracing::warn!(
-                kill_signal = name,
-                "unknown kill_signal, defaulting to SIGTERM"
-            );
-            StopSignal::Term
-        }
+    let Some(signal) = KillSignal::parse(name) else {
+        tracing::error!(
+            kill_signal = name,
+            "kill_signal reached the stop ladder unvalidated; normalize should have refused it. \
+             Falling back to SIGTERM"
+        );
+        return StopSignal::Term;
+    };
+    match signal {
+        KillSignal::Term => StopSignal::Term,
+        KillSignal::Int => StopSignal::Int,
+        KillSignal::Quit => StopSignal::Quit,
+        KillSignal::Usr2 => StopSignal::Usr2,
     }
 }
 
@@ -117,6 +126,7 @@ mod tests {
     use crate::channel::ShepherdMessage;
     use crate::fake::{ProcScript, ScriptedRunner};
     use crate::runner::{ProcessRunner, SpawnSpec};
+    use crate::testing::capture_logs;
 
     /// The cap an ordinary stop passes — the app's own `kill_timeout`, which
     /// is what every caller outside a reload's drain hands `kill_process`.
@@ -246,10 +256,23 @@ mod tests {
         }
     }
 
+    // fails if an unparseable `kill_signal` reaching the stop ladder (a state
+    // `normalize` should have refused before the daemon ever saw it) stops
+    // logging loudly. This branch is unreachable through a validated config;
+    // it exists only for a wiring bug, and an `error!` line is the one signal
+    // an operator staring at a detached daemon's logs would actually have.
     #[test]
-    fn stop_signal_unknown_name_falls_back_to_term() {
+    fn an_unvalidated_kill_signal_reaching_the_ladder_falls_back_to_term_and_logs_loudly() {
         let mut app = AppConfig::minimal("web", "./srv");
         app.kill_signal = Some("SIGBOGUS".to_string());
-        assert_eq!(stop_signal(&app), StopSignal::Term);
+
+        let mut signal = None;
+        let logs = capture_logs(|| {
+            signal = Some(stop_signal(&app));
+        });
+
+        assert_eq!(signal, Some(StopSignal::Term));
+        assert!(logs.contains("ERROR"), "{logs}");
+        assert!(logs.contains("SIGBOGUS"), "{logs}");
     }
 }
