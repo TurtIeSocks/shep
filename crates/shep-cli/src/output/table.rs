@@ -109,6 +109,40 @@ pub fn human_duration(ms: u64) -> String {
     }
 }
 
+/// Renders `at_ms` (unix millis, UTC by construction — [`Bark::at_ms`]'s own
+/// doc) as a local timestamp for a table cell: `shep barks`' `WHEN` column.
+///
+/// A local rendering, not UTC: `at_ms` is read during an incident, at a
+/// terminal, by an operator who thinks in wall-clock time — the same reason
+/// `human_duration`/`human_bytes` exist instead of a raw `uptime_ms`/
+/// `memory_bytes` echo. The raw millis stay in `--format json`'s `at_ms`
+/// field for a consumer that wants to do its own arithmetic; this is table
+/// output only.
+///
+/// `%Y-%m-%d %H:%M:%S` rather than RFC3339: no `T`, no offset suffix — this
+/// is a column meant to be read at a glance, not parsed back, and the
+/// operator's own local zone is implied by every other clock in the room.
+///
+/// A millis value too large to fit `i64` (`u64::MAX`, a corrupt or
+/// far-future record) renders as the raw number rather than failing the
+/// whole row: [`shep_core::barks::read`]'s own doc already tolerates a bad
+/// *line*; a good line with one unrenderable field should not be dropped
+/// for a reason narrower than that.
+///
+/// [`Bark::at_ms`]: shep_core::barks::Bark::at_ms
+#[must_use]
+pub fn local_timestamp(at_ms: u64) -> String {
+    let Ok(millis) = i64::try_from(at_ms) else {
+        return at_ms.to_string();
+    };
+    let Some(utc) = chrono::DateTime::from_timestamp_millis(millis) else {
+        return at_ms.to_string();
+    };
+    utc.with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
 /// Formats a byte count for a table cell: the largest binary unit that
 /// leaves at least one significant digit, one decimal place under 10.
 ///
@@ -181,6 +215,60 @@ mod tests {
     fn human_duration_day_arm_skips_a_zero_middle_unit() {
         assert_eq!(human_duration(86_700_000), "1d 5m"); // 1 day + 5 minutes, 0 hours
         assert_eq!(human_duration(3_602_000), "1h 2s"); // 1 hour + 2 seconds, 0 minutes
+    }
+
+    /// Round-trips a real millis value through [`local_timestamp`] and back,
+    /// rather than pinning a fixed string — this test must pass on any
+    /// machine in any `$TZ`, and `std::env::set_var` is `unsafe` in edition
+    /// 2024 (this crate is `#![forbid(unsafe_code)]`), so there is no way to
+    /// pin the host's own zone from inside the test. Parsing the rendered
+    /// cell back as a *local* naive datetime and converting it back to UTC
+    /// is what actually proves the cell names the same instant `at_ms`
+    /// does, whatever zone rendered it.
+    #[test]
+    fn local_timestamp_round_trips_through_the_hosts_own_zone() {
+        let at_ms: u64 = 1_700_000_000_000; // 2023-11-14T22:13:20Z, an arbitrary real moment
+        let rendered = local_timestamp(at_ms);
+        assert_eq!(
+            rendered.len(),
+            19,
+            "shape is `YYYY-MM-DD HH:MM:SS`: {rendered}"
+        );
+        let parsed = chrono::NaiveDateTime::parse_from_str(&rendered, "%Y-%m-%d %H:%M:%S")
+            .unwrap_or_else(|e| {
+                panic!("local_timestamp produced something unparseable: {rendered}: {e}")
+            });
+        let resolved_utc = parsed
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap_or_else(|| panic!("{rendered} does not resolve to one local instant"))
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            resolved_utc.timestamp_millis(),
+            i64::try_from(at_ms).unwrap(),
+            "the rendered cell must name the same instant at_ms does, in whatever zone \
+             this machine runs"
+        );
+    }
+
+    /// fails if a millis value this crate cannot render (too large for
+    /// `i64`, or in-range for `i64` but outside chrono's representable
+    /// calendar) panics or silently drops the row, rather than falling back
+    /// to the raw number — [`shep_core::barks::read`]'s own doc already
+    /// tolerates a bad *line*; a good line with one unrenderable field
+    /// should not be dropped for a narrower reason than that.
+    #[test]
+    fn local_timestamp_falls_back_to_the_raw_number_when_it_will_not_render() {
+        assert_eq!(
+            local_timestamp(u64::MAX),
+            u64::MAX.to_string(),
+            "too large to fit i64 at all"
+        );
+        assert_eq!(
+            local_timestamp(u64::try_from(i64::MAX).unwrap()),
+            i64::MAX.to_string(),
+            "fits i64, but names a calendar date far outside what chrono can represent"
+        );
     }
 
     /// `render_table`'s own defensive check, not `assert_no_drift`'s

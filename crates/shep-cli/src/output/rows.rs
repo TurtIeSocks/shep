@@ -11,6 +11,7 @@
 //! kind, so this really is pure tier.
 
 use serde::Serialize;
+use shep_core::barks::{Bark, SinkOutcome};
 use shep_core::protocol::{ActionOutcome, ActionReply, DogSource, ProcessInfo};
 
 use super::Render;
@@ -975,6 +976,88 @@ fn preview_body(body: &str) -> String {
     preview
 }
 
+/// `Vec<Bark>` — `shep barks`' own payload, newest last exactly as it sits
+/// on disk (`shep_core::barks::read`'s own order — a ring is appended to,
+/// never re-sorted) and as `--tail` counts from.
+///
+/// `transparent`, matching every other `Vec<T>` payload in this file: the
+/// JSON is a plain array, not a wrapper object.
+///
+/// Never built from a `Response` — `commands/dogs.rs`'s `barks` reads
+/// `shep_core::barks::read` straight off `barks.jsonl`, never connecting to
+/// the shepherd (that module's own doc: the history is on disk precisely so
+/// it survives the shepherd). `Bark` is shep-core's, so this newtype is what
+/// the orphan rule requires to implement [`Render`] on it.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct BarkRows(pub Vec<Bark>);
+
+impl Render for BarkRows {
+    fn headers() -> &'static [&'static str] {
+        &["WHEN", "RULE", "SUBJECT", "MESSAGE", "SINKS"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|b| {
+                vec![
+                    super::local_timestamp(b.at_ms),
+                    b.rule.clone(),
+                    b.subject.clone(),
+                    b.message.clone(),
+                    sinks_cell(&b.sinks),
+                ]
+            })
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "WHEN" => "at_ms",
+            "RULE" => "rule",
+            "SUBJECT" => "subject",
+            "MESSAGE" => "message",
+            "SINKS" => "sinks",
+            other => panic!("BarkRows::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
+/// Renders one [`Bark::sinks`] list for the `SINKS` column: a delivered sink
+/// by its bare name (`ops`), a refused one with `(failed)` appended
+/// (`ops(failed)`) so the failure is visible in the table an operator is
+/// already reading rather than only in `--format json`'s `error` field —
+/// and never the sink's own error text, which can quote a webhook's HTTP
+/// response and would widen an already-tight column for a detail
+/// `--format json` already carries in full.
+///
+/// `-` for an empty list: [`Bark::sinks`]'s own doc says empty means the
+/// shepherd wrote the record itself, with no sinks and no webhook code — the
+/// same "no honest value" case every other `-` cell in this file marks,
+/// never a delivery this dog attempted and lost track of.
+fn sinks_cell(sinks: &[SinkOutcome]) -> String {
+    if sinks.is_empty() {
+        return "-".to_string();
+    }
+    sinks
+        .iter()
+        .map(|outcome| {
+            if outcome.error.is_some() {
+                format!("{}(failed)", outcome.sink)
+            } else {
+                outcome.sink.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::BTreeSet;
@@ -1595,5 +1678,115 @@ pub(crate) mod tests {
             *table_cell, long_body,
             "the table cell must be the collapsed preview, not the real body"
         );
+    }
+
+    /// Two barks: one the bark dog delivered to a live sink, one it
+    /// refused, and one the shepherd wrote itself with no sinks at all —
+    /// [`sinks_cell`]'s three cases in one fixture, shared by every test
+    /// below.
+    fn sample_barks() -> BarkRows {
+        BarkRows(vec![
+            Bark {
+                at_ms: 1_700_000_000_000,
+                rule: "restart-storm".to_string(),
+                subject: "web".to_string(),
+                message: "3 restarts in 60s".to_string(),
+                sinks: vec![SinkOutcome {
+                    sink: "ops".to_string(),
+                    error: None,
+                }],
+            },
+            Bark {
+                at_ms: 1_700_000_060_000,
+                rule: "daemon".to_string(),
+                subject: "worker".to_string(),
+                message: "restart budget exhausted".to_string(),
+                sinks: vec![],
+            },
+        ])
+    }
+
+    /// fails if `BarkRows` grows a field that never reaches the table —
+    /// the same gate every other payload has. `WHEN` and `SINKS` are both
+    /// human renderings of their own JSON field (a formatted timestamp, and
+    /// a delivered/failed label rather than the raw `SinkOutcome` array), so
+    /// both sit in `formatted` for the reason `assert_no_drift`'s own doc
+    /// gives.
+    #[test]
+    fn bark_rows_do_not_drift() {
+        assert_no_drift(&sample_barks(), |j| &j[0], &["WHEN", "SINKS"]);
+    }
+
+    /// `sinks_cell`'s own coverage: a delivered sink renders bare, a refused
+    /// one carries `(failed)`, and a shepherd-authored bark with no sinks at
+    /// all renders `-` rather than an empty cell — the same "no honest
+    /// value" rule every other `-` cell in this file follows.
+    #[test]
+    fn sinks_render_delivered_failed_and_empty() {
+        let delivered = Bark {
+            sinks: vec![SinkOutcome {
+                sink: "ops".to_string(),
+                error: None,
+            }],
+            ..sample_barks().0[0].clone()
+        };
+        assert_eq!(sinks_cell(&delivered.sinks), "ops");
+
+        let failed = Bark {
+            sinks: vec![SinkOutcome {
+                sink: "ops".to_string(),
+                error: Some("connection refused".to_string()),
+            }],
+            ..sample_barks().0[0].clone()
+        };
+        assert_eq!(sinks_cell(&failed.sinks), "ops(failed)");
+
+        assert_eq!(sinks_cell(&[]), "-");
+    }
+
+    /// Multiple sinks on one bark render as a comma-separated list, each
+    /// carrying its own delivered/failed label independently — the shape a
+    /// bark fanned out to more than one `[dog.bark.sinks]` entry actually
+    /// has.
+    #[test]
+    fn multiple_sinks_each_carry_their_own_outcome() {
+        let sinks = vec![
+            SinkOutcome {
+                sink: "ops".to_string(),
+                error: None,
+            },
+            SinkOutcome {
+                sink: "oncall".to_string(),
+                error: Some("timed out".to_string()),
+            },
+        ];
+        assert_eq!(sinks_cell(&sinks), "ops, oncall(failed)");
+    }
+
+    /// A sink's error text is never a bare word alone — this pins that the
+    /// cell carries no more than the sink's own name plus `(failed)`, never
+    /// the error string itself, which can quote a webhook's HTTP response.
+    #[test]
+    fn a_failed_sinks_error_text_never_reaches_the_cell() {
+        let sinks = vec![SinkOutcome {
+            sink: "ops".to_string(),
+            error: Some("HTTP 401 from discord.com/api/webhooks/...".to_string()),
+        }];
+        let cell = sinks_cell(&sinks);
+        assert_eq!(cell, "ops(failed)");
+        assert!(
+            !cell.contains("401") && !cell.contains("discord"),
+            "the error text must stay out of the table cell: {cell}"
+        );
+    }
+
+    /// `shep barks` is newest-last, matching the file on disk
+    /// (`shep_core::barks::read`'s own order) — this pins that `rows()`
+    /// preserves that order rather than reversing or re-sorting it.
+    #[test]
+    fn bark_rows_stay_in_the_order_they_were_given() {
+        let rows = sample_barks().rows();
+        assert_eq!(rows[0][2], "web", "the older bark stays first");
+        assert_eq!(rows[1][2], "worker", "the newer bark stays last");
     }
 }

@@ -35,15 +35,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use shep_client::Client;
+use shep_core::barks;
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{DogSource, Request, Response};
 
-use crate::cli::{AdoptArgs, Format};
+use crate::cli::{AdoptArgs, BarksArgs, Format};
 use crate::commands::shep_toml::{ShepToml, ShepTomlError};
 use crate::exit::ExitCode;
 use crate::output::{
-    DogAdoptedRow, DogDisabledRow, DogEnabledRow, DogRehomedRow, Streams, emit, emit_error,
-    emit_notice, write_outcome,
+    BarkRows, DogAdoptedRow, DogDisabledRow, DogEnabledRow, DogRehomedRow, Streams, emit,
+    emit_error, emit_notice, write_outcome,
 };
 
 /// [`DogEnabledRow::status`] when `enable` wrote the config but no shepherd
@@ -719,6 +720,44 @@ async fn rehome_after_config(
     }
 }
 
+/// `shep barks`: the alert history, newest last.
+///
+/// Reads `barks.jsonl` straight off disk and never connects to the
+/// shepherd — this module's own doc gives the reasoning shared with `shep
+/// flush --daemon`, the other verb that answers from a file rather than the
+/// socket. [`barks::read`] is already the forgiving half of that file's own
+/// contract: a line a writer died mid-append leaves unparseable costs that
+/// one record, not the whole read, so nothing here has to re-implement
+/// that tolerance.
+///
+/// `--tail N` takes the LAST N records — [`BarksArgs::tail`]'s own doc, and
+/// [`barks::read`]'s: oldest first, so the tail of that `Vec` is the most
+/// recent N, in the same newest-last order the untailed read already has.
+pub fn barks(
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    paths: &ShepPaths,
+    args: &BarksArgs,
+) -> ExitCode {
+    let mut history = match barks::read(&paths.barks) {
+        Ok(history) => history,
+        Err(err) => {
+            let _ = emit_error(
+                &mut *streams.err,
+                fmt,
+                ExitCode::Failure.code_str(),
+                &err.to_string(),
+            );
+            return ExitCode::Failure;
+        }
+    };
+    if let Some(tail) = args.tail {
+        let keep_from = history.len().saturating_sub(tail);
+        history.drain(..keep_from);
+    }
+    write_outcome(emit(&mut *streams.out, fmt, "barks", BarkRows(history)))
+}
+
 #[cfg(test)]
 mod tests {
     use shep_client::testing::{
@@ -1318,5 +1357,187 @@ mod tests {
         let cfg = shep_core::config::DaemonConfig::load(Some(&written), &|_| None).unwrap();
         assert!(cfg.daemon.enabled_dogs.is_empty());
         assert!(!cfg.daemon.adopted_dogs.contains_key("otel"));
+    }
+
+    use shep_core::barks::{self, Bark, SinkOutcome};
+
+    /// A bark named `subject`, at `at_ms`, delivered to one sink named
+    /// `ops`. `barks` tests below only ever care about ordering and
+    /// filtering, so every field but the two callers vary is fixed.
+    fn bark_for(subject: &str, at_ms: u64) -> Bark {
+        Bark {
+            at_ms,
+            rule: "watchdog".to_string(),
+            subject: subject.to_string(),
+            message: "restart budget exhausted".to_string(),
+            sinks: vec![SinkOutcome {
+                sink: "ops".to_string(),
+                error: None,
+            }],
+        }
+    }
+
+    /// fails if `barks` connects to a shepherd, ever renders the ring in
+    /// any order but the one it was written in, or drops the `WHEN` column
+    /// — this is the read-the-file contract `commands/dogs.rs`'s own
+    /// module doc states for this verb, and no client fixture exists
+    /// anywhere in this function's path to accidentally satisfy. `#[test]`,
+    /// not `#[tokio::test]`: `barks` is a plain synchronous fn, exactly
+    /// like `logs::flush_daemon` — the other verb that answers from a file
+    /// with no socket in reach at all.
+    #[test]
+    fn barks_renders_the_ring_newest_last_with_no_client_anywhere_in_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        std::fs::create_dir_all(&paths.home).unwrap();
+        barks::append(&paths.barks, &bark_for("web", 1), barks::DEFAULT_MAX_BYTES).unwrap();
+        barks::append(
+            &paths.barks,
+            &bark_for("worker", 2),
+            barks::DEFAULT_MAX_BYTES,
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = barks(
+            &mut streams(&mut out, &mut err),
+            Format::Table,
+            &paths,
+            &BarksArgs { tail: None },
+        );
+
+        assert_eq!(code, ExitCode::Success);
+        let text = String::from_utf8(out).unwrap();
+        let web_at = text.find("web").expect("the older bark must be rendered");
+        let worker_at = text
+            .find("worker")
+            .expect("the newer bark must be rendered");
+        assert!(
+            web_at < worker_at,
+            "newest last: web (older) must render before worker (newer): {text}"
+        );
+    }
+
+    /// fails if `--tail N` shows anything but the LAST N records — the
+    /// distinction `BarksArgs::tail`'s own doc draws against "the first
+    /// N", which would show an operator the oldest history instead of the
+    /// most recent.
+    #[test]
+    fn tail_shows_only_the_most_recent_n_barks() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        std::fs::create_dir_all(&paths.home).unwrap();
+        for (subject, at_ms) in [("first", 1), ("second", 2), ("third", 3)] {
+            barks::append(
+                &paths.barks,
+                &bark_for(subject, at_ms),
+                barks::DEFAULT_MAX_BYTES,
+            )
+            .unwrap();
+        }
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = barks(
+            &mut streams(&mut out, &mut err),
+            Format::Table,
+            &paths,
+            &BarksArgs { tail: Some(2) },
+        );
+
+        assert_eq!(code, ExitCode::Success);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains("first"),
+            "--tail 2 must drop the oldest of three: {text}"
+        );
+        assert!(text.contains("second"), "{text}");
+        assert!(text.contains("third"), "{text}");
+    }
+
+    /// `--tail` past the length of the whole ring is the whole ring, not a
+    /// usage error or a panic — `history.len().saturating_sub(tail)`'s own
+    /// reason for being `saturating`.
+    #[test]
+    fn tail_larger_than_the_ring_shows_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        std::fs::create_dir_all(&paths.home).unwrap();
+        barks::append(&paths.barks, &bark_for("web", 1), barks::DEFAULT_MAX_BYTES).unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = barks(
+            &mut streams(&mut out, &mut err),
+            Format::Table,
+            &paths,
+            &BarksArgs { tail: Some(50) },
+        );
+
+        assert_eq!(code, ExitCode::Success);
+        assert!(String::from_utf8(out).unwrap().contains("web"));
+    }
+
+    /// fails if a ring nobody has ever written to is treated as a failure —
+    /// no barks yet is the state every fresh `$SHEP_HOME` starts in, and
+    /// `barks::read`'s own doc already makes that `Ok(vec![])` rather than
+    /// an I/O error; this pins that `dogs::barks` still exits `Success` and
+    /// prints headers rather than nothing (`render_table`'s own rule for an
+    /// empty payload).
+    #[test]
+    fn no_ring_file_yet_is_an_empty_history_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = barks(
+            &mut streams(&mut out, &mut err),
+            Format::Table,
+            &paths,
+            &BarksArgs { tail: None },
+        );
+
+        assert_eq!(code, ExitCode::Success);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("WHEN"),
+            "an empty history still prints its header row: {text}"
+        );
+    }
+
+    /// fails if one line a writer died mid-append leaves refuses the whole
+    /// read — the CONTEXT this task was handed is explicit that a corrupt
+    /// trailing line must cost the reader that one record, not the file,
+    /// and `barks::read` (shep-core) is where that tolerance actually
+    /// lives; this test is `dogs::barks`' own proof that nothing between
+    /// here and there swallows it.
+    #[test]
+    fn a_corrupt_trailing_line_costs_one_record_not_the_whole_read() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        std::fs::create_dir_all(&paths.home).unwrap();
+        barks::append(&paths.barks, &bark_for("web", 1), barks::DEFAULT_MAX_BYTES).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&paths.barks)
+            .unwrap()
+            .write_all(b"{\"at_ms\": 2, \"rul\n")
+            .unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = barks(
+            &mut streams(&mut out, &mut err),
+            Format::Table,
+            &paths,
+            &BarksArgs { tail: None },
+        );
+
+        assert_eq!(code, ExitCode::Success);
+        assert!(String::from_utf8(out).unwrap().contains("web"));
     }
 }

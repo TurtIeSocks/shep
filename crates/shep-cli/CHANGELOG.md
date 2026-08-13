@@ -714,6 +714,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and 10s respectively — an empty `[dog.bark]` is the ordinary case, and
   it needed sane numbers, not zeros.
 
+- Add `shep barks [--tail N]`, which shows the alert history —
+  `barks.jsonl` — newest last, the same order a reader scrolling to the
+  bottom of a terminal expects and the same one `tail` itself gives.
+  `--tail N` shows only the last N.
+
+  Reads the file directly and **never connects to the shepherd**: the
+  history is on disk precisely so it survives the shepherd, and the case
+  it exists for is an operator reading it after a crash — the same
+  precedent `shep flush --daemon` set for a verb that answers from a file
+  rather than the socket. A line a writer died mid-append costs the
+  reader that one record, never the whole read (`shep_core::barks::read`'s
+  own contract); `shep barks` adds no tolerance of its own on top of it,
+  because none is missing.
+
+  Columns: `WHEN`, `RULE`, `SUBJECT`, `MESSAGE`, `SINKS`. `WHEN` renders
+  the millis as a local timestamp — the machine surface keeps the raw
+  `at_ms`. `SINKS` renders a delivered sink by its bare name and a refused
+  one with `(failed)` appended, so the failure is visible in the table an
+  operator is already reading rather than only in `--format json`; a bark
+  the shepherd wrote itself, with no sinks at all, renders `-`.
+
 ### Fixes
 
 - `shep enable <name>` sends the source `shep.toml` actually records, not a

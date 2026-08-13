@@ -58,6 +58,13 @@ webpki-roots.workspace = true
 # `log_json` branch, and `ansi` is colour when stderr is a terminal and
 # `NO_COLOR` says nothing to the contrary.
 tracing-subscriber.workspace = true
+# `output::table::local_timestamp`'s rendering of `shep barks`' `WHEN`
+# column: a `Bark::at_ms` (unix millis, UTC by construction) into the
+# operator's own local zone. Adds zero crates to the tree — shep-core and
+# shep-daemon already carry it, at this same workspace-pinned version
+# (`Cargo.lock` resolves exactly one `chrono`), and the workspace entry's
+# `clock` feature is what makes `Local` exist to convert into.
+chrono.workspace = true
 # `bleats.rs`'s `stream.next()` now comes from `EventStream::next`, an
 # inherent method shep-client provides directly — no `StreamExt` import
 # needed here any more. This dependency stays for `FutureExt`: the Ctrl-C

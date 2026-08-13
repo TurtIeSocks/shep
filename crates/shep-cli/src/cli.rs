@@ -144,6 +144,14 @@ pub enum Commands {
     Reopen(ReopenArgs),
     /// Empty the log files of one or more sheep, or the shepherd's own.
     Flush(FlushArgs),
+    /// Show the alert history: `barks.jsonl`, newest last.
+    ///
+    /// Reads the file directly and never connects to the shepherd — the
+    /// history is on disk precisely so it survives the shepherd, and the
+    /// case this verb exists for is an operator reading it after a crash.
+    /// Same precedent as `shep flush --daemon`, which also works on files
+    /// rather than through the socket.
+    Barks(BarksArgs),
     /// Check whether the shepherd answers.
     Ping,
     /// Shut the shepherd down.
@@ -297,6 +305,20 @@ pub struct FlushArgs {
     /// Empty the shepherd's own logs instead of any sheep's
     #[arg(long)]
     pub daemon: bool,
+}
+
+/// Arguments to `shep barks`.
+///
+/// No selector, and no `--daemon`-shaped flag either — `barks.jsonl` is one
+/// file for the whole `$SHEP_HOME`, holding both the bark dog's own alerts
+/// and the ones the shepherd wrote itself when an enabled dog exhausted its
+/// restart budget, so there is no population within it to select a subset
+/// of the way `flush` selects sheep.
+#[derive(Debug, clap::Args)]
+pub struct BarksArgs {
+    /// Show only the last N barks
+    #[arg(long)]
+    pub tail: Option<usize>,
 }
 
 /// Arguments to `shep fold`.
@@ -640,6 +662,29 @@ mod tests {
         );
     }
 
+    /// `shep barks` takes no selector and defaults `--tail` to `None` (every
+    /// bark); `--tail N` parses to `Some(N)`. Fails if either the bare form
+    /// stops parsing or `--tail` stops being optional — a `default_value`
+    /// on it would turn "show everything" into a silent 10-line window with
+    /// nothing to name why.
+    #[test]
+    fn barks_takes_no_selector_and_tail_defaults_to_everything() {
+        use clap::Parser;
+        let bare = Cli::try_parse_from(["shep", "barks"]).unwrap().command;
+        let Commands::Barks(args) = bare else {
+            panic!("`shep barks` must parse with no selector")
+        };
+        assert_eq!(args.tail, None);
+
+        let tailed = Cli::try_parse_from(["shep", "barks", "--tail", "20"])
+            .unwrap()
+            .command;
+        let Commands::Barks(args) = tailed else {
+            panic!("expected barks")
+        };
+        assert_eq!(args.tail, Some(20));
+    }
+
     #[test]
     fn format_defaults_to_table_and_accepts_json() {
         use clap::Parser;
@@ -698,6 +743,7 @@ mod tests {
             "reload",
             "reopen",
             "flush",
+            "barks",
             "trigger",
             "enable",
             "disable",

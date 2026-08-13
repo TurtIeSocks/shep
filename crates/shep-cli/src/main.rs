@@ -358,6 +358,11 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => logs::flush(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
+        // Reads a file and writes nothing; starts nothing, so — like
+        // `--daemon`'s own arm just above — there is nothing to ask the
+        // socket. The history is on disk precisely so it survives the
+        // shepherd (`commands::dogs`' own module doc on this verb).
+        Commands::Barks(ref args) => dogs::barks(&mut streams, fmt, &paths, args),
         Commands::Kill => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => admin::kill(client, &mut streams, fmt).await,
             Err(code) => code,
@@ -690,6 +695,21 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["shep", "import"]).unwrap().command,
             Commands::Import(_)
+        ));
+    }
+
+    /// The `barks` sibling of `import_parses_to_its_own_command` — same
+    /// reasoning, same limit: this pins clap's own parse only, and
+    /// `cli_e2e.rs`'s `barks_reads_the_history_with_no_shepherd_running` is
+    /// what proves the dispatch arm above actually reaches
+    /// `dogs::barks` rather than merely parsing to the right variant.
+    #[test]
+    fn barks_parses_to_its_own_command() {
+        use clap::Parser;
+        use cli::Commands;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "barks"]).unwrap().command,
+            Commands::Barks(_)
         ));
     }
 
