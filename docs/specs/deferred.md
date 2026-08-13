@@ -249,8 +249,11 @@ parent.
 
 ### Reload's Linux-only assertions have no automatic execution
 
-`daemon_e2e.rs:1892` and `:1948` carry `#[cfg(target_os = "linux")]` on the
-reload connection-count assertions, which is correct: they depend on Linux's
+`daemon_e2e.rs`'s `a_reload_costs_a_draining_app_no_connections` and
+`a_reload_costs_a_defiant_app_the_work_it_will_not_finish` each carry
+`#[cfg(target_os = "linux")]` on their reload connection-count assertion
+(`grep -n 'cfg(target_os = "linux")' crates/shep-daemon/tests/daemon_e2e.rs`
+finds both), which is correct: they depend on Linux's
 accept balancing. Their only real execution to date was one manual Docker run.
 Phase 10 added the `ubuntu-24.04-arm` and `ubuntu-latest` legs that would run
 them, but the workflow stays `workflow_dispatch`-only, so they still execute

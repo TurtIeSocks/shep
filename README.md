@@ -158,9 +158,10 @@ Not started: the lookout TUI, the whistle MCP server, `shep serve`,
 key-value store, `.js` Flockfiles, openrc and BSD `rc.d` units, and lambs
 in `describe`'s output.
 
-Windows is last, and it is genuinely zero rather than partial. The crate
-compiles and its unit tests pass there in CI, which is not the same thing as
-working.
+Windows is last, and it is genuinely zero rather than partial. The workspace
+cross-compiles for it, a check restored this phase and currently passing, but
+the Windows legs in the test workflow have never run: CI here is
+manual-only, so no test has ever executed there, only a compile.
 
 [docs/specs/deferred.md](docs/specs/deferred.md) is the full list, including
 the six things deliberately held back past 1.0.
