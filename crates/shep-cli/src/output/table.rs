@@ -237,6 +237,7 @@ mod tests {
             err_file: None,
             cpu_percent: None,
             memory_bytes: None,
+            dog: None,
         }
     }
 

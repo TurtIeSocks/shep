@@ -136,6 +136,28 @@ pub enum Request {
     },
 }
 
+/// Where a dog came from: this binary, or one an operator adopted.
+///
+/// The one thing an operator wants when a dog misbehaves, which is why it
+/// is a column rather than a detail. Carried on [`ProcessInfo::dog`], so a
+/// listing distinguishes the two populations without a second request.
+///
+/// `#[non_exhaustive]`: a future source — a dog fetched from a registry,
+/// say — must not need a protocol version bump (IR-20).
+// wire format: changing existing variants is a breaking change
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DogSource {
+    /// An argv branch of the shep binary itself (`shep dog <name>`).
+    BuiltIn,
+    /// A binary an operator adopted, run at the daemon's own trust level.
+    Adopted {
+        /// The binary's path, exactly as the operator gave it to `adopt`.
+        path: String,
+    },
+}
+
 /// Snapshot of one sheep for listings and events
 // wire format: changing this is a breaking change
 //
@@ -207,6 +229,15 @@ pub struct ProcessInfo {
     /// under the same three conditions as [`Self::cpu_percent`], minus the
     /// window one — memory needs no baseline.
     pub memory_bytes: Option<u64>,
+    /// Set when this entry is a dog, naming where the dog came from;
+    /// `None` for a sheep.
+    ///
+    /// Unlike [`Self::cpu_percent`], `None` here does not need to enumerate
+    /// three cases. A daemon built before dogs existed has none, so "not a
+    /// dog" is the true answer whether this peer predates the field or the
+    /// entry is genuinely a sheep — there is no resource-usage-style claim
+    /// a stale zero could get wrong. Do not "fix" this into three cases.
+    pub dog: Option<DogSource>,
 }
 
 /// What happened when the daemon tried to deliver one sheep's triggered
@@ -459,7 +490,40 @@ mod tests {
             // binary representation holds exactly.
             cpu_percent: Some(12.5),
             memory_bytes: Some(48 * 1024 * 1024),
+            dog: None,
         }
+    }
+
+    /// fails if `DogSource` loses its `tag = "kind"` or its snake_case
+    /// rename, and fails if `Adopted`'s `path` is renamed — any of the three
+    /// changes one of these two strings while every type-level test in this
+    /// module keeps passing. The marker is what the CLI splits two tables on
+    /// and what the metrics dog reports a health gauge from, so a silent
+    /// rename here is a silently empty dogs table.
+    #[test]
+    fn a_dog_source_serializes_snake_case_under_its_kind() {
+        assert_eq!(
+            serde_json::to_string(&DogSource::BuiltIn).unwrap(),
+            r#"{"kind":"built_in"}"#
+        );
+        let adopted = DogSource::Adopted {
+            path: "/usr/local/bin/shep-otel".to_string(),
+        };
+        let wire = r#"{"kind":"adopted","path":"/usr/local/bin/shep-otel"}"#;
+        assert_eq!(serde_json::to_string(&adopted).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<DogSource>(wire).unwrap(), adopted);
+    }
+
+    /// fails if `dog` stops being optional. A daemon built before dogs
+    /// sends a reply with no such key and still announces protocol 1, so a
+    /// required field would make a current client unable to list against it
+    /// at all — the same skew rule `out_file` and `cpu_percent` are pinned
+    /// under, and the same committed-byte-fixture proof.
+    #[test]
+    fn v1_process_info_without_a_dog_marker_still_deserializes() {
+        let fixture = r#"{"id":3,"name":"web","status":"online","pid":4242,"restarts":1,"uptime_ms":60000,"fold":"backend","out_file":"/l/o.log","err_file":"/l/e.log","cpu_percent":12.5,"memory_bytes":50331648}"#;
+        let info: ProcessInfo = serde_json::from_str(fixture).unwrap();
+        assert_eq!(info.dog, None);
     }
 
     #[test]
@@ -610,6 +674,22 @@ mod tests {
                     path: "/home/rin/.shep/flock.json".to_string(),
                     apps: 2,
                 }),
+            },
+            // `sample_info()` above pins the absent marker (a sheep's
+            // `"dog": null`); this row is the only place the present one is
+            // pinned, and `Adopted` rather than `BuiltIn` because it is the
+            // variant carrying a payload — the unit variant's shape is
+            // already proven by every fieldless variant on this wire.
+            Reply {
+                id: 6,
+                result: Ok(Response::Flock(vec![ProcessInfo {
+                    id: 7,
+                    name: "otel".to_string(),
+                    dog: Some(DogSource::Adopted {
+                        path: "/usr/local/bin/shep-otel".to_string(),
+                    }),
+                    ..sample_info()
+                }])),
             },
         ];
         insta::assert_json_snapshot!("reply_wire_v1", replies);

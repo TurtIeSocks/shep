@@ -88,6 +88,11 @@ impl Render for FlockRows {
         // print. They ride the JSON so a programmatic consumer can find a
         // sheep's logs without re-deriving paths the daemon alone resolves.
         "out_file", "err_file",
+        // No SOURCE column, because every row this table renders is a
+        // sheep — `dog` is always `null` here. A dog gets its own table
+        // with its own SOURCE column; this field rides the JSON only so a
+        // consumer that switches on `ProcessInfo` shape alone still sees it.
+        "dog",
     ];
 }
 
@@ -172,6 +177,11 @@ impl Render for FlushedRows {
         "fold",
         "cpu_percent",
         "memory_bytes",
+        // Same reason `FlockRows` keeps it out of its own table: `flush`
+        // matches sheep, so every row here is a sheep and `dog` is always
+        // `null`. Stays in the JSON for the same shape-consistency reason
+        // the rest of this list does.
+        "dog",
     ];
 }
 
@@ -679,6 +689,12 @@ pub(crate) mod tests {
             // rendering it as "48.1M" is the whole point of that function.
             cpu_percent: Some(12.5),
             memory_bytes: Some(50_462_720),
+            // The one field this fixture deliberately leaves `None`, unlike
+            // every other `Option` above: `dog` is `JSON_ONLY` (see
+            // `FlockRows::JSON_ONLY`), not a column, so `assert_no_drift`'s
+            // cell check never reads it — and `None` is the honest value
+            // besides, since every row `sample_flock` builds is a sheep.
+            dog: None,
         }
     }
 

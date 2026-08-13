@@ -582,6 +582,7 @@ mod tests {
             err_file: Some(format!("/logs/{name}-0-err.log")),
             cpu_percent: None,
             memory_bytes: None,
+            dog: None,
         }
     }
 

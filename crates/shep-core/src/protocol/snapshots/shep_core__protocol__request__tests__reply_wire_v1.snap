@@ -28,7 +28,8 @@ expression: replies
             "out_file": "/home/rin/.shep/logs/web-0-out.log",
             "err_file": "/home/rin/.shep/logs/web-0-err.log",
             "cpu_percent": 12.5,
-            "memory_bytes": 50331648
+            "memory_bytes": 50331648,
+            "dog": null
           }
         ]
       }
@@ -70,6 +71,33 @@ expression: replies
           "path": "/home/rin/.shep/flock.json",
           "apps": 2
         }
+      }
+    }
+  },
+  {
+    "id": 6,
+    "result": {
+      "Ok": {
+        "kind": "flock",
+        "data": [
+          {
+            "id": 7,
+            "name": "otel",
+            "status": "online",
+            "pid": 4242,
+            "restarts": 1,
+            "uptime_ms": 60000,
+            "fold": "backend",
+            "out_file": "/home/rin/.shep/logs/web-0-out.log",
+            "err_file": "/home/rin/.shep/logs/web-0-err.log",
+            "cpu_percent": 12.5,
+            "memory_bytes": 50331648,
+            "dog": {
+              "kind": "adopted",
+              "path": "/usr/local/bin/shep-otel"
+            }
+          }
+        ]
       }
     }
   }

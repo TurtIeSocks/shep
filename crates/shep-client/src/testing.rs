@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 
 use shep_core::protocol::{
-    BusEvent, Envelope, Hello, HelloAck, HelloReply, PROTOCOL_VERSION, ProcessEventKind,
+    BusEvent, DogSource, Envelope, Hello, HelloAck, HelloReply, PROTOCOL_VERSION, ProcessEventKind,
     ProcessInfo, Reply, Request, Response, RpcError, RpcErrorCode, codec, decode_frame,
     encode_frame,
 };
@@ -90,6 +90,7 @@ pub fn sample_info() -> ProcessInfo {
         err_file: Some("/home/rin/.shep/logs/web-0-err.log".to_string()),
         cpu_percent: Some(12.5),
         memory_bytes: Some(48 * 1024 * 1024),
+        dog: Some(DogSource::BuiltIn),
     }
 }
 

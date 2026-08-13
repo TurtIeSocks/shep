@@ -12,6 +12,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `ProcessInfo::dog` and `DogSource`, marking which flock entries are
+  dogs (the daemon's own supervised utility processes — metrics, bark) rather
+  than sheep, and naming where a marked one came from: `BuiltIn` for an argv
+  branch of the shep binary itself, `Adopted { path }` for an operator's own
+  binary run at the daemon's own trust level. `DogSource` is
+  `#[non_exhaustive]`, so a future source needs no protocol bump, and `path`
+  is a `String` rather than a `PathBuf` for the reason `ProcessInfo::out_file`
+  is one: serde's `PathBuf` impl refuses a non-UTF-8 path outright, aborting
+  the whole reply rather than degrading the one odd field. Additive under
+  `#[non_exhaustive]` and an `Option` field, so `PROTOCOL_VERSION` stays
+  **1** on the same terms as `out_file`/`cpu_percent` before it: a daemon
+  built before dogs existed sends no `dog` key at all, and a current client
+  decodes that as `None`.
+
+  `None` deliberately covers both "this entry is a sheep" and "this peer
+  predates the field" without needing to tell them apart, unlike
+  `cpu_percent`'s three enumerated cases — a stale `cpu_percent` reading
+  would be a claim about resource use, and there is no equivalent claim a
+  missing `dog` marker could get wrong: a daemon that predates dogs truly has
+  none, so "not a dog" is the correct answer under either reading.
+
 - Add `ProcessInfo::cpu_percent` and `ProcessInfo::memory_bytes`, a sheep's
   live resource use as the daemon read it while answering. CPU is a
   percentage of one core over the window since the daemon's last periodic

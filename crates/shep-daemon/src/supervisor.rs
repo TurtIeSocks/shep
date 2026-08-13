@@ -4001,6 +4001,10 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
         // and never read.
         cpu_percent: None,
         memory_bytes: None,
+        // Every `ProcessEntry` the supervisor tracks today is a sheep — a
+        // dog is a later phase's addition to this same registry, not yet
+        // reachable from here.
+        dog: None,
     }
 }
 

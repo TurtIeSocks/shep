@@ -157,6 +157,7 @@ mod tests {
                     // which never carries a resource reading.
                     cpu_percent: None,
                     memory_bytes: None,
+                    dog: None,
                 },
                 manually: false,
                 at_ms: 1_700_000_000_000,
@@ -222,6 +223,7 @@ mod tests {
                     err_file: None,
                     cpu_percent: None,
                     memory_bytes: None,
+                    dog: None,
                 },
                 manually: true,
                 at_ms: 0,
