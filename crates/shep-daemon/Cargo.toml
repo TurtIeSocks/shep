@@ -32,6 +32,11 @@ tempfile.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Rendering one `[dog.<name>]` table back to TOML text (dogs.rs) — the reply
+# a dog parses is the section as text, not a shep type. `parse` comes with
+# the workspace entry because shep-core needs it to produce the table in the
+# first place; this crate only writes one back out.
+toml.workspace = true
 # DateTime<Utc> for the Clock seam (cron.rs): cron means wall time, which is
 # not the same clock as tokio::time's paused Instant.
 chrono.workspace = true

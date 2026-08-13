@@ -57,6 +57,9 @@
 //!
 //! - `bus`: the daemon-wide event bus — topic-glob filtering, per-subscriber forwarder tasks
 //! - [`rpc`]: request dispatch — verb routing onto [`SupervisorHandle`](supervisor::SupervisorHandle), typed errors, per-call deadlines
+//! - [`dogs`]: the dog contract — what a dog is spawned as
+//!   ([`dog_app`](dogs::dog_app)) and the `[dog.<name>]` section served back
+//!   to it over the socket ([`dog_section`](dogs::dog_section))
 //! - `server`: the unix-socket connection layer — peer-cred auth, handshake, subscriptions (unix-only)
 //! - [`snapshot`]: the muster roll — debounced atomic `flock.json` writes, restart-survival restore
 //! - [`boot`]: daemon boot — `0700` layout dirs, pidfile, socket bind with stale-socket
@@ -230,6 +233,19 @@ pub(crate) mod watch;
 // it open.
 pub mod assemble;
 pub mod channel;
+// Reachable tier, and the second entry here whose consumer lives outside
+// this crate by design rather than by fact today (`sys` is the other one).
+// A `dogs::DogSpec` says which dogs to run and where their binaries come
+// from, which is an answer only `shep.toml` holds — and this crate resolves
+// none of its own knobs from that file: `boot::BootOptions` receives
+// `socket` and `max_cron_sleep` already decided, because every `shep.toml`
+// and `SHEP_*` read in this project happens in `shep-cli`. Dogs follow that
+// same division, so the assembling caller is out-of-crate by construction.
+// (`dogs::dog_section` does read the file, but to serve a dog its own
+// opaque section — never to configure this daemon.) `pub(crate)` would
+// compile and would have to be widened again the moment that caller is
+// written.
+pub mod dogs;
 pub mod limits;
 pub mod privilege;
 pub mod probes;

@@ -660,6 +660,8 @@ pub async fn boot<R: ProcessRunner>(
         events,
         registry,
         snapshot_path: paths.snapshot.clone(),
+        daemon_config: paths.daemon_config.clone(),
+        paths: paths.clone(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         pid,
         shutdown,

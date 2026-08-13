@@ -51,6 +51,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Answer the three dog verbs. `DogConfig` hands a dog its own `[dog.<name>]`
+  section as TOML text, `EnableDog` starts one, and `DisableDog` stops and
+  deregisters it through the same `delete` a sheep goes through — kill
+  ladder, graceful timeout, deregistration — rather than a second way to end
+  a supervised process.
+
+  A dog's configuration travels over the socket, never in its environment.
+  The child inherits `$SHEP_HOME` and nothing else it did not already need in
+  order to exec; it connects to the socket that names, handshakes, and asks
+  for its section. A bark sink is a webhook URL with a bearer token in it,
+  and the environment is readable from the process table on some systems,
+  inherited by every child a dog spawns, and captured into crash dumps. The
+  reply is opaque text the dog parses rather than a shep type, so a
+  third-party dog is bound to the shape of its own section and not to this
+  project's config model, file discovery or layering rules — changing any of
+  those cannot then break a dog nobody has seen.
+
+  The section is read from disk on every request rather than served from a
+  copy taken at boot. One reader can never be stale, and it is what makes
+  `shep disable X && shep enable X` pick up an edited section. A missing
+  file, or a file with no such section, answers with the empty string: a dog
+  with no configuration is the ordinary case, not a fault.
+
+  Enabling a dog under a name a sheep already holds is refused rather than
+  answered. Starting one is idempotent by name, so what comes back is
+  whatever already holds the name; an unmarked entry means no dog started and
+  none can while the name is taken, and reporting it would claim a success
+  that never happened.
+
 - Start a dog. `SupervisorHandle::start_dog` registers one through the same
   spawn path a sheep takes, and writes onto its entry where the dog came
   from. The marker rides the entry rather than a registry of its own, which
@@ -71,8 +100,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kill.
 
 - Keep a dog out of what a wildcard selector sweeps. `stop all`, `reload all`,
-  `delete all` and a `/regex/` or `fold:` sweep now pass every dog by, while a
-  selector that names one — `shep restart bark`, or its id — still reaches it.
+  `delete all`, `describe all` and a `/regex/` or `fold:` sweep now pass every
+  dog by, while a selector that names one — `shep restart bark`, or its id —
+  still reaches it. `flock` is the deliberate exception: it is the single
+  registry both the flock table and the dogs table are rendered from, so
+  filtering there would leave the second one with nothing to show.
   A dog is a process an operator installed rather than a member of the flock
   `all` means, and an operator sweeping the flock does not expect to take the
   metrics plumbing down with it. Selection is now answered in one place for
