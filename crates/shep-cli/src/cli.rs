@@ -90,6 +90,20 @@ pub enum Commands {
     Flock,
     /// List the dogs, and nothing else.
     Dogs,
+    /// Turn on a registered dog: writes `[daemon] enabled_dogs` in
+    /// `shep.toml`, and starts it now if a shepherd is running.
+    ///
+    /// Writes the config either way and exits 0 even with no shepherd
+    /// running — the dog comes up with the next one. `shep muster` is the
+    /// only verb that autostarts a shepherd; this is not it.
+    Enable(DogArgs),
+    /// Turn off a registered dog: removes it from `[daemon] enabled_dogs`,
+    /// and stops it now if a shepherd is running.
+    ///
+    /// Leaves `[dog.<name>]` in place — the dog's own configuration
+    /// survives a disable/enable cycle. `shep rehome` is the verb that
+    /// forgets a dog entirely.
+    Disable(DogArgs),
     /// Describe one sheep in detail.
     Describe(SelectorArgs),
     /// Send a named action to matched sheep and report what each app
@@ -269,6 +283,17 @@ pub struct FlushArgs {
 #[derive(Debug, clap::Args)]
 pub struct FoldArgs {
     /// The fold to list
+    pub name: String,
+}
+
+/// Arguments to `shep enable`/`shep disable`.
+///
+/// One struct for both verbs, matching [`StartupArgs`]'s own precedent: a
+/// dog is named, never selected — `SelectorArgs`' grammar (`all`, `/regex/`,
+/// `fold:<name>`) answers "which of the flock", and a dog is not the flock.
+#[derive(Debug, clap::Args)]
+pub struct DogArgs {
+    /// The dog's name — the `[dog.<name>]` config key
     pub name: String,
 }
 
@@ -608,6 +633,8 @@ mod tests {
             "reopen",
             "flush",
             "trigger",
+            "enable",
+            "disable",
             "ping",
             "kill",
             "save",

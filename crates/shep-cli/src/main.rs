@@ -35,6 +35,8 @@ use commands::bleats;
 #[cfg(unix)]
 use commands::daemon::{daemon_exit_code, run_daemon};
 #[cfg(unix)]
+use commands::dogs;
+#[cfg(unix)]
 use commands::import;
 #[cfg(unix)]
 use commands::lifecycle;
@@ -264,6 +266,13 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => query::dogs(&client, &mut streams, fmt).await,
             Err(code) => code,
         },
+        // Neither goes through `connect_client`/`connect_or_spawn_client`:
+        // both must still write the config with no shepherd running at all
+        // (decision 11, `commands::dogs`' own module doc), so each attempts
+        // its own connection internally and tolerates a failure to reach
+        // one, rather than being refused before it ever gets that far.
+        Commands::Enable(ref args) => dogs::enable(&mut streams, fmt, &paths, &args.name).await,
+        Commands::Disable(ref args) => dogs::disable(&mut streams, fmt, &paths, &args.name).await,
         Commands::Describe(ref args) => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => query::describe(&client, &mut streams, fmt, args).await,
             Err(code) => code,
@@ -497,6 +506,43 @@ mod tests {
             Cli::try_parse_from(["shep", "dogs"]).unwrap().command,
             Commands::Dogs
         ));
+    }
+
+    /// fails if `Commands::Enable`/`Commands::Disable` are wired to another
+    /// verb's function, or if either loses its required `name` positional —
+    /// the same gap `save_parses_to_its_own_command` closes for `save`, plus
+    /// the `SelectorArgs`-family requiredness check
+    /// `a_selector_taking_verb_refuses_to_run_without_one` (`cli.rs`) runs
+    /// for every selector-taking verb, neither of which `DogArgs` shares.
+    #[test]
+    fn enable_and_disable_parse_to_their_own_commands_and_require_a_name() {
+        use clap::Parser;
+        use cli::Commands;
+
+        let enabled = Cli::try_parse_from(["shep", "enable", "metrics"])
+            .unwrap()
+            .command;
+        let Commands::Enable(args) = enabled else {
+            panic!("expected enable")
+        };
+        assert_eq!(args.name, "metrics");
+
+        let disabled = Cli::try_parse_from(["shep", "disable", "metrics"])
+            .unwrap()
+            .command;
+        let Commands::Disable(args) = disabled else {
+            panic!("expected disable")
+        };
+        assert_eq!(args.name, "metrics");
+
+        assert!(
+            Cli::try_parse_from(["shep", "enable"]).is_err(),
+            "`shep enable` with no name must be a usage error"
+        );
+        assert!(
+            Cli::try_parse_from(["shep", "disable"]).is_err(),
+            "`shep disable` with no name must be a usage error"
+        );
     }
 
     /// fails if `Commands::Muster` is wired to another verb's function —

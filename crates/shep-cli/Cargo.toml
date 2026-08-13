@@ -53,6 +53,15 @@ serde_json.workspace = true
 # CLI reads Flockfiles through shep-core — but the workspace entry names both
 # and a per-crate feature narrowing would be the only difference.
 toml.workspace = true
+# `commands::shep_toml`'s `ShepToml`: the one writer of `$SHEP_HOME/shep.toml`
+# in this binary, edited through `toml_edit::DocumentMut` rather than a plain
+# `toml::Table` so an operator's comments, key order and formatting survive a
+# `shep enable`/`shep disable`. Not a workspace entry (like `clap_complete`
+# above): this crate is its only user. Adds zero crates to the tree —
+# `toml` 0.8 already pulls in `toml_edit` 0.22.27 as its own backing
+# implementation (`Cargo.lock`), and `default-features = false` plus this
+# exact feature pair matches what that pulls in already.
+toml_edit = { version = "0.22", default-features = false, features = ["display", "parse"] }
 
 [dev-dependencies]
 # The same shep-client the `[dependencies]` entry above pulls in, asking for

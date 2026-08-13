@@ -12,6 +12,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `shep enable <name>` and `shep disable <name>`, the operator verbs
+  that turn a registered dog on and off. Both write `$SHEP_HOME/shep.toml`
+  first and only then, if a shepherd is reachable, ask it to act — so a
+  failed or skipped RPC still leaves the config saying what the operator
+  asked for, and the next boot honours it.
+
+  - `enable` adds `name` to `[daemon] enabled_dogs` (idempotently) and
+    ensures a `[dog.<name>]` table exists to configure it through, then
+    sends `EnableDog` if a shepherd answers. Against a name a sheep
+    already holds, the daemon refuses with `invalid_config` and a message
+    naming the collision; that message reaches the operator verbatim.
+  - `disable` removes `name` from `enabled_dogs`, leaving `[dog.<name>]`
+    in place — a disabled dog's own configuration survives, unlike
+    `shep rehome` (a later verb), which forgets it entirely — then sends
+    `DisableDog` if a shepherd answers.
+  - Neither verb autostarts a shepherd (`shep muster` is the one verb that
+    does). Against no running daemon, both still exit `0`: the config edit
+    is the part the operator asked for, and it landed. A `--format json`
+    reply's `shepherd_acted` field says whether a shepherd was actually
+    reached; `status` is the resulting state either way.
+  - A config change reaches an already-running dog only through
+    `disable` then `enable` again — neither verb re-reads a running dog's
+    `[dog.<name>]` section on its own.
+
+  `shep.toml` is edited through `toml_edit`, not round-tripped through a
+  plain `toml::Table`: an operator's comments, key order, and formatting
+  survive a `shep enable`/`shep disable`, since that file is hand-written
+  far more often than it is generated. A `shep.toml` that fails to parse
+  is refused rather than overwritten.
+
 - `shep flock` prints a second table beneath the flock's own whenever any
   dog is registered, captioned `Dogs` — headers `NAME`, `SOURCE`, `STATUS`,
   `PID`, `RESTARTS`, `CPU`, `MEM`, `UPTIME`. No `ID` column: ids reflect

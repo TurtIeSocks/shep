@@ -109,6 +109,18 @@ impl Render for FlockRows {
 #[serde(transparent)]
 pub struct DogRows(pub Vec<ProcessInfo>);
 
+/// `DogSource`'s table rendering, shared by every payload with a SOURCE
+/// column: `DogSource` is `#[non_exhaustive]` (IR-20), so a kind this client
+/// predates renders `unknown` rather than failing to compile against a
+/// future daemon.
+fn dog_source_label(source: &DogSource) -> &'static str {
+    match source {
+        DogSource::BuiltIn => "built-in",
+        DogSource::Adopted { .. } => "adopted",
+        _ => "unknown",
+    }
+}
+
 impl Render for DogRows {
     fn headers() -> &'static [&'static str] {
         &[
@@ -122,21 +134,15 @@ impl Render for DogRows {
             .map(|p| {
                 vec![
                     p.name.clone(),
-                    // `built-in` or `adopted`, never the adopted path — see
-                    // `Self::JSON_ONLY`'s sibling reasoning on `FlockRows`
-                    // for why a path stays out of the table. `None` reads
-                    // as `-`: this row only exists because some caller
-                    // filtered on `dog.is_some()`, so a `None` here is a
-                    // caller bug, not a value this type should panic over.
-                    // `DogSource` is `#[non_exhaustive]` (IR-20), so a kind
-                    // this client predates renders `unknown` rather than
-                    // failing to compile against a future daemon.
-                    match &p.dog {
-                        Some(DogSource::BuiltIn) => "built-in".to_string(),
-                        Some(DogSource::Adopted { .. }) => "adopted".to_string(),
-                        Some(_) => "unknown".to_string(),
-                        None => "-".to_string(),
-                    },
+                    // Never the adopted path — see `Self::JSON_ONLY`'s
+                    // sibling reasoning on `FlockRows` for why a path stays
+                    // out of the table. `None` reads as `-`: this row only
+                    // exists because some caller filtered on
+                    // `dog.is_some()`, so a `None` here is a caller bug, not
+                    // a value this type should panic over.
+                    p.dog.as_ref().map_or("-".to_string(), |source| {
+                        dog_source_label(source).to_string()
+                    }),
                     p.status.to_string(),
                     p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                     p.restarts.to_string(),
@@ -182,6 +188,112 @@ impl Render for DogRows {
         // ride the JSON so a programmatic consumer can still find them.
         "out_file", "err_file",
     ];
+}
+
+/// `shep enable <name>`: what the config edit and, if a shepherd is
+/// running, the resulting `EnableDog` RPC actually did.
+///
+/// Constructed by `commands/dogs.rs`'s `enable`, whether or not a shepherd
+/// answered — [`Self::shepherd_acted`] and [`Self::status`] are exactly how
+/// a `--format json` consumer tells the two outcomes apart without also
+/// having to parse a table caption or a stderr notice.
+#[derive(Debug, Serialize)]
+pub struct DogEnabledRow {
+    /// The dog's name.
+    pub name: String,
+    /// Where its binary comes from — always [`DogSource::BuiltIn`] for this
+    /// verb; `shep adopt` is the one that carries a path.
+    pub source: DogSource,
+    /// Whether a shepherd was reached and asked to start the dog. `false`
+    /// means only the config changed — decision 11: `enable` never
+    /// autostarts a shepherd to act on its own edit.
+    pub shepherd_acted: bool,
+    /// The dog's resulting status: a real `ProcStatus` rendering
+    /// (`"online"`, `"starting"`, ...) when a shepherd started it, or a
+    /// sentence explaining why not when none answered.
+    pub status: String,
+}
+
+impl Render for DogEnabledRow {
+    fn headers() -> &'static [&'static str] {
+        &["NAME", "SOURCE", "SHEPHERD", "STATUS"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        vec![vec![
+            self.name.clone(),
+            dog_source_label(&self.source).to_string(),
+            self.shepherd_acted.to_string(),
+            self.status.clone(),
+        ]]
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "NAME" => "name",
+            "SOURCE" => "source",
+            "SHEPHERD" => "shepherd_acted",
+            "STATUS" => "status",
+            other => panic!("DogEnabledRow::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
+/// `shep disable <name>`: what the config edit and, if a shepherd is
+/// running, the resulting `DisableDog` RPC actually did.
+///
+/// Constructed by `commands/dogs.rs`'s `disable`. [`Self::source`] is not
+/// echoed from any RPC reply — `Request::DisableDog` answers
+/// `Response::Deleted`, which carries only ids — so this repeats the same
+/// [`DogSource::BuiltIn`] every `disable` sends, for the same reason
+/// [`DogEnabledRow::source`] does: `shep rehome` is the verb that deals in
+/// an adopted dog's own path.
+#[derive(Debug, Serialize)]
+pub struct DogDisabledRow {
+    /// The dog's name.
+    pub name: String,
+    /// Where its binary comes from — see this type's own doc.
+    pub source: DogSource,
+    /// Whether a shepherd was reached and asked to stop the dog.
+    pub shepherd_acted: bool,
+    /// The dog's resulting status: `"stopped"` when a shepherd acted, or a
+    /// sentence explaining why not when none answered.
+    pub status: String,
+}
+
+impl Render for DogDisabledRow {
+    fn headers() -> &'static [&'static str] {
+        &["NAME", "SOURCE", "SHEPHERD", "STATUS"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        vec![vec![
+            self.name.clone(),
+            dog_source_label(&self.source).to_string(),
+            self.shepherd_acted.to_string(),
+            self.status.clone(),
+        ]]
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "NAME" => "name",
+            "SOURCE" => "source",
+            "SHEPHERD" => "shepherd_acted",
+            "STATUS" => "status",
+            other => panic!("DogDisabledRow::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
 }
 
 /// `Response::Flushed(Vec<ProcessInfo>)` — the sheep a `shep flush` matched,
@@ -955,6 +1067,39 @@ pub(crate) mod tests {
             &DogRows(vec![dog_info("metrics", DogSource::BuiltIn)]),
             |j| &j[0],
             &["UPTIME", "CPU", "MEM", "SOURCE"],
+        );
+    }
+
+    /// fails if `DogEnabledRow` grows a field that never reaches the table —
+    /// the same gate every other payload has. `SOURCE` is `formatted` for
+    /// the same reason `dog_rows_do_not_drift` gives.
+    #[test]
+    fn dog_enabled_row_does_not_drift() {
+        assert_no_drift(
+            &DogEnabledRow {
+                name: "metrics".to_string(),
+                source: DogSource::BuiltIn,
+                shepherd_acted: true,
+                status: "online".to_string(),
+            },
+            |j| j,
+            &["SOURCE"],
+        );
+    }
+
+    /// The other side of `dog_enabled_row_does_not_drift`, for the payload
+    /// `disable` renders.
+    #[test]
+    fn dog_disabled_row_does_not_drift() {
+        assert_no_drift(
+            &DogDisabledRow {
+                name: "metrics".to_string(),
+                source: DogSource::BuiltIn,
+                shepherd_acted: false,
+                status: "not running; will not start with the next shepherd".to_string(),
+            },
+            |j| j,
+            &["SOURCE"],
         );
     }
 
