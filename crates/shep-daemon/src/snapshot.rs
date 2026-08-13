@@ -155,6 +155,14 @@ fn is_running(status: ProcStatus) -> bool {
 /// keep the underlying OS/serde diagnostic via [`core::error::Error::source`];
 /// that costs this enum `Clone`/`PartialEq`/`Eq` (IR-19's documented
 /// exception for variants wrapping `io::Error`).
+///
+/// `#[non_exhaustive]`: today's four variants cover the write-side steps (no
+/// parent, serialize, I/O) and the read-side parse failure, and a future
+/// roll-format change — a version this daemon recognizes but refuses to
+/// restore, rather than merely fails to parse — would need its own variant
+/// distinct from [`Self::Parse`]'s catch-all, and shep-daemon is a published
+/// library an out-of-tree matcher should not break for (IR-20).
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum SnapshotError {
     /// The roll path has no parent directory to create the temp file in

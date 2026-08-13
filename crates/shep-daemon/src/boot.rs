@@ -1122,6 +1122,14 @@ fn install_signals(
 /// diagnostic via [`core::error::Error::source`]; that costs this enum
 /// `Clone`/`PartialEq`/`Eq` (IR-19's documented exception for variants
 /// wrapping `io::Error`).
+///
+/// `#[non_exhaustive]`: today's four variants cover filesystem setup, socket
+/// claim, roll restore, and readiness reporting, and a future boot step —
+/// socket-activation handoff, or cgroup setup — would add a fifth rather
+/// than overloading [`Self::Io`], whose `path`/`source` shape is specific to
+/// the steps that already exist, and shep-daemon is a published library an
+/// out-of-tree matcher should not break for (IR-20).
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum BootError {
     /// A filesystem step failed (carries the path and the OS error)

@@ -113,6 +113,14 @@ impl<'de> Deserialize<'de> for MemSize {
 }
 
 /// Failure to parse a [`MemSize`] from the grammar `^\d+(G|M|K)?$`
+///
+/// `#[non_exhaustive]`: today's four variants exhaust one frozen grammar, but
+/// a future revision of it — fractional sizes (`1.5G`), or a binary-vs-decimal
+/// unit distinction — would want its own variant rather than folding into
+/// [`Self::InvalidCharacter`]'s catch-all, and shep-core is a published
+/// library an out-of-tree matcher should not break for the day that lands
+/// (IR-20).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseMemSizeError {
     /// The input string was empty
@@ -252,6 +260,14 @@ impl<'de> Deserialize<'de> for UpDuration {
 }
 
 /// Failure to parse an [`UpDuration`] from the grammar `^\d+(h|m|s)?$`
+///
+/// `#[non_exhaustive]`, for the same reason as
+/// [`ParseMemSizeError`]: a future grammar
+/// revision — fractional durations, or a `d`/`w` unit — would want its own
+/// variant rather than folding into [`Self::InvalidCharacter`]'s catch-all,
+/// and shep-core is a published library an out-of-tree matcher should not
+/// break for the day that lands (IR-20).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseUpDurationError {
     /// The input string was empty

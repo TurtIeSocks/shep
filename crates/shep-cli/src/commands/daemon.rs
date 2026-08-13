@@ -303,25 +303,28 @@ pub fn boot_options(
 /// Maps a boot or run failure to the process exit status the parent will
 /// read.
 ///
-/// [`BootError`] is not `#[non_exhaustive]` and has exactly four variants,
-/// so the [`DaemonRunError::Boot`] arm matches it exhaustively rather than
-/// carrying a `_` arm that would silently absorb a fifth variant added
-/// later. [`DaemonRunError::Run`] maps unconditionally to
-/// [`ExitCode::Failure`] rather than re-inspecting the inner `BootError`:
-/// `RunningDaemon::run()`'s own `# Errors` section names only
-/// `BootError::Io`, so `AlreadyRunning` — the one variant with its own
-/// dedicated code — can only ever come from the [`DaemonRunError::Boot`]
-/// arm, where a daemon has not yet claimed the flock; a daemon that already
-/// served has no "already running" outcome left to report.
+/// [`BootError`] is `#[non_exhaustive]` (IR-20), so the
+/// [`DaemonRunError::Boot`] arm carries a wildcard rather than naming all
+/// four of today's variants: a boot failure this crate does not yet know
+/// about should still exit non-zero, same as [`BootError::Io`],
+/// [`BootError::Snapshot`], and [`BootError::ReadyWrite`] already do — only
+/// [`BootError::AlreadyRunning`] gets its own code. [`DaemonRunError::Run`]
+/// maps unconditionally to [`ExitCode::Failure`] rather than re-inspecting
+/// the inner `BootError`: `RunningDaemon::run()`'s own `# Errors` section
+/// names only `BootError::Io`, so `AlreadyRunning` — the one variant with
+/// its own dedicated code — can only ever come from the
+/// [`DaemonRunError::Boot`] arm, where a daemon has not yet claimed the
+/// flock; a daemon that already served has no "already running" outcome
+/// left to report.
 #[must_use]
 pub fn daemon_exit_code(err: &DaemonRunError) -> ExitCode {
     match err {
         DaemonRunError::Config(_) => ExitCode::InvalidConfig,
         DaemonRunError::Boot(boot_err) => match boot_err {
             BootError::AlreadyRunning { .. } => ExitCode::DaemonAlreadyRunning,
-            BootError::Io { .. } | BootError::Snapshot(_) | BootError::ReadyWrite(_) => {
-                ExitCode::Failure
-            }
+            // BootError::Io/Snapshot/ReadyWrite today, plus any future
+            // variant IR-20's `#[non_exhaustive]` makes room for.
+            _ => ExitCode::Failure,
         },
         DaemonRunError::Run(_) => ExitCode::Failure,
     }

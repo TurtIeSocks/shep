@@ -700,6 +700,14 @@ pub struct SpawnSpec {
 }
 
 /// Error type returned from spawn and process control
+///
+/// `#[non_exhaustive]`: today's two variants cover spawn and signal
+/// delivery, and a future process-control primitive — a cgroup freeze, or a
+/// Windows job-object failure — would need its own variant rather than
+/// stretching [`Self::SignalFailed`] to mean something Unix signals do not
+/// cover, and shep-daemon is a published library an out-of-tree matcher
+/// should not break for (IR-20).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunnerError {
     /// The OS refused the spawn (exec failure, permissions, missing binary)

@@ -86,6 +86,15 @@ impl ProcessSelector {
 }
 
 /// Error type returned from [`ProcessSelector::parse`]
+///
+/// `#[non_exhaustive]`: only two of today's four selector kinds have a
+/// failure mode of their own (`fold:` with no name, `/regex/` that will not
+/// compile) — a future kind with its own malformed-value class, such as a
+/// `status:` filter rejecting a name that is not a known state, would need a
+/// new variant rather than stretching [`Self::BadRegex`] to mean something
+/// it does not, and shep-core is a published library an out-of-tree matcher
+/// should not break for (IR-20).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectorError {
     /// The selector string was empty

@@ -159,6 +159,15 @@ pub unsafe fn adopt_fd(fd: RawFd) -> Result<File, SysError> {
 }
 
 /// Errors adopting an inherited descriptor.
+///
+/// `#[non_exhaustive]`: today's two variants cover a disqualified fd number
+/// and one the OS says is not open, and a future adoption check — rejecting
+/// an fd that is open but of the wrong kind, not a socket where one is
+/// required — would need its own variant rather than stretching
+/// [`Self::BadFd`] past what `fcntl` actually told the caller, and
+/// shep-daemon is a published library an out-of-tree matcher should not
+/// break for (IR-20).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SysError {
     /// The descriptor number cannot be adopted: negative, or below 3

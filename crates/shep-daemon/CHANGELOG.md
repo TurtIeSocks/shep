@@ -917,3 +917,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The real runner also spawns one pump task per sheep now instead of one per
   stream, so a single request covers both files and answers once.
 - `DogError` is `#[non_exhaustive]`. Match on it with a wildcard arm.
+- `NotifyError`, `BootError`, `SupervisorError`, `AuthError`, `ConnError`,
+  `RunnerError`, `SysError`, `SnapshotError` and `BusError` are
+  `#[non_exhaustive]`. Match on them with a wildcard arm.

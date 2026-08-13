@@ -424,3 +424,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this closes coverage, not behaviour.
 - `FlockfileError`, `DaemonConfigError` and `BarkError` are `#[non_exhaustive]`.
   Match on them with a wildcard arm.
+- `SelectorError`, `ParseMemSizeError`, `ParseUpDurationError` and `WireError`
+  are `#[non_exhaustive]`. Match on them with a wildcard arm.

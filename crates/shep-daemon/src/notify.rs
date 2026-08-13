@@ -146,6 +146,15 @@ fn send_to_abstract(_name: &[u8]) -> Result<(), NotifyError> {
 /// the underlying OS diagnostic through [`core::error::Error::source`]; that
 /// costs this enum `Clone`/`PartialEq`/`Eq` (IR-19's documented exception
 /// for variants wrapping `io::Error`), which nothing here needs.
+///
+/// `#[non_exhaustive]`: today's two variants cover one readiness transport
+/// (an `AF_UNIX` datagram, abstract or pathname) failing to open or send. A
+/// future transport — a named pipe where abstract sockets don't exist, or a
+/// launchd/upstart equivalent of `sd_notify` — would need its own variant,
+/// distinct from [`Self::Unsupported`]'s specifically-a-namespace-mismatch
+/// meaning, and shep-daemon is a published library an out-of-tree matcher
+/// should not break for (IR-20).
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum NotifyError {
     /// The address named the abstract socket namespace (a leading `@`) on a

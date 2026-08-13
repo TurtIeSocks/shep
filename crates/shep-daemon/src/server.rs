@@ -207,6 +207,14 @@ pub fn daemon_uid() -> u32 {
 }
 
 /// Why [`check_peer`] refused a connection.
+///
+/// `#[non_exhaustive]`: today's two variants cover a credentials read that
+/// failed outright and one that succeeded but named the wrong uid, and a
+/// future check — a group-membership or TLS peer-certificate requirement —
+/// would need its own variant rather than stretching [`Self::ForeignUid`] to
+/// mean something it does not, and shep-daemon is a published library an
+/// out-of-tree matcher should not break for (IR-20).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
     /// The OS would not report peer credentials on this socket (carries the
@@ -240,6 +248,15 @@ impl core::error::Error for AuthError {}
 /// [`RpcServer::serve`]'s spawn) and closes the socket. None of these panic
 /// the daemon — a malformed or hostile peer can only ever cost itself its
 /// own connection.
+///
+/// `#[non_exhaustive]`: the connection layer already distinguishes seven
+/// failure points across auth, framing, encode/decode, and handshake
+/// timing, and a future one — a TLS handshake failure, or a rate-limit
+/// refusal — would add its own variant rather than overloading
+/// [`Self::Auth`], which is specifically [`check_peer`]'s verdict, and
+/// shep-daemon is a published library an out-of-tree matcher should not
+/// break for (IR-20).
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum ConnError {
     /// [`check_peer`] refused the connection.

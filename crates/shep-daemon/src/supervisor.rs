@@ -340,6 +340,14 @@ pub(crate) enum Msg {
 }
 
 /// Error type returned from supervisor commands.
+///
+/// `#[non_exhaustive]`: six variants today cover lookup, spawn, reload
+/// overlap, and the two log-maintenance failure classes, and a future
+/// supervisor command — a scale or pause verb — would add its own failure
+/// variant rather than overloading one meant for a different command, and
+/// shep-daemon is a published library an out-of-tree matcher should not
+/// break for (IR-20).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorError {
     /// The selector matched no registered sheep.

@@ -46,6 +46,13 @@ pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, WireError> {
 }
 
 /// Error type returned from [`encode_frame`] and [`decode_frame`]
+///
+/// `#[non_exhaustive]` unconditionally, per IR-20's rule for every wire
+/// enum: the protocol will grow past a JSON payload and a size cap —
+/// checksums, compression, or a second framing format — and this type is on
+/// the peer-facing surface, so an out-of-tree caller must not break the day
+/// it does.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
     /// JSON (de)serialization failed (carries the serde message)

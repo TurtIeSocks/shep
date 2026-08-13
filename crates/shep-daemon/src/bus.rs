@@ -102,6 +102,15 @@ impl TopicFilter {
 }
 
 /// Error type returned from [`TopicFilter::new`]
+///
+/// `#[non_exhaustive]`: today's two variants cover a pattern that will not
+/// compile and a subscribe that asked for too many, and a future
+/// subscribe-time check — a wildcard-depth limit, or a reserved-topic
+/// refusal — would need its own variant rather than stretching
+/// [`Self::BadPattern`] to cover a rule the compiler never rejected, and
+/// shep-daemon is a published library an out-of-tree matcher should not
+/// break for (IR-20).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusError {
     /// A subscribe pattern failed to compile (carries pattern + compiler message)
