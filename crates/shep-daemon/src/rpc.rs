@@ -324,13 +324,33 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
         },
         Request::Scale { name, count } => match ctx.supervisor.scale(&name, count).await {
             Ok(scaled) => {
-                // Re-recorded here, and this line is the whole reason `scale`
-                // hands back the config at all: without it `shep scale web 4`
-                // followed by `shep save` writes a roll saying `instances = 2`,
-                // and the scale is silently undone by the next reboot — a bug
-                // that cannot be seen until the machine comes back.
+                // Recorded UNCONDITIONALLY, and this line is the whole reason
+                // `scale` hands back the config at all: without it `shep scale
+                // web 4` followed by `shep save` writes a roll saying
+                // `instances = 2`, and the scale is silently undone by the next
+                // reboot — a bug that cannot be seen until the machine comes
+                // back. Unconditionally, because a partial scale-up leaves real
+                // instances running that the roll has to know about too: this
+                // recording is about what the daemon DID, while the reply below
+                // is about whether the operator got what they asked for.
+                let achieved = scaled.achieved();
+                let requested = scaled.requested;
                 ctx.registry.record(&[scaled.app]);
-                reply(Ok(Response::Scaled(scaled.instances)))
+                match scaled.shortfall {
+                    None => reply(Ok(Response::Scaled(scaled.instances))),
+                    // Non-zero exit, on purpose: the operator asked for four
+                    // and has three. The sentence names both numbers because
+                    // an operator who reads a bare spawn failure does not know
+                    // the other three came up, and so cannot tell a scale that
+                    // achieved nothing from one that nearly finished.
+                    Some(message) => reply(Err(RpcError {
+                        code: RpcErrorCode::SpawnFailed,
+                        message: format!(
+                            "scaled {name} to {achieved} of {requested} requested; \
+                             the next instance would not spawn: {message}"
+                        ),
+                    })),
+                }
             }
             Err(err) => reply(Err(rpc_error(&err))),
         },
@@ -1434,6 +1454,61 @@ mod tests {
         };
         let roll = crate::snapshot::read(std::path::Path::new(&path)).unwrap();
         assert_eq!(roll.apps[0].app.instances, 4);
+    }
+
+    /// fails if a PARTIAL scale-up leaves the muster roll holding the PRE-scale
+    /// count — the durability half of the same bug the test above covers for the
+    /// full-success path, and the assertion nobody wrote when `scale` landed.
+    ///
+    /// Reproduced: `web` at two instances, scaled to four, one script left in the
+    /// pool so the first new spawn succeeds and the second fails. Three instances
+    /// are then running and healthy. A roll saying `2` means the next `shep
+    /// muster` or reboot silently stops one of them; a roll saying `4` means it
+    /// brings up a count that never ran. Only `3` — what is actually running — is
+    /// the truth, and it only gets there if the handler records off the `Err`
+    /// path too.
+    ///
+    /// The reply is asserted as well as the roll: recording what the daemon did
+    /// must not quietly turn "I gave you three of four" into a success an
+    /// operator's `&&` chain walks straight past.
+    #[tokio::test]
+    async fn a_partial_scale_is_recorded_in_the_roll_and_still_reported_short() {
+        let h = harness(vec![ProcScript::never_exits(); 3]);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.instances = 2;
+        reply_of(dispatch(envelope(1, Request::Start { apps: vec![app] }), &h.ctx).await);
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::Scale {
+                        name: "web".to_string(),
+                        count: 4,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let err = reply.result.unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::SpawnFailed);
+        assert!(
+            err.message.contains("3 of 4"),
+            "the operator has to be told both numbers: {}",
+            err.message
+        );
+
+        let saved = reply_of(dispatch(envelope(3, Request::SaveRoll), &h.ctx).await);
+        let Ok(Response::RollSaved { path, .. }) = saved.result else {
+            panic!("expected RollSaved, got {:?}", saved.result)
+        };
+        let roll = crate::snapshot::read(std::path::Path::new(&path)).unwrap();
+        assert_eq!(
+            roll.apps[0].app.instances, 3,
+            "the roll must hold the three instances really running — not the \
+             pre-scale two, and not the four that were asked for"
+        );
     }
 
     /// fails if the handler forwards `snapshot_now`'s engine-stopped

@@ -703,9 +703,13 @@ impl SupervisorHandle {
     /// - [`SupervisorError::InvalidScale`] — a count of `0`, or a target that
     ///   is a dog.
     /// - [`SupervisorError::ReloadInFlight`] — the app is mid-reload.
-    /// - [`SupervisorError::SpawnFailed`] — an instance would not spawn.
-    ///   Instances already spawned by this call stay running.
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    ///
+    /// A scale-up that ran out of instances part-way is NOT an error here: it
+    /// answers `Ok` with [`Scaled::shortfall`] set, the achieved count on
+    /// [`Scaled::app`], and the instances that did come up still running. See
+    /// [`Scaled`]'s own doc for why, and `crate::rpc` for what the operator is
+    /// told.
     pub(crate) async fn scale(&self, name: &str, count: u32) -> Result<Scaled, SupervisorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -1468,12 +1472,43 @@ enum ReplyKind {
 /// actor reach into the roll keeps [`crate::snapshot::FlockRegistry`] a
 /// thing the rpc layer owns, which is where `Request::Start` already keeps
 /// it.
+///
+/// # Why a scale that fell short is still a `Scaled`
+///
+/// A partial scale-up is a partial SUCCESS: some instances came up, they are
+/// serving traffic, and every registered slot has been rewritten to the count
+/// really running. Reporting that as a flat `Err` throws away the config the
+/// caller needs to record, which is how the muster roll came to keep the
+/// PRE-scale count after a partial scale — a `shep muster` or a reboot then
+/// discarding healthy instances nobody asked it to stop. So the shortfall
+/// rides along in [`Self::shortfall`] and the caller decides what the operator
+/// is told; recording is unconditional, and only the operator's exit code
+/// turns on whether the request was fully satisfied.
 #[derive(Debug)]
 pub(crate) struct Scaled {
-    /// The app's surviving instances, in instance-slot order.
+    /// The app's surviving instances, in instance-slot order. On a partial
+    /// scale-up this is what came up, never the count asked for.
     pub(crate) instances: Vec<ProcessInfo>,
-    /// The app's config as it now stands, with the new `instances` count.
+    /// The app's config as it now stands, with the ACHIEVED `instances` count.
     pub(crate) app: ResolvedApp,
+    /// The count the operator asked for. Equal to [`Self::achieved`] unless
+    /// [`Self::shortfall`] is `Some`.
+    pub(crate) requested: u32,
+    /// `Some(message)` when a scale-up ran out part-way: the spawn failure
+    /// that stopped it, in the runner's own words. `None` on every path that
+    /// reached the requested count.
+    pub(crate) shortfall: Option<String>,
+}
+
+impl Scaled {
+    /// How many instances the app is left running.
+    ///
+    /// Read off `instances` rather than the stored config so the two cannot
+    /// disagree: they are written from the same survivor list, and a build
+    /// that let them drift is one this returns the wrong number for loudly.
+    pub(crate) fn achieved(&self) -> u32 {
+        u32::try_from(self.instances.len()).unwrap_or(u32::MAX)
+    }
 }
 
 /// One command's aggregation state: which ids are still outstanding, the
@@ -2461,8 +2496,7 @@ impl<R: ProcessRunner> Actor<R> {
         // function's care about a partial scale. Writing `rescaled` onto every
         // slot up front and then failing a spawn leaves every survivor
         // claiming `instances = 4` in a flock of three: `shep describe` and the
-        // next `respawn` read the new number, `shep save` writes it, the muster
-        // roll never hears about the failure (rpc.rs records only on `Ok`), and
+        // next `respawn` read the new number, `shep save` writes it, and
         // nothing in the tree notices until a reboot brings up a count that was
         // never running.
         let mut failure = None;
@@ -2550,19 +2584,21 @@ impl<R: ProcessRunner> Actor<R> {
             }
         }
 
-        if let Some(message) = failure {
-            let _ = reply.send(Err(SupervisorError::SpawnFailed(message)));
-            return;
-        }
-
         let mut instances: Vec<ProcessInfo> = survivors
             .iter()
             .filter_map(|id| self.sheep.get(id).map(|slot| to_info(&slot.entry)))
             .collect();
         instances.sort_unstable_by_key(|info| info.id);
+        // `Ok` even when `failure` is set, and that is deliberate: see
+        // `Scaled`'s own doc. The caller records `app` unconditionally and
+        // turns `shortfall` into the operator's error; an `Err` here would
+        // take the achieved config with it and leave the muster roll holding
+        // the pre-scale count.
         let _ = reply.send(Ok(Scaled {
             instances,
             app: stored,
+            requested: count,
+            shortfall: failure,
         }));
     }
 
@@ -7586,10 +7622,18 @@ mod tests {
             reply,
         });
 
-        assert!(matches!(
-            answer.await.unwrap(),
-            Err(SupervisorError::SpawnFailed(_))
-        ));
+        let scaled = answer.await.unwrap().expect(
+            "a partial scale-up is a partial success: an `Err` here would take \
+             the achieved config with it and leave the roll pre-scale",
+        );
+        assert_eq!(scaled.requested, 3);
+        assert_eq!(scaled.achieved(), 2);
+        assert!(
+            scaled.shortfall.is_some(),
+            "the shortfall has to survive the reply, or nothing downstream can \
+             tell the operator they got two of three"
+        );
+        assert_eq!(scaled.app.config().instances, 2);
         assert_eq!(
             stored_instance_counts(&actor),
             vec![2, 2, 2],
