@@ -17,7 +17,7 @@ pub use frame::ServerFrame;
 pub use request::{
     ActionOutcome, ActionReply, DogSectionToml, DogSource, Envelope, Hello, HelloAck, HelloReply,
     ProcessInfo, ProcessInfoBuilder, Reply, Request, Response, RpcError, RpcErrorCode,
-    SelectorSpec,
+    SelectorSpec, SignalOutcome, SignalReply,
 };
 pub use wire::{MAX_FRAME_BYTES, WireError, codec, decode_frame, encode_frame};
 

@@ -25,6 +25,7 @@ pub mod config;
 pub mod paths;
 pub mod protocol;
 pub mod selector;
+pub mod signals;
 pub mod status;
 pub mod values;
 

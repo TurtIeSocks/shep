@@ -123,6 +123,25 @@ pub enum Request {
         /// `action` message this ultimately becomes.
         params: Option<String>,
     },
+    /// Deliver one signal to every matched sheep's OWN process — never its
+    /// process group (see `shep signal`).
+    Signal {
+        /// Which sheep. No default anywhere in the stack, matching every
+        /// other verb that reaches a running process: an operator names the
+        /// target rather than signal the whole flock by accident.
+        selector: SelectorSpec,
+        /// The signal's name, as
+        /// [`OperatorSignal`](crate::signals::OperatorSignal) spells it — the
+        /// `SIG` prefix and the case are both optional.
+        ///
+        /// A `String` rather than the enum, for the reason
+        /// [`AppConfig::kill_signal`](crate::config::AppConfig::kill_signal)
+        /// is one: the wire stays plain text a person can read in a capture,
+        /// and the daemon re-validates regardless, because peer input is
+        /// untrusted. A name outside the grammar answers
+        /// [`RpcErrorCode::InvalidConfig`].
+        signal: String,
+    },
     /// Write the muster roll now, bypassing the snapshot writer's debounce
     SaveRoll,
     /// Assemble the flock from the muster roll on disk: start every app the
@@ -438,6 +457,53 @@ pub struct ActionReply {
     pub outcome: ActionOutcome,
 }
 
+/// What happened when the shepherd tried to deliver one signal.
+///
+/// `#[non_exhaustive]`: a future outcome — a sheep refused because it is a dog,
+/// say, or a delivery held while a stop ladder runs — must not need a protocol
+/// version bump (IR-20).
+// wire format: changing existing variants is a breaking change
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SignalOutcome {
+    /// The kernel accepted the signal for this sheep's pid.
+    ///
+    /// Says the signal was delivered, not that the app did anything with it.
+    /// A signal the app blocks, ignores, or has no handler for is `Delivered`
+    /// exactly like one it acts on — there is nothing on this path that could
+    /// tell the difference, and pretending otherwise would be the dishonest
+    /// half of an honest report.
+    Delivered,
+    /// The sheep is registered but has no live process to signal — stopped,
+    /// errored, or waiting out a restart backoff.
+    NotRunning,
+    /// The kernel refused the delivery; carries its reason (`ESRCH` for a
+    /// process reaped between the lookup and the syscall, `EPERM` for one this
+    /// daemon may not signal).
+    Failed {
+        /// The refusal, as the OS worded it.
+        reason: String,
+    },
+}
+
+/// One matched sheep's row in a `Signal` reply.
+///
+/// Shaped exactly like [`ActionReply`] and for the same reason: spec §9's
+/// selector grammar (`all`, `/regex/`, `fold:`) makes a mixed flock the normal
+/// case, so a per-row outcome beats a whole-request refusal that would leave
+/// the operator unable to tell which half was taken.
+// wire format: changing this is a breaking change
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalReply {
+    /// The sheep's stable id.
+    pub id: u32,
+    /// The sheep's name.
+    pub name: String,
+    /// What happened when the shepherd tried to deliver the signal.
+    pub outcome: SignalOutcome,
+}
+
 /// A dog's `[dog.<name>]` config section, carried as TOML text.
 ///
 /// This travels over the socket rather than the child's environment for
@@ -547,6 +613,12 @@ pub enum Response {
     /// carrying what each one answered rather than a flock listing:
     /// `ProcessInfo` has nowhere to hold a reply body.
     Triggered(Vec<ActionReply>),
+    /// Answer to `Signal` — one [`SignalReply`] row per matched sheep.
+    ///
+    /// Not a flock listing: what a caller wants back is per-instance delivery,
+    /// and [`ProcessInfo`] has nowhere to hold it. Same reasoning, and the
+    /// same row-shaped answer, as [`Self::Triggered`].
+    Signalled(Vec<SignalReply>),
     /// Answer to `SaveRoll`
     RollSaved {
         /// Absolute path of the roll the daemon wrote
@@ -813,6 +885,49 @@ mod tests {
         assert_eq!(info.dog, None);
     }
 
+    /// fails if a `Signal` frame stops carrying the signal name as plain text, or
+    /// if the outcome rows stop distinguishing their three cases. The name travels
+    /// as a `String` on purpose (`AppConfig::kill_signal` does the same): the wire
+    /// stays readable and the daemon re-validates, which it has to do anyway
+    /// because peer input is untrusted.
+    #[test]
+    fn a_signal_request_and_its_reply_round_trip() {
+        let request = Request::Signal {
+            selector: SelectorSpec::Name("web".to_string()),
+            signal: "SIGHUP".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+
+        let reply = Response::Signalled(vec![
+            SignalReply {
+                id: 1,
+                name: "web".to_string(),
+                outcome: SignalOutcome::Delivered,
+            },
+            SignalReply {
+                id: 2,
+                name: "web".to_string(),
+                outcome: SignalOutcome::NotRunning,
+            },
+            SignalReply {
+                id: 3,
+                name: "api".to_string(),
+                outcome: SignalOutcome::Failed {
+                    reason: "no such process".to_string(),
+                },
+            },
+        ]);
+        let json = serde_json::to_string(&reply).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), reply);
+        // The three tags, spelled out: a variant renamed in Rust changes these
+        // strings mechanically, compiles clean, and breaks a client matching on
+        // them with nothing to say why.
+        assert!(json.contains(r#""kind":"delivered""#), "{json}");
+        assert!(json.contains(r#""kind":"not_running""#), "{json}");
+        assert!(json.contains(r#""kind":"failed""#), "{json}");
+    }
+
     #[test]
     fn request_wire_snapshots() {
         let requests = vec![
@@ -968,6 +1083,17 @@ mod tests {
                     selector: SelectorSpec::Fold("api".to_string()),
                 },
             },
+            // `SIGHUP` rather than `SIGTERM`: TERM is what the stop ladder
+            // already sends, so a fixture using it could not tell a `signal`
+            // frame from a stop's. HUP is the signal this verb exists for.
+            Envelope {
+                id: 17,
+                deadline_ms: None,
+                body: Request::Signal {
+                    selector: SelectorSpec::Name("web".to_string()),
+                    signal: "SIGHUP".to_string(),
+                },
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v1", requests);
     }
@@ -1108,6 +1234,33 @@ mod tests {
             Reply {
                 id: 19,
                 result: Ok(Response::ShuttingDown),
+            },
+            // `Signalled`, mirroring the `Triggered` row above: three rows,
+            // one per `SignalOutcome` variant, so a reader sees the whole
+            // shape of the reply in one pinned fixture rather than one row
+            // that happens to hit `Delivered` and leaves the other two tags
+            // unproven.
+            Reply {
+                id: 20,
+                result: Ok(Response::Signalled(vec![
+                    SignalReply {
+                        id: 1,
+                        name: "web".to_string(),
+                        outcome: SignalOutcome::Delivered,
+                    },
+                    SignalReply {
+                        id: 2,
+                        name: "web".to_string(),
+                        outcome: SignalOutcome::NotRunning,
+                    },
+                    SignalReply {
+                        id: 3,
+                        name: "api".to_string(),
+                        outcome: SignalOutcome::Failed {
+                            reason: "no such process".to_string(),
+                        },
+                    },
+                ])),
             },
         ];
         insta::assert_json_snapshot!("reply_wire_v1", replies);

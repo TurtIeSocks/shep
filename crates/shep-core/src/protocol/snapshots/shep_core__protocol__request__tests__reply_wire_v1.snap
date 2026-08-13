@@ -235,5 +235,37 @@ expression: replies
         "kind": "shutting_down"
       }
     }
+  },
+  {
+    "id": 20,
+    "result": {
+      "Ok": {
+        "kind": "signalled",
+        "data": [
+          {
+            "id": 1,
+            "name": "web",
+            "outcome": {
+              "kind": "delivered"
+            }
+          },
+          {
+            "id": 2,
+            "name": "web",
+            "outcome": {
+              "kind": "not_running"
+            }
+          },
+          {
+            "id": 3,
+            "name": "api",
+            "outcome": {
+              "kind": "failed",
+              "reason": "no such process"
+            }
+          }
+        ]
+      }
+    }
   }
 ]
