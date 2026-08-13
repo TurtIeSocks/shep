@@ -194,6 +194,20 @@ IF an operator runs `shep adopt <name> <path>`, THEN:
   rest: a fired alert records a sink by its `[dog.bark.sinks]` config key,
   never the URL or token behind it, and the file is created `0600` inside
   the already-`0700` `$SHEP_HOME`.
+- `shep.toml` is where an operator pastes those webhook URLs, and the four
+  verbs that write it — `enable`, `disable`, `adopt`, `rehome` — are what
+  create it on a host that has never booted a shepherd. They create
+  `$SHEP_HOME` at `0700` and the file at `0600`, both at creation rather
+  than chmod'ed afterwards, so neither is briefly wider and neither waits
+  on the first `shep muster` to be narrowed. The mode also rides along in
+  a `tar` or a `cp -p` of `$SHEP_HOME`, where the directory's own `0700`
+  does not follow.
+- Each of those four holds an exclusive advisory lock on a sibling
+  `shep.toml.lock` across the whole read-edit-write, and installs the new
+  document by renaming a staged temp file over the old one. A provisioning
+  script that backgrounds two of them cannot have one silently drop the
+  other's edit, and a crash or a full disk mid-write leaves the previous
+  file intact rather than a truncated one.
 - Discord and Slack sinks are refused at config load if given a `http://`
   URL — the webhook token lives in the path, and both services only ever
   serve `https://`, so no working deployment loses anything to the refusal.

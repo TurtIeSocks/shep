@@ -9,18 +9,50 @@
 //! SHAPE of the file is decided (what a key means, what a bad value looks
 //! like); this module only ever adds or removes the handful of keys each
 //! verb owns, leaving everything else exactly as it was read.
+//!
+//! Every edit goes through [`ShepToml::edit`], which is the whole write
+//! path: `$SHEP_HOME` created at `0700`, an exclusive advisory lock on a
+//! sibling `shep.toml.lock` held across the read-modify-write, and the new
+//! document staged in a `0600` temp file, `fsync`ed and `rename`d over the
+//! original. Each of those three is the same shape `shep-core`'s
+//! `barks::append` already uses, for the same reasons and after the same
+//! bug: two writers racing on `barks.jsonl` silently lost half of each
+//! other's records until an advisory lock landed there.
+//!
+//! `#[cfg(unix)]` wholesale, at `commands`' own declaration in `main.rs` —
+//! `flock(2)` and unix mode bits are both Unix-only, and Windows is shep's
+//! 0% tier where no verb runs at all.
 
+use std::io::Write as _;
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
+/// Mode `shep.toml` — and the sibling lock file and staging file it is
+/// written through — is created with: owner read/write, nobody else.
+///
+/// Unlike `barks.jsonl`'s own `0600`, this is not belt-and-braces. This
+/// file is where `docs/dogs.md` tells an operator to paste a Discord or
+/// Slack webhook URL, and both carry a bearer token in the path, so the
+/// mode here is the guard rather than a second one behind `$SHEP_HOME`'s.
+/// It is also what a `tar`, a `cp -p` or a backup of `$SHEP_HOME` carries
+/// out with the file, somewhere no directory mode follows it.
+const CONFIG_FILE_MODE: u32 = 0o600;
+
 /// The one writer of `$SHEP_HOME/shep.toml` in this binary.
 ///
-/// A missing file is created (as an empty document — [`Self::save`] makes
-/// the directory too, if needed); a file that will not parse is refused
+/// A missing file is created (as an empty document — [`Self::edit`] makes
+/// `$SHEP_HOME` too, if needed); a file that will not parse is refused
 /// rather than overwritten, because it may hold every knob a daemon boots
 /// with, credentials included, and there is no undo for losing it to a
 /// typo'd verb.
+///
+/// [`Self::edit`] is the only way to reach one of these, and holds the
+/// document's lock for exactly as long as the closure runs. Reading and
+/// writing are deliberately not separate public steps: a caller that
+/// could read, think, and then write would be the lost update this type
+/// takes a lock to prevent.
 pub struct ShepToml {
     path: PathBuf,
     doc: DocumentMut,
@@ -43,12 +75,59 @@ impl std::fmt::Debug for ShepToml {
 }
 
 impl ShepToml {
+    /// Reads `path`, hands the document to `f`, and writes it back — the
+    /// whole read-modify-write under one exclusive advisory lock.
+    ///
+    /// The one way to write this file. `f` returns whatever the caller
+    /// needed to read while the lock was held — `shep enable` reads a
+    /// dog's source before it edits the same document — and that value
+    /// comes back on success.
+    ///
+    /// Serialised against any other editor, in this process or another,
+    /// by a lock on a sibling `shep.toml.lock` ([`ConfigLock`]). Without
+    /// it, `shep adopt otel ... & shep enable metrics &` from one
+    /// provisioning script has both processes read the pre-edit document
+    /// and write the whole thing back, and the loser's edit is gone with
+    /// no error on either side. That is not theory: `barks.jsonl` lost
+    /// half its records to the identical shape before it grew the same
+    /// lock.
+    ///
+    /// # Errors
+    /// - [`ShepTomlError::Io`] — `$SHEP_HOME` could not be created, the
+    ///   lock beside the file could not be taken, or the file could not
+    ///   be read or replaced.
+    /// - [`ShepTomlError::Parse`] — the file exists and is not valid
+    ///   TOML. Refused rather than overwritten, and `f` never runs.
+    pub fn edit<T>(path: &Path, f: impl FnOnce(&mut Self) -> T) -> Result<T, ShepTomlError> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        create_home_dir(parent).map_err(|source| ShepTomlError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+
+        // Held until this function returns, so the read below and the
+        // rename inside `save` are one transaction as far as any other
+        // editor is concerned.
+        let _lock = ConfigLock::acquire(path).map_err(|source| ShepTomlError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        let mut doc = Self::open(path)?;
+        let value = f(&mut doc);
+        doc.save()?;
+        Ok(value)
+    }
+
     /// Reads `path`, treating a missing file as an empty document.
+    ///
+    /// Private, and reached only from [`Self::edit`] with the document's
+    /// lock already held — see that method's own doc.
     ///
     /// # Errors
     /// - [`ShepTomlError::Io`] — the file exists and could not be read.
     /// - [`ShepTomlError::Parse`] — the file exists and is not valid TOML.
-    pub fn open(path: &Path) -> Result<Self, ShepTomlError> {
+    fn open(path: &Path) -> Result<Self, ShepTomlError> {
         let doc = match std::fs::read_to_string(path) {
             Ok(text) => text
                 .parse::<DocumentMut>()
@@ -162,21 +241,47 @@ impl ShepToml {
         }
     }
 
-    /// Writes the document back, creating the parent directory if needed.
+    /// Writes the document back: staged in a sibling temp file at
+    /// [`CONFIG_FILE_MODE`], `fsync`ed, then `rename`d over `path`.
+    ///
+    /// Private, and reached only from [`Self::edit`] with the lock held.
+    ///
+    /// `std::fs::write` opens `O_TRUNC`, so a crash, a signal or an
+    /// `ENOSPC` between the truncate and the write leaves an operator's
+    /// whole `shep.toml` truncated or empty — the one loss this type's
+    /// own doc says there is no undo for. Staging and renaming is what
+    /// every other file this workspace writes already does
+    /// (`barks::write_ring`, `snapshot::write_atomic`,
+    /// `boot::write_pidfile`), and it is also what re-tightens a
+    /// `shep.toml` that an older shep left at `0644`: the rename
+    /// installs the staging file's inode, mode included.
     ///
     /// # Errors
-    /// - [`ShepTomlError::Io`] — the write failed.
-    pub fn save(&self) -> Result<(), ShepTomlError> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| ShepTomlError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
-        std::fs::write(&self.path, self.doc.to_string()).map_err(|source| ShepTomlError::Io {
+    /// - [`ShepTomlError::Io`] — the staging file could not be created or
+    ///   written, or the rename over `path` failed.
+    fn save(&self) -> Result<(), ShepTomlError> {
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let mut tmp = create_config_file(parent).map_err(|source| self.io_error(source))?;
+        tmp.write_all(self.doc.to_string().as_bytes())
+            .map_err(|source| self.io_error(source))?;
+        tmp.as_file()
+            .sync_all()
+            .map_err(|source| self.io_error(source))?;
+        // `persist` is `rename(2)`. On failure the `NamedTempFile` comes
+        // back inside the error and its `Drop` removes the staging file,
+        // so a failed replace leaves nothing behind in `$SHEP_HOME`.
+        tmp.persist(&self.path)
+            .map_err(|err| self.io_error(err.error))?;
+        Ok(())
+    }
+
+    /// This file's [`ShepTomlError::Io`], for the several ways one write
+    /// of it can fail.
+    fn io_error(&self, source: std::io::Error) -> ShepTomlError {
+        ShepTomlError::Io {
             path: self.path.clone(),
             source,
-        })
+        }
     }
 
     /// `[daemon]`, creating it (empty) if this document has none yet.
@@ -204,8 +309,106 @@ impl ShepToml {
     }
 }
 
-/// What [`ShepToml::open`]/[`ShepToml::save`] can fail with. Module-scoped
-/// per IR-18.
+/// Creates `dir` (and any missing parent) at `boot::DIR_MODE` directly,
+/// via `DirBuilderExt`, rather than `create_dir_all` and a later `chmod`.
+///
+/// `$SHEP_HOME` holds the webhook URLs `docs/dogs.md` tells an operator to
+/// paste into `[dog.bark.sinks]`, and on a host that has never booted a
+/// shepherd this call is the one that creates it — `boot::init_dirs`, which
+/// force-chmods it to `DIR_MODE`, does not run until the first `shep
+/// muster`. A `create_dir_all` here would leave it at the ambient umask,
+/// typically `0755`, for every local user to read until that boot. Asking
+/// for the mode at `mkdir` time also leaves no window in which the
+/// directory exists wider, the same TOCTOU discipline
+/// `launch::launch_command` and `boot::create_dir_at_dir_mode` each spell
+/// out at their own call.
+///
+/// Reuses `shep_daemon::boot::DIR_MODE` rather than restating `0o700`: one
+/// spelling of the number, so a change to the daemon's posture cannot pass
+/// this by.
+fn create_home_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(shep_daemon::boot::DIR_MODE)
+        .create(dir)
+}
+
+/// Creates the staging file the config is written through, in `parent` so
+/// the later `rename` stays within one filesystem.
+///
+/// Mode-at-creation rather than a separate `chmod` pass (`tempfile` passes
+/// these permissions to the `open` call itself): there is no window in
+/// which the file holding a webhook token sits at whatever the process
+/// umask leaves it. Same shape, and same reasoning, as
+/// `barks::create_ring_file`.
+fn create_config_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix("shep")
+        .suffix(".toml.tmp")
+        .permissions(std::fs::Permissions::from_mode(CONFIG_FILE_MODE))
+        .tempfile_in(parent)
+}
+
+/// An exclusive advisory lock over one `shep.toml`, held for as long as
+/// the value lives and released when it drops (including on an early `?`,
+/// and by the kernel if the process dies holding it).
+///
+/// The lock is on a sibling `shep.toml.lock`, never on the config itself,
+/// and that is the whole design decision — the same one `barks::RingLock`
+/// records: [`ShepToml::save`] finishes by `rename`ing a new file over the
+/// config, which replaces the inode. A lock taken on the config would be a
+/// lock on an inode the very next successful save unlinks; the next writer
+/// would open the *new* inode, find it unlocked, and the two would be
+/// excluding nothing. The lock file is never renamed, never rewritten and
+/// never read; it exists only to be an inode with a stable identity, and
+/// it is left on disk between edits on purpose so both writers keep
+/// agreeing on which one it is.
+struct ConfigLock {
+    /// `flock(2)` is released by this handle's `Drop`. Named with a
+    /// leading underscore because it is held, never read.
+    _flock: nix::fcntl::Flock<std::fs::File>,
+}
+
+impl ConfigLock {
+    /// Blocks until this process holds `path`'s lock exclusively.
+    ///
+    /// # Errors
+    /// The lock file could not be created beside `path`, or `flock` failed
+    /// for a reason other than contention (contention blocks rather than
+    /// failing).
+    fn acquire(path: &Path) -> std::io::Result<Self> {
+        use nix::fcntl::{Flock, FlockArg};
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(CONFIG_FILE_MODE)
+            .open(lock_path(path))?;
+
+        // `LockExclusive` blocks; the non-blocking variant would need a
+        // retry loop and a deadline, and a `shep enable` that waits its
+        // turn behind a concurrent `shep adopt` is exactly the behaviour
+        // wanted here.
+        Flock::lock(file, FlockArg::LockExclusive)
+            .map(|flock| Self { _flock: flock })
+            .map_err(|(_file, errno)| std::io::Error::from(errno))
+    }
+}
+
+/// The lock file that guards `path`: its own name with `.lock` appended,
+/// so it sits in `$SHEP_HOME` next to the config and inherits that
+/// directory's `0700`.
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".lock");
+    path.parent().unwrap_or_else(|| Path::new(".")).join(name)
+}
+
+/// What [`ShepToml::edit`] can fail with. Module-scoped per IR-18.
 pub enum ShepTomlError {
     /// A read or write of `path` itself failed.
     Io {
@@ -275,6 +478,11 @@ mod tests {
 
     use super::*;
 
+    /// `path`'s permission bits, masked to the nine that matter.
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
     /// fails if the writer round-trips through a plain `toml::Table`. An
     /// operator's `shep.toml` is hand-written, and a `shep enable` that
     /// silently dropped their comments and reordered their keys is a reason
@@ -286,9 +494,7 @@ mod tests {
         let original = "# the shepherd's own knobs\n[daemon]\nlog_level = \"info\"  # chatty\nlog_json = false\n";
         std::fs::write(&path, original).unwrap();
 
-        let mut doc = ShepToml::open(&path).unwrap();
-        doc.enable_dog("metrics");
-        doc.save().unwrap();
+        ShepToml::edit(&path, |doc| doc.enable_dog("metrics")).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("# the shepherd's own knobs"));
@@ -316,17 +522,16 @@ mod tests {
         let path = dir.path().join("shep.toml");
         std::fs::write(&path, "[dog.bark]\ndebounce = \"30s\"\n").unwrap();
 
-        let mut doc = ShepToml::open(&path).unwrap();
-        doc.enable_dog("bark");
-        doc.enable_dog("bark");
-        doc.save().unwrap();
+        ShepToml::edit(&path, |doc| {
+            doc.enable_dog("bark");
+            doc.enable_dog("bark");
+        })
+        .unwrap();
         let cfg =
             DaemonConfig::load(Some(&std::fs::read_to_string(&path).unwrap()), &|_| None).unwrap();
         assert_eq!(cfg.daemon.enabled_dogs, vec!["bark"]);
 
-        let mut doc = ShepToml::open(&path).unwrap();
-        doc.disable_dog("bark");
-        doc.save().unwrap();
+        ShepToml::edit(&path, |doc| doc.disable_dog("bark")).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         let cfg = DaemonConfig::load(Some(&written), &|_| None).unwrap();
         assert!(cfg.daemon.enabled_dogs.is_empty());
@@ -345,7 +550,7 @@ mod tests {
         let path = dir.path().join("shep.toml");
         std::fs::write(&path, "[daemon\nlog_json = true\n").unwrap();
         assert!(matches!(
-            ShepToml::open(&path),
+            ShepToml::edit(&path, |doc| doc.enable_dog("metrics")),
             Err(ShepTomlError::Parse { .. })
         ));
         assert_eq!(
@@ -361,9 +566,10 @@ mod tests {
     fn rehoming_a_dog_forgets_it_entirely() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shep.toml");
-        let mut doc = ShepToml::open(&path).unwrap();
-        doc.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
-        doc.save().unwrap();
+        ShepToml::edit(&path, |doc| {
+            doc.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
+        })
+        .unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         let cfg = DaemonConfig::load(Some(&written), &|_| None).unwrap();
         assert_eq!(cfg.daemon.enabled_dogs, vec!["otel"]);
@@ -376,9 +582,7 @@ mod tests {
         );
         assert!(cfg.dog.contains_key("otel"));
 
-        let mut doc = ShepToml::open(&path).unwrap();
-        doc.rehome_dog("otel");
-        doc.save().unwrap();
+        ShepToml::edit(&path, |doc| doc.rehome_dog("otel")).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         let cfg = DaemonConfig::load(Some(&written), &|_| None).unwrap();
         assert!(cfg.daemon.enabled_dogs.is_empty());
@@ -394,28 +598,75 @@ mod tests {
     fn adopted_dog_path_reads_what_adopt_dog_wrote_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shep.toml");
-        let mut doc = ShepToml::open(&path).unwrap();
-        doc.enable_dog("metrics"); // built-in: no `adopted_dogs` entry at all
-        doc.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
+        ShepToml::edit(&path, |doc| {
+            doc.enable_dog("metrics"); // built-in: no `adopted_dogs` entry at all
+            doc.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
 
-        assert_eq!(
-            doc.adopted_dog_path("otel"),
-            Some(PathBuf::from("/usr/local/bin/shep-otel"))
-        );
-        assert_eq!(doc.adopted_dog_path("metrics"), None);
-        assert_eq!(doc.adopted_dog_path("ghost"), None);
+            assert_eq!(
+                doc.adopted_dog_path("otel"),
+                Some(PathBuf::from("/usr/local/bin/shep-otel"))
+            );
+            assert_eq!(doc.adopted_dog_path("metrics"), None);
+            assert_eq!(doc.adopted_dog_path("ghost"), None);
+        })
+        .unwrap();
     }
 
-    /// A missing `shep.toml` is not an error — `open` treats it as an empty
-    /// document, and `save` creates the file (and its parent directory).
+    /// A missing `shep.toml` is not an error — `edit` opens it as an empty
+    /// document and creates the file (and `$SHEP_HOME` itself).
     #[test]
-    fn a_missing_file_opens_empty_and_save_creates_it() {
+    fn a_missing_file_opens_empty_and_edit_creates_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("shep.toml");
-        let mut doc = ShepToml::open(&path).unwrap();
-        doc.enable_dog("metrics");
-        doc.save().unwrap();
+        ShepToml::edit(&path, |doc| doc.enable_dog("metrics")).unwrap();
         assert!(path.exists());
+    }
+
+    /// fails if the first `shep enable` on a host that has never booted a
+    /// shepherd leaves either the file or `$SHEP_HOME` readable by another
+    /// local user. This is the file `docs/dogs.md` tells an operator to
+    /// paste a Discord webhook URL into, and `boot::init_dirs` — the
+    /// force-chmod that would otherwise narrow the directory — does not run
+    /// until the first `shep muster`, which may be much later or never.
+    ///
+    /// Both modes are asserted on a path where neither the directory nor
+    /// the file existed beforehand, because that is the case the ambient
+    /// umask would decide.
+    #[test]
+    fn a_first_edit_creates_the_home_and_the_file_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("cold");
+        let path = home.join("shep.toml");
+
+        ShepToml::edit(&path, |doc| doc.enable_dog("bark")).unwrap();
+
+        assert_eq!(
+            mode_of(&home),
+            0o700,
+            "$SHEP_HOME is readable by other local users until the first boot"
+        );
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "the file a webhook token goes in, and the mode a `tar` of it keeps"
+        );
+    }
+
+    /// fails if an existing `shep.toml` left wide by an older shep (or by
+    /// an operator's own `touch`) stays wide after this writer replaces it.
+    /// The rename installs the staging file's inode, mode included, so the
+    /// narrowing is a property of the write path rather than a chmod pass
+    /// somebody has to remember to run.
+    #[test]
+    fn editing_a_world_readable_config_leaves_it_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(&path, "[daemon]\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        ShepToml::edit(&path, |doc| doc.enable_dog("bark")).unwrap();
+
+        assert_eq!(mode_of(&path), 0o600);
     }
 
     /// The redaction IR-41 requires: `Debug` on a parse failure carries the
@@ -448,5 +699,120 @@ mod tests {
         // reads to find their own typo — it still shows the offending line.
         let display = err.to_string();
         assert!(display.contains("invalid table header"));
+    }
+
+    /// Env var naming the `shep.toml` the re-executed child should edit.
+    /// Its presence is also what tells the child it is a child.
+    const CHILD_PATH_VAR: &str = "SHEP_CONFIG_RACE_PATH";
+    /// Env var carrying the child's tag, which decides both which verb's
+    /// edit it makes and what it names the dogs it writes.
+    const CHILD_TAG_VAR: &str = "SHEP_CONFIG_RACE_TAG";
+    /// How many edits each of the two writers makes. One apiece would race
+    /// only in the instant the two overlap; this many makes an unlocked
+    /// read-modify-write lose an edit on essentially every run.
+    const EDITS_PER_WRITER: usize = 100;
+    /// The tag whose child adopts (`[daemon] adopted_dogs` plus
+    /// `enabled_dogs`); the other enables (`enabled_dogs` alone). Two
+    /// different edits, so a survivor of one cannot stand in for the other.
+    const ADOPTING_TAG: &str = "alpha";
+
+    /// Not a test — the child half of
+    /// [`two_writer_processes_do_not_lose_each_other_s_edits`], which
+    /// re-executes this binary with `--ignored --exact` to reach it. It is
+    /// `#[ignore]`d so a normal run never picks it up, and it asserts
+    /// nothing: its job is to hammer [`ShepToml::edit`] from a second OS
+    /// process, and the parent does the judging.
+    #[test]
+    #[ignore = "child process of two_writer_processes_do_not_lose_each_other_s_edits"]
+    fn config_race_child() {
+        let Ok(path) = std::env::var(CHILD_PATH_VAR) else {
+            panic!("{CHILD_PATH_VAR} unset — this test is only run as a child process");
+        };
+        let tag = std::env::var(CHILD_TAG_VAR).expect("child needs a tag");
+        let path = PathBuf::from(path);
+
+        for i in 0..EDITS_PER_WRITER {
+            let name = format!("{tag}-{i}");
+            ShepToml::edit(&path, |doc| {
+                if tag == ADOPTING_TAG {
+                    doc.adopt_dog(&name, Path::new("/usr/local/bin/shep-otel"));
+                } else {
+                    doc.enable_dog(&name);
+                }
+            })
+            .expect("child edit");
+        }
+    }
+
+    /// fails if two `shep` processes editing one `shep.toml` lose each
+    /// other's edits — `shep adopt otel ... & shep enable metrics &` out of
+    /// a provisioning script, where both read the pre-edit document and
+    /// both write the whole thing back.
+    ///
+    /// Two OS processes, not two threads: this document is read and written
+    /// by whole `shep` invocations, so any in-process serialisation would
+    /// prove nothing about the bug, which is a read-modify-write across a
+    /// `rename` with no lock between address spaces. `barks.jsonl` had the
+    /// identical shape and lost half its records to it.
+    #[test]
+    fn two_writer_processes_do_not_lose_each_other_s_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        let exe = std::env::current_exe().expect("test binary path");
+
+        let children: Vec<_> = [ADOPTING_TAG, "beta"]
+            .iter()
+            .map(|tag| {
+                std::process::Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "--ignored",
+                        "commands::shep_toml::tests::config_race_child",
+                    ])
+                    .env(CHILD_PATH_VAR, &path)
+                    .env(CHILD_TAG_VAR, tag)
+                    // Piped, not inherited: a passing run should not
+                    // interleave two child harnesses' output into this
+                    // one's, and a failing child's harness output is
+                    // exactly what the assertion below needs to show.
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("spawn writer")
+            })
+            .collect();
+
+        for child in children {
+            let out = child.wait_with_output().expect("wait for writer");
+            assert!(
+                out.status.success(),
+                "a writer process failed: {}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let cfg = DaemonConfig::load(Some(&written), &|_| None).unwrap();
+        for i in 0..EDITS_PER_WRITER {
+            let adopted = format!("{ADOPTING_TAG}-{i}");
+            let enabled = format!("beta-{i}");
+            assert!(
+                cfg.daemon.adopted_dogs.contains_key(&adopted),
+                "{adopted}: an adopt was overwritten by the other writer"
+            );
+            assert!(
+                cfg.daemon.enabled_dogs.contains(&adopted),
+                "{adopted}: the adopt's own enable was overwritten"
+            );
+            assert!(
+                cfg.daemon.enabled_dogs.contains(&enabled),
+                "{enabled}: an enable was overwritten by the other writer"
+            );
+        }
+        assert_eq!(
+            cfg.daemon.enabled_dogs.len(),
+            2 * EDITS_PER_WRITER,
+            "the config enables dogs nobody asked for"
+        );
     }
 }

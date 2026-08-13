@@ -10,7 +10,7 @@
 //! here, tolerating a failure to reach one.
 //!
 //! **The order is config first, then the daemon — for `enable`/`disable`/
-//! `rehome`.** [`ShepToml::save`] runs before any of the three ever tries
+//! `rehome`.** [`ShepToml::edit`] runs before any of the three ever tries
 //! the socket: if the RPC that follows fails or never gets attempted, the
 //! config still says what the operator asked for, and the next boot brings
 //! it up — which is the state the operator actually wanted. The reverse
@@ -100,19 +100,22 @@ pub async fn enable(
     paths: &ShepPaths,
     name: &str,
 ) -> ExitCode {
-    let mut cfg = match ShepToml::open(&paths.daemon_config) {
-        Ok(cfg) => cfg,
+    // The read and the edit are one `edit` call because they are one
+    // transaction: the source below is read from the same document this
+    // then writes back, under the lock that keeps a concurrent `shep
+    // adopt` from landing between the two.
+    let source = match ShepToml::edit(&paths.daemon_config, |cfg| {
+        // Read from the config rather than assumed: `shep adopt` records
+        // the binary and `shep enable` is what starts it afterwards, so a
+        // hardcoded `BuiltIn` here sends the shepherd off to spawn `shep
+        // dog <name>` and the adopted binary never runs at all.
+        let source = dog_source(cfg, name);
+        cfg.enable_dog(name);
+        source
+    }) {
+        Ok(source) => source,
         Err(err) => return fail_config(streams, fmt, &err),
     };
-    // Read from the config rather than assumed: `shep adopt` records the
-    // binary and `shep enable` is what starts it afterwards, so a hardcoded
-    // `BuiltIn` here sends the shepherd off to spawn `shep dog <name>` and
-    // the adopted binary never runs at all.
-    let source = dog_source(&cfg, name);
-    cfg.enable_dog(name);
-    if let Err(err) = cfg.save() {
-        return fail_config(streams, fmt, &err);
-    }
     let client = Client::connect(&paths.socket).await.ok();
     enable_after_config(streams, fmt, name, &source, client.as_ref()).await
 }
@@ -189,19 +192,18 @@ pub async fn disable(
     paths: &ShepPaths,
     name: &str,
 ) -> ExitCode {
-    let mut cfg = match ShepToml::open(&paths.daemon_config) {
-        Ok(cfg) => cfg,
+    let source = match ShepToml::edit(&paths.daemon_config, |cfg| {
+        // `disable_dog` leaves `[daemon] adopted_dogs` alone — that is the
+        // difference between `disable` and `rehome` — so this reads the
+        // same answer before or after the edit. It is read for the report
+        // only: `DisableDog` carries a name and nothing else.
+        let source = dog_source(cfg, name);
+        cfg.disable_dog(name);
+        source
+    }) {
+        Ok(source) => source,
         Err(err) => return fail_config(streams, fmt, &err),
     };
-    // `disable_dog` leaves `[daemon] adopted_dogs` alone — that is the
-    // difference between `disable` and `rehome` — so this reads the same
-    // answer before or after the edit. It is read for the report only:
-    // `DisableDog` carries a name and nothing else.
-    let source = dog_source(&cfg, name);
-    cfg.disable_dog(name);
-    if let Err(err) = cfg.save() {
-        return fail_config(streams, fmt, &err);
-    }
     let client = Client::connect(&paths.socket).await.ok();
     disable_after_config(streams, fmt, name, &source, client.as_ref()).await
 }
@@ -574,12 +576,9 @@ pub async fn adopt(
     for writable in &vetted.group_writable {
         warn_group_writable(streams, fmt, writable);
     }
-    let mut cfg = match ShepToml::open(&paths.daemon_config) {
-        Ok(cfg) => cfg,
-        Err(err) => return fail_config(streams, fmt, &err),
-    };
-    cfg.adopt_dog(&args.name, &path);
-    if let Err(err) = cfg.save() {
+    if let Err(err) = ShepToml::edit(&paths.daemon_config, |cfg| {
+        cfg.adopt_dog(&args.name, &path);
+    }) {
         return fail_config(streams, fmt, &err);
     }
     let client = Client::connect(&paths.socket).await.ok();
@@ -646,20 +645,19 @@ pub async fn rehome(
     paths: &ShepPaths,
     name: &str,
 ) -> ExitCode {
-    let mut cfg = match ShepToml::open(&paths.daemon_config) {
-        Ok(cfg) => cfg,
+    let source = match ShepToml::edit(&paths.daemon_config, |cfg| {
+        // Read before `rehome_dog` erases it — the row below reports what
+        // this verb forgot, and `None` (a name never adopted, or a
+        // built-in dog's own name) is a legitimate answer, not a fault.
+        let source = cfg.adopted_dog_path(name).map(|path| DogSource::Adopted {
+            path: path.display().to_string(),
+        });
+        cfg.rehome_dog(name);
+        source
+    }) {
+        Ok(source) => source,
         Err(err) => return fail_config(streams, fmt, &err),
     };
-    // Read before `rehome_dog` erases it — the row below reports what this
-    // verb forgot, and `None` (a name never adopted, or a built-in dog's
-    // own name) is a legitimate answer, not a fault.
-    let source = cfg.adopted_dog_path(name).map(|path| DogSource::Adopted {
-        path: path.display().to_string(),
-    });
-    cfg.rehome_dog(name);
-    if let Err(err) = cfg.save() {
-        return fail_config(streams, fmt, &err);
-    }
     let client = Client::connect(&paths.socket).await.ok();
     rehome_after_config(streams, fmt, name, source, client.as_ref()).await
 }
@@ -819,9 +817,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = ShepPaths::resolve(&|_| None, dir.path());
         std::fs::create_dir_all(&paths.run).unwrap();
-        let mut seed = ShepToml::open(&paths.daemon_config).unwrap();
-        seed.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
-        seed.save().unwrap();
+        ShepToml::edit(&paths.daemon_config, |seed| {
+            seed.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
+        })
+        .unwrap();
         let handle = serve_one_request(
             &paths.socket,
             sample_ack(),
@@ -959,9 +958,7 @@ mod tests {
     async fn disable_with_no_shepherd_writes_the_config_and_exits_zero() {
         let dir = tempfile::tempdir().unwrap();
         let paths = ShepPaths::resolve(&|_| None, dir.path());
-        let mut seed = ShepToml::open(&paths.daemon_config).unwrap();
-        seed.enable_dog("bark");
-        seed.save().unwrap();
+        ShepToml::edit(&paths.daemon_config, |seed| seed.enable_dog("bark")).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = disable(
@@ -1273,9 +1270,10 @@ mod tests {
     async fn rehome_forgets_everything_disable_deliberately_keeps() {
         let dir = tempfile::tempdir().unwrap();
         let paths = ShepPaths::resolve(&|_| None, dir.path());
-        let mut seed = ShepToml::open(&paths.daemon_config).unwrap();
-        seed.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
-        seed.save().unwrap();
+        ShepToml::edit(&paths.daemon_config, |seed| {
+            seed.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
+        })
+        .unwrap();
 
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -1338,9 +1336,10 @@ mod tests {
     async fn rehome_with_no_shepherd_writes_the_config_and_exits_zero() {
         let dir = tempfile::tempdir().unwrap();
         let paths = ShepPaths::resolve(&|_| None, dir.path());
-        let mut seed = ShepToml::open(&paths.daemon_config).unwrap();
-        seed.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
-        seed.save().unwrap();
+        ShepToml::edit(&paths.daemon_config, |seed| {
+            seed.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
+        })
+        .unwrap();
 
         let mut out = Vec::new();
         let mut err = Vec::new();

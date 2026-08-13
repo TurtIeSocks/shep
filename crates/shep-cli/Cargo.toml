@@ -88,6 +88,13 @@ toml.workspace = true
 # implementation (`Cargo.lock`), and `default-features = false` plus this
 # exact feature pair matches what that pulls in already.
 toml_edit = { version = "0.22", default-features = false, features = ["display", "parse"] }
+# `commands::shep_toml`'s write path: `shep.toml` is staged in a sibling temp
+# file at `0600` (mode at creation, via `Builder::permissions`), `fsync`ed and
+# `rename`d over the original, the same shape shep-core's `barks::write_ring`
+# uses. Promoted from `[dev-dependencies]`, where the test tier already had it:
+# adds zero crates to the tree, since shep-core and shep-daemon both carry this
+# same workspace-pinned version already.
+tempfile.workspace = true
 
 [dev-dependencies]
 # `test-util` for `#[tokio::test(start_paused = true)]` — `dog::http`'s own
@@ -99,7 +106,6 @@ tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 # dev-dependency, so the feature is on for the test targets and off for the
 # shipped binary.
 shep-client = { workspace = true, features = ["test-support"] }
-tempfile.workspace = true
 # Snapshot coverage for `--format json` payloads.
 insta.workspace = true
 # The real-binary e2e tier (`tests/cli_e2e.rs`).

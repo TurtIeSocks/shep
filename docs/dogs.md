@@ -59,6 +59,12 @@ the one verb in this CLI that autostarts anything.
 `shep disable <name>` is the mirror: it stops the dog if one is running,
 and removes it from the boot list either way.
 
+Running two of these at once is safe. A provisioning script that
+backgrounds `shep adopt` and `shep enable` together has each of them take
+an exclusive lock on `shep.toml` for its whole read-edit-write, so the
+second waits its turn instead of writing back a document it read before
+the first one's edit landed.
+
 ## Configuration
 
 A dog's settings live under `[dog.<name>]` in `shep.toml`, and they never
