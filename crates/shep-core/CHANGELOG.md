@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `ProcessSelector::is_exact`, which answers whether a selector names one
+  entry the caller already knew of — by its name or its id — rather than
+  sweeping whatever matches. `Regex` and `Fold` are wildcards by this
+  measure even when the pattern is a literal that can only ever match one
+  name: what the split turns on is whether the operator named the thing, not
+  how many things the selector reaches. The daemon uses it to keep a dog out
+  of what `all` and a `/regex/` sweep touch while leaving `shep restart bark`
+  able to reach it.
+
 - Add `DaemonSection::adopted_dogs`, a `BTreeMap<String, PathBuf>` recording
   where each adopted dog's binary lives, keyed by dog name (`shep adopt`
   writes an entry; `shep rehome` removes it). A name in `enabled_dogs` with

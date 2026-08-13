@@ -51,6 +51,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Keep a dog out of what a wildcard selector sweeps. `stop all`, `reload all`,
+  `delete all` and a `/regex/` or `fold:` sweep now pass every dog by, while a
+  selector that names one — `shep restart bark`, or its id — still reaches it.
+  A dog is a process an operator installed rather than a member of the flock
+  `all` means, and an operator sweeping the flock does not expect to take the
+  metrics plumbing down with it. Selection is now answered in one place for
+  every verb that resolves a selector against the registry, so the reach of
+  `stop`, `reload`, `reopen`, `flush` and `trigger` cannot drift apart; a
+  by-product is that a multi-match `stop`/`restart` emits its events in id
+  order rather than in whatever order the registry happened to yield.
+
 - Answer `flock` and `describe` with each sheep's live CPU and memory, in the
   two `ProcessInfo` fields shep-core grew for them. The reading is taken when
   the request is served, not read off the last periodic tick, so memory is

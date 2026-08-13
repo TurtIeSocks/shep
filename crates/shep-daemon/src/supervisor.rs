@@ -1521,6 +1521,7 @@ impl<R: ProcessRunner> Actor<R> {
                     credentials,
                     out_file,
                     err_file,
+                    dog: None,
                 };
                 let info = to_info(&entry);
                 let log_ctl = io.log_ctl.clone();
@@ -1588,6 +1589,7 @@ impl<R: ProcessRunner> Actor<R> {
                     credentials,
                     out_file,
                     err_file,
+                    dog: None,
                 };
                 let info = to_info(&entry);
                 self.sheep.insert(
@@ -1815,6 +1817,29 @@ impl<R: ProcessRunner> Actor<R> {
         }
     }
 
+    /// Every registered id `selector` names, in id order.
+    ///
+    /// The one place selection happens. A dog is included only for a selector
+    /// that named it ([`ProcessSelector::is_exact`]), so `stop all`, `reload
+    /// all`, `delete all` and a `/regex/` sweep pass every dog by while `shep
+    /// restart bark` still reaches one.
+    fn matching_ids(&self, selector: &ProcessSelector) -> Vec<u32> {
+        let exact = selector.is_exact();
+        let mut ids: Vec<u32> = self
+            .sheep
+            .iter()
+            .filter(|(_, slot)| exact || slot.entry.dog.is_none())
+            .filter_map(|(id, slot)| {
+                let config = slot.entry.spec.config();
+                selector
+                    .matches(&config.name, *id, config.fold.as_deref())
+                    .then_some(*id)
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Resolves `selector`, then either defers to each matched sheep's next
     /// exit (if running) or applies the command immediately (if not).
     ///
@@ -1832,16 +1857,7 @@ impl<R: ProcessRunner> Actor<R> {
         origin: CommandOrigin,
         reply: ReplyKind,
     ) {
-        let matched: Vec<u32> = self
-            .sheep
-            .iter()
-            .filter_map(|(id, slot)| {
-                let config = slot.entry.spec.config();
-                selector
-                    .matches(&config.name, *id, config.fold.as_deref())
-                    .then_some(*id)
-            })
-            .collect();
+        let matched = self.matching_ids(&selector);
 
         if matched.is_empty() {
             send_reply(reply, Err(SupervisorError::NotFound));
@@ -2038,17 +2054,7 @@ impl<R: ProcessRunner> Actor<R> {
         selector: &ProcessSelector,
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     ) {
-        let mut matched: Vec<u32> = self
-            .sheep
-            .iter()
-            .filter_map(|(id, slot)| {
-                let config = slot.entry.spec.config();
-                selector
-                    .matches(&config.name, *id, config.fold.as_deref())
-                    .then_some(*id)
-            })
-            .collect();
-        matched.sort_unstable();
+        let matched = self.matching_ids(selector);
 
         if matched.is_empty() {
             let _ = reply.send(Err(SupervisorError::NotFound));
@@ -2316,6 +2322,7 @@ impl<R: ProcessRunner> Actor<R> {
                     credentials,
                     out_file,
                     err_file,
+                    dog: None,
                 };
                 let info = to_info(&entry);
                 let log_ctl = io.log_ctl.clone();
@@ -2902,11 +2909,11 @@ impl<R: ProcessRunner> Actor<R> {
     ) {
         let mut matched: Vec<ProcessInfo> = Vec::new();
         let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
-        for (id, slot) in &self.sheep {
-            let config = slot.entry.spec.config();
-            if !selector.matches(&config.name, *id, config.fold.as_deref()) {
-                continue;
-            }
+        for id in self.matching_ids(selector) {
+            let slot = self
+                .sheep
+                .get(&id)
+                .expect("`matching_ids` answers with ids read off this map a moment ago");
             paths.insert(slot.entry.out_file.clone());
             paths.insert(slot.entry.err_file.clone());
             matched.push(to_info(&slot.entry));
@@ -2930,13 +2937,13 @@ impl<R: ProcessRunner> Actor<R> {
             })
             .collect();
 
-        // Both sorted here, where the whole set is in hand, rather than after
-        // the reopens: `HashMap` iteration order is arbitrary, a caller
-        // reading the reply as a table wants the same id order `list` gives,
-        // and pump failures are reported in the order they are collected, so
-        // an unsorted reopen set would make a multi-pump failure message read
-        // differently run to run.
-        matched.sort_unstable_by_key(|info| info.id);
+        // Sorted here, where the whole set is in hand, rather than after the
+        // reopens: `HashMap` iteration order is arbitrary, and pump failures
+        // are reported in the order they are collected, so an unsorted pump
+        // set would make a multi-pump failure message read differently run to
+        // run. `matched` needs no such step — it is built in the id order
+        // `matching_ids` answers in, which is the order `list` gives, and a
+        // caller reading the reply as a table wants that one.
         pumps.sort_unstable_by_key(|(info, _)| info.id);
         spawn_reopen_task(matched, pumps, reply);
     }
@@ -3001,11 +3008,11 @@ impl<R: ProcessRunner> Actor<R> {
     ) {
         let mut matched: Vec<ProcessInfo> = Vec::new();
         let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
-        for (id, slot) in &self.sheep {
-            let config = slot.entry.spec.config();
-            if !selector.matches(&config.name, *id, config.fold.as_deref()) {
-                continue;
-            }
+        for id in self.matching_ids(selector) {
+            let slot = self
+                .sheep
+                .get(&id)
+                .expect("`matching_ids` answers with ids read off this map a moment ago");
             paths.insert(slot.entry.out_file.clone());
             paths.insert(slot.entry.err_file.clone());
             matched.push(to_info(&slot.entry));
@@ -3025,13 +3032,14 @@ impl<R: ProcessRunner> Actor<R> {
             .filter_map(|(id, slot)| slot.log_ctl.clone().map(|log_ctl| (*id, log_ctl)))
             .collect();
 
-        // Both sorted for the reason `handle_reopen` sorts: `HashMap`
-        // iteration order is arbitrary, and a caller rendering the reply as a
-        // table wants `list`'s id order — while pump failures are reported in
-        // the order they are collected, so an unsorted flush set would make a
-        // multi-pump failure message read differently run to run. `paths`
-        // needs no such step, being a `BTreeSet` already.
-        matched.sort_unstable_by_key(|info| info.id);
+        // Sorted for the reason `handle_reopen` sorts: `HashMap` iteration
+        // order is arbitrary, and pump failures are reported in the order
+        // they are collected, so an unsorted flush set would make a
+        // multi-pump failure message read differently run to run. Neither
+        // `matched` nor `paths` needs the step — the first is built in the id
+        // order `matching_ids` answers in, which is `list`'s and so the one a
+        // caller rendering the reply as a table wants, and the second is a
+        // `BTreeSet` already.
         pumps.sort_unstable_by_key(|&(id, _)| id);
         let pumps = pumps.into_iter().map(|(_, log_ctl)| log_ctl).collect();
         spawn_flush_task(matched, pumps, paths, reply);
@@ -3648,21 +3656,11 @@ impl<R: ProcessRunner> Actor<R> {
         params: Option<String>,
         reply: oneshot::Sender<Result<Vec<ActionReply>, SupervisorError>>,
     ) {
-        let mut matched: Vec<u32> = self
-            .sheep
-            .iter()
-            .filter_map(|(id, slot)| {
-                let config = slot.entry.spec.config();
-                selector
-                    .matches(&config.name, *id, config.fold.as_deref())
-                    .then_some(*id)
-            })
-            .collect();
-        // Sorted so the actions go out in id order rather than in whatever
-        // order the map happened to yield them. The final sort in
-        // `spawn_trigger_task` is what the ANSWER's order rests on; this one
-        // only keeps delivery from being arbitrary as well.
-        matched.sort_unstable();
+        // `matching_ids` answers in id order, so the actions go out in that
+        // order rather than in whatever order the map happened to yield them.
+        // The final sort in `spawn_trigger_task` is what the ANSWER's order
+        // rests on; this one only keeps delivery from being arbitrary as well.
+        let matched = self.matching_ids(selector);
 
         if matched.is_empty() {
             let _ = reply.send(Err(SupervisorError::NotFound));
@@ -4001,10 +3999,7 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
         // and never read.
         cpu_percent: None,
         memory_bytes: None,
-        // Every `ProcessEntry` the supervisor tracks today is a sheep — a
-        // dog is a later phase's addition to this same registry, not yet
-        // reachable from here.
-        dog: None,
+        dog: entry.dog.clone(),
     }
 }
 
@@ -4517,6 +4512,7 @@ async fn run_sheep<P: RunningProcess>(
 #[cfg(test)]
 mod tests {
     use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, normalize};
+    use shep_core::protocol::DogSource;
     use shep_core::status::ProcStatus;
     use shep_core::values::UpDuration;
 
@@ -4524,7 +4520,8 @@ mod tests {
     use crate::fake::{ProcScript, ScriptedRunner};
     // the one crate-root fixture (IR-33)
     use crate::testing::{
-        RecordingEnforcer, SharedRunner, armed_entry, idle_stats, probe_config, test_paths,
+        RecordingEnforcer, SharedRunner, app_with, armed_entry, idle_stats, probe_config,
+        test_paths,
     };
     // Test-only: the one case that drives a real `liveness_probe` has to
     // build the lifecycle extras the production wiring builds at boot, and
@@ -6310,6 +6307,113 @@ mod tests {
             reloads: HashMap::new(),
         };
         (actor, rx)
+    }
+
+    /// [`ProcessEntry::id`] of the fixture's sheep, and of its dog.
+    const SHEEP_ID: u32 = 0;
+    const DOG_ID: u32 = 1;
+
+    /// A bare actor holding one `Online` sheep and one `Online` dog.
+    ///
+    /// The two entries are alike in everything a selector can read — same
+    /// status, same fold, same registration, adjacent ids — so the marker is
+    /// the only difference between them. That is what lets a case watching
+    /// the dog drop out of a wildcard's answer conclude the MARKER did it,
+    /// rather than a status or a fold the wildcard would have passed over
+    /// anyway.
+    fn actor_with_a_sheep_and_a_dog(
+        dir: &tempfile::TempDir,
+    ) -> (Actor<ScriptedRunner>, mpsc::Receiver<Msg>) {
+        let paths = test_paths(dir);
+        let mut sheep = HashMap::new();
+        for (id, name, dog) in [
+            (SHEEP_ID, "web", None),
+            (DOG_ID, "bark", Some(DogSource::BuiltIn)),
+        ] {
+            let app = app_with(name, |config| config.fold = Some("svc".to_string()));
+            let mut entry = armed_entry(id, 0, 1111 + id, app, &paths);
+            entry.dog = dog;
+            sheep.insert(
+                id,
+                SheepSlot {
+                    entry,
+                    ctl: None,
+                    log_ctl: None,
+                    to_child: None,
+                    manual: None,
+                    pending_delete: false,
+                    epoch: 0,
+                    ready_tx: None,
+                    actions: ActionWaits::default(),
+                },
+            );
+        }
+        let (events, _events_rx) = broadcast::channel(64);
+        let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
+        let actor = Actor {
+            runner: ScriptedRunner::new(Vec::new()),
+            paths,
+            events,
+            tx,
+            sheep,
+            next_id: DOG_ID + 1,
+            next_action_stamp: 0,
+            pending: Vec::new(),
+            shutting_down: false,
+            extras: None,
+            registry: ExtrasRegistry::default(),
+            reloads: HashMap::new(),
+        };
+        (actor, rx)
+    }
+
+    /// fails if a wildcard reaches a dog. Every assertion is load-bearing
+    /// and none implies another: without the last two a helper that excluded
+    /// dogs from EVERYTHING passes, and `shep disable bark` — which stops the
+    /// dog by naming it — would silently match nothing.
+    #[test]
+    fn a_wildcard_passes_a_dog_by_and_its_own_name_still_reaches_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (actor, _mailbox) = actor_with_a_sheep_and_a_dog(&dir);
+
+        assert_eq!(
+            actor.matching_ids(&ProcessSelector::All),
+            vec![SHEEP_ID],
+            "`all` is the flock, not the kennel"
+        );
+        assert_eq!(
+            actor.matching_ids(&ProcessSelector::parse("/^(web|bark)$/").unwrap()),
+            vec![SHEEP_ID],
+            "a sweep that spells both names out is still a sweep"
+        );
+        assert_eq!(
+            actor.matching_ids(&ProcessSelector::Fold("svc".into())),
+            vec![SHEEP_ID],
+            "a dog shares its fold with the flock and is still not swept by it"
+        );
+        assert_eq!(
+            actor.matching_ids(&ProcessSelector::Name("bark".into())),
+            vec![DOG_ID]
+        );
+        assert_eq!(
+            actor.matching_ids(&ProcessSelector::Id(DOG_ID)),
+            vec![DOG_ID]
+        );
+    }
+
+    /// fails if `to_info` invents the marker rather than reading the entry's
+    /// — the shape that puts a dog in a listing as an ordinary sheep, with
+    /// nothing anywhere left to say which it is.
+    #[test]
+    fn a_listing_reports_where_a_dog_came_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let (actor, _mailbox) = actor_with_a_sheep_and_a_dog(&dir);
+
+        assert_eq!(
+            to_info(&actor.sheep[&DOG_ID].entry).dog,
+            Some(DogSource::BuiltIn)
+        );
+        assert_eq!(to_info(&actor.sheep[&SHEEP_ID].entry).dog, None);
     }
 
     /// A [`ScriptedRunner`] that refuses one spawn by ordinal and forwards
