@@ -77,7 +77,15 @@ Priority when rules collide: **Readability > KISS > DRY** (Rin's global order).
   and drop `Copy`/`Eq` for that enum only.
 - **IR-20** `#[non_exhaustive]` only where growth is anticipated, with a
   comment citing why (`ProtocolError`: wire will grow). It taxes downstream
-  matching — don't cargo-cult it.
+  matching — don't cargo-cult it. The default that settles the usual case: a
+  `pub` error enum in a LIBRARY crate (shep-core, shep-daemon, shep-client)
+  gets it, because an out-of-tree consumer can match exhaustively and a new
+  variant would break them with no version bump to say so; a `pub` error enum
+  in shep-cli does not, because the crate is `[[bin]]`-only and its own
+  exhaustive matches are the ones we want broken. Either way the comment is
+  mandatory — `CronScheduleError` is the model for the negative case. Every
+  wire enum gets it unconditionally, and so does `ProcessInfo`, the one wire
+  STRUCT (Phase 10, wire audit #1).
 - **IR-21** Constructors return `Result`, validation-first with early returns.
   Panicking conveniences exist only in shep-cli, carry `#[track_caller]` +
   `# Panics` doc (the two travel together, one commit), and panic messages
@@ -172,6 +180,18 @@ Priority when rules collide: **Readability > KISS > DRY** (Rin's global order).
 - **IR-40** Boundary sweeps as a habit: wire framing tested at every partial-
   read length around the header size; supervisor at 0/1/max processes;
   empty/defaulted configs.
+- **IR-46** Every `await` in a test needs a FORCING MECHANISM — something that
+  makes it resolve, or makes it fail, within a bound the test itself sets. Two
+  failure shapes this catches, both found in five separate phases: an await
+  nothing will ever resolve (the test hangs, and a hang reports as a timeout
+  minutes later with no diagnostic), and an await that resolves on a state the
+  test was not waiting for (`await_status(Online)` satisfied by the state
+  BEFORE the crash under test — a vacuous pass, which is worse than a hang
+  because it is green). Concretely: wrap the wait in `tokio::time::timeout`
+  and assert on the result, or wait for a transition rather than a state, or
+  drive a paused clock past the point the thing must have happened by. "The
+  test passes locally" is not a forcing mechanism; neither is the harness's
+  own process timeout, which fails the whole binary and names nothing.
 
 ## I. Security-sensitive types
 
@@ -215,4 +235,6 @@ Priority when rules collide: **Readability > KISS > DRY** (Rin's global order).
 [ ] wire changes: stability fixtures updated + CHANGELOG           (IR-35,45)
 [ ] tests: paused clock, no sleeps, unique fixtures                (IR-33,34)
 [ ] tuning consts named + benchmark comment                        (IR-26)
+[ ] new pub error enum: non_exhaustive per crate tier + why comment (IR-20)
+[ ] every await in a test has a forcing mechanism, not just a hope  (IR-46)
 ```

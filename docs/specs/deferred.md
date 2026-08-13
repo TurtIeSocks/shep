@@ -189,6 +189,109 @@ error with no sentence naming the limit (104 bytes on macOS, 108 on Linux) or
 the variable responsible. Low impact and a small fix — a length check ahead of
 the bind that names both — but not this task's subject.
 
+### `DaemonConfig` is not a proof token, unlike `ResolvedApp`
+
+`ResolvedApp` keeps its `config` private so that holding one proves it went
+through `normalize` (`normalize.rs:63`). `DaemonConfig` does not: its `daemon`
+and `dog` fields are `pub`, and the one validation it performs — the
+`max_cron_sleep` floor — happens inline inside `DaemonConfig::load`
+(`daemon.rs:203-210`) rather than in a `validate` step a hand-built value would
+also have to pass.
+
+Nothing constructs one by hand today outside tests, so nothing is currently
+wrong. Deferred because making the fields private and splitting `validate` out
+of `load` is an architectural call on a type whose shape is Rin's to decide,
+not a defect with a known fix. What would force it: any production path that
+assembles a `DaemonConfig` from something other than a file — the daemon-config
+flags layer, for instance.
+
+### `ProcessInfo` fuses four concerns behind one discriminator
+
+Identity and lifecycle (`id`, `name`, `status`, `pid`, `restarts`,
+`uptime_ms`, `fold`), log paths (`out_file`, `err_file`), resource stats
+(`cpu_percent`, `memory_bytes`) and dog provenance (`dog`) all ride in one
+struct, and a dog's row leaves several of them meaningless.
+
+Deferred on the wire audit's own recommendation: do not split speculatively.
+What would force it is the `lambs` field — the moment a row carries a process
+tree, the question of what a `FlockMember` is stops being cosmetic. Phase 10
+made that field cheap to add (`ProcessInfo` is `#[non_exhaustive]` with a
+builder), which is deliberately the opposite of forcing the split early.
+
+### `check_log_ancestry`'s TOCTOU window, and the Linux syscall that would close it
+
+`check_log_ancestry` verifies a log path's ancestry and `open_log_path` then
+opens it, with no atomic tie between the two. The realistic local-multiuser
+attack is caught — a loose or wrong-owned ancestor is refused, and
+`O_NOFOLLOW` refuses a symlink standing at the final component — but an
+attacker who can rearrange a directory between the check and the open still
+wins that race.
+
+The design, written down so it does not have to be rediscovered:
+
+- Linux fast path: `nix::fcntl::openat2` (available under the `fs` feature this
+  crate already enables) with `ResolveFlag::RESOLVE_NO_SYMLINKS`, opening
+  relative to a directory fd for the log directory.
+- The `RawFd` it returns is adopted into a `File` with `FromRawFd`, which is
+  `unsafe`, so the wrapper lives in `shep-daemon/src/sys.rs` with a per-block
+  `// SAFETY:` (IR-22/23) and nothing else in the crate touches the raw fd.
+- Fallback ladder: `ENOSYS` (kernel < 5.6) and `EPERM` (seccomp filters that
+  do not allow the syscall) both fall through to today's
+  check-then-`O_NOFOLLOW`-open path, which stays as the portable
+  implementation and remains the only path on macOS.
+
+Not built in Phase 10 because it is new `unsafe` on a Linux-only path that this
+project cannot execute a test for from a macOS development machine — the exact
+shape of debt the platform audit's "never been compiled" finding exists to
+complain about. What would force it: a Linux box in the regular test loop, or a
+threat model that includes an attacker with write access to a log directory's
+parent.
+
+### Reload's Linux-only assertions have no automatic execution
+
+`daemon_e2e.rs:1892` and `:1948` carry `#[cfg(target_os = "linux")]` on the
+reload connection-count assertions, which is correct: they depend on Linux's
+accept balancing. Their only real execution to date was one manual Docker run.
+Phase 10 added the `ubuntu-24.04-arm` and `ubuntu-latest` legs that would run
+them, but the workflow stays `workflow_dispatch`-only, so they still execute
+only when someone presses the button. Recorded so the gap is known, not because
+the tests are wrong.
+
+### The `cli_e2e` 7-test correlation
+
+Four of nine `cli_e2e` tests in one grouping failed under `--test-threads=1`
+where zero of six in another did — investigated twice, exonerated twice as a
+load artefact rather than a regression, and never measured again since Phase 6.
+It is a standing false-positive risk in the serial phase-gate run that CLAUDE.md
+mandates before a merge. What it needs is one fresh bounded measurement pass
+with the numbers written down, which is a measurement rather than an edit, and
+is why it is here rather than in a task.
+
+### The windows-gnu cross-check went three phases unrun
+
+`cargo check --workspace --all-targets --all-features --target
+x86_64-pc-windows-gnu` was in the gate list of every plan from Phase 3 through
+Phase 6. Phase 7's plan does not carry it, nor Phase 8's, nor Phase 9's, and
+no plan says why — it was dropped silently. It had also never been written into
+`CLAUDE.md`'s own gate section, so there was nothing outside the plans to
+notice its absence.
+
+This one is **closed, not deferred**, and is recorded here only so the gap is
+dated. Phase 10 ran it (`EXIT=0`, 8.42s, 2026-08-13, at `b7c466b`) and put it
+back, in `CLAUDE.md` this time rather than in a plan that expires. The likely
+reason it lapsed is its prerequisite: `ring`'s build script runs `cc` for the
+target, so the check needs a C toolchain for `x86_64-pc-windows-gnu`
+(`mingw-w64`), and a host without one cannot run it at all — an easy thing to
+stop doing and never mention. Windows was 0% implemented for all three of
+those phases, so nothing broke; what was lost was the guarantee that nothing
+had.
+
+It is spelled `cargo check`, not `clippy -- -D warnings`, and that is a
+decision rather than an oversight: shep-daemon's `boot`, `sys`, `server` and
+`tokio_runner` are `cfg(unix)`-gated, so the Windows target reports 51
+dead-code warnings for code that is not dead on any platform shep ships.
+Silencing them would mean `#[allow(dead_code)]` on live code.
+
 ## Not deferred
 
 **Dogs** (spec §8) **shipped**: the dog contract (`shep_daemon::dogs`,
