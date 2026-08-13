@@ -51,6 +51,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Start a dog. `SupervisorHandle::start_dog` registers one through the same
+  spawn path a sheep takes, and writes onto its entry where the dog came
+  from. The marker rides the entry rather than a registry of its own, which
+  is what makes a restart, a memory-limit respawn, a cron occurrence, a
+  watch-triggered restart and a reload all keep it without any of them
+  knowing dogs exist — a reload reads it off the instance it is replacing,
+  and everything else mutates the entry in place. It lands on a dog that
+  failed to spawn too: a binary that is not there has to be visible as
+  `errored` in the dogs table, not as a sheep nobody started.
+
+  Starting a dog is idempotent by name. `shep enable` runs against a daemon
+  that may already have the dog, and a second live process under one name
+  would mean two connections, two metrics listeners on one port and two
+  copies of every bark; the dog already registered is reported as it stands
+  instead. A dog is refused outright once a graceful shutdown has begun, the
+  same rule `start`, `restart` and `reload` follow — the shutdown's kill list
+  is fixed when it runs, so a child registered after it is one nothing would
+  kill.
+
 - Keep a dog out of what a wildcard selector sweeps. `stop all`, `reload all`,
   `delete all` and a `/regex/` or `fold:` sweep now pass every dog by, while a
   selector that names one — `shep restart bark`, or its id — still reaches it.
