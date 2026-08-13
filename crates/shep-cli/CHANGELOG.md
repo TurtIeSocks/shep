@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `shep scale <name> <count>`.
 - Add `shep signal <selector> <signal>`.
+- Add `shep sendline <selector> <line>`, for apps whose Flockfile sets
+  `stdin = true`.
 - Add the hidden `shep dog <name>` subcommand — the re-exec target a
   built-in dog runs as, the same shape `shep daemon` already is: not for
   direct use, spawned by the shepherd when it starts an enabled dog.

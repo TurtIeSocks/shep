@@ -49,6 +49,8 @@ use commands::muster;
 #[cfg(unix)]
 use commands::query;
 #[cfg(unix)]
+use commands::sendline;
+#[cfg(unix)]
 use commands::signal;
 #[cfg(unix)]
 use commands::startup;
@@ -288,6 +290,10 @@ async fn run(cli: Cli) -> ExitCode {
         },
         Commands::Signal(ref args) => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => signal::signal(&client, &mut streams, fmt, args).await,
+            Err(code) => code,
+        },
+        Commands::SendLine(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => sendline::sendline(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
         Commands::Flock => match connect_client(&mut streams, fmt, &paths).await {

@@ -12,6 +12,7 @@ pub mod logs;
 pub mod muster;
 pub mod query;
 pub(crate) mod selector;
+pub mod sendline;
 pub(crate) mod shep_toml;
 pub mod signal;
 pub(crate) mod startup;

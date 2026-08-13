@@ -22,9 +22,9 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use shep_core::config::AppConfig;
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
-    ActionOutcome, BusEvent, ChildMessage, Envelope, Hello, HelloAck, HelloReply, PROTOCOL_VERSION,
-    ProcessEventKind, ProcessInfo, Reply, Request, Response, RpcErrorCode, SelectorSpec,
-    ServerFrame, codec, decode_frame, encode_frame,
+    ActionOutcome, BusEvent, ChildMessage, Envelope, Hello, HelloAck, HelloReply, LineOutcome,
+    PROTOCOL_VERSION, ProcessEventKind, ProcessInfo, Reply, Request, Response, RpcErrorCode,
+    SelectorSpec, ServerFrame, codec, decode_frame, encode_frame,
 };
 use shep_core::status::ProcStatus;
 use shep_core::values::UpDuration;
@@ -924,6 +924,62 @@ async fn a_triggered_action_reaches_a_real_child_and_answers_it_twice() {
             "round {round} must carry its own reply, not a leftover from the other one"
         );
     }
+
+    fixture.shutdown().await;
+}
+
+/// A real pipe, a real child, a real socket. The child echoes what it reads,
+/// so the `log.out` line coming back is proof the line went all the way
+/// down and the app's answer came all the way up — the one claim no tier
+/// below this can make.
+///
+/// Bounded (IR-46) at both ends: `Client::request` bounds each frame it
+/// reads via `recv_as`'s own `RECV_TIMEOUT`, and `await_log_line` carries
+/// the same bound around its own wait.
+#[tokio::test]
+async fn a_line_written_to_a_real_sheeps_stdin_comes_back_on_its_stdout() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+
+    // Subscribe BEFORE starting: the bus delivers from the moment you join,
+    // same rule `log_lines_reach_a_log_subscriber` follows.
+    let subscribed = client
+        .request(Request::Subscribe {
+            topics: vec!["log.*".to_string()],
+        })
+        .await;
+    assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
+
+    let mut app = AppConfig::minimal("echoer", "/bin/sh");
+    app.interpreter = Some("none".to_string());
+    app.args = vec![
+        "-c".to_string(),
+        "while IFS= read -r line; do echo \"got $line\"; done".to_string(),
+    ];
+    app.stdin = true;
+
+    let started = client.request(Request::Start { apps: vec![app] }).await;
+    let Response::Started(infos) = started.result.unwrap() else {
+        panic!("expected started")
+    };
+    let id = infos[0].id;
+
+    let reply = client
+        .request(Request::SendLine {
+            selector: SelectorSpec::Name("echoer".to_string()),
+            line: "ping".to_string(),
+        })
+        .await;
+    let Response::SentLine(rows) = reply.result.unwrap() else {
+        panic!("expected sent line")
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].outcome, LineOutcome::Sent);
+
+    // `Sent` only claims the bytes reached the pipe. This is the half that
+    // proves the app actually read them.
+    let echoed = client.await_log_line(id).await;
+    assert_eq!(echoed, "got ping");
 
     fixture.shutdown().await;
 }

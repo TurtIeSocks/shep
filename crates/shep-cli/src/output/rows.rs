@@ -13,7 +13,8 @@
 use serde::Serialize;
 use shep_core::barks::{Bark, SinkOutcome};
 use shep_core::protocol::{
-    ActionOutcome, ActionReply, DogSource, ProcessInfo, SignalOutcome, SignalReply,
+    ActionOutcome, ActionReply, DogSource, LineOutcome, LineReply, ProcessInfo, SignalOutcome,
+    SignalReply,
 };
 
 use super::Render;
@@ -1046,6 +1047,77 @@ fn describe_signal_outcome(outcome: &SignalOutcome) -> (&'static str, String) {
     }
 }
 
+/// `Response::SentLine(Vec<LineReply>)` — one row per matched sheep, each
+/// carrying what happened when the shepherd tried to write `shep sendline`'s
+/// line to its stdin.
+///
+/// Shaped exactly like [`TriggeredRows`]/[`SignalledRows`], for the same
+/// reason [`LineReply`]'s own doc gives: a per-row outcome, since spec §9's
+/// selector grammar makes a mixed flock the normal case.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct SentLineRows(pub Vec<LineReply>);
+
+impl Render for SentLineRows {
+    fn headers() -> &'static [&'static str] {
+        &["ID", "NAME", "OUTCOME", "DETAIL"]
+    }
+
+    /// One row per matched sheep. `OUTCOME` is the short, stable kind
+    /// (`sent`, `no_stdin`, `not_written` — [`LineOutcome`]'s own `kind`
+    /// tag); `DETAIL` is where the three variants differ, via
+    /// [`describe_line_outcome`].
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|reply| {
+                let (outcome, detail) = describe_line_outcome(&reply.outcome);
+                vec![
+                    reply.id.to_string(),
+                    reply.name.clone(),
+                    outcome.to_string(),
+                    detail,
+                ]
+            })
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "ID" => "id",
+            "NAME" => "name",
+            // Both table columns are read off the one `outcome` object, same
+            // as `TriggeredRows::json_key_for`'s own reasoning.
+            "OUTCOME" | "DETAIL" => "outcome",
+            other => panic!("SentLineRows::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
+/// [`SentLineRows::rows`]'s per-outcome split: the short, stable `OUTCOME`
+/// label and the human `DETAIL` text.
+///
+/// `LineOutcome` is `#[non_exhaustive]` (shep-core's own Global
+/// Constraints), so this carries a wildcard arm: a variant this client
+/// predates renders as `unknown` with its `Debug` form, rather than failing
+/// to compile.
+fn describe_line_outcome(outcome: &LineOutcome) -> (&'static str, String) {
+    match outcome {
+        LineOutcome::Sent => ("sent", String::new()),
+        // Names the config field, same reasoning as
+        // `describe_outcome`'s own `NoChannel` arm: the row an operator hits
+        // is the one place they learn why.
+        LineOutcome::NoStdin => ("no_stdin", "no stdin pipe — set stdin = true".to_string()),
+        LineOutcome::NotWritten { reason } => ("not_written", reason.clone()),
+        other => ("unknown", format!("{other:?}")),
+    }
+}
+
 /// `Vec<Bark>` — `shep barks`' own payload, newest last exactly as it sits
 /// on disk (`shep_core::barks::read`'s own order — a ring is appended to,
 /// never re-sorted) and as `--tail` counts from.
@@ -1790,6 +1862,68 @@ pub(crate) mod tests {
         .rows();
         assert_eq!(rows[0][2], "failed");
         assert_eq!(rows[0][3], "No such process");
+    }
+
+    fn sample_line_replies() -> SentLineRows {
+        SentLineRows(vec![
+            LineReply {
+                id: 1,
+                name: "repl".to_string(),
+                outcome: LineOutcome::Sent,
+            },
+            LineReply {
+                id: 2,
+                name: "worker".to_string(),
+                outcome: LineOutcome::NoStdin,
+            },
+        ])
+    }
+
+    /// OUTCOME and DETAIL both derive from `outcome`, a nested JSON object
+    /// rather than a scalar — same reasoning as `triggered_rows_do_not_drift`.
+    #[test]
+    fn sent_line_rows_do_not_drift() {
+        assert_no_drift(&sample_line_replies(), |j| &j[0], &["OUTCOME", "DETAIL"]);
+    }
+
+    #[test]
+    fn sent_line_rows_render_id_name_and_outcome_kind() {
+        let rows = sample_line_replies().rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], "1");
+        assert_eq!(rows[0][1], "repl");
+        assert_eq!(rows[0][2], "sent");
+        assert_eq!(rows[1][0], "2");
+        assert_eq!(rows[1][1], "worker");
+        assert_eq!(rows[1][2], "no_stdin");
+    }
+
+    /// An operator reading a `no_stdin` row must find the config field that
+    /// would have avoided it, right there in the row — not just in
+    /// `--help`, the same rule `a_no_channel_detail_names_the_config_field`
+    /// pins for `trigger`.
+    #[test]
+    fn a_no_stdin_detail_names_the_config_field() {
+        let rows = sample_line_replies().rows();
+        let detail = &rows[1][3];
+        assert!(
+            detail.contains("stdin = true"),
+            "a no_stdin row must name the field that opens one: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_not_written_line_details_the_reason() {
+        let rows = SentLineRows(vec![LineReply {
+            id: 1,
+            name: "repl".to_string(),
+            outcome: LineOutcome::NotWritten {
+                reason: "pipe is full".to_string(),
+            },
+        }])
+        .rows();
+        assert_eq!(rows[0][2], "not_written");
+        assert_eq!(rows[0][3], "pipe is full");
     }
 
     /// Two barks: one the bark dog delivered to a live sink, one it

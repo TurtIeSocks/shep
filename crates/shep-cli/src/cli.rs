@@ -169,6 +169,22 @@ pub enum Commands {
     /// delivered, because the kernel took it and there is nothing further shep
     /// can see.
     Signal(SignalArgs),
+    /// Write one line to matched sheep's stdin.
+    ///
+    /// Only reaches an app whose Flockfile sets `stdin = true`. Nothing else
+    /// implies it — unlike the shepherd channel, which `wait_ready` and
+    /// `shutdown_with_message` both turn on — because nothing in shep needs a
+    /// sheep's stdin except this verb. A sheep without it answers a `no_stdin`
+    /// row naming the field.
+    ///
+    /// One line, and the terminator is shep's to add: a line containing a
+    /// newline or a carriage return is a usage error rather than two commands.
+    ///
+    /// `sent` means the bytes were written and flushed to the pipe, not that
+    /// the app read them. A pipe holds 64 KiB before it blocks, so a short line
+    /// to an app that never reads its stdin is still `sent`.
+    #[command(name = "sendline")]
+    SendLine(SendLineArgs),
     /// List one fold.
     Fold(FoldArgs),
     /// Show or follow bleats (log output) for one or more sheep.
@@ -332,6 +348,20 @@ pub struct SignalArgs {
     pub selector: String,
     /// Signal name, e.g. `SIGHUP` or `hup`
     pub signal: String,
+}
+
+/// Arguments to `shep sendline`.
+///
+/// Not [`SelectorArgs`]: this verb needs a second positional, the line
+/// itself. The selector stays required — no `default_value` — for the same
+/// reason every running-process verb's does: an accidental `shep sendline`
+/// should be a usage error, never sent to the whole flock.
+#[derive(Debug, clap::Args)]
+pub struct SendLineArgs {
+    /// name, id, `all`, `/regex/`, or `fold:<name>`
+    pub selector: String,
+    /// The line, without a trailing newline — shep adds exactly one
+    pub line: String,
 }
 
 /// Arguments to `shep flush`.
@@ -885,5 +915,18 @@ mod tests {
             exec_arg.is_hide_set(),
             "--exec must stay hidden from --help"
         );
+    }
+
+    /// Pins the spelling spec §9 gives — `sendline`, one word — against
+    /// clap's own default: a `SendLine` variant's kebab-case rename would be
+    /// `send-line`, which is why the variant carries an explicit
+    /// `#[command(name = "sendline")]`. Both halves matter: a passing
+    /// `shep sendline` alone would not catch `send-line` staying wired
+    /// alongside it as an unintended second spelling.
+    #[test]
+    fn sendline_is_spelled_one_word() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["shep", "sendline", "web", "gc"]).is_ok());
+        assert!(Cli::try_parse_from(["shep", "send-line", "web", "gc"]).is_err());
     }
 }
