@@ -267,5 +267,29 @@ expression: replies
         ]
       }
     }
+  },
+  {
+    "id": 21,
+    "result": {
+      "Ok": {
+        "kind": "scaled",
+        "data": [
+          {
+            "id": 3,
+            "name": "web",
+            "status": "online",
+            "pid": 4242,
+            "restarts": 1,
+            "uptime_ms": 60000,
+            "fold": "backend",
+            "out_file": "/home/rin/.shep/logs/web-0-out.log",
+            "err_file": "/home/rin/.shep/logs/web-0-err.log",
+            "cpu_percent": 12.5,
+            "memory_bytes": 50331648,
+            "dog": null
+          }
+        ]
+      }
+    }
   }
 ]

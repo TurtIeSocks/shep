@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `signals::OperatorSignal`, the nine signals `shep signal` may name;
   `Request::Signal` / `Response::Signalled` / `SignalReply` / `SignalOutcome`.
+- Add `Request::Scale` / `Response::Scaled` — set an app's instance count.
 - Add `BusEvent::Channel` and the `channel.ready` / `channel.metric` /
   `channel.action_reply` topics (spec §6).
 - Add `protocol::ProcessInfoBuilder`.

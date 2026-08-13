@@ -92,6 +92,36 @@ pub enum Request {
         /// Which sheep
         selector: SelectorSpec,
     },
+    /// Set how many instances one app runs (see `shep scale`).
+    ///
+    /// # Why a name and not a selector
+    ///
+    /// Every other verb here takes a [`SelectorSpec`], and this one
+    /// deliberately does not. `instances` is a per-app number and instance
+    /// slots are allocated against the same-name group
+    /// (`shep_daemon::assemble::instance_slots`), so a selector matching two
+    /// apps would have to mean either "four of each" or "four in total", and
+    /// neither reading is more obviously right than the other. A name has one
+    /// meaning.
+    ///
+    /// # Why absolute and not a delta
+    ///
+    /// There is no `+N`/`-N` form and there will not be one. An absolute count
+    /// is idempotent — run it twice, get the same flock — where two operators
+    /// sending `+2` against the same app get a number neither of them asked
+    /// for. This project's own trace notes also record a crash on pm2's
+    /// relative-remove path, and those notes exist so shep does not reproduce
+    /// what they record.
+    Scale {
+        /// The app's name, exactly as its config spells it. Not a selector: no
+        /// `all`, no regex, no `fold:`.
+        name: String,
+        /// How many instances the app has when this returns. `0` is refused
+        /// with [`RpcErrorCode::InvalidConfig`] — `normalize` rejects
+        /// `instances == 0` for every other path into the daemon, and `shep
+        /// delete` is the verb for removing an app.
+        count: u32,
+    },
     /// Reopen every matched sheep's log files, for an external rotator that
     /// has renamed them (`create`-mode rotation)
     Reopen {
@@ -554,15 +584,16 @@ impl fmt::Debug for DogSectionToml {
 
 /// One RPC response (pairs with [`Request`] variants)
 ///
-/// Nine variants carry a bare `Vec<ProcessInfo>` (`Flock`, `Described`,
-/// `Started`, `Stopped`, `Restarted`, `Reloading`, `Reopened`, `Flushed`,
-/// `Mustered`), and that repetition is intentional — do not collapse them
-/// into one. Each names which request it answers, which is what lets a
-/// variant diverge later without a protocol bump: `Reloading` already means
-/// an acceptance rather than a result, and `Mustered` already means "every
-/// sheep of every restored app" rather than "what this call started". A
-/// single `Listing(Vec<ProcessInfo>)` would have to relitigate both of those
-/// as a breaking change.
+/// Ten variants carry a bare `Vec<ProcessInfo>` (`Flock`, `Described`,
+/// `Started`, `Stopped`, `Restarted`, `Reloading`, `Scaled`, `Reopened`,
+/// `Flushed`, `Mustered`), and that repetition is intentional — do not
+/// collapse them into one. Each names which request it answers, which is what
+/// lets a variant diverge later without a protocol bump: `Reloading` already
+/// means an acceptance rather than a result, `Scaled` already means only the
+/// survivors on a scale-down rather than every matched row, and `Mustered`
+/// already means "every sheep of every restored app" rather than "what this
+/// call started". A single `Listing(Vec<ProcessInfo>)` would have to
+/// relitigate all three as a breaking change.
 // wire format: changing existing variants is a breaking change
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
@@ -594,6 +625,21 @@ pub enum Response {
     /// listed here as the no-op success it is, so this carries the same
     /// matches `Describe` would.
     Reloading(Vec<ProcessInfo>),
+    /// Answer to `Scale` — the app's instances that will REMAIN, one row each,
+    /// in instance-slot order.
+    ///
+    /// Scaling up, these are the instances that exist, the new ones included,
+    /// and the answer is complete.
+    ///
+    /// Scaling down, these are the survivors and the departing instances are
+    /// deliberately absent, even though they are still running their kill
+    /// ladders as this reply is written. The operator asked for a number; this
+    /// is that number of rows. Listing the departing ones as well would answer
+    /// a `scale web 2` with four rows, which is the one thing the reply must
+    /// not do. The departures report themselves on the bus as `process.delete`
+    /// — the same split `Reloading` already makes between an acceptance and
+    /// the swaps that follow it.
+    Scaled(Vec<ProcessInfo>),
     /// Answer to `Delete` — ids removed
     Deleted(Vec<u32>),
     /// Answer to `Reopen` — every matched sheep, running or not. A sheep with
@@ -928,6 +974,35 @@ mod tests {
         assert!(json.contains(r#""kind":"failed""#), "{json}");
     }
 
+    /// fails if `Scale` grows a selector. It takes an app NAME, and that is the
+    /// design: `instances` is a per-app number and instance slots are allocated
+    /// per name-group, so `shep scale /web.*/ 4` would have to mean either four
+    /// each or four total and there is no reading of it that is not a guess.
+    #[test]
+    fn a_scale_request_names_one_app_and_a_count() {
+        let request = Request::Scale {
+            name: "web".to_string(),
+            count: 4,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+        assert!(json.contains(r#""kind":"scale""#), "{json}");
+        assert!(json.contains(r#""name":"web""#), "{json}");
+        // No `selector` key at all — the shape that says this verb is not one of
+        // the selector-taking family.
+        assert!(!json.contains("selector"), "{json}");
+    }
+
+    /// fails if `Scaled` stops being distinguishable from the eight other replies
+    /// carrying a bare `Vec<ProcessInfo>`. Each of those names which request it
+    /// answers precisely so it can diverge later without a protocol bump — the
+    /// enum's own doc says not to collapse them, and this is the test that notices.
+    #[test]
+    fn a_scaled_reply_carries_its_own_tag() {
+        let json = serde_json::to_string(&Response::Scaled(vec![])).unwrap();
+        assert_eq!(json, r#"{"kind":"scaled","data":[]}"#);
+    }
+
     #[test]
     fn request_wire_snapshots() {
         let requests = vec![
@@ -1092,6 +1167,17 @@ mod tests {
                 body: Request::Signal {
                     selector: SelectorSpec::Name("web".to_string()),
                     signal: "SIGHUP".to_string(),
+                },
+            },
+            // The one verb in this enum whose body has no `selector` key at
+            // all — a reader comparing this row against `stop`'s sees the
+            // whole difference in one place.
+            Envelope {
+                id: 18,
+                deadline_ms: None,
+                body: Request::Scale {
+                    name: "web".to_string(),
+                    count: 4,
                 },
             },
         ];
@@ -1261,6 +1347,10 @@ mod tests {
                         },
                     },
                 ])),
+            },
+            Reply {
+                id: 21,
+                result: Ok(Response::Scaled(vec![sample_info()])),
             },
         ];
         insta::assert_json_snapshot!("reply_wire_v1", replies);
