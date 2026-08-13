@@ -315,6 +315,29 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
             params,
         } => trigger(id, selector, action, params, ctx).await,
         Request::Signal { selector, signal } => signal_request(id, selector, signal, ctx).await,
+        Request::SendLine { selector, line } => {
+            // Refused here, not silently split by the writer: a line
+            // carrying a newline would be delivered as two commands where
+            // the operator typed one, and to a REPL the second one is an
+            // instruction nobody sent. `\r` too — a line ending in CRLF
+            // reaches a shell as a command with a stray carriage return in
+            // it.
+            if line.contains(['\n', '\r']) {
+                return reply(Err(RpcError {
+                    code: RpcErrorCode::InvalidConfig,
+                    message: "a line may not contain a newline or a carriage return; \
+                              send one line per request"
+                        .to_string(),
+                }));
+            }
+            match selector_of(selector) {
+                Ok(selector) => match ctx.supervisor.send_line(selector, line).await {
+                    Ok(rows) => reply(Ok(Response::SentLine(rows))),
+                    Err(err) => reply(Err(rpc_error(&err))),
+                },
+                Err(err) => reply(Err(err)),
+            }
+        }
         Request::Delete { selector } => match selector_of(selector) {
             Err(err) => reply(Err(err)),
             Ok(selector) => match ctx.supervisor.delete(selector).await {
@@ -1113,6 +1136,33 @@ mod tests {
         assert!(err.message.contains("SIGHUPP"), "{}", err.message);
         assert!(err.message.contains("SIGHUP"), "{}", err.message);
         assert!(err.message.contains("SIGUSR2"), "{}", err.message);
+    }
+
+    /// fails if a line carrying a newline reaches the supervisor. Delivered
+    /// unrefused it would land as two commands where the operator typed one,
+    /// so it must be refused at the dispatch boundary with `InvalidConfig`
+    /// and never reach `send_line` at all — there is no sheep in this
+    /// fixture to answer it, so a `NotFound` here would mean the refusal was
+    /// skipped rather than that it fired.
+    #[tokio::test]
+    async fn a_line_carrying_a_newline_is_refused_before_it_reaches_the_supervisor() {
+        let h = harness(vec![]);
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::SendLine {
+                        selector: SelectorSpec::All,
+                        line: "reload\nrm -rf /".to_string(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let err = reply.result.unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::InvalidConfig);
+        assert!(err.message.contains("newline"), "{}", err.message);
     }
 
     /// Fails if the daemon's own per-app wait is ever allowed to reach or

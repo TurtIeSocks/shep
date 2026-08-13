@@ -46,8 +46,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use shep_core::config::{AppConfig, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
-    ActionOutcome, ActionReply, BusEvent, DogSource, ProcessEventKind, ProcessInfo, SignalOutcome,
-    SignalReply,
+    ActionOutcome, ActionReply, BusEvent, DogSource, LineOutcome, LineReply, ProcessEventKind,
+    ProcessInfo, SignalOutcome, SignalReply,
 };
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
@@ -65,7 +65,7 @@ use crate::probes::os::OsProber;
 use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
 use crate::runner::{
     ExitOutcome, FlushError, LogCtl, ProcIo, ProcessRunner, ReopenError, RunnerError,
-    RunningProcess, SpawnSpec, check_log_ancestry, open_log_path,
+    RunningProcess, SpawnSpec, StdinWrite, check_log_ancestry, open_log_path,
 };
 
 /// Capacity of the actor's own mailbox (commands + internal events).
@@ -101,6 +101,28 @@ const SIGNAL_CAPACITY: usize = 16;
 /// it is. What is lost either way is the rest of the reload, and the event
 /// says so.
 const RELOAD_DEADLINE_SLACK: Duration = Duration::from_secs(5);
+
+/// How long the shepherd waits for one line to land in a sheep's stdin before
+/// reporting [`LineOutcome::NotWritten`].
+///
+/// A bound is not optional here (IR-46): a pipe fills at 64 KiB and the write
+/// then blocks until the app reads, which an app that never reads never does —
+/// so an unbounded wait is a request that can only end by the caller's own
+/// deadline expiring, which tells the operator nothing about why.
+///
+/// Two seconds, and fixed rather than per-app. `AppConfig::action_timeout` is
+/// per-app because an action's duration is the APP's work; a pipe write is the
+/// kernel's, and the only thing a longer wait would buy is more time for an app
+/// that is not reading its stdin to start. Comfortably under the 5s an RPC
+/// caller gets when it sends no deadline of its own, so the honest
+/// `not_written` row reaches the caller rather than racing its budget.
+///
+/// **That last sentence is only true because the waits run concurrently.** One
+/// `sendline` costs at most this, whatever the selector matched; it is a bound
+/// on the CALL, not on each sheep. Awaited one after another, `sendline all`
+/// against three wedged sheep would cost six seconds and the caller's budget
+/// would expire first. See [`Actor::begin_send_line`].
+const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How many replies one sheep may still owe from actions that stopped
 /// waiting before the oldest of them is forgotten (see [`ActionWaits`]).
@@ -269,6 +291,18 @@ pub(crate) enum Command {
         /// running — off a task of its own, never the actor loop (see
         /// [`Actor::begin_signal`]).
         reply: oneshot::Sender<Result<Vec<SignalReply>, SupervisorError>>,
+    },
+    /// Writes one line to every matched sheep's stdin.
+    SendLine {
+        /// Which sheep.
+        selector: ProcessSelector,
+        /// The line, without its terminator — the writer appends exactly one
+        /// `\n`.
+        line: String,
+        /// Answers once every matched sheep's write has settled or timed
+        /// out, off a task of its own, never the actor loop (see
+        /// [`Actor::begin_send_line`]).
+        reply: oneshot::Sender<Result<Vec<LineReply>, SupervisorError>>,
     },
     /// Graceful engine shutdown: kill ladder on every online sheep, then stop.
     Shutdown {
@@ -872,6 +906,35 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
     }
 
+    /// Writes `line` to every matched sheep's stdin, and answers with one
+    /// id-sorted row per match.
+    ///
+    /// Unlike [`Self::signal`], each write can genuinely wait — a pipe write
+    /// blocks until the app reads — so the reply is bounded per sheep at
+    /// [`STDIN_WRITE_TIMEOUT`] rather than resolving as soon as delivery is
+    /// attempted.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::NotFound`] — nothing matched.
+    /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    pub(crate) async fn send_line(
+        &self,
+        selector: ProcessSelector,
+        line: String,
+    ) -> Result<Vec<LineReply>, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::SendLine {
+                selector,
+                line,
+                reply,
+            }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
     /// Full flock listing, name-grouped (see [`Actor::snapshot_all`]).
     ///
     /// # Errors
@@ -1390,6 +1453,27 @@ struct SheepSlot {
     /// sender left on a dead slot parks it for as long as the sheep stays
     /// registered.
     signals: Option<mpsc::Sender<SignalRequest>>,
+    /// A clone of the [`ProcIo::to_stdin`] the most recent successful spawn
+    /// handed out — the daemon's writing end of this sheep's stdin pipe.
+    /// `None` whenever no process is running under this id, or whenever the
+    /// running one never asked for a pipe at all (`AppConfig::stdin ==
+    /// false`), in which case the sender is present but closed — see
+    /// [`Self::open_stdin`].
+    ///
+    /// Cleared with [`Self::to_child`], for the reason that field's doc
+    /// gives: the far end parks on `recv()`, and a sender left here past the
+    /// process's exit parks that task for as long as the sheep stays
+    /// registered.
+    ///
+    /// **No `.await` on this sender may appear on the actor loop.** A sheep
+    /// whose app has stopped reading fd 0 fills its 64 KiB pipe; the writer
+    /// task then blocks in `write_all` and stops draining its `mpsc`, so an
+    /// `.await`ed send into a full queue would park whatever task made the
+    /// call — and on the actor loop that task is the actor itself, which
+    /// would stop supervising every other sheep in the flock over one app
+    /// that is not reading its stdin. [`Actor::begin_send_line`] enqueues
+    /// with `try_send` for exactly this reason.
+    to_stdin: Option<mpsc::Sender<StdinWrite>>,
     /// Which manual command (if any) is waiting on this sheep's next exit,
     /// and who asked for it. Claimed through [`Actor::claim_manual`].
     manual: Option<PendingManual>,
@@ -1449,6 +1533,21 @@ impl SheepSlot {
         self.to_child
             .as_ref()
             .filter(|to_child| !to_child.is_closed())
+    }
+
+    /// This sheep's stdin sender while something is still there to receive on
+    /// it, and `None` when nothing is.
+    ///
+    /// Read off the channel rather than off `AppConfig::stdin` so there is no
+    /// second copy of the fact free to disagree — exactly as
+    /// [`Self::open_channel`] reads the channel rather than `AppConfig::channel`.
+    /// Both halves matter: `to_stdin` is cleared when a process ends under this
+    /// id, and `is_closed` catches an app that never asked for a pipe, whose
+    /// receiver the runner dropped at spawn.
+    fn open_stdin(&self) -> Option<&mpsc::Sender<StdinWrite>> {
+        self.to_stdin
+            .as_ref()
+            .filter(|to_stdin| !to_stdin.is_closed())
     }
 }
 
@@ -1686,6 +1785,16 @@ impl<R: ProcessRunner> Actor<R> {
                 self.begin_signal(&selector, sig, reply);
                 false
             }
+            // Not rejected while `shutting_down`, for the same reason as
+            // Signal above: a line registers nothing and spawns nothing.
+            Command::SendLine {
+                selector,
+                line,
+                reply,
+            } => {
+                self.begin_send_line(&selector, line, reply);
+                false
+            }
             Command::Stop { selector, reply } => {
                 self.begin_manual(
                     selector,
@@ -1880,6 +1989,7 @@ impl<R: ProcessRunner> Actor<R> {
                 let info = to_info(&entry);
                 let log_ctl = io.log_ctl.clone();
                 let to_child = io.to_child.clone();
+                let to_stdin = io.to_stdin.clone();
                 let handles = spawn_sheep_task::<R::Proc>(
                     id,
                     proc,
@@ -1912,6 +2022,7 @@ impl<R: ProcessRunner> Actor<R> {
                         log_ctl: Some(log_ctl),
                         to_child: Some(to_child),
                         signals: Some(handles.signals),
+                        to_stdin: Some(to_stdin),
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
@@ -1955,6 +2066,7 @@ impl<R: ProcessRunner> Actor<R> {
                         log_ctl: None,
                         to_child: None,
                         signals: None,
+                        to_stdin: None,
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
@@ -2002,6 +2114,7 @@ impl<R: ProcessRunner> Actor<R> {
                 let pid = proc.pid();
                 let log_ctl = io.log_ctl.clone();
                 let to_child = io.to_child.clone();
+                let to_stdin = io.to_stdin.clone();
                 let handles = spawn_sheep_task::<R::Proc>(
                     id,
                     proc,
@@ -2043,6 +2156,7 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.log_ctl = Some(log_ctl);
                 slot.to_child = Some(to_child);
                 slot.signals = Some(handles.signals);
+                slot.to_stdin = Some(to_stdin);
                 // IMPORTANT-3: a new process now exists for this id — any
                 // RestartDue timer, or readiness task, scheduled before this
                 // point (targeting the process this replaced) is stale the
@@ -2084,6 +2198,7 @@ impl<R: ProcessRunner> Actor<R> {
                 // at each site rather than infer from the callers.
                 slot.to_child = None;
                 slot.signals = None;
+                slot.to_stdin = None;
                 slot.ready_tx = None;
                 let info = to_info(&slot.entry);
                 self.emit(ProcessEventKind::Errored, info.clone(), manually);
@@ -2916,6 +3031,7 @@ impl<R: ProcessRunner> Actor<R> {
                 let info = to_info(&entry);
                 let log_ctl = io.log_ctl.clone();
                 let to_child = io.to_child.clone();
+                let to_stdin = io.to_stdin.clone();
                 let handles = spawn_sheep_task::<R::Proc>(
                     new_id,
                     proc,
@@ -2943,6 +3059,7 @@ impl<R: ProcessRunner> Actor<R> {
                         log_ctl: Some(log_ctl),
                         to_child: Some(to_child),
                         signals: Some(handles.signals),
+                        to_stdin: Some(to_stdin),
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
@@ -3726,6 +3843,10 @@ impl<R: ProcessRunner> Actor<R> {
         // receiver open for as long as the entry lived, past the process it
         // was meant to reach. See `SheepSlot::signals`.
         slot.signals = None;
+        // Cleared alongside `to_child` for the same reason again: the
+        // writer task on the far end parks on `recv()`. See
+        // `SheepSlot::to_stdin`.
+        slot.to_stdin = None;
         // The one site that clears these, because it is the one place a
         // process under a registered id stops existing: every respawn and
         // every deregistration is downstream of an exit handled here, so a
@@ -4387,6 +4508,89 @@ impl<R: ProcessRunner> Actor<R> {
         spawn_signal_task(settled, waits, reply);
     }
 
+    /// Writes one line to every matched sheep's stdin.
+    ///
+    /// Off the actor loop, like [`Self::begin_signal`] and [`Self::begin_action`]
+    /// and for the same reason: each write is a round trip through a sheep
+    /// task, and the actor must not park on one.
+    ///
+    /// A sheep with no live task, or one running without `stdin = true`,
+    /// answers [`LineOutcome::NoStdin`] without a round trip — read off
+    /// [`SheepSlot::open_stdin`], which is the one fact that decides whether a
+    /// pipe exists.
+    ///
+    /// **The enqueue is `try_send`, never an `.await`ed send.** A full queue
+    /// means this sheep's writer task is blocked on a pipe the app is not
+    /// draining — the exact condition [`LineOutcome::NotWritten`] names, and
+    /// reporting it here costs no round trip at all. Awaiting into a full
+    /// queue would park the actor loop itself on one wedged sheep's pipe,
+    /// stopping every other sheep in the flock from being supervised — see
+    /// [`SheepSlot::to_stdin`]'s own doc.
+    ///
+    /// A reload drainee gets the line, exactly as [`Self::begin_signal`]
+    /// delivers a signal to one: the reply is not a conversation nobody can
+    /// finish, and the drainee is a live process the selector matched.
+    fn begin_send_line(
+        &mut self,
+        selector: &ProcessSelector,
+        line: String,
+        reply: oneshot::Sender<Result<Vec<LineReply>, SupervisorError>>,
+    ) {
+        let matched = self.matching_ids(selector);
+        if matched.is_empty() {
+            let _ = reply.send(Err(SupervisorError::NotFound));
+            return;
+        }
+
+        let mut settled = Vec::new();
+        let mut waits = Vec::new();
+        for id in matched {
+            let slot = self
+                .sheep
+                .get(&id)
+                .expect("begin_send_line: `matched` holds ids read off this map a moment ago");
+            let name = slot.entry.spec.config().name.clone();
+            let Some(to_stdin) = slot.open_stdin().cloned() else {
+                settled.push(LineReply {
+                    id,
+                    name,
+                    outcome: LineOutcome::NoStdin,
+                });
+                continue;
+            };
+            let (done, answer) = oneshot::channel();
+            match to_stdin.try_send(StdinWrite {
+                line: line.clone(),
+                done,
+            }) {
+                Ok(()) => waits.push((id, name, answer)),
+                // The queue is full: this sheep's writer is blocked on a pipe
+                // the app is not draining. That is precisely the condition
+                // `NotWritten` names, and reporting it here costs no round
+                // trip at all.
+                Err(mpsc::error::TrySendError::Full(_)) => settled.push(LineReply {
+                    id,
+                    name,
+                    outcome: LineOutcome::NotWritten {
+                        reason: format!(
+                            "the app is not reading its stdin (its queue is full \
+                             after {}s)",
+                            STDIN_WRITE_TIMEOUT.as_secs()
+                        ),
+                    },
+                }),
+                // Closed: the writer task is gone, so the process is too.
+                Err(mpsc::error::TrySendError::Closed(_)) => settled.push(LineReply {
+                    id,
+                    name,
+                    outcome: LineOutcome::NoStdin,
+                }),
+            }
+        }
+
+        spawn_send_line_task(settled, waits, reply);
+    }
+
     /// Puts one action on `id`'s shepherd channel and arms the wait for its
     /// reply, handing back the receiver that wait's outcome will arrive on.
     ///
@@ -4871,6 +5075,56 @@ fn spawn_signal_task(
             };
             rows.push(SignalReply { id, name, outcome });
         }
+        rows.sort_unstable_by_key(|row| row.id);
+        let _ = reply.send(Ok(rows));
+    });
+}
+
+/// One matched sheep's arming: its id and name, and the receiver its write's
+/// acknowledgement will arrive on.
+type LineWait = (u32, String, oneshot::Receiver<Result<(), RunnerError>>);
+
+/// Awaits every write's acknowledgement, each under its own
+/// [`STDIN_WRITE_TIMEOUT`], and answers `reply` with `settled` and the results
+/// in id order.
+///
+/// The waits run CONCURRENTLY — `join_all`, not a `for` loop. Unlike
+/// `spawn_trigger_task`, whose per-row waits carry no shared bound, every wait
+/// here is bounded by the same constant, so awaiting them one after another
+/// would make the total `STDIN_WRITE_TIMEOUT * matched` and put a flock-wide
+/// `sendline` over an RPC caller's default budget.
+/// `a_flock_of_wedged_sheep_is_bounded_once_and_not_once_each` is the test
+/// that says so.
+fn spawn_send_line_task(
+    settled: Vec<LineReply>,
+    waits: Vec<LineWait>,
+    reply: oneshot::Sender<Result<Vec<LineReply>, SupervisorError>>,
+) {
+    tokio::spawn(async move {
+        let mut rows = settled;
+        rows.extend(
+            futures_util::future::join_all(waits.into_iter().map(
+                |(id, name, answer)| async move {
+                    let outcome = match tokio::time::timeout(STDIN_WRITE_TIMEOUT, answer).await {
+                        Ok(Ok(Ok(()))) => LineOutcome::Sent,
+                        Ok(Ok(Err(err))) => LineOutcome::NotWritten {
+                            reason: err.to_string(),
+                        },
+                        // The sender was dropped: the writer task ended before it
+                        // served this request, which means the process did too.
+                        Ok(Err(_recv)) => LineOutcome::NoStdin,
+                        Err(_elapsed) => LineOutcome::NotWritten {
+                            reason: format!(
+                                "the app did not read its stdin within {}s",
+                                STDIN_WRITE_TIMEOUT.as_secs()
+                            ),
+                        },
+                    };
+                    LineReply { id, name, outcome }
+                },
+            ))
+            .await,
+        );
         rows.sort_unstable_by_key(|row| row.id);
         let _ = reply.send(Ok(rows));
     });
@@ -6944,6 +7198,7 @@ mod tests {
             log_ctl: None,
             to_child: None,
             signals: None,
+            to_stdin: None,
             manual: None,
             pending_delete: false,
             epoch,
@@ -7115,6 +7370,7 @@ mod tests {
                 log_ctl: None,
                 to_child: None,
                 signals: None,
+                to_stdin: None,
                 manual: None,
                 pending_delete: false,
                 epoch: 0,
@@ -7173,6 +7429,7 @@ mod tests {
                     log_ctl: None,
                     to_child: None,
                     signals: None,
+                    to_stdin: None,
                     manual: None,
                     pending_delete: false,
                     epoch: 0,
@@ -7362,6 +7619,7 @@ mod tests {
                     log_ctl: None,
                     to_child: None,
                     signals: None,
+                    to_stdin: None,
                     manual: None,
                     pending_delete: false,
                     epoch: 0,
@@ -10375,6 +10633,7 @@ mod tests {
                 log_ctl: None,
                 to_child,
                 signals: None,
+                to_stdin: None,
                 manual: None,
                 pending_delete: false,
                 epoch: 0,
@@ -11314,6 +11573,181 @@ mod tests {
             .expect("the signal's reply channel was dropped")
             .unwrap();
         assert_eq!(rows[0].outcome, SignalOutcome::Delivered);
+    }
+
+    // --- SendLine: `shep sendline`, one selector in, one row per matched
+    // sheep out ---
+
+    /// fails if a line does not reach the sheep's pipe. The fake records what
+    /// it was handed, so this asserts the line and not merely that something
+    /// happened.
+    #[tokio::test(start_paused = true)]
+    async fn a_line_reaches_a_sheep_that_asked_for_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppConfig::minimal("repl", "./repl");
+        app.stdin = true;
+        let (handle, runner, _events) = started(&dir, app, vec![ProcScript::never_exits()]).await;
+
+        let rows = handle
+            .send_line(ProcessSelector::Id(0), "reload-config".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![LineReply {
+                id: 0,
+                name: "repl".to_string(),
+                outcome: LineOutcome::Sent,
+            }]
+        );
+        assert_eq!(runner.stdin_lines(0), vec!["reload-config".to_string()]);
+    }
+
+    /// fails if a sheep without `stdin = true` is answered anything but
+    /// `no_stdin` — and especially if it is answered `Sent`, which would claim
+    /// a line landed somewhere that has no pipe at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_sheep_without_stdin_answers_no_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _runner, _events) = started(
+            &dir,
+            AppConfig::minimal("web", "./srv"),
+            vec![ProcScript::never_exits()],
+        )
+        .await;
+
+        let rows = handle
+            .send_line(ProcessSelector::Id(0), "hello".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(rows[0].outcome, LineOutcome::NoStdin);
+    }
+
+    /// fails if a mixed flock is refused as a whole. Half the sheep having a
+    /// pipe is the normal case under `all`, and a refusal that took the
+    /// reachable half with it would leave the operator unable to tell which
+    /// half was taken — the same rule `Reopen`, `Flush`, `Trigger` and
+    /// `Signal` all follow.
+    #[tokio::test(start_paused = true)]
+    async fn a_mixed_flock_reports_per_sheep_rather_than_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut piped = AppConfig::minimal("repl", "./repl");
+        piped.stdin = true;
+        // `started` starts one app; the second goes on through the handle,
+        // which is what makes the two spawn indices 0 and 1 and the two ids
+        // 0 and 1.
+        let (handle, runner, _events) = started(
+            &dir,
+            piped,
+            vec![ProcScript::never_exits(), ProcScript::never_exits()],
+        )
+        .await;
+        handle
+            .start(vec![normalize(AppConfig::minimal("web", "./srv")).unwrap()])
+            .await
+            .unwrap();
+
+        let rows = handle
+            .send_line(ProcessSelector::All, "hello".to_string())
+            .await
+            .unwrap();
+
+        let outcome = |id| rows.iter().find(|r| r.id == id).unwrap().outcome.clone();
+        assert_eq!(outcome(0), LineOutcome::Sent);
+        assert_eq!(outcome(1), LineOutcome::NoStdin);
+        assert_eq!(runner.stdin_lines(1), Vec::<String>::new());
+        // id-sorted, like every other row-shaped reply, so the answer's order
+        // is the selector's and not the scheduler's.
+        assert!(rows.windows(2).all(|w| w[0].id < w[1].id));
+    }
+
+    /// fails if a wait on an app that never reads its stdin has no bound
+    /// (IR-46). This is the case that can only fail by hanging, so it is the
+    /// one that has to carry an explicit deadline — and the outcome has to
+    /// name the bound, because "the app is not reading" and "the pipe broke"
+    /// have different fixes.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_that_never_lands_times_out_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppConfig::minimal("stuck", "./stuck");
+        app.stdin = true;
+        // `never_reads_its_stdin` accepts the write and answers nothing —
+        // exactly what a full pipe looks like from this side.
+        let (handle, _runner, _events) =
+            started(&dir, app, vec![ProcScript::never_reads_its_stdin()]).await;
+
+        let rows = tokio::time::timeout(
+            STDIN_WRITE_TIMEOUT * 4,
+            handle.send_line(ProcessSelector::Id(0), "hello".to_string()),
+        )
+        .await
+        .expect("send_line did not honour its own bound")
+        .unwrap();
+
+        let LineOutcome::NotWritten { reason } = rows[0].outcome.clone() else {
+            panic!("expected NotWritten, got {:?}", rows[0].outcome);
+        };
+        assert!(reason.contains("read"), "{reason}");
+    }
+
+    /// fails if a flock of wedged sheep costs STDIN_WRITE_TIMEOUT **each**.
+    ///
+    /// This is the case the constant's own doc rests on: two seconds is
+    /// chosen to sit under the 5s an RPC caller gets by default, and that
+    /// argument is only true if the waits run CONCURRENTLY. Awaited in a
+    /// `for` loop — which is what `spawn_trigger_task` does, and what this
+    /// task was first written to copy — three wedged sheep cost six seconds,
+    /// the caller's budget expires first, and `shep sendline all` answers
+    /// `DeadlineExceeded` instead of the three honest `not_written` rows the
+    /// outcome enum exists to deliver.
+    ///
+    /// Asserted against `Instant`, not against the row contents: the rows are
+    /// the same either way, and the elapsed time is the whole difference.
+    #[tokio::test(start_paused = true)]
+    async fn a_flock_of_wedged_sheep_is_bounded_once_and_not_once_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppConfig::minimal("stuck", "./stuck");
+        app.stdin = true;
+        app.instances = 3;
+        let (handle, _runner, _events) =
+            started(&dir, app, vec![ProcScript::never_reads_its_stdin(); 3]).await;
+
+        let started_at = tokio::time::Instant::now();
+        let rows = handle
+            .send_line(ProcessSelector::All, "hello".to_string())
+            .await
+            .unwrap();
+        let elapsed = started_at.elapsed();
+
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .all(|row| matches!(row.outcome, LineOutcome::NotWritten { .. })),
+            "{rows:?}"
+        );
+        // Under the paused clock the auto-advance is exact, so this is a real
+        // ceiling rather than a flaky one: sequential waits would read 6s.
+        assert!(
+            elapsed < STDIN_WRITE_TIMEOUT * 2,
+            "three wedged sheep cost {elapsed:?}; the bound is per-CALL, not per-sheep"
+        );
+    }
+
+    /// fails if a selector matching nothing is answered with an empty
+    /// success.
+    #[tokio::test(start_paused = true)]
+    async fn a_selector_that_matches_nothing_is_not_found_for_send_line() {
+        let h = harness(vec![]);
+        assert_eq!(
+            h.ctx
+                .supervisor
+                .send_line(ProcessSelector::Name("ghost".to_string()), "x".to_string())
+                .await
+                .unwrap_err(),
+            SupervisorError::NotFound
+        );
     }
 
     // --- flush -------------------------------------------------------
