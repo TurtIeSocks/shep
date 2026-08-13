@@ -768,6 +768,37 @@ mod tests {
         assert!(rules.on_poll(&[info], 1_000).is_empty());
     }
 
+    /// fails if `GaveUp` fires on the bus route for anything other than
+    /// `Errored` — the quiet half of "the alert that must not be missed".
+    /// `GaveUp` is on by default with no configuration at all; a rule that
+    /// fires on every event kind is as useless as one that never fires,
+    /// because it trains an operator to ignore it. Proven by mutating the
+    /// `on_event` match arm from `Trigger::GaveUp if kind ==
+    /// ProcessEventKind::Errored` to an unconditional `Trigger::GaveUp`:
+    /// before this test existed, all 14 other `rules::` tests stayed green
+    /// under that mutation because none of them fed `gave_up_rules()`
+    /// anything but an `Errored` event or status.
+    #[test]
+    fn gave_up_does_not_fire_on_event_for_a_non_errored_kind() {
+        let mut rules = gave_up_rules();
+        let online = rules.on_event(&process_event("web", ProcessEventKind::Online), 1_000);
+        assert!(online.is_empty(), "GaveUp fires on Errored only");
+        let restart = rules.on_event(&restart_event("web"), 1_100);
+        assert!(restart.is_empty(), "GaveUp fires on Errored only");
+    }
+
+    /// fails if `GaveUp` fires on the poll route for a status other than
+    /// `Errored` — the same quiet half as
+    /// [`gave_up_does_not_fire_on_event_for_a_non_errored_kind`], for the
+    /// route that has exactly the same `info.status ==
+    /// ProcStatus::Errored` guard and exactly the same gap without a test.
+    #[test]
+    fn gave_up_does_not_fire_on_poll_for_a_non_errored_status() {
+        let mut rules = gave_up_rules();
+        let fired = rules.on_poll(&[online_info("web")], 1_000);
+        assert!(fired.is_empty(), "GaveUp fires when status is Errored only");
+    }
+
     /// fails if the debounce boundary is off by one in either direction:
     /// one millisecond short of it must still be quiet, and exactly at it
     /// must fire again.
