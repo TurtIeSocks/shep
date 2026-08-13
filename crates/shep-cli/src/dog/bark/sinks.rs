@@ -755,7 +755,10 @@ mod tests {
         let err = require_secure_scheme("ops", &sink).unwrap_err();
         assert!(matches!(
             err,
-            SinkConfigError::InsecureScheme { kind: "discord", .. }
+            SinkConfigError::InsecureScheme {
+                kind: "discord",
+                ..
+            }
         ));
         assert!(!err.to_string().contains("discord.com"));
     }
