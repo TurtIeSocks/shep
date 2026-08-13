@@ -36,7 +36,7 @@ use shep_core::protocol::{BusEvent, ProcessEventKind, ProcessInfo};
 use shep_core::status::ProcStatus;
 use shep_core::values::{MemSize, UpDuration};
 
-use super::sinks::Sink;
+use super::sinks::{self, Sink, SinkConfigError};
 
 /// How long, by default, a rule stays quiet for a subject after firing.
 ///
@@ -157,6 +157,9 @@ pub enum RulesError {
         /// The kind string that matches no [`ProcessEventKind`].
         kind: String,
     },
+    /// A `[dog.bark.sinks]` entry is a Discord or Slack webhook configured
+    /// with `http://`. See [`sinks::require_secure_scheme`].
+    InsecureSink(SinkConfigError),
 }
 
 impl fmt::Display for RulesError {
@@ -171,11 +174,19 @@ impl fmt::Display for RulesError {
                 f,
                 "rule {index}'s event trigger names \"{kind}\", which is not an event kind on the wire"
             ),
+            Self::InsecureSink(source) => write!(f, "{source}"),
         }
     }
 }
 
-impl core::error::Error for RulesError {}
+impl core::error::Error for RulesError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::InsecureSink(source) => Some(source),
+            Self::UnknownSink { .. } | Self::NoSinks { .. } | Self::UnknownKind { .. } => None,
+        }
+    }
+}
 
 /// Per-subject bookkeeping [`Rules`] keeps to make the bus route and the
 /// poll route agree on one firing rather than two, and to let
@@ -213,7 +224,15 @@ impl Rules {
     /// - [`RulesError::UnknownKind`] — an `Event` rule names an event kind
     ///   that is not on the wire, which is a typo and not a future event:
     ///   bark and the shepherd ship in one binary.
+    /// - [`RulesError::InsecureSink`] — a `[dog.bark.sinks]` entry is a
+    ///   Discord or Slack webhook configured with `http://`. Checked
+    ///   against every sink, whether or not any rule currently routes to
+    ///   it — an unused insecure sink is still sitting in the config as a
+    ///   footgun for the next rule that does.
     pub fn new(rules: Vec<Rule>, sinks: &BTreeMap<String, Sink>) -> Result<Self, RulesError> {
+        for (name, sink) in sinks {
+            sinks::require_secure_scheme(name, sink).map_err(RulesError::InsecureSink)?;
+        }
         for (index, rule) in rules.iter().enumerate() {
             if rule.sinks.is_empty() {
                 return Err(RulesError::NoSinks { index });

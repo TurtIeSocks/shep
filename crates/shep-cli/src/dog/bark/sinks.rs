@@ -109,11 +109,84 @@ impl Sink {
     ///
     /// Not exposed past this module — a caller reaching for a sink's URL
     /// directly is exactly the leak [`Sink`]'s own `Debug` guards against;
-    /// [`parse_sink_url`] is the only caller.
+    /// [`parse_sink_url`] and [`require_secure_scheme`] are the only
+    /// callers.
     fn url(&self) -> &str {
         match self {
             Self::Discord { url } | Self::Slack { url } | Self::Json { url, .. } => url,
         }
+    }
+
+    /// `"discord"`/`"slack"` for the two kinds that are HTTPS-only on the
+    /// real service, `None` for [`Sink::Json`] — an operator's own
+    /// endpoint, which may legitimately have no TLS in front of it.
+    fn https_only_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::Discord { .. } => Some("discord"),
+            Self::Slack { .. } => Some("slack"),
+            Self::Json { .. } => None,
+        }
+    }
+}
+
+/// Why a `[dog.bark.sinks]` entry was refused at config-load time.
+///
+/// `Debug` needs no redaction, unlike [`Sink`]'s own: the only field this
+/// carries is the sink's config key, never its url.
+#[derive(Debug)]
+pub enum SinkConfigError {
+    /// Sink `name` is a [`Sink::Discord`] or [`Sink::Slack`] (`kind`)
+    /// configured with `http://`.
+    InsecureScheme {
+        /// The sink's config key under `[dog.bark.sinks]` — never the url,
+        /// which is the credential this refusal exists to protect.
+        name: String,
+        /// `"discord"` or `"slack"`.
+        kind: &'static str,
+    },
+}
+
+impl fmt::Display for SinkConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InsecureScheme { name, kind } => write!(
+                f,
+                "sink \"{name}\" is a {kind} webhook configured with http://; \
+                 {kind} only serves https://, and a {kind} webhook url is a \
+                 bearer credential that must not travel in cleartext"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for SinkConfigError {}
+
+/// Refuses a Discord or Slack sink configured with `http://`.
+///
+/// A Discord or Slack webhook url IS the bearer credential — the token
+/// lives in the path — so an `http://` scheme lets anyone on the wire
+/// capture it and post as that integration forever. This removes no
+/// legitimate use: discord.com and slack.com serve `https://` only, so an
+/// `http://` url to either could never have worked anyway.
+/// [`Sink::Json`] is left permissive — an operator pointing bark at an
+/// internal endpoint over plain `http://` is a legitimate arrangement, and
+/// [`parse_sink_url`] still accepts it at delivery time.
+///
+/// # Errors
+/// - [`SinkConfigError::InsecureScheme`] — `sink` is [`Sink::Discord`] or
+///   [`Sink::Slack`] and its configured url does not start with
+///   `https://`.
+pub fn require_secure_scheme(name: &str, sink: &Sink) -> Result<(), SinkConfigError> {
+    let Some(kind) = sink.https_only_kind() else {
+        return Ok(());
+    };
+    if sink.url().starts_with("https://") {
+        Ok(())
+    } else {
+        Err(SinkConfigError::InsecureScheme {
+            name: name.to_owned(),
+            kind,
+        })
     }
 }
 
@@ -608,5 +681,49 @@ mod tests {
         let rendered = format!("{:?}", discord_sink());
         assert_eq!(rendered, "Sink::Discord { url: <redacted> }");
         assert!(!rendered.contains("discord.com"));
+    }
+
+    /// fails if a Discord webhook over `http://` is accepted. The webhook
+    /// url IS the bearer credential, and discord.com serves `https://`
+    /// only, so no legitimate `http://` use is being removed.
+    #[test]
+    fn a_discord_sink_over_http_is_refused() {
+        let sink = Sink::Discord {
+            url: "http://discord.com/api/webhooks/1/super-secret-token".to_string(),
+        };
+        let err = require_secure_scheme("ops", &sink).unwrap_err();
+        assert!(matches!(
+            err,
+            SinkConfigError::InsecureScheme { kind: "discord", .. }
+        ));
+        assert!(!err.to_string().contains("discord.com"));
+    }
+
+    /// fails if a Slack webhook over `http://` is accepted — the same
+    /// credential-in-cleartext footgun as Discord's.
+    #[test]
+    fn a_slack_sink_over_http_is_refused() {
+        let sink = Sink::Slack {
+            url: "http://hooks.slack.com/services/T0/B0/super-secret-token".to_string(),
+        };
+        let err = require_secure_scheme("ops", &sink).unwrap_err();
+        assert!(matches!(
+            err,
+            SinkConfigError::InsecureScheme { kind: "slack", .. }
+        ));
+        assert!(!err.to_string().contains("hooks.slack.com"));
+    }
+
+    /// fails if a `Json` sink over `http://` is refused. Unlike Discord and
+    /// Slack, a `Json` sink's endpoint is the operator's own — pointing it
+    /// at an internal service with no TLS in front of it is a legitimate
+    /// arrangement, not a footgun.
+    #[test]
+    fn a_json_sink_over_http_is_accepted() {
+        let sink = Sink::Json {
+            url: "http://127.0.0.1:8080/hook".to_string(),
+            body: None,
+        };
+        require_secure_scheme("ops", &sink).unwrap();
     }
 }
