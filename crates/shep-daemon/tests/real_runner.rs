@@ -430,6 +430,43 @@ async fn shepherd_channel_delivers_ready() {
     assert_eq!(outcome.signal, Some(9));
 }
 
+/// fails if a real child with a channel does not see `SHEP_CHANNEL_VERSION`
+/// in its environment. The child prints the variable and the pump carries it
+/// to the log file, so this proves the whole path an app walks — env set on
+/// the `Command`, inherited across the exec, readable by a plain shell.
+///
+/// Bounded by `await_file_contents`'s own `LOG_WRITE_DEADLINE` rather than by
+/// an unbounded read: a version that never arrives has to fail here in
+/// seconds, not hang until the harness gives up on the whole binary.
+#[tokio::test]
+async fn a_child_with_a_channel_is_told_which_channel_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = spec_for(&dir, "/bin/sh", &["-c", "echo \"$SHEP_CHANNEL_VERSION\""]);
+    // The variable rides with the channel, not with every spawn: an app with
+    // no fd 3 has no channel to be told the version of.
+    spec.channel = true;
+
+    let runner = TokioRunner::new();
+    let (_proc, _io) = runner.spawn(&spec).unwrap();
+
+    await_file_contents(&dir.path().join("out.log"), "1\n").await;
+}
+
+/// fails if `SHEP_CHANNEL_VERSION` leaks into a child that was given no
+/// channel. The pair matters: a variable set unconditionally would tell an
+/// app with no fd 3 that it has a channel to speak.
+#[tokio::test]
+async fn a_child_without_a_channel_is_told_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = spec_for(&dir, "/bin/sh", &["-c", "echo \"[$SHEP_CHANNEL_VERSION]\""]);
+    assert!(!spec.channel, "`spec_for` opens no channel by default");
+
+    let runner = TokioRunner::new();
+    let (_proc, _io) = runner.spawn(&spec).unwrap();
+
+    await_file_contents(&dir.path().join("out.log"), "[]\n").await;
+}
+
 /// A `/bin/sh` child that answers exactly `rounds` shepherd-channel messages
 /// with a reply naming which round it is, then exits 0.
 ///
@@ -474,7 +511,14 @@ async fn channel_round_trip(io: &mut ProcIo, round: u32, err_file: &Path) -> Chi
     let name = format!("round-{round}");
     let delivered = io
         .to_child
-        .send(ShepherdMessage::Action { name, params: None })
+        .send(ShepherdMessage::Action {
+            name,
+            params: None,
+            // Derived from `round`, not hardcoded: this helper is called once
+            // per round, and a distinct id per call is what keeps each
+            // round's dispatch its own rather than sharing a stamp.
+            id: u64::from(round),
+        })
         .await
         .is_ok();
     let reply = if delivered {
@@ -533,6 +577,8 @@ async fn a_child_can_block_reading_the_shepherd_channel() {
         ChildMessage::ActionReply {
             action: "round-1".to_string(),
             body: "ok".to_string(),
+            // The echo script never writes an `id` key.
+            id: None,
         }
     );
 
@@ -544,6 +590,7 @@ async fn a_child_can_block_reading_the_shepherd_channel() {
         ChildMessage::ActionReply {
             action: "round-2".to_string(),
             body: "ok".to_string(),
+            id: None,
         }
     );
 

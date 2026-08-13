@@ -296,10 +296,11 @@ pub(crate) enum Msg {
     /// The sheep's shepherd channel carried a reply to an action.
     ///
     /// Routed to the waiting action task, if one is waiting — dropped
-    /// silently otherwise, exactly as `Msg::Ready` is. The correlation an
-    /// app gives us is the action NAME and nothing else, so which wait this
-    /// belongs to is a question [`ActionWaits::answer`] answers rather than
-    /// one the message carries.
+    /// silently otherwise, exactly as `Msg::Ready` is. `stamp` is the
+    /// dispatch id the app echoed, when it echoed one; without it the only
+    /// correlation the app gave us is the action NAME, and which wait the
+    /// reply belongs to is a question [`ActionWaits::answer`] answers rather
+    /// than one the message carries.
     ActionReply {
         /// The sheep's id.
         id: u32,
@@ -307,6 +308,8 @@ pub(crate) enum Msg {
         action: String,
         /// The reply body, exactly as the app sent it.
         body: String,
+        /// The dispatch stamp the app echoed, if it echoed one.
+        stamp: Option<u64>,
     },
     /// An action wait resolved.
     ActionResult {
@@ -1035,8 +1038,8 @@ struct PendingAction {
     /// there was nothing to duplicate.
     stamp: u64,
     /// The action name this is waiting for a reply to. What
-    /// [`ActionWaits::answer`] matches on, because an app's reply carries the
-    /// name and nothing else.
+    /// [`ActionWaits::answer`] falls back to matching on when the app's
+    /// reply does not echo this wait's `stamp`.
     action: String,
     /// Wakes the waiting task with the app's reply body.
     ///
@@ -1055,33 +1058,50 @@ struct PendingAction {
     reply: oneshot::Sender<ActionOutcome>,
 }
 
+/// One reply a sheep's app still owes a wait that has already ended.
+///
+/// The `stamp` is what separates a late reply from a prompt one when both
+/// name the same action: an app that echoes lets the daemon settle exactly
+/// the debt it belongs to, and an app that does not is matched by `action`
+/// and by order, the only signal the channel gives on its own.
+#[derive(Debug)]
+struct AbandonedReply {
+    /// The wait that ended without this reply.
+    stamp: u64,
+    /// Its action name — the fallback key for an app that does not echo.
+    action: String,
+}
+
 /// What one sheep still owes on its shepherd channel: the action waits armed
 /// against it, and the replies its app can still send that no wait wants.
 ///
 /// # Why the second half exists
 ///
-/// An app is free to answer an action after that action's wait has given up,
-/// and a reply carries the action NAME and nothing else — no request id, no
-/// stamp the daemon chose, and adding one would be a silent break for every
-/// deployed app, since the shepherd channel has no version to negotiate. So
-/// a late reply to a `gc` that timed out is byte-identical to a prompt reply
-/// to a `gc` triggered afterwards, and handing it to the second wait answers
-/// an operator's question with another operator's answer — a wrong answer,
-/// not an error, and the sharpest failure this type exists to prevent.
+/// An app is free to answer an action after that action's wait has given up.
+/// Since Phase 10 the daemon stamps every dispatch and an app may echo that
+/// stamp back, in which case a late reply is unambiguous and settles its own
+/// debt with nothing else at risk. An app that does not echo leaves the
+/// daemon with the action NAME and nothing else, and a late reply to a `gc`
+/// that timed out is then byte-identical to a prompt reply to a `gc`
+/// triggered afterwards. Handing that to the second wait answers an
+/// operator's question with another operator's answer — a wrong answer, not
+/// an error, and the sharpest failure this type exists to prevent.
 ///
-/// What separates them is order, which is the one thing the channel does
-/// preserve: a child reads its actions in the order they were written and its
-/// replies arrive in the order it wrote them. So a wait that ends without its
-/// reply leaves its action's name in `abandoned`, and the next reply naming
-/// that action pays off that debt instead of the live wait. Only once the
-/// debt is settled does a reply of that name reach a wait again.
+/// What separates them for an unstamped app is order, which is the one thing
+/// the channel preserves on its own: a child reads its actions in the order
+/// they were written and its replies arrive in the order it wrote them. So a
+/// wait that ends without its reply leaves a debt behind, and the next
+/// unstamped reply naming that action pays the debt instead of the live wait.
+/// Only once the debt is settled does an unstamped reply of that name reach a
+/// wait again. Echoing the stamp is how an app opts out of that whole
+/// mechanism.
 #[derive(Debug, Default)]
 struct ActionWaits {
     /// Waits still expecting a message about them, oldest first.
     live: Vec<PendingAction>,
     /// One entry per reply the app still owes a wait that has already ended,
     /// oldest first, capped at [`MAX_ABANDONED_ACTION_REPLIES`].
-    abandoned: VecDeque<String>,
+    abandoned: VecDeque<AbandonedReply>,
 }
 
 impl ActionWaits {
@@ -1090,15 +1110,41 @@ impl ActionWaits {
         self.live.push(pending);
     }
 
-    /// Routes one reply to `action`: hands back the waiter it belongs to, or
-    /// `None` if it belongs to nothing.
+    /// Routes one reply to `action` — stamped with `stamp` if the app echoed
+    /// the dispatch's `id` — to the waiter it belongs to, or `None` if it
+    /// belongs to nothing.
     ///
-    /// `None` covers the three ways a reply can arrive with nowhere to go,
-    /// and they are all ordinary rather than errors: it settles a debt left
-    /// by a wait that already gave up, it is a second reply to an action
-    /// answered once already, or the app volunteered it without being asked.
-    fn answer(&mut self, action: &str) -> Option<oneshot::Sender<String>> {
-        if let Some(owed) = self.abandoned.iter().position(|name| name == action) {
+    /// Two paths, and which one runs is the app's choice, not a mode:
+    ///
+    /// - **Stamped.** The reply names its own dispatch, so it goes to the
+    ///   live wait carrying that stamp; failing that, it settles that stamp's
+    ///   own debt; failing that, it belongs to nothing. A live wait for the
+    ///   same action name is never touched by another wait's reply, which is
+    ///   the correctness gap this path closes (wire.md #2).
+    /// - **Unstamped.** Byte-identical to the behaviour before stamping
+    ///   existed: the oldest debt of that name is settled first, and only
+    ///   once the debt is clear does a reply of that name reach a live wait.
+    ///   Order is the only signal an unstamped channel gives, and this is
+    ///   what makes of it what can be made.
+    ///
+    /// `None` still covers three ordinary shapes on both paths and none of
+    /// them is an error: a debt settled, a second reply to an action already
+    /// answered, or a reply the app volunteered without being asked.
+    fn answer(&mut self, action: &str, stamp: Option<u64>) -> Option<oneshot::Sender<String>> {
+        if let Some(stamp) = stamp {
+            if let Some(pending) = self
+                .live
+                .iter_mut()
+                .find(|pending| pending.stamp == stamp && pending.waiter.is_some())
+            {
+                return pending.waiter.take();
+            }
+            if let Some(owed) = self.abandoned.iter().position(|debt| debt.stamp == stamp) {
+                self.abandoned.remove(owed);
+            }
+            return None;
+        }
+        if let Some(owed) = self.abandoned.iter().position(|debt| debt.action == action) {
             self.abandoned.remove(owed);
             return None;
         }
@@ -1125,7 +1171,10 @@ impl ActionWaits {
         // lives, and the debt is what stops the reply being read as an answer
         // to something else.
         if pending.waiter.is_some() {
-            self.abandoned.push_back(pending.action);
+            self.abandoned.push_back(AbandonedReply {
+                stamp: pending.stamp,
+                action: pending.action,
+            });
             if self.abandoned.len() > MAX_ABANDONED_ACTION_REPLIES {
                 self.abandoned.pop_front();
             }
@@ -1358,8 +1407,13 @@ impl<R: ProcessRunner> Actor<R> {
                     self.handle_reload_deadline(&name, new_id);
                     false
                 }
-                Msg::ActionReply { id, action, body } => {
-                    self.handle_action_reply(id, &action, body);
+                Msg::ActionReply {
+                    id,
+                    action,
+                    body,
+                    stamp,
+                } => {
+                    self.handle_action_reply(id, &action, body, stamp);
                     false
                 }
                 Msg::ActionResult { id, stamp, outcome } => {
@@ -3860,6 +3914,7 @@ impl<R: ProcessRunner> Actor<R> {
             ShepherdMessage::Action {
                 name: action.clone(),
                 params,
+                id: stamp,
             },
             to_child,
             timeout,
@@ -3885,12 +3940,12 @@ impl<R: ProcessRunner> Actor<R> {
     /// Forwards one shepherd-channel reply to the action wait it belongs to,
     /// if it belongs to one. A reply with nowhere to go is dropped silently,
     /// exactly as an unwanted `Msg::Ready` is — see [`ActionWaits::answer`]
-    /// for the three shapes that takes, none of which is an error.
-    fn handle_action_reply(&mut self, id: u32, action: &str, body: String) {
+    /// for the shapes that takes, none of which is an error.
+    fn handle_action_reply(&mut self, id: u32, action: &str, body: String, stamp: Option<u64>) {
         let Some(slot) = self.sheep.get_mut(&id) else {
             return;
         };
-        if let Some(waiter) = slot.actions.answer(action) {
+        if let Some(waiter) = slot.actions.answer(action, stamp) {
             let _ = waiter.send(body);
         }
     }
@@ -4620,8 +4675,22 @@ async fn run_sheep<P: RunningProcess>(
                     Some(ChildMessage::Metric { name, value }) => {
                         tracing::debug!(id, name, value, "child metric (the metrics dog reads these; not built yet)");
                     }
-                    Some(ChildMessage::ActionReply { action, body }) => {
-                        let _ = actor_tx.send(Msg::ActionReply { id, action, body }).await;
+                    Some(ChildMessage::ActionReply {
+                        action,
+                        body,
+                        // The child's `id` is the DISPATCH's, not the sheep's;
+                        // `id` below is the sheep's. Renamed at the boundary
+                        // so no line downstream has to hold both meanings.
+                        id: stamp,
+                    }) => {
+                        let _ = actor_tx
+                            .send(Msg::ActionReply {
+                                id,
+                                action,
+                                body,
+                                stamp,
+                            })
+                            .await;
                     }
                     None => from_child_open = false,
                 }
@@ -8750,6 +8819,12 @@ mod tests {
             ShepherdMessage::Action {
                 name: "gc".to_string(),
                 params: Some("--full".to_string()),
+                // `next_action_stamp` starts at 0 and is read before it is
+                // incremented, so a freshly-built actor's first dispatch —
+                // this one — is always stamp 0. Written deliberately, not
+                // discovered: this literal is the proof the daemon stamps at
+                // all.
+                id: 0,
             },
             "the action reaches the child's end of the channel as it was asked for"
         );
@@ -8758,6 +8833,10 @@ mod tests {
             .send(ChildMessage::ActionReply {
                 action: "gc".to_string(),
                 body: "swept 3".to_string(),
+                // Echoing the dispatch's own stamp (0, asserted above) makes
+                // this a real stamped round trip through the actor, not two
+                // literals that happen to agree.
+                id: Some(0),
             })
             .await
             .unwrap();
@@ -8811,8 +8890,125 @@ mod tests {
             ShepherdMessage::Action {
                 name: "stats".to_string(),
                 params: None,
+                // Same actor, same reasoning as the previous test: its first
+                // and only dispatch carries stamp 0.
+                id: 0,
             },
             "the timeout is an app that did not answer, not an action that was never sent"
+        );
+    }
+
+    /// fails if a stamped reply is consumed as a debt payment instead of waking
+    /// the live wait it names. This is wire.md #2, in one function: T1 times out
+    /// and leaves a `gc` debt, T2 is triggered and is live, and the app's next
+    /// `gc` reply — carrying T2's stamp — must reach T2.
+    ///
+    /// The alert that must not be missed: before this task, `answer` returned
+    /// `None` here and the operator was told `timed_out` about a request the app
+    /// had answered promptly and correctly.
+    #[test]
+    fn a_stamped_reply_wakes_its_own_wait_even_with_a_debt_outstanding() {
+        let mut waits = ActionWaits::default();
+
+        // T1: armed, then resolved without its reply — the timeout path.
+        let (t1_reply, _t1_out) = oneshot::channel();
+        let (t1_waiter, _t1_body) = oneshot::channel();
+        waits.arm(PendingAction {
+            stamp: 1,
+            action: "gc".to_string(),
+            waiter: Some(t1_waiter),
+            reply: t1_reply,
+        });
+        assert!(waits.resolve(1).is_some(), "T1 must have been live");
+
+        // T2: armed and still live.
+        let (t2_reply, _t2_out) = oneshot::channel();
+        let (t2_waiter, t2_body) = oneshot::channel();
+        waits.arm(PendingAction {
+            stamp: 2,
+            action: "gc".to_string(),
+            waiter: Some(t2_waiter),
+            reply: t2_reply,
+        });
+
+        let woken = waits
+            .answer("gc", Some(2))
+            .expect("a reply stamped with the live wait's own stamp must reach it");
+        woken.send("collected".to_string()).unwrap();
+        assert_eq!(t2_body.blocking_recv().unwrap(), "collected");
+    }
+
+    /// fails if an UNSTAMPED reply stops behaving the way it does today. An app
+    /// that does not echo the stamp — every app written before this task — must
+    /// see byte-identical behaviour: the debt is paid first, the live wait is
+    /// left alone. Changing this is the regression a stamped path is most likely
+    /// to cause.
+    #[test]
+    fn an_unstamped_reply_still_settles_the_oldest_debt_first() {
+        let mut waits = ActionWaits::default();
+
+        let (t1_reply, _t1_out) = oneshot::channel();
+        let (t1_waiter, _t1_body) = oneshot::channel();
+        waits.arm(PendingAction {
+            stamp: 1,
+            action: "gc".to_string(),
+            waiter: Some(t1_waiter),
+            reply: t1_reply,
+        });
+        waits.resolve(1);
+
+        let (t2_reply, _t2_out) = oneshot::channel();
+        let (t2_waiter, _t2_body) = oneshot::channel();
+        waits.arm(PendingAction {
+            stamp: 2,
+            action: "gc".to_string(),
+            waiter: Some(t2_waiter),
+            reply: t2_reply,
+        });
+
+        assert!(
+            waits.answer("gc", None).is_none(),
+            "an unstamped reply pays the debt, exactly as it did before stamping"
+        );
+        assert!(
+            waits.answer("gc", None).is_some(),
+            "and the next one reaches the live wait, exactly as it did before"
+        );
+    }
+
+    /// fails if a reply stamped for a wait that has ALREADY given up leaks into a
+    /// live wait of the same name. The stamped path has to settle its own debt,
+    /// not just skip the queue.
+    #[test]
+    fn a_stamped_reply_for_a_dead_wait_does_not_reach_a_live_one() {
+        let mut waits = ActionWaits::default();
+
+        let (t1_reply, _t1_out) = oneshot::channel();
+        let (t1_waiter, _t1_body) = oneshot::channel();
+        waits.arm(PendingAction {
+            stamp: 1,
+            action: "gc".to_string(),
+            waiter: Some(t1_waiter),
+            reply: t1_reply,
+        });
+        waits.resolve(1);
+
+        let (t2_reply, _t2_out) = oneshot::channel();
+        let (t2_waiter, _t2_body) = oneshot::channel();
+        waits.arm(PendingAction {
+            stamp: 2,
+            action: "gc".to_string(),
+            waiter: Some(t2_waiter),
+            reply: t2_reply,
+        });
+
+        assert!(
+            waits.answer("gc", Some(1)).is_none(),
+            "T1's own late reply belongs to T1's debt, not to T2"
+        );
+        assert!(
+            waits.answer("gc", Some(2)).is_some(),
+            "and T2 is still waiting for its own"
         );
     }
 
@@ -8846,7 +9042,7 @@ mod tests {
         let second = trigger_action(&mut actor, "gc");
         sent_action(&mut child_rx).await;
         // The app finally answers the FIRST `gc`, having no way to say so.
-        actor.handle_action_reply(0, "gc", "swept 3".to_string());
+        actor.handle_action_reply(0, "gc", "swept 3".to_string(), None);
         assert_eq!(
             settle_action(&mut actor, &mut mailbox).await,
             ActionOutcome::TimedOut,
@@ -8863,8 +9059,8 @@ mod tests {
         // every assertion above.
         let third = trigger_action(&mut actor, "gc");
         sent_action(&mut child_rx).await;
-        actor.handle_action_reply(0, "gc", "swept 7".to_string());
-        actor.handle_action_reply(0, "gc", "swept 11".to_string());
+        actor.handle_action_reply(0, "gc", "swept 7".to_string(), None);
+        actor.handle_action_reply(0, "gc", "swept 11".to_string(), None);
         assert_eq!(
             settle_action(&mut actor, &mut mailbox).await,
             ActionOutcome::Replied {
@@ -8899,7 +9095,7 @@ mod tests {
 
         let answered = trigger_action(&mut actor, "gc");
         sent_action(&mut child_rx).await;
-        actor.handle_action_reply(0, "gc", "swept 3".to_string());
+        actor.handle_action_reply(0, "gc", "swept 3".to_string(), None);
         assert_eq!(
             settle_action(&mut actor, &mut mailbox).await,
             ActionOutcome::Replied {
@@ -8913,7 +9109,7 @@ mod tests {
             }
         );
 
-        actor.handle_action_reply(0, "gc", "spent".to_string());
+        actor.handle_action_reply(0, "gc", "spent".to_string(), None);
 
         let next = trigger_action(&mut actor, "gc");
         sent_action(&mut child_rx).await;
@@ -8944,8 +9140,8 @@ mod tests {
         let second = trigger_action(&mut actor, "gc");
         sent_action(&mut child_rx).await;
 
-        actor.handle_action_reply(0, "gc", "swept 3".to_string());
-        actor.handle_action_reply(0, "gc", "swept 7".to_string());
+        actor.handle_action_reply(0, "gc", "swept 3".to_string(), None);
+        actor.handle_action_reply(0, "gc", "swept 7".to_string(), None);
         settle_action(&mut actor, &mut mailbox).await;
         settle_action(&mut actor, &mut mailbox).await;
 
@@ -9109,7 +9305,7 @@ mod tests {
         sent_action(&mut child_rx).await;
         sent_action(&mut silent_rx).await;
 
-        actor.handle_action_reply(0, "gc", "swept 3".to_string());
+        actor.handle_action_reply(0, "gc", "swept 3".to_string(), None);
         assert_eq!(
             settle_action(&mut actor, &mut mailbox).await,
             ActionOutcome::Replied {
@@ -9167,7 +9363,7 @@ mod tests {
 
         let answer = trigger_flock(&mut actor, ProcessSelector::All, "gc");
         sent_action(&mut child_rx).await;
-        actor.handle_action_reply(0, "gc", "swept 3".to_string());
+        actor.handle_action_reply(0, "gc", "swept 3".to_string(), None);
         settle_action(&mut actor, &mut mailbox).await;
 
         assert_eq!(
@@ -9278,7 +9474,7 @@ mod tests {
 
         let answer = trigger_flock(&mut actor, ProcessSelector::Name("web".to_string()), "gc");
         sent_action(&mut replacement_rx).await;
-        actor.handle_action_reply(new_id, "gc", "swept 3".to_string());
+        actor.handle_action_reply(new_id, "gc", "swept 3".to_string(), None);
         settle_action(&mut actor, &mut mailbox).await;
 
         assert_eq!(

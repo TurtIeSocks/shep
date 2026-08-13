@@ -844,6 +844,7 @@ mod tests {
         let sent = ShepherdMessage::Action {
             name: "gc".to_string(),
             params: None,
+            id: 0,
         };
         io.to_child.send(sent.clone()).await.unwrap();
         let observed = fake_io.to_child_rx.recv().await.unwrap();

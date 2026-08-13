@@ -207,13 +207,18 @@ tweaks; file-locked JSON; not the primary config path.
 - **Shepherd channel** (extra pipe fd, newline JSON, language-agnostic):
   child→daemon `{"kind":"ready"}`, `{"kind":"metric",...}`,
   `{"kind":"action-reply",...}`; daemon→child `{"kind":"shutdown"}`,
-  `{"kind":"action",...}`. Fd number exported as `SHEP_CHANNEL_FD`. An
-  `action` carries `name`, and `params` when the operator supplied any — the
-  key is absent otherwise, which is what keeps it additive (§9). Full
-  contract for an app author writing to this wire, including the parts this
-  bullet has no room for (why an action should reply even to a name it does
-  not recognize, how a reply is matched to its trigger with no correlation
-  id, the `params` quoting gap): [`docs/shepherd-channel.md`](../shepherd-channel.md).
+  `{"kind":"action",...}`. Fd number exported as `SHEP_CHANNEL_FD`, wire
+  version as `SHEP_CHANNEL_VERSION` (`1`). An `action` carries `name` and
+  `id`, and `params` when the operator supplied any — the `params` key is
+  absent otherwise, which is what keeps it additive (§9). `id` is the
+  dispatch's correlation token; an app that echoes it back on its
+  `action-reply` as `id` gets its answer matched to that exact request, and
+  an app that does not is matched by action name and by order, exactly as
+  every app written before the field existed. Full contract for an app author
+  writing to this wire, including the parts this bullet has no room for (why
+  an action should reply even to a name it does not recognize, what the
+  name-and-order fallback costs when two triggers of one action overlap, the
+  `params` quoting gap): [`docs/shepherd-channel.md`](../shepherd-channel.md).
 - **Probes** (per app, optional): `readiness_probe` / `liveness_probe` =
   HTTP GET / TCP connect / exec, with interval, timeout, failure threshold.
   Readiness gates reload; liveness failures trigger the restart policy.
@@ -336,10 +341,11 @@ written. That asymmetry is the entire argument, and `trigger web
 set-log-level debug` is an ordinary thing for an operator to want.
 
 Additive is what makes it survivable at all: `params` is omitted from the
-serialized message when there are none, so `{"kind":"action","name":"gc"}` is
-still exactly what an argument-free action looks like on the wire, a message
-with no `params` key reads back as none, and an app that ignores the field
-goes on working. It is **one opaque string, not structured data** — shep does
+serialized message when there are none, so
+`{"kind":"action","name":"gc","id":7}` is still exactly what an argument-free
+action looks like on the wire, a message with no `params` key reads back as
+none, and an app that ignores the field goes on working. It is **one opaque
+string, not structured data** — shep does
 not parse it, validate it, or hold a schema for it. An app that defines an
 action already has a grammar for that action's arguments, and a second
 grammar in the daemon would only be something for every app to either adopt

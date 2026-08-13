@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- `ShepherdMessage::Action` carries `id`; `ChildMessage::ActionReply`
+  accepts an optional `id` echo. Additive — an app that ignores both is
+  matched by name and order exactly as before.
+- `SHEP_CHANNEL_VERSION` is exported to every child with a channel;
+  `channel::CHANNEL_VERSION` is its value.
 - Record, in `barks.jsonl`, an enabled dog that exhausts its restart budget —
   the shepherd's own trail for the one alert it cannot deliver itself. It has
   no sinks and no webhook code by design, so a dead bark dog can raise no
@@ -668,6 +673,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixes
 
+- A reply to a live trigger is no longer swallowed as a previous trigger's
+  timeout debt when the app echoes the dispatch `id`.
 - Let a child block on the shepherd channel. Every fd 3 handed to a child was
   non-blocking, and nothing meant it to be: `UnixStream::pair()` sets
   `O_NONBLOCK` on both ends for the sake of the daemon's own half, `into_std`

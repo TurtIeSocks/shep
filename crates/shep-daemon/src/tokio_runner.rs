@@ -40,7 +40,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use crate::boot::DIR_MODE;
-use crate::channel::{ChildMessage, ShepherdMessage};
+use crate::channel::{CHANNEL_VERSION, ChildMessage, ShepherdMessage};
 use crate::runner::{
     ExitOutcome, FlushError, LogCtl, LogLine, ProcIo, ProcessRunner, ReopenError, RunnerError,
     RunningProcess, SpawnSpec, StopSignal, check_log_ancestry, open_log_path,
@@ -241,6 +241,12 @@ impl ProcessRunner for TokioRunner {
 
         if spec.channel {
             command.env("SHEP_CHANNEL_FD", "3");
+            // Not negotiation — the shepherd still cannot ask an app what it
+            // speaks — but an app that wants to be defensive can now tell a
+            // channel it understands from one it does not, instead of
+            // failing to parse a line with nothing connecting that failure to
+            // a protocol change. One line, taken while it is still free.
+            command.env("SHEP_CHANNEL_VERSION", CHANNEL_VERSION);
             let (daemon_end, child_end) = UnixStream::pair().map_err(|error| {
                 RunnerError::SpawnFailed(format!("shepherd channel socketpair: {error}"))
             })?;
