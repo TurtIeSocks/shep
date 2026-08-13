@@ -291,5 +291,37 @@ expression: replies
         ]
       }
     }
+  },
+  {
+    "id": 22,
+    "result": {
+      "Ok": {
+        "kind": "sent_line",
+        "data": [
+          {
+            "id": 1,
+            "name": "repl",
+            "outcome": {
+              "kind": "sent"
+            }
+          },
+          {
+            "id": 2,
+            "name": "web",
+            "outcome": {
+              "kind": "no_stdin"
+            }
+          },
+          {
+            "id": 3,
+            "name": "stuck",
+            "outcome": {
+              "kind": "not_written",
+              "reason": "the app did not read its stdin within 2s"
+            }
+          }
+        ]
+      }
+    }
   }
 ]

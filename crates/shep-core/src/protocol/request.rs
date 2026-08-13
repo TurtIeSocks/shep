@@ -172,6 +172,22 @@ pub enum Request {
         /// [`RpcErrorCode::InvalidConfig`].
         signal: String,
     },
+    /// Write one line to every matched sheep's stdin (see `shep sendline`).
+    SendLine {
+        /// Which sheep. No default, matching every other verb that reaches a
+        /// running process.
+        selector: SelectorSpec,
+        /// The line, WITHOUT its terminator — the shepherd appends exactly one
+        /// `\n` when it writes. Carrying the terminator here would leave "did
+        /// the caller include one" as a question every hop has to re-answer,
+        /// and a caller that included two would send an empty line the app
+        /// never asked for.
+        ///
+        /// A line containing an embedded newline is refused
+        /// ([`RpcErrorCode::InvalidConfig`]): it would deliver two commands
+        /// where the operator typed one.
+        line: String,
+    },
     /// Write the muster roll now, bypassing the snapshot writer's debounce
     SaveRoll,
     /// Assemble the flock from the muster roll on disk: start every app the
@@ -534,6 +550,61 @@ pub struct SignalReply {
     pub outcome: SignalOutcome,
 }
 
+/// What happened when the shepherd tried to write one line to a sheep's stdin.
+///
+/// `#[non_exhaustive]`: a future outcome — a sheep refused because its pipe is
+/// backed up, say — must not need a protocol version bump (IR-20).
+// wire format: changing existing variants is a breaking change
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LineOutcome {
+    /// The line was written to the pipe and flushed.
+    ///
+    /// Says the bytes left the shepherd, not that the app read them. A pipe
+    /// holds 64 KiB before it blocks, so a short line to an app that never
+    /// reads its stdin is `Sent` — which is honest, because there is nothing
+    /// on this path that could tell the difference and a supervisor inventing
+    /// one would be guessing.
+    Sent,
+    /// The sheep has no stdin pipe: its config does not set `stdin = true`, or
+    /// it is not running.
+    ///
+    /// One outcome for two causes, deliberately. The row is read to answer
+    /// "why did my line not arrive", and both answers are "there is no pipe
+    /// here"; splitting them would put the operator in front of a distinction
+    /// with the same fix behind it. A sheep that is not running is visible as
+    /// such in `shep flock`, which is where that question belongs.
+    NoStdin,
+    /// The shepherd had a pipe and could not write to it; carries why.
+    ///
+    /// Two shapes reach it: the write failed (the far end is gone — normally
+    /// the app exiting between the lookup and the write), or it did not finish
+    /// inside the shepherd's own bound, which means the pipe is full because
+    /// the app is not reading. The reason names which, because the operator's
+    /// next move differs.
+    NotWritten {
+        /// What went wrong, in plain English.
+        reason: String,
+    },
+}
+
+/// One matched sheep's row in a `SendLine` reply.
+///
+/// Same shape and same argument as [`ActionReply`] and [`SignalReply`]: spec
+/// §9's selector grammar makes a mixed flock the normal case, so an outcome
+/// per row beats a whole-request refusal.
+// wire format: changing this is a breaking change
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineReply {
+    /// The sheep's stable id.
+    pub id: u32,
+    /// The sheep's name.
+    pub name: String,
+    /// What happened.
+    pub outcome: LineOutcome,
+}
+
 /// A dog's `[dog.<name>]` config section, carried as TOML text.
 ///
 /// This travels over the socket rather than the child's environment for
@@ -665,6 +736,8 @@ pub enum Response {
     /// and [`ProcessInfo`] has nowhere to hold it. Same reasoning, and the
     /// same row-shaped answer, as [`Self::Triggered`].
     Signalled(Vec<SignalReply>),
+    /// Answer to `SendLine` — one [`LineReply`] row per matched sheep.
+    SentLine(Vec<LineReply>),
     /// Answer to `SaveRoll`
     RollSaved {
         /// Absolute path of the roll the daemon wrote
@@ -1003,6 +1076,63 @@ mod tests {
         assert_eq!(json, r#"{"kind":"scaled","data":[]}"#);
     }
 
+    /// fails if the three outcomes stop being tellable apart on the wire, or if
+    /// `NotWritten` stops carrying its reason. That reason is the only thing that
+    /// distinguishes "the app is not reading its stdin" from "the pipe broke", and
+    /// the operator's next move differs between them.
+    #[test]
+    fn a_send_line_request_and_its_reply_round_trip() {
+        let request = Request::SendLine {
+            selector: SelectorSpec::Name("repl".to_string()),
+            line: "reload-config".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+
+        let reply = Response::SentLine(vec![
+            LineReply {
+                id: 1,
+                name: "repl".to_string(),
+                outcome: LineOutcome::Sent,
+            },
+            LineReply {
+                id: 2,
+                name: "web".to_string(),
+                outcome: LineOutcome::NoStdin,
+            },
+            LineReply {
+                id: 3,
+                name: "stuck".to_string(),
+                outcome: LineOutcome::NotWritten {
+                    reason: "the app did not read its stdin within 2s".to_string(),
+                },
+            },
+        ]);
+        let json = serde_json::to_string(&reply).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), reply);
+        assert!(json.contains(r#""kind":"sent""#), "{json}");
+        assert!(json.contains(r#""kind":"no_stdin""#), "{json}");
+        assert!(json.contains("did not read its stdin"), "{json}");
+    }
+
+    /// fails if a newline can ride inside the line. The wire carries ONE line and
+    /// the writer appends the terminator, so an embedded newline would deliver two
+    /// commands where the operator typed one — the shape that turns a typo into an
+    /// unintended second instruction to a REPL.
+    #[test]
+    fn a_line_carrying_a_newline_is_still_one_field_on_the_wire() {
+        let request = Request::SendLine {
+            selector: SelectorSpec::All,
+            line: "a\nb".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        // Escaped, not literal: the frame stays one JSON object. Rejecting it is
+        // the daemon's job (see `shep sendline`), not serde's, and this pins that
+        // the wire itself does not quietly split it.
+        assert!(json.contains(r#""line":"a\nb""#), "{json}");
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+    }
+
     #[test]
     fn request_wire_snapshots() {
         let requests = vec![
@@ -1180,6 +1310,19 @@ mod tests {
                     count: 4,
                 },
             },
+            // `SelectorSpec::All` rather than a named sheep, mirroring the
+            // `reopen`/`flush` rows above: it is the widest thing an operator
+            // can type, and the line carries no terminator on the wire — the
+            // shepherd appends it — so a fixture with one proves that half of
+            // the contract too.
+            Envelope {
+                id: 19,
+                deadline_ms: None,
+                body: Request::SendLine {
+                    selector: SelectorSpec::All,
+                    line: "reload-config".to_string(),
+                },
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v1", requests);
     }
@@ -1351,6 +1494,32 @@ mod tests {
             Reply {
                 id: 21,
                 result: Ok(Response::Scaled(vec![sample_info()])),
+            },
+            // `SentLine`, mirroring the `Signalled` row above: three rows, one
+            // per `LineOutcome` variant, so a reader sees the whole shape of
+            // the reply in one pinned fixture rather than one row that
+            // happens to hit `Sent` and leaves the other two tags unproven.
+            Reply {
+                id: 22,
+                result: Ok(Response::SentLine(vec![
+                    LineReply {
+                        id: 1,
+                        name: "repl".to_string(),
+                        outcome: LineOutcome::Sent,
+                    },
+                    LineReply {
+                        id: 2,
+                        name: "web".to_string(),
+                        outcome: LineOutcome::NoStdin,
+                    },
+                    LineReply {
+                        id: 3,
+                        name: "stuck".to_string(),
+                        outcome: LineOutcome::NotWritten {
+                            reason: "the app did not read its stdin within 2s".to_string(),
+                        },
+                    },
+                ])),
             },
         ];
         insta::assert_json_snapshot!("reply_wire_v1", replies);

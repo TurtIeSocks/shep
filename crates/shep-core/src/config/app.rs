@@ -159,6 +159,32 @@ pub struct AppConfig {
     /// real cost weighed against spec §14.11's single-digit-MB idle-RSS
     /// goal, so a channel is opened only when something asks for one.
     pub channel: bool,
+    /// Open a pipe on this sheep's stdin, so `shep sendline` can write to it.
+    ///
+    /// Defaults to `false`, and the default is the decision rather than a
+    /// convenience. Without it a sheep gets `/dev/null` on fd 0, which is what
+    /// every sheep has had until now, and three things argue for keeping it
+    /// that way unless an app asks otherwise:
+    ///
+    /// - Flipping it for the whole flock is a behaviour change to processes
+    ///   nobody asked to change.
+    /// - **Programs detect stdin.** A closed or null fd 0 is how a great many
+    ///   programs decide they are non-interactive — no prompt, no pager, no
+    ///   readline, no colour. Handing them a pipe silently moves them to the
+    ///   other branch.
+    /// - It costs a descriptor and a pump task per sheep for the whole life of
+    ///   the process, against spec §14.11's single-digit-MB idle-RSS goal — the
+    ///   same budget [`Self::channel`]'s own default is protecting.
+    ///
+    /// Unlike `channel`, nothing implies this: `wait_ready` and
+    /// `shutdown_with_message` both need fd 3 and so turn `channel` on for you,
+    /// while nothing in shep needs a sheep's stdin except an operator typing
+    /// `shep sendline`. A sheep without it answers a `no_stdin` row and names
+    /// this field.
+    ///
+    /// The pipe's write end lives as long as the sheep does, so the app sees
+    /// EOF on stdin when the process is on its way out, never before.
+    pub stdin: bool,
     /// Expect `{"kind":"ready"}` on the shepherd channel
     pub wait_ready: bool,
     /// Asserts that the app itself sets `SO_REUSEPORT` before it binds —
@@ -235,6 +261,7 @@ impl Default for AppConfig {
             err_file: None,
             merge_logs: false,
             channel: false,
+            stdin: false,
             wait_ready: false,
             reuse_port: false,
             readiness_probe: None,
@@ -280,6 +307,30 @@ mod tests {
         assert!(app.max_memory.is_none());
         assert!(app.fold.is_none());
         assert!(!app.channel);
+    }
+
+    /// fails if `stdin` defaults to anything but false. The default is the
+    /// whole decision: piping stdin for every sheep would change how a great
+    /// many programs behave (a closed stdin is how they decide they are
+    /// non-interactive), and would hold a descriptor and a task per sheep for
+    /// the life of the process.
+    #[test]
+    fn stdin_is_not_piped_unless_the_app_asks() {
+        let app = AppConfig::minimal("web", "./srv");
+        assert!(!app.stdin);
+        let parsed: AppConfig = toml::from_str("name = \"web\"\nscript = \"./srv\"").unwrap();
+        assert!(!parsed.stdin);
+    }
+
+    /// fails if the Flockfile key is spelled anything but `stdin`. It is a
+    /// contract with every config file already written against it the moment
+    /// this ships, and `deny_unknown_fields` means a rename is a hard parse
+    /// failure for the operator rather than a silently ignored key.
+    #[test]
+    fn the_flockfile_key_is_stdin() {
+        let parsed: AppConfig =
+            toml::from_str("name = \"web\"\nscript = \"./srv\"\nstdin = true").unwrap();
+        assert!(parsed.stdin);
     }
 
     #[test]

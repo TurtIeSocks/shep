@@ -67,6 +67,7 @@ expression: requests
           "err_file": null,
           "merge_logs": false,
           "channel": false,
+          "stdin": false,
           "wait_ready": false,
           "reuse_port": false,
           "readiness_probe": null,
@@ -215,6 +216,17 @@ expression: requests
       "kind": "scale",
       "name": "web",
       "count": 4
+    }
+  },
+  {
+    "id": 19,
+    "deadline_ms": null,
+    "body": {
+      "kind": "send_line",
+      "selector": {
+        "kind": "all"
+      },
+      "line": "reload-config"
     }
   }
 ]
