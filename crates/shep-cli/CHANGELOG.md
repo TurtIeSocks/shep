@@ -635,6 +635,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   derived; `SinkError` carries the sink's kind and failure kind, never its
   URL.
 
+- `dog::bark::rules`: `Rules`, deciding which events become a bark and
+  which are filtered out. Four trigger kinds under `[dog.bark.rules]`'s
+  `on = "..."` key: `event` (any of a configured list of bus event kinds,
+  by wire spelling — `exit`, `errored`, `online`, ...), `gave_up` (a sheep
+  reached `Errored` — on by default with no configuration at all, since
+  it is the alert that must not be missed), `restart_rate` (`restarts`
+  restarts within `within` — opt-in, since it is the one that pages at
+  3am for a blip and the threshold should be one the operator chose), and
+  `memory_above` (a sheep's memory crossed a `bytes` ceiling). A
+  `[dog.bark]` with sinks configured and no `[[dog.bark.rules]]` at all
+  still alerts: `Rules::default_rules` builds one `gave_up` rule routed to
+  every configured sink.
+
+  Two routes feed the same rule set: `on_event` off the daemon bus, and
+  `on_poll` off a reconciliation snapshot of the flock. Both exist because
+  `tokio::sync::broadcast` drops events for a lagging subscriber rather
+  than queueing them — the daemon surfaces that as `BusEvent::Dropped` —
+  so a dog that only listened to the bus would miss some. `restart_rate`
+  and `memory_above` are two rules, not one, because a restart is
+  something that HAPPENS (a bus edge bark can count occurrences of) and
+  memory is a LEVEL (only ever known by reading the current sample), and
+  `restart_rate` itself only ever evaluates off `on_poll`, reading the
+  shepherd's own `ProcessInfo::restarts` rather than tallying `restart`
+  bus events itself — a private tally drifts from the number the
+  shepherd acts on, and would tell the operator a different story from
+  the one the supervisor believes.
+
+  Debounce (`[dog.bark.rules]`'s own `debounce`, five minutes by default)
+  is per rule PER SUBJECT, never global: a global debounce would mean the
+  second sheep to go down during an incident is silent, and that is the
+  incident's most interesting fact. The same per-rule-per-subject state
+  is what lets one `Errored` seen by both routes — off the bus, and off
+  the very next poll — fire once rather than twice: whichever route sees
+  it first records the firing, and the debounce covers the other.
+  `Rules::new` refuses a configuration that cannot work before it ever
+  runs: a rule routing to a sink `[dog.bark.sinks]` does not define, a
+  rule routing to no sink at all, or an `event` rule naming a kind that
+  is not on the wire are all startup errors, not alerts that fire
+  correctly for months and deliver nowhere.
+
 ### Fixes
 
 - `shep enable <name>` sends the source `shep.toml` actually records, not a
