@@ -278,6 +278,10 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => lifecycle::delete(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
+        Commands::Scale(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => lifecycle::scale(&client, &mut streams, fmt, args).await,
+            Err(code) => code,
+        },
         Commands::Trigger(ref args) => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => trigger::trigger(&client, &mut streams, fmt, args).await,
             Err(code) => code,

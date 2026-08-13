@@ -3179,6 +3179,84 @@ fn signal_reaches_the_signal_verb_and_delivers() {
     graceful_kill(dir.path());
 }
 
+// --- Scale -------------------------------------------------------------
+
+/// `shep scale` reaches the scale verb and no other, against a real daemon:
+/// scaling up spawns the new instances, scaling back down drains the extras.
+///
+/// Both directions are polled through `shep flock` rather than trusted off
+/// `scale`'s own exit — a scale-down accepts before the departing instances'
+/// stop ladders finish (see `Commands::Scale`'s own doc), so the flock
+/// settling to one row is the real assertion, and a scale-down that never
+/// settles fails the test on `FLOCK_DEADLINE` rather than hanging it (IR-46).
+#[test]
+fn scale_reaches_the_scale_verb_and_settles_the_flock() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("sheep")
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    let scaled_up = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("scale")
+        .arg("sheep")
+        .arg("3")
+        .output()
+        .unwrap();
+    assert_success(&scaled_up);
+    let envelope: serde_json::Value = serde_json::from_slice(&scaled_up.stdout).unwrap();
+    assert_eq!(
+        envelope["command"], "scale",
+        "`shep scale` must reach the scale verb and no other: {envelope}"
+    );
+
+    let grown = poll_flock_data(dir.path(), FLOCK_DEADLINE, |data| {
+        data.as_array().is_some_and(|rows| rows.len() == 3)
+    });
+    assert_eq!(
+        grown.as_array().unwrap().len(),
+        3,
+        "scaling up must settle at three instances: {grown}"
+    );
+    assert!(
+        grown
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["name"] == "sheep"),
+        "every instance must still belong to `sheep`: {grown}"
+    );
+
+    let scaled_down = shep(dir.path())
+        .arg("scale")
+        .arg("sheep")
+        .arg("1")
+        .output()
+        .unwrap();
+    assert_success(&scaled_down);
+
+    let settled = poll_flock_data(dir.path(), FLOCK_DEADLINE, |data| {
+        data.as_array().is_some_and(|rows| rows.len() == 1)
+    });
+    assert_eq!(
+        settled.as_array().unwrap().len(),
+        1,
+        "scaling down must settle back to one instance: {settled}"
+    );
+
+    graceful_kill(dir.path());
+}
+
 // --- Save / Muster ---------------------------------------------------------
 
 /// `shep save` writes the muster roll and `shep muster` reads it back — the

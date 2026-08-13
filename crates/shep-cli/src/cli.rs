@@ -85,6 +85,24 @@ pub enum Commands {
     Reload(SelectorArgs),
     /// Delete one or more sheep from the flock.
     Delete(SelectorArgs),
+    /// Set how many instances one app runs.
+    ///
+    /// An absolute count, not a change: `shep scale web 4` means web has four
+    /// instances afterwards, whatever it had before. There is no +N/-N form —
+    /// run it twice and get the same flock.
+    ///
+    /// Scaling up fills the lowest free instance slots; scaling down releases
+    /// the highest, so scaling out and back returns the same slot numbers, the
+    /// same SHEP_INSTANCE values and the same log files it started with.
+    ///
+    /// Exits as soon as the shepherd accepts, printing the instances that
+    /// remain. On a scale-down the departing instances are still running their
+    /// stop ladders at that point; they report themselves on the bus, under
+    /// process.delete.
+    ///
+    /// The new count is written to the muster roll, so `shep save` and a
+    /// reboot keep it.
+    Scale(ScaleArgs),
     /// List the flock.
     #[command(visible_aliases = ["list", "ls"])]
     Flock,
@@ -265,6 +283,22 @@ pub struct StartArgs {
 pub struct SelectorArgs {
     /// name, id, `all`, `/regex/`, or `fold:<name>`
     pub selector: String,
+}
+
+/// Arguments to `shep scale`.
+///
+/// Not [`SelectorArgs`], and this is the only lifecycle verb that is not.
+/// `instances` is a per-app number, so the target is an app NAME: no `all`,
+/// no `/regex/`, no `fold:` — a selector matching two apps would have to mean
+/// either four each or four in total, and neither reading is more obviously
+/// right.
+#[derive(Debug, clap::Args)]
+pub struct ScaleArgs {
+    /// The app's name
+    pub name: String,
+    /// How many instances it runs afterwards
+    #[arg(value_parser = clap::value_parser!(u32).range(1..))]
+    pub count: u32,
 }
 
 /// Arguments to `shep trigger`.
@@ -563,6 +597,25 @@ mod tests {
             panic!("expected reopen")
         };
         assert_eq!(args.selector, "web");
+    }
+
+    /// fails if clap accepts `shep scale web 0`. The refusal exists daemon-side
+    /// too, and deliberately in both places — but a usage error should not cost a
+    /// connection, and `range(1..)` is what puts the accepted range into `--help`.
+    #[test]
+    fn scale_refuses_a_count_of_zero_before_it_reaches_the_wire() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["shep", "scale", "web", "0"]).is_err());
+        assert!(Cli::try_parse_from(["shep", "scale", "web", "1"]).is_ok());
+    }
+
+    /// fails if `scale` grows a default target. `shep scale 4` must be a usage
+    /// error, never "scale whatever app happens to be first".
+    #[test]
+    fn scale_requires_both_the_name_and_the_count() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["shep", "scale"]).is_err());
+        assert!(Cli::try_parse_from(["shep", "scale", "web"]).is_err());
     }
 
     /// Every verb sharing [`SelectorArgs`] must refuse to run without one.

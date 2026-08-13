@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `shep scale <name> <count>`.
 - Add `shep signal <selector> <signal>`.
 - Add the hidden `shep dog <name>` subcommand — the re-exec target a
   built-in dog runs as, the same shape `shep daemon` already is: not for

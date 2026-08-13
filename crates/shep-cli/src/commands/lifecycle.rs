@@ -16,7 +16,7 @@ use shep_client::{Client, START_DEADLINE};
 use shep_core::config::{AppConfig, FlockFormat, Flockfile, FlockfileError};
 use shep_core::protocol::{Request, Response, SelectorSpec};
 
-use crate::cli::{Format, SelectorArgs, StartArgs};
+use crate::cli::{Format, ScaleArgs, SelectorArgs, StartArgs};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
 use crate::output::{DeletedIds, FlockRows, Render, Streams, emit, emit_error, write_outcome};
@@ -360,6 +360,38 @@ pub async fn delete(
     .await
 }
 
+/// Sets `args.name`'s instance count, and renders the instances that remain.
+///
+/// No `parse_selector` call, unlike every other verb in this module: `scale`
+/// takes a name. See [`ScaleArgs`]'s own doc for why.
+///
+/// Sends `Request::Scale` with `START_DEADLINE`, not the client's default: a
+/// scale-up spawns processes, which is the same work `start` already asks
+/// for the longer budget to cover.
+pub async fn scale(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    args: &ScaleArgs,
+) -> ExitCode {
+    request_and_render(
+        client,
+        streams,
+        fmt,
+        "scale",
+        Request::Scale {
+            name: args.name.clone(),
+            count: args.count,
+        },
+        Some(START_DEADLINE),
+        |response| match response {
+            Response::Scaled(procs) => Some(FlockRows(procs)),
+            _ => None,
+        },
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,5 +714,79 @@ mod tests {
             }
             other => panic!("expected Request::Start, got {other:?}"),
         }
+    }
+
+    /// fails if the envelope carries anything but the name and the count. `scale`
+    /// is the one verb here that does NOT parse a selector, and a copy-pasted
+    /// `parse_selector` would turn `web` into `SelectorSpec::Name("web")` and send
+    /// a frame the daemon has no arm for.
+    #[tokio::test]
+    async fn the_request_carries_the_app_name_and_the_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+        };
+        let _ = scale(
+            &client,
+            &mut streams,
+            Format::Table,
+            &ScaleArgs {
+                name: "web".to_string(),
+                count: 4,
+            },
+        )
+        .await;
+
+        let envelope = envelopes.recv().await.unwrap();
+        assert_eq!(
+            envelope.body,
+            Request::Scale {
+                name: "web".to_string(),
+                count: 4,
+            }
+        );
+    }
+
+    /// fails if an `InvalidConfig` refusal is swallowed or remapped. A count of 0
+    /// is the shape an operator will actually type, and it has to come back as
+    /// exit 4 with the daemon's own sentence, not as a generic failure.
+    #[tokio::test]
+    async fn an_invalid_scale_exits_invalid_config_and_prints_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, _served) = fake_client_replying_err(
+            &path,
+            RpcErrorCode::InvalidConfig,
+            "an app runs at least one instance; use `shep delete web` to remove it",
+        )
+        .await;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            scale(
+                &client,
+                &mut streams,
+                Format::Table,
+                &ScaleArgs {
+                    name: "web".to_string(),
+                    count: 1,
+                },
+            )
+            .await
+        };
+        assert_eq!(code, ExitCode::InvalidConfig);
+        assert!(
+            String::from_utf8(err).unwrap().contains("shep delete web"),
+            "the daemon's own sentence has to reach the operator"
+        );
     }
 }
