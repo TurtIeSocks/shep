@@ -20,6 +20,7 @@
 //! would abort a supervised process with a panic and a confusing log line
 //! instead of a plain, restartable failure.
 
+pub mod bark;
 pub mod http;
 pub mod metrics;
 
@@ -253,7 +254,7 @@ pub async fn run_dog(name: &str, paths: ShepPaths) -> ExitCode {
     };
     match name {
         "metrics" => metrics::run(runtime).await,
-        "bark" => stub(&runtime, "Task 21", "crates/shep-cli/src/dog/bark.rs"),
+        "bark" => stub(&runtime, "Task 21", "crates/shep-cli/src/dog/bark/mod.rs"),
         _ => unreachable!("checked against BUILT_IN_DOGS above"),
     }
 }

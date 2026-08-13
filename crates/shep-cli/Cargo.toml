@@ -42,6 +42,15 @@ clap_complete = { version = "4.6.0", default-features = false }
 # `AsyncWriteExt`, and `tokio::io::duplex` for its own tests — the same
 # reason shep-daemon's own hand-rolled HTTP probe (`probes/os.rs`) carries it.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "io-util"] }
+# `dog::bark::sinks`'s TLS transport for Discord/Slack webhooks. Rin's ruling
+# (2026-08-12): a hand-rolled HTTP/1.1 client over `tokio-rustls`, not
+# `reqwest` — see this crate's root `Cargo.toml` entry for the full
+# accounting. `ring`/`tls12` name the crypto provider directly so
+# `tokio-rustls`'s own default features (which pull in `aws_lc_rs`, a C
+# build dependency) never apply.
+tokio-rustls.workspace = true
+# Mozilla's compiled-in TLS root store, for the same TLS connector.
+webpki-roots.workspace = true
 # The one GLOBAL subscriber install in the workspace, in `commands::daemon`
 # (shep-daemon's own `testing::capture_logs` installs a scoped one per test).
 # Every feature the workspace entry names is live there: `fmt` renders,

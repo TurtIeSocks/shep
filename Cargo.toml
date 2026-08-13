@@ -176,6 +176,22 @@ notify-debouncer-full = { version = "0.7.0", default-features = false }
 # `FSEventsPurgeEventsForDeviceUpToEventId`, all added in 4.1.0. macOS only,
 # but the pin is unconditional because that is where the rehearsal runs.
 fsevent-sys = "4.1.0"
+# Bark's sinks are Discord and Slack webhooks, which are HTTPS, so this is
+# the one thing in the workspace that needs TLS. Rin's ruling (2026-08-12)
+# is a hand-rolled HTTP/1.1 client over tokio-rustls rather than reqwest:
+# reqwest's default rustls feature costs +93 crates over this workspace's
+# existing 196 and a C build dependency (aws-lc-sys, cmake); tokio-rustls +
+# webpki-roots, named directly, costs +10 crates and none of it needs a C
+# toolchain. `ring`, not the default `aws_lc_rs`, is the crypto provider —
+# aws_lc_rs is exactly the C dependency this choice exists to avoid, and
+# tokio-rustls's own default features pull it in unless named away.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# Mozilla's compiled-in root store. rustls itself is reached through
+# tokio-rustls's own `pub use rustls;` (tokio-rustls-0.26.4/src/lib.rs) — a
+# direct `rustls` dependency is not named in crates/shep-cli/Cargo.toml
+# because nothing there needs to name the crate, only the types it
+# re-exports.
+webpki-roots = "0.26"
 
 # Most debuginfo in `target/` is not ours: the default `debug = true` emits
 # full DWARF for every dependency and links a copy into each of the

@@ -596,6 +596,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first rung of its kill ladder, rather than riding it all the way to
   `SIGKILL`.
 
+- `dog::bark::sinks`: `Sink`, the three webhook destinations one fired bark
+  can be delivered to — `discord` (`{"content": "..."}`), `slack`
+  (`{"text": "..."}`), and `json` (an operator-templated POST, defaulting
+  to an object carrying `subject`, `rule`, `message` and `at_ms`). A
+  templated `body` substitutes `{subject}`, `{rule}`, `{message}` and
+  `{at_ms}` — the three strings JSON-escaped, `at_ms` a bare number — and
+  `render_body` refuses to send a template that does not render valid
+  JSON, naming the parser's own complaint rather than letting an operator
+  guess at the 400 every one of these endpoints answers a malformed body
+  with.
+
+  `deliver` POSTs the rendered body over a hand-rolled HTTP/1.1 client,
+  bounded end-to-end (connect, handshake, write, read) by one timeout. A
+  non-2xx reply is `SinkError::Status`, carrying the code and the first
+  line of the body — Discord's own rate-limit `429` arrives this way and
+  reads as one, rather than as a silently-swallowed success.
+
+  Two new workspace dependencies: `tokio-rustls` and `webpki-roots`, named
+  directly rather than pulling in `reqwest`. Discord and Slack webhooks
+  are HTTPS-only, so this phase needs a TLS client somewhere, and Rin's
+  ruling (2026-08-12) was a hand-rolled HTTP/1.1 request/response over
+  `tokio-rustls`'s connector — the same call already made for the metrics
+  dog's HTTP *server* side, aimed the other way — rather than `reqwest`.
+  Measured against this workspace's existing dependency tree: `reqwest`'s
+  default `rustls` feature costs +93 crates and a C build dependency
+  (`aws-lc-sys`, `cmake`); `tokio-rustls` + `webpki-roots`, named with
+  `ring` as the crypto provider instead of the default `aws_lc_rs`, cost
+  11 unique runtime crates (plus 3 build-time-only crates behind `ring`'s
+  own build script) and no C toolchain — the extra one over the ruling's
+  own "+10" estimate is `webpki-roots` 0.26's own semver-trick shim onto
+  `webpki-roots` 1.x, confirmed with `cargo tree -p shep-cli`. What
+  `reqwest` adds beyond that includes QUIC/HTTP3, wasm/JNI bindings, ICU
+  (IDNA), and a `tower` stack — none of it reachable from a Unix daemon
+  POSTing to a webhook. A sink's
+  `url` is a bearer credential (Discord and Slack embed the token in the
+  path), so `Sink`'s `Debug` is hand-written and redacted rather than
+  derived; `SinkError` carries the sink's kind and failure kind, never its
+  URL.
+
 ### Fixes
 
 - `shep enable <name>` sends the source `shep.toml` actually records, not a
