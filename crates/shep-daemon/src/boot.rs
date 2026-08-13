@@ -58,7 +58,7 @@ use shep_core::selector::ProcessSelector;
 
 use crate::bus::new_bus;
 use crate::cron::DEFAULT_MAX_CRON_SLEEP;
-use crate::dogs::DogSpec;
+use crate::dogs::{DogSpec, spawn_dog_watch};
 use crate::extras::{Extras, ExtrasReports, spawn_extras_reporter};
 use crate::rpc::RpcContext;
 use crate::runner::ProcessRunner;
@@ -615,6 +615,12 @@ pub async fn boot<R: ProcessRunner>(
 
     // 4. Bus, supervisor, muster restore, snapshot writer, context.
     let events = new_bus();
+    // Spawned the moment the bus exists, ahead of the supervisor that will
+    // ever emit anything onto it: this is a subscriber like the snapshot
+    // writer, not a branch inside the engine (see `spawn_dog_watch`'s own
+    // doc), and giving it a receiver early means it can never miss an
+    // `Errored` a dog reaches during boot's own restore step.
+    let dog_watch = spawn_dog_watch(events.subscribe(), paths.barks.clone());
     let (breach_tx, breach_rx) = mpsc::channel(EXTRAS_REPORT_CAPACITY);
     let (live_tx, live_rx) = mpsc::channel(EXTRAS_REPORT_CAPACITY);
     let extras = Extras::real(
@@ -711,6 +717,7 @@ pub async fn boot<R: ProcessRunner>(
         ctx,
         listener,
         writer,
+        dog_watch,
         paths,
         socket,
         // Held from here into `RunningDaemon` — `watch::Sender::send` is a
@@ -784,6 +791,12 @@ pub struct RunningDaemon {
     ctx: RpcContext,
     listener: UnixListener,
     writer: SnapshotWriter,
+    // Parks on a broadcast receiver until this handle aborts it (see
+    // `spawn_dog_watch`'s own doc for why holding the handle, not sender
+    // count, is what makes that deterministic). Stopped in `run`'s teardown
+    // step 1 alongside `writer`: both are bus subscribers with no further
+    // reason to run once serving ends.
+    dog_watch: JoinHandle<()>,
     paths: ShepPaths,
     socket: PathBuf,
     // Held from `boot` onward, not created fresh in `run`: `watch::Sender::send`
@@ -832,7 +845,9 @@ impl RunningDaemon {
     /// Serves until a signal or `KillDaemon`, then tears down in order.
     ///
     /// TEARDOWN ORDER IS LOAD-BEARING:
-    /// 1. stop the snapshot writer — nothing may rewrite the roll from here on;
+    /// 1. stop the snapshot writer, and the dog watch alongside it — nothing
+    ///    may rewrite the roll from here on, and no bus subscriber has a
+    ///    reason left to watch once serving ends;
     /// 2. write the final muster roll — records the flock AS IT WAS, still running;
     /// 3. broadcast [`BusEvent::DaemonShutdown`] — subscribers learn before their sockets close;
     /// 4. [`SupervisorHandle::shutdown`] — the kill ladder on every online sheep;
@@ -864,6 +879,7 @@ impl RunningDaemon {
             ctx,
             listener,
             writer,
+            dog_watch,
             paths,
             socket,
             shutdown_rx,
@@ -889,8 +905,11 @@ impl RunningDaemon {
             .serve(shutdown_rx)
             .await;
 
-        // 1. Stop the snapshot writer FIRST — see this fn's doc.
+        // 1. Stop the snapshot writer FIRST — see this fn's doc. The dog
+        //    watch stops alongside it: both are bus subscribers with
+        //    nothing left to watch for once serving ends.
         writer.stop().await;
+        dog_watch.abort();
 
         // 2. Write the final roll while every sheep is still online.
         if let Err(err) = ctx.snapshot_now().await {

@@ -51,6 +51,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Record, in `barks.jsonl`, an enabled dog that exhausts its restart budget —
+  the shepherd's own trail for the one alert it cannot deliver itself. It has
+  no sinks and no webhook code by design, so a dead bark dog can raise no
+  webhook alert about its own death; what it can guarantee is a local record,
+  so an operator reading `shep barks` after an outage finds the moment
+  alerting stopped rather than a gap they have to infer. Written by a bus
+  watcher (`dogs::spawn_dog_watch`), not a branch inside the supervisor —
+  supervision stays blind to dog-ness, and this only answers who should see
+  an event that already happened. Fires on a dog's `Errored` only, never on
+  an `Exit` it survives or a sheep's own `Errored`, which is bark's record to
+  write. A lagging watcher logs the drop at `warn!` and does not attempt to
+  recover it; polling for what the bus already dropped would be building a
+  second bark dog inside the shepherd.
+
 - Start every `[daemon] enabled_dogs` dog when the daemon boots, strictly
   after the muster restore and strictly before the daemon reports itself
   ready. Both halves of that placement are load-bearing: after the restore,

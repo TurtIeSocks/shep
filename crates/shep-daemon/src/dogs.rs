@@ -33,11 +33,13 @@
 //! that exposure to a second surface.
 
 use core::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use shep_core::barks::{self, Bark};
 use shep_core::config::{AppConfig, DaemonConfig, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
-use shep_core::protocol::DogSource;
+use shep_core::protocol::{BusEvent, DogSource, ProcessEventKind};
+use tokio::sync::broadcast::{self, error::RecvError};
 
 use crate::supervisor::SupervisorHandle;
 
@@ -225,10 +227,100 @@ pub fn dog_section(path: &Path, name: &str) -> Result<String, DogError> {
     }
 }
 
+/// Watches the bus and records, locally, every enabled dog that exhausts
+/// its restart budget.
+///
+/// The shepherd cannot DELIVER an alert about a dead bark dog: it has no
+/// sinks and no webhook code, by design. What it can guarantee is a local
+/// trail, so an operator reading `shep barks` after an outage finds the
+/// moment alerting stopped rather than a gap they have to infer.
+///
+/// A bus WATCHER rather than a branch inside the supervisor, and the
+/// distinction is the phase's own tripwire: this answers *who should see
+/// this*, from outside, and the supervisor stays a machine that knows only
+/// how to supervise. A `dog` arm inside `handle_exited` would be the same
+/// behaviour reaching into the wrong place.
+///
+/// Its `JoinHandle` is held by the caller and aborted at teardown: the task
+/// parks on a broadcast receiver, which ends on its own when the sender
+/// drops, and holding the handle is what makes the end deterministic rather
+/// than dependent on sender count.
+pub fn spawn_dog_watch(
+    mut events: broadcast::Receiver<BusEvent>,
+    barks: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                // Only a DOG's Errored is this watcher's business. A sheep's
+                // Errored is bark's job — bark writes those records over its
+                // own client connection — and duplicating that write here
+                // would leave one event with two authors in one file. Exit
+                // is excluded too: it fires on every restart a dog survives,
+                // and a `barks.jsonl` full of those is one an operator stops
+                // reading.
+                Ok(BusEvent::Process {
+                    event: ProcessEventKind::Errored,
+                    info,
+                    ..
+                }) if info.dog.is_some() => {
+                    record_dog_errored(&barks, &info.name, info.restarts);
+                }
+                Ok(_) => {}
+                // The bus DROPS events for a lagging subscriber rather than
+                // queuing them (`tokio::sync::broadcast`'s own contract), so
+                // a dog's death notice may be among what this receiver just
+                // lost. There is no poll to recover it — building one here
+                // would be building a second bark dog inside the shepherd,
+                // exactly the subsystem this module exists to avoid.
+                // Metrics' `shep_dog_up` is the intended answer to this gap.
+                Err(RecvError::Lagged(count)) => {
+                    tracing::warn!(
+                        count,
+                        "the shepherd's dog watch dropped bus events; a dog's exhausted restart budget may have gone unrecorded"
+                    );
+                }
+                Err(RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+/// Records `name`'s exhausted restart budget as a [`Bark`] the shepherd
+/// wrote itself, and logs the same facts at `tracing::error!`.
+///
+/// The two records serve different audiences: `message` is plain English
+/// for an operator reading `shep barks` mid-incident, and the `tracing`
+/// event carries the same facts structured for `journalctl`. `sinks` is
+/// left empty, which is how a [`Bark`] says the shepherd has no webhook
+/// code of its own (see [`Bark::sinks`]'s own doc).
+///
+/// A dog is supervised with `AppConfig`'s own defaults — [`dog_app`] never
+/// overrides `max_restarts` — so `AppConfig::default().max_restarts` is the
+/// exhausted budget for every dog, not a guess.
+fn record_dog_errored(barks_path: &Path, name: &str, restarts: u32) {
+    let budget = AppConfig::default().max_restarts;
+    tracing::error!(dog = %name, restarts, budget, "a dog exhausted its restart budget");
+    let bark = Bark {
+        at_ms: crate::now_ms(),
+        rule: "daemon".to_string(),
+        subject: name.to_string(),
+        message: format!(
+            "dog {name} exhausted its restart budget: {restarts} restarts against a budget of {budget}"
+        ),
+        sinks: Vec::new(),
+    };
+    if let Err(err) = barks::append(barks_path, &bark, barks::DEFAULT_MAX_BYTES) {
+        tracing::warn!(%err, dog = %name, "failed to record a dog's exhausted restart budget");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::test_paths;
+    use shep_core::protocol::ProcessInfo;
+    use shep_core::status::ProcStatus;
 
     /// fails if a `[dog.<name>]` value is folded into the child's
     /// environment. That is the design's whole reason for putting config on
@@ -338,5 +430,114 @@ mod tests {
             dog_section(&dir.path().join("gone.toml"), "bark").unwrap(),
             ""
         );
+    }
+
+    /// A minimal `Process` bus event, `name` carrying either a sheep's or a
+    /// dog's entry depending on `dog`.
+    fn process_event(name: &str, kind: ProcessEventKind, dog: Option<DogSource>) -> BusEvent {
+        BusEvent::Process {
+            event: kind,
+            info: ProcessInfo {
+                id: 1,
+                name: name.to_string(),
+                status: ProcStatus::Errored,
+                pid: None,
+                restarts: 16,
+                uptime_ms: 0,
+                fold: None,
+                out_file: None,
+                err_file: None,
+                cpu_percent: None,
+                memory_bytes: None,
+                dog,
+            },
+            manually: false,
+            at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn errored_event(name: &str, dog: Option<DogSource>) -> BusEvent {
+        process_event(name, ProcessEventKind::Errored, dog)
+    }
+
+    /// Polls `path` under a real timeout until it holds at least `n` barks.
+    /// The watcher writing to it runs as a separate task, so a bare read
+    /// races it; a bare `recv().await` on nothing is the hang this project
+    /// has already paid for twice.
+    async fn await_barks(path: &std::path::Path, n: usize) -> Vec<Bark> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let found = barks::read(path).unwrap_or_default();
+                if found.len() >= n {
+                    return found;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("barks.jsonl never reached the expected record count")
+    }
+
+    /// fails if the shepherd records a sheep's death as well as a dog's.
+    /// Bark writes the sheep records; two writers for one event, into one
+    /// file, is how a history stops being trustworthy. Both halves are
+    /// needed: without the negative assertion, a watcher that recorded
+    /// EVERY `Errored` passes.
+    #[tokio::test]
+    async fn the_shepherd_records_a_dog_that_gave_up_and_leaves_the_sheep_to_bark() {
+        let dir = tempfile::tempdir().unwrap();
+        let barks_path = dir.path().join("barks.jsonl");
+        let (events, rx) = broadcast::channel(16);
+        let watch = spawn_dog_watch(rx, barks_path.clone());
+
+        events.send(errored_event("web", None)).unwrap();
+        events
+            .send(errored_event("bark", Some(DogSource::BuiltIn)))
+            .unwrap();
+
+        let recorded = await_barks(&barks_path, 1).await;
+        assert_eq!(recorded.len(), 1, "one record, and it is the dog's");
+        assert_eq!(recorded[0].subject, "bark");
+        assert_eq!(recorded[0].rule, "daemon");
+        assert!(
+            recorded[0].sinks.is_empty(),
+            "the shepherd has no sinks and says so by carrying none"
+        );
+
+        watch.abort();
+    }
+
+    /// fails if a restart a dog survives is recorded as a death. A dog that
+    /// crashes and comes back is not an outage, and a `barks.jsonl` full of
+    /// them is one an operator stops reading.
+    #[tokio::test]
+    async fn a_dog_that_merely_exited_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let barks_path = dir.path().join("barks.jsonl");
+        let (events, rx) = broadcast::channel(16);
+        let watch = spawn_dog_watch(rx, barks_path.clone());
+
+        events
+            .send(process_event(
+                "bark",
+                ProcessEventKind::Exit,
+                Some(DogSource::BuiltIn),
+            ))
+            .unwrap();
+        // A real `Errored` after it is what proves the watcher was ever
+        // listening: without this, a watcher that recorded nothing at all
+        // (dead code, or the wrong topic) would also pass.
+        events
+            .send(errored_event("bark", Some(DogSource::BuiltIn)))
+            .unwrap();
+
+        let recorded = await_barks(&barks_path, 1).await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the Exit left no record; only the Errored that followed it did"
+        );
+
+        watch.abort();
     }
 }
