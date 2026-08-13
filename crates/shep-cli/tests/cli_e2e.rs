@@ -3131,6 +3131,54 @@ fn trigger_reaches_the_trigger_verb_and_names_the_missing_channel() {
     graceful_kill(dir.path());
 }
 
+// --- Signal ------------------------------------------------------------
+
+/// `shep signal` reaches the signal verb and no other, against a real
+/// daemon and a real sheep — the same dispatch-misroute gap `trigger`'s own
+/// case names, for `Commands::Signal` instead.
+///
+/// `SIGWINCH` is the right signal for an e2e case: harmless to essentially
+/// everything, so the assertion is about delivery reaching the sheep at all,
+/// not about what the child did with it.
+#[test]
+fn signal_reaches_the_signal_verb_and_delivers() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("sheep")
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    let signalled = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("signal")
+        .arg("sheep")
+        .arg("SIGWINCH")
+        .output()
+        .unwrap();
+    assert_success(&signalled);
+    let envelope: serde_json::Value = serde_json::from_slice(&signalled.stdout).unwrap();
+    assert_eq!(
+        envelope["command"], "signal",
+        "`shep signal` must reach the signal verb and no other: {envelope}"
+    );
+    assert_eq!(envelope["data"][0]["name"], "sheep", "{envelope}");
+    assert_eq!(
+        envelope["data"][0]["outcome"]["kind"], "delivered",
+        "a running sheep must answer delivered for a signal the kernel accepted: {envelope}"
+    );
+
+    graceful_kill(dir.path());
+}
+
 // --- Save / Muster ---------------------------------------------------------
 
 /// `shep save` writes the muster roll and `shep muster` reads it back — the

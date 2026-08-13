@@ -29,6 +29,7 @@ use shep_core::protocol::{
     BusEvent, Envelope, ProcessInfo, Reply, Request, Response, RpcError, RpcErrorCode, SelectorSpec,
 };
 use shep_core::selector::ProcessSelector;
+use shep_core::signals::OperatorSignal;
 
 use crate::bus::TopicFilter;
 use crate::dogs::DogSpec;
@@ -313,6 +314,7 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
             action,
             params,
         } => trigger(id, selector, action, params, ctx).await,
+        Request::Signal { selector, signal } => signal_request(id, selector, signal, ctx).await,
         Request::Delete { selector } => match selector_of(selector) {
             Err(err) => reply(Err(err)),
             Ok(selector) => match ctx.supervisor.delete(selector).await {
@@ -577,6 +579,33 @@ async fn trigger(
             .await
             .map(Response::Triggered)
             .map_err(|err| rpc_error(&err)),
+    };
+    Outcome::Reply(Reply { id, result })
+}
+
+/// `Signal`'s own resolve-then-map path, mirroring [`trigger`]: the signal
+/// name is re-validated here even though the CLI validated it too — peer
+/// input is untrusted, the same rule `Request::Start`'s own `normalize_all`
+/// follows a few arms up — then the selector is converted, the supervisor is
+/// called, and the rows are mapped.
+async fn signal_request(id: u64, spec: SelectorSpec, signal: String, ctx: &RpcContext) -> Outcome {
+    let result = match OperatorSignal::parse(&signal) {
+        None => Err(RpcError {
+            code: RpcErrorCode::InvalidConfig,
+            message: format!(
+                "`{signal}` is not a signal shep will send; accepted: {}",
+                OperatorSignal::ACCEPTED.join(", ")
+            ),
+        }),
+        Some(sig) => match selector_of(spec) {
+            Err(err) => Err(err),
+            Ok(selector) => ctx
+                .supervisor
+                .signal(selector, sig)
+                .await
+                .map(Response::Signalled)
+                .map_err(|err| rpc_error(&err)),
+        },
     };
     Outcome::Reply(Reply { id, result })
 }
@@ -1016,6 +1045,33 @@ mod tests {
                 outcome: ActionOutcome::TimedOut,
             }]
         );
+    }
+
+    /// fails if a bad signal name reaches the supervisor. It must be refused at the
+    /// dispatch boundary with `InvalidConfig`, not turned into a `NotFound` or an
+    /// `Internal` deeper in — an operator who typed `SIGHUPP` needs the accepted
+    /// list, and only this arm has it.
+    #[tokio::test]
+    async fn a_signal_name_outside_the_grammar_is_refused_with_the_accepted_list() {
+        let h = harness(vec![]);
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Signal {
+                        selector: SelectorSpec::All,
+                        signal: "SIGHUPP".to_string(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let err = reply.result.unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::InvalidConfig);
+        assert!(err.message.contains("SIGHUPP"), "{}", err.message);
+        assert!(err.message.contains("SIGHUP"), "{}", err.message);
+        assert!(err.message.contains("SIGUSR2"), "{}", err.message);
     }
 
     /// Fails if the daemon's own per-app wait is ever allowed to reach or

@@ -34,6 +34,7 @@ use std::process::Stdio;
 use command_fds::{CommandFdExt, FdMapping};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
+use shep_core::signals::OperatorSignal;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWriteExt as _, BufReader, Lines};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
@@ -115,6 +116,23 @@ impl RunningProcess for TokioProc {
     fn kill_tree(&mut self) -> Result<(), RunnerError> {
         signal_group(self.pid, Signal::SIGKILL)
     }
+
+    fn signal_process(&mut self, sig: OperatorSignal) -> Result<(), RunnerError> {
+        // POSITIVE pid, unlike `signal_group`'s negative one. That single
+        // character is the difference between the two contracts, so it gets
+        // its own function rather than a boolean on the existing one.
+        let pid = i32::try_from(self.pid)
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| {
+                RunnerError::SignalFailed(format!(
+                    "pid {} is not a signallable process id",
+                    self.pid
+                ))
+            })?;
+        signal::kill(Pid::from_raw(pid), to_nix_operator_signal(sig))
+            .map_err(|error| RunnerError::SignalFailed(error.to_string()))
+    }
 }
 
 // Both stop rungs go through one function because they differ only in which
@@ -185,6 +203,27 @@ fn to_nix_signal(sig: StopSignal) -> Signal {
         StopSignal::Quit => Signal::SIGQUIT,
         StopSignal::Usr2 => Signal::SIGUSR2,
         StopSignal::Kill => Signal::SIGKILL,
+    }
+}
+
+/// Maps [`OperatorSignal`] to the nix [`Signal`] it names.
+///
+/// An explicit match, like [`to_nix_signal`], rather than a numeric
+/// conversion: shep-core deliberately holds no raw signal numbers (they differ
+/// by platform — `SIGUSR1` is 10 on Linux and 30 on macOS), so this is the one
+/// place in the workspace where the two vocabularies meet, and an unmapped
+/// variant must be a compile error rather than a runtime one.
+fn to_nix_operator_signal(sig: OperatorSignal) -> Signal {
+    match sig {
+        OperatorSignal::Hup => Signal::SIGHUP,
+        OperatorSignal::Int => Signal::SIGINT,
+        OperatorSignal::Quit => Signal::SIGQUIT,
+        OperatorSignal::Term => Signal::SIGTERM,
+        OperatorSignal::Usr1 => Signal::SIGUSR1,
+        OperatorSignal::Usr2 => Signal::SIGUSR2,
+        OperatorSignal::Winch => Signal::SIGWINCH,
+        OperatorSignal::Cont => Signal::SIGCONT,
+        OperatorSignal::Kill => Signal::SIGKILL,
     }
 }
 

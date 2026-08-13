@@ -30,6 +30,8 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::{mpsc, oneshot};
 
+use shep_core::signals::OperatorSignal;
+
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::privilege::Credentials;
 
@@ -644,6 +646,39 @@ pub trait RunningProcess: Send + 'static {
     /// portable tier) documents how it establishes the property and what an
     /// implementation that dropped it would do instead.
     fn signal(&mut self, sig: StopSignal) -> Result<(), RunnerError>;
+
+    /// Sends `sig` to this sheep's OWN process, never its process group.
+    ///
+    /// The counterpart to [`Self::signal`], and the difference between them is
+    /// the whole design of `shep signal`. That one is group-wide because a
+    /// stop has to reach a `thing & wait` wrapper's child too. This one is not,
+    /// because it exists for a conversation between an operator and one
+    /// application: a `SIGHUP` broadcast to every process in the group reaches
+    /// whatever `sh` and whatever runtime child happen to be in it, none of
+    /// which the operator addressed and several of which have their own
+    /// meaning for the signal.
+    ///
+    /// # Errors
+    ///
+    /// - [`RunnerError::SignalFailed`] — delivery failed (`ESRCH` for a
+    ///   process reaped between the lookup and the syscall, `EPERM` for one
+    ///   this daemon may not signal), or this implementation has no per-process
+    ///   delivery at all.
+    ///
+    /// # Default implementation
+    ///
+    /// Refuses. A defaulted method rather than a required one so that adding
+    /// it did not break an out-of-tree implementor of this trait, which is a
+    /// `pub` trait in a published library — the same courtesy `#[non_exhaustive]`
+    /// buys an enum (IR-20). An implementation that can deliver a signal to one
+    /// process overrides it; one that cannot says so honestly instead of
+    /// silently widening to the group.
+    fn signal_process(&mut self, sig: OperatorSignal) -> Result<(), RunnerError> {
+        let _ = sig;
+        Err(RunnerError::SignalFailed(
+            "this runner cannot signal a single process".to_string(),
+        ))
+    }
 
     /// SIGKILLs the whole process group/tree
     ///

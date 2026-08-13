@@ -13,6 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use shep_core::signals::OperatorSignal;
 use shep_daemon::channel::{ChildMessage, ShepherdMessage};
 use shep_daemon::privilege::Credentials;
 use shep_daemon::runner::{ProcIo, ProcessRunner, RunningProcess, SpawnSpec, StopSignal};
@@ -262,6 +263,60 @@ async fn signal_ignored_then_kill_tree_reaps() {
         .await
         .expect("kill_tree should reap promptly");
     assert_eq!(outcome.signal, Some(9));
+}
+
+/// A real child, a real `kill(2)`, and the one assertion the scripted tier
+/// cannot make: the signal reached the sheep and NOT the lamb it forked.
+///
+/// The wrapper traps SIGUSR1 and prints one word; the lamb traps it and prints
+/// another. A group delivery prints both. Bounded (IR-46): without the timeout
+/// a signal that reached nobody would hang the read rather than fail it.
+#[tokio::test]
+async fn a_process_signal_reaches_the_sheep_and_not_its_lamb() {
+    let dir = tempfile::tempdir().unwrap();
+    // The lamb arms its trap and announces itself, so the test can wait for it
+    // to be READY rather than racing the fork. Without that line the signal can
+    // land before `trap` runs in the subshell and the assertion passes for the
+    // wrong reason.
+    let script = r#"
+        trap 'echo sheep-got-it' USR1
+        ( trap 'echo lamb-got-it' USR1; echo lamb-ready; while :; do sleep 0.1; done ) &
+        while :; do sleep 0.1; done
+    "#;
+    let spec = sh_spec(
+        script,
+        false,
+        dir.path().join("out.log"),
+        dir.path().join("err.log"),
+    );
+    let runner = TokioRunner::new();
+    let (mut proc, mut io) = runner.spawn(&spec).unwrap();
+    let _reaper = Reaper(vec![i32::try_from(proc.pid()).unwrap()]);
+
+    // Wait for the lamb's trap to be armed.
+    let ready = tokio::time::timeout(Duration::from_secs(10), io.logs.recv())
+        .await
+        .expect("the lamb did not announce itself within 10s")
+        .expect("log channel closed");
+    assert_eq!(ready.line, "lamb-ready");
+
+    proc.signal_process(OperatorSignal::Usr1).unwrap();
+
+    let answer = tokio::time::timeout(Duration::from_secs(10), io.logs.recv())
+        .await
+        .expect("nothing answered the signal within 10s")
+        .expect("log channel closed");
+    assert_eq!(answer.line, "sheep-got-it");
+
+    // And nothing else follows it. A group delivery would put `lamb-got-it` on
+    // the same stream; a bounded read that times out is the proof it did not.
+    let extra = tokio::time::timeout(Duration::from_secs(2), io.logs.recv()).await;
+    assert!(
+        extra.is_err(),
+        "the lamb answered too: {extra:?} — the signal reached the group"
+    );
+
+    proc.kill_tree().unwrap();
 }
 
 /// How long the forked grandchild in

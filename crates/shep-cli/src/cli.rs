@@ -135,6 +135,22 @@ pub enum Commands {
     /// to the app verbatim, on its own shepherd-channel wire, for the app
     /// itself to recognize or refuse.
     Trigger(TriggerArgs),
+    /// Send a unix signal to matched sheep.
+    ///
+    /// Delivered to each sheep's own process, not to its process group — the
+    /// lambs it forked are not signalled. This is a nudge to the application
+    /// (SIGHUP to re-read config, SIGUSR1 to dump state); `shep stop` is what
+    /// runs the stop ladder, and `shep reload` is what swaps instances.
+    ///
+    /// Accepted: SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2, SIGWINCH,
+    /// SIGCONT, SIGKILL. The SIG prefix and the case are both optional.
+    /// SIGSTOP is refused: a stopped sheep still reads online in every listing
+    /// shep can produce.
+    ///
+    /// Delivery is not action. A signal the app blocks or ignores is reported
+    /// delivered, because the kernel took it and there is nothing further shep
+    /// can see.
+    Signal(SignalArgs),
     /// List one fold.
     Fold(FoldArgs),
     /// Show or follow bleats (log output) for one or more sheep.
@@ -268,6 +284,20 @@ pub struct TriggerArgs {
     pub action: String,
     /// Argument text for the action, passed through to the app verbatim
     pub params: Option<String>,
+}
+
+/// Arguments to `shep signal`.
+///
+/// Not [`SelectorArgs`]: this verb needs a second positional. The selector
+/// stays required — no `default_value` — for the reason every
+/// running-process verb's does: an accidental `shep signal` should be a usage
+/// error, never a flock-wide SIGHUP.
+#[derive(Debug, clap::Args)]
+pub struct SignalArgs {
+    /// name, id, `all`, `/regex/`, or `fold:<name>`
+    pub selector: String,
+    /// Signal name, e.g. `SIGHUP` or `hup`
+    pub signal: String,
 }
 
 /// Arguments to `shep flush`.

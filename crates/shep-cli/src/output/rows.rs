@@ -12,7 +12,9 @@
 
 use serde::Serialize;
 use shep_core::barks::{Bark, SinkOutcome};
-use shep_core::protocol::{ActionOutcome, ActionReply, DogSource, ProcessInfo};
+use shep_core::protocol::{
+    ActionOutcome, ActionReply, DogSource, ProcessInfo, SignalOutcome, SignalReply,
+};
 
 use super::Render;
 
@@ -976,6 +978,74 @@ fn preview_body(body: &str) -> String {
     preview
 }
 
+/// `Response::Signalled(Vec<SignalReply>)` — one row per matched sheep, each
+/// carrying what happened when the shepherd tried to deliver `shep signal`'s
+/// signal to it.
+///
+/// Shaped exactly like [`TriggeredRows`], for the same reason
+/// [`SignalReply`]'s own doc gives: a per-row outcome, since spec §9's
+/// selector grammar makes a mixed flock the normal case.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct SignalledRows(pub Vec<SignalReply>);
+
+impl Render for SignalledRows {
+    fn headers() -> &'static [&'static str] {
+        &["ID", "NAME", "OUTCOME", "DETAIL"]
+    }
+
+    /// One row per matched sheep. `OUTCOME` is the short, stable kind
+    /// (`delivered`, `not_running`, `failed` — [`SignalOutcome`]'s own `kind`
+    /// tag); `DETAIL` is where the three variants differ, via
+    /// [`describe_signal_outcome`].
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|reply| {
+                let (outcome, detail) = describe_signal_outcome(&reply.outcome);
+                vec![
+                    reply.id.to_string(),
+                    reply.name.clone(),
+                    outcome.to_string(),
+                    detail,
+                ]
+            })
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "ID" => "id",
+            "NAME" => "name",
+            // Both table columns are read off the one `outcome` object, same
+            // as `TriggeredRows::json_key_for`'s own reasoning.
+            "OUTCOME" | "DETAIL" => "outcome",
+            other => panic!("SignalledRows::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
+/// [`SignalledRows::rows`]'s per-outcome split: the short, stable `OUTCOME`
+/// label and the human `DETAIL` text.
+///
+/// `SignalOutcome` is `#[non_exhaustive]` (shep-core's own Global
+/// Constraints), so this carries a wildcard arm: a variant this client
+/// predates renders as `unknown` with its `Debug` form, rather than failing
+/// to compile.
+fn describe_signal_outcome(outcome: &SignalOutcome) -> (&'static str, String) {
+    match outcome {
+        SignalOutcome::Delivered => ("delivered", String::new()),
+        SignalOutcome::NotRunning => ("not_running", "no live process to signal".to_string()),
+        SignalOutcome::Failed { reason } => ("failed", reason.clone()),
+        other => ("unknown", format!("{other:?}")),
+    }
+}
+
 /// `Vec<Bark>` — `shep barks`' own payload, newest last exactly as it sits
 /// on disk (`shep_core::barks::read`'s own order — a ring is appended to,
 /// never re-sorted) and as `--tail` counts from.
@@ -1672,6 +1742,54 @@ pub(crate) mod tests {
             *table_cell, long_body,
             "the table cell must be the collapsed preview, not the real body"
         );
+    }
+
+    fn sample_signal_replies() -> SignalledRows {
+        SignalledRows(vec![
+            SignalReply {
+                id: 1,
+                name: "web".to_string(),
+                outcome: SignalOutcome::Delivered,
+            },
+            SignalReply {
+                id: 2,
+                name: "worker".to_string(),
+                outcome: SignalOutcome::NotRunning,
+            },
+        ])
+    }
+
+    /// OUTCOME and DETAIL both derive from `outcome`, a nested JSON object
+    /// rather than a scalar — same reasoning as `triggered_rows_do_not_drift`.
+    #[test]
+    fn signalled_rows_do_not_drift() {
+        assert_no_drift(&sample_signal_replies(), |j| &j[0], &["OUTCOME", "DETAIL"]);
+    }
+
+    #[test]
+    fn signalled_rows_render_id_name_and_outcome_kind() {
+        let rows = sample_signal_replies().rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], "1");
+        assert_eq!(rows[0][1], "web");
+        assert_eq!(rows[0][2], "delivered");
+        assert_eq!(rows[1][0], "2");
+        assert_eq!(rows[1][1], "worker");
+        assert_eq!(rows[1][2], "not_running");
+    }
+
+    #[test]
+    fn a_failed_signal_details_the_kernels_reason() {
+        let rows = SignalledRows(vec![SignalReply {
+            id: 1,
+            name: "web".to_string(),
+            outcome: SignalOutcome::Failed {
+                reason: "No such process".to_string(),
+            },
+        }])
+        .rows();
+        assert_eq!(rows[0][2], "failed");
+        assert_eq!(rows[0][3], "No such process");
     }
 
     /// Two barks: one the bark dog delivered to a live sink, one it

@@ -35,7 +35,7 @@ use crate::exit::ExitCode;
 pub use rows::{
     BarkRows, DeletedIds, DogAdoptedRow, DogDisabledRow, DogEnabledRow, DogRehomedRow, DogRows,
     EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, ImportRow, ImportRows, KillRow, PingRow,
-    SavedRollRow, StartupStep, StartupSteps, TriggeredRows,
+    SavedRollRow, SignalledRows, StartupStep, StartupSteps, TriggeredRows,
 };
 pub use table::{human_bytes, human_duration, local_timestamp, render_table};
 

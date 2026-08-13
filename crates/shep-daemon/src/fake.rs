@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use shep_core::signals::OperatorSignal;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Duration, Instant, sleep_until};
 
@@ -185,6 +186,9 @@ struct ProcState {
     /// message does NOT append here, so tests can assert "no `signal()` call
     /// happened" even though the wait still resolved.
     signals: Mutex<Vec<i32>>,
+    /// Every `signal_process` call, in call order. Separate from `signals`,
+    /// which records group deliveries — see `ScriptedRunner::process_signals`.
+    process_signals: Mutex<Vec<OperatorSignal>>,
     /// Notified on `kill_tree()`; same before-or-during buffering as above
     kill_notify: Notify,
     /// `kill_tree()` call count, read back via [`ScriptedRunner::kill_counts`]
@@ -227,6 +231,10 @@ impl ProcState {
     fn record_kill(&self) {
         self.kill_count.fetch_add(1, Ordering::SeqCst);
         self.kill_notify.notify_one();
+    }
+
+    fn record_process_signal(&self, sig: OperatorSignal) {
+        self.process_signals.lock().unwrap().push(sig);
     }
 }
 
@@ -308,6 +316,19 @@ impl RunningProcess for FakeProc {
         self.state.record_kill();
         Ok(())
     }
+
+    // Recorded on its own list, not `record_signal`'s. A scripted proc models
+    // one process with no descendants, so the two deliveries are
+    // indistinguishable in what they REACH here — but they are entirely
+    // distinguishable in which one the supervisor called, and that is the fact
+    // a test of `shep signal` needs. Notably this does NOT resolve the wait:
+    // `signal` does (it is the stop ladder's polite rung and the scripted proc
+    // obeys it), and a nudge that killed the sheep would make every case here
+    // vacuous.
+    fn signal_process(&mut self, sig: OperatorSignal) -> Result<(), RunnerError> {
+        self.state.record_process_signal(sig);
+        Ok(())
+    }
 }
 
 /// One spawn's shared state plus its still-unclaimed [`FakeIo`] test handles
@@ -386,6 +407,27 @@ impl ScriptedRunner {
         self.spawned.lock().unwrap()[spawn_index]
             .state
             .signals
+            .lock()
+            .unwrap()
+            .clone()
+    }
+
+    /// Every [`OperatorSignal`] a `signal_process` call has recorded for the
+    /// proc spawned at `spawn_index`, in call order.
+    ///
+    /// The counterpart to [`Self::signals`], which records the group-wide
+    /// deliveries the stop ladder makes. Two lists rather than one because
+    /// which of the two the supervisor called is exactly what a test of
+    /// `shep signal` is asking.
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[must_use]
+    pub fn process_signals(&self, spawn_index: usize) -> Vec<OperatorSignal> {
+        self.spawned.lock().unwrap()[spawn_index]
+            .state
+            .process_signals
             .lock()
             .unwrap()
             .clone()
@@ -506,6 +548,7 @@ impl ProcessRunner for ScriptedRunner {
             signal_notify: Notify::new(),
             pending_signal: Mutex::new(None),
             signals: Mutex::new(Vec::new()),
+            process_signals: Mutex::new(Vec::new()),
             kill_notify: Notify::new(),
             kill_count: AtomicU32::new(0),
             resolved: Mutex::new(None),
@@ -741,6 +784,49 @@ mod tests {
                 signal: Some(StopSignal::Term.as_raw())
             }
         );
+    }
+
+    /// fails if a signal aimed at one sheep is recorded as a group delivery, or
+    /// not recorded at all. `signal` and `signal_process` are two different
+    /// contracts against the same OS primitive, and a fake that answered both from
+    /// one counter could not tell a reviewer which one the supervisor called.
+    #[tokio::test(start_paused = true)]
+    async fn a_process_signal_is_recorded_apart_from_a_group_signal() {
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let (mut proc, _io) = runner.spawn(&spec()).unwrap();
+
+        proc.signal_process(OperatorSignal::Hup).unwrap();
+        proc.signal_process(OperatorSignal::Usr1).unwrap();
+
+        assert_eq!(
+            runner.process_signals(0),
+            vec![OperatorSignal::Hup, OperatorSignal::Usr1]
+        );
+        assert!(
+            runner.signals(0).is_empty(),
+            "a per-process signal must not be counted as a group signal"
+        );
+    }
+
+    /// fails if `signal_process` resolves the scripted proc's `wait()`. It must
+    /// not: `signal` does (it is the stop ladder's polite rung, and this script
+    /// obeys it), and a nudge that ended the sheep would make every supervisor
+    /// case in Step 4.3 vacuous — the row would read `Delivered` off a process
+    /// that had just died.
+    #[tokio::test(start_paused = true)]
+    async fn a_process_signal_does_not_end_the_scripted_proc() {
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let (proc, _io) = runner.spawn(&spec()).unwrap();
+        let mut waiter = proc.clone();
+        let mut signaller = proc;
+        let waiting = tokio::spawn(async move { waiter.wait().await });
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        signaller.signal_process(OperatorSignal::Hup).unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        assert!(!waiting.is_finished(), "signal_process resolved the wait");
+        waiting.abort();
     }
 
     #[tokio::test(start_paused = true)]

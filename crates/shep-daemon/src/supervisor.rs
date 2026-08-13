@@ -45,9 +45,11 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use shep_core::config::{AppConfig, ResolvedApp};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
-    ActionOutcome, ActionReply, BusEvent, DogSource, ProcessEventKind, ProcessInfo,
+    ActionOutcome, ActionReply, BusEvent, DogSource, ProcessEventKind, ProcessInfo, SignalOutcome,
+    SignalReply,
 };
 use shep_core::selector::ProcessSelector;
+use shep_core::signals::OperatorSignal;
 use shep_core::status::ProcStatus;
 
 use crate::assemble::{assemble, instance_slots};
@@ -61,8 +63,8 @@ use crate::probes::Prober;
 use crate::probes::os::OsProber;
 use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
 use crate::runner::{
-    ExitOutcome, FlushError, LogCtl, ProcIo, ProcessRunner, ReopenError, RunningProcess, SpawnSpec,
-    check_log_ancestry, open_log_path,
+    ExitOutcome, FlushError, LogCtl, ProcIo, ProcessRunner, ReopenError, RunnerError,
+    RunningProcess, SpawnSpec, check_log_ancestry, open_log_path,
 };
 
 /// Capacity of the actor's own mailbox (commands + internal events).
@@ -71,6 +73,16 @@ const MAILBOX_CAPACITY: usize = 256;
 /// Capacity of one sheep task's control mailbox — at most one live `Kill` is
 /// ever in flight, so this stays small on purpose.
 const SHEEP_CTL_CAPACITY: usize = 4;
+
+/// Capacity of one sheep task's signal mailbox.
+///
+/// Wider than [`SHEEP_CTL_CAPACITY`] on purpose: unlike the kill ladder,
+/// nothing bounds how many `shep signal` calls an operator can fire off
+/// against one sheep in a burst, and [`Actor::begin_signal`] reads a `Full`
+/// mailbox as "this sheep's task is busy" rather than as a hint the ladder is
+/// already running (see [`SheepSlot::signals`]'s own doc for why the two
+/// mailboxes cannot share one queue).
+const SIGNAL_CAPACITY: usize = 16;
 
 /// How much longer than its own two timeouts one swap of a reload is given
 /// before the actor gives up on it (see [`Actor::arm_reload_deadline`]).
@@ -234,6 +246,18 @@ pub(crate) enum Command {
         /// refused — off a task of its own, never the actor loop (see
         /// [`Actor::begin_action`]).
         reply: oneshot::Sender<Result<Vec<ActionReply>, SupervisorError>>,
+    },
+    /// Delivers one signal to the OWN process of every sheep matching
+    /// `selector` — never its process group (see [`Actor::begin_signal`]).
+    Signal {
+        /// Which sheep.
+        selector: ProcessSelector,
+        /// The signal to deliver.
+        sig: OperatorSignal,
+        /// Answers once every matched sheep has been signalled or found not
+        /// running — off a task of its own, never the actor loop (see
+        /// [`Actor::begin_signal`]).
+        reply: oneshot::Sender<Result<Vec<SignalReply>, SupervisorError>>,
     },
     /// Graceful engine shutdown: kill ladder on every online sheep, then stop.
     Shutdown {
@@ -761,6 +785,36 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
     }
 
+    /// Delivers `sig` to the OWN process of every sheep matching `selector` —
+    /// never its process group — and answers with one id-sorted row per
+    /// match.
+    ///
+    /// Unlike [`Self::trigger`], there is nothing to wait out: a `kill(2)`
+    /// either returns or does not, so this answers as soon as every matched
+    /// sheep's delivery has settled rather than on some app-configured
+    /// timeout.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::NotFound`] — nothing matched.
+    /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    pub(crate) async fn signal(
+        &self,
+        selector: ProcessSelector,
+        sig: OperatorSignal,
+    ) -> Result<Vec<SignalReply>, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::Signal {
+                selector,
+                sig,
+                reply,
+            }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
     /// Full flock listing, name-grouped (see [`Actor::snapshot_all`]).
     ///
     /// # Errors
@@ -1262,6 +1316,23 @@ struct SheepSlot {
     /// holding the daemon's half of the socketpair with it: one leaked task
     /// and one leaked descriptor per exit, on a daemon that runs for months.
     to_child: Option<mpsc::Sender<ShepherdMessage>>,
+    /// Sender for this sheep's signal mailbox — a live sheep task's second
+    /// mailbox, separate from [`Self::ctl`]. `None` whenever no process is
+    /// running under this id.
+    ///
+    /// A mailbox of its own rather than a [`SheepCtl`] variant, and this is
+    /// not tidiness. [`Self::ctl`]'s queue is bounded at
+    /// [`SHEEP_CTL_CAPACITY`], its senders `try_send` into it, and
+    /// [`Actor::claim_manual`] ignores a `Full` there *because a queued
+    /// [`SheepCtl::Kill`] means the ladder is already running*. That argument
+    /// holds only while `Kill` is the sole occupant of those four slots: put
+    /// anything else in them and the same code can drop a `Kill`. A burst of
+    /// signals sharing that queue would make `claim_manual` drop a stop and
+    /// report success for it. Cleared alongside [`Self::to_child`], for the
+    /// same reason that field is: the receiving task parks on `recv()`, and a
+    /// sender left on a dead slot parks it for as long as the sheep stays
+    /// registered.
+    signals: Option<mpsc::Sender<SignalRequest>>,
     /// Which manual command (if any) is waiting on this sheep's next exit,
     /// and who asked for it. Claimed through [`Actor::claim_manual`].
     manual: Option<PendingManual>,
@@ -1497,6 +1568,16 @@ impl<R: ProcessRunner> Actor<R> {
                 self.begin_action(&selector, action, params, reply);
                 false
             }
+            // Not rejected while `shutting_down`, for the same reason as
+            // Trigger above: a signal registers nothing and spawns nothing.
+            Command::Signal {
+                selector,
+                sig,
+                reply,
+            } => {
+                self.begin_signal(&selector, sig, reply);
+                false
+            }
             Command::Stop { selector, reply } => {
                 self.begin_manual(
                     selector,
@@ -1691,7 +1772,7 @@ impl<R: ProcessRunner> Actor<R> {
                 let info = to_info(&entry);
                 let log_ctl = io.log_ctl.clone();
                 let to_child = io.to_child.clone();
-                let ctl = spawn_sheep_task::<R::Proc>(
+                let handles = spawn_sheep_task::<R::Proc>(
                     id,
                     proc,
                     io,
@@ -1719,9 +1800,10 @@ impl<R: ProcessRunner> Actor<R> {
                     id,
                     SheepSlot {
                         entry,
-                        ctl: Some(ctl),
+                        ctl: Some(handles.ctl),
                         log_ctl: Some(log_ctl),
                         to_child: Some(to_child),
+                        signals: Some(handles.signals),
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
@@ -1764,6 +1846,7 @@ impl<R: ProcessRunner> Actor<R> {
                         ctl: None,
                         log_ctl: None,
                         to_child: None,
+                        signals: None,
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
@@ -1811,7 +1894,7 @@ impl<R: ProcessRunner> Actor<R> {
                 let pid = proc.pid();
                 let log_ctl = io.log_ctl.clone();
                 let to_child = io.to_child.clone();
-                let ctl = spawn_sheep_task::<R::Proc>(
+                let handles = spawn_sheep_task::<R::Proc>(
                     id,
                     proc,
                     io,
@@ -1848,9 +1931,10 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.entry.pid = Some(pid);
                 slot.entry.started_at = Some(tokio::time::Instant::now());
                 slot.entry.restarts += 1;
-                slot.ctl = Some(ctl);
+                slot.ctl = Some(handles.ctl);
                 slot.log_ctl = Some(log_ctl);
                 slot.to_child = Some(to_child);
+                slot.signals = Some(handles.signals);
                 // IMPORTANT-3: a new process now exists for this id — any
                 // RestartDue timer, or readiness task, scheduled before this
                 // point (targeting the process this replaced) is stale the
@@ -1891,6 +1975,7 @@ impl<R: ProcessRunner> Actor<R> {
                 // that "these two go together" is something a reader can see
                 // at each site rather than infer from the callers.
                 slot.to_child = None;
+                slot.signals = None;
                 slot.ready_tx = None;
                 let info = to_info(&slot.entry);
                 self.emit(ProcessEventKind::Errored, info.clone(), manually);
@@ -2498,7 +2583,7 @@ impl<R: ProcessRunner> Actor<R> {
                 let info = to_info(&entry);
                 let log_ctl = io.log_ctl.clone();
                 let to_child = io.to_child.clone();
-                let ctl = spawn_sheep_task::<R::Proc>(
+                let handles = spawn_sheep_task::<R::Proc>(
                     new_id,
                     proc,
                     io,
@@ -2521,9 +2606,10 @@ impl<R: ProcessRunner> Actor<R> {
                     new_id,
                     SheepSlot {
                         entry,
-                        ctl: Some(ctl),
+                        ctl: Some(handles.ctl),
                         log_ctl: Some(log_ctl),
                         to_child: Some(to_child),
+                        signals: Some(handles.signals),
                         manual: None,
                         pending_delete: false,
                         epoch: 0,
@@ -3302,6 +3388,11 @@ impl<R: ProcessRunner> Actor<R> {
         // quietly, and would sit on `recv()` holding the daemon's half of the
         // socketpair for as long as the entry lived. See `SheepSlot::to_child`.
         slot.to_child = None;
+        // Cleared alongside `to_child` for the same reason: a sheep task
+        // parked on `signal_rx.recv()` would otherwise hold this sender's
+        // receiver open for as long as the entry lived, past the process it
+        // was meant to reach. See `SheepSlot::signals`.
+        slot.signals = None;
         // The one site that clears these, because it is the one place a
         // process under a registered id stops existing: every respawn and
         // every deregistration is downstream of an exit handled here, so a
@@ -3898,6 +3989,71 @@ impl<R: ProcessRunner> Actor<R> {
         spawn_trigger_task(refused, waits, reply);
     }
 
+    /// Delivers one signal to every matched sheep's own process.
+    ///
+    /// Off the actor loop, like [`Self::begin_action`] and for the same
+    /// reason: each delivery is a round trip through a sheep task, and the
+    /// actor must not park on one. Unlike an action there is nothing to wait
+    /// out — a `kill(2)` either returns or does not — so the fan-out here is
+    /// bounded by the syscall, not by a configured timeout.
+    ///
+    /// A sheep with no live task answers [`SignalOutcome::NotRunning`] without
+    /// a round trip at all: `slot.signals` is `None` for exactly the states
+    /// that have no process (`Stopped`, `Errored`, `WaitingRestart`).
+    ///
+    /// A reload drainee is signalled like any other live sheep — unlike
+    /// [`Self::begin_action`], which skips one because an action expects a
+    /// reply from a process on its way out. A signal expects nothing back, and
+    /// the drainee is a live process the operator's selector matched; holding
+    /// it back would be a silent refusal with no channel to explain itself in.
+    fn begin_signal(
+        &mut self,
+        selector: &ProcessSelector,
+        sig: OperatorSignal,
+        reply: oneshot::Sender<Result<Vec<SignalReply>, SupervisorError>>,
+    ) {
+        let matched = self.matching_ids(selector);
+        if matched.is_empty() {
+            let _ = reply.send(Err(SupervisorError::NotFound));
+            return;
+        }
+
+        let mut settled = Vec::new();
+        let mut waits = Vec::new();
+        for id in matched {
+            let slot = self
+                .sheep
+                .get(&id)
+                .expect("begin_signal: `matched` holds ids read off this map a moment ago");
+            let name = slot.entry.spec.config().name.clone();
+            let Some(signals) = slot.signals.clone() else {
+                settled.push(SignalReply {
+                    id,
+                    name,
+                    outcome: SignalOutcome::NotRunning,
+                });
+                continue;
+            };
+            let (done, answer) = oneshot::channel();
+            if signals.try_send(SignalRequest { sig, done }).is_err() {
+                // A full queue means this sheep's task has not drained several
+                // signals yet, which for a syscall-fast handler means it is
+                // busy dying; a closed one means it already has. Both are
+                // "there is no process here to signal", reported as the
+                // refusal it is rather than as a delivery.
+                settled.push(SignalReply {
+                    id,
+                    name,
+                    outcome: SignalOutcome::NotRunning,
+                });
+                continue;
+            }
+            waits.push((id, name, answer));
+        }
+
+        spawn_signal_task(settled, waits, reply);
+    }
+
     /// Puts one action on `id`'s shepherd channel and arms the wait for its
     /// reply, handing back the receiver that wait's outcome will arrive on.
     ///
@@ -4350,6 +4506,43 @@ fn spawn_trigger_task(
     });
 }
 
+/// One matched sheep's pending signal delivery: its id, name, and the
+/// receiver its outcome will arrive on. A type alias rather than a bare tuple
+/// in [`spawn_signal_task`]'s signature — `clippy::type_complexity`'s
+/// threshold, matching [`spawn_trigger_task`]'s own simpler tuple only by
+/// element count and not by the `Result<(), RunnerError>` nested inside this
+/// one's receiver.
+type SignalWait = (u32, String, oneshot::Receiver<Result<(), RunnerError>>);
+
+/// Spawns the task that collects one signal's rows and answers its caller,
+/// folding the sheep already settled in [`Actor::begin_signal`] (no live
+/// task, or a full/closed mailbox) in with the ones that have a delivery to
+/// wait on. Mirrors [`spawn_trigger_task`], with one difference: a dropped
+/// `done` sender — the sheep task ended between the send and the delivery —
+/// reports [`SignalOutcome::NotRunning`] rather than the trigger tier's
+/// `NoChannel`, since a process that stopped existing mid-delivery is exactly
+/// what that outcome means here.
+fn spawn_signal_task(
+    mut rows: Vec<SignalReply>,
+    waits: Vec<SignalWait>,
+    reply: oneshot::Sender<Result<Vec<SignalReply>, SupervisorError>>,
+) {
+    tokio::spawn(async move {
+        for (id, name, answer) in waits {
+            let outcome = match answer.await {
+                Ok(Ok(())) => SignalOutcome::Delivered,
+                Ok(Err(err)) => SignalOutcome::Failed {
+                    reason: err.to_string(),
+                },
+                Err(_dropped) => SignalOutcome::NotRunning,
+            };
+            rows.push(SignalReply { id, name, outcome });
+        }
+        rows.sort_unstable_by_key(|row| row.id);
+        let _ = reply.send(Ok(rows));
+    });
+}
+
 /// Spawns the task that carries out one `Reopen` and answers its caller.
 ///
 /// Every await a reopen needs lives in here, off the actor loop — see
@@ -4573,7 +4766,33 @@ async fn truncate_log(path: &Path) -> Result<(), FlushError> {
     }
 }
 
-/// Spawns the per-sheep task and returns its control sender.
+/// One signal delivery a sheep task is asked to perform, plus where the answer
+/// goes.
+///
+/// A mailbox of its own rather than a [`SheepCtl`] variant — see
+/// [`SheepSlot::signals`]'s own doc, which spells out why sharing
+/// `SheepCtl`'s queue would let a burst of signals make [`Actor::claim_manual`]
+/// drop a stop and report success for it.
+#[derive(Debug)]
+struct SignalRequest {
+    /// What to deliver, to this sheep's own pid.
+    sig: OperatorSignal,
+    /// Fires with what the delivery came to. A dropped sender means the sheep
+    /// task ended between the send and the delivery, which the caller reads as
+    /// the sheep no longer running.
+    done: oneshot::Sender<Result<(), RunnerError>>,
+}
+
+/// The two mailboxes a live sheep task listens on.
+struct SheepHandles {
+    /// The kill ladder's, whose one-message-kind invariant is documented on
+    /// [`SheepSlot::signals`].
+    ctl: mpsc::Sender<SheepCtl>,
+    /// Signal deliveries.
+    signals: mpsc::Sender<SignalRequest>,
+}
+
+/// Spawns the per-sheep task and returns its two mailbox senders.
 fn spawn_sheep_task<P: RunningProcess>(
     id: u32,
     proc: P,
@@ -4581,10 +4800,16 @@ fn spawn_sheep_task<P: RunningProcess>(
     app: ResolvedApp,
     events: broadcast::Sender<BusEvent>,
     actor_tx: mpsc::Sender<Msg>,
-) -> mpsc::Sender<SheepCtl> {
+) -> SheepHandles {
     let (ctl_tx, ctl_rx) = mpsc::channel(SHEEP_CTL_CAPACITY);
-    tokio::spawn(run_sheep(id, proc, io, app, ctl_rx, events, actor_tx));
-    ctl_tx
+    let (signal_tx, signal_rx) = mpsc::channel(SIGNAL_CAPACITY);
+    tokio::spawn(run_sheep(
+        id, proc, io, app, ctl_rx, signal_rx, events, actor_tx,
+    ));
+    SheepHandles {
+        ctl: ctl_tx,
+        signals: signal_tx,
+    }
 }
 
 /// The per-sheep task body: owns `(proc, io)` for the process's whole
@@ -4606,12 +4831,23 @@ fn spawn_sheep_task<P: RunningProcess>(
 /// pumps can outlive or precede the child, depending on timing) would leave
 /// its `recv()` resolving to `None` on every single poll, busy-spinning the
 /// `select!` instead of just falling out of consideration.
+///
+/// Eight parameters, one over clippy's default ceiling: `id`/`proc`/`io`/`app`
+/// are this sheep's own identity and state, `ctl_rx`/`signal_rx` are its two
+/// mailboxes (kept apart per [`SheepSlot::signals`]'s own doc), and
+/// `events`/`actor_tx` are where its news goes. Private, one caller
+/// ([`spawn_sheep_task`]), and every parameter independently threaded through
+/// the `select!` below — bundling them into a struct would move the coupling
+/// around rather than reduce it, the same call `serve_scripted`
+/// (shep-client's own eleven-parameter precedent) makes.
+#[allow(clippy::too_many_arguments)]
 async fn run_sheep<P: RunningProcess>(
     id: u32,
     mut proc: P,
     io: ProcIo,
     app: ResolvedApp,
     mut ctl_rx: mpsc::Receiver<SheepCtl>,
+    mut signal_rx: mpsc::Receiver<SignalRequest>,
     events: broadcast::Sender<BusEvent>,
     actor_tx: mpsc::Sender<Msg>,
 ) {
@@ -4644,6 +4880,7 @@ async fn run_sheep<P: RunningProcess>(
     let mut ctl_open = true;
     let mut logs_open = true;
     let mut from_child_open = true;
+    let mut signals_open = true;
 
     loop {
         tokio::select! {
@@ -4660,6 +4897,20 @@ async fn run_sheep<P: RunningProcess>(
                         break;
                     }
                     None => ctl_open = false,
+                }
+            }
+            maybe_signal = signal_rx.recv(), if signals_open => {
+                match maybe_signal {
+                    Some(SignalRequest { sig, done }) => {
+                        // Delivered from the task that OWNS the proc, never
+                        // from the actor off a recorded pid. The owning task
+                        // is the only place that knows the child has not been
+                        // reaped, which is what closes the pid-reuse ABA race
+                        // the same way `RunningProcess::signal` already does
+                        // for the stop ladder.
+                        let _ = done.send(proc.signal_process(sig));
+                    }
+                    None => signals_open = false,
                 }
             }
             maybe_line = logs.recv(), if logs_open => {
@@ -6351,6 +6602,7 @@ mod tests {
             ctl: Some(ctl_tx),
             log_ctl: None,
             to_child: None,
+            signals: None,
             manual: None,
             pending_delete: false,
             epoch,
@@ -6376,6 +6628,30 @@ mod tests {
             reloads: HashMap::new(),
         };
         (actor, ctl_rx)
+    }
+
+    /// One sheep marked as a reload's drainee — `Stopping` on `status` AND
+    /// `ReloadState::Drainee` on `reload`, which is the pair a real swap
+    /// writes — holding a live signal mailbox whose receiver the caller keeps.
+    ///
+    /// Both halves are load-bearing. `actor_with_stopping_drainee` sets only
+    /// the status, which is what the guards it serves read; a signal has to be
+    /// tested against the MARKER, because that is the field `begin_action`
+    /// filters on and the field `begin_signal` must not.
+    fn actor_with_a_drainee_holding_a_signal_mailbox(
+        dir: &tempfile::TempDir,
+    ) -> (Actor<ScriptedRunner>, mpsc::Receiver<SignalRequest>) {
+        // No scripts: nothing here spawns, so an empty list turns a spawn that
+        // should not have happened into a loud `SpawnFailed`.
+        let (mut actor, _mailbox) = actor_with_one_online_sheep(dir, vec![]);
+        let slot = actor.sheep.get_mut(&0).expect("the fixture registers id 0");
+        slot.entry.status = ProcStatus::Stopping;
+        slot.entry.reload = ReloadState::Drainee { new_id: 1 };
+        // Wide enough that no case can fill it, so a `try_send` that comes
+        // back `Full` means a bug rather than a fixture too small.
+        let (signals, signal_rx) = mpsc::channel(16);
+        slot.signals = Some(signals);
+        (actor, signal_rx)
     }
 
     // fails if `handle_extra_restart`'s guard 4 stops checking status ==
@@ -6497,6 +6773,7 @@ mod tests {
                 ctl: None,
                 log_ctl: None,
                 to_child: None,
+                signals: None,
                 manual: None,
                 pending_delete: false,
                 epoch: 0,
@@ -6554,6 +6831,7 @@ mod tests {
                     ctl: None,
                     log_ctl: None,
                     to_child: None,
+                    signals: None,
                     manual: None,
                     pending_delete: false,
                     epoch: 0,
@@ -8493,9 +8771,12 @@ mod tests {
 
         let (events, _rx) = tokio::sync::broadcast::channel(64);
         let (_ctl_tx, ctl_rx) = mpsc::channel(8);
+        let (_signal_tx, signal_rx) = mpsc::channel(8);
         let (actor_tx, _actor_rx) = mpsc::channel(8);
         let app = normalize(AppConfig::minimal("svc", "./svc")).unwrap();
-        tokio::spawn(run_sheep(7, proc, io, app, ctl_rx, events, actor_tx));
+        tokio::spawn(run_sheep(
+            7, proc, io, app, ctl_rx, signal_rx, events, actor_tx,
+        ));
 
         // A dropped sender closes the channel on the control task's own
         // schedule, so this hands the runtime every chance to run that task
@@ -9369,6 +9650,7 @@ mod tests {
                 ctl: None,
                 log_ctl: None,
                 to_child,
+                signals: None,
                 manual: None,
                 pending_delete: false,
                 epoch: 0,
@@ -10189,6 +10471,125 @@ mod tests {
             1,
             "the healthy sheep must still have been reopened"
         );
+    }
+
+    // --- Signal: `shep signal`, one selector in, one row per matched sheep
+    // out ---
+
+    /// fails if `signal` reaches the group instead of the process, or reaches
+    /// nothing. The group assertion is the load-bearing half — a supervisor
+    /// that called `signal` rather than `signal_process` would look correct
+    /// in every other respect and would deliver SIGHUP to every lamb.
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_reaches_the_sheeps_own_process_and_not_its_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, runner, _events) = started(
+            &dir,
+            AppConfig::minimal("web", "./srv"),
+            vec![ProcScript::never_exits()],
+        )
+        .await;
+
+        let rows = handle
+            .signal(ProcessSelector::Id(0), OperatorSignal::Hup)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![SignalReply {
+                id: 0,
+                name: "web".to_string(),
+                outcome: SignalOutcome::Delivered,
+            }]
+        );
+        assert_eq!(runner.process_signals(0), vec![OperatorSignal::Hup]);
+        assert!(
+            runner.signals(0).is_empty(),
+            "shep signal must not reach the process group"
+        );
+    }
+
+    /// fails if a registered-but-dead sheep is reported as delivered. `Delivered`
+    /// is the only outcome that claims the kernel took the signal, so a stopped
+    /// sheep answering it would be the report lying about the one thing it says.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_sheep_answers_not_running_rather_than_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _runner, _events) = started(
+            &dir,
+            AppConfig::minimal("web", "./srv"),
+            vec![ProcScript::never_exits()],
+        )
+        .await;
+        handle.stop(ProcessSelector::Id(0)).await.unwrap();
+
+        let rows = handle
+            .signal(ProcessSelector::Id(0), OperatorSignal::Hup)
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, SignalOutcome::NotRunning);
+    }
+
+    /// fails if a selector matching nothing is answered with an empty success. It
+    /// is `NotFound`, exactly as it is for every other selector-taking verb —
+    /// `shep signal typo SIGHUP` exiting 0 would be the worst possible answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_selector_that_matches_nothing_is_not_found() {
+        let h = harness(vec![]);
+        let err = h
+            .ctx
+            .supervisor
+            .signal(
+                ProcessSelector::Name("ghost".to_string()),
+                OperatorSignal::Hup,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, SupervisorError::NotFound);
+    }
+
+    /// fails if a reload drainee is skipped. `begin_action` skips one, because an
+    /// action expects a reply from a process on its way out; a signal expects
+    /// nothing back, and the drainee is a live process the operator's selector
+    /// matched. Holding it back would be a silent refusal with no channel in which
+    /// to explain itself.
+    ///
+    /// Actor-tier, and it has to be: a `ReloadState::Drainee` marker lives on
+    /// `ProcessEntry::reload`, which is crate-internal and deliberately never on
+    /// the wire, so there is no way to put one sheep in that state through the
+    /// handle without driving a whole swap and losing the ability to say which
+    /// half the signal reached.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_drainee_is_signalled_like_any_other_live_sheep() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, mut signal_rx) = actor_with_a_drainee_holding_a_signal_mailbox(&dir);
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_command(Command::Signal {
+            selector: ProcessSelector::Id(0),
+            sig: OperatorSignal::Hup,
+            reply,
+        });
+
+        // The request really left the actor for the sheep task's mailbox — the
+        // half that proves the drainee was not filtered out before the fan-out.
+        let request = tokio::time::timeout(ACTION_WINDOW, signal_rx.recv())
+            .await
+            .expect("no signal reached the drainee's mailbox within the window")
+            .expect("the drainee's signal mailbox closed");
+        assert_eq!(request.sig, OperatorSignal::Hup);
+        // Answer it as a live sheep task would, so the fan-out can settle.
+        let _ = request.done.send(Ok(()));
+
+        let rows = tokio::time::timeout(ACTION_WINDOW, answer)
+            .await
+            .expect("the signal reported nothing within the window")
+            .expect("the signal's reply channel was dropped")
+            .unwrap();
+        assert_eq!(rows[0].outcome, SignalOutcome::Delivered);
     }
 
     // --- flush -------------------------------------------------------

@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- `RunningProcess::signal_process` (defaulted, so it is additive for an
+  out-of-tree implementor) and `Request::Signal` — one signal to one sheep's
+  own process, not its group.
 - Every shepherd-channel message a sheep writes is forwarded to the bus,
   including an `action-reply` no trigger is waiting for.
 - `ShepherdMessage::Action` carries `id`; `ChildMessage::ActionReply`
