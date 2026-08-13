@@ -920,3 +920,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `NotifyError`, `BootError`, `SupervisorError`, `AuthError`, `ConnError`,
   `RunnerError`, `SysError`, `SnapshotError` and `BusError` are
   `#[non_exhaustive]`. Match on them with a wildcard arm.
+- `channel::ChildMessage`/`ShepherdMessage` are re-exports of the shep-core
+  types now. Same names, same wire, same imports.

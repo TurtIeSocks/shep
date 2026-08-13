@@ -339,6 +339,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fallback to the default. `DaemonSection` gains the field, so a struct
   literal naming every field must name this one too; `..Default::default()`
   is unaffected.
+- `protocol::channel` — the shepherd channel's `ChildMessage`/`ShepherdMessage`
+  shapes, moved here from shep-daemon so a bus event can carry one.
 
 ### Fixes
 

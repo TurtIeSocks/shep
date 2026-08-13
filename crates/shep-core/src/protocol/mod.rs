@@ -4,12 +4,14 @@
 //! every type here is snapshot-pinned — changing any serialized shape is a
 //! protocol version bump recorded in the CHANGELOG.
 
+pub mod channel;
 pub mod events;
 pub mod frame;
 pub mod request;
 /// Frame encoding shared by daemon and client
 pub mod wire;
 
+pub use channel::{CHANNEL_VERSION, ChildMessage, ShepherdMessage};
 pub use events::{BusEvent, ProcessEventKind};
 pub use frame::ServerFrame;
 pub use request::{
