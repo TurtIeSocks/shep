@@ -363,7 +363,7 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
         // is the supported way to reload a dog's configuration, and a copy
         // taken at boot would answer that with the section as it was.
         Request::DogConfig { name } => match crate::dogs::dog_section(&ctx.daemon_config, &name) {
-            Ok(toml) => reply(Ok(Response::DogSection { toml })),
+            Ok(toml) => reply(Ok(Response::DogSection { toml: toml.into() })),
             Err(err) => reply(Err(RpcError {
                 code: RpcErrorCode::InvalidConfig,
                 message: err.to_string(),
