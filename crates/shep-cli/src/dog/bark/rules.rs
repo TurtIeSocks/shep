@@ -19,13 +19,9 @@
 //! means the second sheep to go down during an incident is silent, and
 //! that is the incident's most interesting fact.
 //!
-//! Every item here is exercised by its own tests, but nothing outside them
-//! calls in yet: Task 21 (`bark::run`, the entrypoint
-//! `super::super::run_dog`'s `"bark"` arm reaches) is what wires `rules`
-//! and [`super::sinks`] together into a running dog. `#![allow(dead_code)]`
-//! says so explicitly, matching `sinks.rs`'s own forward-declaration shape
-//! (Task 19) rather than inventing a call site nothing needs yet.
-#![allow(dead_code)]
+//! [`super::run_loop`] (Task 21) is what actually calls `on_event` and
+//! `on_poll`, wiring this module and [`super::sinks`] together into a
+//! running dog.
 
 use core::fmt;
 use std::collections::BTreeMap;

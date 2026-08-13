@@ -39,15 +39,8 @@
 //! [`SinkError`] carries none of it — a failed delivery is reported by
 //! sink kind and failure kind, never by URL.
 //!
-//! Every item in this module is exercised by its own tests, but nothing
-//! outside them calls in yet: Task 20 (reconciling the shepherd's bus
-//! against `barks.jsonl`) and Task 21 (`bark::run`, the entrypoint
-//! `super::super::run_dog`'s `"bark"` arm reaches) are what wire
-//! [`render_body`]/[`deliver`] into a running dog. `#![allow(dead_code)]`
-//! says so explicitly, matching `output/table.rs`'s and `output/mod.rs`'s
-//! own forward-declaration shape, rather than inventing a call site nothing
-//! needs yet.
-#![allow(dead_code)]
+//! [`super::run_loop`] (Task 21) is what actually calls [`deliver`], once
+//! per firing, off a spawned task rather than inline in its own loop.
 
 use core::fmt;
 use std::sync::Arc;

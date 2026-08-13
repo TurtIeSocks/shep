@@ -675,6 +675,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is not on the wire are all startup errors, not alerts that fire
   correctly for months and deliver nowhere.
 
+- The bark dog itself now runs: `[dog.bark]` (`BarkConfig` — named sinks,
+  named rules, a reconciliation `poll` interval, a `barks.jsonl` byte cap,
+  and a per-delivery `sink_timeout`), and `run_loop`, the engine that
+  subscribes to the shepherd's bus AND polls the flock. `shep dog bark`
+  no longer stubs out — `run_dog`'s `"bark"` arm parses the section,
+  builds `Rules` (the default `gave_up` rule when the operator configured
+  none), subscribes on `process.*`, and drives the loop until `SIGINT`,
+  `SIGTERM`, or the subscription itself ends.
+
+  **A dropped frame polls immediately**, rather than waiting for the next
+  scheduled poll. `tokio::sync::broadcast` drops what a lagging
+  subscriber cannot keep up with instead of queueing it, and the load
+  that produces a drop is exactly the load that produces an alert — a
+  dog that only reconciled on a timer would stay silent for the whole
+  poll interval, and under a paused clock, forever. The subscription is
+  what makes bark fast; the poll is what makes it correct.
+
+  Every firing is delivered by a task spawned off the select loop, never
+  awaited inline: a slow sink (Discord's own rate limit is measured in
+  seconds) must not stop this loop from reading the next bus event, or it
+  causes the exact drop it exists to catch. The record is written to
+  `barks.jsonl` AFTER delivery, with each sink's outcome filled in
+  honestly — including when every sink refuses it, since the local trail
+  is what an operator reads when the page never arrived. `barks::append`
+  is a read-modify-rename against one file; this dog's own concurrent
+  delivery tasks serialize their appends behind an in-process
+  `tokio::sync::Mutex` held only around the `append` call itself, on top
+  of (never in place of) `barks::append`'s own cross-process `flock(2)`
+  lock, which is what keeps this dog and the shepherd's own writer from
+  losing each other's records.
+
+  `BarkConfig` needed a hand-written `Default`: `#[serde(default)]`
+  requires one, and a derived impl would give `poll = 0` (a hot polling
+  loop), `history_bytes = 0` (the ring evicted back to empty on every
+  append) and `sink_timeout = 0` (every delivery timed out before it
+  could leave the process). The defaults are 30s, `shep_core::barks::DEFAULT_MAX_BYTES`,
+  and 10s respectively — an empty `[dog.bark]` is the ordinary case, and
+  it needed sane numbers, not zeros.
+
 ### Fixes
 
 - `shep enable <name>` sends the source `shep.toml` actually records, not a

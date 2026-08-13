@@ -15,10 +15,15 @@
 //!
 //! [`run_dog`] is `main`'s whole `Commands::Dog` arm: validate the name is
 //! one of the two built-ins, connect, and dispatch. `"metrics"` reaches
-//! [`metrics::run`]; `"bark"` (Task 21) is still a stub that reports which
-//! task owns it and exits [`ExitCode::Failure`] — never `todo!()`, which
-//! would abort a supervised process with a panic and a confusing log line
-//! instead of a plain, restartable failure.
+//! [`metrics::run`]; `"bark"` reaches [`run_bark`] (Task 21), this module's
+//! own half of bark's wiring — parse `[dog.bark]`, build
+//! [`bark::rules::Rules`], subscribe to the shepherd's bus, and hand both
+//! to [`bark::run_loop`] alongside a [`ClientFlockSource`] wrapping the
+//! same connection. [`ClientFlockSource`] and the [`bark::EventSource`]
+//! impl for [`shep_client::EventStream`] both live here rather than in
+//! `bark::mod` itself, because both are thin adapters over
+//! [`shep_client::Client`], the type this module already owns through
+//! [`DogRuntime`].
 
 pub mod bark;
 pub mod http;
@@ -26,9 +31,9 @@ pub mod metrics;
 
 use core::fmt;
 
-use shep_client::{Client, ConnectError, RequestError};
+use shep_client::{Client, ConnectError, EventStream, RequestError};
 use shep_core::paths::ShepPaths;
-use shep_core::protocol::{Request, Response};
+use shep_core::protocol::{BusEvent, ProcessInfo, Request, Response, RpcError, RpcErrorCode};
 
 use crate::exit::ExitCode;
 
@@ -95,10 +100,9 @@ pub enum DogRunError {
     ///
     /// Never returned by a daemon on the same protocol version:
     /// `shep-daemon/src/rpc.rs`'s `DogConfig` arm has exactly one success
-    /// reply. Kept as a reportable error rather than `unreachable!()`,
-    /// for the same reason [`run_dog`]'s own doc gives for not using
-    /// `todo!()` in [`stub`] — a dog is a process the shepherd restarts,
-    /// and a clean exit code beats a panic.
+    /// reply. Kept as a reportable error rather than `unreachable!()` or
+    /// `todo!()` — a dog is a process the shepherd restarts, and a clean
+    /// exit code beats a panic and a confusing log line.
     UnexpectedReply,
     /// The section does not fit the shape [`DogRuntime::config`] was asked
     /// to parse it as.
@@ -254,22 +258,111 @@ pub async fn run_dog(name: &str, paths: ShepPaths) -> ExitCode {
     };
     match name {
         "metrics" => metrics::run(runtime).await,
-        "bark" => stub(&runtime, "Task 21", "crates/shep-cli/src/dog/bark/mod.rs"),
+        "bark" => run_bark(runtime).await,
         _ => unreachable!("checked against BUILT_IN_DOGS above"),
     }
 }
 
-/// What every built-in dog answers until its own task lands it.
+/// Runs the bark dog until it is signalled.
 ///
-/// Reports plainly rather than `todo!()`, which would abort this
-/// (supervised, restarted-on-exit) process with a panic and a confusing
-/// stack trace in `<name>-0-err.log` instead of one readable line.
-fn stub(runtime: &DogRuntime, task: &str, module: &str) -> ExitCode {
-    eprintln!(
-        "shep dog {}: not implemented yet — {task}'s own module ({module}) lands this",
-        runtime.name,
-    );
-    ExitCode::Failure
+/// Parses `[dog.bark]` (refusing a section that does not fit, the same
+/// posture [`metrics::run`] takes toward its own), builds
+/// [`bark::rules::Rules`] — [`bark::rules::Rules::default_rules`] when the
+/// operator configured none at all — subscribes to the shepherd's bus on
+/// `process.*` (the topic every [`bark::rules::Trigger`] variant reads:
+/// `GaveUp` and `Event` off the frames themselves, `RestartRate` and
+/// `MemoryAbove` off the reconciliation poll [`bark::run_loop`] drives
+/// independently of this subscription), and hands both to
+/// [`bark::run_loop`] alongside a [`ClientFlockSource`] wrapping this same
+/// connection.
+///
+/// A refused config or a rule set `Rules::new` rejects are both
+/// [`ExitCode::InvalidConfig`] — the same code [`DogRunError::Section`]
+/// reports for a section `DogRuntime::config` could not parse at all, since
+/// both are "this dog will not run on what it was given," just caught one
+/// step later. A failed subscribe defers to `RequestError`'s own
+/// conversion, the same one every other verb's failed request goes
+/// through.
+async fn run_bark(runtime: DogRuntime) -> ExitCode {
+    let config = match runtime.config::<bark::BarkConfig>() {
+        Ok(config) => config,
+        Err(_err) => {
+            // The fact, not the value: a `[dog.bark]` section routinely
+            // carries a webhook URL with a bearer token in its path, and
+            // `DogRunError::Section`'s own message can quote it — see that
+            // type's redacted `Debug`. `metrics::run`'s own diagnostic
+            // takes the same posture for the same reason.
+            eprintln!("shep dog bark: [dog.bark] does not parse; see `shep dogs`");
+            return ExitCode::InvalidConfig;
+        }
+    };
+    let rule_list = if config.rules.is_empty() {
+        bark::rules::Rules::default_rules(&config.sinks)
+    } else {
+        config.rules.clone()
+    };
+    let rules = match bark::rules::Rules::new(rule_list, &config.sinks) {
+        Ok(rules) => rules,
+        Err(err) => {
+            eprintln!("shep dog bark: {err}");
+            return ExitCode::InvalidConfig;
+        }
+    };
+    let events = match runtime.client.subscribe(vec!["process.*".to_owned()]).await {
+        Ok(events) => events,
+        Err(err) => {
+            eprintln!("shep dog bark: could not subscribe to the shepherd's bus: {err}");
+            return ExitCode::from(&err);
+        }
+    };
+    let barks_path = runtime.paths.barks.clone();
+    let flock = ClientFlockSource {
+        client: runtime.client,
+    };
+    bark::run_loop(events, flock, rules, &config, &barks_path).await
+}
+
+/// Adapts [`EventStream`] to [`bark::EventSource`]: its own `next` already
+/// yields `Option<Result<BusEvent, shep_client::Lagged>>`, so this is a
+/// `map_err` over [`shep_client::Lagged::count`] — the count is the whole
+/// of what [`bark::EventSource::next`]'s own `Err` carries.
+///
+/// `self.next()` below resolves to [`EventStream`]'s own INHERENT method,
+/// not a recursive call into this trait impl: `EventStream::next`'s own doc
+/// is explicit that an inherent method wins name resolution over a trait
+/// method of the same name, which is exactly what makes that call safe to
+/// write here.
+impl bark::EventSource for EventStream {
+    async fn next(&mut self) -> Option<Result<BusEvent, u64>> {
+        self.next()
+            .await
+            .map(|item| item.map_err(|lagged| lagged.count))
+    }
+}
+
+/// Wraps [`Client`] as [`bark::FlockSource`]: `Request::ListFlock`, mapped
+/// into the shape [`bark::run_loop`] can poll without a socket of its own —
+/// the same reason [`bark::EventSource`] exists for the subscription side.
+struct ClientFlockSource {
+    client: Client,
+}
+
+impl bark::FlockSource for ClientFlockSource {
+    async fn flock(&self) -> Result<Vec<ProcessInfo>, RequestError> {
+        match self.client.request(Request::ListFlock).await? {
+            Response::Flock(flock) => Ok(flock),
+            // Never returned by a daemon on the same protocol version —
+            // `ListFlock`'s only success reply is `Response::Flock` — kept
+            // reportable rather than `unreachable!()`, the same posture
+            // `DogRunError::UnexpectedReply`'s own doc explains.
+            _ => Err(RequestError::Rpc(RpcError {
+                code: RpcErrorCode::Internal,
+                message: "the shepherd answered ListFlock with something other than \
+                          Response::Flock"
+                    .to_owned(),
+            })),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -385,20 +478,16 @@ mod tests {
         assert_eq!(code, ExitCode::Usage);
     }
 
-    /// fails if `"bark"` stops reaching [`DogRuntime::start`], or its
-    /// stub's `Failure` exit turns into a panic (`todo!()`) — both silent
-    /// regressions `run_dog`'s own doc warns against.
-    ///
-    /// `"metrics"` used to be covered by this same loop, back when both
-    /// built-ins were stubs that returned promptly. It no longer does:
-    /// [`metrics::run`] is a real server that blocks on a shutdown signal,
-    /// so awaiting it to completion here would hang the test. The dispatch
-    /// path metrics also depends on is covered by the sibling test below
-    /// instead (spawned, then aborted rather than awaited); what the
-    /// server actually does once it's up is `dog::metrics`'s own test
-    /// module's job.
+    /// fails if `"bark"` stops reaching [`DogRuntime::start`] — the same
+    /// dispatch-reaches-it proof [`run_dog_reaches_metrics`] gives for its
+    /// own name, and for the same reason this can no longer assert an exit
+    /// code the way it did back when `"bark"` was a stub that returned
+    /// promptly: [`run_bark`] subscribes to the shepherd's bus once its
+    /// config parses, and `serve_one_request`'s fake daemon closes the
+    /// connection right after this one `DogConfig` reply — so this proves
+    /// dispatch reaches the wire, nothing about what `run_bark` does next.
     #[tokio::test]
-    async fn run_dog_reaches_the_stub_for_bark() {
+    async fn run_dog_reaches_bark() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("s.sock");
         let response = Response::DogSection {
@@ -407,8 +496,7 @@ mod tests {
         let handle = serve_one_request(&socket, sample_ack(), response).await;
         let paths = test_paths(dir.path(), socket);
 
-        let code = run_dog("bark", paths).await;
-        assert_eq!(code, ExitCode::Failure);
+        let task = tokio::spawn(run_dog("bark", paths));
 
         let envelope = tokio::time::timeout(Duration::from_secs(5), handle)
             .await
@@ -420,6 +508,8 @@ mod tests {
                 name: "bark".to_string()
             }
         );
+
+        task.abort();
     }
 
     /// fails if `"metrics"` stops reaching [`DogRuntime::start`] — proof
