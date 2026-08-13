@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn bus_event_wire_snapshots() {
-        let events = vec![
+        let mut events = vec![
             BusEvent::Process {
                 event: ProcessEventKind::Exit,
                 info: ProcessInfo {
@@ -168,6 +168,37 @@ mod tests {
             },
             BusEvent::Dropped { count: 17 },
         ];
+
+        // Every lifecycle kind a `process.*` subscriber can receive, over one
+        // identical `info`, so the snapshot rows differ by their `event` tag
+        // and by nothing else. Only `Exit` and the three reload kinds were
+        // pinned before Phase 10; the six here are the ordinary events a real
+        // integration — a dashboard, a bark rule — depends on first, and a
+        // Rust-identifier rename on any of them would change the wire string
+        // mechanically, compile clean, and break that integration silently.
+        let sample = ProcessInfo::builder(3, "web", ProcStatus::WaitingRestart)
+            .restarts(2)
+            .uptime_ms(500)
+            .out_file(Some("/home/rin/.shep/logs/web-0-out.log".to_string()))
+            .err_file(Some("/home/rin/.shep/logs/web-0-err.log".to_string()))
+            .build();
+
+        let lifecycle = [
+            ProcessEventKind::Start,
+            ProcessEventKind::Online,
+            ProcessEventKind::Restart,
+            ProcessEventKind::Stop,
+            ProcessEventKind::Delete,
+            ProcessEventKind::Errored,
+        ]
+        .map(|event| BusEvent::Process {
+            event,
+            info: sample.clone(),
+            manually: false,
+            at_ms: 1_700_000_000_000,
+        });
+
+        events.extend(lifecycle);
         insta::assert_json_snapshot!("bus_event_wire_v1", events);
     }
 

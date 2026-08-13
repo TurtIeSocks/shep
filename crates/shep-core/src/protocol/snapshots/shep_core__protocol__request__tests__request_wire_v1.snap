@@ -162,5 +162,38 @@ expression: requests
       "kind": "disable_dog",
       "name": "metrics"
     }
+  },
+  {
+    "id": 14,
+    "deadline_ms": null,
+    "body": {
+      "kind": "describe",
+      "selector": {
+        "kind": "id",
+        "value": 7
+      }
+    }
+  },
+  {
+    "id": 15,
+    "deadline_ms": null,
+    "body": {
+      "kind": "describe",
+      "selector": {
+        "kind": "regex",
+        "value": "^web-"
+      }
+    }
+  },
+  {
+    "id": 16,
+    "deadline_ms": null,
+    "body": {
+      "kind": "describe",
+      "selector": {
+        "kind": "fold",
+        "value": "api"
+      }
+    }
   }
 ]

@@ -487,6 +487,16 @@ impl fmt::Debug for DogSectionToml {
 }
 
 /// One RPC response (pairs with [`Request`] variants)
+///
+/// Nine variants carry a bare `Vec<ProcessInfo>` (`Flock`, `Described`,
+/// `Started`, `Stopped`, `Restarted`, `Reloading`, `Reopened`, `Flushed`,
+/// `Mustered`), and that repetition is intentional — do not collapse them
+/// into one. Each names which request it answers, which is what lets a
+/// variant diverge later without a protocol bump: `Reloading` already means
+/// an acceptance rather than a result, and `Mustered` already means "every
+/// sheep of every restored app" rather than "what this call started". A
+/// single `Listing(Vec<ProcessInfo>)` would have to relitigate both of those
+/// as a breaking change.
 // wire format: changing existing variants is a breaking change
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
@@ -930,6 +940,34 @@ mod tests {
                     name: "metrics".to_string(),
                 },
             },
+            // The three selector shapes no fixture reached before Phase 10.
+            // Grouped and adjacent on purpose: `Id`, `Regex` and `Fold` are
+            // three newtypes over three different inner types, and the wire
+            // tells them apart only by their own `kind` tag — a `Fold` that
+            // serialized under `regex`'s tag is a `shep restart fold:api`
+            // that silently becomes a regex match, which is a wrong set of
+            // sheep restarted and not an error anyone sees.
+            Envelope {
+                id: 14,
+                deadline_ms: None,
+                body: Request::Describe {
+                    selector: SelectorSpec::Id(7),
+                },
+            },
+            Envelope {
+                id: 15,
+                deadline_ms: None,
+                body: Request::Describe {
+                    selector: SelectorSpec::Regex("^web-".to_string()),
+                },
+            },
+            Envelope {
+                id: 16,
+                deadline_ms: None,
+                body: Request::Describe {
+                    selector: SelectorSpec::Fold("api".to_string()),
+                },
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v1", requests);
     }
@@ -1017,6 +1055,59 @@ mod tests {
                     dog: Some(DogSource::BuiltIn),
                     ..sample_info()
                 })),
+            },
+            // The eleven variants no fixture reached before Phase 10. The
+            // existing comment on the `Triggered` row is right that pinning
+            // `Flock` once already proves the `Vec<ProcessInfo>` SHAPE — but
+            // it does not prove any of these variants' own `kind` tags, and
+            // three of them are not `Vec<ProcessInfo>`-shaped at all
+            // (`Deleted` is a `Vec<u32>`, `Subscribed` and `ShuttingDown`
+            // carry nothing). Each row below therefore carries the emptiest
+            // legal body: what is being pinned here is the tag, and a body
+            // repeated eight times would bury it.
+            Reply {
+                id: 9,
+                result: Ok(Response::Described(vec![])),
+            },
+            Reply {
+                id: 10,
+                result: Ok(Response::Started(vec![])),
+            },
+            Reply {
+                id: 11,
+                result: Ok(Response::Stopped(vec![])),
+            },
+            Reply {
+                id: 12,
+                result: Ok(Response::Restarted(vec![])),
+            },
+            Reply {
+                id: 13,
+                result: Ok(Response::Reloading(vec![])),
+            },
+            Reply {
+                id: 14,
+                result: Ok(Response::Deleted(vec![7, 8])),
+            },
+            Reply {
+                id: 15,
+                result: Ok(Response::Reopened(vec![])),
+            },
+            Reply {
+                id: 16,
+                result: Ok(Response::Flushed(vec![])),
+            },
+            Reply {
+                id: 17,
+                result: Ok(Response::Mustered(vec![])),
+            },
+            Reply {
+                id: 18,
+                result: Ok(Response::Subscribed),
+            },
+            Reply {
+                id: 19,
+                result: Ok(Response::ShuttingDown),
             },
         ];
         insta::assert_json_snapshot!("reply_wire_v1", replies);

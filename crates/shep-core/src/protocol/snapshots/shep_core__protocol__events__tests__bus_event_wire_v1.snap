@@ -37,5 +37,137 @@ expression: events
     "data": {
       "count": 17
     }
+  },
+  {
+    "event": "process",
+    "data": {
+      "event": "start",
+      "info": {
+        "id": 3,
+        "name": "web",
+        "status": "waiting-restart",
+        "pid": null,
+        "restarts": 2,
+        "uptime_ms": 500,
+        "fold": null,
+        "out_file": "/home/rin/.shep/logs/web-0-out.log",
+        "err_file": "/home/rin/.shep/logs/web-0-err.log",
+        "cpu_percent": null,
+        "memory_bytes": null,
+        "dog": null
+      },
+      "manually": false,
+      "at_ms": 1700000000000
+    }
+  },
+  {
+    "event": "process",
+    "data": {
+      "event": "online",
+      "info": {
+        "id": 3,
+        "name": "web",
+        "status": "waiting-restart",
+        "pid": null,
+        "restarts": 2,
+        "uptime_ms": 500,
+        "fold": null,
+        "out_file": "/home/rin/.shep/logs/web-0-out.log",
+        "err_file": "/home/rin/.shep/logs/web-0-err.log",
+        "cpu_percent": null,
+        "memory_bytes": null,
+        "dog": null
+      },
+      "manually": false,
+      "at_ms": 1700000000000
+    }
+  },
+  {
+    "event": "process",
+    "data": {
+      "event": "restart",
+      "info": {
+        "id": 3,
+        "name": "web",
+        "status": "waiting-restart",
+        "pid": null,
+        "restarts": 2,
+        "uptime_ms": 500,
+        "fold": null,
+        "out_file": "/home/rin/.shep/logs/web-0-out.log",
+        "err_file": "/home/rin/.shep/logs/web-0-err.log",
+        "cpu_percent": null,
+        "memory_bytes": null,
+        "dog": null
+      },
+      "manually": false,
+      "at_ms": 1700000000000
+    }
+  },
+  {
+    "event": "process",
+    "data": {
+      "event": "stop",
+      "info": {
+        "id": 3,
+        "name": "web",
+        "status": "waiting-restart",
+        "pid": null,
+        "restarts": 2,
+        "uptime_ms": 500,
+        "fold": null,
+        "out_file": "/home/rin/.shep/logs/web-0-out.log",
+        "err_file": "/home/rin/.shep/logs/web-0-err.log",
+        "cpu_percent": null,
+        "memory_bytes": null,
+        "dog": null
+      },
+      "manually": false,
+      "at_ms": 1700000000000
+    }
+  },
+  {
+    "event": "process",
+    "data": {
+      "event": "delete",
+      "info": {
+        "id": 3,
+        "name": "web",
+        "status": "waiting-restart",
+        "pid": null,
+        "restarts": 2,
+        "uptime_ms": 500,
+        "fold": null,
+        "out_file": "/home/rin/.shep/logs/web-0-out.log",
+        "err_file": "/home/rin/.shep/logs/web-0-err.log",
+        "cpu_percent": null,
+        "memory_bytes": null,
+        "dog": null
+      },
+      "manually": false,
+      "at_ms": 1700000000000
+    }
+  },
+  {
+    "event": "process",
+    "data": {
+      "event": "errored",
+      "info": {
+        "id": 3,
+        "name": "web",
+        "status": "waiting-restart",
+        "pid": null,
+        "restarts": 2,
+        "uptime_ms": 500,
+        "fold": null,
+        "out_file": "/home/rin/.shep/logs/web-0-out.log",
+        "err_file": "/home/rin/.shep/logs/web-0-err.log",
+        "cpu_percent": null,
+        "memory_bytes": null,
+        "dog": null
+      },
+      "manually": false,
+      "at_ms": 1700000000000
+    }
   }
 ]

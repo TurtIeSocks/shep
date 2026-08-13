@@ -419,3 +419,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advance, and `SO_REUSEADDR` — which far more frameworks set by default —
   is not sufficient. No behavior changed; the field's meaning was always
   this, only the doc claimed otherwise.
+- Wire fixtures now pin every `SelectorSpec` variant, every
+  `ProcessEventKind`, and every `Response` tag. No wire string changed —
+  this closes coverage, not behaviour.

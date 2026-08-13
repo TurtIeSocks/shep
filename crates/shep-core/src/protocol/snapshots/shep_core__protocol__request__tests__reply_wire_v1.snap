@@ -135,5 +135,105 @@ expression: replies
         }
       }
     }
+  },
+  {
+    "id": 9,
+    "result": {
+      "Ok": {
+        "kind": "described",
+        "data": []
+      }
+    }
+  },
+  {
+    "id": 10,
+    "result": {
+      "Ok": {
+        "kind": "started",
+        "data": []
+      }
+    }
+  },
+  {
+    "id": 11,
+    "result": {
+      "Ok": {
+        "kind": "stopped",
+        "data": []
+      }
+    }
+  },
+  {
+    "id": 12,
+    "result": {
+      "Ok": {
+        "kind": "restarted",
+        "data": []
+      }
+    }
+  },
+  {
+    "id": 13,
+    "result": {
+      "Ok": {
+        "kind": "reloading",
+        "data": []
+      }
+    }
+  },
+  {
+    "id": 14,
+    "result": {
+      "Ok": {
+        "kind": "deleted",
+        "data": [
+          7,
+          8
+        ]
+      }
+    }
+  },
+  {
+    "id": 15,
+    "result": {
+      "Ok": {
+        "kind": "reopened",
+        "data": []
+      }
+    }
+  },
+  {
+    "id": 16,
+    "result": {
+      "Ok": {
+        "kind": "flushed",
+        "data": []
+      }
+    }
+  },
+  {
+    "id": 17,
+    "result": {
+      "Ok": {
+        "kind": "mustered",
+        "data": []
+      }
+    }
+  },
+  {
+    "id": 18,
+    "result": {
+      "Ok": {
+        "kind": "subscribed"
+      }
+    }
+  },
+  {
+    "id": 19,
+    "result": {
+      "Ok": {
+        "kind": "shutting_down"
+      }
+    }
   }
 ]
