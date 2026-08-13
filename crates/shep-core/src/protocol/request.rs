@@ -127,6 +127,28 @@ pub enum Request {
     /// roll recorded running, leaving every app the flock already has exactly
     /// as it stands
     Muster,
+    /// Ask for one dog's `[dog.<name>]` section, as the dog itself parses it
+    DogConfig {
+        /// The dog's name — the config key, not a selector
+        name: String,
+    },
+    /// Start one dog now, marking it as coming from `source`
+    EnableDog {
+        /// The dog's name
+        name: String,
+        /// Where its binary comes from
+        source: DogSource,
+    },
+    /// Stop and deregister one dog
+    ///
+    /// Answers [`Response::Deleted`], the same reply `Delete` gives: disabling
+    /// deregisters exactly as `Delete` does, so this is the same fact and not
+    /// a coincidence of shape. A variant of its own (`DogDisabled`, say) would
+    /// carry nothing `Deleted` does not.
+    DisableDog {
+        /// The dog's name
+        name: String,
+    },
     /// Graceful daemon shutdown
     KillDaemon,
     /// Subscribe this connection to bus topics (glob patterns)
@@ -354,6 +376,14 @@ pub enum Response {
     /// call spawned would be empty there — indistinguishable from an empty
     /// roll, which is the one outcome an operator needs to tell apart.
     Mustered(Vec<ProcessInfo>),
+    /// Answer to `DogConfig` — the dog's own section, rendered back to TOML
+    DogSection {
+        /// The `[dog.<name>]` table as TOML text, empty when the file has
+        /// no such section
+        toml: String,
+    },
+    /// Answer to `EnableDog` — the dog as it stands now
+    DogStarted(ProcessInfo),
     /// Answer to `Subscribe`
     Subscribed,
     /// Answer to `KillDaemon`
@@ -625,6 +655,34 @@ mod tests {
                 deadline_ms: None,
                 body: Request::Muster,
             },
+            // The three dog verbs together, in the order an operator meets
+            // them: ask for a section, start a dog, stop one. Adjacent on
+            // purpose — `enable_dog` and `disable_dog` differ by their
+            // `kind` and by `source`, so a `DisableDog` accidentally given
+            // `EnableDog`'s tag shows up here as two near-identical objects
+            // rather than as a diff a reader has to compare field by field.
+            Envelope {
+                id: 11,
+                deadline_ms: None,
+                body: Request::DogConfig {
+                    name: "bark".to_string(),
+                },
+            },
+            Envelope {
+                id: 12,
+                deadline_ms: None,
+                body: Request::EnableDog {
+                    name: "metrics".to_string(),
+                    source: DogSource::BuiltIn,
+                },
+            },
+            Envelope {
+                id: 13,
+                deadline_ms: None,
+                body: Request::DisableDog {
+                    name: "metrics".to_string(),
+                },
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v1", requests);
     }
@@ -690,6 +748,28 @@ mod tests {
                     }),
                     ..sample_info()
                 }])),
+            },
+            // The opaque blob, pinned as a blob: the daemon renders a TOML
+            // table into a string and never a typed structure, so what this
+            // row proves is that the section crosses the wire as text.
+            Reply {
+                id: 7,
+                result: Ok(Response::DogSection {
+                    toml: "port = 9615\n".to_string(),
+                }),
+            },
+            // The only `Response` variant carrying a BARE `ProcessInfo`
+            // rather than a `Vec` of them: `enable` starts exactly one dog,
+            // and a one-element list would invite a reader to wonder when it
+            // holds two.
+            Reply {
+                id: 8,
+                result: Ok(Response::DogStarted(ProcessInfo {
+                    id: 4,
+                    name: "metrics".to_string(),
+                    dog: Some(DogSource::BuiltIn),
+                    ..sample_info()
+                })),
             },
         ];
         insta::assert_json_snapshot!("reply_wire_v1", replies);
@@ -878,5 +958,34 @@ mod tests {
         let wire = r#"{"kind":"mustered","data":[]}"#;
         assert_eq!(serde_json::to_string(&reply).unwrap(), wire);
         assert_eq!(serde_json::from_str::<Response>(wire).unwrap(), reply);
+    }
+
+    /// fails if any of the three verbs or either reply is given a `rename`,
+    /// or if `Response`'s `content = "data"` is dropped. `disable_dog`'s
+    /// answer is `Deleted`, which no other test in this module pairs with
+    /// this verb — a handler wired to answer `Deleted` for `EnableDog` would
+    /// still round-trip, and this is where the pairing is written down.
+    #[test]
+    fn the_dog_verbs_serialize_snake_case_with_their_payloads_under_data() {
+        assert_eq!(
+            serde_json::to_string(&Request::DogConfig {
+                name: "bark".to_string()
+            })
+            .unwrap(),
+            r#"{"kind":"dog_config","name":"bark"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::DisableDog {
+                name: "bark".to_string()
+            })
+            .unwrap(),
+            r#"{"kind":"disable_dog","name":"bark"}"#
+        );
+        let section = Response::DogSection {
+            toml: "port = 9615\n".to_string(),
+        };
+        let wire = r#"{"kind":"dog_section","data":{"toml":"port = 9615\n"}}"#;
+        assert_eq!(serde_json::to_string(&section).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<Response>(wire).unwrap(), section);
     }
 }

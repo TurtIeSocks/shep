@@ -135,5 +135,32 @@ expression: requests
     "body": {
       "kind": "muster"
     }
+  },
+  {
+    "id": 11,
+    "deadline_ms": null,
+    "body": {
+      "kind": "dog_config",
+      "name": "bark"
+    }
+  },
+  {
+    "id": 12,
+    "deadline_ms": null,
+    "body": {
+      "kind": "enable_dog",
+      "name": "metrics",
+      "source": {
+        "kind": "built_in"
+      }
+    }
+  },
+  {
+    "id": 13,
+    "deadline_ms": null,
+    "body": {
+      "kind": "disable_dog",
+      "name": "metrics"
+    }
   }
 ]

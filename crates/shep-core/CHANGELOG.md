@@ -12,6 +12,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `Request::DogConfig`, `Request::EnableDog`, `Request::DisableDog`, and
+  `Response::DogSection`, `Response::DogStarted` — the wire verbs a dog and an
+  operator use to fetch a dog's config, start one, and stop one. Additive
+  under `#[non_exhaustive]` on the same terms as `Reopen` above —
+  `PROTOCOL_VERSION` stays **1**, and an older daemon fails to decode the verb
+  rather than answering it.
+
+  `DogConfig` carries a `name: String`, not a `SelectorSpec`: a dog's name is
+  a config key, selecting one `[dog.<name>]` table and one `enabled_dogs`
+  entry, not a set of processes, so a selector here would invite `shep enable
+  all`, which has no meaning. `DogSection` answers with the section rendered
+  back to TOML text rather than a typed structure — a config value the daemon
+  never has reason to parse for the dog, and a third-party dog stays bound to
+  the shape of its own section rather than to shep's config model, file
+  discovery, or layering rules. `EnableDog` carries the same `name` plus a
+  `DogSource` naming where the dog's binary comes from, and answers
+  `DogStarted(ProcessInfo)` — a bare `ProcessInfo`, not a `Vec`, the only
+  `Response` variant shaped that way: enabling starts exactly one dog, and a
+  one-element list would invite a reader to wonder when it holds two.
+  `DisableDog` answers the existing `Response::Deleted(Vec<u32>)` rather than
+  a variant of its own: disabling deregisters exactly as `Delete` does, so
+  this is the same fact and not a coincidence of shape.
 - Add `ProcessInfo::dog` and `DogSource`, marking which flock entries are
   dogs (the daemon's own supervised utility processes — metrics, bark) rather
   than sheep, and naming where a marked one came from: `BuiltIn` for an argv
