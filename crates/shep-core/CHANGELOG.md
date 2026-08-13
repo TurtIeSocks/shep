@@ -47,7 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   back to TOML text rather than a typed structure — a config value the daemon
   never has reason to parse for the dog, and a third-party dog stays bound to
   the shape of its own section rather than to shep's config model, file
-  discovery, or layering rules. `EnableDog` carries the same `name` plus a
+  discovery, or layering rules. That text is wrapped in `DogSectionToml`, a
+  `#[serde(transparent)]` newtype over `String` whose `Debug` prints a byte
+  count instead of the section: a `[dog.<name>]` table is where a webhook
+  credential lives, and keeping it off the process table is the whole reason
+  the section travels over the socket rather than through the child's
+  environment. A derived `Debug` would have handed it back on the first
+  `tracing::debug!` of a reply. The newtype is transparent to serde, so the
+  wire bytes are those of a bare string and the pinned fixtures are unchanged;
+  it `Deref`s to `str` for reading. `EnableDog` carries the same `name` plus a
   `DogSource` naming where the dog's binary comes from, and answers
   `DogStarted(ProcessInfo)` — a bare `ProcessInfo`, not a `Vec`, the only
   `Response` variant shaped that way: enabling starts exactly one dog, and a
