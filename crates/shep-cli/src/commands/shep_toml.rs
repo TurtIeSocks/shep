@@ -106,12 +106,9 @@ impl ShepToml {
 
     /// Records `name`'s binary in `[daemon] adopted_dogs` and enables it.
     ///
-    /// Not called outside this module's own tests yet: `shep adopt`, the
-    /// verb that will call it, is a later task. `#[allow(dead_code)]` says
-    /// so explicitly rather than inventing a call site nothing needs yet —
-    /// the same reasoning `output::emit`'s own doc gives for the same
-    /// attribute.
-    #[allow(dead_code)]
+    /// Called by `commands::dogs::adopt`, once `vet_binary` has already
+    /// vetted `exec` — this method itself does no vetting, and never
+    /// truncates anything past the two keys it owns.
     pub fn adopt_dog(&mut self, name: &str, exec: &Path) {
         let daemon = self.daemon_table_mut();
         let adopted_dogs = daemon
@@ -126,13 +123,29 @@ impl ShepToml {
         self.enable_dog(name);
     }
 
+    /// The binary path recorded for `name` in `[daemon] adopted_dogs`, if
+    /// any — `None` for a built-in dog, or a name this document has never
+    /// heard of.
+    ///
+    /// Read by `commands::dogs::rehome` before [`Self::rehome_dog`] removes
+    /// the entry, so the verb can still report what it forgot.
+    #[must_use]
+    pub fn adopted_dog_path(&self, name: &str) -> Option<PathBuf> {
+        self.doc
+            .get("daemon")?
+            .as_table()?
+            .get("adopted_dogs")?
+            .as_table()?
+            .get(name)?
+            .as_str()
+            .map(PathBuf::from)
+    }
+
     /// Forgets `name` entirely: out of `enabled_dogs`, out of
     /// `adopted_dogs`, and `[dog.<name>]` removed. The difference between
     /// `rehome` and `disable`, and the reason they are two verbs.
     ///
-    /// Not called outside this module's own tests yet — see
-    /// [`Self::adopt_dog`]'s own doc on the same `#[allow(dead_code)]`.
-    #[allow(dead_code)]
+    /// Called by `commands::dogs::rehome`.
     pub fn rehome_dog(&mut self, name: &str) {
         self.disable_dog(name);
         if let Some(adopted_dogs) = self
@@ -371,6 +384,26 @@ mod tests {
         assert!(cfg.daemon.enabled_dogs.is_empty());
         assert!(!cfg.daemon.adopted_dogs.contains_key("otel"));
         assert!(!cfg.dog.contains_key("otel"));
+    }
+
+    /// fails if `adopted_dog_path` cannot see an entry `adopt_dog` wrote
+    /// (the read `commands::dogs::rehome` needs before `rehome_dog` erases
+    /// it), or if it invents a path for a name it never recorded — a
+    /// built-in dog, or one this document has never heard of.
+    #[test]
+    fn adopted_dog_path_reads_what_adopt_dog_wrote_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        let mut doc = ShepToml::open(&path).unwrap();
+        doc.enable_dog("metrics"); // built-in: no `adopted_dogs` entry at all
+        doc.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
+
+        assert_eq!(
+            doc.adopted_dog_path("otel"),
+            Some(PathBuf::from("/usr/local/bin/shep-otel"))
+        );
+        assert_eq!(doc.adopted_dog_path("metrics"), None);
+        assert_eq!(doc.adopted_dog_path("ghost"), None);
     }
 
     /// A missing `shep.toml` is not an error — `open` treats it as an empty

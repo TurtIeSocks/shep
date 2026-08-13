@@ -296,6 +296,121 @@ impl Render for DogDisabledRow {
     const JSON_ONLY: &'static [&'static str] = &[];
 }
 
+/// `shep adopt <name> <path>`: what the config edit and, if a shepherd is
+/// running, the resulting `EnableDog` RPC actually did.
+///
+/// Constructed by `commands/dogs.rs`'s `adopt`. [`Self::source`] is always
+/// [`DogSource::Adopted`] — the mirror of [`DogEnabledRow::source`], which
+/// is always [`DogSource::BuiltIn`] for the same reason: this is the one
+/// verb whose own path this session actually has.
+#[derive(Debug, Serialize)]
+pub struct DogAdoptedRow {
+    /// The dog's name.
+    pub name: String,
+    /// Always [`DogSource::Adopted`], carrying the vetted, canonicalized
+    /// path `adopt` just recorded.
+    pub source: DogSource,
+    /// Whether a shepherd was reached and asked to start the dog. `false`
+    /// means only the config changed — decision 11: no verb in this module
+    /// autostarts a shepherd to act on its own edit.
+    pub shepherd_acted: bool,
+    /// The dog's resulting status: a real `ProcStatus` rendering
+    /// (`"online"`, `"starting"`, ...) when a shepherd started it, or a
+    /// sentence explaining why not when none answered.
+    pub status: String,
+}
+
+impl Render for DogAdoptedRow {
+    fn headers() -> &'static [&'static str] {
+        &["NAME", "SOURCE", "SHEPHERD", "STATUS"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        vec![vec![
+            self.name.clone(),
+            dog_source_label(&self.source).to_string(),
+            self.shepherd_acted.to_string(),
+            self.status.clone(),
+        ]]
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "NAME" => "name",
+            "SOURCE" => "source",
+            "SHEPHERD" => "shepherd_acted",
+            "STATUS" => "status",
+            other => panic!("DogAdoptedRow::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
+/// `shep rehome <name>`: what the config edit and, if a shepherd is
+/// running, the resulting `DisableDog` RPC actually did.
+///
+/// Constructed by `commands/dogs.rs`'s `rehome`. Unlike [`DogEnabledRow`]/
+/// [`DogDisabledRow`], [`Self::source`] is not a constant this verb always
+/// sends — `rehome` reads `shep.toml`'s own `[daemon] adopted_dogs` entry
+/// before erasing it, so this carries whatever that read found:
+/// [`DogSource::Adopted`] for a dog `shep adopt` registered, or `None` for
+/// a name `shep.toml` never had an entry for (a built-in dog, or a name
+/// this document has never heard of) — `rehome` still runs in that case,
+/// since forgetting a registration that already does not exist is not a
+/// fault.
+#[derive(Debug, Serialize)]
+pub struct DogRehomedRow {
+    /// The dog's name.
+    pub name: String,
+    /// Where its binary came from, read before this verb forgot it — see
+    /// this type's own doc for what `None` means.
+    pub source: Option<DogSource>,
+    /// Whether a shepherd was reached and asked to stop the dog.
+    pub shepherd_acted: bool,
+    /// The dog's resulting status: `"stopped"` when a shepherd acted, or a
+    /// sentence explaining why not when none answered.
+    pub status: String,
+}
+
+impl Render for DogRehomedRow {
+    fn headers() -> &'static [&'static str] {
+        &["NAME", "SOURCE", "SHEPHERD", "STATUS"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        vec![vec![
+            self.name.clone(),
+            // `-` for `None`, matching `DogRows`' own rule for the same
+            // shape of field — see that type's own `rows` for why.
+            self.source.as_ref().map_or_else(
+                || "-".to_string(),
+                |source| dog_source_label(source).to_string(),
+            ),
+            self.shepherd_acted.to_string(),
+            self.status.clone(),
+        ]]
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "NAME" => "name",
+            "SOURCE" => "source",
+            "SHEPHERD" => "shepherd_acted",
+            "STATUS" => "status",
+            other => panic!("DogRehomedRow::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
 /// `Response::Flushed(Vec<ProcessInfo>)` — the sheep a `shep flush` matched,
 /// rendered by the FILES it emptied rather than by their lifecycle.
 ///
@@ -1095,6 +1210,57 @@ pub(crate) mod tests {
             &DogDisabledRow {
                 name: "metrics".to_string(),
                 source: DogSource::BuiltIn,
+                shepherd_acted: false,
+                status: "not running; will not start with the next shepherd".to_string(),
+            },
+            |j| j,
+            &["SOURCE"],
+        );
+    }
+
+    /// The `adopt` sibling of `dog_enabled_row_does_not_drift` — `SOURCE`
+    /// is `formatted` for the same reason: it serializes to the tagged
+    /// `DogSource` object, not a plain string.
+    #[test]
+    fn dog_adopted_row_does_not_drift() {
+        assert_no_drift(
+            &DogAdoptedRow {
+                name: "otel".to_string(),
+                source: DogSource::Adopted {
+                    path: "/usr/local/bin/shep-otel".to_string(),
+                },
+                shepherd_acted: true,
+                status: "online".to_string(),
+            },
+            |j| j,
+            &["SOURCE"],
+        );
+    }
+
+    /// The `rehome` sibling, exercised once with a recorded source (the
+    /// ordinary case: forgetting a dog `adopt` registered) and once with
+    /// `None` (rehoming a name `shep.toml` never had an `adopted_dogs`
+    /// entry for) — `assert_no_drift`'s own `Value::Null` branch is what
+    /// lets the second case pass without `SOURCE` needing to be
+    /// `formatted` for it too.
+    #[test]
+    fn dog_rehomed_row_does_not_drift_with_or_without_a_source() {
+        assert_no_drift(
+            &DogRehomedRow {
+                name: "otel".to_string(),
+                source: Some(DogSource::Adopted {
+                    path: "/usr/local/bin/shep-otel".to_string(),
+                }),
+                shepherd_acted: true,
+                status: "stopped".to_string(),
+            },
+            |j| j,
+            &["SOURCE"],
+        );
+        assert_no_drift(
+            &DogRehomedRow {
+                name: "ghost".to_string(),
+                source: None,
                 shepherd_acted: false,
                 status: "not running; will not start with the next shepherd".to_string(),
             },

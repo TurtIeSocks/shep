@@ -25,9 +25,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use cli::{Cli, GlobalArgs};
 #[cfg(unix)]
-use cli::{Commands, DaemonArgs, Format};
+use cli::{AdoptArgs, Commands, DaemonArgs, Format};
+use cli::{Cli, GlobalArgs};
 #[cfg(unix)]
 use commands::admin;
 #[cfg(unix)]
@@ -266,13 +266,36 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => query::dogs(&client, &mut streams, fmt).await,
             Err(code) => code,
         },
-        // Neither goes through `connect_client`/`connect_or_spawn_client`:
-        // both must still write the config with no shepherd running at all
-        // (decision 11, `commands::dogs`' own module doc), so each attempts
-        // its own connection internally and tolerates a failure to reach
-        // one, rather than being refused before it ever gets that far.
-        Commands::Enable(ref args) => dogs::enable(&mut streams, fmt, &paths, &args.name).await,
+        // None of the four goes through `connect_client`/
+        // `connect_or_spawn_client`: all four must still write the config
+        // with no shepherd running at all (decision 11, `commands::dogs`'
+        // own module doc), so each attempts its own connection internally
+        // and tolerates a failure to reach one, rather than being refused
+        // before it ever gets that far.
+        //
+        // `--exec` is the hidden pm2 spelling of `adopt` (`EnableArgs`'
+        // own doc) — checked here, not inside `commands::dogs`, so that
+        // module's `enable` keeps the simple `&str` signature every other
+        // verb here has, and the argument-order inversion this alias
+        // carries lives at the one seam that has to know about it.
+        Commands::Enable(ref args) => match &args.exec {
+            Some(path) => {
+                dogs::adopt(
+                    &mut streams,
+                    fmt,
+                    &paths,
+                    &AdoptArgs {
+                        name: args.name.clone(),
+                        path: path.clone(),
+                    },
+                )
+                .await
+            }
+            None => dogs::enable(&mut streams, fmt, &paths, &args.name).await,
+        },
         Commands::Disable(ref args) => dogs::disable(&mut streams, fmt, &paths, &args.name).await,
+        Commands::Adopt(ref args) => dogs::adopt(&mut streams, fmt, &paths, args).await,
+        Commands::Rehome(ref args) => dogs::rehome(&mut streams, fmt, &paths, &args.name).await,
         Commands::Describe(ref args) => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => query::describe(&client, &mut streams, fmt, args).await,
             Err(code) => code,
@@ -543,6 +566,78 @@ mod tests {
             Cli::try_parse_from(["shep", "disable"]).is_err(),
             "`shep disable` with no name must be a usage error"
         );
+    }
+
+    /// The `adopt`/`rehome` sibling of
+    /// `enable_and_disable_parse_to_their_own_commands_and_require_a_name`.
+    /// `adopt` needs both positionals; `rehome` shares `DogArgs` with
+    /// `disable`, so it needs only the name.
+    #[test]
+    fn adopt_and_rehome_parse_to_their_own_commands_and_require_their_arguments() {
+        use clap::Parser;
+        use cli::Commands;
+
+        let adopted = Cli::try_parse_from(["shep", "adopt", "otel", "/opt/bin/shep-otel"])
+            .unwrap()
+            .command;
+        let Commands::Adopt(args) = adopted else {
+            panic!("expected adopt")
+        };
+        assert_eq!(args.name, "otel");
+        assert_eq!(args.path, PathBuf::from("/opt/bin/shep-otel"));
+
+        let rehomed = Cli::try_parse_from(["shep", "rehome", "otel"])
+            .unwrap()
+            .command;
+        let Commands::Rehome(args) = rehomed else {
+            panic!("expected rehome")
+        };
+        assert_eq!(args.name, "otel");
+
+        assert!(
+            Cli::try_parse_from(["shep", "adopt"]).is_err(),
+            "`shep adopt` with neither name nor path must be a usage error"
+        );
+        assert!(
+            Cli::try_parse_from(["shep", "adopt", "otel"]).is_err(),
+            "`shep adopt otel` with no path must be a usage error"
+        );
+        assert!(
+            Cli::try_parse_from(["shep", "rehome"]).is_err(),
+            "`shep rehome` with no name must be a usage error"
+        );
+    }
+
+    /// fails if `enable --exec` routes to `enable` (which would try to run
+    /// a built-in dog named after a path), and fails if the argument order
+    /// is read as `adopt`'s. The two orders are inverted
+    /// (`EnableArgs`'/`AdoptArgs`' own docs), and a swap here is silent:
+    /// both arguments are strings, so nothing but a pinned assertion on
+    /// which field holds which value would catch one crossing the other.
+    #[test]
+    fn the_hidden_pm2_spelling_reaches_adopt_with_the_arguments_the_right_way_round() {
+        use clap::Parser;
+        use cli::Commands;
+
+        let parsed = Cli::try_parse_from(["shep", "enable", "--exec", "/opt/bin/d", "otel"])
+            .unwrap()
+            .command;
+        let Commands::Enable(args) = parsed else {
+            panic!("expected enable")
+        };
+        assert_eq!(args.name, "otel");
+        assert_eq!(args.exec, Some(PathBuf::from("/opt/bin/d")));
+
+        // A plain `enable` (no `--exec`) still carries no path — this is
+        // the branch main's own dispatch reads to decide `enable` vs
+        // `adopt`.
+        let plain = Cli::try_parse_from(["shep", "enable", "metrics"])
+            .unwrap()
+            .command;
+        let Commands::Enable(args) = plain else {
+            panic!("expected enable")
+        };
+        assert_eq!(args.exec, None);
     }
 
     /// fails if `Commands::Muster` is wired to another verb's function —

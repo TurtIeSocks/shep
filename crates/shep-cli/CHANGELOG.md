@@ -42,6 +42,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   far more often than it is generated. A `shep.toml` that fails to parse
   is refused rather than overwritten.
 
+- Add `shep adopt <name> <path>` and `shep rehome <name>`, the verbs that
+  register and forget a third-party dog. **An adopted dog runs at the
+  shepherd's own trust level, with no sandboxing beyond it** — `adopt`
+  vets the binary before running it, not against it being hostile.
+
+  - `adopt` refuses, before `shep.toml` is touched at all, a path that:
+    - doesn't exist,
+    - exists but isn't a file (most often a `bin/` directory the operator
+      meant to point inside of),
+    - exists but has no execute bit set for anyone, or
+    - is executable and this kernel still refuses to run it — the wrong
+      architecture, or a shebang naming an absent interpreter.
+
+    The fourth check is answered by actually running the binary (with no
+    arguments, exactly as the daemon later will) and killing it the moment
+    it's confirmed to run — never by reading its header, which would mean
+    trusting a second, partial loader that can disagree with the real one.
+  - A vetted path is recorded ABSOLUTE and canonicalized in
+    `[daemon] adopted_dogs`, so a reboot's boot path (which spawns from
+    whatever working directory the init system handed it) resolves the
+    same binary the operator pointed at, not whatever a relative path
+    happens to mean from wherever the daemon starts.
+  - `rehome` is to `adopt` what `disable` is to `enable`, with one more
+    thing forgotten: it removes `name` from `enabled_dogs` AND
+    `adopted_dogs`, and drops its `[dog.<name>]` table entirely — where
+    `disable` deliberately keeps that table so a dog's own configuration
+    survives being turned off and back on.
+  - Neither verb autostarts a shepherd, matching `enable`/`disable`: both
+    write the config and exit `0` even with no shepherd running, and a
+    shepherd is still asked to act (start or stop the dog) whenever one
+    answers.
+  - `shep enable --exec <path> <name>` is kept as a hidden alias for
+    `adopt`, pm2's own spelling, for muscle memory — note the argument
+    order: pm2's own spelling puts the path first, `shep adopt` puts the
+    name first. It doesn't appear in `--help`; `shep adopt` is the verb
+    that does.
+
 - `shep flock` prints a second table beneath the flock's own whenever any
   dog is registered, captioned `Dogs` — headers `NAME`, `SOURCE`, `STATUS`,
   `PID`, `RESTARTS`, `CPU`, `MEM`, `UPTIME`. No `ID` column: ids reflect

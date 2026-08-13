@@ -96,7 +96,7 @@ pub enum Commands {
     /// Writes the config either way and exits 0 even with no shepherd
     /// running — the dog comes up with the next one. `shep muster` is the
     /// only verb that autostarts a shepherd; this is not it.
-    Enable(DogArgs),
+    Enable(EnableArgs),
     /// Turn off a registered dog: removes it from `[daemon] enabled_dogs`,
     /// and stops it now if a shepherd is running.
     ///
@@ -104,6 +104,22 @@ pub enum Commands {
     /// survives a disable/enable cycle. `shep rehome` is the verb that
     /// forgets a dog entirely.
     Disable(DogArgs),
+    /// Vet a binary shep has never seen and register it as a dog: writes
+    /// `[daemon] adopted_dogs` and `[daemon] enabled_dogs` in `shep.toml`,
+    /// and starts it now if a shepherd is running.
+    ///
+    /// Refuses, before touching the config at all, a path that does not
+    /// exist, is not a file, has no execute bit set, or that this kernel
+    /// will not exec. An adopted dog runs at the shepherd's own trust
+    /// level, with no sandboxing beyond it.
+    Adopt(AdoptArgs),
+    /// Forget an adopted dog entirely: stops it if a shepherd is running,
+    /// and removes it from `[daemon] enabled_dogs`, `[daemon]
+    /// adopted_dogs`, and its own `[dog.<name>]` table.
+    ///
+    /// `shep disable` stops a dog without forgetting its configuration;
+    /// `rehome` is the verb that forgets it.
+    Rehome(DogArgs),
     /// Describe one sheep in detail.
     Describe(SelectorArgs),
     /// Send a named action to matched sheep and report what each app
@@ -286,15 +302,60 @@ pub struct FoldArgs {
     pub name: String,
 }
 
-/// Arguments to `shep enable`/`shep disable`.
+/// Arguments to `shep disable`/`shep rehome`.
 ///
 /// One struct for both verbs, matching [`StartupArgs`]'s own precedent: a
 /// dog is named, never selected — `SelectorArgs`' grammar (`all`, `/regex/`,
 /// `fold:<name>`) answers "which of the flock", and a dog is not the flock.
+/// `shep enable` shares this shape too, but carries a second, hidden field
+/// ([`EnableArgs`]) that neither `disable` nor `rehome` has any use for, so
+/// it gets a struct of its own rather than widening this one for verbs that
+/// would never touch the extra field.
 #[derive(Debug, clap::Args)]
 pub struct DogArgs {
     /// The dog's name — the `[dog.<name>]` config key
     pub name: String,
+}
+
+/// Arguments to `shep enable`.
+///
+/// [`DogArgs`] plus one hidden field: `--exec` is pm2's own spelling of
+/// `shep adopt`, kept as a working alias so muscle memory carries over —
+/// `#[arg(hide = true)]`, not `#[command(alias = ..)]`, because the alias
+/// is on an argument, not the subcommand itself. `shep enable --exec <path>
+/// <name>` parses here and is routed to [`super::commands::dogs::adopt`] by
+/// `main`'s own dispatch, never handled by `enable` itself: a dog already
+/// built into this binary has no path to vet, so `enable` cannot carry out
+/// what `adopt` does.
+///
+/// **Argument order is inverted from [`AdoptArgs`]'s own**, and that
+/// inversion is deliberate, not an oversight to fix: pm2's own spelling
+/// puts the path before the name (`--exec <path> <name>`), while `shep
+/// adopt` puts the name first (`adopt <name> <path>`, decision, Rin). Both
+/// arguments are strings, so a reader who assumes the two orders agree
+/// introduces a silent swap that nothing short of a test catches — see
+/// `main.rs`'s `the_hidden_pm2_spelling_reaches_adopt_with_the_arguments_the_right_way_round`.
+#[derive(Debug, clap::Args)]
+pub struct EnableArgs {
+    /// The dog's name — the `[dog.<name>]` config key
+    pub name: String,
+    /// Hidden pm2-spelling alias for `shep adopt`: routes to `adopt` with
+    /// this flag's value as the binary path
+    #[arg(long, hide = true)]
+    pub exec: Option<PathBuf>,
+}
+
+/// Arguments to `shep adopt`.
+///
+/// Positional, name then path (decision, Rin: no `--exec` flag on this
+/// verb) — the reverse order of [`EnableArgs`]'s hidden `--exec` alias; see
+/// that type's own doc for why the inversion is deliberate.
+#[derive(Debug, clap::Args)]
+pub struct AdoptArgs {
+    /// The dog's name — the `[dog.<name>]` config key
+    pub name: String,
+    /// Path to the dog's binary, vetted before `shep.toml` is touched
+    pub path: PathBuf,
 }
 
 /// The selector the verbs that take an optional one fall back to.
@@ -635,6 +696,8 @@ mod tests {
             "trigger",
             "enable",
             "disable",
+            "adopt",
+            "rehome",
             "ping",
             "kill",
             "save",
@@ -648,5 +711,24 @@ mod tests {
                 "{visible} must stay visible in --help"
             );
         }
+    }
+
+    /// Fails if `enable`'s pm2-spelled `--exec` alias loses its `hide =
+    /// true` and starts teaching itself in `--help` — the whole reason it
+    /// is an argument-level hide rather than a documented flag: `shep
+    /// adopt` is the verb the help text should point an operator at.
+    #[test]
+    fn the_exec_alias_stays_hidden_from_help() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let enable = cmd.find_subcommand("enable").unwrap();
+        let exec_arg = enable
+            .get_arguments()
+            .find(|a| a.get_id().as_str() == "exec")
+            .expect("EnableArgs must still carry a hidden `exec` field");
+        assert!(
+            exec_arg.is_hide_set(),
+            "--exec must stay hidden from --help"
+        );
     }
 }
