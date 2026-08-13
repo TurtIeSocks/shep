@@ -20,9 +20,9 @@
 //! runs BEFORE `shep.toml` is touched at all — a refused adopt must leave
 //! the config exactly as it was, because there is something here `enable`
 //! structurally cannot have: a binary that might not exist, might not be a
-//! file, might have no execute bit, or might be something this kernel
-//! cannot run. Once vetting passes, `adopt` rejoins the same config-first
-//! order as the other three.
+//! file, might have no execute bit, might sit somewhere any user can
+//! rewrite it, or might be something this kernel cannot run. Once vetting
+//! passes, `adopt` rejoins the same config-first order as the other three.
 //!
 //! **None of the four autostarts a shepherd** — decision 11. Each, against
 //! no running daemon, writes the config, reports what will happen with the
@@ -43,7 +43,7 @@ use crate::commands::shep_toml::{ShepToml, ShepTomlError};
 use crate::exit::ExitCode;
 use crate::output::{
     DogAdoptedRow, DogDisabledRow, DogEnabledRow, DogRehomedRow, Streams, emit, emit_error,
-    write_outcome,
+    emit_notice, write_outcome,
 };
 
 /// [`DogEnabledRow::status`] when `enable` wrote the config but no shepherd
@@ -234,10 +234,11 @@ async fn disable_after_config(
 
 /// Why a binary cannot be adopted.
 ///
-/// The three modes `enable` structurally cannot have, and the reason the
-/// two verbs are split rather than one verb carrying an `--exec` flag: a
-/// dog that already ships inside this binary has no path to be missing, no
-/// permission bit to be unset, and no architecture to be wrong.
+/// The modes `enable` structurally cannot have, and the reason the two
+/// verbs are split rather than one verb carrying an `--exec` flag: a dog
+/// that already ships inside this binary has no path to be missing, no
+/// permission bit to be unset, no architecture to be wrong, and nobody
+/// else who can write it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AdoptRefusal {
     /// Nothing exists at that path.
@@ -247,6 +248,17 @@ pub enum AdoptRefusal {
     NotAFile,
     /// It exists and no execute bit is set for anyone.
     NotExecutable,
+    /// The binary, or the directory holding it, can be written by any user
+    /// on this system. An adopted dog runs at the shepherd's own trust
+    /// level and is exec'd again on every restart without being re-vetted,
+    /// so a path any user can write is a standing way for any user to run
+    /// code as the shep user. A writable directory counts for the same
+    /// reason a writable file does: it lets the binary be renamed away and
+    /// a replacement dropped in its place.
+    WorldWritable {
+        /// The offending path: the binary itself, or its directory.
+        path: PathBuf,
+    },
     /// It exists, is executable, and this kernel refused to exec it —
     /// the wrong architecture, or an interpreter line naming something
     /// absent.
@@ -262,6 +274,12 @@ impl std::fmt::Display for AdoptRefusal {
             Self::Missing => write!(f, "no file exists at that path"),
             Self::NotAFile => write!(f, "that path is not a file"),
             Self::NotExecutable => write!(f, "no execute bit is set on that file"),
+            Self::WorldWritable { path } => write!(
+                f,
+                "{} is writable by any user on this system, and an adopted dog runs \
+                 with the shepherd's own privileges",
+                path.display()
+            ),
             Self::WillNotExec { reason } => {
                 write!(f, "this kernel refused to run that file: {reason}")
             }
@@ -279,10 +297,14 @@ impl core::error::Error for AdoptRefusal {}
 /// operator's shell and then fail to exec months later, with nothing to
 /// connect the failure to the `adopt` that caused it.
 ///
-/// The three checks run in this order — existence, file-ness, permission
-/// bit — each refusing before the next one runs, so a refusal never claims
-/// the wrong cause (`NotExecutable` for a path that does not exist would
-/// send an operator to `chmod` a file that is not there). The fourth check,
+/// The first three checks run in this order — existence, file-ness,
+/// permission bit — each refusing before the next one runs, so a refusal
+/// never claims the wrong cause (`NotExecutable` for a path that does not
+/// exist would send an operator to `chmod` a file that is not there). The
+/// fourth, [`AdoptRefusal::WorldWritable`], is [`writability`]'s, and runs
+/// before the exec probe below rather than after it: the probe RUNS the
+/// binary, and a binary any user can rewrite is not one to run in order to
+/// find out whether it runs. The fifth,
 /// [`AdoptRefusal::WillNotExec`], is answered by actually trying it —
 /// spawned with the same (empty) argument list the daemon uses for an
 /// adopted dog (`shep-daemon/src/dogs.rs`'s `dog_app`), and killed once it
@@ -296,7 +318,7 @@ impl core::error::Error for AdoptRefusal {}
 /// # Errors
 /// The refusal, which the caller renders. Nothing here is a shep fault, so
 /// none of these is an [`ExitCode::Internal`].
-pub fn vet_binary(path: &Path) -> Result<PathBuf, AdoptRefusal> {
+pub fn vet_binary(path: &Path) -> Result<VettedBinary, AdoptRefusal> {
     let metadata = std::fs::metadata(path).map_err(|_| AdoptRefusal::Missing)?;
     if !metadata.is_file() {
         return Err(AdoptRefusal::NotAFile);
@@ -316,6 +338,7 @@ pub fn vet_binary(path: &Path) -> Result<PathBuf, AdoptRefusal> {
     // two calls is the only way it could fail, and either way there is
     // nothing more specific than `Missing` to report.
     let canonical = path.canonicalize().map_err(|_| AdoptRefusal::Missing)?;
+    let group_writable = writability(&canonical)?;
     // Spawned with no arguments — an adopted dog is run exactly this way
     // (`dog_app`'s own doc) — and torn down unconditionally: `kill` is
     // ignored (a process that already exited is not a failure to vet), but
@@ -332,9 +355,77 @@ pub fn vet_binary(path: &Path) -> Result<PathBuf, AdoptRefusal> {
             }
             let _ = child.kill();
             let _ = child.wait();
-            Ok(canonical)
+            Ok(VettedBinary {
+                path: canonical,
+                group_writable,
+            })
         }
     }
+}
+
+/// A binary [`vet_binary`] accepted, and what an operator should still be
+/// told about it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct VettedBinary {
+    /// The absolute, canonicalized path — the one `adopt` records and the
+    /// daemon later exec's.
+    pub path: PathBuf,
+    /// The paths [`writability`] found group-writable: the binary, its
+    /// directory, both, or (the ordinary case) neither. `adopt` reports one
+    /// notice per entry; nothing here is a refusal.
+    pub group_writable: Vec<PathBuf>,
+}
+
+/// Who besides the owner can write `canonical` and the directory holding
+/// it, checked on the canonicalized path — the one actually recorded, and
+/// so the one the daemon actually exec's, whatever the operator typed.
+///
+/// The split between refusing and warning follows the precedent OpenSSH set
+/// for `authorized_keys` and sudo set for `sudoers`: refuse the unambiguous
+/// case, and do not try to be clever about the ambiguous one.
+///
+/// World-writable is unambiguous — no legitimate deployment leaves a binary
+/// the whole machine can rewrite — so it is [`AdoptRefusal::WorldWritable`].
+/// Group-writable is not: a deployment directory owned by a trusted deploy
+/// group is a normal, deliberate arrangement, and CI pushes into one all
+/// day. Refusing it would block real setups, so it comes back as a path to
+/// warn about and the adopt proceeds.
+///
+/// A path with no parent (`/` itself) cannot be a file and never reaches
+/// here as `canonical`, so the directory half simply has nothing to check.
+///
+/// The sticky bit is deliberately not an exemption for the directory half.
+/// It does defeat the rename-and-replace attack in a world-writable `/tmp`,
+/// but a dog exec'd out of `/tmp` on every restart is not an arrangement
+/// worth carving a special case for, and both precedents above refuse the
+/// world-writable mode without consulting it.
+///
+/// # Errors
+/// [`AdoptRefusal::WorldWritable`], naming whichever of the two paths it
+/// found first — the binary before its directory, so the more specific
+/// thing to fix is the one reported.
+fn writability(canonical: &Path) -> Result<Vec<PathBuf>, AdoptRefusal> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut group_writable = Vec::new();
+    for candidate in [Some(canonical), canonical.parent()].into_iter().flatten() {
+        // Unreadable metadata is not a refusal: the binary itself was
+        // stat'ed successfully by the caller, and a directory whose mode
+        // cannot be read is a state this check has nothing to say about.
+        let Ok(metadata) = std::fs::metadata(candidate) else {
+            continue;
+        };
+        let mode = metadata.permissions().mode();
+        if mode & 0o002 != 0 {
+            return Err(AdoptRefusal::WorldWritable {
+                path: candidate.to_path_buf(),
+            });
+        }
+        if mode & 0o020 != 0 {
+            group_writable.push(candidate.to_path_buf());
+        }
+    }
+    Ok(group_writable)
 }
 
 /// How long [`macos_deferred_exec_failure`] gives a spawned probe to prove
@@ -402,9 +493,9 @@ fn macos_deferred_exec_failure(_child: &mut std::process::Child) -> Option<Strin
 }
 
 /// Renders `refusal` and returns the exit code an unvettable binary
-/// reports. [`ExitCode::InvalidConfig`] for all three modes — what's wrong
-/// is the argument `adopt` was given, not shep's own state, the same
-/// category a bad Flockfile value gets.
+/// reports. [`ExitCode::InvalidConfig`] for every mode — what's wrong is
+/// the argument `adopt` was given, not shep's own state, the same category
+/// a bad Flockfile value gets.
 fn fail_adopt(
     streams: &mut Streams<'_>,
     fmt: Format,
@@ -417,6 +508,27 @@ fn fail_adopt(
     code
 }
 
+/// [`emit_notice`] code for the group-writable warning — caller-defined,
+/// like every notice code, and deliberately not one of
+/// [`ExitCode::code_str`]'s: `adopt` still succeeds here.
+const GROUP_WRITABLE_NOTICE: &str = "group_writable";
+
+/// Warns that `path` is group-writable, and lets the adopt proceed.
+///
+/// Not an error and not a refusal — see [`writability`] for why this mode
+/// is warned about rather than refused. It goes out through
+/// [`emit_notice`] rather than [`emit_error`] for exactly the reason that
+/// function exists: a `--format json` consumer must be able to tell a
+/// diagnostic on a successful command from a failure.
+fn warn_group_writable(streams: &mut Streams<'_>, fmt: Format, path: &Path) {
+    let message = format!(
+        "{} is writable by its group; anyone in that group can replace the binary \
+         this dog runs, and it runs with the shepherd's own privileges",
+        path.display()
+    );
+    let _ = emit_notice(&mut *streams.err, fmt, GROUP_WRITABLE_NOTICE, &message);
+}
+
 /// `shep adopt <name> <path>`: vets a binary shep has never seen, records
 /// it, and starts it if a shepherd is running.
 pub async fn adopt(
@@ -425,10 +537,14 @@ pub async fn adopt(
     paths: &ShepPaths,
     args: &AdoptArgs,
 ) -> ExitCode {
-    let path = match vet_binary(&args.path) {
-        Ok(path) => path,
+    let vetted = match vet_binary(&args.path) {
+        Ok(vetted) => vetted,
         Err(refusal) => return fail_adopt(streams, fmt, &args.path, &refusal),
     };
+    let path = vetted.path;
+    for writable in &vetted.group_writable {
+        warn_group_writable(streams, fmt, writable);
+    }
     let mut cfg = match ShepToml::open(&paths.daemon_config) {
         Ok(cfg) => cfg,
         Err(err) => return fail_config(streams, fmt, &err),
@@ -757,7 +873,14 @@ mod tests {
         assert_eq!(code, ExitCode::NotFound);
     }
 
-    /// The three modes `enable` cannot have, and the reason the two verbs
+    /// Sets `mode` on `path`, for the permission-bit cases below.
+    fn chmod(path: &Path, mode: u32) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, mode);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// The modes `enable` cannot have, and the reason the two verbs
     /// are split. fails if any of them is reported as one of the others —
     /// "not executable" for a path that does not exist sends an operator to
     /// `chmod` a file that is not there.
@@ -777,21 +900,108 @@ mod tests {
         // The same file, now executable: the ONLY thing that changed is the
         // mode bit, so a `vet_binary` that refused for some other reason
         // fails here rather than passing for the wrong one.
-        let mut mode = std::fs::metadata(&plain).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
-        std::fs::set_permissions(&plain, mode).unwrap();
-        assert_eq!(vet_binary(&plain).unwrap(), plain.canonicalize().unwrap());
+        chmod(&plain, 0o755);
+        let vetted = vet_binary(&plain).unwrap();
+        assert_eq!(vetted.path, plain.canonicalize().unwrap());
+        assert!(
+            vetted.group_writable.is_empty(),
+            "an 0o755 binary in an 0o700 directory has nothing to warn about: {vetted:?}"
+        );
 
         // Executable, and not something this kernel can run.
         let bogus = dir.path().join("bogus");
         std::fs::write(&bogus, b"\x7fELF\x00\x00\x00 not really").unwrap();
-        let mut mode = std::fs::metadata(&bogus).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
-        std::fs::set_permissions(&bogus, mode).unwrap();
+        chmod(&bogus, 0o755);
         assert!(matches!(
             vet_binary(&bogus),
             Err(AdoptRefusal::WillNotExec { .. })
         ));
+    }
+
+    /// fails if a binary any local user can rewrite is adopted. The path is
+    /// vetted once, here, and then exec'd by the daemon at the shepherd's
+    /// own trust level on every restart with no re-vetting — so a
+    /// world-writable path is a standing way for any user on the box to run
+    /// code as the shep user, indefinitely.
+    ///
+    /// Both halves matter: a writable DIRECTORY is as good as a writable
+    /// file, because it lets the binary be renamed away and a replacement
+    /// dropped in its place.
+    #[test]
+    fn a_binary_any_user_can_rewrite_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("dog");
+        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        chmod(&bin, 0o757);
+        assert_eq!(
+            vet_binary(&bin),
+            Err(AdoptRefusal::WorldWritable {
+                path: bin.canonicalize().unwrap(),
+            }),
+            "a world-writable binary must be refused"
+        );
+
+        // The file is now sound; the directory holding it is not.
+        chmod(&bin, 0o755);
+        chmod(dir.path(), 0o777);
+        assert_eq!(
+            vet_binary(&bin),
+            Err(AdoptRefusal::WorldWritable {
+                path: bin.canonicalize().unwrap().parent().unwrap().to_path_buf(),
+            }),
+            "a world-writable directory must be refused too"
+        );
+        // Restored so the tempdir cleans up from a known state.
+        chmod(dir.path(), 0o700);
+    }
+
+    /// fails if a group-writable deployment directory is refused rather
+    /// than warned about — that is a legitimate, common arrangement with a
+    /// trusted deploy group, and refusing it would block real setups — and
+    /// fails if the warning is silent, since the operator's only chance to
+    /// hear about it is this one command.
+    #[tokio::test]
+    async fn a_group_writable_binary_is_adopted_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        let deploy = dir.path().join("deploy");
+        std::fs::create_dir(&deploy).unwrap();
+        let bin = deploy.join("shep-otel");
+        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        chmod(&bin, 0o775);
+        chmod(&deploy, 0o775);
+
+        let vetted = vet_binary(&bin).unwrap();
+        assert_eq!(
+            vetted.group_writable,
+            vec![bin.canonicalize().unwrap(), deploy.canonicalize().unwrap()],
+            "both the binary and its directory are group-writable"
+        );
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = AdoptArgs {
+            name: "otel".to_string(),
+            path: bin.clone(),
+        };
+        let code = adopt(
+            &mut streams(&mut out, &mut err),
+            Format::Table,
+            &paths,
+            &args,
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::Success, "group-writable is a warning");
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            text.contains(&bin.canonicalize().unwrap().display().to_string()),
+            "the warning names the path: {text}"
+        );
+        assert!(
+            text.contains("group"),
+            "the warning says what the risk is: {text}"
+        );
     }
 
     /// fails if a refused adopt still edits `shep.toml`. The vetting is

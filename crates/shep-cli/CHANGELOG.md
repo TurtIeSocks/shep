@@ -73,11 +73,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - doesn't exist,
     - exists but isn't a file (most often a `bin/` directory the operator
       meant to point inside of),
-    - exists but has no execute bit set for anyone, or
+    - exists but has no execute bit set for anyone,
+    - can be written by any user on this system — the binary itself or the
+      directory holding it, since a writable directory lets the binary be
+      renamed away and a replacement dropped in its place, or
     - is executable and this kernel still refuses to run it — the wrong
       architecture, or a shebang naming an absent interpreter.
 
-    The fourth check is answered by actually running the binary (with no
+    The writability check reads the canonicalized path, the one actually
+    recorded, and runs BEFORE the exec probe below, which runs the binary:
+    a binary any user can rewrite is not one to run in order to find out
+    whether it runs. A GROUP-writable file or directory is warned about
+    instead of refused, naming the path — a deploy directory owned by a
+    trusted group is an ordinary arrangement, and refusing it outright
+    would break real setups. That split is the one OpenSSH makes for
+    `authorized_keys` and sudo for `sudoers`: refuse the unambiguous case,
+    don't be clever about the ambiguous one.
+
+    The last check is answered by actually running the binary (with no
     arguments, exactly as the daemon later will) and killing it the moment
     it's confirmed to run — never by reading its header, which would mean
     trusting a second, partial loader that can disagree with the real one.
