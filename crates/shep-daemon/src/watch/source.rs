@@ -388,109 +388,6 @@ mod tests {
         );
     }
 
-    // fails if the watch is non-recursive, or if the handler's
-    // thread-to-tokio bridge drops the batch
-    #[tokio::test]
-    async fn a_file_created_under_the_root_produces_a_batch_containing_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = canonical_root(&dir);
-        let (_source, mut rx) = watch_tree(&root, TEST_DELAY).unwrap();
-
-        let file = root.join("created.txt");
-        std::fs::write(&file, b"hello").unwrap();
-
-        let batch = expect_batch(&mut rx).await;
-        assert!(
-            batch.paths.contains(&file),
-            "expected {file:?} in the batch, got {batch:?}"
-        );
-    }
-
-    // fails if `RecursiveMode::NonRecursive` was passed instead of `Recursive`
-    #[tokio::test]
-    async fn a_file_created_in_a_nested_subdirectory_also_produces_a_batch() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = canonical_root(&dir);
-        let nested = root.join("a").join("b");
-        std::fs::create_dir_all(&nested).unwrap();
-        let (_source, mut rx) = watch_tree(&root, TEST_DELAY).unwrap();
-
-        let file = nested.join("created.txt");
-        std::fs::write(&file, b"hello").unwrap();
-
-        let batch = expect_batch(&mut rx).await;
-        assert!(
-            batch.paths.contains(&file),
-            "expected {file:?} in the batch, got {batch:?}"
-        );
-    }
-
-    // fails if the debouncer guard is leaked (a `std::mem::forget`-equivalent,
-    // or stored somewhere that outlives the `WatchSource`, e.g. a `static`),
-    // which would leave an OS thread watching a deleted sheep's directory
-    // forever: a write after the drop would still reach `rx` within the
-    // bounded window below
-    #[tokio::test]
-    async fn dropping_the_source_stops_delivery() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = canonical_root(&dir);
-        let (source, mut rx) = watch_tree(&root, TEST_DELAY).unwrap();
-
-        // Prove the watch is live first, so a failure below can't be
-        // confused with "this watch never worked in the first place".
-        std::fs::write(root.join("first.txt"), b"hello").unwrap();
-        expect_batch(&mut rx).await;
-
-        drop(source);
-        std::fs::write(root.join("second.txt"), b"hello").unwrap();
-
-        // A bounded `timeout` + `recv`, not a bare `try_recv` (Global
-        // Constraints rule 11). Both an expired timeout (nothing arrived)
-        // and a closed channel (the debouncer thread already tore down and
-        // dropped its sender) are honest readings of "delivery stopped";
-        // only a delivered batch is the leak this test exists to catch.
-        match timeout(NO_EVENT_WINDOW, rx.recv()).await {
-            Err(_) => {}   // window elapsed with nothing arriving — expected
-            Ok(None) => {} // sender dropped alongside the debouncer thread — expected
-            Ok(Some(batch)) => {
-                panic!("unexpected batch delivered after WatchSource was dropped: {batch:?}")
-            }
-        }
-    }
-
-    // fails if `watch_tree` ignores its own `delay` and debounces against a
-    // hardcoded window instead: both writes happen *before* either is
-    // observed, so a longer hardcoded window would still be running when
-    // `second.txt` lands and the first `expect_batch` below would already
-    // carry it.
-    #[tokio::test]
-    async fn writes_separated_by_more_than_delay_produce_two_batches() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = canonical_root(&dir);
-        let (_source, mut rx) = watch_tree(&root, TEST_DELAY).unwrap();
-
-        let first = crate::testing::touch(&root, "first.txt").unwrap();
-        tokio::time::sleep(TEST_DELAY * 4).await;
-        let second = crate::testing::touch(&root, "second.txt").unwrap();
-
-        let batch_one = expect_batch(&mut rx).await;
-        assert!(
-            batch_one.paths.contains(&first),
-            "expected {first:?} in the first batch, got {batch_one:?}"
-        );
-        assert!(
-            !batch_one.paths.contains(&second),
-            "the two writes coalesced into one batch despite the gap \
-             exceeding `delay` — got {batch_one:?}"
-        );
-
-        let batch_two = expect_batch(&mut rx).await;
-        assert!(
-            batch_two.paths.contains(&second),
-            "expected {second:?} in a batch of its own, got {batch_two:?}"
-        );
-    }
-
     // fails if `delay` is honoured too eagerly (e.g. treated as zero, or
     // each event flushed independently regardless of `delay`): these two
     // near-simultaneous writes would then arrive as two batches instead of
@@ -508,32 +405,6 @@ mod tests {
     // scheduling from this one — so the margin is generous rather than
     // tight.
     const COALESCE_TEST_DELAY: Duration = Duration::from_secs(1);
-
-    #[tokio::test]
-    async fn writes_within_delay_coalesce_into_one_batch() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = canonical_root(&dir);
-        let (_source, mut rx) = watch_tree(&root, COALESCE_TEST_DELAY).unwrap();
-
-        let first = crate::testing::touch(&root, "first.txt").unwrap();
-        let second = crate::testing::touch(&root, "second.txt").unwrap();
-
-        let batch = expect_batch(&mut rx).await;
-        assert!(
-            batch.paths.contains(&first),
-            "expected {first:?} in {batch:?}"
-        );
-        assert!(
-            batch.paths.contains(&second),
-            "writes inside `delay` must land in one batch, got {batch:?}"
-        );
-
-        match timeout(NO_EVENT_WINDOW, rx.recv()).await {
-            Err(_) => {} // window elapsed with nothing further — expected
-            Ok(None) => panic!("watch source ended unexpectedly"),
-            Ok(Some(extra)) => panic!("unexpected second batch: {extra:?}"),
-        }
-    }
 
     // fails if a missing root is silently accepted, reported as the wrong
     // variant, or reported with an empty reason
@@ -585,49 +456,186 @@ mod tests {
         let _: &dyn core::error::Error = &watch;
     }
 
-    // fails if deleting a watched path panics the handler thread or
-    // otherwise breaks delivery instead of just reporting the removal
-    #[tokio::test]
-    async fn a_path_deleted_while_watched_still_produces_a_batch() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = canonical_root(&dir);
-        let file = crate::testing::touch(&root, "doomed.txt").unwrap();
-        let (_source, mut rx) = watch_tree(&root, TEST_DELAY).unwrap();
+    /// Tests that wait on real filesystem events or real elapsed time.
+    ///
+    /// The inner loop skips this module with `--skip ::slow::`; the full
+    /// suite still runs them because nothing here is `#[ignore]`d.
+    mod slow {
+        use super::*;
 
-        std::fs::remove_file(&file).unwrap();
+        // fails if the watch is non-recursive, or if the handler's
+        // thread-to-tokio bridge drops the batch
+        #[tokio::test]
+        async fn a_file_created_under_the_root_produces_a_batch_containing_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = canonical_root(&dir);
+            let (_source, mut rx) = watch_tree(&root, TEST_DELAY).unwrap();
 
-        let batch = expect_batch(&mut rx).await;
-        assert!(
-            batch.paths.contains(&file),
-            "expected the deleted path {file:?} in the batch, got {batch:?}"
-        );
-    }
+            let file = root.join("created.txt");
+            std::fs::write(&file, b"hello").unwrap();
 
-    // fails if a caller can assume delivered paths share root's own literal
-    // form — see the trap this pins for `WatchFilter`'s prefix stripping,
-    // documented on `watch_tree` itself
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_symlinked_root_delivers_the_resolved_path_not_the_one_passed_in() {
-        let target = tempfile::tempdir().unwrap();
-        let resolved_target = canonical_root(&target);
-        let link_parent = tempfile::tempdir().unwrap();
-        let link = link_parent.path().join("link-to-target");
-        std::os::unix::fs::symlink(&resolved_target, &link).unwrap();
+            let batch = expect_batch(&mut rx).await;
+            assert!(
+                batch.paths.contains(&file),
+                "expected {file:?} in the batch, got {batch:?}"
+            );
+        }
 
-        // Watch through the symlink, deliberately left un-canonicalized.
-        let (_source, mut rx) = watch_tree(&link, TEST_DELAY).unwrap();
-        crate::testing::touch(&link, "through-the-link.txt").unwrap();
+        // fails if `RecursiveMode::NonRecursive` was passed instead of `Recursive`
+        #[tokio::test]
+        async fn a_file_created_in_a_nested_subdirectory_also_produces_a_batch() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = canonical_root(&dir);
+            let nested = root.join("a").join("b");
+            std::fs::create_dir_all(&nested).unwrap();
+            let (_source, mut rx) = watch_tree(&root, TEST_DELAY).unwrap();
 
-        let batch = expect_batch(&mut rx).await;
-        let resolved_file = resolved_target.join("through-the-link.txt");
-        assert!(
-            batch.paths.contains(&resolved_file),
-            "expected the resolved path {resolved_file:?} in {batch:?}"
-        );
-        assert!(
-            !batch.paths.iter().any(|p| p.starts_with(&link)),
-            "expected no path under the symlink itself, got {batch:?}"
-        );
+            let file = nested.join("created.txt");
+            std::fs::write(&file, b"hello").unwrap();
+
+            let batch = expect_batch(&mut rx).await;
+            assert!(
+                batch.paths.contains(&file),
+                "expected {file:?} in the batch, got {batch:?}"
+            );
+        }
+
+        // fails if the debouncer guard is leaked (a `std::mem::forget`-equivalent,
+        // or stored somewhere that outlives the `WatchSource`, e.g. a `static`),
+        // which would leave an OS thread watching a deleted sheep's directory
+        // forever: a write after the drop would still reach `rx` within the
+        // bounded window below
+        #[tokio::test]
+        async fn dropping_the_source_stops_delivery() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = canonical_root(&dir);
+            let (source, mut rx) = watch_tree(&root, TEST_DELAY).unwrap();
+
+            // Prove the watch is live first, so a failure below can't be
+            // confused with "this watch never worked in the first place".
+            std::fs::write(root.join("first.txt"), b"hello").unwrap();
+            expect_batch(&mut rx).await;
+
+            drop(source);
+            std::fs::write(root.join("second.txt"), b"hello").unwrap();
+
+            // A bounded `timeout` + `recv`, not a bare `try_recv` (Global
+            // Constraints rule 11). Both an expired timeout (nothing arrived)
+            // and a closed channel (the debouncer thread already tore down and
+            // dropped its sender) are honest readings of "delivery stopped";
+            // only a delivered batch is the leak this test exists to catch.
+            match timeout(NO_EVENT_WINDOW, rx.recv()).await {
+                Err(_) => {}   // window elapsed with nothing arriving — expected
+                Ok(None) => {} // sender dropped alongside the debouncer thread — expected
+                Ok(Some(batch)) => {
+                    panic!("unexpected batch delivered after WatchSource was dropped: {batch:?}")
+                }
+            }
+        }
+
+        // fails if `watch_tree` ignores its own `delay` and debounces against a
+        // hardcoded window instead: both writes happen *before* either is
+        // observed, so a longer hardcoded window would still be running when
+        // `second.txt` lands and the first `expect_batch` below would already
+        // carry it.
+        #[tokio::test]
+        async fn writes_separated_by_more_than_delay_produce_two_batches() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = canonical_root(&dir);
+            let (_source, mut rx) = watch_tree(&root, TEST_DELAY).unwrap();
+
+            let first = crate::testing::touch(&root, "first.txt").unwrap();
+            tokio::time::sleep(TEST_DELAY * 4).await;
+            let second = crate::testing::touch(&root, "second.txt").unwrap();
+
+            let batch_one = expect_batch(&mut rx).await;
+            assert!(
+                batch_one.paths.contains(&first),
+                "expected {first:?} in the first batch, got {batch_one:?}"
+            );
+            assert!(
+                !batch_one.paths.contains(&second),
+                "the two writes coalesced into one batch despite the gap \
+             exceeding `delay` — got {batch_one:?}"
+            );
+
+            let batch_two = expect_batch(&mut rx).await;
+            assert!(
+                batch_two.paths.contains(&second),
+                "expected {second:?} in a batch of its own, got {batch_two:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn writes_within_delay_coalesce_into_one_batch() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = canonical_root(&dir);
+            let (_source, mut rx) = watch_tree(&root, COALESCE_TEST_DELAY).unwrap();
+
+            let first = crate::testing::touch(&root, "first.txt").unwrap();
+            let second = crate::testing::touch(&root, "second.txt").unwrap();
+
+            let batch = expect_batch(&mut rx).await;
+            assert!(
+                batch.paths.contains(&first),
+                "expected {first:?} in {batch:?}"
+            );
+            assert!(
+                batch.paths.contains(&second),
+                "writes inside `delay` must land in one batch, got {batch:?}"
+            );
+
+            match timeout(NO_EVENT_WINDOW, rx.recv()).await {
+                Err(_) => {} // window elapsed with nothing further — expected
+                Ok(None) => panic!("watch source ended unexpectedly"),
+                Ok(Some(extra)) => panic!("unexpected second batch: {extra:?}"),
+            }
+        }
+
+        // fails if deleting a watched path panics the handler thread or
+        // otherwise breaks delivery instead of just reporting the removal
+        #[tokio::test]
+        async fn a_path_deleted_while_watched_still_produces_a_batch() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = canonical_root(&dir);
+            let file = crate::testing::touch(&root, "doomed.txt").unwrap();
+            let (_source, mut rx) = watch_tree(&root, TEST_DELAY).unwrap();
+
+            std::fs::remove_file(&file).unwrap();
+
+            let batch = expect_batch(&mut rx).await;
+            assert!(
+                batch.paths.contains(&file),
+                "expected the deleted path {file:?} in the batch, got {batch:?}"
+            );
+        }
+
+        // fails if a caller can assume delivered paths share root's own literal
+        // form — see the trap this pins for `WatchFilter`'s prefix stripping,
+        // documented on `watch_tree` itself
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_symlinked_root_delivers_the_resolved_path_not_the_one_passed_in() {
+            let target = tempfile::tempdir().unwrap();
+            let resolved_target = canonical_root(&target);
+            let link_parent = tempfile::tempdir().unwrap();
+            let link = link_parent.path().join("link-to-target");
+            std::os::unix::fs::symlink(&resolved_target, &link).unwrap();
+
+            // Watch through the symlink, deliberately left un-canonicalized.
+            let (_source, mut rx) = watch_tree(&link, TEST_DELAY).unwrap();
+            crate::testing::touch(&link, "through-the-link.txt").unwrap();
+
+            let batch = expect_batch(&mut rx).await;
+            let resolved_file = resolved_target.join("through-the-link.txt");
+            assert!(
+                batch.paths.contains(&resolved_file),
+                "expected the resolved path {resolved_file:?} in {batch:?}"
+            );
+            assert!(
+                !batch.paths.iter().any(|p| p.starts_with(&link)),
+                "expected no path under the symlink itself, got {batch:?}"
+            );
+        }
     }
 }

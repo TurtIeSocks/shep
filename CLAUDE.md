@@ -26,14 +26,18 @@ is one class of test.
 ### The inner loop — use this while iterating, including for every mutation
 
 ```bash
-cargo test -p shep-daemon --lib --all-features -- --skip watch:: --skip extras::
+cargo test -p shep-daemon --lib --all-features -- --skip ::slow::
 ```
 
-**~1.3s, roughly 360 of 440 lib tests** — the exact counts drift every time a task adds one, so treat them as a shape, not a checksum; two briefs have now shipped a stale figure. The 79 it skips are filesystem-watch tests
-that wait on `fseventsd`; 26 of them burn 281s of CPU between them, and they
-are the entire reason the unfiltered lib run costs 23s. A mutation in
-`supervisor.rs` does not need them — but a change to `extras.rs` or the
-sampler does, so run the unfiltered lib suite when touching either.
+**~1.3s, 437 of 454 lib tests** — the exact counts drift every time a task
+adds one, so treat them as a shape, not a checksum; two briefs have now
+shipped a stale figure. The 17 tests this skips live in a nested `mod slow`
+inside each file's `mod tests` (in `watch/source.rs`, `watch/mod.rs`, and
+`extras.rs`) and wait on real macOS FSEvents or real elapsed time; they are
+the reason the unfiltered lib run costs ~25s instead. A mutation in
+`supervisor.rs` does not need them — but a change to `watch/source.rs`'s
+watcher plumbing, or to timing-sensitive behavior in `extras.rs` or the
+sampler, does, so run the unfiltered lib suite when touching either.
 
 ### The task gate — run once, when the task is otherwise done
 

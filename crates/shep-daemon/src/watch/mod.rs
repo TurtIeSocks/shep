@@ -1584,34 +1584,42 @@ mod tests {
         }
     }
 
-    // fails if the debouncer guard is dropped before the loop ever sees an
-    // event: the watch dies inside `spawn_watch_group` and the touch below
-    // produces no restart. The abort half asserts the weaker claim its
-    // comment above describes — the loop stops — not a leak check.
-    #[tokio::test]
-    async fn spawn_watch_group_restarts_on_a_real_touch_and_stops_on_abort() {
-        let (handle, mut rx, _dir) = spawn_test_fixture(vec![ProcScript::never_exits(); 2]);
-        let name = "web";
-        start_app(&handle, name, 1).await;
+    /// Tests that wait on real filesystem events or real elapsed time.
+    ///
+    /// The inner loop skips this module with `--skip ::slow::`; the full
+    /// suite still runs them because nothing here is `#[ignore]`d.
+    mod slow {
+        use super::*;
 
-        let watch_dir = tempfile::tempdir().unwrap();
-        let root = watch_dir.path().canonicalize().unwrap();
-        let filter = WatchFilter::new(&[], &[]).unwrap();
-        let group = spawn_watch_group(
-            name.to_string(),
-            root.clone(),
-            filter,
-            real_time::TEST_DELAY,
-            handle.clone(),
-        )
-        .unwrap();
+        // fails if the debouncer guard is dropped before the loop ever sees an
+        // event: the watch dies inside `spawn_watch_group` and the touch below
+        // produces no restart. The abort half asserts the weaker claim its
+        // comment above describes — the loop stops — not a leak check.
+        #[tokio::test]
+        async fn spawn_watch_group_restarts_on_a_real_touch_and_stops_on_abort() {
+            let (handle, mut rx, _dir) = spawn_test_fixture(vec![ProcScript::never_exits(); 2]);
+            let name = "web";
+            start_app(&handle, name, 1).await;
 
-        crate::testing::touch(&root, "trigger.txt").unwrap();
-        let info = expect_restart(&mut rx, name, real_time::SMOKE_DEADLINE).await;
-        assert_eq!(info.restarts, 1);
+            let watch_dir = tempfile::tempdir().unwrap();
+            let root = watch_dir.path().canonicalize().unwrap();
+            let filter = WatchFilter::new(&[], &[]).unwrap();
+            let group = spawn_watch_group(
+                name.to_string(),
+                root.clone(),
+                filter,
+                real_time::TEST_DELAY,
+                handle.clone(),
+            )
+            .unwrap();
 
-        group.abort();
-        crate::testing::touch(&root, "after-abort.txt").unwrap();
-        assert_no_restart_within(&mut rx, name, real_time::NO_EVENT_WINDOW).await;
+            crate::testing::touch(&root, "trigger.txt").unwrap();
+            let info = expect_restart(&mut rx, name, real_time::SMOKE_DEADLINE).await;
+            assert_eq!(info.restarts, 1);
+
+            group.abort();
+            crate::testing::touch(&root, "after-abort.txt").unwrap();
+            assert_no_restart_within(&mut rx, name, real_time::NO_EVENT_WINDOW).await;
+        }
     }
 }
