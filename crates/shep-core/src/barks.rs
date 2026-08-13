@@ -16,6 +16,16 @@
 //! whole history. This file is read during an incident; refusing the
 //! whole ring over one bad line would be the wrong failure mode.
 //!
+//! Two writer processes is also why [`append`] takes an advisory lock on
+//! a sibling `<path>.lock` and holds it across the whole
+//! read-evict-rewrite-rename sequence. Without it the two writers
+//! interleave read-modify-write and the later `rename` silently discards
+//! every record the other appended in between — reproduced, not
+//! theorised: two processes appending 200 records each left 200 of the
+//! expected 400 in the file. Nothing about the atomic-replace shape
+//! prevents that; atomicity buys the reader a whole file, not the writer
+//! a whole transaction.
+//!
 //! Lives in shep-core, not shep-daemon, because it has two writers that
 //! are two different processes (the shepherd and the bark dog) and
 //! neither is the other's crate — one shared cap implementation, or the
@@ -137,10 +147,23 @@ impl core::error::Error for BarkError {
 /// anyway and leaves the file over the cap — the alternative is silently
 /// dropping the alert that was too interesting to fit.
 ///
+/// Serialized against other appenders — in this process or any other — by
+/// an advisory lock on a sibling `<path>.lock`, held across the whole
+/// read-modify-rename. Two writers without it lose each other's records
+/// outright; see this module's own doc. Concurrent [`read`]s are not
+/// blocked and do not need to be: the ring is only ever replaced whole,
+/// by `rename`.
+///
 /// # Errors
-/// - [`BarkError::Io`] — the file could not be read, written, or replaced.
+/// - [`BarkError::Io`] — the file could not be read, written, or
+///   replaced, or the lock beside it could not be taken.
 /// - [`BarkError::Encode`] — the record could not be serialized.
 pub fn append(path: &Path, bark: &Bark, max_bytes: u64) -> Result<(), BarkError> {
+    // Held until this function returns, so the read below and the rename
+    // at the end are one transaction as far as any other writer is
+    // concerned — see [`RingLock`] for why the lock is not on `path`.
+    let _lock = RingLock::acquire(path).map_err(BarkError::Io)?;
+
     let mut lines = read_lines(path)?;
     let new_line = serde_json::to_string(bark).map_err(BarkError::Encode)?;
     lines.push(new_line);
@@ -203,68 +226,141 @@ fn ring_bytes(lines: &[String]) -> u64 {
 }
 
 /// Rewrites `path` to hold exactly `lines`: the new content lands in a
-/// sibling `<path>.tmp`, is `fsync`ed, then `rename`d over `path` — the
-/// same shape `snapshot::write_atomic` uses, so an interrupted write
-/// leaves the original file exactly as it was rather than a fragment
-/// (this module's own doc: rewrite-and-replace, not truncate-in-place).
+/// uniquely-named sibling temp file, is `fsync`ed, then `rename`d over
+/// `path` — the same shape `snapshot::write_atomic` uses, so an
+/// interrupted write leaves the original file exactly as it was rather
+/// than a fragment (this module's own doc: rewrite-and-replace, not
+/// truncate-in-place).
+///
+/// The name is unique per call, not a fixed `<path>.tmp`. A shared temp
+/// name is not merely untidy: two writers racing on it had one process's
+/// `rename` consume the other's staging file, and the loser died with
+/// `ENOENT` renaming a path that no longer existed. [`RingLock`] already
+/// keeps two appenders apart, so this is the second lock on the same door
+/// — deliberately, because it is the half that survives a caller who ever
+/// reaches `write_ring` by another route.
 fn write_ring(path: &Path, lines: &[String]) -> Result<(), BarkError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp_name = path
+    let mut tmp = create_ring_file(parent).map_err(BarkError::Io)?;
+
+    for line in lines {
+        tmp.write_all(line.as_bytes()).map_err(BarkError::Io)?;
+        tmp.write_all(b"\n").map_err(BarkError::Io)?;
+    }
+    tmp.as_file().sync_all().map_err(BarkError::Io)?;
+
+    // `persist` is `rename(2)`. On failure the `NamedTempFile` comes back
+    // inside the error and its `Drop` removes the staging file, so a
+    // failed replace does not leave one behind.
+    tmp.persist(path).map_err(|err| BarkError::Io(err.error))?;
+    Ok(())
+}
+
+/// Creates the staging file the ring is rewritten through, in `parent` so
+/// the later `rename` stays within one filesystem.
+///
+/// Mode-at-creation rather than a separate `chmod` pass ([`tempfile`]
+/// passes these permissions to the `open` call itself): there is no window
+/// where the file sits at whatever the process umask leaves it, the same
+/// TOCTOU `boot::create_dir_at_dir_mode`'s own doc explains for
+/// directories. On Windows the permissions are left alone — there is no
+/// unix permission-bit equivalent (the same split
+/// `snapshot::write_atomic`'s own `write_atomic_is_owner_only_on_unix`
+/// test uses) — and `tempfile`'s own default is already owner-only on
+/// unix, so this call only makes that choice explicit rather than
+/// inherited.
+fn create_ring_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("barks").suffix(".tmp");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(BARK_FILE_MODE));
+    }
+
+    builder.tempfile_in(parent)
+}
+
+/// An exclusive advisory lock over one bark ring, held for as long as the
+/// value lives and released when it drops (including on an early `?`, and
+/// by the kernel if the process dies holding it).
+///
+/// The lock is on a sibling `<path>.lock`, never on the ring itself, and
+/// that is the whole design decision: `append` finishes by `rename`ing a
+/// new file over `path`, which replaces the inode. A lock taken on the
+/// ring would be a lock on an inode that the very next successful append
+/// unlinks — the next writer would open the *new* inode, find it
+/// unlocked, and the two would be excluding nothing. The lock file is
+/// never renamed, never rewritten, and never read; it exists only to be
+/// an inode with a stable identity, and it is left on disk between
+/// appends on purpose so both writers keep agreeing on which one it is.
+struct RingLock {
+    /// `flock(2)` is released by this handle's `Drop`. Named with a
+    /// leading underscore because it is held, never read.
+    #[cfg(unix)]
+    _flock: nix::fcntl::Flock<std::fs::File>,
+}
+
+impl RingLock {
+    /// Blocks until this process holds the ring's lock exclusively.
+    ///
+    /// # Errors
+    /// The lock file could not be created beside `path`, or `flock` failed
+    /// for a reason other than contention (contention blocks rather than
+    /// failing).
+    #[cfg(unix)]
+    fn acquire(path: &Path) -> std::io::Result<Self> {
+        use nix::fcntl::{Flock, FlockArg};
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(BARK_FILE_MODE)
+            .open(lock_path(path))?;
+
+        // `LockExclusive` blocks; the non-blocking variant would need a
+        // retry loop and a deadline, and an append that waits its turn is
+        // exactly the behaviour wanted here.
+        Flock::lock(file, FlockArg::LockExclusive)
+            .map(|flock| Self { _flock: flock })
+            .map_err(|(_file, errno)| std::io::Error::from(errno))
+    }
+
+    /// Deliberate no-op on Windows: there is no `flock(2)`, shep-core is
+    /// `#![forbid(unsafe_code)]` so `LockFileEx` is not ours to call
+    /// directly, and Windows is shep's 0% tier — every verb prints "not
+    /// yet supported" and exits, so nothing on that platform runs two bark
+    /// writers to serialise. This is a documented gap, not an oversight:
+    /// the day a Windows daemon is real, this is one of the things that
+    /// has to become real with it, and the unique temp name above already
+    /// removes the `ENOENT` half of the race regardless of platform.
+    ///
+    /// # Errors
+    /// Never — the signature matches the unix arm so the caller has one
+    /// shape.
+    #[cfg(not(unix))]
+    fn acquire(_path: &Path) -> std::io::Result<Self> {
+        Ok(Self {})
+    }
+}
+
+/// The lock file that guards `path`: its own name with `.lock` appended,
+/// so it sits in `$SHEP_HOME` next to the ring and inherits that
+/// directory's `0700`.
+///
+/// `cfg(unix)` alongside its only caller — [`RingLock::acquire`] is a
+/// documented no-op on Windows, so there is no lock file to name there.
+#[cfg(unix)]
+fn lock_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
         .unwrap_or_default();
-    tmp_name.push(".tmp");
-    let tmp_path = parent.join(&tmp_name);
-
-    if let Err(err) = write_lines(&tmp_path, lines) {
-        // Best-effort: a leftover `.tmp` costs a little disk, and the
-        // write's own error is the one that matters to the caller.
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(BarkError::Io(err));
-    }
-
-    std::fs::rename(&tmp_path, path).map_err(BarkError::Io)
-}
-
-/// Writes `lines` to `tmp_path`, one per line, and `fsync`s before
-/// returning.
-fn write_lines(tmp_path: &Path, lines: &[String]) -> std::io::Result<()> {
-    let mut file = create_ring_file(tmp_path)?;
-    for line in lines {
-        file.write_all(line.as_bytes())?;
-        file.write_all(b"\n")?;
-    }
-    file.sync_all()
-}
-
-/// Opens `tmp_path` for a fresh write at [`BARK_FILE_MODE`].
-///
-/// `DirBuilderExt`-style mode-at-creation (contrast a separate `chmod`
-/// pass): requesting the mode in the `open` call means there is no window
-/// where the file sits at whatever the process umask leaves it, the same
-/// TOCTOU `boot::create_dir_at_dir_mode`'s own doc explains for
-/// directories.
-#[cfg(unix)]
-fn create_ring_file(tmp_path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(BARK_FILE_MODE)
-        .open(tmp_path)
-}
-
-/// Opens `tmp_path` for a fresh write. Portable fallback: Windows has no
-/// unix permission-bit equivalent (same split `snapshot::write_atomic`'s
-/// own `write_atomic_is_owner_only_on_unix` test uses).
-#[cfg(not(unix))]
-fn create_ring_file(tmp_path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(tmp_path)
+    name.push(".lock");
+    path.parent().unwrap_or_else(|| Path::new(".")).join(name)
 }
 
 #[cfg(test)]
@@ -367,6 +463,113 @@ mod tests {
     fn no_file_yet_is_no_barks_rather_than_a_failure() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read(&dir.path().join("nothing.jsonl")).unwrap(), vec![]);
+    }
+
+    /// Env var naming the ring file the re-executed child should append
+    /// to. Its presence is also what tells the child it is a child.
+    #[cfg(unix)]
+    const CHILD_PATH_VAR: &str = "SHEP_BARK_RACE_PATH";
+    /// Env var carrying the child's tag, which it stamps into every
+    /// record's `subject` so the parent can tell the two writers apart.
+    #[cfg(unix)]
+    const CHILD_TAG_VAR: &str = "SHEP_BARK_RACE_TAG";
+    /// How many records each of the two writers appends. Large enough that
+    /// the two read-modify-rename sequences overlap many times over; the
+    /// reviewed reproduction of the lost-update bug used this count and
+    /// lost half the records.
+    #[cfg(unix)]
+    const RECORDS_PER_WRITER: u64 = 200;
+
+    /// Not a test — the child half of
+    /// [`two_writer_processes_do_not_lose_each_other_s_barks`], which
+    /// re-executes this binary with `--ignored --exact` to reach it. It is
+    /// `#[ignore]`d so a normal run never picks it up, and it asserts
+    /// nothing: its job is to hammer [`append`] from a second OS process,
+    /// and the parent does the judging.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child process of two_writer_processes_do_not_lose_each_other_s_barks"]
+    fn bark_race_child() {
+        let Ok(path) = std::env::var(CHILD_PATH_VAR) else {
+            panic!("{CHILD_PATH_VAR} unset — this test is only run as a child process");
+        };
+        let tag = std::env::var(CHILD_TAG_VAR).expect("child needs a tag");
+        let path = std::path::PathBuf::from(path);
+
+        for i in 0..RECORDS_PER_WRITER {
+            append(&path, &bark_for(&tag, i), DEFAULT_MAX_BYTES).expect("child append");
+        }
+    }
+
+    /// fails if two writers in two *processes* lose each other's records —
+    /// the whole reason this module lives in shep-core rather than in
+    /// shep-daemon. Two OS processes, not two threads: any in-process
+    /// mutex would serialise threads and prove nothing about the bug,
+    /// which is a read-modify-write across a `rename` with no lock between
+    /// address spaces.
+    ///
+    /// `cfg(unix)` because [`RingLock`] is a documented no-op on Windows —
+    /// shep's 0% tier, where no verb runs and nothing appends twice — so
+    /// asserting this there would assert a guarantee the code openly does
+    /// not make. If a Windows daemon ever becomes real, this gate coming
+    /// off is part of that work.
+    ///
+    /// Without the advisory lock this fails hard rather than flakily —
+    /// measured at roughly half the records surviving, plus one child
+    /// dying outright on `ENOENT` when the writers shared one temp name.
+    #[cfg(unix)]
+    #[test]
+    fn two_writer_processes_do_not_lose_each_other_s_barks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("barks.jsonl");
+        let exe = std::env::current_exe().expect("test binary path");
+
+        let children: Vec<_> = ["alpha", "beta"]
+            .iter()
+            .map(|tag| {
+                std::process::Command::new(&exe)
+                    .args(["--exact", "--ignored", "barks::tests::bark_race_child"])
+                    .env(CHILD_PATH_VAR, &path)
+                    .env(CHILD_TAG_VAR, tag)
+                    // Piped, not inherited: a passing run should not
+                    // interleave two child harnesses' output into this
+                    // one's, and a failing child's harness output is
+                    // exactly what the assertion below needs to show.
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("spawn writer")
+            })
+            .collect();
+
+        for child in children {
+            let out = child.wait_with_output().expect("wait for writer");
+            assert!(
+                out.status.success(),
+                "a writer process failed: {}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+
+        let barks = read(&path).unwrap();
+        for tag in ["alpha", "beta"] {
+            let mut seen: Vec<u64> = barks
+                .iter()
+                .filter(|b| b.subject == tag)
+                .map(|b| b.at_ms)
+                .collect();
+            seen.sort_unstable();
+            let expected: Vec<u64> = (0..RECORDS_PER_WRITER).collect();
+            assert_eq!(
+                seen, expected,
+                "{tag}'s records did not all survive the other writer"
+            );
+        }
+        assert_eq!(
+            barks.len() as u64,
+            2 * RECORDS_PER_WRITER,
+            "the ring holds records nobody wrote"
+        );
     }
 
     /// fails if the ring lands wider than owner-only. `Bark` carries no

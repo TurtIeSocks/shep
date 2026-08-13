@@ -1117,6 +1117,7 @@ dependencies = [
  "globset",
  "insta",
  "json5",
+ "nix 0.29.0",
  "pest",
  "quote 0.3.15",
  "regex",

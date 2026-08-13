@@ -23,12 +23,28 @@ chrono-tz.workspace = true
 # spec §4 names for the daemon's own watch filter, so a pattern `normalize`
 # accepts is one the filter can build (spec §4 "globs via globset").
 globset.workspace = true
+# `barks::append` stages the rewritten ring through a uniquely-named sibling temp
+# file and `persist`es it over the ledger — rename(2), the same shape
+# shep-daemon's muster-roll write uses. The uniqueness is the point: a single
+# deterministic `<path>.tmp` let one writer's rename consume another's staging
+# file, which is half the lost-update bug this dependency closes. Already a
+# normal dependency of shep-daemon, so this adds a crate to shep-core's tree and
+# none to the workspace's.
+tempfile.workspace = true
+
+# `barks::append` holds an advisory `flock` across its whole read-modify-rename so
+# two writer processes serialise instead of clobbering. nix is already a
+# dependency of shep-daemon and shep-cli and already carries the `fs` feature in
+# shep-daemon, so this adds no crate to the tree — only a feature. A `cfg(unix)`
+# table because nix does not build on Windows, the same split the other two
+# crates use; `barks.rs` carries the Windows story in code.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 insta.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
 futures-util.workspace = true
-tempfile.workspace = true
 
 # `cfg(any())` never matches any target, so nothing here is ever compiled into any real
 # build — but Cargo's resolver still walks these entries when computing the dependency

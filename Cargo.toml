@@ -112,7 +112,12 @@ lazy_static = { version = "1.0.2", default-features = false }
 # payload); 1.18.0 has a JSON-serialization regression with exactly that shape, fixed
 # in 1.18.1.
 insta = { version = "1.18.1", default-features = false, features = ["json"] }
-tempfile = { version = "3", default-features = false }
+# Floor 3.9: shep-core's `barks::write_ring` stages the ring through
+# `Builder::permissions`, so the temp file is created at 0600 in the `open` call
+# rather than chmod'ed afterwards. That builder method landed in tempfile 3.9.0 —
+# `-Z minimal-versions` picks 3.0.0 without this and fails with `no method named
+# permissions found for struct Builder`.
+tempfile = { version = "3.9", default-features = false }
 # Only shep-daemon (dev): property tests on the kill ladder / supervisor state machine.
 proptest = { version = "1", default-features = false, features = ["std"] }
 # For the event-bus subscription stream: `broadcast::Receiver` has no poll
