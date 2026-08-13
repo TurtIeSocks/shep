@@ -20,6 +20,8 @@
 //! `todo!()`, which would abort a supervised process with a panic and a
 //! confusing log line instead of a plain, restartable failure.
 
+pub mod http;
+
 use core::fmt;
 
 use shep_client::{Client, ConnectError, RequestError};
