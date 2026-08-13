@@ -76,10 +76,10 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 | 2 | wire #1 — `ProcessInfo` has no `#[non_exhaustive]` |
 | 3 | wire #2 — `ActionReply` name-only correlation; wire #3 — `SHEP_CHANNEL_VERSION` |
 | 4 | wire #4 — fixture gaps (PARTIAL); wire #5 — the ninefold `Vec<ProcessInfo>` |
-| 5 | platform #1 — the red linux/arm64 test; platform #3 — the never-compiled Linux branch |
-| 6 | tests #1 — CI never runs; tests #5 — the root-only privilege-drop test (the half that is a CI job) |
+| 5 | platform #1 — the red linux/arm64 test; platform #3 — the never-compiled Linux branch; platform (new) — the windows-gnu gate Phase 9 dropped |
+| 6 | tests #1 — the workflow is made correct; the trigger stays manual by Rin's standing decision, recorded in deferred.md with the cost. **Not closed.** tests #5 — the root-only privilege-drop test (the half that is a CI job) |
 | 7 | config #5 — IR-20 rationale gap across six error enums |
-| 8 | platform (new) — the false `ring` claim; docs (new) — README `that'll do` row and test count; config #3 — `reuse_port` dead and undocumented; platform #6 — macOS-anchored `sun_path` comment |
+| 8 | platform (new) — the false `ring` claim; docs (new) — README's test count, which decays every phase; config #3 — `reuse_port` dead and undocumented; platform #6 — macOS-anchored `sun_path` comment; platform #4 — the `openat2` comment's framing |
 | 9 | tests #6 — fails-only-by-hanging has no checklist line; and the ledger entries for every finding this phase deliberately does not build |
 
 ### Findings deliberately NOT built, and where they are recorded instead
@@ -112,14 +112,30 @@ than rediscovered as new drift. None of them becomes code in Phase 10.
   that would execute them, which is as far as this phase goes.
 - **platform #5 — `shep startup` init detection is `target_os`-only.** Doc and
   code already match; the input names the action item as a five-second manual
-  check, not a code change.
+  check, not a code change. This one gets **no new ledger entry**: it is
+  already recorded accurately at `docs/specs/deferred.md:91-101`, inside the
+  **openrc and BSD rc.d units** paragraph, which already says
+  `current_init` picks the renderer by compile target with no runtime check.
+  Task 9 writes nothing for it — re-recording it would be the second copy that
+  drifts.
 - **tests #3 — the `cli_e2e` 7-test correlation.** `needs-design`; twice
   investigated, twice exonerated. A fresh bounded measurement pass is worth
   doing, but it is a measurement, not an edit, and it belongs where its
   numbers can be recorded.
 - **tests #5, the other half — the root-only privilege-drop test.** The Docker
   CI job *is* built (Task 6). What is not built is any change to
-  `real_runner.rs:642` itself, which is correct as it stands.
+  `real_runner.rs:642` itself, which is correct as it stands — it asserts
+  `geteuid().is_root()` before anything else, so it fails loudly on a
+  non-root runner rather than passing vacuously. **No ledger entry**, because
+  there is nothing deferred: the test is right and the job that runs it ships
+  in Task 6.
+
+- **`bind_socket` reports an over-length `$SHEP_HOME` as a raw `ENAMETOOLONG`.**
+  Noticed while correcting the `sun_path` comments in Task 8 — `boot.rs`'s
+  `bind_socket` performs no length check of its own, so an operator with an
+  unusually deep `$SHEP_HOME` gets the OS error with no sentence naming the
+  limit or the variable. Low impact and a small fix, but not this phase's
+  subject; Task 8 corrects the comments and Task 9 records the gap.
 
 ---
 
@@ -127,13 +143,15 @@ than rediscovered as new drift. None of them becomes code in Phase 10.
 
 1. **Task 1 (`kill_signal`)** first: it is the only finding with ongoing user
    harm, and it touches two files nothing else in this phase touches.
-2. **Task 2 (`ProcessInfo`)** second, because it is the wide mechanical sweep —
-   ~50 call sites across four crates — and every later task that adds a test
-   constructing a `ProcessInfo` wants the builder to already exist.
+2. **Task 2 (`ProcessInfo`)** second, because it is the mechanical sweep —
+   26 struct literals across three crates — and every later task that adds a
+   test constructing a `ProcessInfo` wants the builder to already exist.
 3. **Task 3 (stamped actions)** and **Task 4 (fixtures)** are the wire pair;
    3 adds wire fields that 4's fixtures then pin, so 3 goes first.
 4. **Task 5 (platform)** and **Task 6 (CI)** are the verification pair; 5
-   establishes the local cross-check command that 6 encodes as a job.
+   establishes the two local cross-check commands, one of which (the Linux
+   leg) 6 also encodes as a job. Task 5 must land before Task 8, because Task
+   8's `ring` comment states what Task 5's windows-gnu run actually found.
 5. **Tasks 7–9** are comment, doc and ledger work with no code dependencies;
    they go last so they can describe what 1–6 actually shipped.
 
@@ -587,9 +605,17 @@ Then the full task gate.
 in three separate phases, and it is the only wire type without the attribute —
 Phase 9's brand-new `DogSource` got `#[non_exhaustive]` on sight, at
 `request.rs:172-175`, which is what makes this an oversight rather than an
-evolving norm. Construction sites went from ~35 to 58 during Phase 9. `lambs`
-is named in `deferred.md` as the next field, so the next sweep is scheduled,
-not hypothetical.
+evolving norm. There are 32 struct literals of it in the tree, 26 of them
+outside shep-core, and Phase 9 added several. `lambs` is named in
+`deferred.md` as the next field, so the next sweep is scheduled, not
+hypothetical.
+
+**Counting them is itself a trap, and the first draft of this plan fell in
+it.** A bare `grep "ProcessInfo {"` matches `fn f(..) -> ProcessInfo {` as
+readily as a literal, and matched `struct V1ProcessInfo {` too — 59 hits, of
+which 32 are literals. The filtered form is below and the table under it is
+labelled an estimate on purpose: the compiler's own E0639 list is the
+authority, and Step 2.1 generates it before a single site is touched.
 
 **What `#[non_exhaustive]` costs, precisely.** Outside shep-core it blocks two
 things and nothing else:
@@ -610,32 +636,56 @@ unchanged, and that is the mechanical replacement for every `..base` site.
 - **modify** `crates/shep-core/CHANGELOG.md`
 - **sweep** every out-of-crate construction site:
 
-| File | Sites |
-|---|---|
-| `crates/shep-cli/src/commands/bleats.rs` | 14 |
-| `crates/shep-daemon/src/supervisor.rs` | 5 |
-| `crates/shep-cli/src/output/rows.rs` | 5 |
-| `crates/shep-cli/src/dog/bark/rules.rs` | 4 |
-| `crates/shep-cli/src/dog/bark/mod.rs` | 3 |
-| `crates/shep-daemon/tests/daemon_e2e.rs` | 2 |
-| `crates/shep-daemon/src/snapshot.rs` | 2 |
-| `crates/shep-client/src/testing.rs` | 2 |
-| `crates/shep-cli/src/output/table.rs` | 2 |
-| `crates/shep-cli/src/dog/metrics/mod.rs` | 2 |
-| `crates/shep-cli/src/dog/metrics/exposition.rs` | 2 |
-| `crates/shep-daemon/src/{watch/mod,server,rpc,extras,dogs,cron,bus}.rs` | 1 each |
-| `crates/shep-cli/src/output/mod.rs` | 1 |
+**An estimate, measured 2026-08-13 at `b7c466b`, not the worklist.** The
+worklist is Step 2.1's E0639 output. This table exists so an implementer can
+tell "the sweep is nearly done" from "the sweep has barely started", and so a
+file that produces no error is recognised as expected rather than as a missed
+one.
 
-In-crate sites (`request.rs` 5, `events.rs` 2, `frame.rs` 1) need no change —
+| File | Literals |
+|---|---|
+| `crates/shep-cli/src/commands/bleats.rs` | 13 |
+| `crates/shep-cli/src/output/rows.rs` | 2 |
+| `crates/shep-cli/src/output/table.rs` | 1 |
+| `crates/shep-cli/src/dog/bark/mod.rs` | 1 |
+| `crates/shep-cli/src/dog/bark/rules.rs` | 1 |
+| `crates/shep-cli/src/dog/metrics/mod.rs` | 1 |
+| `crates/shep-cli/src/dog/metrics/exposition.rs` | 1 |
+| `crates/shep-daemon/src/supervisor.rs` | 1 (`to_info`, `:4105`) |
+| `crates/shep-daemon/src/snapshot.rs` | 1 |
+| `crates/shep-daemon/src/server.rs` | 1 |
+| `crates/shep-daemon/src/dogs.rs` | 1 |
+| `crates/shep-daemon/src/bus.rs` | 1 |
+| `crates/shep-client/src/testing.rs` | 1 |
+
+26 out-of-crate literals. Files an earlier count wrongly listed, and which
+must produce **no** E0639 at all: `crates/shep-daemon/tests/daemon_e2e.rs`
+(both hits are `-> ProcessInfo {` signatures), `crates/shep-daemon/src/watch/mod.rs`,
+`rpc.rs`, `extras.rs`, `cron.rs`, and `crates/shep-cli/src/output/mod.rs`
+(zero literals each). If the compiler names one of those, read the site before
+editing it — it means something changed since this table was measured.
+
+In-crate sites (`request.rs` 3, `events.rs` 2, `frame.rs` 1) need no change —
 the literal is still legal inside shep-core, and `sample_info()` in
-`request.rs:562` should stay a literal so the builder cannot mask a field the
+`request.rs:563` should stay a literal so the builder cannot mask a field the
 struct grew.
 
-The authoritative list is regenerated, not trusted:
+The authoritative list is regenerated, not trusted. Both `grep -v` filters are
+load-bearing — the first drops the struct's own declaration, the second drops
+every `-> ProcessInfo {` return-type signature, which is what inflated the
+first draft's count from 32 to 59:
 
 ```bash
-grep -rn "ProcessInfo {" --include="*.rs" . | grep -v "pub struct ProcessInfo {"
+grep -rn "ProcessInfo {" --include="*.rs" . \
+  | grep -v "pub struct ProcessInfo {" \
+  | grep -v -- "-> ProcessInfo {"
 ```
+
+Even that leaves two false positives to eyeball rather than edit:
+`request.rs:923`'s `struct V1ProcessInfo {` (a different type, in the v1
+deserialization test) and `table.rs:315`'s
+`fn info_with_name(..) -> shep_core::protocol::ProcessInfo {`, whose
+fully-qualified return type slips past the second filter.
 
 ### Interfaces this task produces
 
@@ -698,8 +748,15 @@ non-exhaustive struct using struct expression"*, once per out-of-crate site.
 That error list **is** the sweep's worklist. Save it:
 
 ```bash
-cargo check --workspace --all-targets --all-features 2>&1 | grep -E "^error\[E063[19]\]|^  --> " > /tmp/e0639.txt
+cargo check --workspace --all-targets --all-features 2>&1 \
+  | grep -E "^error\[E063[19]\]|^  --> " > /tmp/e0639.txt
+wc -l /tmp/e0639.txt
 ```
+
+Expect roughly 52 lines — 26 error headers and 26 `-->` locations, matching
+the estimate table above. A count far below that means the check stopped at
+the first crate rather than reporting the workspace; a count far above it
+means the table is stale and the table is what is wrong, not the compiler.
 
 If any site instead reports `E0638` (*"non-exhaustive structs … cannot be
 matched against without a wildcard"*), that is an exhaustive pattern; fix it by
@@ -903,8 +960,30 @@ fn every_setter_writes_its_own_field_and_no_other() {
     // set. That is the point of comparing against it rather than against
     // another builder call.
     assert_eq!(built, sample_info());
+
+    // `dog` is the one field the comparison above cannot speak for, and it
+    // is the field the whole dogs subsystem reads. `sample_info()`'s `dog`
+    // is `None`, which is also the builder's default, so a `dog` setter with
+    // an EMPTY BODY passes the assert_eq! above and passes it for the wrong
+    // reason. `sample_info()` cannot be changed to `Some(..)` to fix that —
+    // it feeds `reply_wire_snapshots` and `bus_event_wire_snapshots`, so
+    // altering it moves pinned bytes. So the field gets its own line, with a
+    // value nothing defaults to.
+    assert_eq!(
+        ProcessInfo::builder(1, "metrics", ProcStatus::Online)
+            .dog(Some(DogSource::BuiltIn))
+            .build()
+            .dog,
+        Some(DogSource::BuiltIn),
+        "an empty `dog` setter body is invisible to the comparison above"
+    );
 }
 ```
+
+`DogSource` is already in scope in this module (`use super::*;`), so no new
+import is needed. If it is not, import it rather than reaching for a different
+value — `BuiltIn` is the variant with no fields and it is what a real dog row
+carries.
 
 Run:
 
@@ -965,10 +1044,12 @@ cargo test -p shep-cli --bins --all-features
 cargo test -p shep-daemon --test daemon_e2e --all-features
 ```
 
-`crates/shep-daemon/src/supervisor.rs`'s five sites are the ones that matter
-for review: they are the daemon's real snapshot path, and every field there
-comes from a `SheepSlot`. Port them field-for-field; a setter left off is a
-column silently blanked in `shep flock`.
+`crates/shep-daemon/src/supervisor.rs` has exactly **one** site, `to_info` at
+`:4105`, and it is the one that matters for review: it is the daemon's real
+snapshot path, every field there comes from a `SheepSlot`, and every row an
+operator ever sees in `shep flock` or `shep describe` comes out of it. Port it
+field-for-field; a setter left off is a column silently blanked for every
+sheep at once. Everything else in the sweep is a test fixture.
 
 ### Step 2.5 — Verify the wire did not move
 
@@ -983,10 +1064,14 @@ no serialized byte. If insta reports a pending snapshot here, something else in
 the sweep changed a value — find it, do not accept it.
 
 ```bash
-ls crates/shep-core/src/protocol/snapshots/*.snap.new
+find crates/shep-core/src/protocol/snapshots -name '*.snap.new' | wc -l
 ```
 
-must print nothing.
+must print `0`. Written as `find`, not `ls <glob>`: under zsh's default
+`nomatch`, the success case of `ls .../*.snap.new` is a shell error
+("no matches found") on stderr with a non-zero status, so the check reads as
+broken exactly when it passes. `find` prints the count either way and `0` is
+unambiguous.
 
 ### Step 2.6 — MUTATION
 
@@ -1006,42 +1091,72 @@ Run `cargo test -p shep-core --lib --all-features`.
 two things that were both built the wrong way, and the `sample_info()` literal
 anchor has been lost.
 
-Second mutation: delete `#[non_exhaustive]` from `ProcessInfo` and run
-`cargo check --workspace --all-targets --all-features`. It must stay GREEN —
-that is the correct result, and it is the reason this task also needs its own
-guard. Add one:
+Second mutation, on the field the comparison cannot speak for: blank the
+`dog` setter's body —
 
 ```rust
-/// fails if `ProcessInfo` loses `#[non_exhaustive]`. There is no way to
-/// observe the attribute from inside the defining crate — a literal is legal
-/// here either way — so this compiles a struct-update expression the way an
-/// out-of-crate caller would have to write it and asserts the builder is what
-/// answers instead. It is a placeholder for a property the compiler enforces
-/// only across a crate boundary; the real guard is `tests/compile_fail`.
+    pub fn dog(mut self, dog: Option<DogSource>) -> Self {
+        // self.info.dog = dog;
+        self
+    }
 ```
 
-That comment is honest about what a same-crate test can and cannot prove, and
-it names the real guard, which is the compile-fail file IR-38 already permits.
-Add it:
+— and run `cargo test -p shep-core --lib --all-features`.
+`every_setter_writes_its_own_field_and_no_other` **must go red on its second
+assertion**, the `dog(Some(DogSource::BuiltIn))` line, and its
+`assert_eq!(built, sample_info())` must still pass. That split is the whole
+point: an empty `dog` body is invisible to the fixture comparison, because
+`sample_info().dog` and the builder's default are both `None`. If the test
+goes red on the first assertion instead, the mutation was applied to the
+wrong setter. If it stays green entirely, Step 2.3's second assertion was not
+written.
 
-**create** `crates/shep-core/tests/process_info_is_non_exhaustive.rs`:
+Third mutation: delete `#[non_exhaustive]` from `ProcessInfo` and run
+`cargo check --workspace --all-targets --all-features`. It must stay GREEN.
+That is the correct result and it is not a defect in the test suite — it is a
+property of the attribute. **No test in this repository guards
+`#[non_exhaustive]` on `ProcessInfo`, and this task does not add one.** The
+attribute has no observable effect inside the defining crate, so no
+`#[cfg(test)]` module can see it, and the only thing that would catch its
+removal is a compile-fail harness — `trybuild` as a dev-dependency, with a
+`.rs`/`.stderr` pair asserting E0639. That is a new dependency and a new test
+tier for a single attribute, and it is not worth it here. Say so in the
+commit message rather than implying a guard exists.
+
+What this task DOES add is the positive half — proof, from outside the crate,
+that the builder is a complete replacement for the literal it just outlawed.
+That is a real property and it is worth a file, but the file must be named and
+documented for what it proves:
+
+**create** `crates/shep-core/tests/process_info_builder_from_outside_the_crate.rs`:
 
 ```rust
-//! Proves `ProcessInfo` cannot be built by literal from outside shep-core.
+//! Proves [`ProcessInfo::builder`] reaches every field from outside
+//! shep-core, and that field assignment still works across the boundary.
 //!
-//! IR-38 allows one compile-only file per crate proving a property that needs
-//! a real crate boundary to observe. `#[non_exhaustive]` is exactly that: it
-//! is invisible inside the defining crate, so no `#[cfg(test)]` module can
-//! test it. This file is a *positive* test — it proves the builder is a
-//! complete replacement — and the negative half (that the literal is refused)
-//! is what the attribute's own semantics guarantee and what E0639 reported
-//! once, during Task 2 of Phase 10.
+//! It does **not** prove `ProcessInfo` is `#[non_exhaustive]`, and the
+//! filename deliberately does not claim otherwise. That attribute is
+//! invisible inside the defining crate and this file's `assert`s run in a
+//! separate crate but still only observe what compiles here — nothing in the
+//! repository guards the attribute itself. The only thing that would is a
+//! `trybuild` compile-fail pair asserting E0639, which Phase 10 declined as
+//! a whole new test tier for one attribute.
+//!
+//! This file is a deliberate **exception** to IR-38, not an application of
+//! it. IR-38 reads: "`tests/` dir = at most one compile-only file per crate
+//! proving an external crate can implement the public trait (`todo!()`
+//! bodies fine). Everything behavioral is co-located `#[cfg(test)]`." This
+//! file has assertions and is therefore behavioral, so IR-38 does not permit
+//! it. It earns the exception on the same grounds IR-38's own carve-out
+//! rests on — the property needs a real crate boundary to observe, and
+//! shep-core's `#[cfg(test)]` modules are inside the boundary. It is
+//! shep-core's one `tests/` file and must stay the only one.
 
 // `ProcStatus` lives at `shep_core::status` and is re-exported through the
 // prelude, NOT through `protocol` — `protocol/mod.rs`'s `pub use` list does
 // not name it. Two imports, deliberately, rather than one wrong one.
 use shep_core::prelude::ProcStatus;
-use shep_core::protocol::ProcessInfo;
+use shep_core::protocol::{DogSource, ProcessInfo};
 
 #[test]
 fn the_builder_reaches_every_field_from_outside_the_crate() {
@@ -1054,8 +1169,24 @@ fn the_builder_reaches_every_field_from_outside_the_crate() {
         .err_file(Some("e".to_string()))
         .cpu_percent(Some(1.0))
         .memory_bytes(Some(1))
-        .dog(None)
+        .dog(Some(DogSource::BuiltIn))
         .build();
+
+    // Every field, read back across the boundary. `dog` is set to a real
+    // variant rather than `None` for the same reason Step 2.3's second
+    // assertion exists: `None` is the default, so it proves nothing.
+    assert_eq!(info.id, 1);
+    assert_eq!(info.name, "web");
+    assert_eq!(info.status, ProcStatus::Online);
+    assert_eq!(info.pid, Some(1));
+    assert_eq!(info.restarts, 1);
+    assert_eq!(info.uptime_ms, 1);
+    assert_eq!(info.fold.as_deref(), Some("f"));
+    assert_eq!(info.out_file.as_deref(), Some("o"));
+    assert_eq!(info.err_file.as_deref(), Some("e"));
+    assert_eq!(info.cpu_percent, Some(1.0));
+    assert_eq!(info.memory_bytes, Some(1));
+    assert_eq!(info.dog, Some(DogSource::BuiltIn));
 
     // Field ASSIGNMENT is still legal across the boundary — the attribute
     // blocks construction, not mutation, and several call sites in shep-cli
@@ -1067,8 +1198,15 @@ fn the_builder_reaches_every_field_from_outside_the_crate() {
 }
 ```
 
-Run `cargo test -p shep-core --test process_info_is_non_exhaustive`. This adds
-a 16th result line; note it in the phase's count.
+Run `cargo test -p shep-core --test process_info_builder_from_outside_the_crate`.
+This adds a 16th result line; note it in the phase's count.
+
+**Fourth mutation, so that file is not itself a check that cannot fail.**
+Blank the `pid` setter's body the way the `dog` mutation blanked its own, and
+re-run that one test binary. `the_builder_reaches_every_field_from_outside_the_crate`
+must go red on `assert_eq!(info.pid, Some(1))`. Before the field-by-field
+asserts above were added, this file built a `ProcessInfo` and then checked
+only that assignment worked — every setter in it could have been empty.
 
 ### Step 2.7 — CHANGELOG and gate
 
@@ -1122,6 +1260,11 @@ predates stamping" without probing.
 - **modify** `crates/shep-daemon/src/tokio_runner.rs` — the env var
 - **modify** `docs/shepherd-channel.md` — the correlation section and both
   wire tables
+- **modify** `docs/specs/shep-v1.md` — §7's message enumeration (line 209-215)
+  and §9's `params` example (line 339). This task changes the fd-3 wire an app
+  receives, and the spec is the project's behaviour contract — it is what the
+  next audit re-derives against, so leaving it asserting the old shape is how
+  a correct change gets re-reported as drift.
 - **modify** `crates/shep-daemon/CHANGELOG.md`
 
 ### Interfaces this task produces
@@ -1636,10 +1779,46 @@ already means the sheep here:
                     }
 ```
 
-Fix the remaining construction sites the compiler names — `supervisor.rs:8761`
-and any other test building a `ChildMessage::ActionReply`. Give at least one of
+**The sweep is wider than `ChildMessage::ActionReply`.** `id: u64` is
+unconditional on `ShepherdMessage::Action`, so every construction of that
+variant stops compiling too. Six sites, all of them named here rather than
+left to the compiler, because two of them require choosing a number and a
+number chosen by trying values until the test goes green is exactly the
+failure this phase exists to stop:
+
+| Site | What it is | What to write |
+|---|---|---|
+| `crates/shep-daemon/src/supervisor.rs:3860` | `arm_action`'s real dispatch | `id: stamp` (above) |
+| `crates/shep-daemon/src/supervisor.rs:8753` | `assert_eq!(sent_action(..), ShepherdMessage::Action { .. })` in the round-trip test | `id: 0` |
+| `crates/shep-daemon/src/supervisor.rs:8814` | the same assert in the timeout test | `id: 0` |
+| `crates/shep-daemon/src/fake.rs:844` | the fake's own channel round-trip | any value; `id: 0` |
+| `crates/shep-daemon/tests/real_runner.rs:477` | `channel_round_trip`'s send | `id: u64::from(round)` |
+| `crates/shep-daemon/src/channel.rs:141`, `:169` | the two serde fixtures | per Step 3.2 |
+
+**Why `0`, and why it is pinned rather than discovered.** `Actor.next_action_stamp`
+is initialised to `0` (`supervisor.rs:845`) and `arm_action` reads it and then
+increments (`:3855-3856`), so the first dispatch of any freshly-built actor
+carries stamp `0`. Both supervisor tests build their own actor and trigger
+exactly once, so `0` is the first and only stamp either of them ever sees.
+
+Write the literal deliberately and say so in a comment at both sites: it is
+what proves the daemon stamps at all, and a `..` or a wildcard there would
+turn the assert back into "an action of this name was sent", which is what it
+asserted before this task. If a later change makes a test trigger twice, the
+second is `id: 1` — the counter is per-actor and never resets.
+
+`real_runner.rs:477` is the one site that should NOT hardcode a constant:
+`channel_round_trip` is called once per round and the value is only carried
+through the fake's pipe, so deriving it from `round` keeps each round's
+message distinct, which is what that helper is for.
+
+Then the `ChildMessage::ActionReply` sites the compiler names —
+`supervisor.rs:8761` and `real_runner.rs:533`, `:544`. Give at least one of
 them `id: Some(..)` so the stamped path is exercised end to end through the
-actor, not only in the `ActionWaits` unit tests.
+actor, not only in the `ActionWaits` unit tests. `supervisor.rs:8761` is the
+right one: it is the round-trip test whose action is asserted at `:8753` as
+`id: 0`, so `id: Some(0)` there makes the echo a real round trip rather than
+two unrelated literals.
 
 ### Step 3.5 — GREEN: the env var
 
@@ -1668,8 +1847,8 @@ is for:
 /// the `Command`, inherited across the exec, readable by a plain shell.
 ///
 /// Bounded by `await_file_contents`'s own `LOG_WRITE_DEADLINE` rather than by
-/// an unbounded read, per IR-46: a version that never arrives has to fail
-/// here in seconds, not hang until the harness gives up on the whole binary.
+/// an unbounded read: a version that never arrives has to fail here in
+/// seconds, not hang until the harness gives up on the whole binary.
 #[tokio::test]
 async fn a_child_with_a_channel_is_told_which_channel_it_is() {
     let dir = tempfile::tempdir().unwrap();
@@ -1704,6 +1883,15 @@ Check `await_file_contents`'s exact signature and trailing-newline convention
 at `real_runner.rs:70` before writing the expected strings — it is the
 existing helper and it already carries the bound; do not hand-roll a second
 one.
+
+The bound is the point, and it is the rule Task 9 writes down as IR-46. The
+citation is deliberately **absent** from the comment above: `docs/idiomatic-rust.md`
+ends at IR-45 today and IR-46 does not exist until Task 9, which runs last.
+A shipped comment citing a rule number that resolves to nothing for six tasks
+is a broken reference, and Task 7 is editing IR-20 in the same phase, so a
+renumber would leave it silently wrong rather than merely early. Task 9's own
+Step 9.3 walks back over these two tests and confirms they satisfy the rule
+once it exists.
 
 ### Step 3.6 — GREEN: the app-author contract
 
@@ -1760,6 +1948,50 @@ And in "Summary for the impatient", after "Reply to every `action` message":
 ```markdown
 - Echo the `id` from the action on your reply — one field, and it is what
   makes a slow action's answer land on the right trigger.
+```
+
+**Then the spec, which is the contract the next audit re-derives against.**
+`docs/specs/shep-v1.md` asserts the old shape in two places and both become
+false the moment this task lands.
+
+§7's message enumeration (lines 209-215) currently reads *"daemon→child
+`{"kind":"shutdown"}`, `{"kind":"action",...}`. Fd number exported as
+`SHEP_CHANNEL_FD`. An `action` carries `name`, and `params` when the operator
+supplied any"*, and its pointer to `docs/shepherd-channel.md` advertises *"how
+a reply is matched to its trigger with no correlation id"*. Replace the
+`SHEP_CHANNEL_FD` sentence onward with:
+
+```markdown
+  `{"kind":"action",...}`. Fd number exported as `SHEP_CHANNEL_FD`, wire
+  version as `SHEP_CHANNEL_VERSION` (`1`). An `action` carries `name` and
+  `id`, and `params` when the operator supplied any — the `params` key is
+  absent otherwise, which is what keeps it additive (§9). `id` is the
+  dispatch's correlation token; an app that echoes it back on its
+  `action-reply` as `id` gets its answer matched to that exact request, and
+  an app that does not is matched by action name and by order, exactly as
+  every app written before the field existed. Full contract for an app author
+  writing to this wire, including the parts this bullet has no room for (why
+  an action should reply even to a name it does not recognize, what the
+  name-and-order fallback costs when two triggers of one action overlap, the
+  `params` quoting gap): [`docs/shepherd-channel.md`](../shepherd-channel.md).
+```
+
+The "no correlation id" clause is the half that must not survive — it is the
+sentence Task 3 exists to make false.
+
+§9's `params` example (line 339) reads *"so `{"kind":"action","name":"gc"}` is
+still exactly what an argument-free action looks like on the wire"*. It is now
+`{"kind":"action","name":"gc","id":7}`. Correct the example, and leave the
+surrounding argument about `params` being additive untouched — that argument
+is still exactly right, and `id` is a second instance of it rather than a
+counter-example:
+
+```markdown
+Additive is what makes it survivable at all: `params` is omitted from the
+serialized message when there are none, so `{"kind":"action","name":"gc","id":7}`
+is still exactly what an argument-free action looks like on the wire, a
+message with no `params` key reads back as none, and an app that ignores the
+field goes on working.
 ```
 
 ### Step 3.7 — MUTATION
@@ -1877,10 +2109,19 @@ selector, which is what the pinning is for.
 
 ### Step 4.2 — RED: the six unpinned `ProcessEventKind` variants
 
-In `events.rs`'s `bus_event_wire_snapshots`, after the existing
-`BusEvent::Process { event: ProcessEventKind::Exit, … }` row, append one row
-per unpinned kind. To keep the snapshot readable and the diff meaningful, hoist
-the shared `info` into a local built with Task 2's builder:
+In `events.rs`'s `bus_event_wire_snapshots`, append one row per unpinned kind
+**to the end of the `events` vec, after the `Dropped` row** — not after the
+`Exit` row it shares a variant with. The list is a flat
+`vec![Exit, LogOut, Dropped]` and insta serializes it positionally, so an
+insertion in the middle shifts `LogOut` and `Dropped` down and the diff stops
+being a pure addition, which is Step 4.3's own acceptance guard. Grouping by
+variant is not worth losing a readable diff over.
+
+The binding at `events.rs:143` is `let events = vec![...]`. It becomes
+`let mut events = vec![...]` so `events.extend(lifecycle)` compiles.
+
+To keep the snapshot readable and the diff meaningful, hoist the shared `info`
+into a local built with Task 2's builder:
 
 ```rust
         // Every lifecycle kind a `process.*` subscriber can receive, over one
@@ -1913,9 +2154,16 @@ the shared `info` into a local built with Task 2's builder:
         });
 ```
 
-and extend the `events` vec with `lifecycle`. Keep the existing `Exit`,
-`LogOut` and `Dropped` rows exactly where they are so the existing snapshot's
-first three entries do not move — a reordered snapshot is a diff nobody reads.
+then, after the `vec!` literal and before the `assert_json_snapshot!` line:
+
+```rust
+        events.extend(lifecycle);
+```
+
+Keep the existing `Exit`, `LogOut` and `Dropped` rows exactly where they are,
+in that order, so the existing snapshot's first three entries do not move — a
+reordered snapshot is a diff nobody reads, and Step 4.3 is written to fail if
+one of them changes.
 
 ### Step 4.3 — RED: the eleven unpinned `Response` variants
 
@@ -2051,10 +2299,11 @@ Full task gate.
 
 ---
 
-## Task 5 — the red linux/arm64 test, and the never-compiled Linux branch
+## Task 5 — the red linux/arm64 test, and two cross-compile gates
 
-**Closes:** platform.md #1 (Important, one-line) and platform.md #3
-(Important, one-line).
+**Closes:** platform.md #1 (Important, one-line), platform.md #3 (Important,
+one-line), and the new platform finding — the windows-gnu gate every plan
+through Phase 6 carried and Phase 9 silently dropped.
 
 **#1, precisely.** `a_daemon_that_closes_without_answering_is_not_a_silent_success`
 (`crates/shep-client/src/connection.rs:258`) asserts
@@ -2074,11 +2323,37 @@ what a systemd `Type=notify` unit depends on for readiness reporting — the uni
 `shep startup` itself installs on Linux. The fix is not a code change; it is
 running a compiler at it, and writing the command down so it stays run.
 
+### The third finding, and why it is settled rather than open
+
+Phases 3, 4, 5 and 6 all carried
+`cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu`
+in their gate lists (`docs/writing-plans/plans/2026-08-08-shep-phase3-cli.md:75`
+and three siblings). Phases 7, 8 and 9 carry it nowhere — `grep -rn
+"x86_64-pc-windows-gnu" docs/writing-plans/plans/` returns nothing for any of
+the three. It was dropped without a sentence saying so, and it never reached
+`CLAUDE.md`'s own gate list, which is why nothing noticed.
+
+**It was measured on 2026-08-13, at `b7c466b`, and it passes.** Run from a
+separate `CARGO_TARGET_DIR` so the host cache was untouched:
+
+```
+cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu
+EXIT=0    Finished `dev` profile ... in 8.42s
+```
+
+So this is not an open question for Rin and this plan does not put one to her.
+It is a check that was dropped, still works, and goes back. What it needs is a
+stated prerequisite: `ring`'s build script runs `cc` for the target, so the
+cross-compile needs a C toolchain for `x86_64-pc-windows-gnu`. On this machine
+that is `x86_64-w64-mingw32-gcc`, present at `/opt/homebrew/bin` since Phase
+9's final review installed `mingw-w64`. A host without it cannot run the gate,
+and that is the most likely reason it quietly stopped being carried.
+
 ### Files
 
 - **modify** `crates/shep-client/src/connection.rs` — the assertion and its
   comment
-- **modify** `CLAUDE.md` — one new gate command under "The task gate"
+- **modify** `CLAUDE.md` — two new cross-check commands after "The task gate"
 - **modify** `crates/shep-client/CHANGELOG.md`
 
 ### Step 5.1 — RED: state the outcome, not the variant
@@ -2181,8 +2456,10 @@ uncompiled, which is the finding.
 
 Three possible outcomes, and each has a defined response:
 
-1. **Clean.** Record the command in `CLAUDE.md` and in the commit message,
-   with the date. `send_to_abstract` has now been compiled.
+1. **Clean.** Record the result in the commit message with the date;
+   `send_to_abstract` has now been compiled. The `CLAUDE.md` entry itself is
+   written once, in Step 5.4, so both cross-checks land in one block rather
+   than two edits to the same section.
 2. **A compile error inside `notify.rs`.** That is the finding paying off; fix
    it, and say in the commit that the branch had never been compiled and what
    was wrong.
@@ -2191,25 +2468,91 @@ Three possible outcomes, and each has a defined response:
    through the ubuntu leg of Task 6's workflow — noting in `CLAUDE.md` that
    this gate is CI-only and why.
 
-Add to `CLAUDE.md`'s task-gate section:
+### Step 5.4 — GREEN: restore the windows-gnu gate
+
+The check itself, run exactly as Phases 3 through 6 ran it:
+
+```bash
+cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu
+```
+
+Prerequisites, both already satisfied on this machine — verify rather than
+assume, because a missing one is the difference between "passes" and "cannot
+be run":
+
+```bash
+rustup target list --installed | grep x86_64-pc-windows-gnu
+command -v x86_64-w64-mingw32-gcc
+```
+
+The first must print the target; the second must print a path. If the second
+prints nothing, install it (`brew install mingw-w64`) rather than skipping the
+gate — skipping it silently is what put this task here.
+
+**Expected: `EXIT=0`, `Finished \`dev\` profile`.** That is what the
+2026-08-13 measurement returned in 8.42s from a cold, separate target dir. A
+warm host cache is not reused for a different target triple, so budget a
+minute or two the first time and seconds afterwards.
+
+**`cargo check`, not `clippy -D warnings`, and this is a decision rather than
+an omission.** The same run emits **51 warnings in `shep-daemon`'s lib** on
+this target, all of them dead-code: `crates/shep-daemon/src/lib.rs` gates
+`boot`, `sys`, `server` and `tokio_runner` off on Windows (their `nix` and
+`command-fds` dependencies are `[target.'cfg(unix)'.dependencies]`), so
+everything those modules were the only consumer or producer of becomes
+unreachable — `BUS_CAPACITY`, `spawn_forwarder`, `PollingEnforcer`,
+`SheepStats`, and `RpcContext`'s `daemon_version` and `pid` fields among them.
+None of those is a defect. They are the mechanical consequence of Windows
+being 0% implemented on purpose (`deferred.md`), and they would all disappear
+the day it is not.
+
+So the gate's question is **"does the tree still compile for a target nobody
+has implemented yet"**, and `cargo check` asks exactly that. Spelling it
+`clippy … -D warnings` would ask a different question, get 51 answers, and the
+only way to make it green would be to `#[allow(dead_code)]` code that is not
+dead on any platform we ship — degrading the host clippy gate to buy nothing.
+Say this in the `CLAUDE.md` entry, not just here, so the next person to notice
+the asymmetry finds the reason instead of "fixing" it.
+
+Add both cross-checks to `CLAUDE.md`, in their own section immediately after
+"The task gate":
 
 ```markdown
-### The Linux cross-check — run once per phase, not per task
+### The two cross-checks — run once per phase, not per task
 
 ```bash
 cargo check -p shep-daemon --all-targets --all-features --target x86_64-unknown-linux-gnu
+cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu
 ```
 
-`notify.rs`'s abstract-namespace branch and its test are both
+One cargo command at a time, as everywhere else, and give them their own
+`CARGO_TARGET_DIR` if you want the host cache left alone.
+
+**Linux.** `notify.rs`'s abstract-namespace branch and its test are both
 `#[cfg(target_os = "linux")]`, so a macOS `cargo test` compiles neither. That
 branch is what a systemd `Type=notify` unit — the unit `shep startup` installs
 — depends on for readiness reporting, and it went five phases without a
 compiler ever reading it (platform audit #3). `--all-targets` is what reaches
 the test. shep-daemon has no `ring` in its tree, so this needs no cross C
-toolchain; `-p shep-cli` would, and is not part of this gate.
+toolchain; `-p shep-cli` would, and is not in this gate.
+
+**Windows.** Every plan through Phase 6 carried this one; Phases 7-9 dropped
+it without saying so, and it never reached this file, which is why nothing
+noticed for three phases. Restored in Phase 10 after being measured green
+(`EXIT=0`, 8.42s, 2026-08-13). It needs a C toolchain for the target —
+`brew install mingw-w64` — because `ring`'s build script runs `cc`; a host
+without `x86_64-w64-mingw32-gcc` cannot run it, and that is presumably how it
+came to be dropped.
+
+`cargo check`, deliberately, not `clippy -- -D warnings`: shep-daemon's
+`boot`/`sys`/`server`/`tokio_runner` are `cfg(unix)`-gated, so on Windows 51
+dead-code warnings fall out of code that is not dead anywhere we ship. The
+question this gate asks is whether the tree still compiles for a target nobody
+has implemented yet. Silencing those warnings would mean `#[allow(dead_code)]`
+on live code.
 ```
 
-### Step 5.4 — MUTATION
+### Step 5.5 — MUTATION
 
 In `crates/shep-daemon/src/notify.rs`, inside `send_to_abstract`, change
 
@@ -2244,14 +2587,43 @@ Run `cargo test -p shep-client --lib --all-features`. The test must go red with
 `got HandshakeTimeout { .. }`. This is the check that the widened `matches!`
 did not widen into unfailability.
 
-### Step 5.5 — CHANGELOG and gate
+**For the windows-gnu gate**, whose whole risk is that a restored check might
+be reaching cached artifacts or a subset of the workspace rather than the
+whole tree. Add one line at the top of `crates/shep-core/src/status.rs`:
+
+```rust
+use std::os::unix::ffi::OsStrExt as _;
+```
+
+Run the host gate first — `cargo check --workspace --all-targets
+--all-features` — and confirm it stays **green**: `std::os::unix` exists on
+macOS, so a mutation that reddened both would prove nothing about the target.
+Then run
+
+```bash
+cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu
+```
+
+It **must** go red with `error[E0433]`/`E0432` on `std::os::unix` — the module
+does not exist on Windows. That is the pair that proves the gate compiles the
+whole workspace for the target rather than replaying a host cache. Revert.
+
+If it stays green, the most likely cause is a stale `CARGO_TARGET_DIR` or a
+`--target` that was silently ignored; do not proceed on a gate that cannot
+fail.
+
+### Step 5.6 — CHANGELOG and gate
 
 `crates/shep-client/CHANGELOG.md`, under `Fixes`: "The handshake-close test
 asserts the unreachable outcome rather than one `ConnectError` variant, so it
 passes on Linux, where the peer's close surfaces on the write rather than the
 read."
 
-Full task gate, plus the Linux cross-check.
+Full task gate, plus both cross-checks. The commit message says three things
+plainly: that the linux/arm64 fix is written but not executed on linux/arm64
+(Task 6's matrix leg is written and not enabled), that the windows-gnu gate
+passed at `EXIT=0` on a host with mingw-w64 installed, and that it is back in
+`CLAUDE.md` after three phases out.
 
 ---
 
@@ -2335,6 +2707,38 @@ Leave `minimal-versions`, `musl`, `features`, `coverage`, `docs`, `typos` and
 `features` job deliberately runs `--no-default-features` and `--all-features`
 as its own ladder.
 
+**Then the file's own cost claim, which this task would otherwise leave
+stale.** The header comment (lines 2-5) says *"one run of this file is 15 jobs
+— six of them on those two platforms"*. That is wrong twice. It is wrong
+**today**: counting the matrices out, the file is 16 jobs (`lint` 1, `docs` 1,
+`typos` 1, `test` 3×2=6, `minimal-versions` 1, `musl` 1, `features` 2,
+`coverage` 1, `bench` 2), of which 5 are macOS or Windows (`test` gives 2 and
+2, `features` gives 1). Do not "fix" 15 to 19 by adding four — recount from
+the file. And it is wrong **after this task**: the arm leg adds 2 to `test`
+and `privileged` adds 1, so the file becomes 19 jobs, 5 of them still on the
+billed platforms.
+
+19 is the same number Step 6.3 writes into `deferred.md`. Those two numbers
+are one fact recorded in two files and they must be edited together — a task
+whose acceptance check is "the file is correct" cannot ship a workflow whose
+first sentence disagrees with the ledger entry the same task writes.
+
+```yaml
+name: test
+# Manual-only while the repository is private. Actions minutes on a private
+# repo bill macOS at 10x and Windows at 2x, and one run of this file is 19
+# jobs — five of them on those two platforms (two macOS and two Windows in
+# `test`, one Windows in `features`). The full arithmetic, and what turning
+# the triggers on would cost, is in docs/specs/deferred.md. Run it from the
+# Actions tab when you want it.
+#
+# Restore the automatic triggers when the repository goes public, where
+# Actions is free:
+#   push: { branches: [main] }
+#   pull_request:
+#   schedule: [{ cron: "0 0 * * SUN" }]
+```
+
 ### Step 6.2 — The root-in-Docker job
 
 `crates/shep-daemon/tests/real_runner.rs:642` is `#[ignore]`d because the
@@ -2383,9 +2787,33 @@ the image to a digest and say why in the job's comment.
 
 ### Step 6.3 — Write down what enabling it would cost
 
-The workflow's existing header comment already explains *why* it is manual. Add
-the number, in `docs/specs/deferred.md`, in the section that records deliberate
-deferrals:
+The workflow's header comment says *why* it is manual and, after Step 6.1,
+carries the job count. The arithmetic behind that count goes in
+`docs/specs/deferred.md`.
+
+**Where, exactly.** `deferred.md` has four `##` sections today: *"Scope
+decision, 2026-08-12: everything below §2's six cuts ships in v1"*,
+*"Committed to v1.1+ by design (spec §2)"*, *"Named as v1.0 in spec §2/§9, not
+yet built"* and *"Not deferred"*. None of them fits a workflow that exists and
+works but is switched off, and three tasks in this phase each need somewhere
+to write a paragraph. So **Task 6 creates one new `##` section**, placed
+between *"Named as v1.0 in spec §2/§9, not yet built"* and *"Not deferred"*,
+and Tasks 8 and 9 append to it:
+
+```markdown
+## Known debt, recorded rather than built (Phase 10)
+
+Not scope cuts and not unbuilt spec surface — these are things that exist and
+work, or that are known to be missing, and that Phase 10 decided to write down
+rather than change. Each says what it is, why it was not done, and what would
+force it.
+```
+
+Unlike the sections above it, whose entries are bold-lead paragraphs, this one
+uses `###` subheads: its entries run several paragraphs each and a bold lead
+stops being findable at that length.
+
+The first entry, from this task:
 
 ```markdown
 ### Automatic CI, and what it would cost to turn on
@@ -2414,40 +2842,84 @@ base phases ship.** Recorded here so the next person to read the workflow does
 not "fix" the missing trigger, and so that every "all gates green" claim in
 this project's history is understood for what it is — self-reported by the
 agent that wrote the code, never independently re-run.
+
+The job count here and the one in `.github/workflows/test.yml`'s header
+comment are one fact written in two places. Change a matrix and both move.
 ```
+
+Before committing, confirm the two agree:
+
+```bash
+grep -n "19 jobs" .github/workflows/test.yml docs/specs/deferred.md
+```
+
+must print one line from each file. A single line means one of them was
+edited and the other was not, which is the exact state this task exists to
+leave the repository out of.
 
 ### Step 6.4 — Verify the workflow without running it
 
-There is no cargo command for a YAML file. Use two checks:
+There is no cargo command for a YAML file. Use two checks. Both tools are
+installed on this machine — PyYAML imports and `actionlint` is at
+`/opt/homebrew/bin/actionlint`, both confirmed 2026-08-13 — so neither is
+optional and neither has an "if available" escape. An unlinted workflow is
+exactly the "correct and ready" claim this task exists to make true.
 
 ```bash
-python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/test.yml')); print('parsed')"
+python3 -c "import yaml; yaml.safe_load(open('.github/workflows/test.yml')); print('parsed')"
 ```
 
-and, if `actionlint` is available:
+must print `parsed`.
 
 ```bash
 actionlint .github/workflows/test.yml
 ```
 
-If it is not installed, say so rather than skipping silently — an unlinted
-workflow is exactly the "correct and ready" claim this task is supposed to make
-true.
+must print nothing and exit `0`. If either tool turns out to be missing,
+install it (`pip install pyyaml`, `brew install actionlint`) rather than
+skipping the check and saying so.
 
-Then confirm the trigger did not move:
+`actionlint` is the one that can actually catch this task's likeliest mistake:
+`ubuntu-24.04-arm` is a real GitHub-hosted label and a typo for it — 
+`ubuntu-24.04-arm64`, say — is a job that never schedules rather than a job
+that fails. Read its output rather than only its exit code.
+
+Then confirm the trigger did not move. **This is the task's own acceptance
+check**, so it has to be a check that can actually fail. Two commands:
 
 ```bash
-grep -A 2 "^on:" .github/workflows/test.yml
+awk '/^on:/{f=1;next} /^[a-z]/{f=0} f' .github/workflows/test.yml
 ```
 
-must still print `workflow_dispatch:` and nothing else. **This is the task's
-own acceptance check.** A diff that adds a `push:` line fails the task
-regardless of everything else in it.
+must print exactly one line, `  workflow_dispatch:` — everything between the
+`on:` key and the next top-level key.
+
+```bash
+grep -cE '^[[:space:]]+(push|pull_request|schedule):' .github/workflows/test.yml
+```
+
+must print `0`. The commented-out trigger block in the header starts each line
+with `#`, so `^[[:space:]]+` does not reach it — the count is `0` today and
+becomes `1` the moment a real trigger is uncommented.
+
+The first draft of this plan wrote `grep -A 2 "^on:"` here and said it "must
+print `workflow_dispatch:` and nothing else". It prints three lines — `on:`,
+`  workflow_dispatch:`, `permissions:` — so its stated expectation was already
+false at HEAD, which leaves an implementer no way to tell a pass from a fail.
+
+A diff that adds a `push:` line fails the task regardless of everything else
+in it.
 
 ### Step 6.5 — MUTATION
 
-Change `on: workflow_dispatch:` to `on: push:` and re-run the grep check in
-Step 6.4. It must report the change. Revert immediately.
+Uncomment the `push: { branches: [main] }` line from the header block into the
+`on:` map — the realistic version of this mistake, since that is where the
+text an editor would reach for already sits — and re-run **both** Step 6.4
+checks. The `awk` must now print two lines, and the `grep -c` must print `1`.
+Revert immediately.
+
+Both have to move. If only the `awk` changes, the `grep -c` regex is wrong for
+the indentation the file actually uses and would miss the real thing.
 
 That is the only mutation this task can have — the jobs themselves cannot be
 mutation-tested without spending the minutes this task exists to not spend, and
@@ -2627,28 +3099,60 @@ Add a PR-checklist line, in the fenced block at the bottom:
 
 ### Step 7.4 — Verify, then MUTATE
 
+**Expect a no-op for every gate, and say so up front rather than discovering
+it.** This task's diff is six attributes and six comments, and there is no
+check in this repository that can go red on it. That is not a gap in the
+task — it is what `#[non_exhaustive]` is.
+
+The reasoning, which is worth stating because the first draft of this plan
+claimed the opposite. `#[non_exhaustive]` has **no same-crate effect at all**,
+so nothing inside shep-core or shep-daemon can notice. Across a crate boundary
+it would break an exhaustive `match`, and there is no such `match`: the only
+cross-crate use of any of the four library enums is *construction* of
+`DaemonConfigError::Toml` and `DaemonConfigError::BadEnvValue` in shep-cli
+(`commands/daemon.rs:583` and `:587`), and constructing a variant of an
+enum-level `#[non_exhaustive]` enum from another crate stays legal — the
+attribute blocks exhaustive matching, not construction. Confirm it rather than
+trusting this paragraph:
+
+```bash
+for e in FlockfileError DaemonConfigError BarkError DogError; do
+  echo "== $e"
+  grep -rn "$e" --include="*.rs" crates/shep-cli/ crates/shep-client/
+done
+```
+
+Every hit must be a construction, a doc reference or an import — no `match`.
+If one is a `match`, that is the one site this task can break, and the fix is
+a `_ =>` arm **with a comment saying what it is for**, not a silently
+swallowed variant. A cross-crate exhaustive match would be a **compile error**,
+not a test failure, so it surfaces in `cargo check` before any test runs.
+
+Run the gates anyway, because "expected to be a no-op" is a claim about the
+diff and the gates are how it is checked:
+
 ```bash
 cargo test --workspace --all-features
 ```
-
-Attribute-only changes; expect the baseline, unchanged. Any test that goes red
-here is a same-crate exhaustive `match` on one of the four library enums, and
-the fix is a `_ =>` arm **with a comment saying what it is for** — not a
-silently swallowed variant.
 
 ```bash
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-is the real check for this task: `clippy::wildcard_enum_match_arm` and the
-`unreachable_patterns` lint are what will surface a `match` that the attribute
-just changed the meaning of.
+Two things the first draft said clippy would catch, and will not.
+`clippy::wildcard_enum_match_arm` is a **restriction** lint, off by default and
+not enabled in this workspace's lint table, so it fires on nothing here.
+`unreachable_patterns` fires on a redundant arm, which adding an attribute
+cannot create. Neither is a reason to skip the run — a stray edit in six files
+is a real risk — but neither is "the real check for this task" either, because
+this task has no real check.
 
 **Mutation.** Delete `#[non_exhaustive]` from `DogError` and run
 `cargo clippy --workspace --all-targets --all-features -- -D warnings`. It will
-stay green — an attribute has no same-crate observable effect, exactly as Task
-2 found for `ProcessInfo`, and there is no honest test to write for it inside
-the crate.
+stay green, exactly as Task 2 found for `ProcessInfo`. Record that it stayed
+green; a mutation whose expected result is "no change" is still worth running
+once, because it is the difference between knowing there is no guard and
+assuming there is one.
 
 So this task's mutation is on the *rule*, not the code: change one word in
 IR-20's new text from `LIBRARY` to `BINARY` and confirm that the six enums as
@@ -2670,30 +3174,72 @@ fmt, clippy, doc.
 
 ## Task 8 — three claims that are not true, and one field that does nothing
 
-**Closes:** the new platform finding (the `ring` claim), the new docs finding
-(README's `that'll do` row and test count), config.md #3 (`reuse_port`), and
-platform.md #6's citation fix.
+**Closes:** the new platform finding (the `ring` claim), config.md #3
+(`reuse_port`), platform.md #6's citation fix, and platform.md #4's doc half
+(the `openat2` framing). Also refreshes README's test-count sentence, which is
+decay rather than a wrong claim.
+
+**Runs after Task 5**, which is where the windows-gnu cross-compile is
+actually executed. This task writes what that run found into a permanent code
+comment, and a comment asserting a build outcome nobody ran is how the `ring`
+claim being fixed here got written in the first place.
+
+**One README item that is already done, and must not be redone.** The audit
+input flagged two README cells: the `that'll do` row saying `no`, and a stale
+test count. Both were corrected on `main` in `c611853` — *"docs: correct two
+README claims that were wrong when written"* — which is this plan's own base
+commit, one newer than the commit the audit input was re-derived at.
+`README.md:92` already reads `| that'll do | ... | \`shep thatlldo\` | yes |`
+and `README.md:183` already reads `1030 tests`. **Do not edit the `that'll do`
+row and do not add a grep for it**; an earlier draft of this task did both,
+and the grep passed without the implementer touching anything, which is the
+precise shape of check this phase exists to stop shipping. What remains is
+Step 8.2, and it is about the count decaying, not about it being wrong.
 
 ### Files
 
 - **modify** `Cargo.toml` (root, the `tokio-rustls` comment)
 - **modify** `crates/shep-cli/Cargo.toml` (the `tokio-rustls` comment)
-- **modify** `README.md` (the lexicon table, the test count)
+- **modify** `README.md` (the test-count sentence at `:183` — the lexicon
+  table is already correct, see above)
 - **modify** `crates/shep-core/src/config/app.rs` (`reuse_port`'s doc)
 - **modify** `docs/specs/deferred.md` (`reuse_port`)
-- **modify** `crates/shep-daemon/src/runner.rs` (the `openat2` doc's framing)
-- **modify** `crates/shep-daemon/src/testing.rs` (the `sun_path` comment)
+- **modify** `crates/shep-daemon/src/runner.rs` (the `openat2` framing, in
+  **two** doc comments — `:284` and `:366`)
+- **modify** `crates/shep-daemon/src/testing.rs` and
+  `crates/shep-daemon/tests/daemon_e2e.rs` (the `sun_path` comment)
 
 ### Step 8.1 — The `ring` claim
 
-Both `crates/shep-cli/Cargo.toml:46-51` and the root `Cargo.toml:180-188` say
-`ring` was chosen because *"none of it needs a C toolchain"*. That is false.
-`Cargo.lock` shows `ring 0.17.14` depending on `cc 1.4.2`, and ring's
-`build.rs` uses `cc` to compile C and assembly crypto primitives on every
-target. The comparison to `aws_lc_rs` is real — aws-lc-sys additionally needs
-`cmake`, which ring avoids — but the blanket claim is wrong, and it has already
-cost something concrete: a Windows cross-compile died in ring's build script
-for want of mingw.
+**Only the root `Cargo.toml` carries the false claim.** Its comment, at lines
+183-186, reads *"tokio-rustls + webpki-roots, named directly, costs +10 crates
+and none of it needs a C toolchain"* — and the phrase wraps across a line
+break between "C" and "toolchain", which matters for Step 8.5's grep.
+`crates/shep-cli/Cargo.toml:45-51` says only that `aws_lc_rs` is *"a C build
+dependency"*, which is true and needs no correction beyond a pointer. An
+earlier draft of this task treated both files as wrong and asserted "three
+claims that are not true" partly on that basis; the shep-cli mirror is one of
+them only in the sense that it points at a root comment that was.
+
+The claim is false because `Cargo.lock` shows `ring 0.17.14` depending on
+`cc 1.4.2`, and ring's `build.rs` runs `cc` to compile C and assembly crypto
+primitives for the target. The comparison to `aws_lc_rs` is still real and
+still the reason for the choice — aws-lc-sys needs `cmake` on top of a C
+compiler — but "none of it needs a C toolchain" is not the difference.
+
+**What the corrected comment may claim, and no more.** Task 5 ran the
+cross-compile, so this is measurement rather than inference:
+
+```
+cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu
+EXIT=0    Finished `dev` profile ... in 8.42s
+```
+
+on a macOS host with `mingw-w64` installed (`x86_64-w64-mingw32-gcc` on
+`PATH`). So the honest statement is *"a cross-compile needs a C toolchain for
+the target, and with one present the whole workspace cross-compiles clean"* —
+**not** "the cross-compile dies for want of mingw", which is what an earlier
+draft of this comment said and which nobody had run.
 
 Root `Cargo.toml`, replacing the sentence:
 
@@ -2709,30 +3255,38 @@ Root `Cargo.toml`, replacing the sentence:
 # named away.
 #
 # What this DOES cost, stated plainly because an earlier version of this
-# comment claimed otherwise: ring's build.rs uses `cc` to compile C and
-# assembly on every target, so building shep-cli for a target needs a C
-# compiler for THAT target. Native builds are unaffected (macOS ships clang,
-# the CI musl job already installs musl-tools, GitHub's windows-latest
-# runners ship the MSVC build tools ring needs for windows-msvc). A
-# CROSS-compile is what pays: `cargo check --target x86_64-pc-windows-gnu`
-# from macOS dies in ring's build script for want of a mingw toolchain, which
-# is why the per-phase windows-gnu gate every plan through Phase 6 carried is
-# not in this phase's gate list. shep-daemon has no ring in its tree, so the
-# Linux cross-check in CLAUDE.md's gate section is unaffected and is scoped
-# to `-p shep-daemon` for exactly that reason.
+# comment claimed the opposite: ring's build.rs uses `cc` to compile C and
+# assembly for the target, so building shep-cli for a target needs a C
+# compiler for THAT target. Native builds are unaffected — macOS ships clang,
+# the CI musl job installs musl-tools, and GitHub's windows-latest runners
+# ship the MSVC build tools ring wants for windows-msvc. A CROSS-compile is
+# where it is felt: `--target x86_64-pc-windows-gnu` from macOS needs
+# mingw-w64 installed. Measured 2026-08-13 with it installed, the whole
+# workspace cross-compiles clean —
+#   cargo check --workspace --all-targets --all-features \
+#     --target x86_64-pc-windows-gnu     # EXIT=0, 8.42s
+# — and that check is back in CLAUDE.md's gate section after three phases
+# out. shep-daemon has no ring in its tree, so the Linux cross-check beside
+# it needs no cross C toolchain and is scoped to `-p shep-daemon` for exactly
+# that reason.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 ```
 
-`crates/shep-cli/Cargo.toml`, the shorter mirror:
+The backslash continuation inside a TOML comment is only there to keep the
+line under the file's width; it is a comment, so nothing parses it.
+
+`crates/shep-cli/Cargo.toml`, the shorter mirror. Its existing text is not
+wrong — it says `aws_lc_rs` is "a C build dependency", which it is — so this
+is a pointer added, not a claim corrected:
 
 ```toml
 # `dog::bark::sinks`'s TLS transport for Discord/Slack webhooks. Rin's ruling
 # (2026-08-12): a hand-rolled HTTP/1.1 client over `tokio-rustls`, not
-# `reqwest` — see this crate's root `Cargo.toml` entry for the full
-# accounting, including what ring's own `cc` build dependency costs a
-# cross-compile. `ring`/`tls12` name the crypto provider directly so
-# `tokio-rustls`'s own default features (which pull in `aws_lc_rs`, which
-# needs cmake on top of a C compiler) never apply.
+# `reqwest` — see the root `Cargo.toml` entry for the full accounting,
+# including what ring's own `cc` build dependency costs a cross-compile.
+# `ring`/`tls12` name the crypto provider directly so `tokio-rustls`'s own
+# default features (which pull in `aws_lc_rs`, which needs cmake on top of a
+# C compiler) never apply.
 tokio-rustls.workspace = true
 ```
 
@@ -2746,24 +3300,26 @@ grep -n -A 8 '^name = "ring"' Cargo.lock
 must show `cc` among its dependencies. If it does not, the claim has changed
 and this whole step needs rewriting rather than editing.
 
-### Step 8.2 — README's two stale cells
+### Step 8.2 — README's test count, which decays every phase
 
-`README.md:91` (the `that'll do` row) reads `no`. `Commands::Thatlldo` exists at
-`crates/shep-cli/src/cli.rs:211` with `#[command(hide = true)]`, and `main.rs:261`
-dispatches `Commands::Stop(ref args) | Commands::Thatlldo(ref args)`
-identically. It has worked since `a613edf`, weeks before the README was
-written. Change the cell to `yes`.
+**One edit, not two.** The `that'll do` row at `README.md:92` already reads
+`yes` and the count at `README.md:183` already reads `1030` — both corrected in
+`c611853`, this plan's base commit. Neither was missed; they were fixed one
+commit before the plan was written. Leave the lexicon table alone.
 
-Confirm first, since this is a claim about the CLI:
+What is left is not a wrong claim but a decaying one. `README.md:183` reads:
 
-```bash
-grep -n "Thatlldo" crates/shep-cli/src/cli.rs crates/shep-cli/src/main.rs
+```markdown
+**Tested by trying to break it.** 1030 tests, and every task ends with a
+mutation pass: break a line on purpose, confirm a test goes red, put the line
+back. It keeps turning up tests that could not fail, which is the reason to
+do it.
 ```
 
-The test-count line ("1027 tests") is three off the 1030 at the Phase 9 merge
-and will be off again the moment Phase 10 lands. Rather than re-stating a number
-that goes stale every phase, make the sentence say what it is actually claiming.
-Replace the count with the shape:
+`1030` is correct today and stops being correct the moment Task 1 adds its
+first test. It has already been re-corrected once. Rather than re-stating a
+number that goes stale every phase, make the sentence say what it is actually
+claiming:
 
 ```markdown
 Over a thousand tests, and the ones worth having are the ones that were made
@@ -2810,8 +3366,12 @@ value out of an imported config. Correct its doc's last paragraph:
     pub reuse_port: bool,
 ```
 
-And in `docs/specs/deferred.md`, in the section recording things that exist but
-do nothing yet:
+And in `docs/specs/deferred.md`, as a `###` entry under the
+**"Known debt, recorded rather than built (Phase 10)"** section Task 6
+creates. If Task 6 has not run yet, create the section with the two-sentence
+preamble Step 6.3 specifies rather than inventing a second home for it —
+`deferred.md` has exactly four `##` headings today and none of them is
+"things that exist but do nothing yet":
 
 ```markdown
 ### `reuse_port` is accepted, stored, displayed — and never read
@@ -2832,11 +3392,33 @@ field says plainly that it does nothing, which is the part that was missing.
 
 ### Step 8.4 — Two comments that overstate their case
 
-**`openat2`.** `crates/shep-daemon/src/runner.rs:364-369` currently reads *"the
-syscall that would provide one (`openat2(RESOLVE_NO_SYMLINKS)`) is Linux-only
-while macOS is tier-1"*, which reads as a reason the syscall is unavailable to
-this project. It is not — it is a reason it cannot be the *only* path. Narrow
-the claim to what is true, and name the real cost:
+**`openat2`, in two comments and not one.** The framing appears twice in
+`runner.rs` and the plan's first draft found only the second. `:284`, on
+`open_log_path`, says `openat2(RESOLVE_NO_SYMLINKS)` *"is Linux-only and so
+out of scope for a project with macOS as a tier-1 platform (spec §11)"*.
+`:364-369`, on `check_log_ancestry`, says *"the syscall that would provide one
+(`openat2(RESOLVE_NO_SYMLINKS)`) is Linux-only while macOS is tier-1"*. Both
+read as a reason the syscall is unavailable to this project. It is not — being
+Linux-only is a reason it cannot be the *only* path, not a reason it cannot be
+a fast path beside the portable one. Confirm both sites before editing:
+
+```bash
+grep -n "openat2" crates/shep-daemon/src/runner.rs
+```
+
+must print two lines. Narrow both claims to what is true, and name the real
+cost. `:284`'s is short, since the long version belongs on
+`check_log_ancestry` where the design note goes:
+
+```rust
+/// that in the open itself needs `openat2(RESOLVE_NO_SYMLINKS)`, which is
+/// Linux-only — so it cannot be the only path here, though it could be a
+/// Linux fast path beside this one. What that would cost, and why Phase 10
+/// did not spend it, is on [`check_log_ancestry`] and in
+/// `docs/specs/deferred.md`.
+```
+
+and `:364-369`'s, the full version:
 
 ```rust
 /// # What remains
@@ -2878,29 +3460,66 @@ rather than fixed here.
 
 ### Step 8.5 — MUTATION
 
-This task is comments and one table cell, so the mutations are grep-shaped and
-that is stated rather than dressed up:
+This task is comments and doc prose, so the mutations are grep-shaped and that
+is stated rather than dressed up. What matters is that each grep can print a
+different answer before and after the edit — the first draft's version could
+not, and that is the defect being fixed here as much as any comment is.
+
+**The `ring` claim.** The false phrase in the tree is *"none of it needs a C"*
+/ *"toolchain."* — it wraps across `Cargo.toml:183-184`. `grep -c "no C
+toolchain"`, which the first draft used, matches nothing before the edit and
+nothing after it: the words are "none of it needs", not "no", and the phrase
+spans a newline so even `grep "C toolchain"` misses it. It printed `0` for
+both files at HEAD and would have printed `0` had the task never run. Two
+discriminating checks instead, and only against the root file, which is the
+only one that ever carried the claim:
 
 ```bash
-grep -c "no C toolchain" Cargo.toml crates/shep-cli/Cargo.toml
+grep -c "none of it needs" Cargo.toml
 ```
 
-must print `0` for both. Re-introduce the phrase in one file and confirm the
-grep catches it; revert.
+must print `0` — it prints `1` at HEAD, so this one goes from `1` to `0` and
+is the check that the false sentence is gone.
 
 ```bash
-grep -n "that'll do" README.md
+grep -c 'uses `cc`' Cargo.toml
 ```
 
-must show the row ending in `| yes |`.
+must print `1` — the corrected comment's own sentinel, `0` at HEAD. Two
+directions, so a task that deleted the old sentence without writing the new
+one fails the second, and a task that added the new one while leaving the old
+fails the first.
+
+Then the mutation proper: re-introduce `none of it needs a C` in
+`Cargo.toml`'s comment and confirm the first grep prints `1`. Revert.
+
+**`reuse_port`.**
 
 ```bash
-grep -rn "reuse_port" crates/shep-daemon/src/ ; echo "exit=$?"
+grep -rn "reuse_port" crates/shep-daemon/src/
+echo "exit=$?"
 ```
 
-must print `exit=1` (no matches). If a later phase adds a reader, that grep
-starts finding one and the doc comment written here becomes false — say so in
-the deferred.md entry, which Step 8.3 already does.
+must print `exit=1` (no matches) — `grep` exits `1` when nothing matches, so
+this one does discriminate. If a later phase adds a reader, that grep starts
+finding one and the doc comment written here becomes false — which is what the
+deferred.md entry in Step 8.3 says out loud.
+
+**`openat2`.**
+
+```bash
+grep -c "out of scope for a project with macOS" crates/shep-daemon/src/runner.rs
+```
+
+must print `0`; it prints `1` at HEAD. That is the `:284` half, which the
+first draft of this task never touched.
+
+**No README grep.** The first draft asserted
+`grep -n "that'll do" README.md` "must show the row ending in `| yes |`" — it
+does, and it did before the plan existed, because `c611853` had already fixed
+it. A check that passes identically whether or not the task ran is worse than
+no check: it reports success for work that was never done. Step 8.2's edit is
+a prose rewrite and its verification is reading the sentence.
 
 ### Step 8.6 — Gate
 
@@ -2923,7 +3542,9 @@ deliberately does not build.
 ### Files
 
 - **modify** `docs/idiomatic-rust.md` — a new IR-46 and a checklist line
-- **modify** `docs/specs/deferred.md` — six ledger entries
+- **modify** `docs/specs/deferred.md` — seven ledger entries, appended to the
+  **"Known debt, recorded rather than built (Phase 10)"** section Task 6
+  creates and Task 8 has already added `reuse_port` to
 
 ### Step 9.1 — IR-46, the forcing mechanism
 
@@ -2960,8 +3581,36 @@ Checklist line, in the fenced block:
 
 ### Step 9.2 — The ledger
 
-`docs/specs/deferred.md`. One entry each, in the section that records
-deliberate deferrals. Each says what, why not now, and what would force it.
+`docs/specs/deferred.md`, appended as `###` entries to the
+**"Known debt, recorded rather than built (Phase 10)"** section — the one
+Task 6 creates and Task 8 has already put `reuse_port` under. Do not invent a
+section name; `deferred.md` has four `##` headings and none of them is "the
+section that records deliberate deferrals", which is what an earlier draft of
+three separate tasks said and which three separate implementers would have
+guessed three different ways.
+
+Each entry says what, why not now, and what would force it.
+
+**Seven entries: the phase-opening list's six, plus one record.** The
+phase-opening "Findings deliberately NOT built" list and this ledger must name
+the same set, so cross-check them before writing — an earlier draft promised
+entries for two items that never got one and wrote an entry for an item that
+was not on the list.
+
+Six come straight off that list: config #4 (`DaemonConfig`), wire #6
+(`ProcessInfo`'s four concerns), platform #4 (`check_log_ancestry`'s TOCTOU),
+`bind_socket`'s raw `ENAMETOOLONG`, platform #2 (reload's Linux-only
+assertions), and tests #3 (the `cli_e2e` correlation).
+
+Two items on that list get **no** entry, and the list now says so in place:
+platform #5 (already recorded accurately at `deferred.md:91-101`, inside the
+openrc/BSD paragraph — a second copy is a second thing to drift) and tests
+#5's non-CI half (nothing is deferred; the test is correct and Task 6 ships
+the job that runs it).
+
+The seventh is not a deferral at all. It is a dated record of the windows-gnu
+gate's three-phase absence, written down because Task 5 closed it and the fact
+that it lapsed unnoticed is the part worth keeping.
 
 ```markdown
 ### `DaemonConfig` is not a proof token, unlike `ResolvedApp`
@@ -3050,6 +3699,31 @@ It is a standing false-positive risk in the serial phase-gate run that CLAUDE.md
 mandates before a merge. What it needs is one fresh bounded measurement pass
 with the numbers written down, which is a measurement rather than an edit, and
 is why it is here rather than in a task.
+
+### The windows-gnu cross-check went three phases unrun
+
+`cargo check --workspace --all-targets --all-features --target
+x86_64-pc-windows-gnu` was in the gate list of every plan from Phase 3 through
+Phase 6. Phase 7's plan does not carry it, nor Phase 8's, nor Phase 9's, and
+no plan says why — it was dropped silently. It had also never been written into
+`CLAUDE.md`'s own gate section, so there was nothing outside the plans to
+notice its absence.
+
+This one is **closed, not deferred**, and is recorded here only so the gap is
+dated. Phase 10 ran it (`EXIT=0`, 8.42s, 2026-08-13, at `b7c466b`) and put it
+back, in `CLAUDE.md` this time rather than in a plan that expires. The likely
+reason it lapsed is its prerequisite: `ring`'s build script runs `cc` for the
+target, so the check needs a C toolchain for `x86_64-pc-windows-gnu`
+(`mingw-w64`), and a host without one cannot run it at all — an easy thing to
+stop doing and never mention. Windows was 0% implemented for all three of
+those phases, so nothing broke; what was lost was the guarantee that nothing
+had.
+
+It is spelled `cargo check`, not `clippy -- -D warnings`, and that is a
+decision rather than an oversight: shep-daemon's `boot`, `sys`, `server` and
+`tokio_runner` are `cfg(unix)`-gated, so the Windows target reports 51
+dead-code warnings for code that is not dead on any platform shep ships.
+Silencing them would mean `#[allow(dead_code)]` on live code.
 ```
 
 ### Step 9.3 — Verify and MUTATE
@@ -3082,6 +3756,15 @@ against IR-46 as written:
   thread panics, and the first test is a plain `#[test]` for that reason.
 - Task 5's rewritten handshake test — bounded by `HANDSHAKE_TIMEOUT`, which is
   the thing under test. Passes.
+- Task 6 and Tasks 7-9 add no test that awaits anything.
+
+And one thing the rule does not reach, worth saying while the checklist is
+open: IR-46 bounds an `await`, and the failure Task 2 and Task 8 each nearly
+shipped is a **grep that returns the same answer before and after the edit**.
+Different shape, same defect — a check that cannot distinguish done from not
+done. There is no rule for it here, and adding a second one in the same edit
+would dilute IR-46; but note the pattern in the commit message so the next
+audit has the phrase to look for.
 
 Any test that fails this walk is IR-46's first catch in the very phase that
 wrote it, and the fix is to bound it before the phase closes. Record the
@@ -3107,15 +3790,21 @@ plus the phase gate:
 ```bash
 cargo test --workspace --all-features -- --test-threads=1
 cargo check -p shep-daemon --all-targets --all-features --target x86_64-unknown-linux-gnu
+cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu
 ```
 
 and both `benches/` gates (own `CARGO_TARGET_DIR`, own workspace).
+
+The windows-gnu line is back after three phases out (Task 5). It needs
+`mingw-w64` on the host and it is `cargo check`, not clippy — both for reasons
+`CLAUDE.md` now carries.
 
 Expected shape, not a checksum: baseline 1030 passed / 0 failed / 3 ignored
 across 15 result lines, plus roughly
 
 - Task 1: +6 (3 normalize, 3 `kill_signal`)
-- Task 2: +2 in shep-core, +1 new integration test file → **16 result lines**
+- Task 2: +2 in shep-core, +1 new integration test file
+  (`process_info_builder_from_outside_the_crate`) → **16 result lines**
 - Task 3: +3 `ActionWaits` unit tests, +3 channel fixtures, +1 `real_runner`
 - Task 5: no new tests, one rewritten
 - Tasks 4, 6–9: no new test functions (fixtures grow inside existing tests)
@@ -3123,14 +3812,43 @@ across 15 result lines, plus roughly
 so about **1046 passed / 0 failed / 3 ignored across 16 result lines**. Recount
 at the merge; do not carry this number into a brief.
 
-Additionally:
+Additionally, and each of these is written so that it prints a *different*
+answer if the thing it guards is wrong — the phase's own recurring defect is a
+check that passes either way:
 
-- `ls crates/shep-core/src/protocol/snapshots/*.snap.new` prints nothing.
-- `grep -A 2 "^on:" .github/workflows/test.yml` still prints `workflow_dispatch:`
-  and nothing else. **A Phase 10 diff that enables CI fails the phase.**
-- `grep -c "no C toolchain" Cargo.toml crates/shep-cli/Cargo.toml` prints `0`
-  for both.
-- `PROTOCOL_VERSION` is still `1` (`crates/shep-core/src/protocol/mod.rs:31`).
-- Every task's mutation step was run and its named test went red for its named
-  reason. A mutation that did not redden is a finding, not a formality — five
-  phases running, this project has turned one up every time.
+```bash
+find crates/shep-core/src/protocol/snapshots -name '*.snap.new' | wc -l   # 0
+```
+
+```bash
+awk '/^on:/{f=1;next} /^[a-z]/{f=0} f' .github/workflows/test.yml          # "  workflow_dispatch:"
+grep -cE '^[[:space:]]+(push|pull_request|schedule):' .github/workflows/test.yml   # 0
+```
+
+**A Phase 10 diff that enables CI fails the phase.**
+
+```bash
+grep -c "none of it needs" Cargo.toml    # 0   (1 at HEAD — the false claim)
+grep -c 'uses `cc`' Cargo.toml           # 1   (0 at HEAD — the corrected one)
+```
+
+```bash
+grep -n "PROTOCOL_VERSION" crates/shep-core/src/protocol/mod.rs
+```
+
+must still print `pub const PROTOCOL_VERSION: u32 = 1;` — it is a `u32`, not
+the `u16` an earlier draft assumed, and the point is the `1`.
+
+```bash
+grep -n "19 jobs" .github/workflows/test.yml docs/specs/deferred.md
+```
+
+must print one line from each file (Task 6's paired count).
+
+And, last: every task's mutation step was run and its named test went red for
+its named reason. A mutation that did not redden is a finding, not a formality
+— five phases running, this project has turned one up every time. Three of
+this phase's mutations are *expected* not to redden and say so in place
+(Task 2's `#[non_exhaustive]` deletion, Task 7's `DogError` deletion, Task 4's
+enum-reorder); those three are recorded as "stayed green, as designed", and
+nothing else may be.
