@@ -89,7 +89,7 @@ The whole vocabulary, and whether it exists yet.
 | the whistle | the MCP interface agents talk to | `shep whistle` | no |
 | the lookout | the terminal dashboard | `shep lookout` (alias `dash`) | no |
 | adopt / rehome | register or drop a third-party dog | `shep adopt <name> <path>` | yes |
-| that'll do | graceful stop, after the real herding command | `shep thatlldo` | no |
+| that'll do | graceful stop, after the real herding command | `shep thatlldo` | yes |
 
 Sheepdogs and sheep were separate ideas from the start, so "dog" never means
 the daemon. The shepherd is the shepherd. Dogs are plugins that work for it.
@@ -180,7 +180,7 @@ over a pipe once its socket is bound. Four crates build it: `shep-core`
 (types, config, wire protocol), `shep-daemon` (the supervision engine),
 `shep-client` (async client), and `shep-cli` (the binary).
 
-**Tested by trying to break it.** 1027 tests, and every task ends with a
+**Tested by trying to break it.** 1030 tests, and every task ends with a
 mutation pass: break a line on purpose, confirm a test goes red, put the line
 back. It keeps turning up tests that could not fail, which is the reason to
 do it.
