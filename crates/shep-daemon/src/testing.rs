@@ -217,10 +217,12 @@ fn a_sibling_thread_reaching_a_callsite_first_cannot_empty_the_capture() {
     );
 }
 
-// WHY a shallow home: later tasks bind a UDS under `run/`, and sun_path
-// caps a socket path near 104 bytes. Using the tempdir root as
-// $SHEP_HOME (no extra nesting) keeps every test in this crate under the
-// limit on macOS, whose temp paths are already long.
+// WHY a shallow home: later tasks bind a UDS under `run/`, and `sun_path`
+// caps the socket path at 104 bytes on macOS and 108 on Linux, and macOS
+// temp paths are already long — so the tighter number is the one to build
+// against, and it is the platform this runs on most. Using the tempdir root
+// as $SHEP_HOME (no extra nesting) keeps every test in this crate under that
+// limit.
 pub(crate) fn test_paths(dir: &tempfile::TempDir) -> ShepPaths {
     let home = dir.path().to_path_buf();
     ShepPaths::resolve(

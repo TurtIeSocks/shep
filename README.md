@@ -180,10 +180,11 @@ over a pipe once its socket is bound. Four crates build it: `shep-core`
 (types, config, wire protocol), `shep-daemon` (the supervision engine),
 `shep-client` (async client), and `shep-cli` (the binary).
 
-**Tested by trying to break it.** 1030 tests, and every task ends with a
-mutation pass: break a line on purpose, confirm a test goes red, put the line
-back. It keeps turning up tests that could not fail, which is the reason to
-do it.
+**Tested by trying to break it.** Over a thousand tests, and the ones worth
+having are the ones made to fail on purpose: every phase ends with a mutation
+pass that breaks a named line and checks the right test goes red. Five phases
+have turned up tests that could not fail, including one that was
+mathematically incapable of it.
 
 **Small things done on purpose.** The CPU column prints `-` rather than `0.0%`
 when a reading is unavailable, because a confident zero is worse than an

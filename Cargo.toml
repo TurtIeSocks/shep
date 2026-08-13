@@ -180,11 +180,27 @@ fsevent-sys = "4.1.0"
 # the one thing in the workspace that needs TLS. Rin's ruling (2026-08-12)
 # is a hand-rolled HTTP/1.1 client over tokio-rustls rather than reqwest:
 # reqwest's default rustls feature costs +93 crates over this workspace's
-# existing 196 and a C build dependency (aws-lc-sys, cmake); tokio-rustls +
-# webpki-roots, named directly, costs +10 crates and none of it needs a C
-# toolchain. `ring`, not the default `aws_lc_rs`, is the crypto provider —
-# aws_lc_rs is exactly the C dependency this choice exists to avoid, and
-# tokio-rustls's own default features pull it in unless named away.
+# existing 196 and pulls aws-lc-sys, which needs BOTH a C compiler and cmake;
+# tokio-rustls + webpki-roots, named directly, costs +10 crates and needs a C
+# compiler but no cmake. `ring`, not the default `aws_lc_rs`, is the crypto
+# provider, and tokio-rustls's own default features pull aws_lc_rs in unless
+# named away.
+#
+# What this DOES cost, stated plainly because an earlier version of this
+# comment claimed the opposite: ring's build.rs uses `cc` to compile C and
+# assembly for the target, so building shep-cli for a target needs a C
+# compiler for THAT target. Native builds are unaffected — macOS ships clang,
+# the CI musl job installs musl-tools, and GitHub's windows-latest runners
+# ship the MSVC build tools ring wants for windows-msvc. A CROSS-compile is
+# where it is felt: `--target x86_64-pc-windows-gnu` from macOS needs
+# mingw-w64 installed. Measured 2026-08-13 with it installed, the whole
+# workspace cross-compiles clean —
+#   cargo check --workspace --all-targets --all-features \
+#     --target x86_64-pc-windows-gnu     # EXIT=0, 8.42s
+# — and that check is back in CLAUDE.md's gate section after three phases
+# out. shep-daemon has no ring in its tree, so the Linux cross-check beside
+# it needs no cross C toolchain and is scoped to `-p shep-daemon` for exactly
+# that reason.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Mozilla's compiled-in root store. rustls itself is reached through
 # tokio-rustls's own `pub use rustls;` (tokio-rustls-0.26.4/src/lib.rs) — a

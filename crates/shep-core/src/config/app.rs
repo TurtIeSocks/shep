@@ -168,12 +168,14 @@ pub struct AppConfig {
     /// is permission for the old and new instance to overlap during reload,
     /// not the socket option itself.
     ///
-    /// An app that does not actually set the option gets `EADDRINUSE` at the
-    /// replacement spawn, on every reload, and shep cannot detect the
-    /// misconfiguration in advance. `SO_REUSEADDR`, which far more
-    /// frameworks set by default, is not sufficient — a mixed pair (one
-    /// process with `SO_REUSEPORT` set, one without) is refused by the
-    /// kernel on both Linux and macOS.
+    /// **This field is inert today.** shep never reads it: reload overlap
+    /// already happens unconditionally, so setting it changes nothing and
+    /// leaving it unset costs nothing. It is kept because `shep import`
+    /// writes it for a cluster-mode pm2 app and `shep flock` displays it, so
+    /// dropping it would silently discard a value out of an imported config.
+    /// It becomes load-bearing the day shep gains a reload mode that does NOT
+    /// overlap by default, which is when the permission it describes stops
+    /// being free — see `docs/specs/deferred.md`.
     pub reuse_port: bool,
     /// Readiness probe — gates reload's AwaitReady (spec §7)
     pub readiness_probe: Option<ProbeConfig>,

@@ -282,8 +282,10 @@ pub(crate) const SYMLINK_REFUSED: &str = "refusing to follow a symlink at this l
 /// directory still resolves, so `logs -> /elsewhere` followed by
 /// `logs/app.log` reaches `/elsewhere/app.log` exactly as before. Closing
 /// that in the open itself needs `openat2(RESOLVE_NO_SYMLINKS)`, which is
-/// Linux-only and so out of scope for a project with macOS as a tier-1
-/// platform (spec §11). [`check_log_ancestry`] covers that case from the
+/// Linux-only — so it cannot be the only path here, though it could be a
+/// Linux fast path beside this one. What that would cost, and why Phase 10
+/// did not spend it, is on [`check_log_ancestry`] and in
+/// `docs/specs/deferred.md`. [`check_log_ancestry`] covers that case from the
 /// other side — by refusing an ancestry a privileged daemon should not be
 /// writing below at all — but it checks rather than resolves, so a TOCTOU
 /// window remains between the two. This stops the realistic attack; it does
@@ -361,12 +363,22 @@ fn name_the_symlink(error: io::Error) -> io::Error {
 ///
 /// # What remains
 ///
-/// A TOCTOU window, and there is no portable way to close it: this checks the
-/// ancestry and then opens the path, with no atomic tie between the two, and
-/// the syscall that would provide one (`openat2(RESOLVE_NO_SYMLINKS)`) is
-/// Linux-only while macOS is tier-1 (spec §11). An attacker who can rearrange
-/// a directory between the check and the open still wins that race. The bar
-/// is raised substantially; the operation is not atomic.
+/// A TOCTOU window. This checks the ancestry and then opens the path with no
+/// atomic tie between the two, so an attacker who can rearrange a directory
+/// between the check and the open still wins that race. The bar is raised
+/// substantially; the operation is not atomic.
+///
+/// The syscall that would close it on Linux is
+/// `openat2(RESOLVE_NO_SYMLINKS)`, and it IS reachable — `nix 0.29` exposes
+/// `fcntl::openat2` under the `fs` feature this crate already enables. What
+/// stops it being a Linux fast path here is not availability but cost:
+/// `openat2` hands back a `RawFd`, so adopting it into a `File` needs
+/// `FromRawFd`, which is `unsafe` and belongs in `sys.rs` (IR-22), behind a
+/// `cfg(target_os = "linux")` with an `ENOSYS`/`EPERM` fallback ladder for
+/// pre-5.6 kernels and seccomp sandboxes — new unsafe on a Linux-only path
+/// this project cannot execute a test for from a macOS development machine.
+/// The design is written down in `docs/specs/deferred.md` rather than
+/// half-built here.
 ///
 /// # Errors
 ///

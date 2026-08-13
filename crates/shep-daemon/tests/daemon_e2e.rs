@@ -57,8 +57,10 @@ struct Fixture {
 
 impl Fixture {
     async fn boot(dir: tempfile::TempDir, restore: bool) -> Self {
-        // $SHEP_HOME is the tempdir root itself: sun_path caps the socket
-        // path near 104 bytes and macOS temp paths are already long.
+        // $SHEP_HOME is the tempdir root itself: `sun_path` caps the socket
+        // path at 104 bytes on macOS and 108 on Linux, and macOS temp paths
+        // are already long — so the tighter number is the one to build
+        // against, and it is the platform this runs on most.
         let home = dir.path().to_path_buf();
         let paths = ShepPaths::resolve(
             &|key| (key == "SHEP_HOME").then(|| home.display().to_string()),

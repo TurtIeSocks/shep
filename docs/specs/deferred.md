@@ -164,6 +164,31 @@ agent that wrote the code, never independently re-run.
 The job count here and the one in `.github/workflows/test.yml`'s header
 comment are one fact written in two places. Change a matrix and both move.
 
+### `reuse_port` is accepted, stored, displayed — and never read
+
+`AppConfig::reuse_port` has no production reader anywhere in the workspace.
+Reload's overlap between the old and new instance is unconditional, so the
+permission this field grants is one shep already takes.
+
+Kept rather than removed: `shep import` sets it for a cluster-mode pm2 app and
+`shep flock` renders it, so deleting the field would silently drop a value out
+of a config an operator handed us. It costs one `bool` per app.
+
+It stops being inert the day shep grows a reload mode that does not overlap by
+default, a `graceful = false` or a serial reload, at which point this is the
+field that says which apps may be overlapped. Until then the doc comment on
+the field says plainly that it does nothing, which is the part that was
+missing.
+
+### `bind_socket` surfaces an over-length `$SHEP_HOME` as a raw `ENAMETOOLONG`
+
+Noticed while correcting the `sun_path` comments in the same task. `boot.rs`'s
+`bind_socket` performs no length check of its own before handing the path to
+the kernel, so an operator with an unusually deep `$SHEP_HOME` gets the OS
+error with no sentence naming the limit (104 bytes on macOS, 108 on Linux) or
+the variable responsible. Low impact and a small fix — a length check ahead of
+the bind that names both — but not this task's subject.
+
 ## Not deferred
 
 **Dogs** (spec §8) **shipped**: the dog contract (`shep_daemon::dogs`,
