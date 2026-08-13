@@ -21,8 +21,8 @@
 //! (`CHANNEL_VERSION` is a stamp, not a negotiation — see its own doc), so a
 //! new variant here is a change every app that speaks this wire has to be told
 //! about out of band. Leaving them exhaustive means the compiler names every
-//! site that has to decide something, [`BusEvent::topic`] included, which is
-//! exactly the review a change on this wire deserves.
+//! site that has to decide something, [`crate::protocol::BusEvent::topic`]
+//! included, which is exactly the review a change on this wire deserves.
 //!
 //! This module pins the wire shapes; it is not the app-author-facing contract.
 //! An app that wants to speak this wire — including why it should reply to a
