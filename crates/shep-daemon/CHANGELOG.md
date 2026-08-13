@@ -51,6 +51,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Record, in `barks.jsonl`, an enabled dog that exhausts its restart budget —
+  the shepherd's own trail for the one alert it cannot deliver itself. It has
+  no sinks and no webhook code by design, so a dead bark dog can raise no
+  webhook alert about its own death; what it can guarantee is a local record,
+  so an operator reading `shep barks` after an outage finds the moment
+  alerting stopped rather than a gap they have to infer. Written by a bus
+  watcher (`dogs::spawn_dog_watch`), not a branch inside the supervisor —
+  supervision stays blind to dog-ness, and this only answers who should see
+  an event that already happened. Fires on a dog's `Errored` only, never on
+  an `Exit` it survives or a sheep's own `Errored`, which is bark's record to
+  write. A lagging watcher logs the drop at `warn!` and does not attempt to
+  recover it; polling for what the bus already dropped would be building a
+  second bark dog inside the shepherd.
+
+- Start every `[daemon] enabled_dogs` dog when the daemon boots, strictly
+  after the muster restore and strictly before the daemon reports itself
+  ready. Both halves of that placement are load-bearing: after the restore,
+  because a metrics dog started first would answer for an empty flock for
+  the whole restore window, and a bark dog would raise a `process.start`
+  alert for every sheep the roll brings back; before readiness, because
+  `Type=notify` going green is meant to mean the whole daemon — flock and
+  dogs alike — is up, the same reasoning that already put the restore
+  itself inside that promise.
+
+  A dog that will not start never fails the boot — the flock comes up and
+  the daemon serves regardless, with a `warn!` naming the dog. That covers
+  a binary this build cannot spawn, a spawn failure the OS reports, AND the
+  case `EnableDog`'s own handler already guards: `start_dog` is idempotent
+  by name, so a dog enabled under a name a sheep already holds comes back
+  `Ok` over the sheep rather than starting anything, and reporting that as
+  a success would be a false one, exactly as it would be over the socket.
+
+- Answer the three dog verbs. `DogConfig` hands a dog its own `[dog.<name>]`
+  section as TOML text, `EnableDog` starts one, and `DisableDog` stops and
+  deregisters it through the same `delete` a sheep goes through — kill
+  ladder, graceful timeout, deregistration — rather than a second way to end
+  a supervised process.
+
+  A dog's configuration travels over the socket, never in its environment.
+  The child inherits `$SHEP_HOME` and nothing else it did not already need in
+  order to exec; it connects to the socket that names, handshakes, and asks
+  for its section. A bark sink is a webhook URL with a bearer token in it,
+  and the environment is readable from the process table on some systems,
+  inherited by every child a dog spawns, and captured into crash dumps. The
+  reply is opaque text the dog parses rather than a shep type, so a
+  third-party dog is bound to the shape of its own section and not to this
+  project's config model, file discovery or layering rules — changing any of
+  those cannot then break a dog nobody has seen.
+
+  The section is read from disk on every request rather than served from a
+  copy taken at boot. One reader can never be stale, and it is what makes
+  `shep disable X && shep enable X` pick up an edited section. A missing
+  file, or a file with no such section, answers with the empty string: a dog
+  with no configuration is the ordinary case, not a fault.
+
+  Enabling a dog under a name a sheep already holds is refused rather than
+  answered. Starting one is idempotent by name, so what comes back is
+  whatever already holds the name; an unmarked entry means no dog started and
+  none can while the name is taken, and reporting it would claim a success
+  that never happened.
+
+- Start a dog. `SupervisorHandle::start_dog` registers one through the same
+  spawn path a sheep takes, and writes onto its entry where the dog came
+  from. The marker rides the entry rather than a registry of its own, which
+  is what makes a restart, a memory-limit respawn, a cron occurrence, a
+  watch-triggered restart and a reload all keep it without any of them
+  knowing dogs exist — a reload reads it off the instance it is replacing,
+  and everything else mutates the entry in place. It lands on a dog that
+  failed to spawn too: a binary that is not there has to be visible as
+  `errored` in the dogs table, not as a sheep nobody started.
+
+  Starting a dog is idempotent by name. `shep enable` runs against a daemon
+  that may already have the dog, and a second live process under one name
+  would mean two connections, two metrics listeners on one port and two
+  copies of every bark; the dog already registered is reported as it stands
+  instead. A dog is refused outright once a graceful shutdown has begun, the
+  same rule `start`, `restart` and `reload` follow — the shutdown's kill list
+  is fixed when it runs, so a child registered after it is one nothing would
+  kill.
+
+- Keep a dog out of what a wildcard selector sweeps. `stop all`, `reload all`,
+  `delete all`, `describe all` and a `/regex/` or `fold:` sweep now pass every
+  dog by, while a selector that names one — `shep restart bark`, or its id —
+  still reaches it. `flock` is the deliberate exception: it is the single
+  registry both the flock table and the dogs table are rendered from, so
+  filtering there would leave the second one with nothing to show.
+  A dog is a process an operator installed rather than a member of the flock
+  `all` means, and an operator sweeping the flock does not expect to take the
+  metrics plumbing down with it. Selection is now answered in one place for
+  every verb that resolves a selector against the registry, so the reach of
+  `stop`, `reload`, `reopen`, `flush` and `trigger` cannot drift apart; a
+  by-product is that a multi-match `stop`/`restart` emits its events in id
+  order rather than in whatever order the registry happened to yield.
+
 - Answer `flock` and `describe` with each sheep's live CPU and memory, in the
   two `ProcessInfo` fields shep-core grew for them. The reading is taken when
   the request is served, not read off the last periodic tick, so memory is
@@ -651,6 +745,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whichever of the four raised it.
 
 ### Changes
+
+- Every listing comes back grouped by name: `Actor::snapshot_all` now sorts
+  on `(name, instance, id)` instead of bare `id`. Sorting by id scattered a
+  clustered app's instances across the table; sorting by name is what makes
+  a four-instance app read as one thing at a glance. `instance` keeps a
+  clustered app's slots in their own order once grouped, and `id` breaks the
+  tie a reload creates, where a replacement takes the drainee's slot number
+  with a fresh id.
+
+  Applied once, in `snapshot_all`, because it is the single function every
+  listing reply is built from — `ListFlock`, `Describe`, `Mustered`, and the
+  muster roll's own `list_checked`. Sorting in the CLI instead would leave
+  the metrics dog and bark reading a different order from the operator, and
+  sorting in each verb would be four copies of one rule. Every other
+  id-ordered reply (a `Reopen`, a `Flush`, a triggered action's rows) is
+  unchanged — those build their own order off `matching_ids`, not off this
+  function.
 
 - `ProcessRss` gains a `cpu_ms: u64` field — accumulated CPU time in
   CPU-milliseconds, as the OS reports it, cumulative since the process

@@ -20,6 +20,7 @@ mod table;
 use std::io;
 
 use serde::Serialize;
+use shep_core::protocol::ProcessInfo;
 
 use crate::exit::ExitCode;
 
@@ -32,10 +33,11 @@ use crate::exit::ExitCode;
 // narrowed to that target rather than dropped.
 #[cfg_attr(windows, allow(unused_imports))]
 pub use rows::{
-    DeletedIds, EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, ImportRow, ImportRows, KillRow,
-    PingRow, SavedRollRow, StartupStep, StartupSteps, TriggeredRows,
+    BarkRows, DeletedIds, DogAdoptedRow, DogDisabledRow, DogEnabledRow, DogRehomedRow, DogRows,
+    EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, ImportRow, ImportRows, KillRow, PingRow,
+    SavedRollRow, StartupStep, StartupSteps, TriggeredRows,
 };
-pub use table::{human_bytes, human_duration, render_table};
+pub use table::{human_bytes, human_duration, local_timestamp, render_table};
 
 use crate::cli::Format;
 
@@ -157,6 +159,53 @@ pub fn emit<T: Render>(
             writeln!(out)
         }
         Format::Table => write!(out, "{}", render_table(&data)),
+    }
+}
+
+/// Renders one flock listing: the sheep table, then the dogs table beneath
+/// it whenever any dog is registered.
+///
+/// `Format::Json` renders exactly what [`emit`] would for the whole
+/// listing — one array, every entry, each carrying its own `dog` marker.
+/// The machine surface keeps the single registry the two tables are a
+/// rendering OF, so a consumer never has to reassemble one from two.
+///
+/// `Format::Table` partitions `listing` on [`ProcessInfo::dog`], renders
+/// the sheep half through [`render_table::<FlockRows>`](render_table) as
+/// `flock` always has, and — only when the dogs half is non-empty — appends
+/// a blank line, a `Dogs` caption, and the dogs half through
+/// [`render_table::<DogRows>`](render_table). Nothing about widths,
+/// padding, char-counting or the empty-payload header rule is reimplemented
+/// here: both calls go through the one [`render_table`] every other payload
+/// uses, sized independently because the two tables share no columns. A
+/// flock with no dogs prints exactly what it printed before this type
+/// existed — no caption, no second table.
+///
+/// # Errors
+/// The underlying write failed.
+///
+/// Its only caller, `commands::query::flock`, lives in `commands/`, which is
+/// `#[cfg(unix)]`-gated in `main.rs` — same reason [`Streams::out`] and
+/// [`emit_notice`] carry the same attribute.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn emit_flock(
+    out: &mut dyn io::Write,
+    fmt: Format,
+    command: &str,
+    listing: Vec<ProcessInfo>,
+) -> io::Result<()> {
+    match fmt {
+        Format::Json => emit(out, fmt, command, FlockRows(listing)),
+        Format::Table => {
+            let (dogs, sheep): (Vec<ProcessInfo>, Vec<ProcessInfo>) =
+                listing.into_iter().partition(|p| p.dog.is_some());
+            write!(out, "{}", render_table(&FlockRows(sheep)))?;
+            if dogs.is_empty() {
+                return Ok(());
+            }
+            write!(out, "\nDogs\n")?;
+            write!(out, "{}", render_table(&DogRows(dogs)))
+        }
     }
 }
 
@@ -298,8 +347,24 @@ pub fn write_outcome(result: io::Result<()>) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use shep_core::protocol::DogSource;
+
     use super::*;
-    use crate::output::rows::tests::sample_flock;
+    use crate::output::rows::tests::{dog_info, sample_flock, sample_info};
+
+    /// A sheep named `name`, otherwise `rows::tests::sample_info`'s usual
+    /// fixture. A thin wrapper rather than reaching for that function
+    /// directly: this module's own tests build listings by name (`"web"` a
+    /// sheep, `"bark"` a dog), and this is the sheep half of that shape.
+    fn sheep_info(name: &str) -> ProcessInfo {
+        sample_info(1, name, 60_000)
+    }
+
+    /// One sheep (`"web"`), one dog (`"bark"`) — the smallest listing that
+    /// exercises `emit_flock`'s split, shared by the three tests below.
+    fn mixed_listing() -> Vec<ProcessInfo> {
+        vec![sheep_info("web"), dog_info("bark", DogSource::BuiltIn)]
+    }
 
     /// Pins the JSON envelope's exact shape (`--format json` is a stability
     /// surface, same discipline as the wire protocol). A field renamed or
@@ -380,6 +445,55 @@ mod tests {
             !text.contains("schema_version"),
             "the envelope is a JSON-only concept"
         );
+    }
+
+    /// fails if the two populations are rendered into one table, or if the
+    /// dogs table is hidden behind a flag. Both halves: the sheep table must
+    /// not carry the dog's row, and the dogs table must appear with no flag
+    /// at all — a bark dog that has died is precisely what an operator needs
+    /// to notice, and hiding it means finding out by NOT being paged.
+    #[test]
+    fn a_flock_listing_prints_the_dogs_in_their_own_table() {
+        let mut out = Vec::new();
+        emit_flock(&mut out, Format::Table, "flock", mixed_listing()).unwrap();
+        let text = String::from_utf8(out).unwrap();
+
+        let (sheep_table, dogs_table) = text.split_once("\nDogs\n").expect("a Dogs caption");
+        assert!(sheep_table.contains("web"));
+        assert!(!sheep_table.contains("bark"), "a dog is not a sheep");
+        assert!(dogs_table.contains("bark"));
+        assert!(!dogs_table.contains("web"));
+        assert!(
+            !dogs_table.starts_with("ID"),
+            "the dogs table has no ID column"
+        );
+    }
+
+    /// fails if the JSON surface is split to match the tables. The machine
+    /// surface IS the single registry — one array, every entry, each
+    /// carrying its own marker — and a consumer that had to reassemble one
+    /// from two would be paying for a rendering decision.
+    #[test]
+    fn the_json_surface_stays_one_array_of_every_entry() {
+        let mut out = Vec::new();
+        emit_flock(&mut out, Format::Json, "flock", mixed_listing()).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["data"].as_array().unwrap().len(), 2);
+        assert_eq!(json["data"][0]["dog"], serde_json::Value::Null);
+        assert_eq!(json["data"][1]["dog"]["kind"], "built_in");
+    }
+
+    /// fails if a flock with no dogs prints an empty second table. An empty
+    /// table still prints its header row (`render_table`'s own rule), so a
+    /// caption and a bare header line would appear under every listing on
+    /// every machine running no dogs at all.
+    #[test]
+    fn a_flock_with_no_dogs_prints_one_table_and_no_caption() {
+        let mut out = Vec::new();
+        emit_flock(&mut out, Format::Table, "flock", vec![sheep_info("web")]).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("Dogs"));
     }
 
     /// `Streams` carries `&mut dyn io::Write`, which has no `Debug` of its

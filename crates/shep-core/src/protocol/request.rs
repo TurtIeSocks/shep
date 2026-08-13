@@ -1,5 +1,7 @@
 //! RPC frames: requests, responses, envelopes, and structured errors
 
+use core::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
@@ -127,12 +129,56 @@ pub enum Request {
     /// roll recorded running, leaving every app the flock already has exactly
     /// as it stands
     Muster,
+    /// Ask for one dog's `[dog.<name>]` section, as the dog itself parses it
+    DogConfig {
+        /// The dog's name — the config key, not a selector
+        name: String,
+    },
+    /// Start one dog now, marking it as coming from `source`
+    EnableDog {
+        /// The dog's name
+        name: String,
+        /// Where its binary comes from
+        source: DogSource,
+    },
+    /// Stop and deregister one dog
+    ///
+    /// Answers [`Response::Deleted`], the same reply `Delete` gives: disabling
+    /// deregisters exactly as `Delete` does, so this is the same fact and not
+    /// a coincidence of shape. A variant of its own (`DogDisabled`, say) would
+    /// carry nothing `Deleted` does not.
+    DisableDog {
+        /// The dog's name
+        name: String,
+    },
     /// Graceful daemon shutdown
     KillDaemon,
     /// Subscribe this connection to bus topics (glob patterns)
     Subscribe {
         /// Topic globs, e.g. `process.*`
         topics: Vec<String>,
+    },
+}
+
+/// Where a dog came from: this binary, or one an operator adopted.
+///
+/// The one thing an operator wants when a dog misbehaves, which is why it
+/// is a column rather than a detail. Carried on [`ProcessInfo::dog`], so a
+/// listing distinguishes the two populations without a second request.
+///
+/// `#[non_exhaustive]`: a future source — a dog fetched from a registry,
+/// say — must not need a protocol version bump (IR-20).
+// wire format: changing existing variants is a breaking change
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DogSource {
+    /// An argv branch of the shep binary itself (`shep dog <name>`).
+    BuiltIn,
+    /// A binary an operator adopted, run at the daemon's own trust level.
+    Adopted {
+        /// The binary's path, exactly as the operator gave it to `adopt`.
+        path: String,
     },
 }
 
@@ -207,6 +253,15 @@ pub struct ProcessInfo {
     /// under the same three conditions as [`Self::cpu_percent`], minus the
     /// window one — memory needs no baseline.
     pub memory_bytes: Option<u64>,
+    /// Set when this entry is a dog, naming where the dog came from;
+    /// `None` for a sheep.
+    ///
+    /// Unlike [`Self::cpu_percent`], `None` here does not need to enumerate
+    /// three cases. A daemon built before dogs existed has none, so "not a
+    /// dog" is the true answer whether this peer predates the field or the
+    /// entry is genuinely a sheep — there is no resource-usage-style claim
+    /// a stale zero could get wrong. Do not "fix" this into three cases.
+    pub dog: Option<DogSource>,
 }
 
 /// What happened when the daemon tried to deliver one sheep's triggered
@@ -255,6 +310,54 @@ pub struct ActionReply {
     pub name: String,
     /// What happened when the daemon tried to deliver the action.
     pub outcome: ActionOutcome,
+}
+
+/// A dog's `[dog.<name>]` config section, carried as TOML text.
+///
+/// This travels over the socket rather than the child's environment for
+/// exactly one reason: a dog's section routinely holds webhook credentials
+/// (a Discord or Slack URL with a bearer token embedded), and the socket
+/// path keeps that out of the process table and out of crash dumps. A
+/// derived `Debug` on [`Response`] would undo that the moment something
+/// logs a reply — see the manual `Debug` below, which prints only a length.
+///
+/// `#[serde(transparent)]` makes the wire representation identical to a
+/// bare `String`: this newtype changes nothing about
+/// [`crate::protocol::PROTOCOL_VERSION`] or the pinned snapshot fixtures.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DogSectionToml(String);
+
+impl DogSectionToml {
+    /// The TOML text, empty when the file has no such section.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for DogSectionToml {
+    fn from(toml: String) -> Self {
+        Self(toml)
+    }
+}
+
+impl core::ops::Deref for DogSectionToml {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Debug does not print the section body (IR-41) — see the type doc for why.
+/// Exact-string-tested below (`dog_section_toml_debug_does_not_leak`) so a
+/// future `#[derive(Debug)]` fails that test instead of silently reopening
+/// the leak.
+impl fmt::Debug for DogSectionToml {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DogSectionToml(<{} bytes>)", self.0.len())
+    }
 }
 
 /// One RPC response (pairs with [`Request`] variants)
@@ -323,6 +426,19 @@ pub enum Response {
     /// call spawned would be empty there — indistinguishable from an empty
     /// roll, which is the one outcome an operator needs to tell apart.
     Mustered(Vec<ProcessInfo>),
+    /// Answer to `DogConfig` — the dog's own section, rendered back to TOML.
+    ///
+    /// `toml` is [`DogSectionToml`], not a bare `String`: this text
+    /// routinely carries webhook credentials, and the newtype's manual
+    /// `Debug` keeps them out of a `{:?}`-formatted `Response` — see that
+    /// type's docs for why the section travels over the socket at all.
+    DogSection {
+        /// The `[dog.<name>]` table as TOML text, empty when the file has
+        /// no such section
+        toml: DogSectionToml,
+    },
+    /// Answer to `EnableDog` — the dog as it stands now
+    DogStarted(ProcessInfo),
     /// Answer to `Subscribe`
     Subscribed,
     /// Answer to `KillDaemon`
@@ -459,7 +575,40 @@ mod tests {
             // binary representation holds exactly.
             cpu_percent: Some(12.5),
             memory_bytes: Some(48 * 1024 * 1024),
+            dog: None,
         }
+    }
+
+    /// fails if `DogSource` loses its `tag = "kind"` or its snake_case
+    /// rename, and fails if `Adopted`'s `path` is renamed — any of the three
+    /// changes one of these two strings while every type-level test in this
+    /// module keeps passing. The marker is what the CLI splits two tables on
+    /// and what the metrics dog reports a health gauge from, so a silent
+    /// rename here is a silently empty dogs table.
+    #[test]
+    fn a_dog_source_serializes_snake_case_under_its_kind() {
+        assert_eq!(
+            serde_json::to_string(&DogSource::BuiltIn).unwrap(),
+            r#"{"kind":"built_in"}"#
+        );
+        let adopted = DogSource::Adopted {
+            path: "/usr/local/bin/shep-otel".to_string(),
+        };
+        let wire = r#"{"kind":"adopted","path":"/usr/local/bin/shep-otel"}"#;
+        assert_eq!(serde_json::to_string(&adopted).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<DogSource>(wire).unwrap(), adopted);
+    }
+
+    /// fails if `dog` stops being optional. A daemon built before dogs
+    /// sends a reply with no such key and still announces protocol 1, so a
+    /// required field would make a current client unable to list against it
+    /// at all — the same skew rule `out_file` and `cpu_percent` are pinned
+    /// under, and the same committed-byte-fixture proof.
+    #[test]
+    fn v1_process_info_without_a_dog_marker_still_deserializes() {
+        let fixture = r#"{"id":3,"name":"web","status":"online","pid":4242,"restarts":1,"uptime_ms":60000,"fold":"backend","out_file":"/l/o.log","err_file":"/l/e.log","cpu_percent":12.5,"memory_bytes":50331648}"#;
+        let info: ProcessInfo = serde_json::from_str(fixture).unwrap();
+        assert_eq!(info.dog, None);
     }
 
     #[test]
@@ -561,6 +710,34 @@ mod tests {
                 deadline_ms: None,
                 body: Request::Muster,
             },
+            // The three dog verbs together, in the order an operator meets
+            // them: ask for a section, start a dog, stop one. Adjacent on
+            // purpose — `enable_dog` and `disable_dog` differ by their
+            // `kind` and by `source`, so a `DisableDog` accidentally given
+            // `EnableDog`'s tag shows up here as two near-identical objects
+            // rather than as a diff a reader has to compare field by field.
+            Envelope {
+                id: 11,
+                deadline_ms: None,
+                body: Request::DogConfig {
+                    name: "bark".to_string(),
+                },
+            },
+            Envelope {
+                id: 12,
+                deadline_ms: None,
+                body: Request::EnableDog {
+                    name: "metrics".to_string(),
+                    source: DogSource::BuiltIn,
+                },
+            },
+            Envelope {
+                id: 13,
+                deadline_ms: None,
+                body: Request::DisableDog {
+                    name: "metrics".to_string(),
+                },
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v1", requests);
     }
@@ -610,6 +787,44 @@ mod tests {
                     path: "/home/rin/.shep/flock.json".to_string(),
                     apps: 2,
                 }),
+            },
+            // `sample_info()` above pins the absent marker (a sheep's
+            // `"dog": null`); this row is the only place the present one is
+            // pinned, and `Adopted` rather than `BuiltIn` because it is the
+            // variant carrying a payload — the unit variant's shape is
+            // already proven by every fieldless variant on this wire.
+            Reply {
+                id: 6,
+                result: Ok(Response::Flock(vec![ProcessInfo {
+                    id: 7,
+                    name: "otel".to_string(),
+                    dog: Some(DogSource::Adopted {
+                        path: "/usr/local/bin/shep-otel".to_string(),
+                    }),
+                    ..sample_info()
+                }])),
+            },
+            // The opaque blob, pinned as a blob: the daemon renders a TOML
+            // table into a string and never a typed structure, so what this
+            // row proves is that the section crosses the wire as text.
+            Reply {
+                id: 7,
+                result: Ok(Response::DogSection {
+                    toml: "port = 9615\n".to_string().into(),
+                }),
+            },
+            // The only `Response` variant carrying a BARE `ProcessInfo`
+            // rather than a `Vec` of them: `enable` starts exactly one dog,
+            // and a one-element list would invite a reader to wonder when it
+            // holds two.
+            Reply {
+                id: 8,
+                result: Ok(Response::DogStarted(ProcessInfo {
+                    id: 4,
+                    name: "metrics".to_string(),
+                    dog: Some(DogSource::BuiltIn),
+                    ..sample_info()
+                })),
             },
         ];
         insta::assert_json_snapshot!("reply_wire_v1", replies);
@@ -798,5 +1013,56 @@ mod tests {
         let wire = r#"{"kind":"mustered","data":[]}"#;
         assert_eq!(serde_json::to_string(&reply).unwrap(), wire);
         assert_eq!(serde_json::from_str::<Response>(wire).unwrap(), reply);
+    }
+
+    /// fails if any of the three verbs or either reply is given a `rename`,
+    /// or if `Response`'s `content = "data"` is dropped. `disable_dog`'s
+    /// answer is `Deleted`, which no other test in this module pairs with
+    /// this verb — a handler wired to answer `Deleted` for `EnableDog` would
+    /// still round-trip, and this is where the pairing is written down.
+    #[test]
+    fn the_dog_verbs_serialize_snake_case_with_their_payloads_under_data() {
+        assert_eq!(
+            serde_json::to_string(&Request::DogConfig {
+                name: "bark".to_string()
+            })
+            .unwrap(),
+            r#"{"kind":"dog_config","name":"bark"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::DisableDog {
+                name: "bark".to_string()
+            })
+            .unwrap(),
+            r#"{"kind":"disable_dog","name":"bark"}"#
+        );
+        let section = Response::DogSection {
+            toml: "port = 9615\n".to_string().into(),
+        };
+        let wire = r#"{"kind":"dog_section","data":{"toml":"port = 9615\n"}}"#;
+        assert_eq!(serde_json::to_string(&section).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<Response>(wire).unwrap(), section);
+    }
+
+    #[test]
+    fn dog_section_toml_debug_does_not_leak() {
+        // IR-41: a dog's `[dog.<name>]` section routinely holds webhook
+        // credentials (a Discord/Slack URL with a bearer token embedded).
+        // `Response` derives `Debug`, so this is the one thing standing
+        // between that token and any future `tracing::debug!("{:?}", reply)`.
+        // Exact string pinned so a lazy `#[derive(Debug)]` refactor on
+        // `DogSectionToml` fails this test instead of silently reopening
+        // the leak.
+        let toml: DogSectionToml =
+            "webhook_url = \"https://discord.com/api/webhooks/1/super-secret-token\"\n"
+                .to_string()
+                .into();
+        assert_eq!(format!("{toml:?}"), "DogSectionToml(<70 bytes>)");
+
+        let response = Response::DogSection { toml };
+        assert_eq!(
+            format!("{response:?}"),
+            "DogSection { toml: DogSectionToml(<70 bytes>) }"
+        );
     }
 }

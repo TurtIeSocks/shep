@@ -5,11 +5,13 @@
 pub mod admin;
 pub mod bleats;
 pub mod daemon;
+pub mod dogs;
 pub mod import;
 pub mod lifecycle;
 pub mod logs;
 pub mod muster;
 pub mod query;
 pub(crate) mod selector;
+pub(crate) mod shep_toml;
 pub(crate) mod startup;
 pub mod trigger;

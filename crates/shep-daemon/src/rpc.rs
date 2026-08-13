@@ -24,12 +24,14 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 
 use shep_core::config::normalize_all;
+use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
     BusEvent, Envelope, ProcessInfo, Reply, Request, Response, RpcError, RpcErrorCode, SelectorSpec,
 };
 use shep_core::selector::ProcessSelector;
 
 use crate::bus::TopicFilter;
+use crate::dogs::DogSpec;
 use crate::limits::stats::StatsState;
 use crate::snapshot::{FlockRegistry, SnapshotError, write_atomic};
 use crate::supervisor::{SupervisorError, SupervisorHandle};
@@ -61,6 +63,14 @@ pub struct RpcContext {
     pub(crate) registry: FlockRegistry,
     /// Where [`Self::snapshot_now`] writes the muster roll.
     pub(crate) snapshot_path: PathBuf,
+    /// Where `DogConfig` reads a dog's `[dog.<name>]` section from.
+    ///
+    /// Re-read per request rather than held as parsed config: that is what
+    /// makes `shep disable X && shep enable X` pick up an edited section
+    /// (`crate::dogs::dog_section`).
+    pub(crate) daemon_config: PathBuf,
+    /// This daemon's `$SHEP_HOME` layout, for assembling a dog's app config.
+    pub(crate) paths: ShepPaths,
     /// This daemon's crate version, echoed in the handshake.
     pub(crate) daemon_version: String,
     /// This daemon's OS pid, echoed in the handshake.
@@ -221,8 +231,18 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
             Ok(selector) => match ctx.supervisor.list_checked().await {
                 Err(err) => reply(Err(rpc_error(&err))),
                 Ok(infos) => {
+                    // The same rule `Actor::matching_ids` applies to every
+                    // lifecycle verb, applied here because this filter is
+                    // over `ProcessInfo`s and cannot share that code: a dog
+                    // is a process an operator installed rather than a
+                    // member of the flock, so a sweep passes it by while
+                    // `shep describe metrics` still reaches it. `ListFlock`
+                    // is deliberately NOT filtered — it is the one registry
+                    // both the flock table and the dogs table render from.
+                    let exact = selector.is_exact();
                     let hits: Vec<_> = infos
                         .into_iter()
+                        .filter(|i| exact || i.dog.is_none())
                         .filter(|i| selector.matches(&i.name, i.id, i.fold.as_deref()))
                         .collect();
                     if hits.is_empty() {
@@ -337,6 +357,55 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
                             .collect(),
                     ))),
                 },
+            }
+        }
+        // Re-read per request, never cached: `shep disable X && shep enable X`
+        // is the supported way to reload a dog's configuration, and a copy
+        // taken at boot would answer that with the section as it was.
+        Request::DogConfig { name } => match crate::dogs::dog_section(&ctx.daemon_config, &name) {
+            Ok(toml) => reply(Ok(Response::DogSection { toml: toml.into() })),
+            Err(err) => reply(Err(RpcError {
+                code: RpcErrorCode::InvalidConfig,
+                message: err.to_string(),
+            })),
+        },
+        Request::EnableDog { name, source } => {
+            let spec = DogSpec { name, source };
+            match crate::dogs::dog_app(&spec, &ctx.paths) {
+                Err(err) => reply(Err(RpcError {
+                    code: RpcErrorCode::InvalidConfig,
+                    message: err.to_string(),
+                })),
+                Ok(app) => match ctx.supervisor.start_dog(app, spec.source).await {
+                    // `start_dog` is idempotent by NAME, so what comes back
+                    // is whatever already holds that name. An unmarked
+                    // entry means a sheep holds it: no dog was started, and
+                    // none can be while the name is taken. Answering with
+                    // the sheep would report a success that never happened,
+                    // so it is refused instead — and there is nothing to
+                    // undo, because the supervisor returns the squatter
+                    // without spawning anything.
+                    Ok(info) if info.dog.is_none() => reply(Err(RpcError {
+                        code: RpcErrorCode::InvalidConfig,
+                        message: format!(
+                            "a sheep is already registered as `{}`; rename it or give the dog another name",
+                            spec.name
+                        ),
+                    })),
+                    Ok(info) => reply(Ok(Response::DogStarted(info))),
+                    Err(err) => reply(Err(rpc_error(&err))),
+                },
+            }
+        }
+        // Through `delete` with an exact `Name` selector, which is the whole
+        // reason an exact selector still reaches a dog: disabling one reuses
+        // the stop-then-deregister path every sheep already takes — kill
+        // ladder, graceful timeout, deregistration — rather than opening a
+        // second way to end a supervised process.
+        Request::DisableDog { name } => {
+            match ctx.supervisor.delete(ProcessSelector::Name(name)).await {
+                Ok(ids) => reply(Ok(Response::Deleted(ids))),
+                Err(err) => reply(Err(rpc_error(&err))),
             }
         }
         Request::Subscribe { topics } => match TopicFilter::new(&topics) {
@@ -520,7 +589,7 @@ mod tests {
     use crate::testing::{Harness, SCRIPTED_TREE_BYTES, harness, harness_with_stats};
     use shep_core::config::AppConfig;
     use shep_core::protocol::{
-        ActionOutcome, ActionReply, Request, Response, RpcErrorCode, SelectorSpec,
+        ActionOutcome, ActionReply, DogSource, Request, Response, RpcErrorCode, SelectorSpec,
     };
     use shep_core::status::ProcStatus;
     use shep_core::values::UpDuration;
@@ -1533,5 +1602,191 @@ mod tests {
             "only `flock` and `describe` take a live sample"
         );
         assert_eq!(infos[0].cpu_percent, None);
+    }
+
+    /// Enables `name` as a built-in dog through the real dispatch path,
+    /// returning the entry it registered.
+    async fn enable_dog(ctx: &RpcContext, id: u64, name: &str) -> ProcessInfo {
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    id,
+                    Request::EnableDog {
+                        name: name.to_string(),
+                        source: DogSource::BuiltIn,
+                    },
+                ),
+                ctx,
+            )
+            .await,
+        );
+        let Ok(Response::DogStarted(info)) = reply.result else {
+            panic!("expected DogStarted, got {:?}", reply.result)
+        };
+        info
+    }
+
+    /// fails if `DisableDog` is wired to anything but a real deregistration
+    /// — a handler that answered `Deleted(vec![])` without stopping
+    /// anything passes every type-level test and leaves the dog running
+    /// after `shep disable` reported success.
+    #[tokio::test(start_paused = true)]
+    async fn disabling_a_dog_stops_it_and_takes_it_off_the_listing() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let info = enable_dog(&h.ctx, 1, "bark").await;
+        assert_eq!(info.dog, Some(DogSource::BuiltIn));
+
+        let disabled = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::DisableDog {
+                        name: "bark".to_string(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert_eq!(disabled.result.unwrap(), Response::Deleted(vec![info.id]));
+        assert!(h.ctx.supervisor.list().await.is_empty());
+    }
+
+    /// fails if the daemon serves a section it cached at boot. The file is
+    /// written AFTER the harness built its context, so a cached reader
+    /// answers the empty string here — which is exactly the bug that would
+    /// make `shep disable X && shep enable X` fail to pick up an edit.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_config_request_reads_the_file_as_it_stands_now() {
+        let h = harness(vec![]);
+        std::fs::write(&h.ctx.daemon_config, "[dog.bark]\ndebounce = \"30s\"\n").unwrap();
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::DogConfig {
+                        name: "bark".to_string(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::DogSection { toml }) = reply.result else {
+            panic!("expected DogSection, got {:?}", reply.result)
+        };
+        assert!(toml.contains("30s"));
+    }
+
+    /// fails if `describe all` lists a dog, and fails if `describe <dog>`
+    /// stops reaching one. Both halves: a filter that excluded dogs
+    /// outright would leave `shep describe bark` unable to answer at all,
+    /// and a listing that includes them puts a row in the flock table with
+    /// nowhere to go.
+    #[tokio::test(start_paused = true)]
+    async fn describe_sweeps_past_a_dog_and_still_answers_when_one_is_named() {
+        let h = harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        let started = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(started.result.is_ok(), "{:?}", started.result);
+        let dog = enable_dog(&h.ctx, 2, "bark").await;
+
+        let swept = reply_of(
+            dispatch(
+                envelope(
+                    3,
+                    Request::Describe {
+                        selector: SelectorSpec::All,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::Described(hits)) = swept.result else {
+            panic!("expected Described, got {:?}", swept.result)
+        };
+        assert_eq!(
+            hits.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            vec!["web"],
+            "`all` is the flock, not the kennel"
+        );
+
+        let named = reply_of(
+            dispatch(
+                envelope(
+                    4,
+                    Request::Describe {
+                        selector: SelectorSpec::Name("bark".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::Described(hits)) = named.result else {
+            panic!("expected Described, got {:?}", named.result)
+        };
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, dog.id);
+    }
+
+    /// fails if `EnableDog` reports the sheep that already holds the name
+    /// as though a dog had started. `start_dog` is idempotent by name, so
+    /// the squatter comes back as an `Ok` — and a caller that trusted it
+    /// would print "bark enabled", write `enabled_dogs = ["bark"]`, and
+    /// never have a dog, on this boot or any later one.
+    #[tokio::test(start_paused = true)]
+    async fn enabling_a_dog_over_a_sheeps_name_is_refused_rather_than_faked() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let started = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("bark", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(started.result.is_ok(), "{:?}", started.result);
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::EnableDog {
+                        name: "bark".to_string(),
+                        source: DogSource::BuiltIn,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Err(err) = reply.result else {
+            panic!("expected a refusal, got {:?}", reply.result)
+        };
+        assert_eq!(err.code, RpcErrorCode::InvalidConfig);
+        assert!(
+            err.message.contains("bark"),
+            "the refusal names the collision: {}",
+            err.message
+        );
+        let listed = h.ctx.supervisor.list().await;
+        assert_eq!(listed.len(), 1, "nothing was started: {listed:?}");
+        assert_eq!(listed[0].dog, None);
     }
 }

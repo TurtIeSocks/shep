@@ -1385,196 +1385,6 @@ mod tests {
         assert_no_restart_within(&mut rx, "web", PAST_THE_NEXT_OCCURRENCE).await;
     }
 
-    // The overlap a reload runs on. A replacement takes a NEW id in the
-    // drainee's instance slot and arms BEFORE the drainee's exit disarms the
-    // old id, so `disarm` finds a member still standing and the name group's
-    // two tasks are never touched. Nothing in this type states that ordering
-    // or enforces it — it belongs to the sequence the swap runs — so it is
-    // pinned here, at the tier where "the same worker" is a thing that can be
-    // said out loud.
-    //
-    // WHAT DISTINGUISHES A REBUILD FROM A SURVIVAL. A group torn down and put
-    // straight back is otherwise INDISTINGUISHABLE from one never touched:
-    // `arm` re-spawns a cron worker on the same schedule and re-registers a
-    // watcher on the same root, both succeed in a test environment, and
-    // `groups["web"].cron.is_some()`, the member set below, and every restart
-    // the worker goes on to fire read identically under both orderings. The
-    // observation that does tell them apart is TASK IDENTITY: `JoinHandle::id`
-    // names one spawned task, and a rebuilt group's tasks are different ones.
-    //
-    // The two `AbortHandle`s are what make that identity airtight rather than
-    // merely likely. tokio allows a task id to be reused once the task has
-    // exited AND no handle to it is left alive — which is exactly the state a
-    // teardown produces, since `NameExtras::abort` aborts both tasks and drops
-    // both handles. Holding an `AbortHandle` keeps the id reserved for the
-    // ORIGINAL task for the whole test, so a rebuilt task cannot be handed the
-    // same one and pass this by coincidence. They are held and never fired.
-    //
-    // The clock count is a second, independent half, and it is what stands if
-    // tokio's id semantics ever move: `spawn_cron_worker` reads the wall clock
-    // once on its first poll to derive its next occurrence, so a rebuild costs
-    // a reading that a survival does not. That is a claim about work performed
-    // rather than about identity.
-    //
-    // fails if `arm` stops leaving a live name-group task alone — the
-    // `is_none_or(is_finished)` guard dropped, so every re-arm re-registers the
-    // OS watcher, a step that can fail and whose failure silently costs an app
-    // the watch that restarts it — and fails if `disarm` stops keying its
-    // teardown on the member set emptying.
-    #[tokio::test(start_paused = true)]
-    async fn a_replacement_arming_before_the_drainee_disarms_keeps_the_groups_own_tasks() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        let root = tempfile::tempdir().unwrap();
-        let (handle, _rx, _fixture) = spawn_test_fixture();
-        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
-        let mut registry = ExtrasRegistry::default();
-        // Both per-name extras, because the overlap has to hold for both — and
-        // the watch is the one whose rebuild `arm`'s own doc calls out as
-        // costly rather than merely wasteful.
-        let app = app_with("web", |app| {
-            app.cron_restart = Some("0 * * * *".to_string());
-            app.watch = true;
-            app.cwd = Some(root.path().display().to_string());
-        });
-        handle.start(vec![app.clone()]).await.unwrap();
-
-        // The drainee: id 0, holding instance slot 0.
-        registry.arm(
-            &armed_entry(0, 0, 1000, app.clone(), &paths),
-            idle_prober(),
-            &rig.extras,
-            &handle,
-        );
-        // Lets the cron worker reach its first poll, so the reading taken
-        // below is a settled number rather than a race with it.
-        tokio::task::yield_now().await;
-
-        let group = &registry.groups["web"];
-        let cron = group
-            .cron
-            .as_ref()
-            .expect("fixture check: the cron worker must have armed")
-            .abort_handle();
-        let watch = group
-            .watch
-            .as_ref()
-            .expect("fixture check: the watch must have armed")
-            .abort_handle();
-        let reads_before = rig.clock.reads();
-
-        // The overlap, in the order a swap performs it: the replacement takes
-        // a new id in the drainee's instance slot and goes `Online` first, and
-        // only then does the drainee's exit disarm the old id.
-        registry.arm(
-            &armed_entry(1, 0, 2000, app, &paths),
-            idle_prober(),
-            &rig.extras,
-            &handle,
-        );
-        registry.disarm(0, "web");
-        // Lets a REBUILT worker reach its own first poll. Without this the
-        // clock count below could read unchanged because the replacement's
-        // worker had not run yet, rather than because there is no such worker.
-        tokio::task::yield_now().await;
-
-        let group = &registry.groups["web"];
-        assert_eq!(
-            group.members,
-            HashSet::from([1]),
-            "fixture check: the drainee must really have left a group the \
-             replacement had already joined — this reads the same under either \
-             ordering, which is why it cannot be the claim that matters"
-        );
-        assert_eq!(
-            group.cron.as_ref().map(JoinHandle::id),
-            Some(cron.id()),
-            "the group must still hold the cron worker it was armed with, not \
-             an identical one put back in its place"
-        );
-        assert_eq!(
-            group.watch.as_ref().map(JoinHandle::id),
-            Some(watch.id()),
-            "and the watch it was armed with, whose rebuild means re-registering \
-             the OS watcher"
-        );
-        assert_eq!(
-            rig.clock.reads(),
-            reads_before,
-            "a surviving cron worker performs no startup work; a rebuilt one \
-             reads the clock again to derive its next occurrence"
-        );
-    }
-
-    // Boundary sweep (IR-40): a name group with zero online instances —
-    // armed and disarmed again before it ever gets to do anything.
-    //
-    // The nearest existing case,
-    // `only_the_last_instance_leaving_stops_the_name_groups_cron_worker`,
-    // reaches its teardown through two members and a fired occurrence in
-    // between, so it says nothing about a group that empties before its first
-    // one. That window is not hypothetical: an app whose first spawn is
-    // stopped or deleted straight away — a bad deploy, a `shep start` the
-    // operator immediately reverses — passes through exactly this shape, and
-    // a worker leaked there restarts a flock nobody is running.
-    //
-    // The assertions before the disarm are what keep the silence afterwards
-    // from being vacuous: they say a real cron worker and a real OS watcher
-    // were armed and a real enforcer arming existed, so the quiet below is a
-    // teardown rather than an app that never armed anything.
-    //
-    // The negative half is `assert_no_restart_within` over
-    // `PAST_THE_NEXT_OCCURRENCE`, the bounded window Global Constraints rule
-    // 11 asks for: the same call crosses the hourly occurrence and makes the
-    // claim.
-    //
-    // fails if `disarm` tears a group down only once it has fired at least
-    // once, or keys the teardown on anything other than the member set
-    // emptying.
-    #[tokio::test(start_paused = true)]
-    async fn a_group_disarmed_before_its_first_occurrence_leaves_no_worker_behind() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(&dir);
-        let root = tempfile::tempdir().unwrap();
-        let (handle, mut rx, _fixture) = spawn_test_fixture();
-        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
-        let mut registry = ExtrasRegistry::default();
-        // Both per-name extras and one per-pid extra, so a single disarm has
-        // to reach all three.
-        let app = app_with("web", |app| {
-            app.cron_restart = Some("0 * * * *".to_string());
-            app.watch = true;
-            app.cwd = Some(root.path().display().to_string());
-            app.max_memory = Some(MemSize::from_bytes(1024));
-        });
-        handle.start(vec![app.clone()]).await.unwrap();
-
-        registry.arm(
-            &armed_entry(0, 0, 1000, app, &paths),
-            idle_prober(),
-            &rig.extras,
-            &handle,
-        );
-        let group = &registry.groups["web"];
-        assert_eq!(group.members, HashSet::from([0]));
-        assert!(group.cron.is_some(), "the cron worker must have armed");
-        assert!(group.watch.is_some(), "the watch must have armed");
-        assert_eq!(rig.enforcer.arms().len(), 1);
-
-        registry.disarm(0, "web");
-
-        assert!(
-            registry.groups.is_empty(),
-            "a group whose only member left before its first occurrence must go with it"
-        );
-        assert!(
-            registry.instances.is_empty(),
-            "the same disarm must take the instance's own extras too"
-        );
-        assert_eq!(rig.enforcer.disarms(), vec![0]);
-        assert_no_restart_within(&mut rx, "web", PAST_THE_NEXT_OCCURRENCE).await;
-    }
-
     // fails if `disarm` reads "this id was not a member" as "the last member
     // just left" and tears down a group every one of whose instances is still
     // armed — and fails if it panics on a name it never saw. The restart at
@@ -1664,67 +1474,6 @@ mod tests {
             2,
             "a re-arm must rebuild a name-group task that ended on its own"
         );
-    }
-
-    // The watch twin of the case above, and it needs to exist separately: the
-    // gate is two independent conditions, so a watch half narrowed to
-    // `group.watch.is_none()` leaves the cron case — and every other
-    // assertion in this file — perfectly green while an app that ended its
-    // watch stays unwatched forever. fails if that half stops asking whether
-    // the handle is ALIVE rather than merely present.
-    //
-    // The ending is forced with `abort` rather than by killing the
-    // `WatchSource` the loop really returns on. That source dies with the
-    // debouncer's own OS thread, which nothing available to a test reaches —
-    // deleting the watched tree does not close it — and both leave the map in
-    // the one state the gate reads: a finished handle.
-    //
-    // The save at the end is what makes the claim behavioural rather than
-    // structural. A rebuilt watch has to have re-registered a real OS watcher
-    // on the root; replacing the handle alone would restart nothing.
-    //
-    // Real time and a real filesystem, like every case that drives notify.
-    // Twelve scripts against two spawns: the start, and the save's restart.
-    #[tokio::test]
-    async fn a_watch_that_ended_on_its_own_is_rebuilt_on_the_next_arm() {
-        let home = tempfile::tempdir().unwrap();
-        let paths = test_paths(&home);
-        let root = tempfile::tempdir().unwrap();
-        let (handle, mut rx, _fixture) = spawn_test_fixture();
-        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
-        let mut registry = ExtrasRegistry::default();
-        let app = app_with("web", |app| {
-            app.watch = true;
-            app.cwd = Some(root.path().display().to_string());
-            app.watch_delay = Some(UpDuration::from_millis(
-                real_time::TEST_DELAY.as_millis() as u64
-            ));
-        });
-        handle.start(vec![app.clone()]).await.unwrap();
-
-        registry.arm(
-            &armed_entry(0, 0, 1000, app.clone(), &paths),
-            idle_prober(),
-            &rig.extras,
-            &handle,
-        );
-        let armed = registry.groups["web"]
-            .watch
-            .as_ref()
-            .expect("the first arm registers a watcher");
-        armed.abort();
-        settle_finished(armed).await;
-
-        registry.arm(
-            &armed_entry(0, 0, 2000, app, &paths),
-            idle_prober(),
-            &rig.extras,
-            &handle,
-        );
-
-        touch(root.path(), "trigger.txt").unwrap();
-        let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
-        assert_eq!(info.restarts, 1);
     }
 
     // fails if group membership is recorded from what an arming managed to
@@ -1978,216 +1727,6 @@ mod tests {
         // that kept probing after reporting would report again inside this
         // window.
         assert_no_liveness_within(&mut rig.liveness, interval * 3).await;
-    }
-
-    // fails if a watched app is never armed at all; if the root is not
-    // canonicalized (on macOS a tempdir under `/var/...` is delivered as
-    // `/private/var/...`, every `strip_prefix` fails, and the watch fires
-    // never); or if the last instance leaving does not abort the group —
-    // which is the whole of "stopping a name stops its watch" (one instance
-    // here, so the name and the instance are the same thing).
-    //
-    // Real time and a real filesystem: notify's backend is the OS, and a
-    // paused clock does not move it.
-    #[tokio::test]
-    async fn a_watched_app_restarts_on_a_save_and_goes_quiet_once_disarmed() {
-        let home = tempfile::tempdir().unwrap();
-        let paths = test_paths(&home);
-        let root = tempfile::tempdir().unwrap();
-        let (handle, mut rx, _fixture) = spawn_test_fixture();
-        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
-        let mut registry = ExtrasRegistry::default();
-        let app = app_with("web", |app| {
-            app.watch = true;
-            app.cwd = Some(root.path().display().to_string());
-            // The one owner of this subsystem's real-time constants
-            // (`watch::real_time`), converted rather than re-declared.
-            app.watch_delay = Some(UpDuration::from_millis(
-                real_time::TEST_DELAY.as_millis() as u64
-            ));
-        });
-        handle.start(vec![app.clone()]).await.unwrap();
-        registry.arm(
-            &armed_entry(0, 0, 1000, app, &paths),
-            idle_prober(),
-            &rig.extras,
-            &handle,
-        );
-
-        touch(root.path(), "trigger.txt").unwrap();
-        let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
-        assert_eq!(info.restarts, 1);
-
-        registry.disarm(0, "web");
-        touch(root.path(), "after-disarm.txt").unwrap();
-        assert_no_restart_within(&mut rx, "web", real_time::NO_EVENT_WINDOW).await;
-    }
-
-    // fails if `DEFAULT_WATCH_DELAY` is not what an app naming no
-    // `watch_delay` gets. It is 500ms; any fallback long enough to matter (a
-    // stray `Duration::from_secs(600)`, say) leaves the save below with no
-    // restart inside the deadline, and an app that asked to be watched would
-    // in production appear to be watched by nothing.
-    //
-    // Real time and a real filesystem, like every case that drives notify.
-    #[tokio::test]
-    async fn a_watched_app_naming_no_delay_still_restarts_on_a_save() {
-        let home = tempfile::tempdir().unwrap();
-        let paths = test_paths(&home);
-        let root = tempfile::tempdir().unwrap();
-        let (handle, mut rx, _fixture) = spawn_test_fixture();
-        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
-        let mut registry = ExtrasRegistry::default();
-        let app = app_with("web", |app| {
-            app.watch = true;
-            app.cwd = Some(root.path().display().to_string());
-            // No `watch_delay`: this case exists for the default.
-        });
-        handle.start(vec![app.clone()]).await.unwrap();
-        registry.arm(
-            &armed_entry(0, 0, 1000, app, &paths),
-            idle_prober(),
-            &rig.extras,
-            &handle,
-        );
-
-        touch(root.path(), "trigger.txt").unwrap();
-        let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
-        assert_eq!(info.restarts, 1);
-    }
-
-    // The watch's own door into the same claim the cron case makes, and it
-    // needs its own case: the two subsystems pick their `SupervisorHandle`
-    // method independently, so a watch loop calling the operator's `restart`
-    // leaves every cron assertion green.
-    //
-    // fails if `run_group` restarts through `restart` rather than
-    // `restart_automatic` — under which a file save reaches every subscriber
-    // as `manually: true`, and an editor's autosave is reported as a deploy.
-    //
-    // Real time and a real filesystem, like every case that drives notify.
-    #[tokio::test]
-    async fn a_watch_restart_is_not_reported_as_a_user_action() {
-        let home = tempfile::tempdir().unwrap();
-        let paths = test_paths(&home);
-        let root = tempfile::tempdir().unwrap();
-        let (handle, mut rx, _fixture) = spawn_test_fixture();
-        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
-        let mut registry = ExtrasRegistry::default();
-        let app = app_with("web", |app| {
-            app.watch = true;
-            app.cwd = Some(root.path().display().to_string());
-            app.watch_delay = Some(UpDuration::from_millis(
-                real_time::TEST_DELAY.as_millis() as u64
-            ));
-        });
-        handle.start(vec![app.clone()]).await.unwrap();
-        registry.arm(
-            &armed_entry(0, 0, 1000, app, &paths),
-            idle_prober(),
-            &rig.extras,
-            &handle,
-        );
-
-        touch(root.path(), "trigger.txt").unwrap();
-
-        let (info, manually) =
-            expect_restart_event(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
-        assert_eq!(info.restarts, 1);
-        assert!(
-            !manually,
-            "a file changing under a watched tree is not a user action"
-        );
-    }
-
-    // fails if `arm_watch` builds its filter from empty slices rather than
-    // from the app's own `watch_options`/`ignore_watch` — the shape under
-    // which every ignore rule the user wrote is silently discarded and a build
-    // directory's own churn restarts the app forever. The trigger at the end
-    // is what makes the silence able to fail: the same watch, the same window,
-    // a name the filter does not ignore.
-    #[tokio::test]
-    async fn a_watched_app_ignores_the_paths_its_ignore_watch_names() {
-        let home = tempfile::tempdir().unwrap();
-        let paths = test_paths(&home);
-        let root = tempfile::tempdir().unwrap();
-        let (handle, mut rx, _fixture) = spawn_test_fixture();
-        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
-        let mut registry = ExtrasRegistry::default();
-        let app = app_with("web", |app| {
-            app.watch = true;
-            app.cwd = Some(root.path().display().to_string());
-            app.ignore_watch = vec!["ignored.txt".to_string()];
-            app.watch_delay = Some(UpDuration::from_millis(
-                real_time::TEST_DELAY.as_millis() as u64
-            ));
-        });
-        handle.start(vec![app.clone()]).await.unwrap();
-        registry.arm(
-            &armed_entry(0, 0, 1000, app, &paths),
-            idle_prober(),
-            &rig.extras,
-            &handle,
-        );
-
-        touch(root.path(), "ignored.txt").unwrap();
-        assert_no_restart_within(&mut rx, "web", real_time::NO_EVENT_WINDOW).await;
-
-        touch(root.path(), "trigger.txt").unwrap();
-        let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
-        assert_eq!(info.restarts, 1);
-    }
-
-    // fails if the watch's ignore set is the default globs plus `ignore_watch`
-    // and nothing else. An app naming an explicit `out_file`/`err_file` under
-    // its own `cwd` then restarts on its own log writes, and the loop is
-    // self-sustaining: the startup line trips the debounce, the debounce
-    // restarts the group, the restart writes another startup line.
-    // `max_restarts` cannot end it — an automatic restart resets the budget —
-    // and `**/logs/**` does not cover it, since nothing makes an explicit log
-    // path live in a directory called `logs`.
-    //
-    // BOTH log paths are pointed inside the tree, so an implementation that
-    // derives an ignore from `out_file` alone still reddens. The trigger at the
-    // end is what makes the silence able to fail: the same watch, the same
-    // window, a sibling file the filter has no reason to ignore.
-    //
-    // Real time and a real filesystem, like every case that drives notify.
-    #[tokio::test]
-    async fn a_watched_app_ignores_its_own_log_writes() {
-        let home = tempfile::tempdir().unwrap();
-        let paths = test_paths(&home);
-        let root = tempfile::tempdir().unwrap();
-        let (handle, mut rx, _fixture) = spawn_test_fixture();
-        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
-        let mut registry = ExtrasRegistry::default();
-        let app = app_with("web", |app| {
-            app.watch = true;
-            app.cwd = Some(root.path().display().to_string());
-            // Absolute, under the watched tree, and named nothing like `logs`
-            // — the arrangement that really does put a shep write inside the
-            // tree an app asked to have watched.
-            app.out_file = Some(root.path().join("app-out.txt").display().to_string());
-            app.err_file = Some(root.path().join("app-err.txt").display().to_string());
-            app.watch_delay = Some(UpDuration::from_millis(
-                real_time::TEST_DELAY.as_millis() as u64
-            ));
-        });
-        handle.start(vec![app.clone()]).await.unwrap();
-        registry.arm(
-            &armed_entry(0, 0, 1000, app, &paths),
-            idle_prober(),
-            &rig.extras,
-            &handle,
-        );
-
-        touch(root.path(), "app-out.txt").unwrap();
-        touch(root.path(), "app-err.txt").unwrap();
-        assert_no_restart_within(&mut rx, "web", real_time::NO_EVENT_WINDOW).await;
-
-        touch(root.path(), "trigger.txt").unwrap();
-        let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
-        assert_eq!(info.restarts, 1);
     }
 
     // fails if `arm_watch` hands `watch_delay` to the debouncer as written.
@@ -2945,75 +2484,544 @@ mod tests {
         assert_eq!(failure, LivenessFailure { id: 0, pid });
     }
 
-    // fails if the prober handed to a liveness loop is built from the app's
-    // own `config.env` rather than the ASSEMBLED spec's, or built once at
-    // boot and shared: `probe_exec` runs `env_clear().envs(&self.env)`, and
-    // `SHEP_INSTANCE` is written by `assemble` and by nothing else, so under
-    // either bug the variable expands to nothing, `live-` matches no file,
-    // and BOTH instances report. Also fails if the actor assembles with a
-    // hardcoded instance 0, under which neither reports.
-    //
-    // A file, not a port: `test -f` flips fail->pass with no listener, no
-    // reserved port and no race, so the only thing this case can fail on is
-    // the environment the probe ran with. Real time, and `#[cfg(unix)]` on
-    // the test rather than on anything else, so the Windows leg still
-    // compiles and runs every case above.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn each_instances_liveness_probe_runs_with_its_own_assembled_env() {
-        let markers = tempfile::tempdir().unwrap();
-        // Instance 0's marker exists; instance 1's never will.
-        std::fs::write(markers.path().join("live-0"), b"").unwrap();
+    /// Tests that wait on real filesystem events or real elapsed time.
+    ///
+    /// The inner loop skips this module with `--skip ::slow::`; the full
+    /// suite still runs them because nothing here is `#[ignore]`d.
+    mod slow {
+        use super::*;
 
-        let mut h = harness(vec![ProcScript::never_exits(); 4]);
-        h.ctx
-            .supervisor
-            .start(vec![app_with("web", |app| {
-                app.instances = 2;
-                app.liveness_probe = Some(ProbeConfig {
-                    failure_threshold: 1,
-                    interval: PROBE_INTERVAL,
-                    timeout: UpDuration::from_millis(5_000),
-                    ..probe_config(
-                        ProbeKind::Exec,
-                        &format!(
-                            r#"test -f "{}/live-$SHEP_INSTANCE""#,
-                            markers.path().display()
-                        ),
-                    )
-                });
-            })])
-            .await
-            .unwrap();
+        // The overlap a reload runs on. A replacement takes a NEW id in the
+        // drainee's instance slot and arms BEFORE the drainee's exit disarms the
+        // old id, so `disarm` finds a member still standing and the name group's
+        // two tasks are never touched. Nothing in this type states that ordering
+        // or enforces it — it belongs to the sequence the swap runs — so it is
+        // pinned here, at the tier where "the same worker" is a thing that can be
+        // said out loud.
+        //
+        // WHAT DISTINGUISHES A REBUILD FROM A SURVIVAL. A group torn down and put
+        // straight back is otherwise INDISTINGUISHABLE from one never touched:
+        // `arm` re-spawns a cron worker on the same schedule and re-registers a
+        // watcher on the same root, both succeed in a test environment, and
+        // `groups["web"].cron.is_some()`, the member set below, and every restart
+        // the worker goes on to fire read identically under both orderings. The
+        // observation that does tell them apart is TASK IDENTITY: `JoinHandle::id`
+        // names one spawned task, and a rebuilt group's tasks are different ones.
+        //
+        // The two `AbortHandle`s are what make that identity airtight rather than
+        // merely likely. tokio allows a task id to be reused once the task has
+        // exited AND no handle to it is left alive — which is exactly the state a
+        // teardown produces, since `NameExtras::abort` aborts both tasks and drops
+        // both handles. Holding an `AbortHandle` keeps the id reserved for the
+        // ORIGINAL task for the whole test, so a rebuilt task cannot be handed the
+        // same one and pass this by coincidence. They are held and never fired.
+        //
+        // The clock count is a second, independent half, and it is what stands if
+        // tokio's id semantics ever move: `spawn_cron_worker` reads the wall clock
+        // once on its first poll to derive its next occurrence, so a rebuild costs
+        // a reading that a survival does not. That is a claim about work performed
+        // rather than about identity.
+        //
+        // fails if `arm` stops leaving a live name-group task alone — the
+        // `is_none_or(is_finished)` guard dropped, so every re-arm re-registers the
+        // OS watcher, a step that can fail and whose failure silently costs an app
+        // the watch that restarts it — and fails if `disarm` stops keying its
+        // teardown on the member set emptying.
+        #[tokio::test(start_paused = true)]
+        async fn a_replacement_arming_before_the_drainee_disarms_keeps_the_groups_own_tasks() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = test_paths(&dir);
+            let root = tempfile::tempdir().unwrap();
+            let (handle, _rx, _fixture) = spawn_test_fixture();
+            let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+            let mut registry = ExtrasRegistry::default();
+            // Both per-name extras, because the overlap has to hold for both — and
+            // the watch is the one whose rebuild `arm`'s own doc calls out as
+            // costly rather than merely wasteful.
+            let app = app_with("web", |app| {
+                app.cron_restart = Some("0 * * * *".to_string());
+                app.watch = true;
+                app.cwd = Some(root.path().display().to_string());
+            });
+            handle.start(vec![app.clone()]).await.unwrap();
 
-        let listing = h.ctx.supervisor.list().await;
-        // `ProcessInfo` carries no instance number, but the assembler's log
-        // path does — and it is the same `assemble` call the prober's env
-        // came from, so this pins WHICH instance id 1 is rather than assuming
-        // the allocation order.
-        assert!(
-            listing[1]
-                .out_file
+            // The drainee: id 0, holding instance slot 0.
+            registry.arm(
+                &armed_entry(0, 0, 1000, app.clone(), &paths),
+                idle_prober(),
+                &rig.extras,
+                &handle,
+            );
+            // Lets the cron worker reach its first poll, so the reading taken
+            // below is a settled number rather than a race with it.
+            tokio::task::yield_now().await;
+
+            let group = &registry.groups["web"];
+            let cron = group
+                .cron
                 .as_ref()
-                .is_some_and(|path| path.ends_with("web-1-out.log")),
-            "id 1 must be instance 1: {:?}",
-            listing[1].out_file
-        );
-        let instance_one_pid = listing[1].pid.expect("a live sheep has a pid");
+                .expect("fixture check: the cron worker must have armed")
+                .abort_handle();
+            let watch = group
+                .watch
+                .as_ref()
+                .expect("fixture check: the watch must have armed")
+                .abort_handle();
+            let reads_before = rig.clock.reads();
 
-        let failure = expect_liveness(&mut h.liveness, LIVENESS_DEADLINE).await;
-        assert_eq!(
-            failure,
-            LivenessFailure {
-                id: 1,
-                pid: instance_one_pid
-            },
-            "only the instance whose own marker is missing may report"
-        );
-        // Both orderings must fail against the broken implementations above:
-        // under them BOTH instances report and which arrives first is a race,
-        // so the window that catches the other one is not optional. A bounded
-        // `timeout` + `recv` spanning two further probe cycles, per rule 11.
-        assert_no_liveness_within(&mut h.liveness, PROBE_INTERVAL.as_duration() * 3).await;
+            // The overlap, in the order a swap performs it: the replacement takes
+            // a new id in the drainee's instance slot and goes `Online` first, and
+            // only then does the drainee's exit disarm the old id.
+            registry.arm(
+                &armed_entry(1, 0, 2000, app, &paths),
+                idle_prober(),
+                &rig.extras,
+                &handle,
+            );
+            registry.disarm(0, "web");
+            // Lets a REBUILT worker reach its own first poll. Without this the
+            // clock count below could read unchanged because the replacement's
+            // worker had not run yet, rather than because there is no such worker.
+            tokio::task::yield_now().await;
+
+            let group = &registry.groups["web"];
+            assert_eq!(
+                group.members,
+                HashSet::from([1]),
+                "fixture check: the drainee must really have left a group the \
+             replacement had already joined — this reads the same under either \
+             ordering, which is why it cannot be the claim that matters"
+            );
+            assert_eq!(
+                group.cron.as_ref().map(JoinHandle::id),
+                Some(cron.id()),
+                "the group must still hold the cron worker it was armed with, not \
+             an identical one put back in its place"
+            );
+            assert_eq!(
+                group.watch.as_ref().map(JoinHandle::id),
+                Some(watch.id()),
+                "and the watch it was armed with, whose rebuild means re-registering \
+             the OS watcher"
+            );
+            assert_eq!(
+                rig.clock.reads(),
+                reads_before,
+                "a surviving cron worker performs no startup work; a rebuilt one \
+             reads the clock again to derive its next occurrence"
+            );
+        }
+
+        // Boundary sweep (IR-40): a name group with zero online instances —
+        // armed and disarmed again before it ever gets to do anything.
+        //
+        // The nearest existing case,
+        // `only_the_last_instance_leaving_stops_the_name_groups_cron_worker`,
+        // reaches its teardown through two members and a fired occurrence in
+        // between, so it says nothing about a group that empties before its first
+        // one. That window is not hypothetical: an app whose first spawn is
+        // stopped or deleted straight away — a bad deploy, a `shep start` the
+        // operator immediately reverses — passes through exactly this shape, and
+        // a worker leaked there restarts a flock nobody is running.
+        //
+        // The assertions before the disarm are what keep the silence afterwards
+        // from being vacuous: they say a real cron worker and a real OS watcher
+        // were armed and a real enforcer arming existed, so the quiet below is a
+        // teardown rather than an app that never armed anything.
+        //
+        // The negative half is `assert_no_restart_within` over
+        // `PAST_THE_NEXT_OCCURRENCE`, the bounded window Global Constraints rule
+        // 11 asks for: the same call crosses the hourly occurrence and makes the
+        // claim.
+        //
+        // fails if `disarm` tears a group down only once it has fired at least
+        // once, or keys the teardown on anything other than the member set
+        // emptying.
+        #[tokio::test(start_paused = true)]
+        async fn a_group_disarmed_before_its_first_occurrence_leaves_no_worker_behind() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = test_paths(&dir);
+            let root = tempfile::tempdir().unwrap();
+            let (handle, mut rx, _fixture) = spawn_test_fixture();
+            let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+            let mut registry = ExtrasRegistry::default();
+            // Both per-name extras and one per-pid extra, so a single disarm has
+            // to reach all three.
+            let app = app_with("web", |app| {
+                app.cron_restart = Some("0 * * * *".to_string());
+                app.watch = true;
+                app.cwd = Some(root.path().display().to_string());
+                app.max_memory = Some(MemSize::from_bytes(1024));
+            });
+            handle.start(vec![app.clone()]).await.unwrap();
+
+            registry.arm(
+                &armed_entry(0, 0, 1000, app, &paths),
+                idle_prober(),
+                &rig.extras,
+                &handle,
+            );
+            let group = &registry.groups["web"];
+            assert_eq!(group.members, HashSet::from([0]));
+            assert!(group.cron.is_some(), "the cron worker must have armed");
+            assert!(group.watch.is_some(), "the watch must have armed");
+            assert_eq!(rig.enforcer.arms().len(), 1);
+
+            registry.disarm(0, "web");
+
+            assert!(
+                registry.groups.is_empty(),
+                "a group whose only member left before its first occurrence must go with it"
+            );
+            assert!(
+                registry.instances.is_empty(),
+                "the same disarm must take the instance's own extras too"
+            );
+            assert_eq!(rig.enforcer.disarms(), vec![0]);
+            assert_no_restart_within(&mut rx, "web", PAST_THE_NEXT_OCCURRENCE).await;
+        }
+
+        // The watch twin of the case above, and it needs to exist separately: the
+        // gate is two independent conditions, so a watch half narrowed to
+        // `group.watch.is_none()` leaves the cron case — and every other
+        // assertion in this file — perfectly green while an app that ended its
+        // watch stays unwatched forever. fails if that half stops asking whether
+        // the handle is ALIVE rather than merely present.
+        //
+        // The ending is forced with `abort` rather than by killing the
+        // `WatchSource` the loop really returns on. That source dies with the
+        // debouncer's own OS thread, which nothing available to a test reaches —
+        // deleting the watched tree does not close it — and both leave the map in
+        // the one state the gate reads: a finished handle.
+        //
+        // The save at the end is what makes the claim behavioural rather than
+        // structural. A rebuilt watch has to have re-registered a real OS watcher
+        // on the root; replacing the handle alone would restart nothing.
+        //
+        // Real time and a real filesystem, like every case that drives notify.
+        // Twelve scripts against two spawns: the start, and the save's restart.
+        #[tokio::test]
+        async fn a_watch_that_ended_on_its_own_is_rebuilt_on_the_next_arm() {
+            let home = tempfile::tempdir().unwrap();
+            let paths = test_paths(&home);
+            let root = tempfile::tempdir().unwrap();
+            let (handle, mut rx, _fixture) = spawn_test_fixture();
+            let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+            let mut registry = ExtrasRegistry::default();
+            let app = app_with("web", |app| {
+                app.watch = true;
+                app.cwd = Some(root.path().display().to_string());
+                app.watch_delay = Some(UpDuration::from_millis(
+                    real_time::TEST_DELAY.as_millis() as u64
+                ));
+            });
+            handle.start(vec![app.clone()]).await.unwrap();
+
+            registry.arm(
+                &armed_entry(0, 0, 1000, app.clone(), &paths),
+                idle_prober(),
+                &rig.extras,
+                &handle,
+            );
+            let armed = registry.groups["web"]
+                .watch
+                .as_ref()
+                .expect("the first arm registers a watcher");
+            armed.abort();
+            settle_finished(armed).await;
+
+            registry.arm(
+                &armed_entry(0, 0, 2000, app, &paths),
+                idle_prober(),
+                &rig.extras,
+                &handle,
+            );
+
+            touch(root.path(), "trigger.txt").unwrap();
+            let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
+            assert_eq!(info.restarts, 1);
+        }
+
+        // fails if a watched app is never armed at all; if the root is not
+        // canonicalized (on macOS a tempdir under `/var/...` is delivered as
+        // `/private/var/...`, every `strip_prefix` fails, and the watch fires
+        // never); or if the last instance leaving does not abort the group —
+        // which is the whole of "stopping a name stops its watch" (one instance
+        // here, so the name and the instance are the same thing).
+        //
+        // Real time and a real filesystem: notify's backend is the OS, and a
+        // paused clock does not move it.
+        #[tokio::test]
+        async fn a_watched_app_restarts_on_a_save_and_goes_quiet_once_disarmed() {
+            let home = tempfile::tempdir().unwrap();
+            let paths = test_paths(&home);
+            let root = tempfile::tempdir().unwrap();
+            let (handle, mut rx, _fixture) = spawn_test_fixture();
+            let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+            let mut registry = ExtrasRegistry::default();
+            let app = app_with("web", |app| {
+                app.watch = true;
+                app.cwd = Some(root.path().display().to_string());
+                // The one owner of this subsystem's real-time constants
+                // (`watch::real_time`), converted rather than re-declared.
+                app.watch_delay = Some(UpDuration::from_millis(
+                    real_time::TEST_DELAY.as_millis() as u64
+                ));
+            });
+            handle.start(vec![app.clone()]).await.unwrap();
+            registry.arm(
+                &armed_entry(0, 0, 1000, app, &paths),
+                idle_prober(),
+                &rig.extras,
+                &handle,
+            );
+
+            touch(root.path(), "trigger.txt").unwrap();
+            let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
+            assert_eq!(info.restarts, 1);
+
+            registry.disarm(0, "web");
+            touch(root.path(), "after-disarm.txt").unwrap();
+            assert_no_restart_within(&mut rx, "web", real_time::NO_EVENT_WINDOW).await;
+        }
+
+        // fails if `DEFAULT_WATCH_DELAY` is not what an app naming no
+        // `watch_delay` gets. It is 500ms; any fallback long enough to matter (a
+        // stray `Duration::from_secs(600)`, say) leaves the save below with no
+        // restart inside the deadline, and an app that asked to be watched would
+        // in production appear to be watched by nothing.
+        //
+        // Real time and a real filesystem, like every case that drives notify.
+        #[tokio::test]
+        async fn a_watched_app_naming_no_delay_still_restarts_on_a_save() {
+            let home = tempfile::tempdir().unwrap();
+            let paths = test_paths(&home);
+            let root = tempfile::tempdir().unwrap();
+            let (handle, mut rx, _fixture) = spawn_test_fixture();
+            let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+            let mut registry = ExtrasRegistry::default();
+            let app = app_with("web", |app| {
+                app.watch = true;
+                app.cwd = Some(root.path().display().to_string());
+                // No `watch_delay`: this case exists for the default.
+            });
+            handle.start(vec![app.clone()]).await.unwrap();
+            registry.arm(
+                &armed_entry(0, 0, 1000, app, &paths),
+                idle_prober(),
+                &rig.extras,
+                &handle,
+            );
+
+            touch(root.path(), "trigger.txt").unwrap();
+            let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
+            assert_eq!(info.restarts, 1);
+        }
+
+        // The watch's own door into the same claim the cron case makes, and it
+        // needs its own case: the two subsystems pick their `SupervisorHandle`
+        // method independently, so a watch loop calling the operator's `restart`
+        // leaves every cron assertion green.
+        //
+        // fails if `run_group` restarts through `restart` rather than
+        // `restart_automatic` — under which a file save reaches every subscriber
+        // as `manually: true`, and an editor's autosave is reported as a deploy.
+        //
+        // Real time and a real filesystem, like every case that drives notify.
+        #[tokio::test]
+        async fn a_watch_restart_is_not_reported_as_a_user_action() {
+            let home = tempfile::tempdir().unwrap();
+            let paths = test_paths(&home);
+            let root = tempfile::tempdir().unwrap();
+            let (handle, mut rx, _fixture) = spawn_test_fixture();
+            let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+            let mut registry = ExtrasRegistry::default();
+            let app = app_with("web", |app| {
+                app.watch = true;
+                app.cwd = Some(root.path().display().to_string());
+                app.watch_delay = Some(UpDuration::from_millis(
+                    real_time::TEST_DELAY.as_millis() as u64
+                ));
+            });
+            handle.start(vec![app.clone()]).await.unwrap();
+            registry.arm(
+                &armed_entry(0, 0, 1000, app, &paths),
+                idle_prober(),
+                &rig.extras,
+                &handle,
+            );
+
+            touch(root.path(), "trigger.txt").unwrap();
+
+            let (info, manually) =
+                expect_restart_event(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
+            assert_eq!(info.restarts, 1);
+            assert!(
+                !manually,
+                "a file changing under a watched tree is not a user action"
+            );
+        }
+
+        // fails if `arm_watch` builds its filter from empty slices rather than
+        // from the app's own `watch_options`/`ignore_watch` — the shape under
+        // which every ignore rule the user wrote is silently discarded and a build
+        // directory's own churn restarts the app forever. The trigger at the end
+        // is what makes the silence able to fail: the same watch, the same window,
+        // a name the filter does not ignore.
+        #[tokio::test]
+        async fn a_watched_app_ignores_the_paths_its_ignore_watch_names() {
+            let home = tempfile::tempdir().unwrap();
+            let paths = test_paths(&home);
+            let root = tempfile::tempdir().unwrap();
+            let (handle, mut rx, _fixture) = spawn_test_fixture();
+            let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+            let mut registry = ExtrasRegistry::default();
+            let app = app_with("web", |app| {
+                app.watch = true;
+                app.cwd = Some(root.path().display().to_string());
+                app.ignore_watch = vec!["ignored.txt".to_string()];
+                app.watch_delay = Some(UpDuration::from_millis(
+                    real_time::TEST_DELAY.as_millis() as u64
+                ));
+            });
+            handle.start(vec![app.clone()]).await.unwrap();
+            registry.arm(
+                &armed_entry(0, 0, 1000, app, &paths),
+                idle_prober(),
+                &rig.extras,
+                &handle,
+            );
+
+            touch(root.path(), "ignored.txt").unwrap();
+            assert_no_restart_within(&mut rx, "web", real_time::NO_EVENT_WINDOW).await;
+
+            touch(root.path(), "trigger.txt").unwrap();
+            let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
+            assert_eq!(info.restarts, 1);
+        }
+
+        // fails if the watch's ignore set is the default globs plus `ignore_watch`
+        // and nothing else. An app naming an explicit `out_file`/`err_file` under
+        // its own `cwd` then restarts on its own log writes, and the loop is
+        // self-sustaining: the startup line trips the debounce, the debounce
+        // restarts the group, the restart writes another startup line.
+        // `max_restarts` cannot end it — an automatic restart resets the budget —
+        // and `**/logs/**` does not cover it, since nothing makes an explicit log
+        // path live in a directory called `logs`.
+        //
+        // BOTH log paths are pointed inside the tree, so an implementation that
+        // derives an ignore from `out_file` alone still reddens. The trigger at the
+        // end is what makes the silence able to fail: the same watch, the same
+        // window, a sibling file the filter has no reason to ignore.
+        //
+        // Real time and a real filesystem, like every case that drives notify.
+        #[tokio::test]
+        async fn a_watched_app_ignores_its_own_log_writes() {
+            let home = tempfile::tempdir().unwrap();
+            let paths = test_paths(&home);
+            let root = tempfile::tempdir().unwrap();
+            let (handle, mut rx, _fixture) = spawn_test_fixture();
+            let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+            let mut registry = ExtrasRegistry::default();
+            let app = app_with("web", |app| {
+                app.watch = true;
+                app.cwd = Some(root.path().display().to_string());
+                // Absolute, under the watched tree, and named nothing like `logs`
+                // — the arrangement that really does put a shep write inside the
+                // tree an app asked to have watched.
+                app.out_file = Some(root.path().join("app-out.txt").display().to_string());
+                app.err_file = Some(root.path().join("app-err.txt").display().to_string());
+                app.watch_delay = Some(UpDuration::from_millis(
+                    real_time::TEST_DELAY.as_millis() as u64
+                ));
+            });
+            handle.start(vec![app.clone()]).await.unwrap();
+            registry.arm(
+                &armed_entry(0, 0, 1000, app, &paths),
+                idle_prober(),
+                &rig.extras,
+                &handle,
+            );
+
+            touch(root.path(), "app-out.txt").unwrap();
+            touch(root.path(), "app-err.txt").unwrap();
+            assert_no_restart_within(&mut rx, "web", real_time::NO_EVENT_WINDOW).await;
+
+            touch(root.path(), "trigger.txt").unwrap();
+            let info = expect_restart(&mut rx, "web", real_time::SMOKE_DEADLINE).await;
+            assert_eq!(info.restarts, 1);
+        }
+
+        // fails if the prober handed to a liveness loop is built from the app's
+        // own `config.env` rather than the ASSEMBLED spec's, or built once at
+        // boot and shared: `probe_exec` runs `env_clear().envs(&self.env)`, and
+        // `SHEP_INSTANCE` is written by `assemble` and by nothing else, so under
+        // either bug the variable expands to nothing, `live-` matches no file,
+        // and BOTH instances report. Also fails if the actor assembles with a
+        // hardcoded instance 0, under which neither reports.
+        //
+        // A file, not a port: `test -f` flips fail->pass with no listener, no
+        // reserved port and no race, so the only thing this case can fail on is
+        // the environment the probe ran with. Real time, and `#[cfg(unix)]` on
+        // the test rather than on anything else, so the Windows leg still
+        // compiles and runs every case above.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn each_instances_liveness_probe_runs_with_its_own_assembled_env() {
+            let markers = tempfile::tempdir().unwrap();
+            // Instance 0's marker exists; instance 1's never will.
+            std::fs::write(markers.path().join("live-0"), b"").unwrap();
+
+            let mut h = harness(vec![ProcScript::never_exits(); 4]);
+            h.ctx
+                .supervisor
+                .start(vec![app_with("web", |app| {
+                    app.instances = 2;
+                    app.liveness_probe = Some(ProbeConfig {
+                        failure_threshold: 1,
+                        interval: PROBE_INTERVAL,
+                        timeout: UpDuration::from_millis(5_000),
+                        ..probe_config(
+                            ProbeKind::Exec,
+                            &format!(
+                                r#"test -f "{}/live-$SHEP_INSTANCE""#,
+                                markers.path().display()
+                            ),
+                        )
+                    });
+                })])
+                .await
+                .unwrap();
+
+            let listing = h.ctx.supervisor.list().await;
+            // `ProcessInfo` carries no instance number, but the assembler's log
+            // path does — and it is the same `assemble` call the prober's env
+            // came from, so this pins WHICH instance id 1 is rather than assuming
+            // the allocation order.
+            assert!(
+                listing[1]
+                    .out_file
+                    .as_ref()
+                    .is_some_and(|path| path.ends_with("web-1-out.log")),
+                "id 1 must be instance 1: {:?}",
+                listing[1].out_file
+            );
+            let instance_one_pid = listing[1].pid.expect("a live sheep has a pid");
+
+            let failure = expect_liveness(&mut h.liveness, LIVENESS_DEADLINE).await;
+            assert_eq!(
+                failure,
+                LivenessFailure {
+                    id: 1,
+                    pid: instance_one_pid
+                },
+                "only the instance whose own marker is missing may report"
+            );
+            // Both orderings must fail against the broken implementations above:
+            // under them BOTH instances report and which arrives first is a race,
+            // so the window that catches the other one is not optional. A bounded
+            // `timeout` + `recv` spanning two further probe cycles, per rule 11.
+            assert_no_liveness_within(&mut h.liveness, PROBE_INTERVAL.as_duration() * 3).await;
+        }
     }
 }

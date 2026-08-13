@@ -8,6 +8,38 @@ passing locally, 1 ignored). A spec section is a plan, not a shipped-state
 claim — drift between the two is what this file exists to stop hiding.
 Linked from spec §2.
 
+## Scope decision, 2026-08-12: everything below §2's six cuts ships in v1
+
+Rin's call, after the five v1.1 audits came back: *"we should probably fix
+everything in v1. We're not in a rush to release this to the public. We want
+a hot looking app right off the bat if we have to compete with well
+established apps like pm2 and other rust attempts."*
+
+So this file now holds two different kinds of thing, and the section headings
+say which is which. The six items under "Committed to v1.1+ by design" are
+still deferred — they are scope cuts the spec argues for. Everything under
+"Named as v1.0 in spec §2/§9, not yet built" is a **build queue**, in this
+order:
+
+1. **The audit debt** — what the five 2026-08-12 audits turned up. Real bugs
+   first (`kill_signal` accepts a typo and then sends the wrong signal
+   forever; an on-time `ActionReply` can be matched to the wrong request),
+   then the wire and config asymmetries, then the tooling and doc staleness.
+2. **The rest of the v1.0 surface** — lookout, whistle, serve, dev/runtime,
+   scale/signal/sendline, the KV store, `.js` Flockfile, schemars, the
+   daemon-config flags layer, the `channel.*` topic, lambs in describe, and
+   openrc + BSD rc.d.
+3. **The Windows functional tier — last** (Rin, 2026-08-12). It is the one
+   item whose cost estimate is mostly guesswork: the decision brief put it at
+   +30-40% on the daemon's process-control layer, and that number gets much
+   better once nothing else is in flight to confound it.
+
+**Dogs** (spec §8) was originally queued first and has since shipped, on
+`feat/phase9-dogs`; see "Not deferred" below for what landed.
+
+Ordering is not priority. Windows is last because its estimate is the
+weakest, not because it matters least.
+
 ## Committed to v1.1+ by design (spec §2)
 
 Six deliberate scope cuts, not oversights — spec §2 carries the reasoning:
@@ -19,8 +51,11 @@ Six deliberate scope cuts, not oversights — spec §2 carries the reasoning:
 - Windows polish: service integration, ctrl-event graceful stop, full e2e
   (the functional tier below is the v1.0 target)
 - vcs metadata (`vcs` feature, off by default)
-- `shep web` JSON status endpoint (only if the metrics dog turns out not to
-  cover it)
+- `shep web` JSON status endpoint. Resolved, 2026-08-13: the metrics dog
+  does not cover this — it serves Prometheus exposition text for a
+  scraper, and `shep web` was a hand-fetched JSON payload for a
+  dashboard, an incompatible shape for an incompatible consumer. This
+  stays its own deferred item rather than being folded into the dog.
 
 ## Named as v1.0 in spec §2/§9, not yet built
 
@@ -29,14 +64,9 @@ landed part of a spec section, the entry names the part still missing rather
 than the whole section. See `docs/systematic-refactor/refactor-workspace/`
 for what phase is next.
 
-**Dogs subsystem** (spec §8) — the whole thing: the dog contract, the
-`enable`/`disable`/`dogs`/`barks` verbs and hidden `dog <name>` dispatch,
-the metrics dog (Prometheus on `127.0.0.1:9615`) and its Grafana dashboard
-JSON, the bark dog (Discord/Slack/JSON webhook sinks, alert rules).
-`[daemon] enabled_dogs` and `[dog.<name>]` (`DaemonSection`,
-`crates/shep-core/src/config/daemon.rs`) parse and validate today but have
-no reader — daemon boot now warns if either is set
-(`crates/shep-cli/src/commands/daemon.rs`).
+**OTLP export (metrics dog)** (spec §8) — the metrics dog serves
+Prometheus exposition only; no `otel` cargo feature exists in
+`crates/shep-cli/Cargo.toml`.
 
 **lookout** (spec §9, §13) — the ratatui TUI (`lookout`/`dash` verb).
 `ratatui` is not a dependency of any crate.
@@ -98,6 +128,25 @@ field carries them and lamb pids are not persisted, so `describe` cannot
 render the tree spec §4 promises.
 
 ## Not deferred
+
+**Dogs** (spec §8) **shipped**: the dog contract (`shep_daemon::dogs`,
+`DogSpec`/`DogSource`) — a dog is an ordinary supervised process marked
+with where it came from, not a second kind of supervision; the
+`enable`/`disable`/`adopt`/`rehome`/`dogs`/`barks` verbs and the hidden
+`dog <name>` re-exec dispatch; `[dog.<name>]` served over the socket via
+`Request::DogConfig`, re-read per request rather than cached at boot; the
+metrics dog (Prometheus exposition on `127.0.0.1:9615` by default,
+reference Grafana dashboard in `assets/grafana/`); the bark dog
+(`[dog.bark.sinks]` Discord/Slack/JSON webhooks, `[dog.bark.rules]`
+event/`gave_up`/`restart_rate`/`memory_above` triggers with per-subject
+debounce, bus-plus-poll reconciliation so a dropped event still fires);
+`barks.jsonl`, the size-capped ring both the bark dog and the shepherd's
+own dog-restart-budget record write to. Operator-facing contract:
+`docs/dogs.md`. `[daemon] enabled_dogs` and `[dog.<name>]`
+(`DaemonSection`, `crates/shep-core/src/config/daemon.rs`) have a reader
+now: boot starts every enabled dog from the first, and a dog asks for the
+second over the socket. What §8 still promises beyond this — OTLP export
+— is separate work and remains open, above.
 
 `shep trigger` (custom actions over the shepherd channel, spec §7/§9)
 **shipped**: the fd-3 wire (`ShepherdMessage::Action`/

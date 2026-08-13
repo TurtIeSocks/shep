@@ -481,6 +481,8 @@ pub(crate) fn harness_with_extras(
             events,
             registry: FlockRegistry::new(),
             snapshot_path: paths.snapshot.clone(),
+            daemon_config: paths.daemon_config.clone(),
+            paths: paths.clone(),
             daemon_version: "0.1.0".to_string(),
             pid: 4242,
             shutdown: Arc::new(shutdown),
@@ -536,6 +538,7 @@ pub(crate) fn armed_entry(
         credentials: None,
         out_file: spec.out_file,
         err_file: spec.err_file,
+        dog: None,
     }
 }
 

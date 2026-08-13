@@ -58,6 +58,7 @@ use shep_core::selector::ProcessSelector;
 
 use crate::bus::new_bus;
 use crate::cron::DEFAULT_MAX_CRON_SLEEP;
+use crate::dogs::{DogSpec, spawn_dog_watch};
 use crate::extras::{Extras, ExtrasReports, spawn_extras_reporter};
 use crate::rpc::RpcContext;
 use crate::runner::ProcessRunner;
@@ -510,6 +511,13 @@ pub struct BootOptions {
     /// once the flock is actually back. Both may be set, but in practice
     /// never are: whichever one is supervising, the other is not.
     pub notify_socket: Option<OsString>,
+    /// Dogs to start once the flock is back, in the order given.
+    ///
+    /// Assembled by the caller from `[daemon] enabled_dogs` and
+    /// `[daemon] adopted_dogs`, so shep-daemon never reads `shep.toml`
+    /// itself — the same division [`Self::socket`] and
+    /// [`Self::max_cron_sleep`] already follow.
+    pub dogs: Vec<DogSpec>,
 }
 
 /// Brings the daemon up: signal handlers, layout, roll restore, bus,
@@ -534,12 +542,21 @@ pub struct BootOptions {
 ///    an owned [`std::fs::File`] the CALLER adopted before ever
 ///    constructing [`BootOptions`] (see that field's own doc) — this step
 ///    is a plain write, no fd adoption happens inside `boot` itself;
-/// 4. bus, supervisor, muster restore, snapshot writer, `RpcContext` — and
-///    the point where step 1's SIGUSR2 listener is handed the supervisor it
-///    reopens through, this being the first moment one exists. See
-///    `install_signals`'s own doc, next to its definition in this file, for
-///    why that seam is a channel rather than an argument, and why the gap
-///    between the two steps drops no signal;
+/// 4. bus, supervisor, muster restore, [`BootOptions::dogs`], snapshot
+///    writer, `RpcContext` — and the point where step 1's SIGUSR2 listener
+///    is handed the supervisor it reopens through, this being the first
+///    moment one exists. See `install_signals`'s own doc, next to its
+///    definition in this file, for why that seam is a channel rather than
+///    an argument, and why the gap between the two steps drops no signal.
+///    The dogs come up strictly between the restore and the snapshot
+///    writer, and both halves of that placement are load-bearing: after
+///    the restore, because a metrics dog that started first would answer
+///    for an empty flock for the whole restore window, and a bark dog
+///    would raise a `process.start` alert for every sheep the roll brings
+///    back; before step 5's readiness report, because `Type=notify` going
+///    green is meant to mean the whole daemon — flock and dogs alike — is
+///    up, the same reasoning that put the restore itself inside that
+///    promise;
 /// 5. report readiness to an init system supervising this process directly
 ///    ([`BootOptions::notify_socket`], [`crate::notify`]) — last of all,
 ///    which is the opposite of step 3 and deliberately so: that one answers
@@ -598,6 +615,12 @@ pub async fn boot<R: ProcessRunner>(
 
     // 4. Bus, supervisor, muster restore, snapshot writer, context.
     let events = new_bus();
+    // Spawned the moment the bus exists, ahead of the supervisor that will
+    // ever emit anything onto it: this is a subscriber like the snapshot
+    // writer, not a branch inside the engine (see `spawn_dog_watch`'s own
+    // doc), and giving it a receiver early means it can never miss an
+    // `Errored` a dog reaches during boot's own restore step.
+    let dog_watch = spawn_dog_watch(events.subscribe(), paths.barks.clone());
     let (breach_tx, breach_rx) = mpsc::channel(EXTRAS_REPORT_CAPACITY);
     let (live_tx, live_rx) = mpsc::channel(EXTRAS_REPORT_CAPACITY);
     let extras = Extras::real(
@@ -648,6 +671,13 @@ pub async fn boot<R: ProcessRunner>(
         restore_flock(&paths, &registry, &supervisor).await?;
     }
 
+    // After the restore, before step 5's readiness report — see this fn's
+    // own doc, step 4, for why both halves of that placement are
+    // load-bearing. Never fails the boot: a dog that cannot be spawned is a
+    // monitoring gap, not an outage, and `spawn_enabled_dogs` warns and
+    // carries on rather than propagating anything here.
+    crate::dogs::spawn_enabled_dogs(&options.dogs, &paths, &supervisor).await;
+
     let writer = spawn_snapshot_writer(
         paths.snapshot.clone(),
         supervisor.clone(),
@@ -660,6 +690,8 @@ pub async fn boot<R: ProcessRunner>(
         events,
         registry,
         snapshot_path: paths.snapshot.clone(),
+        daemon_config: paths.daemon_config.clone(),
+        paths: paths.clone(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         pid,
         shutdown,
@@ -685,6 +717,7 @@ pub async fn boot<R: ProcessRunner>(
         ctx,
         listener,
         writer,
+        dog_watch,
         paths,
         socket,
         // Held from here into `RunningDaemon` — `watch::Sender::send` is a
@@ -758,6 +791,12 @@ pub struct RunningDaemon {
     ctx: RpcContext,
     listener: UnixListener,
     writer: SnapshotWriter,
+    // Parks on a broadcast receiver until this handle aborts it (see
+    // `spawn_dog_watch`'s own doc for why holding the handle, not sender
+    // count, is what makes that deterministic). Stopped in `run`'s teardown
+    // step 1 alongside `writer`: both are bus subscribers with no further
+    // reason to run once serving ends.
+    dog_watch: JoinHandle<()>,
     paths: ShepPaths,
     socket: PathBuf,
     // Held from `boot` onward, not created fresh in `run`: `watch::Sender::send`
@@ -806,7 +845,9 @@ impl RunningDaemon {
     /// Serves until a signal or `KillDaemon`, then tears down in order.
     ///
     /// TEARDOWN ORDER IS LOAD-BEARING:
-    /// 1. stop the snapshot writer — nothing may rewrite the roll from here on;
+    /// 1. stop the snapshot writer, and the dog watch alongside it — nothing
+    ///    may rewrite the roll from here on, and no bus subscriber has a
+    ///    reason left to watch once serving ends;
     /// 2. write the final muster roll — records the flock AS IT WAS, still running;
     /// 3. broadcast [`BusEvent::DaemonShutdown`] — subscribers learn before their sockets close;
     /// 4. [`SupervisorHandle::shutdown`] — the kill ladder on every online sheep;
@@ -838,6 +879,7 @@ impl RunningDaemon {
             ctx,
             listener,
             writer,
+            dog_watch,
             paths,
             socket,
             shutdown_rx,
@@ -863,8 +905,11 @@ impl RunningDaemon {
             .serve(shutdown_rx)
             .await;
 
-        // 1. Stop the snapshot writer FIRST — see this fn's doc.
+        // 1. Stop the snapshot writer FIRST — see this fn's doc. The dog
+        //    watch stops alongside it: both are bus subscribers with
+        //    nothing left to watch for once serving ends.
         writer.stop().await;
+        dog_watch.abort();
 
         // 2. Write the final roll while every sheep is still online.
         if let Err(err) = ctx.snapshot_now().await {
@@ -1135,12 +1180,14 @@ impl core::error::Error for BootError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dogs::DogSpec;
     use crate::fake::{ProcScript, ScriptedRunner};
     use crate::snapshot::{FlockSnapshot, SNAPSHOT_VERSION, SavedApp};
     // the one crate-root fixture (IR-33)
-    use crate::testing::{AnnouncingRunner, SharedRunner, test_paths};
+    use crate::testing::{AnnouncingRunner, SharedRunner, capture_logs, test_paths};
     use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, normalize};
-    use shep_core::protocol::ProcessEventKind;
+    use shep_core::protocol::{DogSource, ProcessEventKind};
+    use shep_core::status::ProcStatus;
     use shep_core::values::UpDuration;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
@@ -1657,6 +1704,222 @@ mod tests {
             "the socket is unlinked on a clean exit"
         );
         assert_eq!(read_pidfile(&paths).unwrap(), None);
+    }
+
+    /// fails if the dogs come up before the muster restore, or not at all.
+    /// The order half is the point: a metrics dog that starts first answers
+    /// for an empty flock for the whole restore window, and a bark dog
+    /// raises a start alert for every sheep the roll brought back. The
+    /// assertion reads the ORDER the scripted runner was asked to spawn in
+    /// — [`ScriptedRunner`] hands out pids as `FIRST_SCRIPTED_PID + index`,
+    /// so a lower pid is an earlier spawn — which is the only place the
+    /// sequence is observable.
+    #[tokio::test]
+    async fn boot_restores_the_flock_before_it_lets_the_dogs_out() {
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        let roll = FlockSnapshot {
+            version: SNAPSHOT_VERSION,
+            saved_at_ms: 0,
+            apps: vec![SavedApp {
+                app: AppConfig::minimal("web", "./srv"),
+                instances_running: 1,
+            }],
+        };
+        crate::snapshot::write_atomic(&paths.snapshot, &roll).unwrap();
+
+        let daemon = boot(
+            // Two scripts: the restored sheep's spawn, then the dog's.
+            ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]),
+            paths.clone(),
+            BootOptions {
+                restore: true,
+                dogs: vec![DogSpec {
+                    name: "metrics".to_string(),
+                    source: DogSource::BuiltIn,
+                }],
+                ..BootOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let ctx = daemon.context();
+        let flock = ctx.supervisor.list_checked().await.unwrap();
+        assert_eq!(flock.len(), 2, "the sheep and the dog must both be up");
+
+        let sheep = flock
+            .iter()
+            .find(|p| p.name == "web")
+            .expect("the restored sheep must be present");
+        let dog = flock
+            .iter()
+            .find(|p| p.name == "metrics")
+            .expect("the dog must be present");
+        assert!(
+            sheep.dog.is_none(),
+            "the restored app must carry no dog marker"
+        );
+        assert_eq!(
+            dog.dog,
+            Some(DogSource::BuiltIn),
+            "the dog entry must carry its source"
+        );
+        assert!(
+            sheep.pid < dog.pid,
+            "the sheep must be spawned before the dog: sheep={:?} dog={:?}",
+            sheep.pid,
+            dog.pid
+        );
+
+        drop(daemon); // no run() needed; SignalTasks::drop stops the listeners
+    }
+
+    /// fails if a dog that will not start takes the boot down with it. The
+    /// dog is given no script to spawn against — `ScriptedRunner` answers
+    /// `SpawnFailed("script exhausted")` for the first unscripted spawn — so
+    /// the flock must still come up, and the daemon must still serve.
+    ///
+    /// NOT `#[tokio::test]`: `capture_logs` needs a synchronous closure to
+    /// scope its subscriber to (see its own doc), so this drives `boot`
+    /// through a `block_on` of its own inside that closure instead —
+    /// `two_concurrent_boots_on_a_stale_socket_exactly_one_wins`, above,
+    /// establishes the same `new_current_thread` pattern for the same
+    /// reason.
+    #[test]
+    fn a_dog_that_will_not_start_does_not_fail_the_boot() {
+        let _guard = SIGNAL_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut boot_result = None;
+        let logs = capture_logs(|| {
+            boot_result = Some(rt.block_on(boot(
+                // No scripts queued: the dog's spawn is the first (and
+                // only) one attempted, and finds nothing to pop.
+                ScriptedRunner::new(vec![]),
+                paths.clone(),
+                BootOptions {
+                    dogs: vec![DogSpec {
+                        name: "metrics".to_string(),
+                        source: DogSource::BuiltIn,
+                    }],
+                    ..BootOptions::default()
+                },
+            )));
+        });
+        let daemon = boot_result
+            .unwrap()
+            .expect("a dog that will not start must not fail the boot");
+
+        let flock = rt
+            .block_on(daemon.context().supervisor.list_checked())
+            .unwrap();
+        let dog = flock
+            .iter()
+            .find(|p| p.name == "metrics")
+            .expect("the dog's entry must still be registered");
+        assert_eq!(
+            dog.status,
+            ProcStatus::Errored,
+            "a dog that could not spawn is errored, not silently absent"
+        );
+        assert!(
+            logs.contains("metrics"),
+            "the warning must name the dog that did not start: {logs:?}"
+        );
+        assert!(
+            logs.contains("WARN"),
+            "a dog failing to start is a warning, not silence: {logs:?}"
+        );
+
+        drop(daemon); // no run() needed; SignalTasks::drop stops the listeners
+    }
+
+    /// fails if this boot path answers a name collision the way
+    /// `Request::EnableDog`'s own handler refuses to. `start_dog` is
+    /// idempotent by NAME: enabling a dog under a name a sheep already
+    /// holds comes back `Ok` over the SHEEP, not a started dog, and the RPC
+    /// arm inspects that reply for the missing `dog` marker so it can
+    /// refuse rather than report a success that never happened. Task 6
+    /// flagged this exact gap on the boot path when it built the guard into
+    /// the RPC arm alone — this pins that `spawn_enabled_dogs` closes it
+    /// too, rather than logging the sheep's own info as though a dog had
+    /// started.
+    ///
+    /// `#[test]` + `capture_logs`, not `#[tokio::test]`, for the same
+    /// reason as `a_dog_that_will_not_start_does_not_fail_the_boot` above.
+    #[test]
+    fn a_dog_enabled_under_a_sheeps_name_does_not_start_and_does_not_fail_the_boot() {
+        let _guard = SIGNAL_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        let roll = FlockSnapshot {
+            version: SNAPSHOT_VERSION,
+            saved_at_ms: 0,
+            apps: vec![SavedApp {
+                app: AppConfig::minimal("metrics", "./srv"),
+                instances_running: 1,
+            }],
+        };
+        crate::snapshot::write_atomic(&paths.snapshot, &roll).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut boot_result = None;
+        let logs = capture_logs(|| {
+            boot_result = Some(rt.block_on(boot(
+                // One script: the restored sheep's own spawn. `start_dog`
+                // finds the name already registered and returns early
+                // without ever touching the runner, so a second script
+                // here would go unconsumed if that held.
+                ScriptedRunner::new(vec![ProcScript::never_exits()]),
+                paths.clone(),
+                BootOptions {
+                    restore: true,
+                    dogs: vec![DogSpec {
+                        name: "metrics".to_string(),
+                        source: DogSource::BuiltIn,
+                    }],
+                    ..BootOptions::default()
+                },
+            )));
+        });
+        let daemon = boot_result
+            .unwrap()
+            .expect("a name collision must not fail the boot");
+
+        let flock = rt
+            .block_on(daemon.context().supervisor.list_checked())
+            .unwrap();
+        assert_eq!(
+            flock.len(),
+            1,
+            "the collision must not register a second entry: {flock:?}"
+        );
+        assert!(
+            flock[0].dog.is_none(),
+            "the sheep must not be relabeled as a dog by a same-named enable: {:?}",
+            flock[0]
+        );
+        assert!(
+            logs.contains("metrics"),
+            "the warning must name the collision: {logs:?}"
+        );
+
+        drop(daemon); // no run() needed; SignalTasks::drop stops the listeners
     }
 
     /// fails if the notification is sent before the muster restore finishes.

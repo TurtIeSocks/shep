@@ -3,7 +3,7 @@
 use core::time::Duration;
 use std::path::PathBuf;
 
-use shep_core::{config::ResolvedApp, status::ProcStatus};
+use shep_core::{config::ResolvedApp, protocol::DogSource, status::ProcStatus};
 
 use crate::privilege::Credentials;
 
@@ -52,6 +52,18 @@ pub struct ProcessEntry {
     /// Where this instance's stderr is appended, resolved exactly as
     /// [`Self::out_file`].
     pub err_file: PathBuf,
+    /// Set when this entry is a dog, naming where the dog came from.
+    ///
+    /// A MARKER, and deliberately not a second registry: reload, watch,
+    /// cron, the memory ceiling, the log plane and the muster roll all
+    /// supervise a dog exactly as they supervise a sheep, and a field is
+    /// what keeps that true. It is read where the question is *where did
+    /// this come from* (a listing's source column) or *who should see this*
+    /// (a wildcard selector, a flock table). It is never read to decide how
+    /// a process is supervised — a different kill ladder, backoff curve or
+    /// restart budget keyed on this field is the signal that the separate
+    /// registry should have been built instead.
+    pub dog: Option<DogSource>,
 }
 
 /// Restart budget and consecutive-unstable-exit tracking

@@ -594,6 +594,7 @@ mod tests {
                 err_file: Some("/logs/web-0-err.log".to_string()),
                 cpu_percent: None,
                 memory_bytes: None,
+                dog: None,
             },
             manually: false,
             at_ms: 0,

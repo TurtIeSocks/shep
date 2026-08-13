@@ -58,6 +58,25 @@ use tempfile::TempDir;
 const CMD_TIMEOUT: Duration =
     Duration::from_secs(shep_client::spawn::SPAWN_DEADLINE.as_secs() + 15);
 
+/// Bound on how long [`concurrent_cold_starts_produce_exactly_one_daemon`]
+/// waits for one of its two racers, after which the case FAILS.
+///
+/// [`CMD_TIMEOUT`] does not cover this, and the gap is not academic — it is
+/// the one that let a real daemon bug stall the suite for minutes at a time
+/// rather than report anything. `assert_cmd`'s timeout bounds the *process*
+/// wait; the reader threads it joins afterwards are bounded only by EOF on
+/// the child's stdout and stderr, and EOF waits for the last copy of the
+/// write end to close — including a copy held by a daemon that inherited it
+/// (`shep-cli/src/launch.rs`'s `seal_inherited_fds`). A racer that never
+/// comes back has to be given up on from out here, by the only thread that
+/// can still fail the case.
+///
+/// Sized off [`CMD_TIMEOUT`] the way that constant is sized off
+/// `SPAWN_DEADLINE`: strictly longer, so a racer that is merely slow (a
+/// loaded machine, the full autostart budget) still reports its own outcome
+/// and this bound only ever fires on a racer that is genuinely stuck.
+const RACER_DEADLINE: Duration = Duration::from_secs(CMD_TIMEOUT.as_secs() + 15);
+
 /// How long [`bleats_no_follow_until_written`] keeps retrying.
 const BLEATS_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -128,6 +147,27 @@ const FLOCK_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Gap between [`poll_flock`]'s attempts.
 const FLOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long [`poll_metrics`] keeps retrying a scrape of the metrics dog's
+/// `/metrics` endpoint before giving up.
+///
+/// Covers the same real gap [`FLOCK_DEADLINE`] does for a sheep, one hop
+/// further out: `shep enable metrics` returns once the `EnableDog` RPC is
+/// accepted, before the daemon has necessarily finished exec'ing `shep dog
+/// metrics`, let alone before that process has bound its listener. Sized
+/// the same as `FLOCK_DEADLINE` — both wait on one freshly spawned process
+/// finishing its own startup, not on anything slower.
+const METRICS_SCRAPE_DEADLINE: Duration = FLOCK_DEADLINE;
+
+/// Gap between [`poll_metrics`]'s retries.
+const METRICS_SCRAPE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Bound on a single scrape attempt's own I/O, inside [`poll_metrics`]'s
+/// outer retry loop — a connect that succeeds against a peer that then
+/// never answers (unlikely against this dog, but this is the same belt the
+/// dog's own `READ_TIMEOUT` buckles on the server side) must not be able to
+/// stall the loop past its own deadline.
+const METRICS_SCRAPE_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long [`a_cron_occurrence_restarts_a_sheep_on_the_real_clock`] waits
 /// for its occurrence.
@@ -582,8 +622,30 @@ fn daemon_log_after_a_missed_handshake(dir: &TempDir, env: &[(&str, &str)]) -> S
 /// `Drop` must not panic — panicking while already panicking aborts the
 /// process, taking the rest of the run's output with it — so an unreachable
 /// daemon is reported with `eprintln!` rather than asserted.
+///
+/// # `dog_pids`: the grandchild gap
+///
+/// A dog is a GRANDCHILD of this test process — the daemon spawns it, not
+/// the harness — and `tokio_runner.rs` gives it the same per-child process
+/// group a sheep gets (this file's own module doc on why a sheep is never
+/// in the daemon's group; `shep-daemon`'s own architecture supervises a dog
+/// through that exact code path, no special-casing). So `kill_group_of` on
+/// the daemon's own pid, the loop below, never reaches a dog any more than
+/// it reaches a sheep — [`sweep_flock`] is what closes that gap for a
+/// sheep, off pids its own fixture script records; a dog spawned by `shep
+/// dog <name>` writes to no such file, so a case that starts one registers
+/// its pid here directly with [`Self::adopt_dog_pid`] instead.
+///
+/// Swept unconditionally, unlike `sweep_flock`'s panic-only gate: on the
+/// success path [`graceful_kill`] has already stopped the dog through the
+/// shepherd's own kill ladder — the same one that stops every sheep, since
+/// nothing here special-cases a dog — so this is an `ESRCH` no-op there
+/// (`kill_group_of`'s own doc), not a second teardown path racing the first.
 #[derive(Debug, Default)]
-struct DaemonGuard(Vec<PathBuf>);
+struct DaemonGuard {
+    homes: Vec<PathBuf>,
+    dog_pids: Vec<nix::unistd::Pid>,
+}
 
 impl DaemonGuard {
     /// Register a `$SHEP_HOME` whose daemon this test is responsible for.
@@ -593,14 +655,23 @@ impl DaemonGuard {
     /// exists to reap, in exactly the case (a failed autostart) where a
     /// leaked daemon is most likely.
     fn adopt_home(&mut self, home: &Path) {
-        self.0.push(home.to_path_buf());
+        self.homes.push(home.to_path_buf());
+    }
+
+    /// Register a dog's own pid — a grandchild the daemon spawned, whose
+    /// process group sits outside the daemon's own and so survives this
+    /// guard's ordinary `kill_group_of(daemon_pid)` untouched. See this
+    /// struct's own doc on `dog_pids` for why. Call it as soon as the pid
+    /// is known, same ordering rule [`Self::adopt_home`] gives.
+    fn adopt_dog_pid(&mut self, pid: nix::unistd::Pid) {
+        self.dog_pids.push(pid);
     }
 }
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         let panicking = std::thread::panicking();
-        for home in &self.0 {
+        for home in &self.homes {
             match daemon_pid(home) {
                 Some(pid) => kill_group_of(pid),
                 // No parseable pid, and the case succeeded: the daemon's own
@@ -625,6 +696,10 @@ impl Drop for DaemonGuard {
                 continue;
             }
             sweep_flock(home);
+        }
+
+        for pid in &self.dog_pids {
+            kill_group_of(*pid);
         }
     }
 }
@@ -751,6 +826,100 @@ fn assert_group_leader(pid: nix::unistd::Pid) {
         pid,
         "the daemon must be its own process-group leader"
     );
+}
+
+// --- Dogs helpers -----------------------------------------------------
+
+/// A port with nothing on it: bind `:0`, read what the OS chose, release it.
+///
+/// Same idiom `shep-daemon/tests/daemon_e2e.rs`'s own `free_port` uses, and
+/// the same residual risk: a stranger could take the port between the
+/// release here and the metrics dog's own bind. That loss is loud rather
+/// than quiet — the dog refuses to run and `shep dogs` reports it errored —
+/// so a case that hits it fails with a named cause rather than measuring
+/// something else silently.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("the OS must have a free loopback port")
+        .local_addr()
+        .expect("a bound listener has an address")
+        .port()
+}
+
+/// One attempt at a `GET /metrics` scrape against `addr`, over a plain
+/// `std::net::TcpStream` — no HTTP crate anywhere in this workspace
+/// (`dog::http`'s own module doc gives the reason), so the client side of
+/// this exchange is exactly as hand-rolled as the server side.
+///
+/// Reads to EOF rather than to a declared `content-length`: the metrics
+/// dog's own `handle_connection` answers exactly one request per accepted
+/// connection and then drops the stream, so the peer closing *is* the end
+/// of the response, and there is no keep-alive loop on the other end to
+/// race.
+///
+/// # Errors
+/// Connection refused (nothing bound yet), or no full response within
+/// [`METRICS_SCRAPE_READ_TIMEOUT`].
+fn scrape_metrics(addr: std::net::SocketAddr) -> std::io::Result<String> {
+    use std::io::{Read as _, Write as _};
+    let mut stream = std::net::TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(METRICS_SCRAPE_READ_TIMEOUT))?;
+    stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")?;
+    let mut body = String::new();
+    stream.read_to_string(&mut body)?;
+    Ok(body)
+}
+
+/// [`scrape_metrics`], retried until it answers or [`METRICS_SCRAPE_DEADLINE`]
+/// expires, returning whatever the last attempt saw (`""` if every attempt
+/// failed to connect at all). Bounded the same way every other poll in this
+/// file is — a scrape target that never comes up must fail as a named
+/// assertion on an empty string, never hang the case.
+fn poll_metrics(addr: std::net::SocketAddr) -> String {
+    let start = Instant::now();
+    loop {
+        if let Ok(body) = scrape_metrics(addr) {
+            return body;
+        }
+        if start.elapsed() >= METRICS_SCRAPE_DEADLINE {
+            return String::new();
+        }
+        std::thread::sleep(METRICS_SCRAPE_POLL_INTERVAL);
+    }
+}
+
+/// Runs `shep --home <home> flock --format json` until it answers a `pid`
+/// for a dog named `name`, or [`FLOCK_DEADLINE`] expires — the same real
+/// gap [`poll_flock`] covers for a sheep: `shep enable` returning success
+/// means the `EnableDog` RPC landed, not that the daemon's own supervisor
+/// loop has already recorded a pid for the child it just spawned.
+/// `flock`, not `dogs`, on purpose: `Response::Flock` carries both
+/// populations in one array (`emit_flock`'s own doc — `Format::Json`
+/// renders it undivided), so this needs no verb of its own to reach a
+/// dog's pid, the same way [`poll_flock`] itself needs none to reach a
+/// sheep's.
+///
+/// Panics on expiry rather than returning `None`: every case that calls
+/// this already has a `DaemonGuard` in scope to adopt the pid into once it
+/// is known, and a `None` here would leave a real, running dog process
+/// unregistered with the very guard that exists to reap it — worse than a
+/// named panic pointing straight at the cause.
+fn wait_for_dog_pid(home: &Path, name: &str) -> nix::unistd::Pid {
+    let flock = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        data.as_array().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e["name"] == name && !e["pid"].is_null())
+        })
+    });
+    let dog = flock
+        .as_array()
+        .and_then(|entries| entries.iter().find(|e| e["name"] == name))
+        .unwrap_or_else(|| panic!("no entry named {name} in `shep flock`: {flock}"));
+    let pid = dog["pid"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("dog {name} has no pid after {FLOCK_DEADLINE:?}: {dog}"));
+    nix::unistd::Pid::from_raw(i32::try_from(pid).expect("a real OS pid fits i32"))
 }
 
 /// Runs `shep --home <home> bleats --no-follow` with `args` appended, until
@@ -1122,7 +1291,13 @@ fn a_second_command_reuses_the_daemon_rather_than_spawning_a_second() {
 /// error instead of "keep probing" — the losing invocation would exit
 /// non-zero, failing `assert_success`; two daemons somehow both surviving —
 /// `flock` would show one racer's sheep missing (whichever daemon that
-/// query happened to reach would only know about its own).
+/// query happened to reach would only know about its own); and a daemon
+/// that inherits a racer's stdout pipe and holds it for life — that racer's
+/// `.output()` never returns, and [`RACER_DEADLINE`] fails the case instead
+/// of letting it stall. Each racer is collected over a channel rather than
+/// by joining its thread for exactly that reason: `JoinHandle::join` has no
+/// bounded form, so a stuck racer joined directly stops the suite rather
+/// than reporting.
 #[test]
 fn concurrent_cold_starts_produce_exactly_one_daemon() {
     let dir = tempfile::tempdir().unwrap();
@@ -1136,28 +1311,36 @@ fn concurrent_cold_starts_produce_exactly_one_daemon() {
 
     let names = ["racer-a", "racer-b"];
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(names.len()));
-    let handles: Vec<_> = names
-        .iter()
-        .map(|name| {
-            let home = home.clone();
-            let script = script.clone();
-            let name = (*name).to_string();
-            let barrier = std::sync::Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait(); // both racers launch together
-                shep(&home)
-                    .arg("start")
-                    .arg(&script)
-                    .arg("--name")
-                    .arg(&name)
-                    .output()
-                    .unwrap()
-            })
+    let (finished, racers) = std::sync::mpsc::channel();
+    for name in names {
+        let home = home.clone();
+        let script = script.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        let finished = finished.clone();
+        std::thread::spawn(move || {
+            barrier.wait(); // both racers launch together
+            let output = shep(&home)
+                .arg("start")
+                .arg(&script)
+                .arg("--name")
+                .arg(name)
+                .output()
+                .unwrap();
+            // A closed receiver means the case already gave up on this
+            // racer and failed; there is no one left to report to.
+            let _ = finished.send((name, output));
+        });
+    }
+    drop(finished); // the racers hold the only senders that matter
+
+    let outputs: Vec<(&str, Output)> = (0..names.len())
+        .map(|_| {
+            racers
+                .recv_timeout(RACER_DEADLINE)
+                .expect("a racer never came back; see RACER_DEADLINE")
         })
         .collect();
-
-    let outputs: Vec<Output> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    for (name, output) in names.iter().zip(&outputs) {
+    for (name, output) in &outputs {
         assert!(
             output.status.success(),
             "{name}: {}",
@@ -3119,4 +3302,215 @@ fn import_writes_a_flockfile_shep_can_read_back_and_starts_no_daemon() {
                 panic!("shep import wrote a Flockfile shep cannot read back: {e}\n{written}")
             });
     assert_eq!(parsed.apps.len(), 3, "{written}");
+}
+
+// --- Dogs / Barks -----------------------------------------------------
+
+/// Writes `$SHEP_HOME/shep.toml` directly, before any daemon has booted off
+/// it. `shep enable`/`shep adopt` are this binary's only other writers of
+/// that file, and neither has a flag for `[dog.metrics] bind` — a case that
+/// needs a specific port (every case below does, to avoid colliding with a
+/// real `9615` on the machine running this suite) has to put it there
+/// itself, the same way [`write_flockfile`] writes a Flockfile directly
+/// rather than driving `shep start` to produce one.
+fn write_shep_toml(dir: &TempDir, body: &str) -> PathBuf {
+    let path = dir.path().join("shep.toml");
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+/// The phase's own success criterion, at the only tier that can check it: a
+/// real binary, a real shepherd, and a real dog PROCESS spawned by that
+/// shepherd. Every tier below this one scripts the runner or fakes the
+/// client, so none of them has ever exec'd `shep dog metrics` — an argv
+/// branch that did not exist would fail at exec, which no unit test can
+/// see.
+///
+/// Fails if the dog is not spawned (`wait_for_dog_pid` never sees a pid and
+/// panics), if it cannot reach the socket from `$SHEP_HOME` — the one
+/// variable a dog inherits (`dog/mod.rs`'s own module doc) — if it cannot
+/// fetch its own `[dog.metrics]` section, or if it cannot bind and serve:
+/// any of those leaves `poll_metrics` polling a refused connection for its
+/// whole deadline and the body assertions below fail against an empty
+/// string. Those four are the whole contract this case exists to prove.
+#[test]
+fn a_real_shepherd_runs_a_real_metrics_dog_that_answers_a_scrape() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let port = free_port();
+    write_shep_toml(
+        &dir,
+        &format!("[dog.metrics]\nbind = \"127.0.0.1:{port}\"\n"),
+    );
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("web")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&started);
+
+    let online = poll_flock(home, |info| info["status"] == "online");
+    assert_eq!(
+        online["status"], "online",
+        "the sheep must reach online before the dog's own exposition has \
+         anything real to name: {online}"
+    );
+
+    let enabled = shep(home).arg("enable").arg("metrics").output().unwrap();
+    assert_success(&enabled);
+
+    // Registered before the scrape, not after: a scrape that hangs or
+    // panics on assertion must not leak the grandchild the daemon just
+    // spawned. `wait_for_dog_pid` itself panics rather than returning
+    // `None` on a pid that never arrives, for exactly this reason — see its
+    // own doc.
+    let dog_pid = wait_for_dog_pid(home, "metrics");
+    guard.adopt_dog_pid(dog_pid);
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let body = poll_metrics(addr);
+    assert!(
+        body.contains("HTTP/1.1 200"),
+        "the metrics dog must answer 200 at /metrics: {body}"
+    );
+    assert!(
+        body.contains(r#"shep_sheep_status{sheep="web",id="0",fold="",status="online"} 1"#),
+        "the exposition must name the sheep, online: {body}"
+    );
+    assert!(
+        body.contains(r#"shep_dog_up{dog="metrics",source="built-in"} 1"#),
+        "the dog must report itself up while it is the one serving the \
+         scrape that says so: {body}"
+    );
+
+    graceful_kill(home);
+}
+
+/// Fails if `shep dogs` renders the sheep, or `shep flock` renders the dogs
+/// into the sheep table. The two-table split (`FlockRows`/`DogRows`, and
+/// `emit_flock`'s partition between them) has unit coverage of its own;
+/// what this case adds is that the real verbs reach the real renderers over
+/// a real daemon — the gap that would let a dispatch arm in `main::run`
+/// point `Commands::Dogs` at the wrong function unnoticed workspace-wide,
+/// the same class of bug `saving_the_roll_then_mustering_reports_the_same_
+/// flock`'s own doc names for `save`/`muster`.
+///
+/// Table format, not JSON: `Format::Json`'s `flock` answer carries both
+/// populations in one undivided array on purpose (`emit_flock`'s own doc),
+/// so the "two populations, right way round" claim only exists in the
+/// TABLE rendering this case has to read as text.
+#[test]
+fn dogs_and_flock_render_the_two_populations_the_right_way_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let port = free_port();
+    write_shep_toml(
+        &dir,
+        &format!("[dog.metrics]\nbind = \"127.0.0.1:{port}\"\n"),
+    );
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("web")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&started);
+    poll_flock(home, |info| info["status"] == "online");
+
+    let enabled = shep(home).arg("enable").arg("metrics").output().unwrap();
+    assert_success(&enabled);
+    guard.adopt_dog_pid(wait_for_dog_pid(home, "metrics"));
+
+    let flock_table = String::from_utf8(shep(home).arg("flock").output().unwrap().stdout).unwrap();
+    assert!(
+        flock_table.contains("web"),
+        "shep flock must still render the sheep: {flock_table}"
+    );
+    assert!(
+        flock_table.contains("Dogs") && flock_table.contains("metrics"),
+        "shep flock must render the dogs section beneath the sheep table: {flock_table}"
+    );
+
+    let dogs_table = String::from_utf8(shep(home).arg("dogs").output().unwrap().stdout).unwrap();
+    assert!(
+        dogs_table.contains("metrics"),
+        "shep dogs must render the dog: {dogs_table}"
+    );
+    assert!(
+        !dogs_table.contains("web"),
+        "shep dogs must render nothing but dogs — not the sheep: {dogs_table}"
+    );
+    assert!(
+        !dogs_table.contains("Dogs\n"),
+        "shep dogs must not carry flock's own section header — it IS the \
+         dogs table, not a listing with one embedded: {dogs_table}"
+    );
+
+    graceful_kill(home);
+}
+
+/// Fails if `shep barks` needs a shepherd. The history is on disk so it
+/// outlives the daemon, and the case it exists for is an operator reading
+/// it after a crash — this case never starts one at all, which is the
+/// point: `shep barks` against a `$SHEP_HOME` with no `run/shep.sock` must
+/// still succeed and render what `shep_core::barks::append` put on disk.
+#[test]
+fn barks_reads_the_history_with_no_shepherd_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let bark = shep_core::barks::Bark {
+        at_ms: 1_700_000_000_000,
+        rule: "watchdog".to_string(),
+        subject: "web".to_string(),
+        message: "restart budget exhausted".to_string(),
+        sinks: vec![shep_core::barks::SinkOutcome {
+            sink: "ops".to_string(),
+            error: None,
+        }],
+    };
+    shep_core::barks::append(
+        &home.join("barks.jsonl"),
+        &bark,
+        shep_core::barks::DEFAULT_MAX_BYTES,
+    )
+    .unwrap();
+    assert!(
+        !home.join("run/shep.sock").exists(),
+        "this case never starts a daemon at all"
+    );
+
+    let output = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("barks")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert!(
+        !home.join("run/shep.sock").exists(),
+        "`shep barks` must never autostart a shepherd either"
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["command"], "barks",
+        "`shep barks` must reach the barks verb and no other: {envelope}"
+    );
+    let rows = envelope["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("barks data must be an array: {envelope}"));
+    assert_eq!(rows.len(), 1, "{envelope}");
+    assert_eq!(rows[0]["subject"], "web", "{envelope}");
+    assert_eq!(rows[0]["rule"], "watchdog", "{envelope}");
 }

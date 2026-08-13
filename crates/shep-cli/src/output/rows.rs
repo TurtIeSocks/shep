@@ -11,7 +11,8 @@
 //! kind, so this really is pure tier.
 
 use serde::Serialize;
-use shep_core::protocol::{ActionOutcome, ActionReply, ProcessInfo};
+use shep_core::barks::{Bark, SinkOutcome};
+use shep_core::protocol::{ActionOutcome, ActionReply, DogSource, ProcessInfo};
 
 use super::Render;
 
@@ -88,7 +89,329 @@ impl Render for FlockRows {
         // print. They ride the JSON so a programmatic consumer can find a
         // sheep's logs without re-deriving paths the daemon alone resolves.
         "out_file", "err_file",
+        // No SOURCE column, because every row this table renders is a
+        // sheep — `dog` is always `null` here. A dog gets its own table
+        // with its own SOURCE column; this field rides the JSON only so a
+        // consumer that switches on `ProcessInfo` shape alone still sees it.
+        "dog",
     ];
+}
+
+/// The dogs half of a flock listing: the `ProcessInfo`s whose `dog` marker
+/// is set, rendered by where they came from rather than by their place in
+/// the flock.
+///
+/// No `ID` column, and that is the point of the split rather than an
+/// omission: ids reflect spawn order across one registry, so a dog booted
+/// alongside the flock lands among the sheep's numbers. Nobody sees that,
+/// because the two populations are never rendered together — which is what
+/// makes the shared id space cost nothing at the surface.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct DogRows(pub Vec<ProcessInfo>);
+
+/// `DogSource`'s table rendering, shared by every payload with a SOURCE
+/// column: `DogSource` is `#[non_exhaustive]` (IR-20), so a kind this client
+/// predates renders `unknown` rather than failing to compile against a
+/// future daemon.
+fn dog_source_label(source: &DogSource) -> &'static str {
+    match source {
+        DogSource::BuiltIn => "built-in",
+        DogSource::Adopted { .. } => "adopted",
+        _ => "unknown",
+    }
+}
+
+impl Render for DogRows {
+    fn headers() -> &'static [&'static str] {
+        &[
+            "NAME", "SOURCE", "STATUS", "PID", "RESTARTS", "CPU", "MEM", "UPTIME",
+        ]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|p| {
+                vec![
+                    p.name.clone(),
+                    // Never the adopted path — see `Self::JSON_ONLY`'s
+                    // sibling reasoning on `FlockRows` for why a path stays
+                    // out of the table. `None` reads as `-`: this row only
+                    // exists because some caller filtered on
+                    // `dog.is_some()`, so a `None` here is a caller bug, not
+                    // a value this type should panic over.
+                    p.dog.as_ref().map_or("-".to_string(), |source| {
+                        dog_source_label(source).to_string()
+                    }),
+                    p.status.to_string(),
+                    p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+                    p.restarts.to_string(),
+                    p.cpu_percent
+                        .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
+                    p.memory_bytes
+                        .map_or_else(|| "-".to_string(), super::human_bytes),
+                    super::human_duration(p.uptime_ms),
+                ]
+            })
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "NAME" => "name",
+            "SOURCE" => "dog",
+            "STATUS" => "status",
+            "PID" => "pid",
+            "RESTARTS" => "restarts",
+            "CPU" => "cpu_percent",
+            "MEM" => "memory_bytes",
+            "UPTIME" => "uptime_ms",
+            other => panic!("DogRows::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[
+        // Ids reflect spawn order across the one registry shared with the
+        // sheep half; a dog booted alongside the flock lands among the
+        // sheep's own numbers. No column, because the two populations are
+        // never rendered together for that number to be compared against —
+        // see this type's own doc comment.
+        "id",
+        // Fold membership is a sheep concept — a dog is supervised, never
+        // grouped for a selector to match by fold.
+        "fold",
+        // Same reason `FlockRows` keeps them out of its own table: absolute
+        // paths, often longer than every other column put together. They
+        // ride the JSON so a programmatic consumer can still find them.
+        "out_file", "err_file",
+    ];
+}
+
+/// `shep enable <name>`: what the config edit and, if a shepherd is
+/// running, the resulting `EnableDog` RPC actually did.
+///
+/// Constructed by `commands/dogs.rs`'s `enable`, whether or not a shepherd
+/// answered — [`Self::shepherd_acted`] and [`Self::status`] are exactly how
+/// a `--format json` consumer tells the two outcomes apart without also
+/// having to parse a table caption or a stderr notice.
+#[derive(Debug, Serialize)]
+pub struct DogEnabledRow {
+    /// The dog's name.
+    pub name: String,
+    /// Where its binary comes from, as `commands/dogs.rs`'s `dog_source`
+    /// read it out of `shep.toml`: [`DogSource::Adopted`], carrying the
+    /// path `shep adopt` recorded, for a name in `[daemon] adopted_dogs`,
+    /// and [`DogSource::BuiltIn`] for any name that is not.
+    pub source: DogSource,
+    /// Whether a shepherd was reached and asked to start the dog. `false`
+    /// means only the config changed — decision 11: `enable` never
+    /// autostarts a shepherd to act on its own edit.
+    pub shepherd_acted: bool,
+    /// The dog's resulting status: a real `ProcStatus` rendering
+    /// (`"online"`, `"starting"`, ...) when a shepherd started it, or a
+    /// sentence explaining why not when none answered.
+    pub status: String,
+}
+
+impl Render for DogEnabledRow {
+    fn headers() -> &'static [&'static str] {
+        &["NAME", "SOURCE", "SHEPHERD", "STATUS"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        vec![vec![
+            self.name.clone(),
+            dog_source_label(&self.source).to_string(),
+            self.shepherd_acted.to_string(),
+            self.status.clone(),
+        ]]
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "NAME" => "name",
+            "SOURCE" => "source",
+            "SHEPHERD" => "shepherd_acted",
+            "STATUS" => "status",
+            other => panic!("DogEnabledRow::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
+/// `shep disable <name>`: what the config edit and, if a shepherd is
+/// running, the resulting `DisableDog` RPC actually did.
+///
+/// Constructed by `commands/dogs.rs`'s `disable`. [`Self::source`] is not
+/// echoed from any RPC reply — `Request::DisableDog` answers
+/// `Response::Deleted`, which carries only ids — so it comes from the same
+/// `shep.toml` lookup [`DogEnabledRow::source`] uses: an adopted dog
+/// reports as adopted here, whichever of the two verbs stopped it.
+#[derive(Debug, Serialize)]
+pub struct DogDisabledRow {
+    /// The dog's name.
+    pub name: String,
+    /// Where its binary comes from — see this type's own doc.
+    pub source: DogSource,
+    /// Whether a shepherd was reached and asked to stop the dog.
+    pub shepherd_acted: bool,
+    /// The dog's resulting status: `"stopped"` when a shepherd acted, or a
+    /// sentence explaining why not when none answered.
+    pub status: String,
+}
+
+impl Render for DogDisabledRow {
+    fn headers() -> &'static [&'static str] {
+        &["NAME", "SOURCE", "SHEPHERD", "STATUS"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        vec![vec![
+            self.name.clone(),
+            dog_source_label(&self.source).to_string(),
+            self.shepherd_acted.to_string(),
+            self.status.clone(),
+        ]]
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "NAME" => "name",
+            "SOURCE" => "source",
+            "SHEPHERD" => "shepherd_acted",
+            "STATUS" => "status",
+            other => panic!("DogDisabledRow::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
+/// `shep adopt <name> <path>`: what the config edit and, if a shepherd is
+/// running, the resulting `EnableDog` RPC actually did.
+///
+/// Constructed by `commands/dogs.rs`'s `adopt`. [`Self::source`] is always
+/// [`DogSource::Adopted`] — this is the verb that vetted the path in the
+/// first place, so it never has to look one up the way
+/// [`DogEnabledRow::source`] does.
+#[derive(Debug, Serialize)]
+pub struct DogAdoptedRow {
+    /// The dog's name.
+    pub name: String,
+    /// Always [`DogSource::Adopted`], carrying the vetted, canonicalized
+    /// path `adopt` just recorded.
+    pub source: DogSource,
+    /// Whether a shepherd was reached and asked to start the dog. `false`
+    /// means only the config changed — decision 11: no verb in this module
+    /// autostarts a shepherd to act on its own edit.
+    pub shepherd_acted: bool,
+    /// The dog's resulting status: a real `ProcStatus` rendering
+    /// (`"online"`, `"starting"`, ...) when a shepherd started it, or a
+    /// sentence explaining why not when none answered.
+    pub status: String,
+}
+
+impl Render for DogAdoptedRow {
+    fn headers() -> &'static [&'static str] {
+        &["NAME", "SOURCE", "SHEPHERD", "STATUS"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        vec![vec![
+            self.name.clone(),
+            dog_source_label(&self.source).to_string(),
+            self.shepherd_acted.to_string(),
+            self.status.clone(),
+        ]]
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "NAME" => "name",
+            "SOURCE" => "source",
+            "SHEPHERD" => "shepherd_acted",
+            "STATUS" => "status",
+            other => panic!("DogAdoptedRow::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
+/// `shep rehome <name>`: what the config edit and, if a shepherd is
+/// running, the resulting `DisableDog` RPC actually did.
+///
+/// Constructed by `commands/dogs.rs`'s `rehome`, which reads `shep.toml`'s
+/// own `[daemon] adopted_dogs` entry before erasing it — the same lookup
+/// [`DogEnabledRow`]/[`DogDisabledRow`] make, except that here it is an
+/// [`Option`], because `rehome` reports what it FORGOT and a name it never
+/// adopted is nothing forgotten. So this carries whatever that read found:
+/// [`DogSource::Adopted`] for a dog `shep adopt` registered, or `None` for
+/// a name `shep.toml` never had an entry for (a built-in dog, or a name
+/// this document has never heard of) — `rehome` still runs in that case,
+/// since forgetting a registration that already does not exist is not a
+/// fault.
+#[derive(Debug, Serialize)]
+pub struct DogRehomedRow {
+    /// The dog's name.
+    pub name: String,
+    /// Where its binary came from, read before this verb forgot it — see
+    /// this type's own doc for what `None` means.
+    pub source: Option<DogSource>,
+    /// Whether a shepherd was reached and asked to stop the dog.
+    pub shepherd_acted: bool,
+    /// The dog's resulting status: `"stopped"` when a shepherd acted, or a
+    /// sentence explaining why not when none answered.
+    pub status: String,
+}
+
+impl Render for DogRehomedRow {
+    fn headers() -> &'static [&'static str] {
+        &["NAME", "SOURCE", "SHEPHERD", "STATUS"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        vec![vec![
+            self.name.clone(),
+            // `-` for `None`, matching `DogRows`' own rule for the same
+            // shape of field — see that type's own `rows` for why.
+            self.source.as_ref().map_or_else(
+                || "-".to_string(),
+                |source| dog_source_label(source).to_string(),
+            ),
+            self.shepherd_acted.to_string(),
+            self.status.clone(),
+        ]]
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "NAME" => "name",
+            "SOURCE" => "source",
+            "SHEPHERD" => "shepherd_acted",
+            "STATUS" => "status",
+            other => panic!("DogRehomedRow::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
 }
 
 /// `Response::Flushed(Vec<ProcessInfo>)` — the sheep a `shep flush` matched,
@@ -172,6 +495,11 @@ impl Render for FlushedRows {
         "fold",
         "cpu_percent",
         "memory_bytes",
+        // Same reason `FlockRows` keeps it out of its own table: `flush`
+        // matches sheep, so every row here is a sheep and `dog` is always
+        // `null`. Stays in the JSON for the same shape-consistency reason
+        // the rest of this list does.
+        "dog",
     ];
 }
 
@@ -648,6 +976,88 @@ fn preview_body(body: &str) -> String {
     preview
 }
 
+/// `Vec<Bark>` — `shep barks`' own payload, newest last exactly as it sits
+/// on disk (`shep_core::barks::read`'s own order — a ring is appended to,
+/// never re-sorted) and as `--tail` counts from.
+///
+/// `transparent`, matching every other `Vec<T>` payload in this file: the
+/// JSON is a plain array, not a wrapper object.
+///
+/// Never built from a `Response` — `commands/dogs.rs`'s `barks` reads
+/// `shep_core::barks::read` straight off `barks.jsonl`, never connecting to
+/// the shepherd (that module's own doc: the history is on disk precisely so
+/// it survives the shepherd). `Bark` is shep-core's, so this newtype is what
+/// the orphan rule requires to implement [`Render`] on it.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct BarkRows(pub Vec<Bark>);
+
+impl Render for BarkRows {
+    fn headers() -> &'static [&'static str] {
+        &["WHEN", "RULE", "SUBJECT", "MESSAGE", "SINKS"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|b| {
+                vec![
+                    super::local_timestamp(b.at_ms),
+                    b.rule.clone(),
+                    b.subject.clone(),
+                    b.message.clone(),
+                    sinks_cell(&b.sinks),
+                ]
+            })
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "WHEN" => "at_ms",
+            "RULE" => "rule",
+            "SUBJECT" => "subject",
+            "MESSAGE" => "message",
+            "SINKS" => "sinks",
+            other => panic!("BarkRows::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
+/// Renders one [`Bark::sinks`] list for the `SINKS` column: a delivered sink
+/// by its bare name (`ops`), a refused one with `(failed)` appended
+/// (`ops(failed)`) so the failure is visible in the table an operator is
+/// already reading rather than only in `--format json`'s `error` field —
+/// and never the sink's own error text, which can quote a webhook's HTTP
+/// response and would widen an already-tight column for a detail
+/// `--format json` already carries in full.
+///
+/// `-` for an empty list: [`Bark::sinks`]'s own doc says empty means the
+/// shepherd wrote the record itself, with no sinks and no webhook code — the
+/// same "no honest value" case every other `-` cell in this file marks,
+/// never a delivery this dog attempted and lost track of.
+fn sinks_cell(sinks: &[SinkOutcome]) -> String {
+    if sinks.is_empty() {
+        return "-".to_string();
+    }
+    sinks
+        .iter()
+        .map(|outcome| {
+            if outcome.error.is_some() {
+                format!("{}(failed)", outcome.sink)
+            } else {
+                outcome.sink.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::BTreeSet;
@@ -656,7 +1066,7 @@ pub(crate) mod tests {
 
     use super::*;
 
-    fn sample_info(id: u32, name: &str, uptime_ms: u64) -> ProcessInfo {
+    pub(crate) fn sample_info(id: u32, name: &str, uptime_ms: u64) -> ProcessInfo {
         ProcessInfo {
             id,
             name: name.to_string(),
@@ -679,6 +1089,12 @@ pub(crate) mod tests {
             // rendering it as "48.1M" is the whole point of that function.
             cpu_percent: Some(12.5),
             memory_bytes: Some(50_462_720),
+            // The one field this fixture deliberately leaves `None`, unlike
+            // every other `Option` above: `dog` is `JSON_ONLY` (see
+            // `FlockRows::JSON_ONLY`), not a column, so `assert_no_drift`'s
+            // cell check never reads it — and `None` is the honest value
+            // besides, since every row `sample_flock` builds is a sheep.
+            dog: None,
         }
     }
 
@@ -694,6 +1110,19 @@ pub(crate) mod tests {
 
     pub(crate) fn info_with_uptime_ms(uptime_ms: u64) -> ProcessInfo {
         sample_info(1, "web", uptime_ms)
+    }
+
+    /// A dog-shaped `ProcessInfo`: `sample_info` with `dog` set to `source`.
+    /// The id is fixed rather than threaded through as a parameter, like
+    /// `fold`/`cpu_percent` in `sample_info` itself — `DogRows` has no `ID`
+    /// column (its own doc comment says why), so no test needs one that
+    /// varies. `pub(crate)` so `output::mod`'s own tests can build a mixed
+    /// sheep-and-dog listing without a second copy of this helper.
+    pub(crate) fn dog_info(name: &str, source: DogSource) -> ProcessInfo {
+        ProcessInfo {
+            dog: Some(source),
+            ..sample_info(1, name, 60_000)
+        }
     }
 
     /// The anti-drift gate, written once and instantiated three times — once
@@ -795,6 +1224,134 @@ pub(crate) mod tests {
         // not raw echoes of `uptime_ms`/`cpu_percent`/`memory_bytes` — see
         // the doc comment on `assert_no_drift` above.
         assert_no_drift(&sample_flock(), |j| &j[0], &["UPTIME", "CPU", "MEM"]);
+    }
+
+    /// fails if `SOURCE` renders the adopted binary's path into the table.
+    /// A path is wider than every other column combined and would push
+    /// UPTIME off a terminal — the same reason `FlockRows` keeps the log
+    /// paths out of its own table, and the path is still one `--format
+    /// json` away.
+    #[test]
+    fn the_source_column_names_a_kind_and_leaves_the_path_to_json() {
+        let rows = DogRows(vec![
+            dog_info("metrics", DogSource::BuiltIn),
+            dog_info(
+                "otel",
+                DogSource::Adopted {
+                    path: "/usr/local/bin/shep-otel".to_string(),
+                },
+            ),
+        ]);
+        let headers = DogRows::headers();
+        let at = |cells: &[String], h: &str| {
+            cells[headers.iter().position(|x| *x == h).unwrap()].clone()
+        };
+        assert_eq!(at(&rows.rows()[0], "SOURCE"), "built-in");
+        assert_eq!(at(&rows.rows()[1], "SOURCE"), "adopted");
+
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[1]["dog"]["path"], "/usr/local/bin/shep-otel");
+    }
+
+    /// The anti-drift gate for this type. Fails if a `ProcessInfo` field is
+    /// serialized with neither a column nor a `JSON_ONLY` entry.
+    ///
+    /// `SOURCE` joins `formatted` alongside `UPTIME`/`CPU`/`MEM`: its own
+    /// JSON value is the tagged `DogSource` object (`{"kind": "built_in"}`
+    /// or `{"kind": "adopted", "path": ...}`), not a plain string this
+    /// gate's cell comparison knows how to stringify — the test above pins
+    /// that mapping instead.
+    #[test]
+    fn dog_rows_do_not_drift() {
+        assert_no_drift(
+            &DogRows(vec![dog_info("metrics", DogSource::BuiltIn)]),
+            |j| &j[0],
+            &["UPTIME", "CPU", "MEM", "SOURCE"],
+        );
+    }
+
+    /// fails if `DogEnabledRow` grows a field that never reaches the table —
+    /// the same gate every other payload has. `SOURCE` is `formatted` for
+    /// the same reason `dog_rows_do_not_drift` gives.
+    #[test]
+    fn dog_enabled_row_does_not_drift() {
+        assert_no_drift(
+            &DogEnabledRow {
+                name: "metrics".to_string(),
+                source: DogSource::BuiltIn,
+                shepherd_acted: true,
+                status: "online".to_string(),
+            },
+            |j| j,
+            &["SOURCE"],
+        );
+    }
+
+    /// The other side of `dog_enabled_row_does_not_drift`, for the payload
+    /// `disable` renders.
+    #[test]
+    fn dog_disabled_row_does_not_drift() {
+        assert_no_drift(
+            &DogDisabledRow {
+                name: "metrics".to_string(),
+                source: DogSource::BuiltIn,
+                shepherd_acted: false,
+                status: "not running; will not start with the next shepherd".to_string(),
+            },
+            |j| j,
+            &["SOURCE"],
+        );
+    }
+
+    /// The `adopt` sibling of `dog_enabled_row_does_not_drift` — `SOURCE`
+    /// is `formatted` for the same reason: it serializes to the tagged
+    /// `DogSource` object, not a plain string.
+    #[test]
+    fn dog_adopted_row_does_not_drift() {
+        assert_no_drift(
+            &DogAdoptedRow {
+                name: "otel".to_string(),
+                source: DogSource::Adopted {
+                    path: "/usr/local/bin/shep-otel".to_string(),
+                },
+                shepherd_acted: true,
+                status: "online".to_string(),
+            },
+            |j| j,
+            &["SOURCE"],
+        );
+    }
+
+    /// The `rehome` sibling, exercised once with a recorded source (the
+    /// ordinary case: forgetting a dog `adopt` registered) and once with
+    /// `None` (rehoming a name `shep.toml` never had an `adopted_dogs`
+    /// entry for) — `assert_no_drift`'s own `Value::Null` branch is what
+    /// lets the second case pass without `SOURCE` needing to be
+    /// `formatted` for it too.
+    #[test]
+    fn dog_rehomed_row_does_not_drift_with_or_without_a_source() {
+        assert_no_drift(
+            &DogRehomedRow {
+                name: "otel".to_string(),
+                source: Some(DogSource::Adopted {
+                    path: "/usr/local/bin/shep-otel".to_string(),
+                }),
+                shepherd_acted: true,
+                status: "stopped".to_string(),
+            },
+            |j| j,
+            &["SOURCE"],
+        );
+        assert_no_drift(
+            &DogRehomedRow {
+                name: "ghost".to_string(),
+                source: None,
+                shepherd_acted: false,
+                status: "not running; will not start with the next shepherd".to_string(),
+            },
+            |j| j,
+            &["SOURCE"],
+        );
     }
 
     /// fails if a sheep with no reading renders an empty cell or a zero. A
@@ -1121,5 +1678,115 @@ pub(crate) mod tests {
             *table_cell, long_body,
             "the table cell must be the collapsed preview, not the real body"
         );
+    }
+
+    /// Two barks: one the bark dog delivered to a live sink, one it
+    /// refused, and one the shepherd wrote itself with no sinks at all —
+    /// [`sinks_cell`]'s three cases in one fixture, shared by every test
+    /// below.
+    fn sample_barks() -> BarkRows {
+        BarkRows(vec![
+            Bark {
+                at_ms: 1_700_000_000_000,
+                rule: "restart-storm".to_string(),
+                subject: "web".to_string(),
+                message: "3 restarts in 60s".to_string(),
+                sinks: vec![SinkOutcome {
+                    sink: "ops".to_string(),
+                    error: None,
+                }],
+            },
+            Bark {
+                at_ms: 1_700_000_060_000,
+                rule: "daemon".to_string(),
+                subject: "worker".to_string(),
+                message: "restart budget exhausted".to_string(),
+                sinks: vec![],
+            },
+        ])
+    }
+
+    /// fails if `BarkRows` grows a field that never reaches the table —
+    /// the same gate every other payload has. `WHEN` and `SINKS` are both
+    /// human renderings of their own JSON field (a formatted timestamp, and
+    /// a delivered/failed label rather than the raw `SinkOutcome` array), so
+    /// both sit in `formatted` for the reason `assert_no_drift`'s own doc
+    /// gives.
+    #[test]
+    fn bark_rows_do_not_drift() {
+        assert_no_drift(&sample_barks(), |j| &j[0], &["WHEN", "SINKS"]);
+    }
+
+    /// `sinks_cell`'s own coverage: a delivered sink renders bare, a refused
+    /// one carries `(failed)`, and a shepherd-authored bark with no sinks at
+    /// all renders `-` rather than an empty cell — the same "no honest
+    /// value" rule every other `-` cell in this file follows.
+    #[test]
+    fn sinks_render_delivered_failed_and_empty() {
+        let delivered = Bark {
+            sinks: vec![SinkOutcome {
+                sink: "ops".to_string(),
+                error: None,
+            }],
+            ..sample_barks().0[0].clone()
+        };
+        assert_eq!(sinks_cell(&delivered.sinks), "ops");
+
+        let failed = Bark {
+            sinks: vec![SinkOutcome {
+                sink: "ops".to_string(),
+                error: Some("connection refused".to_string()),
+            }],
+            ..sample_barks().0[0].clone()
+        };
+        assert_eq!(sinks_cell(&failed.sinks), "ops(failed)");
+
+        assert_eq!(sinks_cell(&[]), "-");
+    }
+
+    /// Multiple sinks on one bark render as a comma-separated list, each
+    /// carrying its own delivered/failed label independently — the shape a
+    /// bark fanned out to more than one `[dog.bark.sinks]` entry actually
+    /// has.
+    #[test]
+    fn multiple_sinks_each_carry_their_own_outcome() {
+        let sinks = vec![
+            SinkOutcome {
+                sink: "ops".to_string(),
+                error: None,
+            },
+            SinkOutcome {
+                sink: "oncall".to_string(),
+                error: Some("timed out".to_string()),
+            },
+        ];
+        assert_eq!(sinks_cell(&sinks), "ops, oncall(failed)");
+    }
+
+    /// A sink's error text is never a bare word alone — this pins that the
+    /// cell carries no more than the sink's own name plus `(failed)`, never
+    /// the error string itself, which can quote a webhook's HTTP response.
+    #[test]
+    fn a_failed_sinks_error_text_never_reaches_the_cell() {
+        let sinks = vec![SinkOutcome {
+            sink: "ops".to_string(),
+            error: Some("HTTP 401 from discord.com/api/webhooks/...".to_string()),
+        }];
+        let cell = sinks_cell(&sinks);
+        assert_eq!(cell, "ops(failed)");
+        assert!(
+            !cell.contains("401") && !cell.contains("discord"),
+            "the error text must stay out of the table cell: {cell}"
+        );
+    }
+
+    /// `shep barks` is newest-last, matching the file on disk
+    /// (`shep_core::barks::read`'s own order) — this pins that `rows()`
+    /// preserves that order rather than reversing or re-sorting it.
+    #[test]
+    fn bark_rows_stay_in_the_order_they_were_given() {
+        let rows = sample_barks().rows();
+        assert_eq!(rows[0][2], "web", "the older bark stays first");
+        assert_eq!(rows[1][2], "worker", "the newer bark stays last");
     }
 }

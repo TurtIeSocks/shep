@@ -16,6 +16,8 @@ mod cli;
 #[cfg(unix)]
 mod commands;
 mod completions;
+#[cfg(unix)]
+mod dog;
 mod exit;
 #[cfg(unix)]
 mod launch;
@@ -25,15 +27,17 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use cli::{Cli, GlobalArgs};
 #[cfg(unix)]
-use cli::{Commands, DaemonArgs, Format};
+use cli::{AdoptArgs, Commands, DaemonArgs, Format};
+use cli::{Cli, GlobalArgs};
 #[cfg(unix)]
 use commands::admin;
 #[cfg(unix)]
 use commands::bleats;
 #[cfg(unix)]
 use commands::daemon::{daemon_exit_code, run_daemon};
+#[cfg(unix)]
+use commands::dogs;
 #[cfg(unix)]
 use commands::import;
 #[cfg(unix)]
@@ -130,6 +134,14 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
 /// user's passwd entry rather than from this process's environment, so the
 /// shared gate would both impose a requirement they do not have and hand
 /// them the wrong answer under `sudo`, which resets `$HOME` to root's.
+///
+/// `Dog` DOES go through this shared gate, unlike `Completions`/`Daemon`: a
+/// dog resolves `$SHEP_HOME` exactly the way every ordinary verb does (the
+/// daemon sets it as the one environment variable a dog's child inherits).
+/// It is still dispatched immediately after, ahead of the locked-streams
+/// block below, for the unrelated reason that block's own comment gives —
+/// it runs until signalled, so it may not hold a stdout/stderr guard for a
+/// process lifetime.
 #[cfg(unix)]
 async fn run(cli: Cli) -> ExitCode {
     let fmt = cli.global.format;
@@ -140,14 +152,17 @@ async fn run(cli: Cli) -> ExitCode {
     // both across the dispatch buys one lock acquisition instead of one per
     // write, and no interleaving with anything.
     //
-    // Two verbs are not that shape. `daemon` runs until a signal, with
+    // Three verbs are not that shape. `daemon` runs until a signal, with
     // `commands::daemon::install_log_subscriber` rendering the daemon's own
     // records to `std::io::stderr()` from tokio worker threads; `bleats`
-    // without `--no-follow` follows until Ctrl-C. Neither may hold a guard
-    // across that, so `bleats` takes unlocked handles and `daemon` takes none
-    // at all. (`completions` is dispatched early as well, for the unrelated
-    // reason this function's own doc gives — it must work where no `$HOME`
-    // resolves — and is a millisecond verb like the rest.)
+    // without `--no-follow` follows until Ctrl-C; `dog` runs until it is
+    // signalled too, the same re-exec shape as `daemon`. None of the three
+    // may hold a guard across that, so `bleats` takes unlocked handles and
+    // `daemon`/`dog` take none at all — `dog::run_dog` writes its own
+    // diagnostics straight to `eprintln!`, needing no `Streams` value in the
+    // first place. (`completions` is dispatched early as well, for the
+    // unrelated reason this function's own doc gives — it must work where no
+    // `$HOME` resolves — and is a millisecond verb like the rest.)
     //
     // `Stderr`'s lock is re-entrant only for the thread that took it, so a
     // guard held here — on the runtime's main thread, for one of those
@@ -202,6 +217,15 @@ async fn run(cli: Cli) -> ExitCode {
             return code;
         }
     };
+
+    // `dog` is a re-exec target like `daemon` — long-lived until signalled —
+    // and, per `dog::run_dog`'s own doc, writes its own diagnostics straight
+    // to stderr rather than through a `Streams`/`--format json` envelope, so
+    // unlike every verb below it needs no `Streams` value at all, let alone
+    // a locked one.
+    if let Commands::Dog(ref args) = cli.command {
+        return dog::run_dog(&args.name, paths).await;
+    }
 
     // Split out of the dispatch below only to keep its handles unlocked, for
     // the reason the block comment above gives; it is otherwise an arm like
@@ -260,6 +284,40 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => query::flock(&client, &mut streams, fmt).await,
             Err(code) => code,
         },
+        Commands::Dogs => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => query::dogs(&client, &mut streams, fmt).await,
+            Err(code) => code,
+        },
+        // None of the four goes through `connect_client`/
+        // `connect_or_spawn_client`: all four must still write the config
+        // with no shepherd running at all (decision 11, `commands::dogs`'
+        // own module doc), so each attempts its own connection internally
+        // and tolerates a failure to reach one, rather than being refused
+        // before it ever gets that far.
+        //
+        // `--exec` is the hidden pm2 spelling of `adopt` (`EnableArgs`'
+        // own doc) — checked here, not inside `commands::dogs`, so that
+        // module's `enable` keeps the simple `&str` signature every other
+        // verb here has, and the argument-order inversion this alias
+        // carries lives at the one seam that has to know about it.
+        Commands::Enable(ref args) => match &args.exec {
+            Some(path) => {
+                dogs::adopt(
+                    &mut streams,
+                    fmt,
+                    &paths,
+                    &AdoptArgs {
+                        name: args.name.clone(),
+                        path: path.clone(),
+                    },
+                )
+                .await
+            }
+            None => dogs::enable(&mut streams, fmt, &paths, &args.name).await,
+        },
+        Commands::Disable(ref args) => dogs::disable(&mut streams, fmt, &paths, &args.name).await,
+        Commands::Adopt(ref args) => dogs::adopt(&mut streams, fmt, &paths, args).await,
+        Commands::Rehome(ref args) => dogs::rehome(&mut streams, fmt, &paths, &args.name).await,
         Commands::Describe(ref args) => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => query::describe(&client, &mut streams, fmt, args).await,
             Err(code) => code,
@@ -300,6 +358,11 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => logs::flush(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
+        // Reads a file and writes nothing; starts nothing, so — like
+        // `--daemon`'s own arm just above — there is nothing to ask the
+        // socket. The history is on disk precisely so it survives the
+        // shepherd (`commands::dogs`' own module doc on this verb).
+        Commands::Barks(ref args) => dogs::barks(&mut streams, fmt, &paths, args),
         Commands::Kill => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => admin::kill(client, &mut streams, fmt).await,
             Err(code) => code,
@@ -312,7 +375,8 @@ async fn run(cli: Cli) -> ExitCode {
         | Commands::Daemon(_)
         | Commands::Startup(_)
         | Commands::Unstartup(_)
-        | Commands::Bleats(_) => {
+        | Commands::Bleats(_)
+        | Commands::Dog(_) => {
             unreachable!("handled above: before the shared $SHEP_HOME gate, or on unlocked handles")
         }
     }
@@ -482,6 +546,128 @@ mod tests {
         ));
     }
 
+    /// fails if `Commands::Dogs` is wired to another verb's function. The
+    /// dispatch arms carried no unit coverage at all until recently, and a
+    /// verb pointed at the wrong handler was invisible workspace-wide.
+    #[test]
+    fn dogs_parses_to_its_own_command() {
+        use clap::Parser;
+        use cli::Commands;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "dogs"]).unwrap().command,
+            Commands::Dogs
+        ));
+    }
+
+    /// fails if `Commands::Enable`/`Commands::Disable` are wired to another
+    /// verb's function, or if either loses its required `name` positional —
+    /// the same gap `save_parses_to_its_own_command` closes for `save`, plus
+    /// the `SelectorArgs`-family requiredness check
+    /// `a_selector_taking_verb_refuses_to_run_without_one` (`cli.rs`) runs
+    /// for every selector-taking verb, neither of which `DogArgs` shares.
+    #[test]
+    fn enable_and_disable_parse_to_their_own_commands_and_require_a_name() {
+        use clap::Parser;
+        use cli::Commands;
+
+        let enabled = Cli::try_parse_from(["shep", "enable", "metrics"])
+            .unwrap()
+            .command;
+        let Commands::Enable(args) = enabled else {
+            panic!("expected enable")
+        };
+        assert_eq!(args.name, "metrics");
+
+        let disabled = Cli::try_parse_from(["shep", "disable", "metrics"])
+            .unwrap()
+            .command;
+        let Commands::Disable(args) = disabled else {
+            panic!("expected disable")
+        };
+        assert_eq!(args.name, "metrics");
+
+        assert!(
+            Cli::try_parse_from(["shep", "enable"]).is_err(),
+            "`shep enable` with no name must be a usage error"
+        );
+        assert!(
+            Cli::try_parse_from(["shep", "disable"]).is_err(),
+            "`shep disable` with no name must be a usage error"
+        );
+    }
+
+    /// The `adopt`/`rehome` sibling of
+    /// `enable_and_disable_parse_to_their_own_commands_and_require_a_name`.
+    /// `adopt` needs both positionals; `rehome` shares `DogArgs` with
+    /// `disable`, so it needs only the name.
+    #[test]
+    fn adopt_and_rehome_parse_to_their_own_commands_and_require_their_arguments() {
+        use clap::Parser;
+        use cli::Commands;
+
+        let adopted = Cli::try_parse_from(["shep", "adopt", "otel", "/opt/bin/shep-otel"])
+            .unwrap()
+            .command;
+        let Commands::Adopt(args) = adopted else {
+            panic!("expected adopt")
+        };
+        assert_eq!(args.name, "otel");
+        assert_eq!(args.path, PathBuf::from("/opt/bin/shep-otel"));
+
+        let rehomed = Cli::try_parse_from(["shep", "rehome", "otel"])
+            .unwrap()
+            .command;
+        let Commands::Rehome(args) = rehomed else {
+            panic!("expected rehome")
+        };
+        assert_eq!(args.name, "otel");
+
+        assert!(
+            Cli::try_parse_from(["shep", "adopt"]).is_err(),
+            "`shep adopt` with neither name nor path must be a usage error"
+        );
+        assert!(
+            Cli::try_parse_from(["shep", "adopt", "otel"]).is_err(),
+            "`shep adopt otel` with no path must be a usage error"
+        );
+        assert!(
+            Cli::try_parse_from(["shep", "rehome"]).is_err(),
+            "`shep rehome` with no name must be a usage error"
+        );
+    }
+
+    /// fails if `enable --exec` routes to `enable` (which would try to run
+    /// a built-in dog named after a path), and fails if the argument order
+    /// is read as `adopt`'s. The two orders are inverted
+    /// (`EnableArgs`'/`AdoptArgs`' own docs), and a swap here is silent:
+    /// both arguments are strings, so nothing but a pinned assertion on
+    /// which field holds which value would catch one crossing the other.
+    #[test]
+    fn the_hidden_pm2_spelling_reaches_adopt_with_the_arguments_the_right_way_round() {
+        use clap::Parser;
+        use cli::Commands;
+
+        let parsed = Cli::try_parse_from(["shep", "enable", "--exec", "/opt/bin/d", "otel"])
+            .unwrap()
+            .command;
+        let Commands::Enable(args) = parsed else {
+            panic!("expected enable")
+        };
+        assert_eq!(args.name, "otel");
+        assert_eq!(args.exec, Some(PathBuf::from("/opt/bin/d")));
+
+        // A plain `enable` (no `--exec`) still carries no path — this is
+        // the branch main's own dispatch reads to decide `enable` vs
+        // `adopt`.
+        let plain = Cli::try_parse_from(["shep", "enable", "metrics"])
+            .unwrap()
+            .command;
+        let Commands::Enable(args) = plain else {
+            panic!("expected enable")
+        };
+        assert_eq!(args.exec, None);
+    }
+
     /// fails if `Commands::Muster` is wired to another verb's function —
     /// the same gap `save_parses_to_its_own_command` closes for `save`.
     #[test]
@@ -509,6 +695,21 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["shep", "import"]).unwrap().command,
             Commands::Import(_)
+        ));
+    }
+
+    /// The `barks` sibling of `import_parses_to_its_own_command` — same
+    /// reasoning, same limit: this pins clap's own parse only, and
+    /// `cli_e2e.rs`'s `barks_reads_the_history_with_no_shepherd_running` is
+    /// what proves the dispatch arm above actually reaches
+    /// `dogs::barks` rather than merely parsing to the right variant.
+    #[test]
+    fn barks_parses_to_its_own_command() {
+        use clap::Parser;
+        use cli::Commands;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "barks"]).unwrap().command,
+            Commands::Barks(_)
         ));
     }
 

@@ -166,6 +166,60 @@ security writeup for the daemon-wide rundown of what this crate writes to
 disk). Anyone who can read `$SHEP_HOME` — the daemon's own user, or root —
 can read every secret held in any managed app's `env` table.
 
+### Adopted dogs
+
+IF an operator runs `shep adopt <name> <path>`, THEN:
+
+- The binary is vetted **once, at adopt time** — existence, not-a-directory,
+  an execute bit set for someone, no world-writable mode on the binary or
+  its containing directory (refused outright, before any of it is run), a
+  warning on the terminal if either is merely group-writable, and a real
+  spawn (killed immediately) proving this kernel can actually exec it. None
+  of that runs again at boot or at `shep enable` — the daemon spawns
+  whatever `shep.toml` recorded, not whatever is sitting at that path by
+  the time it does.
+- The path `shep.toml` records, and the one the daemon later execs, is the
+  **canonicalized** one, resolved once at adopt time rather than against
+  the daemon's own working directory at spawn — which, after a reboot, may
+  not be the directory `adopt` ran from.
+- **The adopted binary then runs at the shepherd's own trust level, with no
+  sandboxing beyond it.** State it rather than imply it: this is the same
+  trust an ordinary sheep already has, and adopting a dog grants nothing
+  beyond what any Flockfile entry already could. There is no seccomp
+  profile, no namespace, no separate uid for a dog.
+- A dog's `[dog.<name>]` config — a bark sink's webhook URL included —
+  reaches it over the Unix socket, never through its environment, so it
+  cannot appear in the process table, in a spawned child's own inherited
+  environment, or in a crash dump. `barks.jsonl` keeps the same rule at
+  rest: a fired alert records a sink by its `[dog.bark.sinks]` config key,
+  never the URL or token behind it, and the file is created `0600` inside
+  the already-`0700` `$SHEP_HOME`.
+- `shep.toml` is where an operator pastes those webhook URLs, and the four
+  verbs that write it — `enable`, `disable`, `adopt`, `rehome` — are what
+  create it on a host that has never booted a shepherd. They create
+  `$SHEP_HOME` at `0700` and the file at `0600`, both at creation rather
+  than chmod'ed afterwards, so neither is briefly wider and neither waits
+  on the first `shep muster` to be narrowed. The mode also rides along in
+  a `tar` or a `cp -p` of `$SHEP_HOME`, where the directory's own `0700`
+  does not follow.
+- Each of those four holds an exclusive advisory lock on a sibling
+  `shep.toml.lock` across the whole read-edit-write, and installs the new
+  document by renaming a staged temp file over the old one. A provisioning
+  script that backgrounds two of them cannot have one silently drop the
+  other's edit, and a crash or a full disk mid-write leaves the previous
+  file intact rather than a truncated one.
+- Discord and Slack sinks are refused at config load if given a `http://`
+  URL — the webhook token lives in the path, and both services only ever
+  serve `https://`, so no working deployment loses anything to the refusal.
+  `Sink::Json` is exempt: it can point at any operator-chosen endpoint,
+  including a plaintext internal one, because shep has no way to tell a
+  deliberate internal target from a mistake by looking at the URL alone.
+
+These hold only for the binary `shep adopt` actually vetted. Replacing the
+file at that same canonicalized path afterward — after adoption, before the
+daemon next execs it — is a window nothing here closes: the path is what is
+pinned, not a hash of what was read from it.
+
 ### Metrics and serve binds
 
 The metrics dog's Prometheus exposition endpoint and the `shep serve` static

@@ -44,7 +44,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use shep_core::config::{AppConfig, ResolvedApp};
 use shep_core::paths::ShepPaths;
-use shep_core::protocol::{ActionOutcome, ActionReply, BusEvent, ProcessEventKind, ProcessInfo};
+use shep_core::protocol::{
+    ActionOutcome, ActionReply, BusEvent, DogSource, ProcessEventKind, ProcessInfo,
+};
 use shep_core::selector::ProcessSelector;
 use shep_core::status::ProcStatus;
 
@@ -120,6 +122,27 @@ pub(crate) enum Command {
         /// Answers with every spawned instance, or the first spawn failure.
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     },
+    /// Registers + spawns one dog, marked with where it came from.
+    ///
+    /// Separate from [`Self::Start`] only because of what it WRITES — the
+    /// marker, which no Flockfile may declare — and because it is idempotent
+    /// by name. Everything downstream of the registration is the same code
+    /// path, deliberately: a dog is supervised exactly as a sheep is.
+    StartDog {
+        /// The dog's already-validated app spec, built by the daemon rather
+        /// than read from a Flockfile.
+        ///
+        /// Boxed where [`Self::Start`]'s `Vec` is already indirection: a
+        /// bare [`ResolvedApp`] here is the largest thing in this enum by an
+        /// order of magnitude, and every [`Msg`] the actor ever receives
+        /// would be sized for it.
+        app: Box<ResolvedApp>,
+        /// Where this dog came from, written onto its entry.
+        source: DogSource,
+        /// Answers with the dog's instance — the one just started, or the
+        /// one that was already registered under this name.
+        reply: oneshot::Sender<Result<ProcessInfo, SupervisorError>>,
+    },
     /// Stops every sheep matching `selector` (stays registered).
     Stop {
         /// Which sheep.
@@ -169,7 +192,7 @@ pub(crate) enum Command {
         /// Answers with the deleted ids once every matched sheep is terminal.
         reply: oneshot::Sender<Result<Vec<u32>, SupervisorError>>,
     },
-    /// Full flock listing, id-sorted.
+    /// Full flock listing, name-grouped (see [`Actor::snapshot_all`]).
     List {
         /// Answers with the current snapshot.
         reply: oneshot::Sender<Vec<ProcessInfo>>,
@@ -409,6 +432,34 @@ impl SupervisorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Command(Command::Start { apps, reply }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
+    /// Registers and starts one dog, marked as coming from `source`.
+    ///
+    /// Idempotent by name: a dog already registered under `app`'s name is
+    /// reported as it stands rather than started twice, which is what makes
+    /// `shep enable` safe to run against a daemon that already has the dog.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::EngineStopped`] — shutdown has begun, or the
+    ///   actor is gone.
+    /// - [`SupervisorError::SpawnFailed`] — the binary could not be spawned.
+    pub async fn start_dog(
+        &self,
+        app: ResolvedApp,
+        source: DogSource,
+    ) -> Result<ProcessInfo, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::StartDog {
+                app: Box::new(app),
+                source,
+                reply,
+            }))
             .await
             .map_err(|_| SupervisorError::EngineStopped)?;
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
@@ -699,7 +750,7 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
     }
 
-    /// Full flock listing, id-sorted.
+    /// Full flock listing, name-grouped (see [`Actor::snapshot_all`]).
     ///
     /// # Errors
     ///
@@ -713,7 +764,8 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)
     }
 
-    /// Full flock listing, id-sorted.
+    /// Full flock listing, grouped by app name (each app's instances kept
+    /// in their own instance-slot order, ties from a reload broken by id).
     ///
     /// Convenience over `Self::list_checked` for callers that don't need
     /// to distinguish "actor gone" from "empty flock" — mainly tests.
@@ -1340,8 +1392,16 @@ impl<R: ProcessRunner> Actor<R> {
                 let result = if self.shutting_down {
                     Err(SupervisorError::EngineStopped)
                 } else {
-                    self.do_start(apps)
+                    self.do_start(apps, None)
                 };
+                let _ = reply.send(result);
+                false
+            }
+            // Rejected while `shutting_down` under CRITICAL-1's rule, the one
+            // Start follows and for the same reason: a dog spawned after the
+            // shutdown aggregation was computed is a child nothing will kill.
+            Command::StartDog { app, source, reply } => {
+                let result = self.do_start_dog(*app, source);
                 let _ = reply.send(result);
                 false
             }
@@ -1434,10 +1494,47 @@ impl<R: ProcessRunner> Actor<R> {
         }
     }
 
+    /// Registers + spawns one dog, or reports the one already registered
+    /// under that name.
+    ///
+    /// The name lookup is what makes this idempotent, and it reads names
+    /// rather than markers: two live processes under one name is the outcome
+    /// being ruled out, whichever population the entry already there belongs
+    /// to.
+    fn do_start_dog(
+        &mut self,
+        app: ResolvedApp,
+        source: DogSource,
+    ) -> Result<ProcessInfo, SupervisorError> {
+        if self.shutting_down {
+            return Err(SupervisorError::EngineStopped);
+        }
+        if let Some(slot) = self
+            .sheep
+            .values()
+            .find(|slot| slot.entry.spec.config().name == app.config().name)
+        {
+            return Ok(to_info(&slot.entry));
+        }
+        let started = self.do_start(vec![app], Some(source))?;
+        started
+            .into_iter()
+            .next()
+            .ok_or_else(|| SupervisorError::SpawnFailed("the dog registered no instance".into()))
+    }
+
     /// Expands each app through `instance_slots` + `assemble`, spawning one
     /// instance per slot. Already-registered entries persist even when a
     /// later spawn in the batch fails.
-    fn do_start(&mut self, apps: Vec<ResolvedApp>) -> Result<Vec<ProcessInfo>, SupervisorError> {
+    ///
+    /// `dog` is written onto every entry this registers, and is `None` for
+    /// every caller but [`Self::do_start_dog`] — see [`ProcessEntry::dog`]
+    /// for why the marker rides the entry rather than a registry of its own.
+    fn do_start(
+        &mut self,
+        apps: Vec<ResolvedApp>,
+        dog: Option<DogSource>,
+    ) -> Result<Vec<ProcessInfo>, SupervisorError> {
         let mut results = Vec::new();
         for app in apps {
             let name = app.config().name.clone();
@@ -1458,7 +1555,7 @@ impl<R: ProcessRunner> Actor<R> {
             let slots = instance_slots(&existing, app.config().instances);
 
             for instance in slots {
-                match self.spawn_fresh(&app, instance, credentials) {
+                match self.spawn_fresh(&app, instance, credentials, dog.clone()) {
                     Ok(info) => results.push(info),
                     Err(message) => return Err(SupervisorError::SpawnFailed(message)),
                 }
@@ -1474,11 +1571,17 @@ impl<R: ProcessRunner> Actor<R> {
     /// readiness task armed when the app configures `wait_ready` or
     /// `readiness_probe`, `Online` immediately otherwise; `Errored` with no
     /// task on failure.
+    ///
+    /// `dog` lands on the entry both arms register, not just the successful
+    /// one: a dog whose binary cannot be spawned still has to show up in the
+    /// dogs table as `Errored`, which is exactly what adopting a bad path
+    /// produces.
     fn spawn_fresh(
         &mut self,
         app: &ResolvedApp,
         instance: u32,
         credentials: Option<Credentials>,
+        dog: Option<DogSource>,
     ) -> Result<ProcessInfo, String> {
         let spec = assemble(app, instance, &self.paths, credentials);
         let id = self.next_id;
@@ -1521,6 +1624,7 @@ impl<R: ProcessRunner> Actor<R> {
                     credentials,
                     out_file,
                     err_file,
+                    dog,
                 };
                 let info = to_info(&entry);
                 let log_ctl = io.log_ctl.clone();
@@ -1588,6 +1692,7 @@ impl<R: ProcessRunner> Actor<R> {
                     credentials,
                     out_file,
                     err_file,
+                    dog,
                 };
                 let info = to_info(&entry);
                 self.sheep.insert(
@@ -1815,6 +1920,29 @@ impl<R: ProcessRunner> Actor<R> {
         }
     }
 
+    /// Every registered id `selector` names, in id order.
+    ///
+    /// The one place selection happens. A dog is included only for a selector
+    /// that named it ([`ProcessSelector::is_exact`]), so `stop all`, `reload
+    /// all`, `delete all` and a `/regex/` sweep pass every dog by while `shep
+    /// restart bark` still reaches one.
+    fn matching_ids(&self, selector: &ProcessSelector) -> Vec<u32> {
+        let exact = selector.is_exact();
+        let mut ids: Vec<u32> = self
+            .sheep
+            .iter()
+            .filter(|(_, slot)| exact || slot.entry.dog.is_none())
+            .filter_map(|(id, slot)| {
+                let config = slot.entry.spec.config();
+                selector
+                    .matches(&config.name, *id, config.fold.as_deref())
+                    .then_some(*id)
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Resolves `selector`, then either defers to each matched sheep's next
     /// exit (if running) or applies the command immediately (if not).
     ///
@@ -1832,16 +1960,7 @@ impl<R: ProcessRunner> Actor<R> {
         origin: CommandOrigin,
         reply: ReplyKind,
     ) {
-        let matched: Vec<u32> = self
-            .sheep
-            .iter()
-            .filter_map(|(id, slot)| {
-                let config = slot.entry.spec.config();
-                selector
-                    .matches(&config.name, *id, config.fold.as_deref())
-                    .then_some(*id)
-            })
-            .collect();
+        let matched = self.matching_ids(&selector);
 
         if matched.is_empty() {
             send_reply(reply, Err(SupervisorError::NotFound));
@@ -2038,17 +2157,7 @@ impl<R: ProcessRunner> Actor<R> {
         selector: &ProcessSelector,
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     ) {
-        let mut matched: Vec<u32> = self
-            .sheep
-            .iter()
-            .filter_map(|(id, slot)| {
-                let config = slot.entry.spec.config();
-                selector
-                    .matches(&config.name, *id, config.fold.as_deref())
-                    .then_some(*id)
-            })
-            .collect();
-        matched.sort_unstable();
+        let matched = self.matching_ids(selector);
 
         if matched.is_empty() {
             let _ = reply.send(Err(SupervisorError::NotFound));
@@ -2283,6 +2392,12 @@ impl<R: ProcessRunner> Actor<R> {
         // `Credentials` is `Copy`; reused, never re-resolved.
         let credentials = drainee.credentials;
         let restarts = drainee.restarts;
+        // Carried across the swap for the same reason `restarts` is: the
+        // replacement is the same instance continuing, not a new one, and
+        // `shep reload bark` names a dog exactly enough to reach it. Read off
+        // the drainee rather than re-derived, because nothing here could
+        // re-derive it.
+        let dog = drainee.dog.clone();
 
         let new_id = self.next_id;
         self.next_id += 1;
@@ -2316,6 +2431,7 @@ impl<R: ProcessRunner> Actor<R> {
                     credentials,
                     out_file,
                     err_file,
+                    dog,
                 };
                 let info = to_info(&entry);
                 let log_ctl = io.log_ctl.clone();
@@ -2902,11 +3018,11 @@ impl<R: ProcessRunner> Actor<R> {
     ) {
         let mut matched: Vec<ProcessInfo> = Vec::new();
         let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
-        for (id, slot) in &self.sheep {
-            let config = slot.entry.spec.config();
-            if !selector.matches(&config.name, *id, config.fold.as_deref()) {
-                continue;
-            }
+        for id in self.matching_ids(selector) {
+            let slot = self
+                .sheep
+                .get(&id)
+                .expect("`matching_ids` answers with ids read off this map a moment ago");
             paths.insert(slot.entry.out_file.clone());
             paths.insert(slot.entry.err_file.clone());
             matched.push(to_info(&slot.entry));
@@ -2930,13 +3046,13 @@ impl<R: ProcessRunner> Actor<R> {
             })
             .collect();
 
-        // Both sorted here, where the whole set is in hand, rather than after
-        // the reopens: `HashMap` iteration order is arbitrary, a caller
-        // reading the reply as a table wants the same id order `list` gives,
-        // and pump failures are reported in the order they are collected, so
-        // an unsorted reopen set would make a multi-pump failure message read
-        // differently run to run.
-        matched.sort_unstable_by_key(|info| info.id);
+        // Sorted here, where the whole set is in hand, rather than after the
+        // reopens: `HashMap` iteration order is arbitrary, and pump failures
+        // are reported in the order they are collected, so an unsorted pump
+        // set would make a multi-pump failure message read differently run to
+        // run. `matched` needs no such step — it is built in the id order
+        // `matching_ids` answers in, and a caller reading the reply as a
+        // table wants a stable order over `list`'s own (name-grouped) one.
         pumps.sort_unstable_by_key(|(info, _)| info.id);
         spawn_reopen_task(matched, pumps, reply);
     }
@@ -3001,11 +3117,11 @@ impl<R: ProcessRunner> Actor<R> {
     ) {
         let mut matched: Vec<ProcessInfo> = Vec::new();
         let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
-        for (id, slot) in &self.sheep {
-            let config = slot.entry.spec.config();
-            if !selector.matches(&config.name, *id, config.fold.as_deref()) {
-                continue;
-            }
+        for id in self.matching_ids(selector) {
+            let slot = self
+                .sheep
+                .get(&id)
+                .expect("`matching_ids` answers with ids read off this map a moment ago");
             paths.insert(slot.entry.out_file.clone());
             paths.insert(slot.entry.err_file.clone());
             matched.push(to_info(&slot.entry));
@@ -3025,13 +3141,14 @@ impl<R: ProcessRunner> Actor<R> {
             .filter_map(|(id, slot)| slot.log_ctl.clone().map(|log_ctl| (*id, log_ctl)))
             .collect();
 
-        // Both sorted for the reason `handle_reopen` sorts: `HashMap`
-        // iteration order is arbitrary, and a caller rendering the reply as a
-        // table wants `list`'s id order — while pump failures are reported in
-        // the order they are collected, so an unsorted flush set would make a
-        // multi-pump failure message read differently run to run. `paths`
-        // needs no such step, being a `BTreeSet` already.
-        matched.sort_unstable_by_key(|info| info.id);
+        // Sorted for the reason `handle_reopen` sorts: `HashMap` iteration
+        // order is arbitrary, and pump failures are reported in the order
+        // they are collected, so an unsorted flush set would make a
+        // multi-pump failure message read differently run to run. Neither
+        // `matched` nor `paths` needs the step — the first is built in the id
+        // order `matching_ids` answers in, which is `list`'s and so the one a
+        // caller rendering the reply as a table wants, and the second is a
+        // `BTreeSet` already.
         pumps.sort_unstable_by_key(|&(id, _)| id);
         let pumps = pumps.into_iter().map(|(_, log_ctl)| log_ctl).collect();
         spawn_flush_task(matched, pumps, paths, reply);
@@ -3648,21 +3765,11 @@ impl<R: ProcessRunner> Actor<R> {
         params: Option<String>,
         reply: oneshot::Sender<Result<Vec<ActionReply>, SupervisorError>>,
     ) {
-        let mut matched: Vec<u32> = self
-            .sheep
-            .iter()
-            .filter_map(|(id, slot)| {
-                let config = slot.entry.spec.config();
-                selector
-                    .matches(&config.name, *id, config.fold.as_deref())
-                    .then_some(*id)
-            })
-            .collect();
-        // Sorted so the actions go out in id order rather than in whatever
-        // order the map happened to yield them. The final sort in
-        // `spawn_trigger_task` is what the ANSWER's order rests on; this one
-        // only keeps delivery from being arbitrary as well.
-        matched.sort_unstable();
+        // `matching_ids` answers in id order, so the actions go out in that
+        // order rather than in whatever order the map happened to yield them.
+        // The final sort in `spawn_trigger_task` is what the ANSWER's order
+        // rests on; this one only keeps delivery from being arbitrary as well.
+        let matched = self.matching_ids(selector);
 
         if matched.is_empty() {
             let _ = reply.send(Err(SupervisorError::NotFound));
@@ -3933,15 +4040,30 @@ impl<R: ProcessRunner> Actor<R> {
         to_info(&slot.entry)
     }
 
-    /// Full flock listing, id-sorted.
+    /// Full flock listing, grouped by app name.
+    ///
+    /// Sorted on `(name, instance, id)`, not id: sorting by id scatters a
+    /// clustered app's instances across the table, and grouping by name is
+    /// what makes a four-instance app read as one thing at a glance.
+    /// `instance` keeps a clustered app's slots in their own order once
+    /// grouped, and `id` breaks the tie a reload creates, where a
+    /// replacement takes the drainee's slot number with a fresh id.
+    ///
+    /// Applied here once rather than once per verb: this is the single
+    /// function every listing reply is built from — `ListFlock`, `Describe`,
+    /// `Mustered`, and the muster roll's own `list_checked` — so sorting
+    /// anywhere else would leave the metrics dog and bark reading a
+    /// different order from the operator, or duplicate the rule per verb.
     fn snapshot_all(&self) -> Vec<ProcessInfo> {
-        let mut infos: Vec<ProcessInfo> = self
-            .sheep
-            .values()
-            .map(|slot| to_info(&slot.entry))
-            .collect();
-        infos.sort_unstable_by_key(|info| info.id);
-        infos
+        let mut entries: Vec<&ProcessEntry> = self.sheep.values().map(|slot| &slot.entry).collect();
+        entries.sort_unstable_by(|a, b| {
+            (a.spec.config().name.as_str(), a.instance, a.id).cmp(&(
+                b.spec.config().name.as_str(),
+                b.instance,
+                b.id,
+            ))
+        });
+        entries.into_iter().map(to_info).collect()
     }
 
     /// Broadcasts one lifecycle transition. Send failures (no receivers)
@@ -4001,6 +4123,7 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
         // and never read.
         cpu_percent: None,
         memory_bytes: None,
+        dog: entry.dog.clone(),
     }
 }
 
@@ -4513,6 +4636,7 @@ async fn run_sheep<P: RunningProcess>(
 #[cfg(test)]
 mod tests {
     use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, normalize};
+    use shep_core::protocol::DogSource;
     use shep_core::status::ProcStatus;
     use shep_core::values::UpDuration;
 
@@ -4520,7 +4644,8 @@ mod tests {
     use crate::fake::{ProcScript, ScriptedRunner};
     // the one crate-root fixture (IR-33)
     use crate::testing::{
-        RecordingEnforcer, SharedRunner, armed_entry, idle_stats, probe_config, test_paths,
+        Harness, RecordingEnforcer, SharedRunner, app_with, armed_entry, harness, idle_stats,
+        probe_config, test_paths,
     };
     // Test-only: the one case that drives a real `liveness_probe` has to
     // build the lifecycle extras the production wiring builds at boot, and
@@ -6306,6 +6431,353 @@ mod tests {
             reloads: HashMap::new(),
         };
         (actor, rx)
+    }
+
+    /// [`ProcessEntry::id`] of the fixture's sheep, and of its dog.
+    const SHEEP_ID: u32 = 0;
+    const DOG_ID: u32 = 1;
+
+    /// A bare actor holding one `Online` sheep and one `Online` dog.
+    ///
+    /// The two entries are alike in everything a selector can read — same
+    /// status, same fold, same registration, adjacent ids — so the marker is
+    /// the only difference between them. That is what lets a case watching
+    /// the dog drop out of a wildcard's answer conclude the MARKER did it,
+    /// rather than a status or a fold the wildcard would have passed over
+    /// anyway.
+    fn actor_with_a_sheep_and_a_dog(
+        dir: &tempfile::TempDir,
+    ) -> (Actor<ScriptedRunner>, mpsc::Receiver<Msg>) {
+        let paths = test_paths(dir);
+        let mut sheep = HashMap::new();
+        for (id, name, dog) in [
+            (SHEEP_ID, "web", None),
+            (DOG_ID, "bark", Some(DogSource::BuiltIn)),
+        ] {
+            let app = app_with(name, |config| config.fold = Some("svc".to_string()));
+            let mut entry = armed_entry(id, 0, 1111 + id, app, &paths);
+            entry.dog = dog;
+            sheep.insert(
+                id,
+                SheepSlot {
+                    entry,
+                    ctl: None,
+                    log_ctl: None,
+                    to_child: None,
+                    manual: None,
+                    pending_delete: false,
+                    epoch: 0,
+                    ready_tx: None,
+                    actions: ActionWaits::default(),
+                },
+            );
+        }
+        let (events, _events_rx) = broadcast::channel(64);
+        let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
+        let actor = Actor {
+            runner: ScriptedRunner::new(Vec::new()),
+            paths,
+            events,
+            tx,
+            sheep,
+            next_id: DOG_ID + 1,
+            next_action_stamp: 0,
+            pending: Vec::new(),
+            shutting_down: false,
+            extras: None,
+            registry: ExtrasRegistry::default(),
+            reloads: HashMap::new(),
+        };
+        (actor, rx)
+    }
+
+    /// fails if a wildcard reaches a dog. Every assertion is load-bearing
+    /// and none implies another: without the last two a helper that excluded
+    /// dogs from EVERYTHING passes, and `shep disable bark` — which stops the
+    /// dog by naming it — would silently match nothing.
+    #[test]
+    fn a_wildcard_passes_a_dog_by_and_its_own_name_still_reaches_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (actor, _mailbox) = actor_with_a_sheep_and_a_dog(&dir);
+
+        assert_eq!(
+            actor.matching_ids(&ProcessSelector::All),
+            vec![SHEEP_ID],
+            "`all` is the flock, not the kennel"
+        );
+        assert_eq!(
+            actor.matching_ids(&ProcessSelector::parse("/^(web|bark)$/").unwrap()),
+            vec![SHEEP_ID],
+            "a sweep that spells both names out is still a sweep"
+        );
+        assert_eq!(
+            actor.matching_ids(&ProcessSelector::Fold("svc".into())),
+            vec![SHEEP_ID],
+            "a dog shares its fold with the flock and is still not swept by it"
+        );
+        assert_eq!(
+            actor.matching_ids(&ProcessSelector::Name("bark".into())),
+            vec![DOG_ID]
+        );
+        assert_eq!(
+            actor.matching_ids(&ProcessSelector::Id(DOG_ID)),
+            vec![DOG_ID]
+        );
+    }
+
+    /// fails if `to_info` invents the marker rather than reading the entry's
+    /// — the shape that puts a dog in a listing as an ordinary sheep, with
+    /// nothing anywhere left to say which it is.
+    #[test]
+    fn a_listing_reports_where_a_dog_came_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let (actor, _mailbox) = actor_with_a_sheep_and_a_dog(&dir);
+
+        assert_eq!(
+            to_info(&actor.sheep[&DOG_ID].entry).dog,
+            Some(DogSource::BuiltIn)
+        );
+        assert_eq!(to_info(&actor.sheep[&SHEEP_ID].entry).dog, None);
+    }
+
+    /// Starts `app` (normalized) through `h`'s supervisor and hands back the
+    /// snapshot the start answers with.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `app` does not normalize, or if the actor refuses the
+    /// start — both a fixture bug at the call site, not a condition under
+    /// test. (Not `#[track_caller]`: it is a no-op on an async fn, and would
+    /// only mislead a reader into thinking a panic here points back to the
+    /// call site.)
+    async fn start_app(h: &Harness, app: AppConfig) -> Vec<ProcessInfo> {
+        h.ctx
+            .supervisor
+            .start(vec![normalize(app).unwrap()])
+            .await
+            .unwrap()
+    }
+
+    /// fails if the listing comes back in id order. Built so id order and
+    /// name order genuinely disagree — `web` is registered second and must
+    /// still come first — because a fixture whose two orders coincide
+    /// cannot tell the two implementations apart, and that is the shape of
+    /// fixture this project has shipped before.
+    #[tokio::test]
+    async fn a_listing_groups_an_apps_instances_under_its_name() {
+        let h = harness(vec![ProcScript::never_exits(); 4]);
+        start_app(
+            &h,
+            AppConfig {
+                instances: 2,
+                ..AppConfig::minimal("zebra", "./z")
+            },
+        )
+        .await;
+        start_app(
+            &h,
+            AppConfig {
+                instances: 2,
+                ..AppConfig::minimal("alpha", "./a")
+            },
+        )
+        .await;
+
+        let listed = h.ctx.supervisor.list().await;
+        let names: Vec<&str> = listed.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "alpha", "zebra", "zebra"]);
+        let ids: Vec<u32> = listed.iter().map(|i| i.id).collect();
+        assert_ne!(
+            ids,
+            {
+                let mut sorted = ids.clone();
+                sorted.sort_unstable();
+                sorted
+            },
+            "the fixture must make id order and name order disagree, or it proves nothing"
+        );
+    }
+
+    /// One dog's app spec. The path is a label: [`ScriptedRunner`] replays a
+    /// script instead of exec'ing anything, so nothing has to exist there.
+    fn dog_app(name: &str) -> ResolvedApp {
+        normalize(AppConfig::minimal(name, "/nonexistent/shep")).unwrap()
+    }
+
+    /// The `bark` row of a listing, or a panic naming what was there instead.
+    fn dog_row(listed: &[ProcessInfo], id: u32) -> ProcessInfo {
+        listed
+            .iter()
+            .find(|info| info.id == id)
+            .unwrap_or_else(|| panic!("id {id} left the flock: {listed:?}"))
+            .clone()
+    }
+
+    /// fails if `start_dog` marks the entry and the marker is then lost on
+    /// respawn — which is the shape a marker written by the START path
+    /// rather than carried by the ENTRY takes, and it is invisible until a
+    /// dog crashes once: the dog vanishes from the dogs table and reappears
+    /// among the flock, with no error anywhere.
+    ///
+    /// Two scripts, of which a correct run uses both: the crash the entry
+    /// earns its restart with, and the process that restart produces.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_that_restarts_is_still_a_dog() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, mut rx) = broadcast::channel(64);
+        let runner =
+            ScriptedRunner::new(vec![ProcScript::const_exit(1), ProcScript::never_exits()]);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+
+        let dog = handle
+            .start_dog(dog_app("bark"), DogSource::BuiltIn)
+            .await
+            .unwrap();
+        assert_eq!(dog.dog, Some(DogSource::BuiltIn));
+
+        // The scripted exit, then the automatic respawn it earns. Awaited on
+        // the bus rather than polled for: `Restart` is emitted from inside
+        // the respawn, after the entry has been rewritten, so a listing taken
+        // once it lands cannot read the entry mid-flight.
+        expect_event(&mut rx, dog.id, ProcessEventKind::Restart).await;
+        let after = dog_row(&handle.list().await, dog.id);
+
+        assert_eq!(
+            after.restarts, 1,
+            "the ordinary restart path, not a dog one"
+        );
+        assert_eq!(after.dog, Some(DogSource::BuiltIn));
+    }
+
+    /// fails if the marker is written only onto the entry a SUCCESSFUL spawn
+    /// registers. A dog whose binary is not there is the case `adopt` with a
+    /// bad path produces, and it has to be visible in the dogs table as
+    /// `Errored` — an unmarked one is a sheep nobody started, sitting in the
+    /// flock with a name the operator never chose.
+    ///
+    /// No scripts at all: [`ScriptedRunner`] fails a spawn by running out of
+    /// them, which is the only way it can fail.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_that_cannot_be_spawned_is_still_a_dog() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = broadcast::channel(64);
+        let handle = spawn_supervisor(ScriptedRunner::new(Vec::new()), test_paths(&dir), events);
+
+        let failed = handle
+            .start_dog(dog_app("bark"), DogSource::BuiltIn)
+            .await
+            .expect_err("a spawn with no script behind it cannot succeed");
+        assert!(matches!(failed, SupervisorError::SpawnFailed(_)));
+
+        let listed = handle.list().await;
+        let errored = dog_row(&listed, 0);
+        assert_eq!(errored.status, ProcStatus::Errored);
+        assert_eq!(errored.dog, Some(DogSource::BuiltIn));
+    }
+
+    /// fails if a reload's replacement is built without the marker.
+    /// `shep reload bark` names the dog exactly, so it reaches it (a
+    /// wildcard would not), and an unmarked replacement turns the dog into a
+    /// sheep at the one moment nothing is watching: the swap reports itself
+    /// as a success either way.
+    ///
+    /// Three scripts, of which a correct run uses two — the original and its
+    /// replacement. The third is for the spawn a broken run makes that a
+    /// correct one does not, so it lands as a live entry rather than as the
+    /// `SpawnFailed("script exhausted")` that reads like an unrelated
+    /// failure.
+    #[tokio::test(start_paused = true)]
+    async fn a_reloaded_dog_is_still_a_dog() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, mut rx) = broadcast::channel(256);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits(); 3]);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+
+        let dog = handle
+            .start_dog(dog_app("bark"), DogSource::BuiltIn)
+            .await
+            .unwrap();
+        handle
+            .reload(ProcessSelector::Name("bark".to_string()))
+            .await
+            .expect("a reload that names the dog is accepted");
+
+        // The replacement is the next id the actor hands out, and `Reloaded`
+        // on it is the swap being over — the drainee is deregistered by then,
+        // so the listing below holds the replacement alone.
+        let replacement = dog.id + 1;
+        expect_event(&mut rx, replacement, ProcessEventKind::Reloaded).await;
+        let listed = handle.list().await;
+
+        assert_eq!(
+            listed.len(),
+            1,
+            "the swap is over, not in flight: {listed:?}"
+        );
+        assert_eq!(
+            dog_row(&listed, replacement).dog,
+            Some(DogSource::BuiltIn),
+            "the half that arrived is the same dog the half that left was"
+        );
+    }
+
+    /// fails if a dog can be started once a graceful shutdown has begun
+    /// (CRITICAL-1), which is the rule `Start` already follows and for the
+    /// same reason: the shutdown aggregation's `online` snapshot was fixed
+    /// when it ran, so a child registered after it is one nothing will kill.
+    ///
+    /// The runner carries a script on purpose. With the guard deleted the
+    /// spawn a broken run makes really does succeed, so the registration
+    /// assertion below moves — against an exhausted runner it would fail for
+    /// the unrelated reason that nothing could spawn at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_is_refused_once_a_shutdown_has_begun() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _mailbox) =
+            actor_with_one_online_sheep(&dir, vec![ProcScript::never_exits()]);
+        actor.shutting_down = true;
+
+        let (reply, rx) = oneshot::channel();
+        actor.handle_command(Command::StartDog {
+            app: Box::new(dog_app("bark")),
+            source: DogSource::BuiltIn,
+            reply,
+        });
+
+        assert_eq!(rx.await, Ok(Err(SupervisorError::EngineStopped)));
+        assert_eq!(actor.sheep.len(), 1, "nothing new was registered");
+    }
+
+    /// fails if `start_dog` is not idempotent by name. `shep enable` runs
+    /// against a daemon that may already have the dog — from `enabled_dogs`
+    /// at boot — and a second live process under one name would give the dog
+    /// two connections, two metrics listeners on one port, and two copies of
+    /// every bark.
+    ///
+    /// Two scripts, of which a correct run uses one. The second is for the
+    /// spawn a non-idempotent `start_dog` makes into instance slot 1, so
+    /// that the break shows up as the extra entry it is rather than as a
+    /// spawn failure.
+    #[tokio::test(start_paused = true)]
+    async fn enabling_a_dog_twice_starts_one_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits(); 2]);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+
+        let first = handle
+            .start_dog(dog_app("bark"), DogSource::BuiltIn)
+            .await
+            .unwrap();
+        let second = handle
+            .start_dog(dog_app("bark"), DogSource::BuiltIn)
+            .await
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.pid, first.pid, "the same process, not a fresh one");
+        let listed = handle.list().await;
+        assert_eq!(listed.iter().filter(|i| i.name == "bark").count(), 1);
     }
 
     /// A [`ScriptedRunner`] that refuses one spawn by ordinal and forwards

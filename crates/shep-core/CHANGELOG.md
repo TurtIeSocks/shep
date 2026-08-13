@@ -12,6 +12,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `barks` module: `Bark`, `SinkOutcome`, `append`, `read`, and
+  `DEFAULT_MAX_BYTES` — the `barks.jsonl` ring both the bark dog (a rule
+  fired) and the shepherd itself (an enabled dog gave up) append to, and
+  `shep barks` will read. One JSON object per line, because a
+  line-delimited format is the one shape where a writer dying mid-append
+  costs the reader one record rather than the file. `append` keeps the
+  ring under a byte cap by evicting whole lines oldest-first, rewriting
+  the survivors plus the new record to a sibling temp file and `rename`ing
+  it over the original — the same atomic-replace shape
+  `shep-daemon::snapshot::write_atomic` uses, so an interrupted rewrite
+  never leaves a truncated line behind. A single record bigger than the
+  whole cap is written anyway, over cap, rather than dropped — the
+  alternative silently loses the alert that was too interesting to fit.
+  `read` is the forgiving half: a line that will not parse — a partial
+  write from a dead writer, or a record from a future shep — costs that
+  one record, not the whole history, because this file is read during an
+  incident and refusing it over one bad line is the wrong failure mode.
+  Lives in shep-core, not shep-daemon, because it has two writers in two
+  different processes and neither is the other's crate; one implementation
+  of the cap keeps them from evicting differently. `Bark`'s `Debug` is
+  derived, not redacted: it carries a rule name, a subject and a message,
+  all shep's own prose, and `SinkOutcome` names a sink by its
+  `[dog.bark.sinks]` config key, never by its webhook URL or token — the
+  file itself is still created owner-only (unix `0600`) as a matter of
+  posture, not because it holds a secret today.
+
+- Add `ProcessSelector::is_exact`, which answers whether a selector names one
+  entry the caller already knew of — by its name or its id — rather than
+  sweeping whatever matches. `Regex` and `Fold` are wildcards by this
+  measure even when the pattern is a literal that can only ever match one
+  name: what the split turns on is whether the operator named the thing, not
+  how many things the selector reaches. The daemon uses it to keep a dog out
+  of what `all` and a `/regex/` sweep touch while leaving `shep restart bark`
+  able to reach it.
+
+- Add `DaemonSection::adopted_dogs`, a `BTreeMap<String, PathBuf>` recording
+  where each adopted dog's binary lives, keyed by dog name (`shep adopt`
+  writes an entry; `shep rehome` removes it). A name in `enabled_dogs` with
+  no entry here is a built-in dog — an argv branch of the shep binary
+  itself — and that presence-or-absence is the whole of the distinction.
+  The path deliberately lives in `[daemon.adopted_dogs]` rather than as a
+  shep-owned key inside `[dog.<name>]`: that table is the dog's own opaque
+  configuration, parsed by the dog and not by shep, and a shep-owned key
+  planted inside it would collide with a third-party dog's own schema.
+  `PathBuf`, not `String`: unlike `DogSource::Adopted`'s wire form, this
+  value never crosses the wire — it is read straight off `shep.toml` and
+  handed to a spawn, which is a path, not serialized text.
+- Add `Request::DogConfig`, `Request::EnableDog`, `Request::DisableDog`, and
+  `Response::DogSection`, `Response::DogStarted` — the wire verbs a dog and an
+  operator use to fetch a dog's config, start one, and stop one. Additive
+  under `#[non_exhaustive]` on the same terms as `Reopen` above —
+  `PROTOCOL_VERSION` stays **1**, and an older daemon fails to decode the verb
+  rather than answering it.
+
+  `DogConfig` carries a `name: String`, not a `SelectorSpec`: a dog's name is
+  a config key, selecting one `[dog.<name>]` table and one `enabled_dogs`
+  entry, not a set of processes, so a selector here would invite `shep enable
+  all`, which has no meaning. `DogSection` answers with the section rendered
+  back to TOML text rather than a typed structure — a config value the daemon
+  never has reason to parse for the dog, and a third-party dog stays bound to
+  the shape of its own section rather than to shep's config model, file
+  discovery, or layering rules. That text is wrapped in `DogSectionToml`, a
+  `#[serde(transparent)]` newtype over `String` whose `Debug` prints a byte
+  count instead of the section: a `[dog.<name>]` table is where a webhook
+  credential lives, and keeping it off the process table is the whole reason
+  the section travels over the socket rather than through the child's
+  environment. A derived `Debug` would have handed it back on the first
+  `tracing::debug!` of a reply. The newtype is transparent to serde, so the
+  wire bytes are those of a bare string and the pinned fixtures are unchanged;
+  it `Deref`s to `str` for reading. `EnableDog` carries the same `name` plus a
+  `DogSource` naming where the dog's binary comes from, and answers
+  `DogStarted(ProcessInfo)` — a bare `ProcessInfo`, not a `Vec`, the only
+  `Response` variant shaped that way: enabling starts exactly one dog, and a
+  one-element list would invite a reader to wonder when it holds two.
+  `DisableDog` answers the existing `Response::Deleted(Vec<u32>)` rather than
+  a variant of its own: disabling deregisters exactly as `Delete` does, so
+  this is the same fact and not a coincidence of shape.
+- Add `ProcessInfo::dog` and `DogSource`, marking which flock entries are
+  dogs (the daemon's own supervised utility processes — metrics, bark) rather
+  than sheep, and naming where a marked one came from: `BuiltIn` for an argv
+  branch of the shep binary itself, `Adopted { path }` for an operator's own
+  binary run at the daemon's own trust level. `DogSource` is
+  `#[non_exhaustive]`, so a future source needs no protocol bump, and `path`
+  is a `String` rather than a `PathBuf` for the reason `ProcessInfo::out_file`
+  is one: serde's `PathBuf` impl refuses a non-UTF-8 path outright, aborting
+  the whole reply rather than degrading the one odd field. Additive under
+  `#[non_exhaustive]` and an `Option` field, so `PROTOCOL_VERSION` stays
+  **1** on the same terms as `out_file`/`cpu_percent` before it: a daemon
+  built before dogs existed sends no `dog` key at all, and a current client
+  decodes that as `None`.
+
+  `None` deliberately covers both "this entry is a sheep" and "this peer
+  predates the field" without needing to tell them apart, unlike
+  `cpu_percent`'s three enumerated cases — a stale `cpu_percent` reading
+  would be a claim about resource use, and there is no equivalent claim a
+  missing `dog` marker could get wrong: a daemon that predates dogs truly has
+  none, so "not a dog" is the correct answer under either reading.
+
 - Add `ProcessInfo::cpu_percent` and `ProcessInfo::memory_bytes`, a sheep's
   live resource use as the daemon read it while answering. CPU is a
   percentage of one core over the window since the daemon's last periodic

@@ -12,6 +12,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add the hidden `shep dog <name>` subcommand — the re-exec target a
+  built-in dog runs as, the same shape `shep daemon` already is: not for
+  direct use, spawned by the shepherd when it starts an enabled dog.
+
+  A dog inherits exactly one thing from the shepherd's own environment,
+  `$SHEP_HOME`, and nothing else it did not already need in order to exec
+  — no `[dog.<name>]` value ever rides along, since the environment is
+  readable from the process table, inherited by every child a dog spawns,
+  and captured into crash dumps. Instead `DogRuntime::start` connects to
+  the socket `$SHEP_HOME` names and asks for its own section over the
+  wire, and `DogRuntime::config` parses it into whatever shape the dog
+  expects — refusing to run on a section it cannot read rather than
+  silently falling back to defaults an operator did not ask for.
+
+  `shep dog <name>` refuses an unrecognised name before ever touching the
+  socket (`usage`, naming the two built-ins): `"metrics"` runs the metrics
+  dog below, `"bark"` the bark dog further down this file. A dog's own
+  diagnostics go to stderr, plain text: it is a supervised process, and the
+  shepherd's log pump already captures that into
+  `$SHEP_HOME/logs/<name>-0-err.log` like any sheep's — `shep bleats <name>`
+  is how an operator reads it.
+
+- Add `shep enable <name>` and `shep disable <name>`, the operator verbs
+  that turn a registered dog on and off. Both write `$SHEP_HOME/shep.toml`
+  first and only then, if a shepherd is reachable, ask it to act — so a
+  failed or skipped RPC still leaves the config saying what the operator
+  asked for, and the next boot honours it.
+
+  - `enable` adds `name` to `[daemon] enabled_dogs` (idempotently) and
+    ensures a `[dog.<name>]` table exists to configure it through, then
+    sends `EnableDog` if a shepherd answers. Against a name a sheep
+    already holds, the daemon refuses with `invalid_config` and a message
+    naming the collision; that message reaches the operator verbatim.
+  - `disable` removes `name` from `enabled_dogs`, leaving `[dog.<name>]`
+    in place — a disabled dog's own configuration survives, unlike
+    `shep rehome` (a later verb), which forgets it entirely — then sends
+    `DisableDog` if a shepherd answers.
+  - Neither verb autostarts a shepherd (`shep muster` is the one verb that
+    does). Against no running daemon, both still exit `0`: the config edit
+    is the part the operator asked for, and it landed. A `--format json`
+    reply's `shepherd_acted` field says whether a shepherd was actually
+    reached; `status` is the resulting state either way.
+  - A config change reaches an already-running dog only through
+    `disable` then `enable` again — neither verb re-reads a running dog's
+    `[dog.<name>]` section on its own.
+
+  `shep.toml` is edited through `toml_edit`, not round-tripped through a
+  plain `toml::Table`: an operator's comments, key order, and formatting
+  survive a `shep enable`/`shep disable`, since that file is hand-written
+  far more often than it is generated. A `shep.toml` that fails to parse
+  is refused rather than overwritten.
+
+- Add `shep adopt <name> <path>` and `shep rehome <name>`, the verbs that
+  register and forget a third-party dog. **An adopted dog runs at the
+  shepherd's own trust level, with no sandboxing beyond it** — `adopt`
+  vets the binary before running it, not against it being hostile.
+
+  - `adopt` refuses, before `shep.toml` is touched at all, a path that:
+    - doesn't exist,
+    - exists but isn't a file (most often a `bin/` directory the operator
+      meant to point inside of),
+    - exists but has no execute bit set for anyone,
+    - can be written by any user on this system — the binary itself or the
+      directory holding it, since a writable directory lets the binary be
+      renamed away and a replacement dropped in its place, or
+    - is executable and this kernel still refuses to run it — the wrong
+      architecture, or a shebang naming an absent interpreter.
+
+    The writability check reads the canonicalized path, the one actually
+    recorded, and runs BEFORE the exec probe below, which runs the binary:
+    a binary any user can rewrite is not one to run in order to find out
+    whether it runs. A GROUP-writable file or directory is warned about
+    instead of refused, naming the path — a deploy directory owned by a
+    trusted group is an ordinary arrangement, and refusing it outright
+    would break real setups. That split is the one OpenSSH makes for
+    `authorized_keys` and sudo for `sudoers`: refuse the unambiguous case,
+    don't be clever about the ambiguous one.
+
+    The last check is answered by actually running the binary (with no
+    arguments, exactly as the daemon later will) and killing it the moment
+    it's confirmed to run — never by reading its header, which would mean
+    trusting a second, partial loader that can disagree with the real one.
+  - A vetted path is recorded ABSOLUTE and canonicalized in
+    `[daemon] adopted_dogs`, so a reboot's boot path (which spawns from
+    whatever working directory the init system handed it) resolves the
+    same binary the operator pointed at, not whatever a relative path
+    happens to mean from wherever the daemon starts.
+  - `rehome` is to `adopt` what `disable` is to `enable`, with one more
+    thing forgotten: it removes `name` from `enabled_dogs` AND
+    `adopted_dogs`, and drops its `[dog.<name>]` table entirely — where
+    `disable` deliberately keeps that table so a dog's own configuration
+    survives being turned off and back on.
+  - Neither verb autostarts a shepherd, matching `enable`/`disable`: both
+    write the config and exit `0` even with no shepherd running, and a
+    shepherd is still asked to act (start or stop the dog) whenever one
+    answers.
+  - `shep enable --exec <path> <name>` is kept as a hidden alias for
+    `adopt`, pm2's own spelling, for muscle memory — note the argument
+    order: pm2's own spelling puts the path first, `shep adopt` puts the
+    name first. It doesn't appear in `--help`; `shep adopt` is the verb
+    that does.
+
+- `shep flock` prints a second table beneath the flock's own whenever any
+  dog is registered, captioned `Dogs` — headers `NAME`, `SOURCE`, `STATUS`,
+  `PID`, `RESTARTS`, `CPU`, `MEM`, `UPTIME`. No `ID` column: ids reflect
+  spawn order across the one registry the sheep and dogs share, and the two
+  populations are never rendered together, so that shared id space costs
+  nothing at the surface. `SOURCE` renders `built-in` or `adopted`; an
+  adopted binary's own path stays JSON-only, the same reason `flock`'s own
+  table already keeps `out_file`/`err_file` off it.
+
+  `shep dogs` lists the dogs and nothing else, through that same table
+  renderer. Neither verb gained a flag to opt in or out — a flock listing
+  always shows every sheep and every dog.
+
+  `--format json` is unchanged in shape: one `data` array, every entry,
+  each still carrying its own `dog` marker. The table split is a rendering
+  decision only.
+
 - Add the clap command tree (`Cli`, `Commands`, and every argument struct
   the CLI will ever parse — `Start`, `Stop`/`Restart`/`Reload`/`Delete`/
   `Describe`, `Trigger`, `Flock` (aliases `list`/`ls`), `Fold`, `Bleats`
@@ -414,7 +533,226 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column. `shep flush`'s own table is untouched — its CHANGELOG entry
   already covers why lifecycle and resource fields stay JSON-only there.
 
+- Add `dog::metrics::exposition::render`, which turns a flock snapshot into
+  Prometheus text exposition (format version 0.0.4), and `shep dog metrics`
+  (below), the dog that serves it. No `prometheus` crate: the format is one
+  line per series over data that already arrives as a plain
+  `Vec<ProcessInfo>` per scrape, never accumulated, so a
+  registry/collector/gatherer stack would buy nothing this function
+  doesn't already do directly.
+
+  | Metric | Type | Labels | Meaning |
+  |---|---|---|---|
+  | `shep_sheep_cpu_percent` | gauge | `sheep`, `id`, `fold` | tree CPU, omitted when the daemon has no sample |
+  | `shep_sheep_memory_bytes` | gauge | `sheep`, `id`, `fold` | tree RSS, omitted when the daemon has no sample |
+  | `shep_sheep_restart_total` | counter | `sheep`, `id`, `fold` | restarts since registration |
+  | `shep_sheep_uptime_seconds` | gauge | `sheep`, `id`, `fold` | seconds since last successful start |
+  | `shep_sheep_status` | gauge | `sheep`, `id`, `fold`, `status` | one series per lifecycle state, `1` for the current one |
+  | `shep_dog_up` | gauge | `dog`, `source` | `1` when the dog is online, `0` otherwise |
+  | `shep_daemon_up` | gauge | `version` | always `1` — the scrape reached the shepherd |
+  | `shep_daemon_pid` | gauge | — | the shepherd's own pid |
+  | `shep_host_memory_total_bytes` | gauge | — | total physical memory on the host |
+  | `shep_host_memory_used_bytes` | gauge | — | memory in use on the host |
+  | `shep_host_processes` | gauge | — | processes running on the host, the flock included |
+  | `shep_host_uptime_seconds` | gauge | — | seconds since the host booted |
+
+  A sheep with no CPU/memory sample contributes no series for those two
+  metrics rather than a `0` — a zero is a claim the daemon declined to
+  make, and a dashboard averaging invented zeros would report a flock
+  idler than it actually is. `shep_sheep_status` is one series per state
+  with a `status` label, not a single gauge holding an enum ordinal, so an
+  alert can name `status="errored"` without the enum's declaration order
+  in front of it. `shep_dog_up` covers every *registered* dog, including
+  one that never spawned or exhausted its restart budget — both report
+  `0` rather than going missing, because "is the monitoring itself up" is
+  the one question monitoring cannot answer with a missing series. The
+  `shep_host_*` group is omitted entirely when the host sample is
+  unavailable. Label values are escaped per the exposition format
+  (backslash, double quote, newline) — a sheep's name is operator-supplied
+  and reaches the renderer verbatim.
+
+- `shep dog metrics` (spawned by the shepherd when `metrics` is enabled)
+  serves the exposition above over plain HTTP. `[dog.metrics] bind`
+  chooses the listen address, defaulting to `127.0.0.1:9615` —
+  loopback, and only loopback, unless the operator names a wider one
+  explicitly: a metrics endpoint carries every sheep's name, and on many
+  hosts a sheep's name is the name of an internal service, so this dog
+  never widens its own exposure as a side effect of `shep enable`. An
+  unrecognised key under `[dog.metrics]` is a startup error naming it,
+  not a dog silently serving on a port the operator didn't choose.
+
+  `/metrics` answers the exposition; every other path answers `404`
+  naming `/metrics`, so a scrape config that happens to work against `/`
+  doesn't quietly break the day that path is honoured. Each scrape is a
+  live `ListFlock` against the shepherd — never a cached reading
+  refreshed on a timer — so a scrape faster than the shepherd's own
+  sampling window sees the same number twice, honestly: that's the
+  resolution the underlying sample has. A shepherd that doesn't answer
+  gets a `503`, not a stale exposition or an empty `200` a scraper would
+  read as "the flock is empty." A bind failure (`EADDRINUSE`, most often
+  a second shepherd or the operator's own Prometheus pushgateway) is a
+  fatal, named exit, not a warning — this dog's whole purpose is that
+  port. `shep disable metrics` stops it on `SIGTERM`, the shepherd's own
+  first rung of its kill ladder, rather than riding it all the way to
+  `SIGKILL`.
+
+- `dog::bark::sinks`: `Sink`, the three webhook destinations one fired bark
+  can be delivered to — `discord` (`{"content": "..."}`), `slack`
+  (`{"text": "..."}`), and `json` (an operator-templated POST, defaulting
+  to an object carrying `subject`, `rule`, `message` and `at_ms`). A
+  templated `body` substitutes `{subject}`, `{rule}`, `{message}` and
+  `{at_ms}` — the three strings JSON-escaped, `at_ms` a bare number — and
+  `render_body` refuses to send a template that does not render valid
+  JSON, naming the parser's own complaint rather than letting an operator
+  guess at the 400 every one of these endpoints answers a malformed body
+  with.
+
+  `deliver` POSTs the rendered body over a hand-rolled HTTP/1.1 client,
+  bounded end-to-end (connect, handshake, write, read) by one timeout. A
+  non-2xx reply is `SinkError::Status`, carrying the code and the first
+  line of the body — Discord's own rate-limit `429` arrives this way and
+  reads as one, rather than as a silently-swallowed success.
+
+  Two new workspace dependencies: `tokio-rustls` and `webpki-roots`, named
+  directly rather than pulling in `reqwest`. Discord and Slack webhooks
+  are HTTPS-only, so this phase needs a TLS client somewhere, and Rin's
+  ruling (2026-08-12) was a hand-rolled HTTP/1.1 request/response over
+  `tokio-rustls`'s connector — the same call already made for the metrics
+  dog's HTTP *server* side, aimed the other way — rather than `reqwest`.
+  Measured against this workspace's existing dependency tree: `reqwest`'s
+  default `rustls` feature costs +93 crates and a C build dependency
+  (`aws-lc-sys`, `cmake`); `tokio-rustls` + `webpki-roots`, named with
+  `ring` as the crypto provider instead of the default `aws_lc_rs`, cost
+  11 unique runtime crates (plus 3 build-time-only crates behind `ring`'s
+  own build script) and no C toolchain — the extra one over the ruling's
+  own "+10" estimate is `webpki-roots` 0.26's own semver-trick shim onto
+  `webpki-roots` 1.x, confirmed with `cargo tree -p shep-cli`. What
+  `reqwest` adds beyond that includes QUIC/HTTP3, wasm/JNI bindings, ICU
+  (IDNA), and a `tower` stack — none of it reachable from a Unix daemon
+  POSTing to a webhook. A sink's
+  `url` is a bearer credential (Discord and Slack embed the token in the
+  path), so `Sink`'s `Debug` is hand-written and redacted rather than
+  derived; `SinkError` carries the sink's kind and failure kind, never its
+  URL.
+
+- `dog::bark::rules`: `Rules`, deciding which events become a bark and
+  which are filtered out. Four trigger kinds under `[dog.bark.rules]`'s
+  `on = "..."` key: `event` (any of a configured list of bus event kinds,
+  by wire spelling — `exit`, `errored`, `online`, ...), `gave_up` (a sheep
+  reached `Errored` — on by default with no configuration at all, since
+  it is the alert that must not be missed), `restart_rate` (`restarts`
+  restarts within `within` — opt-in, since it is the one that pages at
+  3am for a blip and the threshold should be one the operator chose), and
+  `memory_above` (a sheep's memory crossed a `bytes` ceiling). A
+  `[dog.bark]` with sinks configured and no `[[dog.bark.rules]]` at all
+  still alerts: `Rules::default_rules` builds one `gave_up` rule routed to
+  every configured sink.
+
+  Two routes feed the same rule set: `on_event` off the daemon bus, and
+  `on_poll` off a reconciliation snapshot of the flock. Both exist because
+  `tokio::sync::broadcast` drops events for a lagging subscriber rather
+  than queueing them — the daemon surfaces that as `BusEvent::Dropped` —
+  so a dog that only listened to the bus would miss some. `restart_rate`
+  and `memory_above` are two rules, not one, because a restart is
+  something that HAPPENS (a bus edge bark can count occurrences of) and
+  memory is a LEVEL (only ever known by reading the current sample), and
+  `restart_rate` itself only ever evaluates off `on_poll`, reading the
+  shepherd's own `ProcessInfo::restarts` rather than tallying `restart`
+  bus events itself — a private tally drifts from the number the
+  shepherd acts on, and would tell the operator a different story from
+  the one the supervisor believes.
+
+  Debounce (`[dog.bark.rules]`'s own `debounce`, five minutes by default)
+  is per rule PER SUBJECT, never global: a global debounce would mean the
+  second sheep to go down during an incident is silent, and that is the
+  incident's most interesting fact. The same per-rule-per-subject state
+  is what lets one `Errored` seen by both routes — off the bus, and off
+  the very next poll — fire once rather than twice: whichever route sees
+  it first records the firing, and the debounce covers the other.
+  `Rules::new` refuses a configuration that cannot work before it ever
+  runs: a rule routing to a sink `[dog.bark.sinks]` does not define, a
+  rule routing to no sink at all, or an `event` rule naming a kind that
+  is not on the wire are all startup errors, not alerts that fire
+  correctly for months and deliver nowhere.
+
+- The bark dog itself now runs: `[dog.bark]` (`BarkConfig` — named sinks,
+  named rules, a reconciliation `poll` interval, a `barks.jsonl` byte cap,
+  and a per-delivery `sink_timeout`), and `run_loop`, the engine that
+  subscribes to the shepherd's bus AND polls the flock. `shep dog bark`
+  no longer stubs out — `run_dog`'s `"bark"` arm parses the section,
+  builds `Rules` (the default `gave_up` rule when the operator configured
+  none), subscribes on `process.*`, and drives the loop until `SIGINT`,
+  `SIGTERM`, or the subscription itself ends.
+
+  **A dropped frame polls immediately**, rather than waiting for the next
+  scheduled poll. `tokio::sync::broadcast` drops what a lagging
+  subscriber cannot keep up with instead of queueing it, and the load
+  that produces a drop is exactly the load that produces an alert — a
+  dog that only reconciled on a timer would stay silent for the whole
+  poll interval, and under a paused clock, forever. The subscription is
+  what makes bark fast; the poll is what makes it correct.
+
+  Every firing is delivered by a task spawned off the select loop, never
+  awaited inline: a slow sink (Discord's own rate limit is measured in
+  seconds) must not stop this loop from reading the next bus event, or it
+  causes the exact drop it exists to catch. The record is written to
+  `barks.jsonl` AFTER delivery, with each sink's outcome filled in
+  honestly — including when every sink refuses it, since the local trail
+  is what an operator reads when the page never arrived. `barks::append`
+  is a read-modify-rename against one file; this dog's own concurrent
+  delivery tasks serialize their appends behind an in-process
+  `tokio::sync::Mutex` held only around the `append` call itself, on top
+  of (never in place of) `barks::append`'s own cross-process `flock(2)`
+  lock, which is what keeps this dog and the shepherd's own writer from
+  losing each other's records.
+
+  `BarkConfig` needed a hand-written `Default`: `#[serde(default)]`
+  requires one, and a derived impl would give `poll = 0` (a hot polling
+  loop), `history_bytes = 0` (the ring evicted back to empty on every
+  append) and `sink_timeout = 0` (every delivery timed out before it
+  could leave the process). The defaults are 30s, `shep_core::barks::DEFAULT_MAX_BYTES`,
+  and 10s respectively — an empty `[dog.bark]` is the ordinary case, and
+  it needed sane numbers, not zeros.
+
+- Add `shep barks [--tail N]`, which shows the alert history —
+  `barks.jsonl` — newest last, the same order a reader scrolling to the
+  bottom of a terminal expects and the same one `tail` itself gives.
+  `--tail N` shows only the last N.
+
+  Reads the file directly and **never connects to the shepherd**: the
+  history is on disk precisely so it survives the shepherd, and the case
+  it exists for is an operator reading it after a crash — the same
+  precedent `shep flush --daemon` set for a verb that answers from a file
+  rather than the socket. A line a writer died mid-append costs the
+  reader that one record, never the whole read (`shep_core::barks::read`'s
+  own contract); `shep barks` adds no tolerance of its own on top of it,
+  because none is missing.
+
+  Columns: `WHEN`, `RULE`, `SUBJECT`, `MESSAGE`, `SINKS`. `WHEN` renders
+  the millis as a local timestamp — the machine surface keeps the raw
+  `at_ms`. `SINKS` renders a delivered sink by its bare name and a refused
+  one with `(failed)` appended, so the failure is visible in the table an
+  operator is already reading rather than only in `--format json`; a bark
+  the shepherd wrote itself, with no sinks at all, renders `-`.
+
 ### Fixes
+
+- `shep enable <name>` sends the source `shep.toml` actually records, not a
+  hardcoded `built-in`. A name in `[daemon] adopted_dogs` is an adopted dog
+  and the path recorded there is its binary; a name absent from that map is
+  a built-in one — the same rule the daemon's own boot path already applies
+  to `enabled_dogs`. `enable` claimed `built-in` for every name, so
+  `shep adopt otel /opt/otel-dog` followed by `shep enable otel` had the
+  shepherd spawn `shep dog otel`, an argv branch of the shep binary,
+  instead of the operator's binary: the adopted dog never ran, and nothing
+  reported an error anywhere. `shep adopt` itself was unaffected — it
+  carries the path it just vetted — so the gap was only in enabling an
+  adopted dog afterwards, which is exactly what a reboot-time `enable` or
+  a `disable` then `enable` does.
+
+  `enable` and `disable` report the source they found, so an adopted dog
+  now renders `adopted` in their `SOURCE` column and carries its path in
+  `--format json`, where both used to print `built-in` for everything.
 
 - Open the shepherd's own `shepd.out.log`/`shepd.err.log` `O_APPEND` in the
   launcher. The daemon inherits both as fds 1 and 2 and never opens them
@@ -451,11 +789,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[[bin]]` it produces is named `shep`, so once published the install
   command is `cargo install shep-cli` — `cargo install shep` looks up an
   unrelated crate.
-- Warn, once at daemon boot, when `shep.toml` sets `[daemon] enabled_dogs`
-  or any `[dog.<name>]` section: both parse, validate and round-trip, but
-  there is no dogs infrastructure in this build to read either one, so an
-  operator who wrote `enabled_dogs = ["metrics"]` got a daemon that boots
-  and silently does nothing with it. The daemon still boots — a hard error
-  would be disproportionate to a field that does nothing, and would break a
-  config that works today the moment dogs land and start reading the same
-  field for real.
+- Read `[daemon] enabled_dogs` and `[daemon] adopted_dogs` at daemon boot:
+  each enabled name becomes a dog `shep_daemon::boot` starts once the flock
+  is back, and a name present in `adopted_dogs` is that dog's own binary
+  rather than a built-in one. Both knobs previously parsed, validated and
+  round-tripped but went nowhere — a boot-time `warn!` said as much, since
+  there was no dogs infrastructure yet to read either one. That warning is
+  gone now that there is: a daemon starting two dogs while warning that it
+  has no dogs infrastructure would be worse than saying nothing at all.

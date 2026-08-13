@@ -55,6 +55,23 @@ impl ProcessSelector {
         Ok(Self::Name(input.to_string()))
     }
 
+    /// Whether this selector names ONE entry the caller already knew of, by
+    /// its name or its id, rather than sweeping whatever matches.
+    ///
+    /// The distinction a dog turns on: a dog is a process an operator
+    /// installed, not a member of the flock `all` means, so a wildcard must
+    /// pass it by while `shep restart metrics` still reaches it.
+    /// [`Self::Regex`] and [`Self::Fold`] are wildcards here even when they
+    /// happen to match one entry — what matters is that the operator did not
+    /// name it.
+    #[must_use]
+    pub const fn is_exact(&self) -> bool {
+        match self {
+            Self::Id(_) | Self::Name(_) => true,
+            Self::All | Self::Regex(_) | Self::Fold(_) => false,
+        }
+    }
+
     /// Tests one sheep against this selector
     #[must_use]
     pub fn matches(&self, name: &str, id: u32, fold: Option<&str>) -> bool {
@@ -195,6 +212,21 @@ mod tests {
                 .matches("x", 42, None)
         );
         assert!(ProcessSelector::parse("42").unwrap().matches("x", 42, None));
+    }
+
+    /// fails if `Fold` or `Regex` is counted as exact. Either mistake makes
+    /// `shep reload /^web/` sweep up a dog, which is the failure the split
+    /// exists to prevent — and it is invisible until a flock happens to run
+    /// a dog whose name the pattern matches.
+    #[test]
+    fn only_a_name_or_an_id_names_one_entry_the_caller_knew_of() {
+        assert!(ProcessSelector::Name("bark".into()).is_exact());
+        assert!(ProcessSelector::Id(4).is_exact());
+        assert!(!ProcessSelector::All.is_exact());
+        assert!(!ProcessSelector::Fold("api".into()).is_exact());
+        // Built through the real parser: a `Regex` is a wildcard even when
+        // its pattern is a literal that can only ever match one name.
+        assert!(!ProcessSelector::parse("/^bark$/").unwrap().is_exact());
     }
 
     #[test]

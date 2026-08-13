@@ -13,7 +13,8 @@
       "out_file": null,
       "err_file": null,
       "cpu_percent": null,
-      "memory_bytes": null
+      "memory_bytes": null,
+      "dog": null
     }
   ]
 }
