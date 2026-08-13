@@ -451,11 +451,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[[bin]]` it produces is named `shep`, so once published the install
   command is `cargo install shep-cli` — `cargo install shep` looks up an
   unrelated crate.
-- Warn, once at daemon boot, when `shep.toml` sets `[daemon] enabled_dogs`
-  or any `[dog.<name>]` section: both parse, validate and round-trip, but
-  there is no dogs infrastructure in this build to read either one, so an
-  operator who wrote `enabled_dogs = ["metrics"]` got a daemon that boots
-  and silently does nothing with it. The daemon still boots — a hard error
-  would be disproportionate to a field that does nothing, and would break a
-  config that works today the moment dogs land and start reading the same
-  field for real.
+- Read `[daemon] enabled_dogs` and `[daemon] adopted_dogs` at daemon boot:
+  each enabled name becomes a dog `shep_daemon::boot` starts once the flock
+  is back, and a name present in `adopted_dogs` is that dog's own binary
+  rather than a built-in one. Both knobs previously parsed, validated and
+  round-tripped but went nowhere — a boot-time `warn!` said as much, since
+  there was no dogs infrastructure yet to read either one. That warning is
+  gone now that there is: a daemon starting two dogs while warning that it
+  has no dogs infrastructure would be worse than saying nothing at all.

@@ -31,8 +31,10 @@ use std::io::IsTerminal;
 
 use shep_core::config::{DaemonConfig, DaemonConfigError};
 use shep_core::paths::ShepPaths;
+use shep_core::protocol::DogSource;
 use shep_core::values::UpDuration;
 use shep_daemon::boot::{BootError, BootOptions, boot};
+use shep_daemon::dogs::DogSpec;
 use shep_daemon::notify::NOTIFY_SOCKET_ENV;
 use shep_daemon::tokio_runner::TokioRunner;
 use tracing_subscriber::EnvFilter;
@@ -186,48 +188,15 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
     stderr_is_terminal && no_color.is_none_or(OsStr::is_empty)
 }
 
-/// Whether `config` sets a dog-related knob this build has no code to act
-/// on: `[daemon] enabled_dogs` or any `[dog.<name>]` section.
-///
-/// Both parse, validate and round-trip today ([`DaemonConfig::load`],
-/// [`DaemonSection`]) — spec §8's dogs infrastructure is not built yet, so
-/// nothing in this binary reads either one. An operator who writes
-/// `enabled_dogs = ["metrics"]` gets a daemon that boots and does nothing
-/// with it.
-///
-/// [`DaemonSection`]: shep_core::config::daemon::DaemonSection
-fn dog_config_is_inert(config: &DaemonConfig) -> bool {
-    !config.daemon.enabled_dogs.is_empty() || !config.dog.is_empty()
-}
-
-/// Warns once, at boot, if [`dog_config_is_inert`] — never refuses to boot.
-///
-/// A hard error here would be disproportionate to what the field actually
-/// does (nothing) and would break a daemon that boots cleanly today the
-/// moment dogs infrastructure lands and starts reading the same field for
-/// real — a config author has no way to know from the file alone which of
-/// those two worlds they are in. A log line trades that all-or-nothing
-/// choice for what the gap actually is: worth knowing about, not worth
-/// stopping for.
-fn warn_on_inert_dog_config(config: &DaemonConfig) {
-    if dog_config_is_inert(config) {
-        tracing::warn!(
-            enabled_dogs = config.daemon.enabled_dogs.len(),
-            dog_sections = config.dog.len(),
-            "shep.toml configures dogs, but this build has no dogs infrastructure yet \
-             — enabled_dogs and [dog.*] sections have no effect",
-        );
-    }
-}
-
 /// Runs the supervisor in this process until a signal or `KillDaemon`.
 ///
 /// Loads `shep.toml` (a missing file is not an error — see
 /// [`read_daemon_config_source`]) plus `SHEP_*` environment overrides, installs
 /// the log subscriber those two knobs configure (see
-/// [`install_log_subscriber`]), warns if the loaded config is [dog-inert]
-/// (see [`warn_on_inert_dog_config`]), folds `args` in via [`boot_options`],
-/// then boots and serves. The re-exec'd child inherits a real environment on
+/// [`install_log_subscriber`]), folds `args` in via [`boot_options`] —
+/// which is also where `[daemon] enabled_dogs`/`adopted_dogs` become the
+/// dogs `boot` starts once the flock is back — then boots and serves. The
+/// re-exec'd child inherits a real environment on
 /// purpose (`launch::launch_command` deliberately does not `.env_clear()`), so
 /// `SHEP_LOG_JSON`, `SHEP_LOG_LEVEL`, `SHEP_SOCKET`, and
 /// `SHEP_MAX_CRON_SLEEP` are read straight from `std::env::var`.
@@ -249,15 +218,12 @@ fn warn_on_inert_dog_config(config: &DaemonConfig) {
 ///   to boot.
 /// - [`DaemonRunError::Run`] — the supervisor came up and served, then
 ///   failed during its run loop or teardown.
-///
-/// [dog-inert]: dog_config_is_inert
 pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), DaemonRunError> {
     let env = |key: &str| std::env::var(key).ok();
     let file_source = read_daemon_config_source(&paths)?;
     let config =
         DaemonConfig::load(file_source.as_deref(), &env).map_err(DaemonRunError::Config)?;
     install_log_subscriber(&config);
-    warn_on_inert_dog_config(&config);
     // The one read of this variable in the workspace, here beside every
     // `SHEP_*` override rather than inside shep-daemon — see
     // `shep_daemon::notify::NOTIFY_SOCKET_ENV`'s own doc.
@@ -289,6 +255,17 @@ pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), Daemo
 /// the CLI autostarted from *inside* some other notify-type service
 /// inherits that service's `$NOTIFY_SOCKET`, and must not report its
 /// readiness by accident.
+///
+/// `dogs` is where this function earns its keep over a plain field-by-field
+/// copy: `[daemon] enabled_dogs` names each dog to start, in the order an
+/// operator wrote it, and `[daemon] adopted_dogs` says which of those names
+/// is a third-party binary rather than a built-in one — a name absent from
+/// the map is [`DogSource::BuiltIn`] by construction, which is exactly what
+/// [`DaemonSection::adopted_dogs`](shep_core::config::daemon::DaemonSection::adopted_dogs)'s
+/// own doc promises. The map holds a `PathBuf`; [`DogSource::Adopted`]
+/// holds a `String`, because the wire already refuses a non-UTF-8
+/// `PathBuf` outright, so `display().to_string()` here is lossy exactly
+/// where that refusal already is, and nowhere else this value travels.
 #[must_use]
 pub fn boot_options(
     config: &DaemonConfig,
@@ -303,6 +280,23 @@ pub fn boot_options(
         notify_socket: notify_socket
             .filter(|_| args.foreground)
             .map(OsStr::to_os_string),
+        dogs: config
+            .daemon
+            .enabled_dogs
+            .iter()
+            .map(|name| {
+                let source = match config.daemon.adopted_dogs.get(name) {
+                    Some(path) => DogSource::Adopted {
+                        path: path.display().to_string(),
+                    },
+                    None => DogSource::BuiltIn,
+                };
+                DogSpec {
+                    name: name.clone(),
+                    source,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -358,31 +352,6 @@ mod tests {
         );
     }
 
-    /// `dog_config_is_inert` is what [`warn_on_inert_dog_config`] gates on,
-    /// so this pins the predicate directly rather than capturing a global
-    /// tracing subscriber to observe the log line it drives.
-    ///
-    /// Three cases: a config with neither knob set is not inert (nothing to
-    /// warn about); `enabled_dogs` alone trips it; a `[dog.<name>]` section
-    /// with `enabled_dogs` left empty trips it too — an operator writing
-    /// per-dog config ahead of `enable`-ing it is exactly as inert as one
-    /// who only enabled a dog, and a predicate that checked just one field
-    /// would miss half of what this function exists to catch.
-    #[test]
-    fn dog_config_is_inert_catches_either_knob_alone() {
-        let neither = DaemonConfig::load(None, &|_| None).unwrap();
-        assert!(!dog_config_is_inert(&neither));
-
-        let enabled_only =
-            DaemonConfig::load(Some("[daemon]\nenabled_dogs = [\"metrics\"]\n"), &|_| None)
-                .unwrap();
-        assert!(dog_config_is_inert(&enabled_only));
-
-        let section_only =
-            DaemonConfig::load(Some("[dog.metrics]\nport = 9615\n"), &|_| None).unwrap();
-        assert!(dog_config_is_inert(&section_only));
-    }
-
     #[test]
     fn boot_options_pass_ready_fd_none_and_the_configured_socket() {
         let config =
@@ -405,6 +374,46 @@ mod tests {
             Some(std::path::Path::new("/tmp/custom.sock"))
         );
         assert!(opts.restore, "the default is to restore the muster roll");
+    }
+
+    /// fails if `enabled_dogs` or `adopted_dogs` is dropped between
+    /// `shep.toml` and `BootOptions` — the entire failure mode of a knob
+    /// nobody plumbed, and the one this file has been warning about since
+    /// the field was added with no reader. Both halves: a bare name is a
+    /// built-in, and a name with a path is adopted.
+    #[test]
+    fn boot_options_carry_every_enabled_dog_with_the_source_the_file_names() {
+        let src = r#"
+[daemon]
+enabled_dogs = ["metrics", "otel"]
+
+[daemon.adopted_dogs]
+otel = "/usr/local/bin/shep-otel"
+"#;
+        let config = DaemonConfig::load(Some(src), &|_| None).unwrap();
+        let opts = boot_options(
+            &config,
+            &DaemonArgs {
+                no_restore: false,
+                foreground: false,
+            },
+            None,
+        );
+        assert_eq!(
+            opts.dogs,
+            vec![
+                DogSpec {
+                    name: "metrics".into(),
+                    source: DogSource::BuiltIn
+                },
+                DogSpec {
+                    name: "otel".into(),
+                    source: DogSource::Adopted {
+                        path: "/usr/local/bin/shep-otel".into()
+                    }
+                },
+            ]
+        );
     }
 
     /// The knob has to survive the trip from `shep.toml` into `BootOptions`.

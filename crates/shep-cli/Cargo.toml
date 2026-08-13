@@ -39,9 +39,12 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "
 # `log_json` branch, and `ansi` is colour when stderr is a terminal and
 # `NO_COLOR` says nothing to the contrary.
 tracing-subscriber.workspace = true
-# `warn_on_inert_dog_config` (commands/daemon.rs) is the one call site: a
-# `[daemon]`/`[dog.*]` knob with no reader yet should say so on the daemon's
-# own log, not stay silent until an operator notices nothing happened.
+# No call site in this crate as of Task 7 (Phase 9): the inert-dog warning
+# that was its one user is gone now that `[daemon] enabled_dogs`/
+# `adopted_dogs` have a real reader (`commands/daemon.rs::boot_options`),
+# and every dog-boot warning lives in shep-daemon's own `tracing` dependency
+# instead. Left declared rather than pruned — narrower than this task's
+# scope, and cheap to remove in its own commit if it stays unused.
 tracing.workspace = true
 # `bleats.rs`'s `stream.next()` now comes from `EventStream::next`, an
 # inherent method shep-client provides directly — no `StreamExt` import

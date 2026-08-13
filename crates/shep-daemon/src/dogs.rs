@@ -39,6 +39,8 @@ use shep_core::config::{AppConfig, DaemonConfig, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::DogSource;
 
+use crate::supervisor::SupervisorHandle;
+
 /// One dog the daemon knows about: its name, and where its binary comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DogSpec {
@@ -145,6 +147,50 @@ pub fn dog_app(spec: &DogSpec, paths: &ShepPaths) -> Result<ResolvedApp, DogErro
         .env
         .insert("SHEP_HOME".to_string(), paths.home.display().to_string());
     normalize(config).map_err(|err| DogError::Config(err.to_string()))
+}
+
+/// Starts every dog in `specs`, warning and carrying on for each one that
+/// will not start.
+///
+/// Never fails the boot. A dog that cannot be spawned is a monitoring gap,
+/// and refusing to bring the flock up over it would turn that gap into an
+/// outage — the one trade this whole subsystem is built to avoid.
+///
+/// Two ways a dog can fail to start, both answered the same way — a
+/// `warn!` naming the dog, and moving on to the next one in `specs`:
+///
+/// - [`dog_app`] rejects the spec before anything is registered: the
+///   binary's own path is unreadable, or the source is one this build does
+///   not know how to spawn.
+/// - [`SupervisorHandle::start_dog`] itself fails to spawn the binary, or
+///   — the guard `Request::EnableDog`'s handler already carries, and this
+///   boot path has to carry too — comes back `Ok` over a sheep that
+///   already holds the name. `start_dog` is idempotent by NAME, so an
+///   unmarked reply means a sheep got there first: no dog was started, and
+///   logging success over that reply would be the exact false positive the
+///   RPC arm already refuses to give an operator who types `shep enable`.
+pub async fn spawn_enabled_dogs(
+    specs: &[DogSpec],
+    paths: &ShepPaths,
+    supervisor: &SupervisorHandle,
+) {
+    for spec in specs {
+        let app = match dog_app(spec, paths) {
+            Ok(app) => app,
+            Err(err) => {
+                tracing::warn!(dog = %spec.name, %err, "a dog did not start");
+                continue;
+            }
+        };
+        match supervisor.start_dog(app, spec.source.clone()).await {
+            Ok(info) if info.dog.is_none() => tracing::warn!(
+                dog = %spec.name,
+                "a sheep is already registered under this name; the dog did not start"
+            ),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(dog = %spec.name, %err, "a dog did not start"),
+        }
+    }
 }
 
 /// The `[dog.<name>]` section of `path`, rendered back to TOML text.

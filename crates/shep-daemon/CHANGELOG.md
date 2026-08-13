@@ -51,6 +51,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Start every `[daemon] enabled_dogs` dog when the daemon boots, strictly
+  after the muster restore and strictly before the daemon reports itself
+  ready. Both halves of that placement are load-bearing: after the restore,
+  because a metrics dog started first would answer for an empty flock for
+  the whole restore window, and a bark dog would raise a `process.start`
+  alert for every sheep the roll brings back; before readiness, because
+  `Type=notify` going green is meant to mean the whole daemon — flock and
+  dogs alike — is up, the same reasoning that already put the restore
+  itself inside that promise.
+
+  A dog that will not start never fails the boot — the flock comes up and
+  the daemon serves regardless, with a `warn!` naming the dog. That covers
+  a binary this build cannot spawn, a spawn failure the OS reports, AND the
+  case `EnableDog`'s own handler already guards: `start_dog` is idempotent
+  by name, so a dog enabled under a name a sheep already holds comes back
+  `Ok` over the sheep rather than starting anything, and reporting that as
+  a success would be a false one, exactly as it would be over the socket.
+
 - Answer the three dog verbs. `DogConfig` hands a dog its own `[dog.<name>]`
   section as TOML text, `EnableDog` starts one, and `DisableDog` stops and
   deregisters it through the same `delete` a sheep goes through — kill
