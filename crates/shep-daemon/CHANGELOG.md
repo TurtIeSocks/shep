@@ -732,6 +732,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changes
 
+- Every listing comes back grouped by name: `Actor::snapshot_all` now sorts
+  on `(name, instance, id)` instead of bare `id`. Sorting by id scattered a
+  clustered app's instances across the table; sorting by name is what makes
+  a four-instance app read as one thing at a glance. `instance` keeps a
+  clustered app's slots in their own order once grouped, and `id` breaks the
+  tie a reload creates, where a replacement takes the drainee's slot number
+  with a fresh id.
+
+  Applied once, in `snapshot_all`, because it is the single function every
+  listing reply is built from — `ListFlock`, `Describe`, `Mustered`, and the
+  muster roll's own `list_checked`. Sorting in the CLI instead would leave
+  the metrics dog and bark reading a different order from the operator, and
+  sorting in each verb would be four copies of one rule. Every other
+  id-ordered reply (a `Reopen`, a `Flush`, a triggered action's rows) is
+  unchanged — those build their own order off `matching_ids`, not off this
+  function.
+
 - `ProcessRss` gains a `cpu_ms: u64` field — accumulated CPU time in
   CPU-milliseconds, as the OS reports it, cumulative since the process
   started. **Breaking for anything outside this crate that implements

@@ -192,7 +192,7 @@ pub(crate) enum Command {
         /// Answers with the deleted ids once every matched sheep is terminal.
         reply: oneshot::Sender<Result<Vec<u32>, SupervisorError>>,
     },
-    /// Full flock listing, id-sorted.
+    /// Full flock listing, name-grouped (see [`Actor::snapshot_all`]).
     List {
         /// Answers with the current snapshot.
         reply: oneshot::Sender<Vec<ProcessInfo>>,
@@ -750,7 +750,7 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
     }
 
-    /// Full flock listing, id-sorted.
+    /// Full flock listing, name-grouped (see [`Actor::snapshot_all`]).
     ///
     /// # Errors
     ///
@@ -764,7 +764,8 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)
     }
 
-    /// Full flock listing, id-sorted.
+    /// Full flock listing, grouped by app name (each app's instances kept
+    /// in their own instance-slot order, ties from a reload broken by id).
     ///
     /// Convenience over `Self::list_checked` for callers that don't need
     /// to distinguish "actor gone" from "empty flock" — mainly tests.
@@ -3050,8 +3051,8 @@ impl<R: ProcessRunner> Actor<R> {
         // are reported in the order they are collected, so an unsorted pump
         // set would make a multi-pump failure message read differently run to
         // run. `matched` needs no such step — it is built in the id order
-        // `matching_ids` answers in, which is the order `list` gives, and a
-        // caller reading the reply as a table wants that one.
+        // `matching_ids` answers in, and a caller reading the reply as a
+        // table wants a stable order over `list`'s own (name-grouped) one.
         pumps.sort_unstable_by_key(|(info, _)| info.id);
         spawn_reopen_task(matched, pumps, reply);
     }
@@ -4039,15 +4040,30 @@ impl<R: ProcessRunner> Actor<R> {
         to_info(&slot.entry)
     }
 
-    /// Full flock listing, id-sorted.
+    /// Full flock listing, grouped by app name.
+    ///
+    /// Sorted on `(name, instance, id)`, not id: sorting by id scatters a
+    /// clustered app's instances across the table, and grouping by name is
+    /// what makes a four-instance app read as one thing at a glance.
+    /// `instance` keeps a clustered app's slots in their own order once
+    /// grouped, and `id` breaks the tie a reload creates, where a
+    /// replacement takes the drainee's slot number with a fresh id.
+    ///
+    /// Applied here once rather than once per verb: this is the single
+    /// function every listing reply is built from — `ListFlock`, `Describe`,
+    /// `Mustered`, and the muster roll's own `list_checked` — so sorting
+    /// anywhere else would leave the metrics dog and bark reading a
+    /// different order from the operator, or duplicate the rule per verb.
     fn snapshot_all(&self) -> Vec<ProcessInfo> {
-        let mut infos: Vec<ProcessInfo> = self
-            .sheep
-            .values()
-            .map(|slot| to_info(&slot.entry))
-            .collect();
-        infos.sort_unstable_by_key(|info| info.id);
-        infos
+        let mut entries: Vec<&ProcessEntry> = self.sheep.values().map(|slot| &slot.entry).collect();
+        entries.sort_unstable_by(|a, b| {
+            (a.spec.config().name.as_str(), a.instance, a.id).cmp(&(
+                b.spec.config().name.as_str(),
+                b.instance,
+                b.id,
+            ))
+        });
+        entries.into_iter().map(to_info).collect()
     }
 
     /// Broadcasts one lifecycle transition. Send failures (no receivers)
@@ -4628,8 +4644,8 @@ mod tests {
     use crate::fake::{ProcScript, ScriptedRunner};
     // the one crate-root fixture (IR-33)
     use crate::testing::{
-        RecordingEnforcer, SharedRunner, app_with, armed_entry, idle_stats, probe_config,
-        test_paths,
+        Harness, RecordingEnforcer, SharedRunner, app_with, armed_entry, harness, idle_stats,
+        probe_config, test_paths,
     };
     // Test-only: the one case that drives a real `liveness_probe` has to
     // build the lifecycle extras the production wiring builds at boot, and
@@ -6522,6 +6538,64 @@ mod tests {
             Some(DogSource::BuiltIn)
         );
         assert_eq!(to_info(&actor.sheep[&SHEEP_ID].entry).dog, None);
+    }
+
+    /// Starts `app` (normalized) through `h`'s supervisor and hands back the
+    /// snapshot the start answers with.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `app` does not normalize, or if the actor refuses the
+    /// start — both a fixture bug at the call site, not a condition under
+    /// test. (Not `#[track_caller]`: it is a no-op on an async fn, and would
+    /// only mislead a reader into thinking a panic here points back to the
+    /// call site.)
+    async fn start_app(h: &Harness, app: AppConfig) -> Vec<ProcessInfo> {
+        h.ctx
+            .supervisor
+            .start(vec![normalize(app).unwrap()])
+            .await
+            .unwrap()
+    }
+
+    /// fails if the listing comes back in id order. Built so id order and
+    /// name order genuinely disagree — `web` is registered second and must
+    /// still come first — because a fixture whose two orders coincide
+    /// cannot tell the two implementations apart, and that is the shape of
+    /// fixture this project has shipped before.
+    #[tokio::test]
+    async fn a_listing_groups_an_apps_instances_under_its_name() {
+        let h = harness(vec![ProcScript::never_exits(); 4]);
+        start_app(
+            &h,
+            AppConfig {
+                instances: 2,
+                ..AppConfig::minimal("zebra", "./z")
+            },
+        )
+        .await;
+        start_app(
+            &h,
+            AppConfig {
+                instances: 2,
+                ..AppConfig::minimal("alpha", "./a")
+            },
+        )
+        .await;
+
+        let listed = h.ctx.supervisor.list().await;
+        let names: Vec<&str> = listed.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "alpha", "zebra", "zebra"]);
+        let ids: Vec<u32> = listed.iter().map(|i| i.id).collect();
+        assert_ne!(
+            ids,
+            {
+                let mut sorted = ids.clone();
+                sorted.sort_unstable();
+                sorted
+            },
+            "the fixture must make id order and name order disagree, or it proves nothing"
+        );
     }
 
     /// One dog's app spec. The path is a label: [`ScriptedRunner`] replays a
