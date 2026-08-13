@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `DaemonSection::adopted_dogs`, a `BTreeMap<String, PathBuf>` recording
+  where each adopted dog's binary lives, keyed by dog name (`shep adopt`
+  writes an entry; `shep rehome` removes it). A name in `enabled_dogs` with
+  no entry here is a built-in dog — an argv branch of the shep binary
+  itself — and that presence-or-absence is the whole of the distinction.
+  The path deliberately lives in `[daemon.adopted_dogs]` rather than as a
+  shep-owned key inside `[dog.<name>]`: that table is the dog's own opaque
+  configuration, parsed by the dog and not by shep, and a shep-owned key
+  planted inside it would collide with a third-party dog's own schema.
+  `PathBuf`, not `String`: unlike `DogSource::Adopted`'s wire form, this
+  value never crosses the wire — it is read straight off `shep.toml` and
+  handed to a spawn, which is a path, not serialized text.
 - Add `Request::DogConfig`, `Request::EnableDog`, `Request::DisableDog`, and
   `Response::DogSection`, `Response::DogStarted` — the wire verbs a dog and an
   operator use to fetch a dog's config, start one, and stop one. Additive

@@ -6,6 +6,7 @@
 use core::fmt;
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -23,6 +24,16 @@ pub struct DaemonSection {
     pub socket: Option<std::path::PathBuf>,
     /// Dogs to autostart with the daemon (`shep enable` writes this)
     pub enabled_dogs: Vec<String>,
+    /// Where an adopted dog's binary lives, keyed by dog name
+    /// (`shep adopt` writes this; `shep rehome` removes it).
+    ///
+    /// A name in [`Self::enabled_dogs`] with no entry here is a built-in
+    /// dog — an argv branch of the shep binary itself. That is the whole of
+    /// the distinction, and it is deliberately NOT recorded inside
+    /// `[dog.<name>]`: that table is the dog's own opaque configuration, and
+    /// a shep-owned key inside it would collide with a third-party dog's
+    /// schema.
+    pub adopted_dogs: BTreeMap<String, PathBuf>,
     /// Longest a cron worker sleeps before re-deriving its next occurrence.
     ///
     /// Shorter recovers faster from a suspended laptop or an NTP step and
@@ -376,6 +387,36 @@ port = 9615
         assert_eq!(cfg.dog["metrics"]["port"].as_integer(), Some(9615));
     }
 
+    /// fails if `adopted_dogs` is not `default`ed, or is declared outside
+    /// `deny_unknown_fields`'s reach: a `shep.toml` written before it
+    /// existed must still load, and a typo'd key must still be refused.
+    /// Both halves matter — dropping `default` breaks every existing file,
+    /// and the table is the one place an operator names a binary shep is
+    /// about to run at the daemon's own trust level.
+    #[test]
+    fn adopted_dogs_default_empty_and_round_trip_by_name() {
+        let bare = DaemonConfig::load(Some("[daemon]\nlog_json = true\n"), &no_env).unwrap();
+        assert!(bare.daemon.adopted_dogs.is_empty());
+
+        let src = r#"
+[daemon]
+enabled_dogs = ["metrics", "otel"]
+
+[daemon.adopted_dogs]
+otel = "/usr/local/bin/shep-otel"
+"#;
+        let cfg = DaemonConfig::load(Some(src), &no_env).unwrap();
+        assert_eq!(cfg.daemon.enabled_dogs, vec!["metrics", "otel"]);
+        assert_eq!(
+            cfg.daemon.adopted_dogs.get("otel"),
+            Some(&std::path::PathBuf::from("/usr/local/bin/shep-otel"))
+        );
+        assert!(
+            !cfg.daemon.adopted_dogs.contains_key("metrics"),
+            "a name with no entry here is a built-in, and that is the whole distinction"
+        );
+    }
+
     #[test]
     fn env_overrides_file() {
         let env = |k: &str| (k == "SHEP_LOG_JSON").then(|| "true".to_string());
@@ -516,7 +557,7 @@ port = 9615
         let cfg = DaemonConfig::load(Some("[dog.metrics]\nport = 9615"), &no_env).unwrap();
         assert_eq!(
             format!("{cfg:?}"),
-            "DaemonConfig { daemon: DaemonSection { log_json: false, log_level: Warn, socket: None, enabled_dogs: [], max_cron_sleep: None }, dog: <1 tables> }"
+            "DaemonConfig { daemon: DaemonSection { log_json: false, log_level: Warn, socket: None, enabled_dogs: [], adopted_dogs: {}, max_cron_sleep: None }, dog: <1 tables> }"
         );
     }
 }
