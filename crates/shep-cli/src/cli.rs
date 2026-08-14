@@ -139,6 +139,14 @@ pub enum Commands {
     /// `rehome` is the verb that forgets it.
     Rehome(DogArgs),
     /// Describe one sheep in detail.
+    ///
+    /// Includes the sheep's lambs: the processes the OS reports as
+    /// descendants of its pid. That is not the same set the stop ladder
+    /// kills, which acts on the process group — a double-forked descendant
+    /// leaves this list and is still killed, and a setsid() one stays in it
+    /// and survives.
+    ///
+    /// Lamb names are executable names, never command lines.
     Describe(SelectorArgs),
     /// Send a named action to matched sheep and report what each app
     /// answers.

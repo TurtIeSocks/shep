@@ -292,6 +292,22 @@ fn write_test_script(dir: &TempDir) -> PathBuf {
     )
 }
 
+/// Writes a script whose top-level process explicitly backgrounds a
+/// `sleep 300` and `wait`s on it — a real forked lamb for
+/// [`describe_renders_a_real_sheeps_lamb_tree`], distinct from
+/// [`write_test_script`]'s own bare trailing `sleep` (a lamb too, per that
+/// function's own doc, but that fact is incidental there rather than the
+/// point). `wait` keeps the top-level `sh` alive exactly as long as its
+/// forked child, so the daemon's own pid stays the one this test started
+/// and stopping it still reaches the lamb through the shared process group.
+fn write_forking_script(dir: &TempDir) -> PathBuf {
+    write_script(
+        dir,
+        "forker.sh",
+        &format!("#!/bin/sh\n{}sleep 300 &\nwait\n", record_pid_line(dir)),
+    )
+}
+
 /// The line every fixture script opens with: this spawn's own pid, appended
 /// to `<home>/`[`FIXTURE_PIDS`].
 ///
@@ -3252,6 +3268,65 @@ fn scale_reaches_the_scale_verb_and_settles_the_flock() {
         settled.as_array().unwrap().len(),
         1,
         "scaling down must settle back to one instance: {settled}"
+    );
+
+    graceful_kill(dir.path());
+}
+
+// --- Lambs ---------------------------------------------------------------
+
+/// `shep describe` renders a real sheep's lamb tree: the forked `sleep`
+/// child appears in its own table, captioned with what the parent-pid walk
+/// is and what it is not — the same caveat `output/mod.rs`'s own unit tests
+/// pin against a hand-built `ProcessInfo` (Step 17.0/17.1), exercised here
+/// over a real process tree end to end.
+///
+/// Polled rather than asserted on the first `describe`: the daemon walks for
+/// lambs only inside its own `Describe` handler, against whatever the OS
+/// process table happens to report at that instant, and the forked child's
+/// appearance there is a real race against this test's own process —
+/// bounded by `FLOCK_DEADLINE` rather than a fixed sleep (IR-46).
+#[test]
+fn describe_renders_a_real_sheeps_lamb_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_forking_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("sheep")
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    // Polls for `sleep` specifically, not merely for a `Lambs of` section:
+    // the walk can catch the forked child mid-exec, still reporting its
+    // parent shell's own name for one sampling tick before the `execve`
+    // into `sleep` lands — a real race this loop has to ride out, not just
+    // the fork itself.
+    let start = Instant::now();
+    let described = loop {
+        let output = shep(dir.path())
+            .arg("describe")
+            .arg("sheep")
+            .output()
+            .unwrap();
+        assert_success(&output);
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        if text.contains("sleep") || start.elapsed() >= FLOCK_DEADLINE {
+            break text;
+        }
+        std::thread::sleep(FLOCK_POLL_INTERVAL);
+    };
+
+    assert!(described.contains("Lambs of"), "{described}");
+    assert!(described.contains("sleep"), "{described}");
+    assert!(
+        described.contains("not exactly the set a stop kills"),
+        "{described}"
     );
 
     graceful_kill(dir.path());

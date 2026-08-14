@@ -22,7 +22,7 @@ use crate::cli::{FoldArgs, Format, SelectorArgs};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
 use crate::output::{
-    DogRows, FlockRows, PingRow, Render, Streams, emit, emit_error, emit_flock, write_outcome,
+    DogRows, PingRow, Render, Streams, emit, emit_described, emit_error, emit_flock, write_outcome,
 };
 
 /// Sends `body`, renders whatever the daemon answers through [`emit`], and
@@ -70,9 +70,16 @@ where
 }
 
 /// `describe` and `fold`'s shared body: one `Request::Describe` against
-/// `selector`, rendered as [`FlockRows`]. `command` is the verb name the
-/// output envelope reports (`"describe"` or `"fold"`), which is why this
-/// takes it as a parameter rather than hard-coding one.
+/// `selector`, rendered through [`emit_described`] — the sheep table, then
+/// each sheep's lamb tree beneath it. `command` is the verb name the output
+/// envelope reports (`"describe"` or `"fold"`), which is why this takes it
+/// as a parameter rather than hard-coding one.
+///
+/// Not routed through [`request_and_render`], for the same reason
+/// [`flock`] is not: `emit_described` renders one `Vec<ProcessInfo>` into
+/// two tables in table mode, which no single [`Render`] impl can express —
+/// this is the small bespoke path this verb needs instead of widening that
+/// helper into a second renderer.
 async fn describe_selector(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -80,18 +87,26 @@ async fn describe_selector(
     command: &str,
     selector: SelectorSpec,
 ) -> ExitCode {
-    request_and_render(
-        client,
-        streams,
-        fmt,
-        command,
-        Request::Describe { selector },
-        |response| match response {
-            Response::Described(procs) => Some(FlockRows(procs)),
-            _ => None,
-        },
-    )
-    .await
+    match client.request(Request::Describe { selector }).await {
+        Ok(Response::Described(procs)) => {
+            write_outcome(emit_described(&mut *streams.out, fmt, command, procs))
+        }
+        Ok(_) => {
+            let message = "the daemon answered with a response this client does not understand";
+            let _ = emit_error(
+                &mut *streams.err,
+                fmt,
+                ExitCode::Internal.code_str(),
+                message,
+            );
+            ExitCode::Internal
+        }
+        Err(err) => {
+            let code = ExitCode::from(&err);
+            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
+            code
+        }
+    }
 }
 
 /// Lists the whole flock: the sheep table, then the dogs table beneath it

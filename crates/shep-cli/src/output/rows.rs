@@ -13,8 +13,8 @@
 use serde::Serialize;
 use shep_core::barks::{Bark, SinkOutcome};
 use shep_core::protocol::{
-    ActionOutcome, ActionReply, DogSource, LineOutcome, LineReply, ProcessInfo, SignalOutcome,
-    SignalReply,
+    ActionOutcome, ActionReply, DogSource, Lamb, LineOutcome, LineReply, ProcessInfo,
+    SignalOutcome, SignalReply,
 };
 
 use super::Render;
@@ -202,6 +202,45 @@ impl Render for DogRows {
         // needs to grow to cover.
         "lambs",
     ];
+}
+
+/// One sheep's lamb tree, as `describe`'s second table.
+///
+/// Two columns and no more. A command line is deliberately absent — see
+/// [`Lamb`]'s own doc, which is where the reasoning lives rather than
+/// repeated here. Not `#[serde(transparent)]` like [`FlockRows`]/[`DogRows`]:
+/// this type's JSON shape is never read. `describe`'s `--format json` arm
+/// serializes the listing as `FlockRows` (each row already carrying its own
+/// `lambs`), exactly as [`emit_flock`](super::emit_flock) does for dogs —
+/// this type exists only to reach [`render_table`](super::render_table) for
+/// the table half.
+#[derive(Debug, Serialize)]
+pub struct LambRows(pub Vec<Lamb>);
+
+impl Render for LambRows {
+    fn headers() -> &'static [&'static str] {
+        &["PID", "NAME"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|lamb| vec![lamb.pid.to_string(), lamb.name.clone()])
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "PID" => "pid",
+            "NAME" => "name",
+            other => panic!("LambRows::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
 }
 
 /// `shep enable <name>`: what the config edit and, if a shepherd is
@@ -1473,6 +1512,17 @@ pub(crate) mod tests {
         // not raw echoes of `uptime_ms`/`cpu_percent`/`memory_bytes` — see
         // the doc comment on `assert_no_drift` above.
         assert_no_drift(&sample_flock(), |j| &j[0], &["UPTIME", "CPU", "MEM"]);
+    }
+
+    /// fails if `LambRows` grows a field that never reaches the table, or
+    /// swaps PID and NAME between its two columns.
+    #[test]
+    fn lamb_rows_do_not_drift() {
+        assert_no_drift(
+            &LambRows(vec![Lamb::new(4243, "node"), Lamb::new(4244, "sh")]),
+            |j| &j[0],
+            &[],
+        );
     }
 
     /// fails if `SOURCE` renders the adopted binary's path into the table.

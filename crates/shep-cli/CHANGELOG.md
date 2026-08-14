@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stdin = true`.
 - Add `shep set` / `shep get` / `shep unset` (spec §5's KV store). They read
   and write `$SHEP_HOME/kv.json` directly and never connect to the shepherd.
+- `shep describe` renders each sheep's lambs beneath its row, captioned with
+  what the parent-pid walk is and what it is not. A sheep with no lambs
+  prints exactly what it printed before.
 - Add the hidden `shep dog <name>` subcommand — the re-exec target a
   built-in dog runs as, the same shape `shep daemon` already is: not for
   direct use, spawned by the shepherd when it starts an enabled dog.

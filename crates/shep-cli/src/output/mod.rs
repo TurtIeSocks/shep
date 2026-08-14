@@ -35,7 +35,7 @@ use crate::exit::ExitCode;
 pub use rows::{
     BarkRows, DeletedIds, DogAdoptedRow, DogDisabledRow, DogEnabledRow, DogRehomedRow, DogRows,
     EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, ImportRow, ImportRows, KillRow, KvEntry,
-    KvRows, KvUnsetRow, PingRow, SavedRollRow, SentLineRows, SignalledRows, StartupStep,
+    KvRows, KvUnsetRow, LambRows, PingRow, SavedRollRow, SentLineRows, SignalledRows, StartupStep,
     StartupSteps, TriggeredRows,
 };
 pub use table::{human_bytes, human_duration, local_timestamp, render_table};
@@ -210,6 +210,76 @@ pub fn emit_flock(
     }
 }
 
+/// Renders one `describe` answer: the sheep table, then each sheep's lamb
+/// tree beneath it when the reply walked for one and found any.
+///
+/// `Format::Json` renders exactly what [`emit`] would for the whole
+/// listing — one array, every row carrying its own `lambs`. The machine
+/// surface keeps the single listing the tables are a rendering OF, so a
+/// consumer never has to reassemble one; the same rule [`emit_flock`]
+/// follows for dogs.
+///
+/// `Format::Table` renders the sheep through
+/// [`render_table::<FlockRows>`](render_table), exactly as `describe`
+/// always has, then — only for a sheep whose `lambs` is `Some` and
+/// non-empty — a blank line, a caption, and that sheep's lambs through
+/// [`render_table::<LambRows>`](render_table).
+///
+/// A sheep with no lambs, and a sheep whose reply did not walk for any,
+/// both print exactly what `describe` printed before this function
+/// existed: no caption, no second table.
+///
+/// # The caption
+///
+/// It names what was walked and what that is not, in one line, because the
+/// operator reading this output is reading neither [`Lamb`](shep_core::protocol::Lamb)'s
+/// doc nor `--help`. The walk follows parent-pid links; the stop ladder
+/// acts on the process group; the two diverge in both directions. Do not
+/// shorten the caption to "process tree" — that is the claim this wording
+/// exists to avoid.
+///
+/// # Errors
+/// The underlying write failed.
+///
+/// Its only caller, `commands::query::describe_selector`, lives in
+/// `commands/`, which is `#[cfg(unix)]`-gated in `main.rs` — same reason
+/// [`emit_flock`] carries the same attribute.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn emit_described(
+    out: &mut dyn io::Write,
+    fmt: Format,
+    command: &str,
+    listing: Vec<ProcessInfo>,
+) -> io::Result<()> {
+    match fmt {
+        Format::Json => emit(out, fmt, command, FlockRows(listing)),
+        Format::Table => {
+            let flock = FlockRows(listing);
+            write!(out, "{}", render_table(&flock))?;
+            for sheep in &flock.0 {
+                let Some(lambs) = &sheep.lambs else {
+                    continue;
+                };
+                if lambs.is_empty() {
+                    continue;
+                }
+                writeln!(
+                    out,
+                    "\nLambs of {} (id {}) — parent-pid descendants of {}, which is not exactly \
+                     the set a stop kills",
+                    sheep.name,
+                    sheep.id,
+                    sheep
+                        .pid
+                        .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+                )?;
+                write!(out, "{}", render_table(&LambRows(lambs.clone())))?;
+            }
+            Ok(())
+        }
+    }
+}
+
 /// The `--format json` shape of a failure: `{"schema_version", "error":
 /// {"code", "message"}}`.
 #[derive(Debug, Serialize)]
@@ -348,7 +418,8 @@ pub fn write_outcome(result: io::Result<()>) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use shep_core::protocol::DogSource;
+    use shep_core::protocol::{DogSource, Lamb};
+    use shep_core::status::ProcStatus;
 
     use super::*;
     use crate::output::rows::tests::{dog_info, sample_flock, sample_info};
@@ -495,6 +566,72 @@ mod tests {
         emit_flock(&mut out, Format::Table, "flock", vec![sheep_info("web")]).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("Dogs"));
+    }
+
+    /// fails if the caption stops saying what the list is not. This is the
+    /// whole honesty requirement for the feature: the walk is a parent-pid
+    /// tree and the kill is a process group, they diverge in both
+    /// directions, and the operator reading the table is reading neither
+    /// the type doc nor `--help`.
+    #[test]
+    fn the_lamb_caption_does_not_promise_the_kill_set() {
+        let info = ProcessInfo::builder(3, "web", ProcStatus::Online)
+            .pid(Some(4242))
+            .lambs(Some(vec![Lamb::new(4243, "node")]))
+            .build();
+        let mut out = Vec::new();
+        emit_described(&mut out, Format::Table, "describe", vec![info]).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(rendered.contains("parent-pid descendants"), "{rendered}");
+        assert!(
+            rendered.contains("not exactly the set a stop kills"),
+            "{rendered}"
+        );
+        // And the row itself, so the caption is not the only thing being
+        // asserted.
+        assert!(rendered.contains("4243"), "{rendered}");
+        assert!(rendered.contains("node"), "{rendered}");
+    }
+
+    /// fails if a sheep with no lambs grows an empty section. `describe`
+    /// printed one table before this task and must print exactly that for
+    /// the overwhelmingly common sheep — the same rule `emit_flock` follows
+    /// for a flock with no dogs.
+    #[test]
+    fn a_sheep_with_no_lambs_renders_exactly_what_it_did_before() {
+        let bare = ProcessInfo::builder(3, "web", ProcStatus::Online)
+            .pid(Some(4242))
+            .build();
+        let walked_empty = ProcessInfo::builder(3, "web", ProcStatus::Online)
+            .pid(Some(4242))
+            .lambs(Some(Vec::new()))
+            .build();
+
+        for info in [bare, walked_empty] {
+            let mut out = Vec::new();
+            emit_described(&mut out, Format::Table, "describe", vec![info.clone()]).unwrap();
+            let rendered = String::from_utf8(out).unwrap();
+            assert!(!rendered.contains("Lambs of"), "{rendered}");
+        }
+    }
+
+    /// fails if the JSON surface changes shape. `--format json` stays one
+    /// array of `ProcessInfo`, each row carrying its own `lambs` — a
+    /// consumer must not have to reassemble a listing out of two payloads,
+    /// which is the same rule `emit_flock`'s own JSON arm follows for dogs.
+    #[test]
+    fn the_json_surface_stays_one_array_with_lambs_on_each_row() {
+        let info = ProcessInfo::builder(3, "web", ProcStatus::Online)
+            .pid(Some(4242))
+            .lambs(Some(vec![Lamb::new(4243, "node")]))
+            .build();
+        let mut out = Vec::new();
+        emit_described(&mut out, Format::Json, "describe", vec![info]).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let rows = value["data"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["lambs"][0]["pid"], 4243);
     }
 
     /// `Streams` carries `&mut dyn io::Write`, which has no `Debug` of its
