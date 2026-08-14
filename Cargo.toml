@@ -208,6 +208,29 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # because nothing there needs to name the crate, only the types it
 # re-exports.
 webpki-roots = "0.26"
+# The lookout TUI (spec §9). A terminal UI is the one thing in this tree that
+# is genuinely not worth hand-rolling — the cell diffing, the resize handling
+# and the cursor arithmetic are the whole cost, and all three are exactly what
+# an established TUI crate has already got right. Same argument that took
+# `rmcp` for whistle, and the opposite of the one that rejected reqwest: this
+# is a rendering library with no protocol, no TLS and no C toolchain behind it.
+#
+# Features per IR-2. `crossterm_0_29` pins the backend's crossterm line
+# explicitly so it can never skew from our own direct dependency below;
+# `layout-cache` is the memoized layout solver; `underline-color` is what makes
+# a coloured underline expressible without a second style pass. Not
+# `all-widgets` (gates the calendar widget alone, unused) and not `macros`
+# (ratatui-macros is sugar; KISS).
+ratatui = { version = "0.30", default-features = false, features = ["std", "crossterm_0_29", "layout-cache", "underline-color"] }
+# The backend, named directly rather than reached through ratatui's re-export:
+# `crossterm::event::EventStream` (the async input source the UI loop selects
+# on) lives behind the `event-stream` feature, and a feature can only be
+# enabled by a crate that names the dependency. `events` is the key/resize
+# types. NOT `windows`: both of these sit under
+# `[target.'cfg(unix)'.dependencies]` in shep-cli, because `lookout` is
+# `#[cfg(unix)]` like `commands` and `dog`, and the Windows leg of
+# `main.rs::run` refuses every verb before dispatching to any of them.
+crossterm = { version = "0.29", default-features = false, features = ["events", "event-stream"] }
 
 # Most debuginfo in `target/` is not ours: the default `debug = true` emits
 # full DWARF for every dependency and links a copy into each of the

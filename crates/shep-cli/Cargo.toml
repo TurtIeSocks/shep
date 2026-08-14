@@ -127,6 +127,15 @@ predicates.workspace = true
 # the other crate stops needing it.
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs"] }
+# The lookout TUI. Unix-only for the same reason `nix` above is: `src/lookout/`
+# is `#[cfg(unix)]`, because it needs a unix socket to reach a shepherd, and
+# the Windows build refuses every verb before it could reach this module.
+# Declaring these two unconditionally would build a terminal stack,
+# `crossterm_winapi` and a second `windows-sys` face into a binary that cannot
+# use any of it — and would slow the `--target x86_64-pc-windows-gnu` check the
+# phase gate runs.
+ratatui.workspace = true
+crossterm.workspace = true
 
 # A process-group assertion and a teardown Drop guard both need to signal a
 # real pid; same cfg(unix) dev-only shape shep-daemon uses. The workspace

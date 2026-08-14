@@ -2,13 +2,14 @@
 //! daemon launch/re-exec path. Module-by-module design:
 //! `docs/systematic-refactor/refactor-workspace/map.md`.
 //!
-//! A ratatui dashboard (`lookout`), a static file server (`serve`), and the
-//! container (`shep runtime`) and dev (`shep dev`) execution modes are
-//! spec'd (`docs/specs/shep-v1.md` §9) but not built — this crate depends on
-//! neither `ratatui`, `axum` nor `tower-http`, and there is no `[[bin]]`
-//! beyond `shep` itself. Recorded here as deliberately absent rather than
-//! letting them quietly read as shipped; full inventory:
-//! `docs/specs/deferred.md`.
+//! A static file server (`serve`) and the container (`shep runtime`) and dev
+//! (`shep dev`) execution modes are spec'd (`docs/specs/shep-v1.md` §9) but
+//! not built — this crate depends on neither `axum` nor `tower-http`, and
+//! there is no `[[bin]]` beyond `shep` itself. The ratatui `lookout` dashboard
+//! has its shell and its flock table (Phase 12a); its other three panes — the
+//! bleats feed, the sheep detail and the host-usage strip — are 12b. Recorded
+//! here as deliberately absent or deliberately partial rather than letting
+//! either read as shipped; full inventory: `docs/specs/deferred.md`.
 
 #![forbid(unsafe_code)]
 

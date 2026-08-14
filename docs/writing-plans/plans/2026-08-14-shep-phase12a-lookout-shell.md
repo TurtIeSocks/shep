@@ -226,13 +226,57 @@ something to hand-roll. The open question is only whether the backend is right.
 **Baseline: `Cargo.lock` holds 217 packages at `6595df7`** (`grep -c
 '^\[\[package\]\]' Cargo.lock`).
 
-**Estimate: +18 to +24 packages.** This is an *estimate*, derived by reading
-`Cargo.lock` for which of the two crates' known transitive dependencies are
-already resolved here — not a measured number, because measuring it requires
-running cargo, which the plan-writing pass could not do. **Task 1's first step
-is to measure it and write the real number into this plan.** If the measured
-number lands outside 18–24, that is a finding, not a rounding error: say so
-before continuing.
+**Measured: 217 → 326 packages, +109.** (`grep -c '^\[\[package\]\]' Cargo.lock`,
+before and after Task 1.) **This is outside 18–24 — a finding, per this
+section's own instruction, not a rounding error.** Two numbers matter here, not
+one, because the raw `Cargo.lock` count and the crate count that actually
+compiles for this workspace's unix build are not the same thing, and reporting
+only the first would mislead in the opposite direction:
+
+- **The raw lockfile delta is +109**, and roughly half of it (~55 packages) is
+  never compiled here at all. `ratatui` 0.30.2 declares two *alternative*
+  backends — `ratatui-termina` and `ratatui-termwiz` — as optional,
+  non-default dependencies alongside `ratatui-crossterm`. Cargo's resolver
+  locks a version for every declared optional dependency regardless of
+  whether its feature is on, so `ratatui-termwiz`'s entire chain
+  (`termwiz`, `termina`, `terminfo`, `termios`, `vtparse`, `filedescriptor`,
+  `mac_address`, the six `wezterm-*` crates, `palette` + its four satellites,
+  `rand`/`rand_core`, `uuid`, a second `thiserror`, a second `phf`) rides
+  along in `Cargo.lock` without ever appearing in the compiled graph. Verified
+  with `cargo tree -p shep-cli --all-features -e normal --target
+  aarch64-apple-darwin`, which lists only `ratatui-core`, `ratatui-crossterm`
+  and `ratatui-widgets` under `ratatui` — no `termwiz`/`termina` — and
+  confirmed absent by rooting a tree directly at the package:
+  `cargo tree -p ratatui@0.30.2 --target aarch64-apple-darwin -e normal`
+  prints 77 lines with none of that chain in them.
+- **The real, compiled delta is +48 crate names** — `cargo tree -p
+  ratatui@0.30.2` ∪ `cargo tree -p crossterm@0.29.0`, both rooted at the
+  unix target, deduplicated by name (61 names), minus the thirteen names from
+  the "already present" table below that show up in that union
+  (`bitflags`, `cfg-if`, `futures-core`, `hashbrown`, `itoa`, `libc`, `log`,
+  `mio`, `rustix`, `signal-hook-registry`, `strum`, `strum_macros`,
+  `unicode-width`). This is still above the 18–24 estimate, and the reason is
+  concrete and named, not slop: `ratatui-crossterm` (the backend adapter) declares its own
+  `crossterm` dependency edge with no `default-features = false` —
+  `[dependencies.crossterm_0_29]` in its `Cargo.toml` is bare `version =
+  "0.29", optional = true, package = "crossterm"`. Cargo unifies features
+  across every consumer of the same resolved version, so crossterm's
+  *default* feature set (`bracketed-paste`, `events`, `windows`,
+  `derive-more`) ends up active alongside the four features our own entry
+  names, regardless of our `default-features = false`. That pulls in
+  `derive_more` + `derive_more-impl`, `convert_case`, `document-features`,
+  `darling` + `darling_core` + `darling_macro`, `heck`, `ident_case`,
+  `strsim`, `litrs`, `errno`, `smallvec`, `rustversion` — twelve crates this
+  plan's dependency bill did not name, none of them ours to remove.
+- **The "NOT windows" decision (below) still holds for compiled code.** The
+  `windows` feature nominally activates, but crossterm's own manifest scopes
+  `crossterm_winapi`/`winapi` under `[target.'cfg(windows)'.dependencies]`, so
+  they resolve a locked version and compile on no target this workspace
+  builds for on macOS or Linux. Confirmed: neither name appears in `cargo
+  tree -p crossterm@0.29.0 --target aarch64-apple-darwin -e normal`.
+- **Exactly one `crossterm` resolves** — `grep -c '^name = "crossterm"$'
+  Cargo.lock` prints `1` — so the two-backends-fighting-over-the-tty risk this
+  section originally flagged did not materialize.
 
 Already present, so free (version resolved in `Cargo.lock` at `6595df7`):
 
