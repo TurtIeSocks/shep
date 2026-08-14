@@ -21,4 +21,4 @@ ID    NAME                                    STATUS           PID      RESTARTS
                                                                                                                         
                                                                                                                         
                                                                                                                         
-q quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only
+q quit   j/k scroll   g/G top/bottom   r refresh                                                               read-only

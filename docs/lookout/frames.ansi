@@ -37,7 +37,7 @@ shep lookout   /home/rin/.shep                                                  
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only[0m
+[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh                                                               read-only[0m
 
 
 === errored  (120x20) ===
@@ -62,7 +62,7 @@ shep lookout   /home/rin/.shep                                                  
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only[0m
+[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh                                                               read-only[0m
 
 
 === empty  (100x12) ===
@@ -79,7 +79,7 @@ shep lookout   /home/rin/.shep                                                  
                                                                                                     [0m
                                                                                                     [0m
                                                                                                     [0m
-[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh   x stop                                  read-only[0m
+[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh                                           read-only[0m
 
 
 === narrow  (49x14) ===
@@ -136,7 +136,7 @@ shep lookout   /home/rin/.shep                                                  
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only[0m
+[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh                                                               read-only[0m
 
 
 === frozen  (120x20) ===
@@ -161,7 +161,7 @@ shep lookout   /home/rin/.shep                                                  
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only[0m
+[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh                                                               read-only[0m
 
 
 === refused  (120x20) ===

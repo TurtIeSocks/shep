@@ -63,8 +63,14 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
                 palette.attention()
             },
         ),
+        // `x` (stop) is bound and always refuses in 12a — see `App::on_key`
+        // — so it is left out of the hint rather than marked somehow. This
+        // file's own standing rule is that every sentence here is literal;
+        // a hint that needs a footnote to be true is not literal, it is an
+        // asterisk. The key still works as a refusal, and still exercises
+        // the control gate; it is only the advertisement that is gone.
         None => (
-            "q quit   j/k scroll   g/G top/bottom   r refresh   x stop".to_string(),
+            "q quit   j/k scroll   g/G top/bottom   r refresh".to_string(),
             palette.muted(),
         ),
     };
@@ -114,7 +120,7 @@ mod tests {
     /// fails if the truncated key hint ever butts straight against the
     /// control-state label again. Pinned at 49 columns — the `narrow`
     /// gallery scene's own width — because that is exactly where the bug
-    /// shipped: the default hint is 57 characters, the label 9, and at this
+    /// shipped: the default hint is 48 characters, the label 9, and at this
     /// width the hint truncates while the label still fits, which is the
     /// one combination that makes a missing gap visible.
     #[test]

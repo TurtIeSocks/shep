@@ -17,10 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   screen moves as things happen, and re-lists the flock every two seconds so a
   dropped event cannot leave it quietly wrong. If the shepherd stops answering
   it re-dials five times over about eight seconds, then says so and stops
-  updating — the last known values stay on screen and it does not exit. Acting
-  on a sheep is off unless `--allow-control` or
-  `shep set lookout.allow_control true` says otherwise. The bleats feed, the
-  sheep detail pane and the host-usage strip are next.
+  updating — the last known values stay on screen and it does not exit. The
+  action gate — `--allow-control` or `shep set lookout.allow_control true` —
+  is wired this phase, but no action checks it yet: `x` (stop) is bound and
+  refuses either way, honestly, with a message saying why. The bleats feed,
+  the sheep detail pane, the host-usage strip, and the actions themselves are
+  next.
 - Add `shep stock <name> <count>` (alias `scale`) — "stocking rate" is the
   husbandry term for how many animals a piece of land runs.
 - Add `shep signal <selector> <signal>`.

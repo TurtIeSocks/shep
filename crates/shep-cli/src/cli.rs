@@ -575,7 +575,12 @@ pub struct BleatsArgs {
 /// Arguments to `shep lookout`.
 #[derive(Debug, clap::Args)]
 pub struct LookoutArgs {
-    /// Let the dashboard act on a sheep. Off by default.
+    /// Open the dashboard's action gate. Off by default.
+    ///
+    /// This phase wires the gate but not the actions: every action key
+    /// still refuses either way, honestly, with a message saying why —
+    /// `stop is not built yet` once this flag is set. Actions land in a
+    /// later phase and will check this same gate.
     ///
     /// A guard against a keystroke in a window you were reading, not a
     /// security boundary: lookout runs as you, so anything it could do you can

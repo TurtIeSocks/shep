@@ -37,7 +37,7 @@ ID    NAME                                    STATUS           PID      RESTARTS
                                                                                                                         
                                                                                                                         
                                                                                                                         
-q quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only
+q quit   j/k scroll   g/G top/bottom   r refresh                                                               read-only
 
 === errored  (120x20) ===
 One errored, one waiting to restart, one stopped. Each row's own STATUS cell is the only coloured cell in that row — but stopped shares the chrome's muted grey, so its STATUS word does not stand out from the frame around it.
@@ -61,7 +61,7 @@ ID    NAME                                    STATUS           PID      RESTARTS
                                                                                                                         
                                                                                                                         
                                                                                                                         
-q quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only
+q quit   j/k scroll   g/G top/bottom   r refresh                                                               read-only
 
 === empty  (100x12) ===
 No sheep registered. The header row still prints, and a plain sentence says the pane is empty rather than leaving it blank.
@@ -77,7 +77,7 @@ the flock is empty
                                                                                                     
                                                                                                     
                                                                                                     
-q quit   j/k scroll   g/G top/bottom   r refresh   x stop                                  read-only
+q quit   j/k scroll   g/G top/bottom   r refresh                                           read-only
 
 === narrow  (49x14) ===
 49 columns: FOLD, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY.
@@ -131,7 +131,7 @@ ID    NAME                                    STATUS           PID      RESTARTS
                                                                                                                         
                                                                                                                         
                                                                                                                         
-q quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only
+q quit   j/k scroll   g/G top/bottom   r refresh                                                               read-only
 
 === frozen  (120x20) ===
 The ladder ran out. Last known values stay; the uptime clock has stopped; lookout does not exit.
@@ -155,7 +155,7 @@ ID    NAME                                    STATUS           PID      RESTARTS
                                                                                                                         
                                                                                                                         
                                                                                                                         
-q quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only
+q quit   j/k scroll   g/G top/bottom   r refresh                                                               read-only
 
 === refused  (120x20) ===
 `x` with actions gated off. Both refusals are literal — nothing about damage gets charming.
