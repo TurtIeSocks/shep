@@ -4,4 +4,6 @@
 //! sibling `docs/lookout/README.md`.
 
 pub mod app;
+pub mod frames;
 pub mod theme;
+pub mod view;
