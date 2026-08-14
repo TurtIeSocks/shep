@@ -3640,3 +3640,231 @@ fn barks_reads_the_history_with_no_shepherd_running() {
     assert_eq!(rows[0]["subject"], "web", "{envelope}");
     assert_eq!(rows[0]["rule"], "watchdog", "{envelope}");
 }
+
+/// The whole store, through the real binary, with no shepherd anywhere. That
+/// last part is the assertion that matters: `shep set` has to work on a
+/// machine where nothing is running, because that is when provisioning
+/// happens — the same claim [`barks_reads_the_history_with_no_shepherd_running`]
+/// makes for `shep barks`.
+///
+/// Folds in the file-mode claim `shep_core::kv`'s own module doc makes
+/// (`KV_FILE_MODE`, `0600`) rather than giving it a separate case: the file
+/// this test's own first `set` creates is the one to check, and creating a
+/// second store just to stat it would prove nothing this one doesn't.
+///
+/// What a broken implementation this would catch: a `set`/`get`/`unset`
+/// dispatch that reached for `connect_client` instead of going straight to
+/// `shep_core::kv` (any step here would then hang or exit
+/// `DaemonUnreachable` instead of the codes asserted below); a store
+/// created with the wrong mode; `unset` on a present key reporting anything
+/// but success, or on an absent one reporting anything but `NotFound`.
+#[test]
+fn the_kv_store_works_with_no_shepherd_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+
+    let set1 = shep(home)
+        .arg("set")
+        .arg("bark.cooldown")
+        .arg("30s")
+        .output()
+        .unwrap();
+    assert_success(&set1);
+    assert!(
+        !home.join("run/shep.sock").exists(),
+        "shep set must never autostart a shepherd"
+    );
+
+    let mode = std::fs::metadata(home.join("kv.json"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "{mode:o}");
+
+    let get1 = shep(home).arg("get").arg("bark.cooldown").output().unwrap();
+    assert_success(&get1);
+    assert!(
+        String::from_utf8_lossy(&get1.stdout).contains("30s"),
+        "{}",
+        String::from_utf8_lossy(&get1.stdout)
+    );
+
+    let missing = shep(home).arg("get").arg("missing").output().unwrap();
+    assert_eq!(missing.status.code(), Some(3), "NotFound; {missing:?}");
+
+    let set2 = shep(home)
+        .arg("set")
+        .arg("metrics_port")
+        .arg("9615")
+        .output()
+        .unwrap();
+    assert_success(&set2);
+
+    let both = shep(home).arg("get").output().unwrap();
+    assert_success(&both);
+    let both_text = String::from_utf8_lossy(&both.stdout);
+    assert!(both_text.contains("bark.cooldown"), "{both_text}");
+    assert!(both_text.contains("metrics_port"), "{both_text}");
+
+    let unset1 = shep(home)
+        .arg("unset")
+        .arg("bark.cooldown")
+        .output()
+        .unwrap();
+    assert_success(&unset1);
+
+    let gone = shep(home).arg("get").arg("bark.cooldown").output().unwrap();
+    assert_eq!(gone.status.code(), Some(3), "NotFound; {gone:?}");
+
+    let unset_all = shep(home).arg("unset").arg("--all").output().unwrap();
+    assert_success(&unset_all);
+
+    let empty = shep(home).arg("get").output().unwrap();
+    assert_success(&empty);
+    let empty_text = String::from_utf8_lossy(&empty.stdout);
+    assert!(
+        !empty_text.contains("metrics_port"),
+        "store must be empty after unset --all: {empty_text}"
+    );
+
+    let bad_key = shep(home)
+        .arg("set")
+        .arg("bad key")
+        .arg("x")
+        .output()
+        .unwrap();
+    assert_eq!(bad_key.status.code(), Some(2), "usage; {bad_key:?}");
+}
+
+/// `shep --format json get` on the same shape of store `shep get` renders
+/// as a table above: the envelope's `data` is an array of `{key, value}`
+/// objects (never a JSON map — `KvRows`' own doc gives the reason), and
+/// `schema_version` is `1` — pinned as a literal rather than imported from
+/// `output::SCHEMA_VERSION`, since `shep-cli` is `[[bin]]`-only and this
+/// file, an external test binary, has no lib target to import it from. Same
+/// envelope shape every other verb in this binary produces. A key that is
+/// not there and a key outside the grammar are checked here too, since
+/// both surface as this envelope's error half.
+///
+/// What a broken implementation this would catch: `get`'s whole-store
+/// listing degrading to a JSON object keyed by name (the one shape every
+/// other consumer of this envelope would have to special-case); `unset`
+/// reaching `NotFound` for a bad key instead of `Usage`, or the reverse.
+#[test]
+fn kv_json_envelope_is_an_array_with_the_schema_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+
+    shep(home).arg("set").arg("a").arg("1").output().unwrap();
+    shep(home).arg("set").arg("b").arg("2").output().unwrap();
+
+    let get_all = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("get")
+        .output()
+        .unwrap();
+    assert_success(&get_all);
+    let envelope: serde_json::Value = serde_json::from_slice(&get_all.stdout).unwrap();
+    assert!(envelope["data"].is_array(), "{envelope}");
+    assert_eq!(envelope["data"].as_array().unwrap().len(), 2, "{envelope}");
+    assert_eq!(envelope["schema_version"], 1, "{envelope}");
+
+    let missing = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("get")
+        .arg("ghost")
+        .output()
+        .unwrap();
+    assert_json_error(&missing, 3, "not_found");
+
+    let bad_key = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("set")
+        .arg("bad key")
+        .arg("x")
+        .output()
+        .unwrap();
+    assert_json_error(&bad_key, 2, "usage");
+}
+
+/// Two real `shep set` PROCESSES — not two threads sharing one process's
+/// open-file-description table — writing to the same store at once. This is
+/// the CLI's own version of `shep_core::kv`'s own
+/// `two_concurrent_writers_lose_nothing` unit test, and it exists because
+/// that unit test's own two racers are `std::thread::spawn` inside ONE
+/// `cli_e2e` test process: real, but not the claim `shep set` makes to two
+/// operators running it from two separate shells. Proving that needs two
+/// separate processes actually contending for `kv.json.lock`'s `flock(2)`,
+/// which is what `Command::spawn` (via `shep`, wrapping `assert_cmd`) gives
+/// here that two threads in this test binary could not.
+///
+/// The [`std::sync::Barrier`] is [`concurrent_cold_starts_produce_exactly_one_daemon`]'s
+/// own synchronization, for the same reason: without it, OS scheduling could
+/// let one writer finish its whole batch before the other starts a single
+/// process, which would still pass the assertions below but would not
+/// actually be racing anything.
+///
+/// What a broken implementation this would catch: a lock taken on the store
+/// file itself rather than the sibling `.lock` file (the `rename` that
+/// installs new content would then race the very lock guarding it); a fixed
+/// temp-file name (one writer's `rename` consuming the other's staging file,
+/// which reads here as a spurious `Io` error on one of the racers' outputs
+/// rather than a clean loss of keys — either way `data.len()` comes up
+/// short).
+#[test]
+fn two_real_shep_processes_writing_concurrently_lose_no_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_path_buf();
+    const PER_WRITER: usize = 15;
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let (finished, racers) = std::sync::mpsc::channel();
+    for writer in 0..2 {
+        let home = home.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        let finished = finished.clone();
+        std::thread::spawn(move || {
+            barrier.wait(); // both writers start their first `shep set` together
+            for n in 0..PER_WRITER {
+                let key = format!("writer{writer}.k{n}");
+                let output = shep(&home).arg("set").arg(&key).arg("v").output().unwrap();
+                // A closed receiver means the case already gave up on this
+                // writer and failed; there is no one left to report to.
+                let _ = finished.send((writer, key, output));
+            }
+        });
+    }
+    drop(finished); // the writer threads hold the only senders that matter
+
+    for _ in 0..(PER_WRITER * 2) {
+        let (writer, key, output) = racers
+            .recv_timeout(RACER_DEADLINE)
+            .expect("a writer never came back; see RACER_DEADLINE");
+        assert!(
+            output.status.success(),
+            "writer {writer}, key {key}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let list = shep(&home)
+        .arg("--format")
+        .arg("json")
+        .arg("get")
+        .output()
+        .unwrap();
+    assert_success(&list);
+    let envelope: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let data = envelope["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("get data must be an array: {envelope}"));
+    assert_eq!(
+        data.len(),
+        PER_WRITER * 2,
+        "two concurrent shep set processes must not lose each other's keys: {envelope}"
+    );
+}

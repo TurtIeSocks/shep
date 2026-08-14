@@ -151,6 +151,13 @@ cluster mode does not survive the trip unchanged, and refuses to silently
 swallow env keys it cannot place. [docs/migration.md](docs/migration.md) is
 the walkthrough.
 
+**A junk drawer with a lock on it.** `shep set bark.cooldown 30s`,
+`shep get`, `shep unset --all` — a flat key/value store at
+`$SHEP_HOME/kv.json` for the ad-hoc notes and dog runtime tweaks that
+neither a Flockfile nor `shep.toml` has a field for. Works with no
+shepherd running, and two writers racing it lose nothing.
+[docs/kv.md](docs/kv.md) is the guide.
+
 ## What's not built yet
 
 Not started: the lookout TUI, the whistle MCP server, `shep serve`,
@@ -200,6 +207,7 @@ a redacted `Debug`, with a test pinning the exact string it prints.
 - [docs/migration.md](docs/migration.md): coming from pm2
 - [docs/shepherd-channel.md](docs/shepherd-channel.md): the fd-3 protocol, for app authors
 - [docs/dogs.md](docs/dogs.md): the metrics and bark dogs, and writing your own
+- [docs/kv.md](docs/kv.md): the key/value store
 - [docs/specs/shep-v1.md](docs/specs/shep-v1.md): the behavior contract
 - [docs/specs/deferred.md](docs/specs/deferred.md): what is not built, and the order it lands in
 - [docs/idiomatic-rust.md](docs/idiomatic-rust.md): the 45 house style rules
