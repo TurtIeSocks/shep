@@ -168,10 +168,13 @@ never costs clarity.
 
 ## Status / workflow
 
-Phases 1–6 merged: shep-core, the daemon supervision engine, log plane, the
-16-verb CLI, watch/cron/memory-limit restarts, and SO_REUSEPORT reload. Phase
-7 (`shep trigger`, custom actions over the shepherd channel) is in flight —
-fd-3 plumbing merged, the RPC and verb itself not yet.
+Phases 1–10 merged: shep-core, the daemon supervision engine, log plane, the
+16-verb CLI, watch/cron/memory-limit restarts, SO_REUSEPORT reload, custom
+actions over the shepherd channel (now with a correlation id), the pm2
+cutover, the dogs subsystem with working metrics and bark dogs, and an
+audit-debt phase. Phase 11 merged too: the six remaining daemon-surface
+verbs — `shep scale`, `shep signal`, `shep sendline`, the KV store's
+`set`/`get`/`unset`, lambs in `describe`, and the `channel.*` bus topic.
 
 What's built vs. deferred to v1.1+: [docs/specs/deferred.md](docs/specs/deferred.md).
 Windows is 0%, not partial — every verb prints "not yet supported" and exits.

@@ -177,7 +177,14 @@ sheep to a named group. `shep fold <name>` lists that fold; `fold:<name>`
 selects it in any verb; `flock`/`describe` display fold membership.
 
 **KV store** (`shep set/get/unset`): retained for ad-hoc + dog runtime
-tweaks; file-locked JSON; not the primary config path.
+tweaks; file-locked JSON; not the primary config path. Lives at
+`$SHEP_HOME/kv.json`; keys are flat strings, not paths — a dot in a key is
+part of its name, never a nesting separator. A dog reads the store through
+`shep_core::kv`, not over the socket, unlike `[dog.<name>]`: that section
+goes over the wire because the alternative was the child's environment,
+which a process listing or crash dump can read back; a `0600` file inside a
+`0700` `$SHEP_HOME`, opened by a process running as the same uid, has none
+of that exposure, so the socket would buy a round trip for nothing.
 
 ## 6. Wire protocol (v1 = protocol version 1)
 
@@ -193,7 +200,11 @@ tweaks; file-locked JSON; not the primary config path.
 - Events: client sends `Subscribe{topics: Vec<Glob>}`; daemon filters
   server-side; bounded per-subscriber queue, drop-oldest, `Dropped{count}`
   notice event. Topics: `process.*` (lifecycle), `log.out`, `log.err`,
-  `channel.*` (shepherd-channel messages), `daemon.*`.
+  `channel.*` (shepherd-channel messages), `daemon.*`. `channel.*` is
+  `channel.ready`, `channel.metric`, `channel.action_reply` — every message
+  kind a sheep writes on fd 3. The outbound half (`shutdown`, `action`) is
+  deliberately absent: those are already reported to their caller, by
+  `process.stop` and by `Response::Triggered`.
 - Stability: every frame type has committed byte fixtures + insta snapshots
   (IR-35); breaking change = protocol version bump + CHANGELOG.
 - Auth: socket permissions + SO_PEERCRED/getpeereid check (same-uid only by
@@ -350,6 +361,15 @@ not parse it, validate it, or hold a schema for it. An app that defines an
 action already has a grammar for that action's arguments, and a second
 grammar in the daemon would only be something for every app to either adopt
 or work around.
+
+**`scale` and `signal` each made a narrowing call worth recording here too.**
+`scale <name> <count>` takes an absolute count and has no relative `+N`/`-N`
+form: a count is idempotent under concurrent operators in a way a delta is
+not, and the trace notes record a pm2 crash on the relative-remove path this
+avoids reproducing. `signal <selector> <signal>` delivers to the sheep's own
+process, not its group: the stop ladder already owns group-wide delivery for
+the shutdown case, and broadcasting an operator's SIGHUP to every lamb would
+reach processes the operator never named.
 
 **Exit codes.** Distinct causes get distinct codes; no error ever exits 0.
 

@@ -83,13 +83,17 @@ The whole vocabulary, and whether it exists yet.
 | bleats | logs | `shep bleats` (alias `logs`) | yes |
 | muster | bring a saved flock back | `shep save`, then `shep muster` | yes |
 | the shepherd channel | a private pipe on fd 3 between daemon and app | `channel = true`, `shep trigger` | yes |
-| a lamb | a child process of a sheep | tree-kill today, `describe` tree view later | partly |
+| a lamb | a child process of a sheep | tree-kill, `describe`'s tree view | yes |
 | a dog | a plugin process the shepherd supervises | `shep enable metrics`, `shep dogs` | yes |
 | a bark | a webhook alert | `[dog.bark.sinks]` config, `shep barks` | yes |
 | the whistle | the MCP interface agents talk to | `shep whistle` | no |
 | the lookout | the terminal dashboard | `shep lookout` (alias `dash`) | no |
 | adopt / rehome | register or drop a third-party dog | `shep adopt <name> <path>` | yes |
 | that'll do | graceful stop, after the real herding command | `shep thatlldo` | yes |
+| scale | change how many instances of an app run | `shep scale <name> <count>` | yes |
+| signal | send a signal to one sheep's own process | `shep signal <selector> <signal>` | yes |
+| sendline | write a line to a sheep's stdin | `shep sendline <selector> <line>` | yes |
+| set / get / unset | the flat key-value junk drawer | `shep set`, `shep get`, `shep unset` | yes |
 
 Sheepdogs and sheep were separate ideas from the start, so "dog" never means
 the daemon. The shepherd is the shepherd. Dogs are plugins that work for it.
@@ -161,9 +165,9 @@ shepherd running, and two writers racing it lose nothing.
 ## What's not built yet
 
 Not started: the lookout TUI, the whistle MCP server, `shep serve`,
-`shep dev` and `shep runtime`, `scale` / `signal` / `sendline`, the
-key-value store, `.js` Flockfiles, openrc and BSD `rc.d` units, and lambs
-in `describe`'s output.
+`shep dev` and `shep runtime`, `.js` Flockfiles, a `schemars`-exported
+config JSON schema, a CLI-flag config layer, and openrc and BSD `rc.d`
+units.
 
 Windows is last, and it is genuinely zero rather than partial. The workspace
 cross-compiles for it, a check restored this phase and currently passing, but

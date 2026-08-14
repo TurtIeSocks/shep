@@ -141,6 +141,22 @@ there is currently no shep-level convention for how a multi-value `params`
 string should be split — that is a decision your app makes for its own
 actions, documented wherever you document them.
 
+## Everything you write here is also public on the bus
+
+Every message you send on fd 3 — `ready`, `metric`, `action-reply` — is
+republished on the daemon's event bus under `channel.*`
+(`channel.ready`, `channel.metric`, `channel.action_reply`), as its own
+topic alongside `process.*` and the log topics. Anyone subscribed to
+`channel.*` sees it, not just the operator who happened to send the
+`trigger` you were answering.
+
+This is not a security warning — nothing on this wire is a credential,
+which is exactly why the event carries your message whole rather than a
+redacted stand-in for it. It is a reminder that a `body` you write for one
+operator's terminal is also a `body` a dashboard, a log aggregator, or
+another dog entirely might render. Put in it what you would be comfortable
+with any subscriber seeing, not just the one who asked.
+
 ## Summary for the impatient
 
 - Ask for a channel with `channel = true` (or get one for free from

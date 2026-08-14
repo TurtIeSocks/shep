@@ -26,9 +26,8 @@ order:
    forever; an on-time `ActionReply` can be matched to the wrong request),
    then the wire and config asymmetries, then the tooling and doc staleness.
 2. **The rest of the v1.0 surface** — lookout, whistle, serve, dev/runtime,
-   scale/signal/sendline, the KV store, `.js` Flockfile, schemars, the
-   daemon-config flags layer, the `channel.*` topic, lambs in describe, and
-   openrc + BSD rc.d.
+   `.js` Flockfile, schemars, the daemon-config flags layer, and openrc +
+   BSD rc.d.
 3. **The Windows functional tier — last** (Rin, 2026-08-12). It is the one
    item whose cost estimate is mostly guesswork: the decision brief put it at
    +30-40% on the daemon's process-control layer, and that number gets much
@@ -83,11 +82,6 @@ PID-1 zombie reaping). Neither verb exists, nor the `shep-runtime`/
 `shep-dev` `[[bin]]` aliases spec §3 describes — `shep-cli/Cargo.toml` has
 one `[[bin]]`.
 
-**`scale`, `signal`, `sendline`** (spec §9) — no clap variant.
-
-**`set`/`get`/`unset`** (spec §5, the KV store) — no clap variant, no
-file-locked JSON store.
-
 **openrc and BSD rc.d units** (spec §11) — `shep startup` writes a systemd
 unit (`Type=notify`) on Linux and a `LaunchDaemon` plist on macOS; spec §11
 names four init systems and there is no renderer for the other two.
@@ -114,20 +108,7 @@ derive; no schema ships in `assets/` (the directory does not exist).
 **Daemon-config flags layer** (spec §5) — layering is `file < SHEP_* env`
 today; the third, CLI-flag layer over the top does not exist.
 
-**`channel.*` bus topic** (spec §6) — spec'd as subscribable alongside
-`process.*`/`log.out`/`log.err`/`daemon.*`. No such topic variant exists
-(`BusEvent::topic` in `crates/shep-core/src/protocol/events.rs`) and
-nothing forwards shepherd-channel (fd 3) traffic to the bus. `shep trigger`
-shipping (below) does not close this: its reply is scoped to the caller
-that sent one trigger, so `Ready`/`Metric` traffic and a stale or
-unprompted `action-reply` stay just as invisible as before.
-
-**Lambs in `describe`'s tree view** (spec §4) — a sheep's child processes
-(lambs) are killed with it via the process-group tree kill, but no wire
-field carries them and lamb pids are not persisted, so `describe` cannot
-render the tree spec §4 promises.
-
-## Known debt, recorded rather than built (Phase 10)
+## Known debt, recorded rather than built
 
 Not scope cuts and not unbuilt spec surface — these are things that exist and
 work, or that are known to be missing, and that Phase 10 decided to write down
@@ -295,6 +276,19 @@ decision rather than an oversight: shep-daemon's `boot`, `sys`, `server` and
 dead-code warnings for code that is not dead on any platform shep ships.
 Silencing them would mean `#[allow(dead_code)]` on live code.
 
+### `shep signal` cannot reach a sheep's lambs, on purpose
+
+`signal` delivers to the sheep's own pid. An operator who wants a whole
+process tree to get a `SIGHUP` — the nginx-worker shape — has no verb for it:
+`stop` signals the group but also runs a kill ladder behind it, and there is
+no group-wide nudge.
+
+Deferred rather than built because the two are genuinely different asks and
+one flag on `signal` (`--group`) would make the safe reading the non-default
+one. What would force it: an app class where the sheep is a supervisor that
+does not forward signals to its own workers, which is a real shape and simply
+has not come up here yet.
+
 ## Not deferred
 
 **Dogs** (spec §8) **shipped**: the dog contract (`shep_daemon::dogs`,
@@ -358,3 +352,38 @@ every sheep's process tree on the existing memory-poll tick;
 `ProcessInfo::cpu_percent`/`memory_bytes` carry the reading on the wire,
 populated only by `ListFlock`/`Describe` (`rpc::with_live_stats`); the CLI
 renders them as the `CPU`/`MEM` columns (`FlockRows`, `output::human_bytes`).
+
+**The six daemon-surface verbs** (spec §4, §5, §6, §9) **shipped** on
+`feat/phase11-verbs`: `shep scale <name> <count>` (absolute counts only —
+scale-up fills the lowest free instance slots, scale-down releases the
+highest, and the new count is written back to the muster roll so a reboot
+keeps it); `shep signal <selector> <signal>`, delivered to each sheep's own
+process and not its group, over `signals::OperatorSignal`'s nine names;
+`shep sendline <selector> <line>`, for apps whose Flockfile opts in with
+`stdin = true`; the KV store (`shep set`/`get`/`unset` over
+`shep_core::kv`, a `0600` `$SHEP_HOME/kv.json` under the same sibling-lockfile
+and atomic-rename shape `barks.jsonl` and `shep.toml` already use, reachable
+by a dog without going over the socket — operator contract: `docs/kv.md`);
+`ProcessInfo::lambs` and `describe`'s tree view, populated by `Describe`
+alone and captioned with what the parent-pid walk is not; and the
+`channel.*` bus topic, carrying every message a sheep writes on fd 3,
+including an `action-reply` no trigger is waiting for.
+
+What each of those does NOT do, recorded so it is not rediscovered as drift:
+
+- `scale` has no relative `+N`/`-N` form and will not grow one — an absolute
+  count is idempotent and pm2's relative-remove path is one of the crashes
+  the trace notes exist to keep us from reproducing.
+- `signal` refuses `SIGSTOP`: a stopped sheep still reads `online` in every
+  listing the shepherd can produce, so accepting it would put the flock in a
+  state shep cannot report.
+- `sendline`'s `Sent` means the bytes were written and flushed to the pipe,
+  not that the app read them. A pipe holds 64 KiB before it blocks, and there
+  is nothing on that path that could tell the difference.
+- The KV store is flat. A dot in a key is part of the name, not a path.
+- `lambs` is a parent-pid walk and is not the kill unit, in both directions
+  (`shep-daemon`'s `limits` module doc has the account). Only `Describe`
+  populates it; `ListFlock` deliberately does not walk.
+- `channel.*` carries child→shepherd traffic only. The shepherd's own
+  `shutdown` and `action` writes are already reported by `process.stop` and by
+  `Response::Triggered`; adding them stays additive if that changes.
