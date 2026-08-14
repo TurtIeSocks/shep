@@ -26,12 +26,13 @@
 //! is and where it diverges from the kill unit.
 
 use core::fmt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use shep_core::protocol::Lamb;
 use tokio::time::Instant;
 
-use super::sample::{MemorySampler, TreeIndex};
+use super::sample::{MemorySampler, ProcessIdentity, TreeIndex};
 
 /// One sheep's live resource reading.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -78,6 +79,28 @@ pub(crate) struct StatsState {
     watched: Mutex<HashMap<u32, u32>>,
     /// The last periodic reading, per watched root pid.
     baselines: Mutex<HashMap<u32, Baseline>>,
+}
+
+/// An indexed snapshot of the machine's process table: who each process is,
+/// and which processes name it as their parent.
+///
+/// Split out of [`StatsState::lambs_of`] rather than rebuilt per root, for
+/// the reason [`TreeIndex`]'s own doc already gives about the polling
+/// enforcer: the index is the expensive part — it scans the whole table —
+/// and a caller walking several roots (`shep describe all`, one root per
+/// row) builds it once and reuses it. Building per root would multiply a
+/// whole-machine scan by flock size on an operator's command.
+///
+/// One refresh of the process table happens per [`StatsState::lamb_index`]
+/// call, and none inside [`StatsState::lambs_of`], so the whole of a
+/// `describe`'s answer describes ONE instant rather than one instant per
+/// row.
+#[derive(Debug)]
+pub(crate) struct LambIndex {
+    /// Every process by pid — the name a lamb row carries.
+    by_pid: HashMap<u32, ProcessIdentity>,
+    /// Child pids per parent pid.
+    children_of: HashMap<u32, Vec<u32>>,
 }
 
 impl StatsState {
@@ -222,6 +245,65 @@ impl StatsState {
         watched.sort_unstable();
         watched
     }
+
+    /// Indexes one fresh walk of the machine's process table.
+    ///
+    /// The table refresh lives here rather than in [`Self::lambs_of`], so a
+    /// caller answering several sheep pays for it once. See [`LambIndex`].
+    pub(crate) fn lamb_index(&self) -> LambIndex {
+        let table = self.sampler.identify();
+        let mut by_pid = HashMap::with_capacity(table.len());
+        let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+        for entry in table {
+            if let Some(parent) = entry.parent {
+                children_of.entry(parent).or_default().push(entry.pid);
+            }
+            by_pid.insert(entry.pid, entry);
+        }
+        LambIndex {
+            by_pid,
+            children_of,
+        }
+    }
+
+    /// Every process `index` reports as a descendant of `root_pid`, in pid
+    /// order, excluding `root_pid` itself.
+    ///
+    /// Takes the index rather than building one, so several roots share one
+    /// walk of the process table — the same split [`TreeIndex::build`] and
+    /// [`TreeIndex::sum_from`] already make, and for the same reason.
+    ///
+    /// Cycle-safe, with the same shape [`TreeIndex::total_over`] uses: the
+    /// kernel does not produce a cycle in the parent links, but a fixture can
+    /// and a torn `/proc` read might, and a walk that spun on one would hang
+    /// a request rather than answer it.
+    ///
+    /// **This is not the set of processes a stop kills.** The kill acts on
+    /// the process group, which diverges from the ppid tree in both
+    /// directions — this module's own doc has the account. Anything
+    /// rendering this list owes the operator that caveat where they can see
+    /// it.
+    pub(crate) fn lambs_of(&self, index: &LambIndex, root_pid: u32) -> Vec<Lamb> {
+        // `visited` seeded with the root, which does two things at once: it
+        // keeps the sheep out of its own lamb list, and it terminates a
+        // cycle that leads back to it.
+        let mut visited: HashSet<u32> = HashSet::from([root_pid]);
+        let mut stack = vec![root_pid];
+        let mut lambs = Vec::new();
+        while let Some(pid) = stack.pop() {
+            for child in index.children_of.get(&pid).into_iter().flatten() {
+                if !visited.insert(*child) {
+                    continue;
+                }
+                if let Some(entry) = index.by_pid.get(child) {
+                    lambs.push(Lamb::new(entry.pid, entry.name.clone()));
+                }
+                stack.push(*child);
+            }
+        }
+        lambs.sort_unstable_by_key(|lamb| lamb.pid);
+        lambs
+    }
 }
 
 impl fmt::Debug for StatsState {
@@ -268,7 +350,7 @@ mod tests {
     use super::super::MEMORY_POLL_INTERVAL;
     use super::super::sample::ProcessRss;
     use super::*;
-    use crate::testing::ScriptedSampler;
+    use crate::testing::{ScriptedSampler, identity};
 
     fn rss_cpu(pid: u32, parent: Option<u32>, bytes: u64, cpu_ms: u64) -> ProcessRss {
         ProcessRss {
@@ -459,5 +541,124 @@ mod tests {
             vec![(7, 5353)],
             "unwatching an id never watched must leave the rest alone"
         );
+    }
+
+    /// fails if the walk includes the sheep's own pid. They are LAMBS — the
+    /// sheep is the row this list hangs off, and repeating it there would
+    /// double it in every rendering.
+    #[test]
+    fn the_lamb_walk_excludes_the_sheeps_own_pid() {
+        let table = vec![
+            identity(100, None, "srv"),
+            identity(101, Some(100), "node"),
+            identity(102, Some(101), "sh"),
+        ];
+        let stats = StatsState::new(Arc::new(ScriptedSampler::identifying(vec![table])));
+
+        let lambs = stats.lambs_of(&stats.lamb_index(), 100);
+
+        assert_eq!(
+            lambs,
+            vec![Lamb::new(101, "node"), Lamb::new(102, "sh")],
+            "the root pid must not appear among its own lambs"
+        );
+    }
+
+    /// fails if the walk stops at the first generation. A `sh` wrapper that
+    /// execs a runtime that forks workers is three deep and is the ordinary
+    /// case, not an exotic one.
+    #[test]
+    fn the_lamb_walk_reaches_every_generation() {
+        let table = vec![
+            identity(100, None, "sh"),
+            identity(101, Some(100), "node"),
+            identity(102, Some(101), "node"),
+            identity(103, Some(102), "node"),
+        ];
+        let stats = StatsState::new(Arc::new(ScriptedSampler::identifying(vec![table])));
+        assert_eq!(stats.lambs_of(&stats.lamb_index(), 100).len(), 3);
+    }
+
+    /// fails if a sibling subtree leaks in. Two sheep of the same app run
+    /// side by side, so a walk that took everything with a parent would
+    /// report each one's children under the other.
+    ///
+    /// Both roots are walked off ONE index, which is also the case for the
+    /// split Step 16.0b makes: `shep describe all` builds the index once and
+    /// calls `lambs_of` per row.
+    #[test]
+    fn a_sibling_subtree_is_not_this_sheeps() {
+        let table = vec![
+            identity(100, None, "srv"),
+            identity(101, Some(100), "mine"),
+            identity(200, None, "srv"),
+            identity(201, Some(200), "theirs"),
+        ];
+        let stats = StatsState::new(Arc::new(ScriptedSampler::identifying(vec![table])));
+        let index = stats.lamb_index();
+        assert_eq!(stats.lambs_of(&index, 100), vec![Lamb::new(101, "mine")]);
+        assert_eq!(stats.lambs_of(&index, 200), vec![Lamb::new(201, "theirs")]);
+    }
+
+    /// fails if a cycle in the parent links is walked twice, or spins
+    /// forever. The kernel does not produce one, but a fixture can and a
+    /// truncated `/proc` read might — `TreeIndex::total_over` already
+    /// terminates on this and the lamb walk must too.
+    ///
+    /// **No IR-46 bound, deliberately, and do not add one back.** `lambs_of`
+    /// is a synchronous `fn`: `tokio::time::timeout(_, async {
+    /// stats.lambs_of(..) })` runs the whole body on its first poll, so the
+    /// timer is never armed and a genuinely non-terminating walk hangs
+    /// exactly as it would bare — while the wrapper tells every later reader
+    /// the case is bounded. IR-46 asks for a bound on a case that can ONLY
+    /// fail by hanging; the `assert_eq!` below is a live failure mode, and
+    /// the mutation step (Step 16.4) reddens it. That, not a decorative
+    /// wrapper, is what makes this case able to fail.
+    #[test]
+    fn a_parent_link_cycle_terminates_and_reports_each_pid_once() {
+        let table = vec![identity(100, Some(101), "a"), identity(101, Some(100), "b")];
+        let stats = StatsState::new(Arc::new(ScriptedSampler::identifying(vec![table])));
+
+        let lambs = stats.lambs_of(&stats.lamb_index(), 100);
+
+        assert_eq!(
+            lambs,
+            vec![Lamb::new(101, "b")],
+            "the root is its own descendant through the cycle and must not be listed"
+        );
+    }
+
+    /// fails if the rows come back in whatever order the map yielded.
+    /// `describe`'s output is read by people and diffed by scripts; an
+    /// unstable order makes both worse for no gain.
+    #[test]
+    fn lambs_come_back_in_pid_order() {
+        let table = vec![
+            identity(100, None, "srv"),
+            identity(103, Some(100), "c"),
+            identity(101, Some(100), "a"),
+            identity(102, Some(100), "b"),
+        ];
+        let stats = StatsState::new(Arc::new(ScriptedSampler::identifying(vec![table])));
+        assert_eq!(
+            stats
+                .lambs_of(&stats.lamb_index(), 100)
+                .iter()
+                .map(|l| l.pid)
+                .collect::<Vec<_>>(),
+            vec![101, 102, 103]
+        );
+    }
+
+    /// fails if a sampler that cannot report names produces bogus rows
+    /// instead of none. The trait's default `identify` returns nothing, and
+    /// every consumer has to read that as "unknown", never as "this sheep
+    /// has no lambs".
+    #[test]
+    fn a_sampler_that_cannot_identify_reports_no_lambs() {
+        // `ScriptedSampler::new(..)` implements only `sample`, taking the
+        // default `identify`.
+        let stats = StatsState::new(Arc::new(ScriptedSampler::new(vec![vec![]])));
+        assert!(stats.lambs_of(&stats.lamb_index(), 100).is_empty());
     }
 }

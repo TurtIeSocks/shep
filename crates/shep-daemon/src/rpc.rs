@@ -18,6 +18,7 @@
 use core::future::Future;
 use core::time::Duration;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,7 +27,8 @@ use tokio::sync::{broadcast, watch};
 use shep_core::config::normalize_all;
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
-    BusEvent, Envelope, ProcessInfo, Reply, Request, Response, RpcError, RpcErrorCode, SelectorSpec,
+    BusEvent, Envelope, Lamb, ProcessInfo, Reply, Request, Response, RpcError, RpcErrorCode,
+    SelectorSpec,
 };
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
@@ -249,9 +251,8 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
                     if hits.is_empty() {
                         reply(Err(not_found()))
                     } else {
-                        reply(Ok(Response::Described(
-                            with_live_stats(&ctx.stats, hits).await,
-                        )))
+                        let hits = with_live_stats(&ctx.stats, hits).await;
+                        reply(Ok(Response::Described(with_lambs(&ctx.stats, hits).await)))
                     }
                 }
             },
@@ -524,6 +525,48 @@ async fn with_live_stats(stats: &Arc<StatsState>, mut infos: Vec<ProcessInfo>) -
     infos
 }
 
+/// Fills each row's `lambs` from a fresh walk of the process table.
+///
+/// Applied to `Describe` and to nothing else. `ListFlock` deliberately does
+/// not walk: the walk is a second pass over every process on the machine,
+/// and a flock listing is the thing an operator leaves running in a loop —
+/// while a `describe` is one sheep, once, on purpose.
+///
+/// A row with no pid is left `None` rather than set to `Some(vec![])`: a
+/// sheep that is not running has no tree to walk, which is the "not walked"
+/// case the field's own doc distinguishes from "walked and empty".
+async fn with_lambs(stats: &Arc<StatsState>, mut infos: Vec<ProcessInfo>) -> Vec<ProcessInfo> {
+    if infos.iter().all(|info| info.pid.is_none()) {
+        // Nothing to walk for: skip the table refresh entirely rather than
+        // pay for it and assign `None` anyway.
+        return infos;
+    }
+    let stats = Arc::clone(stats);
+    let pids: Vec<u32> = infos.iter().filter_map(|info| info.pid).collect();
+    let Ok(walked) = tokio::task::spawn_blocking(move || {
+        // ONE index for the whole reply — `describe all` on a large flock
+        // walks the machine's process table once, not once per row. This is
+        // the split `LambIndex`'s own doc argues for.
+        let index = stats.lamb_index();
+        pids.into_iter()
+            .map(|pid| (pid, stats.lambs_of(&index, pid)))
+            .collect::<HashMap<u32, Vec<Lamb>>>()
+    })
+    .await
+    else {
+        // The blocking pool is gone or the task panicked: describe the sheep
+        // without their trees rather than fail the request over a
+        // decoration — exactly what `with_live_stats` does one function up.
+        return infos;
+    };
+    for info in &mut infos {
+        if let Some(lambs) = info.pid.and_then(|pid| walked.get(&pid)) {
+            info.lambs = Some(lambs.clone());
+        }
+    }
+    infos
+}
+
 fn rpc_error(err: &SupervisorError) -> RpcError {
     match err {
         SupervisorError::NotFound => not_found(),
@@ -679,7 +722,9 @@ mod tests {
     use super::*;
     use crate::fake::{FIRST_SCRIPTED_PID, ProcScript};
     use crate::limits::MEMORY_POLL_INTERVAL;
-    use crate::testing::{Harness, SCRIPTED_TREE_BYTES, harness, harness_with_stats};
+    use crate::testing::{
+        Harness, SCRIPTED_TREE_BYTES, harness, harness_identifying, harness_with_stats, identity,
+    };
     use shep_core::config::AppConfig;
     use shep_core::protocol::{
         ActionOutcome, ActionReply, DogSource, Request, Response, RpcErrorCode, SelectorSpec,
@@ -2022,5 +2067,64 @@ mod tests {
         let listed = h.ctx.supervisor.list().await;
         assert_eq!(listed.len(), 1, "nothing was started: {listed:?}");
         assert_eq!(listed[0].dog, None);
+    }
+
+    /// fails if `ListFlock` starts walking, or if `Describe` stops. The split
+    /// is a cost decision (`with_lambs`' own doc) and nothing else enforces
+    /// it — both arms build their rows from the same `snapshot_all`, so a
+    /// helper applied in the wrong place looks correct at every other level.
+    #[tokio::test(start_paused = true)]
+    async fn only_describe_carries_a_lamb_tree() {
+        // A process table where FIRST_SCRIPTED_PID really has a child, so a
+        // walk that runs finds something and a walk that does not is
+        // distinguishable from one that found nothing.
+        let h = harness_identifying(
+            vec![ProcScript::never_exits()],
+            vec![
+                identity(FIRST_SCRIPTED_PID, None, "srv"),
+                identity(FIRST_SCRIPTED_PID + 1, Some(FIRST_SCRIPTED_PID), "node"),
+            ],
+        );
+        reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        let listed = reply_of(dispatch(envelope(2, Request::ListFlock), &h.ctx).await);
+        let Ok(Response::Flock(rows)) = listed.result else {
+            panic!("expected a flock listing");
+        };
+        assert!(
+            rows.iter().all(|row| row.lambs.is_none()),
+            "ListFlock must not walk the process table"
+        );
+
+        let described = reply_of(
+            dispatch(
+                envelope(
+                    3,
+                    Request::Describe {
+                        selector: SelectorSpec::Name("web".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::Described(rows)) = described.result else {
+            panic!("expected a describe listing");
+        };
+        assert_eq!(
+            rows[0].lambs,
+            Some(vec![Lamb::new(FIRST_SCRIPTED_PID + 1, "node")])
+        );
     }
 }

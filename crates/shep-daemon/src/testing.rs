@@ -23,7 +23,7 @@ use crate::cron::{Clock, DEFAULT_MAX_CRON_SLEEP};
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
 use crate::extras::{Extras, ExtrasReports};
 use crate::fake::{FIRST_SCRIPTED_PID, ProcScript, ScriptedRunner};
-use crate::limits::sample::{MemorySampler, ProcessRss};
+use crate::limits::sample::{MemorySampler, ProcessIdentity, ProcessRss};
 use crate::limits::stats::StatsState;
 use crate::limits::{LimitBreach, LimitEnforcer};
 use crate::probes::{LivenessFailure, ProbeFailure, Prober};
@@ -430,6 +430,49 @@ fn harness_sampling(scripts: Vec<ProcScript>, readings: Vec<Vec<ProcessRss>>) ->
     })
 }
 
+/// [`harness`], over a process table that reports process identities.
+///
+/// The one fixture that can answer a lamb walk. [`harness_sampling`]'s
+/// sampler takes the trait's default `identify` (which returns nothing), so
+/// a `describe` driven through [`harness`] finds no lambs however the walk
+/// is implemented — which would make a dispatch test of `with_lambs`
+/// vacuous.
+pub(crate) fn harness_identifying(
+    scripts: Vec<ProcScript>,
+    identities: Vec<ProcessIdentity>,
+) -> Harness {
+    harness_with_extras(scripts, |reports| {
+        let sampler: Arc<dyn MemorySampler> =
+            Arc::new(ScriptedSampler::identifying(vec![identities]));
+        let stats = Arc::new(StatsState::new(Arc::clone(&sampler)));
+        Extras {
+            clock: Arc::new(TestClock::starting_at(
+                "2026-01-01T00:00:00Z"
+                    .parse()
+                    .expect("a valid RFC3339 timestamp"),
+            )),
+            enforcer: Arc::new(crate::limits::PollingEnforcer::start(
+                sampler,
+                reports.breaches.clone(),
+                Arc::clone(&stats),
+            )),
+            max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+            reports,
+            stats,
+        }
+    })
+}
+
+/// One row of a scripted identity table, shared by [`harness_identifying`]
+/// and `stats.rs`'s and `rpc.rs`'s test modules.
+pub(crate) fn identity(pid: u32, parent: Option<u32>, name: &str) -> ProcessIdentity {
+    ProcessIdentity {
+        pid,
+        parent,
+        name: name.to_string(),
+    }
+}
+
 /// A [`StatsState`] over a machine with no visible processes.
 ///
 /// The neutral value for a fixture that has to hand [`Extras`] a `stats` but
@@ -657,11 +700,19 @@ impl Clock for TestClock {
 pub(crate) struct ScriptedSampler {
     readings: Vec<Vec<ProcessRss>>,
     calls: AtomicUsize,
+    // Empty for every sampler built through `new`, which is what makes those
+    // samplers behave like the trait's default `identify`: an empty table is
+    // returned on every call rather than replayed against `identities`.
+    identities: Vec<Vec<ProcessIdentity>>,
+    identify_calls: AtomicUsize,
 }
 
 impl ScriptedSampler {
     /// A sampler that replays `readings` in order, one per [`MemorySampler::sample`]
     /// call, repeating the last reading once the script is exhausted.
+    ///
+    /// `identify` is left unscripted — see [`Self::identifying`] for a
+    /// sampler that answers it too.
     pub(crate) fn new(readings: Vec<Vec<ProcessRss>>) -> Self {
         // A script with nothing to replay is a fixture bug: failing loudly
         // here, at the call site that misconfigured it, beats an
@@ -673,6 +724,28 @@ impl ScriptedSampler {
         Self {
             readings,
             calls: AtomicUsize::new(0),
+            identities: Vec::new(),
+            identify_calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// A sampler that answers `identify` from `tables`, one per call, and
+    /// `sample` from an empty machine.
+    ///
+    /// A separate constructor rather than a field on [`Self::new`] because
+    /// the two halves are scripted independently and every existing caller
+    /// of `new` wants the DEFAULT `identify` — which is itself the subject
+    /// of one case in `stats.rs`'s test module.
+    pub(crate) fn identifying(tables: Vec<Vec<ProcessIdentity>>) -> Self {
+        assert!(
+            !tables.is_empty(),
+            "ScriptedSampler::identifying needs at least one table to replay"
+        );
+        Self {
+            readings: vec![vec![]],
+            calls: AtomicUsize::new(0),
+            identities: tables,
+            identify_calls: AtomicUsize::new(0),
         }
     }
 
@@ -687,6 +760,17 @@ impl MemorySampler for ScriptedSampler {
         let call = self.calls.fetch_add(1, Ordering::Relaxed);
         let index = call.min(self.readings.len() - 1);
         self.readings[index].clone()
+    }
+
+    fn identify(&self) -> Vec<ProcessIdentity> {
+        // A sampler built through `new` has nothing scripted here, and reads
+        // exactly as the trait's own default would.
+        if self.identities.is_empty() {
+            return Vec::new();
+        }
+        let call = self.identify_calls.fetch_add(1, Ordering::Relaxed);
+        let index = call.min(self.identities.len() - 1);
+        self.identities[index].clone()
     }
 }
 

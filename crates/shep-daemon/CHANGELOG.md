@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- `MemorySampler::identify` (defaulted) and `StatsState::lambs_of` — a
+  sheep's parent-pid descendants, walked on demand and carried by `Describe`
+  only.
 - `Request::SendLine` — one line to a sheep's stdin, per-sheep outcome,
   bounded at two seconds.
 - `SpawnSpec::stdin` and `ProcIo::to_stdin` — an opt-in pipe on a sheep's

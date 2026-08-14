@@ -38,6 +38,26 @@ pub struct ProcessRss {
     pub cpu_ms: u64,
 }
 
+/// One process's identity: who it is and whose child it is.
+///
+/// Separate from [`ProcessRss`] rather than a widening of it, and that is a
+/// cost decision, not a taste one. `ProcessRss` is `Copy` and is the row type
+/// of a whole-machine table the polling enforcer walks every
+/// `MEMORY_POLL_INTERVAL` (15 seconds, private to this crate); putting a
+/// `String` on it would take `Copy` away and allocate once per process on
+/// the machine, per tick, for a field only `shep describe` reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    /// The process's own pid.
+    pub pid: u32,
+    /// Its parent's pid, absent for the roots of the process table.
+    pub parent: Option<u32>,
+    /// The executable's name as the OS reports it — never its command line.
+    /// See `shep_core::protocol::Lamb` for why the distinction is
+    /// load-bearing.
+    pub name: String,
+}
+
 /// Reads the machine's process table.
 ///
 /// One implementation samples the real OS; the scripted one replays a fixture.
@@ -47,6 +67,26 @@ pub struct ProcessRss {
 pub trait MemorySampler: Send + Sync + 'static {
     /// Every process currently visible to this process's user.
     fn sample(&self) -> Vec<ProcessRss>;
+
+    /// Every process currently visible, with the name the OS reports for it.
+    ///
+    /// Called on demand by `shep describe` and by nothing else — a lamb tree
+    /// is an operator asking a question, not a poll. It performs its own
+    /// table walk rather than sharing [`Self::sample`]'s: the two have
+    /// different lifetimes (one is a 15-second tick, this is a request) and
+    /// a shared table would have to be either stale for this or retained for
+    /// that.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns nothing. Defaulted so that adding this to a `pub` trait did
+    /// not break an out-of-tree implementor (the courtesy `#[non_exhaustive]`
+    /// buys an enum — IR-20), and honest rather than convenient: a sampler
+    /// that cannot report identities says so, and every consumer must read
+    /// an empty answer as "unknown", never as "this sheep has no lambs".
+    fn identify(&self) -> Vec<ProcessIdentity> {
+        Vec::new()
+    }
 }
 
 /// `MemorySampler` over sysinfo.
@@ -126,6 +166,29 @@ impl MemorySampler for SysinfoSampler {
                 parent: process.parent().map(sysinfo::Pid::as_u32),
                 bytes: process.memory(),
                 cpu_ms: process.accumulated_cpu_time(),
+            })
+            .collect()
+    }
+
+    fn identify(&self) -> Vec<ProcessIdentity> {
+        // A poisoned lock recovers for the same reason `sample` does.
+        let mut system = self.system.lock().unwrap_or_else(PoisonError::into_inner);
+        // Neither `.with_memory()` nor `.with_cpu()`: this walk reads only
+        // `name()` and `parent()`, and widening the refresh kind would make
+        // an operator's `shep describe` cost the same syscalls as the
+        // 15-second poll for figures nobody asked this call for.
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        system
+            .processes()
+            .values()
+            .map(|process| ProcessIdentity {
+                pid: process.pid().as_u32(),
+                parent: process.parent().map(sysinfo::Pid::as_u32),
+                name: process.name().to_string_lossy().into_owned(),
             })
             .collect()
     }
