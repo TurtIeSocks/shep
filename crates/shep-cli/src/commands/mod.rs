@@ -7,6 +7,7 @@ pub mod bleats;
 pub mod daemon;
 pub mod dogs;
 pub mod import;
+pub mod kv;
 pub mod lifecycle;
 pub mod logs;
 pub mod muster;

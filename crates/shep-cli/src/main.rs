@@ -41,6 +41,8 @@ use commands::dogs;
 #[cfg(unix)]
 use commands::import;
 #[cfg(unix)]
+use commands::kv;
+#[cfg(unix)]
 use commands::lifecycle;
 #[cfg(unix)]
 use commands::logs;
@@ -379,6 +381,12 @@ async fn run(cli: Cli) -> ExitCode {
         // socket. The history is on disk precisely so it survives the
         // shepherd (`commands::dogs`' own module doc on this verb).
         Commands::Barks(ref args) => dogs::barks(&mut streams, fmt, &paths, args),
+        // Reads and writes `kv.json` directly and never connects to the
+        // shepherd — `commands::kv`'s own module doc gives the reasoning,
+        // shared with `Barks` just above.
+        Commands::Set(ref args) => kv::set(&mut streams, fmt, &paths, args),
+        Commands::Get(ref args) => kv::get(&mut streams, fmt, &paths, args),
+        Commands::Unset(ref args) => kv::unset(&mut streams, fmt, &paths, args),
         Commands::Kill => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => admin::kill(client, &mut streams, fmt).await,
             Err(code) => code,

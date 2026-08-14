@@ -34,8 +34,9 @@ use crate::exit::ExitCode;
 #[cfg_attr(windows, allow(unused_imports))]
 pub use rows::{
     BarkRows, DeletedIds, DogAdoptedRow, DogDisabledRow, DogEnabledRow, DogRehomedRow, DogRows,
-    EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, ImportRow, ImportRows, KillRow, PingRow,
-    SavedRollRow, SentLineRows, SignalledRows, StartupStep, StartupSteps, TriggeredRows,
+    EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, ImportRow, ImportRows, KillRow, KvEntry,
+    KvRows, KvUnsetRow, PingRow, SavedRollRow, SentLineRows, SignalledRows, StartupStep,
+    StartupSteps, TriggeredRows,
 };
 pub use table::{human_bytes, human_duration, local_timestamp, render_table};
 

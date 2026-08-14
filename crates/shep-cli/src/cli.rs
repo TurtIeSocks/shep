@@ -202,6 +202,20 @@ pub enum Commands {
     /// Same precedent as `shep flush --daemon`, which also works on files
     /// rather than through the socket.
     Barks(BarksArgs),
+    /// Store a value in the shepherd's key/value store.
+    ///
+    /// Reads and writes `$SHEP_HOME/kv.json` directly and never connects to the
+    /// shepherd — the store is for ad-hoc notes and dog settings, and it has to
+    /// work while nothing is running, exactly as `shep enable` does.
+    ///
+    /// Keys are flat: letters, digits, `.`, `_` and `-`, up to 128 bytes, not
+    /// starting with a dot. A dot is part of the name — `bark.cooldown` is one
+    /// key, not a path into anything.
+    Set(KvSetArgs),
+    /// Read one value from the store, or list the whole store with no key.
+    Get(KvGetArgs),
+    /// Remove one key from the store, or every key with --all.
+    Unset(KvUnsetArgs),
     /// Check whether the shepherd answers.
     Ping,
     /// Shut the shepherd down.
@@ -413,6 +427,38 @@ pub struct BarksArgs {
     /// Show only the last N barks
     #[arg(long)]
     pub tail: Option<usize>,
+}
+
+/// Arguments to `shep set`.
+#[derive(Debug, clap::Args)]
+pub struct KvSetArgs {
+    /// The key
+    pub key: String,
+    /// The value
+    pub value: String,
+}
+
+/// Arguments to `shep get`.
+#[derive(Debug, clap::Args)]
+pub struct KvGetArgs {
+    /// The key; omit to list every key
+    pub key: Option<String>,
+}
+
+/// Arguments to `shep unset`.
+///
+/// `--all` rather than a reserved key name, for the reason [`FlushArgs`]'s own
+/// doc gives about `shep flush shep`: nothing stops an operator having a key
+/// called `all`, and `shep unset all` would then mean something different
+/// depending on their own store. A flag cannot collide.
+#[derive(Debug, clap::Args)]
+pub struct KvUnsetArgs {
+    /// The key to remove
+    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    pub key: Option<String>,
+    /// Remove every key
+    #[arg(long)]
+    pub all: bool,
 }
 
 /// Arguments to `shep fold`.
@@ -796,6 +842,45 @@ mod tests {
             panic!("expected barks")
         };
         assert_eq!(args.tail, Some(20));
+    }
+
+    /// fails if `shep unset` with no key and no --all is accepted. It would have to
+    /// mean either nothing or everything, and the everything reading is
+    /// unrecoverable.
+    #[test]
+    fn unset_needs_a_key_or_the_all_flag() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["shep", "unset"]).is_err());
+        assert!(Cli::try_parse_from(["shep", "unset", "a"]).is_ok());
+        assert!(Cli::try_parse_from(["shep", "unset", "--all"]).is_ok());
+    }
+
+    /// fails if `--all` composes with a key. `shep unset a --all` would be an
+    /// operator asking for one thing and a flag doing something far larger —
+    /// the same conflict `shep flush all --daemon` is a usage error for.
+    #[test]
+    fn unset_refuses_a_key_and_all_together() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["shep", "unset", "a", "--all"]).is_err());
+    }
+
+    /// fails if `shep get` starts requiring a key. Bare `get` listing the whole
+    /// store is the discovery path — an operator who does not remember what they
+    /// set has nowhere else to look.
+    #[test]
+    fn get_takes_an_optional_key() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["shep", "get"]).is_ok());
+        assert!(Cli::try_parse_from(["shep", "get", "a"]).is_ok());
+    }
+
+    /// fails if `set` becomes anything but two required positionals. A `set` with a
+    /// defaultable value would let `shep set a` silently store an empty string.
+    #[test]
+    fn set_needs_both_a_key_and_a_value() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["shep", "set", "a"]).is_err());
+        assert!(Cli::try_parse_from(["shep", "set", "a", "1"]).is_ok());
     }
 
     #[test]

@@ -1200,6 +1200,105 @@ fn sinks_cell(sinks: &[SinkOutcome]) -> String {
         .join(", ")
 }
 
+/// One row of `shep get`'s whole-store listing.
+///
+/// A named-field struct rather than a bare `(String, String)` tuple: a tuple
+/// serializes to a JSON array (`["a","1"]`), and the store's own design
+/// decision (Task 13's spec) is that the payload is "a list of objects
+/// rather than a JSON map" — a tuple's array-of-arrays shape is neither, and
+/// would make every consumer index into position 0/1 instead of reading a
+/// `key`/`value` field.
+#[derive(Debug, Serialize)]
+pub struct KvEntry {
+    /// The key, exactly as stored — already validated by
+    /// [`shep_core::kv`]'s grammar by the time this is constructed.
+    pub key: String,
+    /// Its value.
+    pub value: String,
+}
+
+/// `shep get`'s whole-store listing (bare `shep get`), or one key's own
+/// entry (`shep get <key>`).
+///
+/// `transparent`, matching every other `Vec<T>` payload in this file: the
+/// JSON is a plain array of [`KvEntry`] objects, not a wrapper object —
+/// the envelope's `data` is an array for every other verb in this binary,
+/// and a KV listing answering with a JSON map would be the one payload a
+/// consumer has to special-case.
+///
+/// Constructed by `commands/kv.rs`, from `shep_core::kv::all`/`kv::get` —
+/// never from a `Response`: the store never touches the wire (Task 12's own
+/// doc).
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct KvRows(pub Vec<KvEntry>);
+
+impl Render for KvRows {
+    fn headers() -> &'static [&'static str] {
+        &["KEY", "VALUE"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|entry| vec![entry.key.clone(), entry.value.clone()])
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "KEY" => "key",
+            "VALUE" => "value",
+            other => panic!("KvRows::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
+/// `shep unset`'s own report: how many keys the store lost.
+///
+/// A count rather than the removed keys themselves: `shep_core::kv::clear`
+/// hands back only how many entries it dropped, not which ones — the store
+/// never materializes the full set it is about to empty just to name it in
+/// a report — so a single key's success and `--all`'s share this one shape
+/// rather than two.
+///
+/// Constructed by `commands/kv.rs`'s `unset`.
+#[derive(Debug, Serialize)]
+pub struct KvUnsetRow {
+    /// How many keys were removed: always `1` for a single-key `unset`
+    /// (a key that was not there exits [`crate::exit::ExitCode::NotFound`]
+    /// before this is ever built), and `shep_core::kv::clear`'s own count
+    /// for `--all`.
+    pub removed: u32,
+}
+
+impl Render for KvUnsetRow {
+    fn headers() -> &'static [&'static str] {
+        &["REMOVED"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        vec![vec![self.removed.to_string()]]
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "REMOVED" => "removed",
+            other => panic!("KvUnsetRow::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::BTreeSet;
@@ -2034,5 +2133,24 @@ pub(crate) mod tests {
         let rows = sample_barks().rows();
         assert_eq!(rows[0][2], "web", "the older bark stays first");
         assert_eq!(rows[1][2], "worker", "the newer bark stays last");
+    }
+
+    /// fails if `KvRows` grows a field that never reaches the table — the
+    /// same gate every other payload has. Neither column is a formatted
+    /// rendering of anything else, so `formatted` is empty.
+    #[test]
+    fn kv_rows_do_not_drift() {
+        let rows = KvRows(vec![KvEntry {
+            key: "bark.cooldown".to_string(),
+            value: "30s".to_string(),
+        }]);
+        assert_no_drift(&rows, |j| &j[0], &[]);
+    }
+
+    /// fails if `KvUnsetRow` grows a field that never reaches the table —
+    /// the same gate every other payload has.
+    #[test]
+    fn kv_unset_row_does_not_drift() {
+        assert_no_drift(&KvUnsetRow { removed: 2 }, |j| j, &[]);
     }
 }
