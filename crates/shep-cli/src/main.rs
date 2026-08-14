@@ -22,6 +22,8 @@ mod dog;
 mod exit;
 #[cfg(unix)]
 mod launch;
+#[cfg(unix)]
+mod lookout;
 mod output;
 
 use std::path::PathBuf;
