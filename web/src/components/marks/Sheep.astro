@@ -1,0 +1,82 @@
+---
+/*
+ * The sheep mark. Path data verbatim from
+ * docs/shep-design/design-files/Shep Landing v3 scene.dc.html (the pasture
+ * instances) — see docs/shep-design/README.md "Illustration > Sheep".
+ *
+ * Below 32px wide the legs drop and only the head-and-fleece silhouette
+ * remains (handoff rule, also stated in the design-language "Do" panel).
+ * Only the lead sheep in a group chews; give any two bobbing sheep different
+ * durations and offset delays so they don't read as a loading spinner.
+ */
+interface Props {
+  width: number;
+  legs?: boolean;
+  chewing?: boolean;
+  bob?: boolean;
+  bobDuration?: string;
+  bobDelay?: string;
+  class?: string;
+}
+
+const {
+  width,
+  legs = width >= 32,
+  chewing = false,
+  bob = false,
+  bobDuration = "5.6s",
+  bobDelay = "0s",
+  class: className,
+} = Astro.props;
+
+const wrapperStyle = [
+  `width:${width}px`,
+  bob ? `--bob-duration:${bobDuration}` : null,
+  bob ? `--bob-delay:${bobDelay}` : null,
+]
+  .filter(Boolean)
+  .join(";");
+---
+
+<div
+  class:list={["sheep-mark", bob && "anim-bob", className]}
+  style={wrapperStyle}
+>
+  <svg viewBox="0 0 104 78" width="100%" role="img" aria-label="a sheep">
+    {
+      legs && (
+        <g fill="var(--ink)">
+          <rect x="40" y="52" width="8" height="21" rx="4" />
+          <rect x="66" y="52" width="8" height="21" rx="4" />
+        </g>
+      )
+    }
+    <path
+      d="M40 20c6-9 22-10 28-2 10-3 19 4 18 13 7 4 7 15-1 19-2 8-12 11-19 8-8 5-21 4-26-3-10 1-17-7-15-16-4-8 4-18 15-19Z"
+      fill="var(--fleece)"
+      stroke="var(--ink)"
+      stroke-width="4"
+      stroke-linejoin="round"
+    />
+    <g class:list={[chewing && "anim-chew"]} style="--chew-origin:34px 40px;">
+      <ellipse
+        cx="26"
+        cy="34"
+        rx="9"
+        ry="7"
+        transform="rotate(-28 26 34)"
+        fill="var(--ink)"
+      />
+      <ellipse cx="27" cy="48" rx="15" ry="14" fill="var(--ink)" />
+      <circle cx="22" cy="45" r="3" fill="var(--fleece)" />
+      <circle cx="21.4" cy="45.6" r="1.4" fill="var(--ink)" />
+    </g>
+  </svg>
+</div>
+
+<style>
+  .sheep-mark {
+    display: inline-block;
+    line-height: 0;
+  }
+</style>

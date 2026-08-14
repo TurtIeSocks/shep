@@ -1,0 +1,63 @@
+/*
+ * shep global stylesheet — reset + base type, on top of tokens.css and
+ * motion.css. Fonts: docs/shep-design/README.md, "Design tokens > Type".
+ * Bricolage Grotesque is display/headings only, never body. Space Grotesk is
+ * prose and UI (the body default). Space Mono is terminals, labels, values,
+ * code.
+ */
+
+@import "./tokens.css";
+@import "./motion.css";
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Space Grotesk", system-ui, sans-serif;
+  transition:
+    background 0.25s ease,
+    color 0.25s ease;
+}
+
+h1,
+h2,
+h3 {
+  font-family: "Bricolage Grotesque", sans-serif;
+  font-weight: 800;
+  margin: 0;
+}
+
+code,
+pre,
+kbd {
+  font-family: "Space Mono", monospace;
+}
+
+/*
+ * Link color is meadow on the landing page but sky on docs/design-language
+ * (--sky is documented as "reference material and inline doc links"). This is
+ * the landing default; docs-scoped stylesheets should override `a { color }`
+ * to var(--sky) when those pages are built.
+ */
+a {
+  color: var(--meadow);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+
+a:hover {
+  color: var(--bark);
+}
+
+::selection {
+  background: var(--butter);
+  color: #17251c;
+}

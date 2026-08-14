@@ -1,0 +1,100 @@
+/*
+ * shep motion — keyframes + press state.
+ * Source: docs/shep-design/README.md, "Design tokens > Shape, shadow, motion".
+ *
+ * Rule from the handoff: give any two animals different durations AND offset
+ * delays — two sheep bobbing in lockstep reads as a loading spinner. Durations
+ * and delays are set per-instance (inline style custom properties), not baked
+ * into these keyframes.
+ */
+
+@keyframes bob {
+  0%,
+  100% {
+    transform: translateY(0) rotate(-1.5deg);
+  }
+  50% {
+    transform: translateY(-7px) rotate(1.5deg);
+  }
+}
+
+@keyframes chew {
+  0%,
+  100% {
+    transform: rotate(0deg);
+  }
+  50% {
+    transform: rotate(-7deg);
+  }
+}
+
+@keyframes wag {
+  0%,
+  100% {
+    transform: rotate(-14deg);
+  }
+  50% {
+    transform: rotate(16deg);
+  }
+}
+
+@keyframes twinkle {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/*
+ * Utility classes for the four animations. Each reads its duration/delay from
+ * a custom property set inline on the element (falls back to the handoff's
+ * default), and is a no-op unless the visitor has no reduced-motion preference.
+ */
+@media (prefers-reduced-motion: no-preference) {
+  .anim-bob {
+    animation: bob var(--bob-duration, 5.6s) ease-in-out infinite;
+    animation-delay: var(--bob-delay, 0s);
+  }
+
+  .anim-chew {
+    animation: chew 2.4s ease-in-out infinite;
+    transform-origin: var(--chew-origin, 34px 40px);
+  }
+
+  .anim-wag {
+    animation: wag 1.1s ease-in-out infinite;
+    transform-origin: var(--wag-origin, 106px 50px);
+  }
+
+  .anim-twinkle {
+    animation: twinkle var(--twinkle-duration, 3.4s) ease-in-out infinite;
+    animation-delay: var(--twinkle-delay, 0s);
+  }
+}
+
+/*
+ * Press state (buttons, pills, cards): a state, not an animation — no
+ * transition. On hover, translate(2px,2px) (3px on large buttons) while the
+ * hard shadow shrinks by the same amount, so the shadow always reads as the
+ * gap between the element and its resting position.
+ *
+ * Usage: set --shadow-offset (3px pills, 5-7px cards, 9px hero panels) and
+ * optionally --shadow-color (defaults to var(--shadow)) and --press-offset
+ * (defaults to 2px; use 3px on large buttons) on the element, then apply the
+ * .press class.
+ */
+.press {
+  --press-offset: 2px;
+  box-shadow: var(--shadow-offset, 4px) var(--shadow-offset, 4px) 0
+    var(--shadow-color, var(--shadow));
+}
+
+.press:hover {
+  transform: translate(var(--press-offset), var(--press-offset));
+  box-shadow: calc(var(--shadow-offset, 4px) - var(--press-offset))
+    calc(var(--shadow-offset, 4px) - var(--press-offset)) 0
+    var(--shadow-color, var(--shadow));
+}

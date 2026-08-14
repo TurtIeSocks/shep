@@ -1,0 +1,76 @@
+---
+/*
+ * The barn mark. Path data verbatim from
+ * docs/shep-design/design-files/Shep Landing v3 scene.dc.html — see
+ * docs/shep-design/README.md "Illustration > Barn".
+ *
+ * --barn is scenery-only and this is the mark it exists for: walls, roof,
+ * cupola. Never reuse --barn anywhere this component isn't scenery.
+ */
+interface Props {
+  width: number;
+  class?: string;
+}
+
+const { width, class: className } = Astro.props;
+---
+
+<div class:list={["barn-mark", className]} style={`width:${width}px`}>
+  <svg viewBox="0 0 320 262" width="100%" style="overflow:visible" role="img" aria-label="a barn">
+    <ellipse cx="160" cy="240" rx="146" ry="10" fill="rgba(23,37,28,.15)" />
+
+    <path d="M160 3v13" stroke="var(--ink)" stroke-width="4" stroke-linecap="round" />
+    <path d="M160 6 172 12 160 18Z" fill="var(--butter)" stroke="var(--ink)" stroke-width="3" stroke-linejoin="round" />
+
+    <path d="M160 14 180 28H140Z" fill="var(--illus-barn-door)" stroke="var(--ink)" stroke-width="4" stroke-linejoin="round" />
+    <rect x="147" y="26" width="26" height="20" rx="3" fill="var(--barn)" stroke="var(--ink)" stroke-width="4" />
+    <path d="M154 33h12" stroke="var(--ink)" stroke-width="3" stroke-linecap="round" />
+
+    <path d="M160 42 262 80 288 116H32L58 80Z" fill="var(--barn)" stroke="var(--ink)" stroke-width="6" stroke-linejoin="round" />
+
+    <rect x="141" y="60" width="38" height="32" rx="3" fill="var(--illus-hayloft-glass)" stroke="var(--ink)" stroke-width="4" />
+    <path d="M160 60v32" stroke="var(--ink)" stroke-width="3" />
+    <path d="M160 100h0M148 100h24" stroke="var(--ink)" stroke-width="5" stroke-linecap="round" />
+
+    <rect x="44" y="110" width="232" height="112" fill="var(--barn)" stroke="var(--ink)" stroke-width="6" />
+
+    <rect x="34" y="216" width="252" height="22" rx="4" fill="var(--illus-foundation)" stroke="var(--ink)" stroke-width="5" />
+    <g stroke="var(--illus-foundation-joints)" stroke-width="3" stroke-linecap="round">
+      <path d="M80 218v18" />
+      <path d="M128 218v18" />
+      <path d="M176 218v18" />
+      <path d="M224 218v18" />
+    </g>
+
+    <g stroke="var(--fleece)" stroke-width="6" stroke-linecap="round">
+      <path d="M52 124h216" />
+      <path d="M52 214h216" />
+      <path d="M110 214v-72" />
+      <path d="M210 214v-72" />
+    </g>
+
+    <rect x="110" y="142" width="100" height="74" fill="var(--illus-barn-door)" stroke="var(--ink)" stroke-width="5" />
+    <path d="M110 142l100 74M210 142l-100 74M160 142v74" stroke="var(--fleece)" stroke-width="5" />
+    <path d="M92 138h136" stroke="var(--ink)" stroke-width="5" stroke-linecap="round" />
+    <g fill="var(--illus-cream)" stroke="var(--ink)" stroke-width="3">
+      <circle cx="124" cy="138" r="5" />
+      <circle cx="196" cy="138" r="5" />
+    </g>
+
+    <g fill="var(--illus-hayloft-glass)" stroke="var(--ink)" stroke-width="4">
+      <rect x="62" y="152" width="30" height="30" rx="3" />
+      <rect x="228" y="152" width="30" height="30" rx="3" />
+    </g>
+    <g stroke="var(--ink)" stroke-width="3">
+      <path d="M77 152v30M62 167h30" />
+      <path d="M243 152v30M228 167h30" />
+    </g>
+  </svg>
+</div>
+
+<style>
+  .barn-mark {
+    display: inline-block;
+    line-height: 0;
+  }
+</style>

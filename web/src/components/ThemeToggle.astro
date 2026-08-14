@@ -1,0 +1,98 @@
+---
+/*
+ * Docs / design-language theme toggle. Landing page has no toggle (it has
+ * no dark mode — see tokens.css comment on --grass-deep / --barn).
+ *
+ * variant "icon"  — 36px circular button, ☾ / ☀ only (docs header).
+ * variant "label" — pill button, "☾ night pasture" / "☀ day pasture"
+ *                    (design-language header).
+ */
+interface Props {
+  variant?: "icon" | "label";
+}
+
+const { variant = "icon" } = Astro.props;
+---
+
+<button
+  type="button"
+  class="theme-toggle press"
+  data-variant={variant}
+  aria-label="Toggle color theme"
+  style={
+    variant === "icon"
+      ? "--shadow-offset:2px; --press-offset:1px;"
+      : "--shadow-offset:3px; --press-offset:1px;"
+  }
+>
+  <span class="icon" aria-hidden="true">☾</span>
+  {variant === "label" && <span class="label">night pasture</span>}
+</button>
+
+<style>
+  .theme-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-family: "Space Mono", monospace;
+    background: var(--paper-2);
+    color: var(--ink);
+    border: 2.5px solid var(--line);
+    cursor: pointer;
+  }
+
+  .theme-toggle[data-variant="icon"] {
+    width: 36px;
+    height: 36px;
+    justify-content: center;
+    border-radius: 999px;
+    font-size: 14px;
+  }
+
+  .theme-toggle[data-variant="label"] {
+    border-radius: 999px;
+    padding: 10px 18px;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+</style>
+
+<script>
+  function currentTheme(): "light" | "dark" {
+    return document.documentElement.getAttribute("data-theme") === "dark"
+      ? "dark"
+      : "light";
+  }
+
+  // Icon/label shown is the theme a click switches TO, not the active one.
+  function syncToggle(button: HTMLButtonElement) {
+    const targetTheme = currentTheme() === "dark" ? "light" : "dark";
+    const icon = button.querySelector<HTMLSpanElement>(".icon");
+    const label = button.querySelector<HTMLSpanElement>(".label");
+    if (icon) icon.textContent = targetTheme === "dark" ? "☾" : "☀";
+    if (label)
+      label.textContent =
+        targetTheme === "dark" ? "night pasture" : "day pasture";
+    button.setAttribute(
+      "aria-label",
+      targetTheme === "dark"
+        ? "Switch to night pasture (dark theme)"
+        : "Switch to day pasture (light theme)",
+    );
+  }
+
+  document
+    .querySelectorAll<HTMLButtonElement>(".theme-toggle")
+    .forEach((button) => {
+      syncToggle(button);
+      button.addEventListener("click", () => {
+        const nextTheme = currentTheme() === "dark" ? "light" : "dark";
+        document.documentElement.setAttribute("data-theme", nextTheme);
+        localStorage.setItem("shep-theme", nextTheme);
+        document
+          .querySelectorAll<HTMLButtonElement>(".theme-toggle")
+          .forEach(syncToggle);
+      });
+    });
+</script>

@@ -1,0 +1,108 @@
+/*
+ * shep design tokens — CSS custom properties.
+ * Source: docs/shep-design/README.md, "Design tokens > Color" table,
+ * cross-checked against design-files/*.dc.html :root / [data-theme="dark"] blocks.
+ *
+ * --barn is SCENERY ONLY — barn walls and roofs, never UI or status.
+ * --bark is errored, refused and destructive AND NOTHING ELSE.
+ * These are the two rules most easily broken by the next person reaching for a red.
+ *
+ * --grass-deep and --barn have no dark-mode override (the landing page, the only
+ * place either is used, has no theme toggle) — they keep their light value in
+ * both themes.
+ */
+
+:root {
+  --paper: #fbf6e7;
+  --paper-2: #fffdf5; /* "Fleece" */
+  --ink: #17251c;
+  --ink-2: #3d5245;
+  --ink-3: #7a8c80;
+  --line: #17251c;
+  --hair: rgba(23, 37, 28, 0.14);
+  --meadow: #2e8b57;
+  --grass: #6fcb6b;
+  --grass-deep: #2a7444;
+  --bark: #e0552b;
+  --butter: #f3c44c;
+  --sky: #4e9dd3;
+  --barn: #c6432e;
+  --shadow: #17251c;
+  --code-bg: #f1ebd8;
+  --dot: rgba(23, 37, 28, 0.1);
+
+  /* alias used throughout the design files for --paper-2 */
+  --fleece: var(--paper-2);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #131e18;
+    --paper-2: #1b2a21;
+    --ink: #f0ecdc;
+    --ink-2: #bfcfc2;
+    --ink-3: #7e9186;
+    --line: #35493c;
+    --hair: rgba(240, 236, 220, 0.14);
+    --meadow: #59c47d;
+    --grass: #7fd98e;
+    --bark: #ff7b4f;
+    --butter: #f6d072;
+    --sky: #78beec;
+    --shadow: #050a07;
+    --code-bg: #22332a;
+    --dot: rgba(240, 236, 220, 0.08);
+  }
+}
+
+:root[data-theme="dark"] {
+  --paper: #131e18;
+  --paper-2: #1b2a21;
+  --ink: #f0ecdc;
+  --ink-2: #bfcfc2;
+  --ink-3: #7e9186;
+  --line: #35493c;
+  --hair: rgba(240, 236, 220, 0.14);
+  --meadow: #59c47d;
+  --grass: #7fd98e;
+  --bark: #ff7b4f;
+  --butter: #f6d072;
+  --sky: #78beec;
+  --shadow: #050a07;
+  --code-bg: #22332a;
+  --dot: rgba(240, 236, 220, 0.08);
+}
+
+/*
+ * Non-token illustration literals (docs/shep-design/README.md, "Illustration").
+ * Deliberately not tokens — fixed colors for the sheep/dog/barn marks and
+ * terminal chrome, unrelated to the light/dark palette above.
+ */
+:root {
+  --illus-dog-body: #2a1c15;
+  --illus-dog-far-legs: #1e140f;
+  --illus-dog-muzzle: #e8d9c3;
+  --illus-barn-door: #a8351f;
+  --illus-hayloft-glass: #f7e4b0;
+  --illus-foundation: #3d5245;
+  --illus-foundation-joints: #2a3b31;
+  --illus-far-hill: #8cd08a;
+  --illus-moon: #f4f0e2;
+  --illus-moon-craters: #dcd6c2;
+  --illus-terminal-bg: #0d1712;
+  --illus-terminal-border: #35493c;
+  --illus-terminal-text: #e8e4d4;
+  --illus-terminal-muted: #7e9186;
+
+  /*
+   * Additional illustration-only literals, not called out by name in the
+   * handoff's non-token list but present in the source marks. Kept separate
+   * from --bark / --butter / --barn on purpose, even where the hex is
+   * identical, so illustration fills never accidentally pick up UI/status
+   * meaning (see the --bark and --barn rules above). --illus-cream is the
+   * moon's fill, reused for a couple of small cream architectural details
+   * (e.g. the barn's sliding-door hangers) that happen to share its tone.
+   */
+  --illus-dog-nose: #e0552b;
+  --illus-cream: #f4f0e2;
+}

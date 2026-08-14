@@ -1,0 +1,136 @@
+---
+/*
+ * The dog mark (border collie). Path data verbatim from
+ * docs/shep-design/design-files/Shep Landing v3 scene.dc.html (the pasture
+ * instance) — see docs/shep-design/README.md "Illustration > Dog".
+ *
+ * The head faces the viewer while the body is in profile — deliberate, and
+ * consistent with the wordmark's logo. Stroke widths in the head group are
+ * pre-multiplied (5, 3.75, 2.5) inside a scale(0.8) transform so they render
+ * at 4/3/2px; don't "simplify" them to round numbers post-scale.
+ *
+ * --illus-dog-nose is a separate token from --bark even though the hex is
+ * identical — see tokens.css. Never wire this mark's fills to --bark.
+ */
+interface Props {
+  width: number;
+  wag?: boolean;
+  class?: string;
+}
+
+const { width, wag = false, class: className } = Astro.props;
+---
+
+<div class:list={["dog-mark", className]} style={`width:${width}px`}>
+  <svg viewBox="0 0 154 112" width="100%" role="img" aria-label="a dog">
+    <ellipse cx="76" cy="102" rx="52" ry="7" fill="rgba(23,37,28,.16)" />
+
+    <g class:list={[wag && "anim-wag"]} style="--wag-origin:106px 50px;">
+      <path
+        d="M104 52c18-2 27-14 24-29"
+        fill="none"
+        stroke="var(--ink)"
+        stroke-width="11"
+        stroke-linecap="round"
+      />
+      <path
+        d="M128.5 25.5 127 20"
+        fill="none"
+        stroke="var(--fleece)"
+        stroke-width="7"
+        stroke-linecap="round"
+      />
+    </g>
+
+    <g fill="var(--illus-dog-far-legs)" stroke="var(--ink)" stroke-width="4">
+      <rect x="82" y="56" width="12" height="42" rx="6" />
+      <rect x="47" y="56" width="12" height="42" rx="6" />
+    </g>
+
+    <path
+      d="M40 56c0-13 15-22 37-22s33 8 33 21-13 22-33 22-37-8-37-21Z"
+      fill="var(--illus-dog-body)"
+      stroke="var(--ink)"
+      stroke-width="4"
+      stroke-linejoin="round"
+    />
+    <path
+      d="M53 36c-9 5-13 12-13 20 0 9 5 16 14 20 7-5 10-12 10-20s-4-15-11-20Z"
+      fill="var(--fleece)"
+      stroke="var(--ink)"
+      stroke-width="3.6"
+      stroke-linejoin="round"
+    />
+
+    <g fill="var(--illus-dog-body)" stroke="var(--ink)" stroke-width="4">
+      <rect x="95" y="58" width="13" height="42" rx="6.5" />
+      <rect x="57" y="58" width="13" height="42" rx="6.5" />
+    </g>
+    <g fill="var(--fleece)" stroke="var(--ink)" stroke-width="3.4">
+      <rect x="82" y="84" width="12" height="14" rx="6" />
+      <rect x="47" y="84" width="12" height="14" rx="6" />
+      <rect x="95" y="86" width="13" height="14" rx="6.5" />
+      <rect x="57" y="86" width="13" height="14" rx="6.5" />
+    </g>
+
+    <g transform="translate(4,-8) scale(0.8)">
+      <g
+        fill="var(--illus-dog-body)"
+        stroke="var(--ink)"
+        stroke-width="5"
+        stroke-linejoin="round"
+      >
+        <path d="M34 28c-12-5-22 2-20 14 2 12 11 20 21 18Z" />
+        <path d="M70 28c12-5 22 2 20 14-2 12-11 20-21 18Z" />
+        <path
+          d="M32 36c0-14 9-22 20-22s20 8 20 22v10c0 15-9 24-20 24s-20-9-20-24V36Z"
+        />
+      </g>
+      <path d="M52 15c4 0 6 7 6 13v14H46V28c0-6 2-13 6-13Z" fill="var(--fleece)" />
+      <ellipse
+        cx="52"
+        cy="57"
+        rx="14"
+        ry="10"
+        fill="var(--illus-dog-muzzle)"
+        stroke="var(--ink)"
+        stroke-width="3.75"
+      />
+      <path
+        d="M52 63c4 0 7 3 7 7s-3 8-7 8-7-4-7-8 3-7 7-7Z"
+        fill="var(--illus-dog-nose)"
+        stroke="var(--ink)"
+        stroke-width="3.75"
+      />
+      <path
+        d="M52 47c5 0 8 3 8 6s-4 5-8 5-8-2-8-5 3-6 8-6Z"
+        fill="var(--ink)"
+      />
+      <circle
+        cx="42"
+        cy="38"
+        r="4.4"
+        fill="var(--fleece)"
+        stroke="var(--ink)"
+        stroke-width="2.5"
+      />
+      <circle
+        cx="62"
+        cy="38"
+        r="4.4"
+        fill="var(--fleece)"
+        stroke="var(--ink)"
+        stroke-width="2.5"
+      />
+      <circle cx="42.6" cy="38.8" r="2" fill="var(--ink)" />
+      <circle cx="61.4" cy="38.8" r="2" fill="var(--ink)" />
+    </g>
+  </svg>
+</div>
+
+<style>
+  .dog-mark {
+    display: inline-block;
+    line-height: 0;
+  }
+</style>
