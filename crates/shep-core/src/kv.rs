@@ -47,7 +47,12 @@
 use core::fmt;
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// `PathBuf` backs `lock_path` below, which is `cfg(unix)`-only (POSIX advisory
+// locking has no Windows equivalent here) — gated the same way so a
+// non-unix target does not carry an unused import.
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
