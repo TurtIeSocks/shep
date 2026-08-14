@@ -77,6 +77,11 @@ pub trait MemorySampler: Send + Sync + 'static {
     /// a shared table would have to be either stale for this or retained for
     /// that.
     ///
+    /// For [`SysinfoSampler`] that separation is load-bearing rather than
+    /// tidy, and its own `identify` says what goes wrong without it: a name
+    /// read out of a retained table is the name that pid had when the table
+    /// first saw it, forever.
+    ///
     /// # Default implementation
     ///
     /// Returns nothing. Defaulted so that adding this to a `pub` trait did
@@ -171,8 +176,30 @@ impl MemorySampler for SysinfoSampler {
     }
 
     fn identify(&self) -> Vec<ProcessIdentity> {
-        // A poisoned lock recovers for the same reason `sample` does.
-        let mut system = self.system.lock().unwrap_or_else(PoisonError::into_inner);
+        // A `System` of this call's own, built here and dropped at the end of
+        // it, rather than the retained one `self.system` holds for `sample`.
+        // This is the whole correctness of the method, not an allocation
+        // preference: sysinfo fills a process's `name` when its table first
+        // sees that pid and never revises it on a later refresh. Measured on
+        // this machine (macOS 25.2, sysinfo 0.38.4) against
+        // `/bin/sh -c 'sleep 0.6; exec sleep 5'` — one pid throughout: a
+        // retained `System` refreshed before and after the `execve` reports
+        // `sh` both times, while a freshly built one reports `sleep`.
+        //
+        // Sharing the enforcer's table would therefore not cost `describe` a
+        // stale name for one 15-second tick. It would cost it that name for
+        // the daemon's whole life, for every lamb the table happened to
+        // catch between its `fork` and its `execve` — which is precisely the
+        // shell-wrapper shape (`#!/bin/sh` plus a backgrounded binary) that
+        // most lambs have. `shep describe` would name the wrapper instead of
+        // the program, and nothing short of a restart would correct it.
+        //
+        // The extra table is affordable because this is an operator's
+        // question, not a poll: `sample` runs every 15 seconds and keeps its
+        // table; this runs when someone types `shep describe`. It costs the
+        // same one process-table walk either way — what is not shared is the
+        // retention, and the lock, which this no longer takes at all.
+        let mut system = System::new();
         // Neither `.with_memory()` nor `.with_cpu()`: this walk reads only
         // `name()` and `parent()`, and widening the refresh kind would make
         // an operator's `shep describe` cost the same syscalls as the
@@ -505,5 +532,69 @@ mod tests {
         sampler.sample();
         sampler.sample();
         assert_eq!(sampler.calls(), 3);
+    }
+
+    /// Tests that spawn a real process and wait on real elapsed time.
+    ///
+    /// The inner loop skips this module with `--skip ::slow::`; the full
+    /// suite still runs them because nothing here is `#[ignore]`d.
+    mod slow {
+        use std::process::Command;
+        use std::time::Duration;
+
+        use super::*;
+
+        /// The name `sampler` reports for `pid`, or `None` if the walk did
+        /// not see it.
+        fn name_of(sampler: &SysinfoSampler, pid: u32) -> Option<String> {
+            sampler
+                .identify()
+                .into_iter()
+                .find(|identity| identity.pid == pid)
+                .map(|identity| identity.name)
+        }
+
+        // fails if `identify` reads its names out of a table the sampler
+        // retains between calls. sysinfo fills a process's `name` when its
+        // table first sees that pid and never revises it, so a lamb first
+        // observed between its `fork` and its `execve` would keep the
+        // wrapper shell's name for the daemon's whole life — and the
+        // `#!/bin/sh` wrapper is the commonest lamb there is, which makes
+        // this "`shep describe` names the wrong program, permanently"
+        // rather than "for one tick".
+        //
+        // One pid throughout: `sh` execs into `sleep` in place. Real elapsed
+        // time is the point of the case (there is no seam that could fake an
+        // `execve`), which is why it lives in `slow`.
+        #[test]
+        fn identify_reports_the_name_a_lamb_execed_into_not_the_one_it_forked_with() {
+            let mut child = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 0.6; exec sleep 30")
+                .spawn()
+                .expect("/bin/sh is present on every platform this daemon supports");
+            let pid = child.id();
+            let sampler = SysinfoSampler::new();
+
+            let forked_as = name_of(&sampler, pid);
+            std::thread::sleep(Duration::from_millis(1_500));
+            let execed_into = name_of(&sampler, pid);
+
+            let _ = child.kill();
+            let _ = child.wait();
+
+            assert_eq!(
+                forked_as.as_deref(),
+                Some("sh"),
+                "the first walk has to land before the `execve` or the case \
+                 says nothing; it did not"
+            );
+            assert_eq!(
+                execed_into.as_deref(),
+                Some("sleep"),
+                "the second walk must report what pid {pid} is NOW, not what \
+                 the first walk recorded for it"
+            );
+        }
     }
 }
