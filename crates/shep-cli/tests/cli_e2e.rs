@@ -3303,10 +3303,18 @@ fn describe_renders_a_real_sheeps_lamb_tree() {
     assert_success(&started);
 
     // Polls for `sleep` specifically, not merely for a `Lambs of` section:
-    // the walk can catch the forked child mid-exec, still reporting its
-    // parent shell's own name for one sampling tick before the `execve`
-    // into `sleep` lands — a real race this loop has to ride out, not just
-    // the fork itself.
+    // a walk can catch the forked child mid-exec, still reporting the
+    // parent shell's own name — `sh` — rather than the program that pid is
+    // about to become, so this loop rides out the `execve` as well as the
+    // fork.
+    //
+    // Not a sampling tick, and the distinction is what makes the loop able
+    // to ride it out at all: the 15-second memory poll is a different walk
+    // entirely, and `MemorySampler::identify` builds a process table of its
+    // own per call. Sharing the poll's retained table instead would make
+    // this loop futile rather than slow — sysinfo never revises a name it
+    // has already recorded for a pid, so every later iteration would read
+    // the same `sh` back until the daemon restarted.
     let start = Instant::now();
     let described = loop {
         let output = shep(dir.path())
