@@ -4568,15 +4568,20 @@ impl<R: ProcessRunner> Actor<R> {
                 // the app is not draining. That is precisely the condition
                 // `NotWritten` names, and reporting it here costs no round
                 // trip at all.
+                //
+                // The reason names no duration, and used to name
+                // `STDIN_WRITE_TIMEOUT`. `try_send` measured nothing: it
+                // looked at the queue once, on arrival, and found it full. An
+                // elapsed time in this message is fiction — and the operator
+                // reading it would take it for the bound the timeout path
+                // reports, which is a different fact about a different line.
                 Err(mpsc::error::TrySendError::Full(_)) => settled.push(LineReply {
                     id,
                     name,
                     outcome: LineOutcome::NotWritten {
-                        reason: format!(
-                            "the app is not reading its stdin (its queue is full \
-                             after {}s)",
-                            STDIN_WRITE_TIMEOUT.as_secs()
-                        ),
+                        reason: "the app is not reading its stdin (its queue was \
+                                 already full when this line arrived)"
+                            .to_string(),
                     },
                 }),
                 // Closed: the writer task is gone, so the process is too.
