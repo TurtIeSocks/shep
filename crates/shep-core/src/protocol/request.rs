@@ -655,13 +655,30 @@ pub enum LineOutcome {
     /// with the same fix behind it. A sheep that is not running is visible as
     /// such in `shep flock`, which is where that question belongs.
     NoStdin,
-    /// The shepherd had a pipe and could not write to it; carries why.
+    /// The shepherd had a pipe and did not confirm a write to it; carries
+    /// why.
     ///
-    /// Two shapes reach it: the write failed (the far end is gone — normally
-    /// the app exiting between the lookup and the write), or it did not finish
-    /// inside the shepherd's own bound, which means the pipe is full because
-    /// the app is not reading. The reason names which, because the operator's
-    /// next move differs.
+    /// Three shapes reach it: the write failed (the far end is gone —
+    /// normally the app exiting between the lookup and the write), the line
+    /// arrived to find the sheep's queue already full, or the write did not
+    /// finish inside the shepherd's own bound. The reason names which,
+    /// because the operator's next move differs.
+    ///
+    /// # The last shape does not promise the line was never written
+    ///
+    /// "Did not confirm", not "could not write", and the difference is the
+    /// operator's whole decision about retrying. A write that timed out is a
+    /// write the shepherd stopped WAITING for: the bytes may be part-written
+    /// into a pipe the app is not draining, and they land in full the moment
+    /// it does. There is no way to take them back — abandoning a write
+    /// halfway would leave a partial line in the pipe, which is worse than a
+    /// slow one.
+    ///
+    /// What the shepherd does do is drop a line still QUEUED behind that one
+    /// once its caller has given up, so retrying a `sendline` cannot pile
+    /// duplicates up behind a wedged pipe and deliver them together later.
+    /// The first line of a retry sequence is the one that can still arrive
+    /// late; treat a retry as a second command, not a repeat of the first.
     NotWritten {
         /// What went wrong, in plain English.
         reason: String,

@@ -5118,9 +5118,17 @@ fn spawn_send_line_task(
                         // The sender was dropped: the writer task ended before it
                         // served this request, which means the process did too.
                         Ok(Err(_recv)) => LineOutcome::NoStdin,
+                        // The shepherd stopped WAITING; it did not stop the
+                        // write. The bytes may be part-written into a pipe
+                        // the app is not draining and land in full when it
+                        // drains, so the reason says so rather than letting
+                        // an operator read `not_written` as "never sent" and
+                        // retry into a double delivery. See `LineOutcome`'s
+                        // own doc.
                         Err(_elapsed) => LineOutcome::NotWritten {
                             reason: format!(
-                                "the app did not read its stdin within {}s",
+                                "the app did not read its stdin within {}s; this line \
+                                 may still land if it drains",
                                 STDIN_WRITE_TIMEOUT.as_secs()
                             ),
                         },

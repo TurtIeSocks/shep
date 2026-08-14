@@ -380,6 +380,14 @@ What each of those does NOT do, recorded so it is not rediscovered as drift:
 - `sendline`'s `Sent` means the bytes were written and flushed to the pipe,
   not that the app read them. A pipe holds 64 KiB before it blocks, and there
   is nothing on that path that could tell the difference.
+- `sendline`'s `not_written` on the TIMEOUT path does not promise the line was
+  never written. The shepherd stops waiting after 2s; it cannot stop a write
+  already part-way into a pipe the app is not draining, because abandoning one
+  halfway would leave a partial line behind — so those bytes land in full
+  whenever the app drains. A line still QUEUED behind that one is dropped once
+  its caller gives up, so a retry cannot pile duplicates up and deliver them
+  together, but the first line of a retry sequence can still arrive late.
+  Treat a retry as a second command.
 - The KV store is flat. A dot in a key is part of the name, not a path.
 - `lambs` is a parent-pid walk and is not the kill unit, in both directions
   (`shep-daemon`'s `limits` module doc has the account). Only `Describe`

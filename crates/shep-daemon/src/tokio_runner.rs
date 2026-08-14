@@ -35,9 +35,11 @@ use command_fds::{CommandFdExt, FdMapping};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use shep_core::signals::OperatorSignal;
-use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWriteExt as _, BufReader, Lines};
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader, Lines,
+};
 use tokio::net::UnixStream;
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use crate::boot::DIR_MODE;
@@ -891,10 +893,32 @@ async fn open_append(path: &Path) -> io::Result<tokio::fs::File> {
 /// rather than this task bounding the write (a write abandoned halfway would
 /// leave a partial line in the pipe, which is worse than a slow one).
 ///
+/// A request whose caller has stopped listening is DROPPED rather than
+/// written. The supervisor bounds its own wait at `STDIN_WRITE_TIMEOUT` and
+/// abandons the `oneshot` when that expires; without this check the request
+/// stayed queued and landed whenever the app finally drained its pipe, so an
+/// operator who read `not_written` and retried twice had all three lines
+/// delivered at once — a command nobody meant to send, which is the same
+/// hazard `rpc`'s newline and carriage-return refusal exists to prevent.
+///
+/// It is a reduction, not a guarantee, and the one case it cannot reach is
+/// the commonest one: the line the pump is already blocked in `write_all` on
+/// is past the point where anything here could take it back, and abandoning
+/// it halfway would leave a partial line in the pipe. `LineOutcome::NotWritten`
+/// says so.
+///
+/// Generic over the writer for the same reason [`spawn_log_pump`] is generic
+/// over its readers: a `tokio::io::duplex` half is an `AsyncWrite`, so a test
+/// can wedge this pump on a full pipe with no child process in it. The only
+/// production caller passes a [`ChildStdin`](tokio::process::ChildStdin).
+///
 /// Ends when the last sender drops, which closes the child's stdin and gives
 /// the app EOF. That is the sheep task letting go of `ProcIo`, i.e. the child
 /// exiting — never before.
-fn spawn_stdin_pump(stdin: Option<ChildStdin>, mut rx: mpsc::Receiver<StdinWrite>) {
+fn spawn_stdin_pump<W>(stdin: Option<W>, mut rx: mpsc::Receiver<StdinWrite>)
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     tokio::spawn(async move {
         let Some(mut stdin) = stdin else {
             // `Stdio::piped()` was set and `child.stdin` was still `None`,
@@ -908,6 +932,14 @@ fn spawn_stdin_pump(stdin: Option<ChildStdin>, mut rx: mpsc::Receiver<StdinWrite
             return;
         };
         while let Some(StdinWrite { line, done }) = rx.recv().await {
+            if done.is_closed() {
+                // Nobody is waiting for this line any more: the supervisor's
+                // `STDIN_WRITE_TIMEOUT` expired and it dropped the receiver.
+                // Writing it now would deliver a line the operator has
+                // already been told was not written — see this function's
+                // own doc.
+                continue;
+            }
             let mut bytes = line.into_bytes();
             // Exactly one terminator, appended here and nowhere else. The wire
             // carries the line without one (`Request::SendLine::line`), so this
@@ -1597,6 +1629,93 @@ mod tests {
             .await
             .expect("the pump must end once nothing can control it");
         assert!(after.is_none(), "a pump that has ended sends nothing more");
+    }
+
+    /// Room in the in-memory pipe standing in for a child's stdin.
+    ///
+    /// Four bytes, far under the first line the stdin case writes, so the
+    /// pump parks inside `write_all` on that first request and cannot reach
+    /// the next one until the test starts reading. That parking is what
+    /// makes the case's ordering a fact rather than a hope.
+    const STDIN_BUFFER: usize = 4;
+
+    // fails if the pump writes a line whose caller has stopped waiting. The
+    // supervisor bounds its own wait at `STDIN_WRITE_TIMEOUT` and then
+    // abandons the `oneshot`; a pump that still wrote the request would
+    // deliver a line the operator was already told was `not_written`, so an
+    // operator who retried twice would have all three arrive at once.
+    //
+    // Real clock rather than this crate's usual paused one (IR-33), like
+    // every other case in this module: the forcing mechanism is the pipe
+    // being drained and then closed, which no virtual-time advance reaches.
+    #[tokio::test]
+    async fn a_line_whose_caller_stopped_waiting_is_dropped_rather_than_written_later() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (mut child_end, daemon_end) = tokio::io::duplex(STDIN_BUFFER);
+        let (to_stdin, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        spawn_stdin_pump(Some(daemon_end), rx);
+
+        // Wedges the pump: eight bytes into a four-byte pipe nobody is
+        // reading yet.
+        let (first_done, first_ack) = oneshot::channel();
+        to_stdin
+            .send(StdinWrite {
+                line: "AAAAAAAA".to_string(),
+                done: first_done,
+            })
+            .await
+            .unwrap();
+
+        // The abandoned one. Sent while the pump is parked on the first, so
+        // it is still in the queue when its caller gives up.
+        let (second_done, second_ack) = oneshot::channel();
+        to_stdin
+            .send(StdinWrite {
+                line: "BBBB".to_string(),
+                done: second_done,
+            })
+            .await
+            .unwrap();
+        drop(second_ack);
+
+        // A live caller behind it, so the case can tell "dropped the
+        // abandoned line" from "stopped writing altogether".
+        let (third_done, third_ack) = oneshot::channel();
+        to_stdin
+            .send(StdinWrite {
+                line: "CCCC".to_string(),
+                done: third_done,
+            })
+            .await
+            .unwrap();
+        drop(to_stdin);
+
+        let mut written = Vec::new();
+        timeout(PUMP_DEADLINE, child_end.read_to_end(&mut written))
+            .await
+            .expect("the pump must drain and close the pipe")
+            .expect("reading the pipe must succeed");
+
+        assert_eq!(
+            String::from_utf8(written).unwrap(),
+            "AAAAAAAA\nCCCC\n",
+            "the abandoned line must not reach the app, and the live one must"
+        );
+        assert!(
+            timeout(PUMP_DEADLINE, first_ack)
+                .await
+                .expect("the first write must be acknowledged")
+                .expect("its sender must outlive the write")
+                .is_ok()
+        );
+        assert!(
+            timeout(PUMP_DEADLINE, third_ack)
+                .await
+                .expect("the third write must be acknowledged")
+                .expect("its sender must outlive the write")
+                .is_ok()
+        );
     }
 
     // Everything else in this module needs a real OS child and lives in
