@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `AppConfig::stdin` (default `false`) — pipe a sheep's stdin so `shep
   sendline` can reach it; `Request::SendLine` / `Response::SentLine` /
   `LineReply` / `LineOutcome`.
+- Add `Lamb` and `ProcessInfo::lambs` — a sheep's process-tree members,
+  populated by `Describe` only. `None` means the reply did not walk for them,
+  never that there are none.
 - Add `kv` — the file-locked key/value store at `$SHEP_HOME/kv.json` (spec
   §5), and `ShepPaths::kv`.
 - Add `BusEvent::Channel` and the `channel.ready` / `channel.metric` /

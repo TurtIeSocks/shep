@@ -97,6 +97,11 @@ impl Render for FlockRows {
         // with its own SOURCE column; this field rides the JSON only so a
         // consumer that switches on `ProcessInfo` shape alone still sees it.
         "dog",
+        // Always `null` here: only `Describe` walks for lambs, and `flock`
+        // is `ListFlock`. `describe`'s own row type gets a LAMBS rendering
+        // in a later task; this list just keeps the shape consistent with
+        // every other verb answering `ProcessInfo`.
+        "lambs",
     ];
 }
 
@@ -191,6 +196,11 @@ impl Render for DogRows {
         // paths, often longer than every other column put together. They
         // ride the JSON so a programmatic consumer can still find them.
         "out_file", "err_file",
+        // Always `null` here: only `Describe` walks for lambs, and this
+        // table renders `ListFlock`'s dog half. A dog is one process by
+        // contract, so a lamb tree for one is not a rendering this table
+        // needs to grow to cover.
+        "lambs",
     ];
 }
 
@@ -503,6 +513,10 @@ impl Render for FlushedRows {
         // `null`. Stays in the JSON for the same shape-consistency reason
         // the rest of this list does.
         "dog",
+        // Always `null` here: only `Describe` walks for lambs, and `flush`
+        // is not `Describe`. Same shape-consistency reason as the rest of
+        // this list.
+        "lambs",
     ];
 }
 

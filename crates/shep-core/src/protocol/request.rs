@@ -247,6 +247,65 @@ pub enum DogSource {
     },
 }
 
+/// One process the OS reports as a descendant of a sheep.
+///
+/// # What this is not
+///
+/// It is **not** the set of processes that die with the sheep, and nothing here
+/// should be read as promising that. The list is built by walking the OS's
+/// parent-pid links; the stop ladder acts on the process GROUP, and the two
+/// units diverge in both directions — a lamb that forks and exits leaves its
+/// own children re-parented to init, out of this list and still in the group,
+/// while a `setsid()` grandchild stays in this list and leaves the group.
+/// shep-daemon's `limits` module doc has the full account, and it is the
+/// authority; this is a pointer to it, not a second copy free to drift.
+///
+/// # Why a name and not a command line
+///
+/// `name` is the executable's name as the OS reports it (`node`, `sh`,
+/// `python3`), never its argument vector. A process's argv routinely carries
+/// credentials — a `--password=` flag, a URL with a token in the query string —
+/// and this field rides in `shep describe --format json`, which is output
+/// people paste into bug reports. A pid alone would be safe too, and was
+/// considered; it was rejected because a tree of bare integers sends the
+/// operator to `ps`, which is the work the tree exists to save.
+///
+/// # Why no memory figure
+///
+/// The sheep's own row already reports its whole tree's resident size
+/// ([`ProcessInfo::memory_bytes`]), and a per-lamb breakdown is a profiler's
+/// job. `deferred.md`'s note on this struct's growth asks for exactly this
+/// restraint.
+///
+/// `#[non_exhaustive]`: shep-core is a published library, this type is new, and
+/// the two obvious next fields (a parent pid, so a deep tree can be nested
+/// rather than flattened; a start time) would otherwise be breaking additions
+/// (IR-20). Build one with [`Self::new`].
+// wire format: changing this is a breaking change
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lamb {
+    /// The lamb's own pid.
+    pub pid: u32,
+    /// The executable's name, as the OS reports it. Never its command line.
+    pub name: String,
+}
+
+impl Lamb {
+    /// One lamb.
+    ///
+    /// A plain constructor rather than a builder, unlike [`ProcessInfo`]: both
+    /// fields are required and neither is optional or derived, which is the
+    /// case a builder buys nothing for.
+    #[must_use]
+    pub fn new(pid: u32, name: impl Into<String>) -> Self {
+        Self {
+            pid,
+            name: name.into(),
+        }
+    }
+}
+
 /// Snapshot of one sheep for listings and events
 // wire format: changing this is a breaking change
 //
@@ -284,16 +343,15 @@ pub enum DogSource {
 // compares a `ProcessInfo` for total equality — `assert_eq!` needs only
 // `PartialEq`, and no listing is keyed on, hashed by, or sorted by a whole
 // row.
-/// `#[non_exhaustive]`: this struct has grown a field in three separate
+/// `#[non_exhaustive]`: this struct has now grown a field in four separate
 /// phases (`out_file`/`err_file`, then `cpu_percent`/`memory_bytes`, then
-/// `dog`), and `deferred.md` already names the next one — `lambs`, for
-/// `describe`'s tree view. Each of those additions was a hand-edit sweep
-/// across every construction site in the workspace because any crate could
-/// write the literal. Under the attribute the compiler names only the sites
-/// that must decide something, and an out-of-tree consumer cannot be broken
-/// by an addition at all (IR-20 — growth here is not anticipated, it is
-/// scheduled). Use [`ProcessInfo::builder`] to construct one; the fields stay
-/// `pub`, so reading them and assigning to them are both unchanged.
+/// `dog`, then `lambs`) with no hand-edit sweep across the workspace for any
+/// of them — the attribute is paying for itself exactly as advertised. There
+/// is no forecast next field; `deferred.md`'s `ProcessInfo` entry explicitly
+/// warns against growing this struct speculatively, so the attribute stays
+/// for whatever the next genuine need turns out to be, not for a named one.
+/// Use [`ProcessInfo::builder`] to construct one; the fields stay `pub`, so
+/// reading them and assigning to them are both unchanged.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessInfo {
@@ -338,6 +396,20 @@ pub struct ProcessInfo {
     /// entry is genuinely a sheep — there is no resource-usage-style claim
     /// a stale zero could get wrong. Do not "fix" this into three cases.
     pub dog: Option<DogSource>,
+    /// The processes the OS reports as descendants of this sheep, or `None`
+    /// when this reply did not walk for them.
+    ///
+    /// `None` covers two cases and is deliberately not a third: this reply is
+    /// not a `Describe` (only `Describe` walks — the walk costs a second pass
+    /// over the machine's process table, and a flock listing is the thing an
+    /// operator leaves running in a loop), or the peer daemon predates the
+    /// field. `Some(vec![])` is the third case, and the one that means what it
+    /// looks like: walked, and this sheep has no children.
+    ///
+    /// Read [`Lamb`]'s own doc before rendering this. The list is a parent-pid
+    /// walk and is NOT the set of processes a stop kills; any output built from
+    /// it has to say so where the operator will see it.
+    pub lambs: Option<Vec<Lamb>>,
 }
 
 impl ProcessInfo {
@@ -369,6 +441,7 @@ impl ProcessInfo {
                 cpu_percent: None,
                 memory_bytes: None,
                 dog: None,
+                lambs: None,
             },
         }
     }
@@ -445,6 +518,12 @@ impl ProcessInfoBuilder {
     /// Marks this row a dog and names where the dog came from.
     pub fn dog(mut self, dog: Option<DogSource>) -> Self {
         self.info.dog = dog;
+        self
+    }
+
+    /// Sets the sheep's lamb list; `None` when this reply did not walk for one.
+    pub fn lambs(mut self, lambs: Option<Vec<Lamb>>) -> Self {
+        self.info.lambs = lambs;
         self
     }
 
@@ -903,6 +982,7 @@ mod tests {
             cpu_percent: Some(12.5),
             memory_bytes: Some(48 * 1024 * 1024),
             dog: None,
+            lambs: None,
         }
     }
 
@@ -926,6 +1006,7 @@ mod tests {
         assert_eq!(info.cpu_percent, None);
         assert_eq!(info.memory_bytes, None);
         assert_eq!(info.dog, None);
+        assert_eq!(info.lambs, None);
     }
 
     /// fails if any setter writes a field other than its own — the failure a
@@ -970,6 +1051,66 @@ mod tests {
             Some(DogSource::BuiltIn),
             "an empty `dog` setter body is invisible to the comparison above"
         );
+
+        // `lambs` is the second field the comparison above cannot speak for,
+        // for the identical reason `dog` is the first: `sample_info()`'s value
+        // is `None`, which is also the builder's default, so an EMPTY `lambs`
+        // setter body passes the `assert_eq!` above. And `sample_info()` still
+        // cannot be changed to a `Some(..)` — it feeds `reply_wire_snapshots`
+        // and `bus_event_wire_snapshots`, so altering it moves pinned bytes.
+        assert_eq!(
+            ProcessInfo::builder(1, "web", ProcStatus::Online)
+                .lambs(Some(vec![Lamb::new(4243, "node")]))
+                .build()
+                .lambs,
+            Some(vec![Lamb::new(4243, "node")]),
+            "an empty `lambs` setter body is invisible to the comparison above"
+        );
+    }
+
+    /// fails if `lambs` collapses to a bare `Vec`. The three states are the point:
+    /// a peer that predates the field and a reply that did not walk the tree are
+    /// both `None`, and a sheep that really has no children is `Some(vec![])`. A
+    /// `Vec` would render the first two as "this sheep has no lambs", which is a
+    /// claim neither of them makes.
+    #[test]
+    fn lambs_distinguishes_not_walked_from_walked_and_empty() {
+        let not_walked = ProcessInfo::builder(1, "web", ProcStatus::Online).build();
+        assert_eq!(not_walked.lambs, None);
+
+        let walked_empty = ProcessInfo::builder(1, "web", ProcStatus::Online)
+            .lambs(Some(Vec::new()))
+            .build();
+        assert_eq!(walked_empty.lambs, Some(Vec::new()));
+    }
+
+    /// fails if a `ProcessInfo` from a daemon that predates the field stops
+    /// deserializing. That is the whole reason the field is optional and the reason
+    /// `PROTOCOL_VERSION` does not move for it — an old daemon's reply carries no
+    /// `lambs` key at all, and a required field there would mean a new client could
+    /// not list against an old daemon.
+    #[test]
+    fn a_process_info_without_a_lambs_key_still_deserializes() {
+        let fixture = r#"{
+            "id": 3, "name": "web", "status": "online", "pid": 4242,
+            "restarts": 0, "uptime_ms": 100, "fold": null,
+            "out_file": null, "err_file": null,
+            "cpu_percent": null, "memory_bytes": null, "dog": null
+        }"#;
+        let info: ProcessInfo = serde_json::from_str(fixture).unwrap();
+        assert_eq!(info.lambs, None);
+    }
+
+    /// fails if a lamb stops carrying its name, or starts carrying a command line.
+    /// The name is `sysinfo`'s executable name, never argv — argv routinely holds
+    /// credentials (`--password=`, `?token=`) and `shep describe --format json` is
+    /// output people paste into issues.
+    #[test]
+    fn a_lamb_is_a_pid_and_an_executable_name() {
+        let lamb = Lamb::new(4243, "node");
+        let json = serde_json::to_string(&lamb).unwrap();
+        assert_eq!(json, r#"{"pid":4243,"name":"node"}"#);
+        assert_eq!(serde_json::from_str::<Lamb>(&json).unwrap(), lamb);
     }
 
     /// fails if `DogSource` loses its `tag = "kind"` or its snake_case
@@ -1519,6 +1660,19 @@ mod tests {
                             reason: "the app did not read its stdin within 2s".to_string(),
                         },
                     },
+                ])),
+            },
+            // A `Described` row with a real lamb tree. The `null` shape is pinned
+            // on every other row here; this is the one that pins what a walked
+            // sheep serializes as, which is the shape a `describe` consumer
+            // actually parses.
+            Reply {
+                id: 23,
+                result: Ok(Response::Described(vec![
+                    ProcessInfo::builder(3, "web", ProcStatus::Online)
+                        .pid(Some(4242))
+                        .lambs(Some(vec![Lamb::new(4243, "node"), Lamb::new(4244, "sh")]))
+                        .build(),
                 ])),
             },
         ];

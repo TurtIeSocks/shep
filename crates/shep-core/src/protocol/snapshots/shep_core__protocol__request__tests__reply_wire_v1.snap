@@ -29,7 +29,8 @@ expression: replies
             "err_file": "/home/rin/.shep/logs/web-0-err.log",
             "cpu_percent": 12.5,
             "memory_bytes": 50331648,
-            "dog": null
+            "dog": null,
+            "lambs": null
           }
         ]
       }
@@ -95,7 +96,8 @@ expression: replies
             "dog": {
               "kind": "adopted",
               "path": "/usr/local/bin/shep-otel"
-            }
+            },
+            "lambs": null
           }
         ]
       }
@@ -131,7 +133,8 @@ expression: replies
           "memory_bytes": 50331648,
           "dog": {
             "kind": "built_in"
-          }
+          },
+          "lambs": null
         }
       }
     }
@@ -286,7 +289,8 @@ expression: replies
             "err_file": "/home/rin/.shep/logs/web-0-err.log",
             "cpu_percent": 12.5,
             "memory_bytes": 50331648,
-            "dog": null
+            "dog": null,
+            "lambs": null
           }
         ]
       }
@@ -319,6 +323,40 @@ expression: replies
               "kind": "not_written",
               "reason": "the app did not read its stdin within 2s"
             }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 23,
+    "result": {
+      "Ok": {
+        "kind": "described",
+        "data": [
+          {
+            "id": 3,
+            "name": "web",
+            "status": "online",
+            "pid": 4242,
+            "restarts": 0,
+            "uptime_ms": 0,
+            "fold": null,
+            "out_file": null,
+            "err_file": null,
+            "cpu_percent": null,
+            "memory_bytes": null,
+            "dog": null,
+            "lambs": [
+              {
+                "pid": 4243,
+                "name": "node"
+              },
+              {
+                "pid": 4244,
+                "name": "sh"
+              }
+            ]
           }
         ]
       }

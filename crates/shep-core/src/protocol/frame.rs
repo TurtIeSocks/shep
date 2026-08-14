@@ -63,6 +63,7 @@ mod tests {
                 cpu_percent: None,
                 memory_bytes: None,
                 dog: None,
+                lambs: None,
             },
             manually: false,
             at_ms: 1_700_000_000_000,

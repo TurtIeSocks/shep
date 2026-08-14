@@ -18,7 +18,8 @@ expression: out
       "err_file": "/logs/web-0-err.log",
       "cpu_percent": 12.5,
       "memory_bytes": 50462720,
-      "dog": null
+      "dog": null,
+      "lambs": null
     },
     {
       "id": 2,
@@ -32,7 +33,8 @@ expression: out
       "err_file": "/logs/worker-0-err.log",
       "cpu_percent": 12.5,
       "memory_bytes": 50462720,
-      "dog": null
+      "dog": null,
+      "lambs": null
     },
     {
       "id": 3,
@@ -46,7 +48,8 @@ expression: out
       "err_file": "/logs/cron-0-err.log",
       "cpu_percent": 12.5,
       "memory_bytes": 50462720,
-      "dog": null
+      "dog": null,
+      "lambs": null
     }
   ]
 }

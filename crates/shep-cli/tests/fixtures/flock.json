@@ -14,7 +14,8 @@
       "err_file": null,
       "cpu_percent": null,
       "memory_bytes": null,
-      "dog": null
+      "dog": null,
+      "lambs": null
     }
   ]
 }

@@ -30,9 +30,9 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 
 use shep_core::protocol::{
-    BusEvent, DogSource, Envelope, Hello, HelloAck, HelloReply, PROTOCOL_VERSION, ProcessEventKind,
-    ProcessInfo, Reply, Request, Response, RpcError, RpcErrorCode, codec, decode_frame,
-    encode_frame,
+    BusEvent, DogSource, Envelope, Hello, HelloAck, HelloReply, Lamb, PROTOCOL_VERSION,
+    ProcessEventKind, ProcessInfo, Reply, Request, Response, RpcError, RpcErrorCode, codec,
+    decode_frame, encode_frame,
 };
 use shep_core::status::ProcStatus;
 
@@ -120,6 +120,7 @@ pub fn sample_info() -> ProcessInfo {
         .cpu_percent(Some(12.5))
         .memory_bytes(Some(48 * 1024 * 1024))
         .dog(Some(DogSource::BuiltIn))
+        .lambs(Some(vec![Lamb::new(4243, "node")]))
         .build()
 }
 

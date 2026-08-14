@@ -23,7 +23,7 @@
 // prelude, NOT through `protocol` — `protocol/mod.rs`'s `pub use` list does
 // not name it. Two imports, deliberately, rather than one wrong one.
 use shep_core::prelude::ProcStatus;
-use shep_core::protocol::{DogSource, ProcessInfo};
+use shep_core::protocol::{DogSource, Lamb, ProcessInfo};
 
 #[test]
 fn the_builder_reaches_every_field_from_outside_the_crate() {
@@ -37,6 +37,7 @@ fn the_builder_reaches_every_field_from_outside_the_crate() {
         .cpu_percent(Some(1.0))
         .memory_bytes(Some(1))
         .dog(Some(DogSource::BuiltIn))
+        .lambs(Some(vec![Lamb::new(4243, "node")]))
         .build();
 
     // Every field, read back across the boundary. `dog` is set to a real
@@ -54,6 +55,7 @@ fn the_builder_reaches_every_field_from_outside_the_crate() {
     assert_eq!(info.cpu_percent, Some(1.0));
     assert_eq!(info.memory_bytes, Some(1));
     assert_eq!(info.dog, Some(DogSource::BuiltIn));
+    assert_eq!(info.lambs, Some(vec![Lamb::new(4243, "node")]));
 
     // Field ASSIGNMENT is still legal across the boundary — the attribute
     // blocks construction, not mutation, and several call sites in shep-cli
