@@ -199,6 +199,19 @@ entry, and the `deferred.md` / `README.md` reconciliation.
   this phase's.
 - **The actions themselves** — see design decision 2.
 - **Search / filter.** Spec §9 lists it. It narrows two panes; there is one.
+- **A selected row.** Considered for 12a and cut (Rin, 2026-08-14) — recorded
+  here so 12b's author knows it was decided rather than forgotten. A cursor
+  means `selected`, a reseat rule for the wholesale snapshot replacement that
+  lands every two seconds, `selected_id`, and a REVERSED row style; none of it
+  has a consumer in this phase, because the detail pane it feeds is 12b and the
+  one action key it could target refuses in both gate states. What a flock
+  taller than the viewport genuinely needs is a **scroll offset**, and that is
+  what 12a ships: `j`/`k` move the viewport by a row, `g`/`G` jump to its ends,
+  and `view::flock::scroll_offset` clamps the result against the rows that
+  actually exist. 12b adds selection on top of that offset, together with the
+  pane that reads it. The retrofit argument that kept the control gate in 12a
+  does not transfer: a gate is a routing decision every future key has to pass
+  through, while a cursor is state one later pane reads.
 
 ---
 
@@ -293,6 +306,23 @@ cross-check the phase gate runs.
 **Rin's ruling.** lookout retries the connection a bounded number of times,
 then says the shepherd has died and **stops updating**, leaving the last known
 values on screen. It never exits on its own; the operator quits.
+
+**The FIRST connection is not on that ladder** (Rin, 2026-08-14). The ruling
+above is about a shepherd that dies *underneath* a running dashboard — the
+sentence presupposes it was alive. A shepherd that was never there is a
+different situation, and lookout treats it the way every other client verb
+treats it. The opening `Shepherd::link` happens **before** raw mode; if it
+fails, lookout emits the ordinary `daemon_unreachable` error envelope on stderr
+and exits `ExitCode::DaemonUnreachable` (5), having never entered the alternate
+screen. The alternative — which an earlier draft of this plan specified — was
+that `shep lookout` on a machine with no shepherd opens a full-screen
+dashboard, cycles "reconnecting" for eight seconds, announces a death that
+never happened, sits there, and finally exits `Success`, while `shep flock` one
+line earlier exited 5.
+
+So: **the bounded ladder applies only after a link has once been established.**
+Both halves are one rule said twice — the dashboard reports what it knows, and
+never reports a state it was not in.
 
 This is deliberately not `bleats`' precedent. `bleats` prints a notice and exits
 cleanly when the connection ends, and that is right for a follow — a `tail -f`
@@ -509,8 +539,9 @@ first multi-byte name.
 So `view/flock.rs` builds `Vec<Line>` itself and writes them with
 `frame.buffer_mut().set_line(..)`. The upstream API this phase uses is six
 items wide: `Frame::area`, `Frame::buffer_mut`, `Buffer::set_line`, `Line`,
-`Span`, and `Style`/`Color`/`Modifier`. Layout is arithmetic on `Rect`, not
-`Layout`/`Constraint`.
+`Span`, and `Style`/`Color`. Layout is arithmetic on `Rect`, not
+`Layout`/`Constraint`, and no `Modifier` is ever set — 12a has no selected row
+and nothing bold, so a foreground colour is the whole of its styling.
 
 That is not an argument that ratatui is unnecessary. What it is being taken for
 is the part worth taking: the backend abstraction, the double-buffered diffing
@@ -545,12 +576,22 @@ the last two numbers to go because they are the ones that explain *why*
 something is wrong. `ID NAME STATUS` is the floor because those three are the
 pane.
 
-Below 31 columns, or below 5 rows, the whole draw becomes one line:
-`terminal too small — lookout needs 31x6`. Named `MIN_WIDTH: u16 = 31` and
+Below 31 columns, or below 6 rows, the pane refuses instead of drawing: `too
+small` on the first line, `need 31x6` on the second, and only the first when
+there is a single row to write into. Named `MIN_WIDTH: u16 = 31` and
 `MIN_HEIGHT: u16 = 6` (title, the link banner, header, rule, one row, status
 bar — six, not five, because the banner has to fit in the state that most needs
 it). A pane that
 tried to draw anyway would produce overlapping garbage that reads as a crash.
+
+**The refusal has to fit in the terminal it is refusing about.** This is the
+trap, and an earlier draft of this plan fell into it: `Buffer::set_line`
+truncates at `max_width` silently, and this branch exists precisely for
+terminals narrower than 31 columns. `terminal too small — lookout needs 31x6`
+is 39 characters, so at 28 columns the operator reads `terminal too small —
+lookout` and never sees `31x6` — the one piece of information the message
+exists to carry, cut off in exactly the case it was written for. Two
+nine-character lines fit anything from nine columns up.
 
 Names longer than the NAME column are truncated with a trailing `…` — never
 silently cut, because a truncated name that looks whole is a name an operator
@@ -614,7 +655,14 @@ does:
 - The row's uptime does not advance for a sheep that is not running, either,
   frozen or not: a `stopped` sheep's `uptime_ms` is a historical fact, and
   advancing it would invent one.
-- Keys still work. `q` quits. `x` still refuses, with the same words.
+- Keys still work, and they stay honest about being frozen. `q` quits. `j`/`k`
+  and `g`/`G` still scroll the last known rows — reading them is the whole
+  point of not clearing the screen. `x` still refuses, with the same words.
+  `r`, the one key that asks for I/O, does **not** silently do nothing: the
+  link task has ended, so its poll receiver is gone and a request would vanish
+  into a closed channel. Pressing `r` while frozen leaves a notice saying there
+  is nothing left to ask. A refresh key that quietly failed on a frozen
+  dashboard would be the same lie as a running clock, one keystroke smaller.
 - **lookout never exits on its own.** Not on freeze, not on `Lagged`, not on
   `BusEvent::DaemonShutdown` — that last one is a *notice* here, where in
   `bleats` it precedes an exit.
@@ -791,62 +839,107 @@ re-derive it:
 git diff -U0 Cargo.lock | grep '^+name = ' | sed 's/^+name = //' | sort
 ```
 
-### Step 1.4 — GREEN: confirm the upstream API surface this phase uses
+### Step 1.4 — confirm the upstream API surface this phase uses
 
-This phase touches six upstream items and this is the step that proves they are
-spelled the way the rest of this plan spells them. Locate the fetched sources:
+**This step is a confirmation, not a before/after check, and it deliberately
+states no baseline** — an earlier draft claimed these greps "print `0` today
+only because the crates were not fetched", which is false: all five crates are
+already unpacked under `~/.cargo/registry/src/`, so every one of them passes at
+HEAD and none of them could ever have gone from red to green. A check that
+cannot fail is worse than no check, and this plan's own rule
+(§"Every check in this plan states its baseline") is what caught it.
+
+What this step IS for: the rest of the plan writes these six call sites out in
+full, and if the resolved version spells any of them differently, the
+implementer should find that out here rather than in Task 4.
 
 ```bash
 RC=$(ls -d ~/.cargo/registry/src/*/ | head -1)
 ls -d "$RC"ratatui-core-* "$RC"ratatui-0.30* "$RC"crossterm-0.29*
 ```
 
-Then confirm each, and each of these greps prints `0` today only because the
-crates were not fetched — after Step 1.2 they must each print at least `1`:
+Each of these must print at least `1`. Note the exact paths and the `const`
+spellings — `ratatui-0.30.2` has **no** `src/backend/` directory at all (its
+`backend` is a re-export module in `lib.rs`), and `Frame::area` /
+`Frame::buffer_mut` are `pub const fn`, so a pattern of `pub fn area` matches
+nothing:
 
 ```bash
-grep -rn 'pub fn set_line' "$RC"ratatui-core-*/src/buffer/buffer.rs | wc -l   # >= 1
-grep -rn 'pub fn buffer_mut' "$RC"ratatui-core-*/src/terminal/frame.rs | wc -l # >= 1
-grep -rn 'pub fn area' "$RC"ratatui-core-*/src/terminal/frame.rs | wc -l       # >= 1
-grep -rn 'pub struct TestBackend' "$RC"ratatui-*/src/backend/test.rs | wc -l   # >= 1
-grep -rn 'pub struct EventStream' "$RC"crossterm-0.29*/src/event/stream.rs | wc -l # >= 1
+grep -c 'pub fn set_line'         "$RC"ratatui-core-*/src/buffer/buffer.rs       # >= 1
+grep -c 'pub const fn area'       "$RC"ratatui-core-*/src/terminal/frame.rs      # >= 1
+grep -c 'pub const fn buffer_mut' "$RC"ratatui-core-*/src/terminal/frame.rs      # >= 1
+grep -c 'pub struct TestBackend'  "$RC"ratatui-core-*/src/backend/test.rs        # >= 1
+grep -c 'pub const fn buffer'     "$RC"ratatui-core-*/src/backend/test.rs        # >= 1
+grep -c 'pub struct EventStream'  "$RC"crossterm-0.29.0/src/event/stream.rs      # >= 1
 ```
 
-If any of the five paths has moved between the version resolved and the one
-this plan was written against, **fix the call sites, not the plan's intent**:
-what each is for is stated in design decision 5b, and the intent survives a
-module rename. Report which ones moved.
+Verified at plan time, against exactly these files, so a mismatch is a real
+signal rather than a typo in this plan:
+`Buffer::set_line(&mut self, x: u16, y: u16, line: &Line<'_>, max_width: u16)
+-> (u16, u16)` (buffer.rs:373 — note it **truncates at `max_width`**, which is
+design decision 6's whole point), `Frame::area(&self) -> Rect` (frame.rs:68),
+`Frame::buffer_mut(&mut self) -> &mut Buffer` (frame.rs:207),
+`Buffer::area(&self) -> &Rect` (buffer.rs:113),
+`Buffer::cell(impl Into<Position>) -> Option<&Cell>` (buffer.rs:179),
+`Cell::{fg, modifier}` public fields plus `Cell::symbol(&self) -> &str`
+(cell.rs:49/59/105), `TestBackend` (backend/test.rs:32) with
+`buffer(&self) -> &Buffer` (test.rs:103) and
+`type Error = core::convert::Infallible` (test.rs:250),
+`Terminal::backend(&self) -> &B` (terminal/backend.rs:16),
+`Line::style(self, impl Into<Style>)` (text/line.rs:343),
+`ratatui::backend::TestBackend` re-exported unconditionally with no feature
+gate (ratatui-0.30.2/src/lib.rs:505), and
+`impl Stream for EventStream` (crossterm stream.rs:101).
+
+If any path or spelling has moved, **fix the call sites, not the plan's
+intent**: what each item is for is stated in design decision 5b, and the intent
+survives a module rename. Report which ones moved.
 
 ### Step 1.5 — GREEN: the module doc stops saying ratatui is absent
 
-`crates/shep-cli/src/main.rs`, the module doc currently reads:
+`crates/shep-cli/src/main.rs`, the module doc currently reads — **all four
+sentences, main.rs:5-11**, which is the whole paragraph and not the first two
+thirds of it. A find/replace against a shorter quotation leaves the
+"Recorded here as deliberately absent" sentence behind and the file ends up
+saying it twice:
 
 ```rust
 //! A ratatui dashboard (`lookout`), a static file server (`serve`), and the
 //! container (`shep runtime`) and dev (`shep dev`) execution modes are
 //! spec'd (`docs/specs/shep-v1.md` §9) but not built — this crate depends on
 //! neither `ratatui`, `axum` nor `tower-http`, and there is no `[[bin]]`
-//! beyond `shep` itself.
+//! beyond `shep` itself. Recorded here as deliberately absent rather than
+//! letting them quietly read as shipped; full inventory:
+//! `docs/specs/deferred.md`.
 ```
 
-Replace with:
+Replace the whole of it with:
 
 ```rust
 //! A static file server (`serve`) and the container (`shep runtime`) and dev
 //! (`shep dev`) execution modes are spec'd (`docs/specs/shep-v1.md` §9) but
 //! not built — this crate depends on neither `axum` nor `tower-http`, and
-//! there is no `[[bin]]` beyond `shep` itself. The `lookout` dashboard has its
-//! shell and its flock table (Phase 12a, [`lookout`]); its other three panes —
-//! the bleats feed, the sheep detail and the host-usage strip — are 12b.
-//! Recorded here as deliberately partial rather than letting it quietly read
-//! as shipped; full inventory: `docs/specs/deferred.md`.
+//! there is no `[[bin]]` beyond `shep` itself. The ratatui `lookout` dashboard
+//! has its shell and its flock table (Phase 12a); its other three panes — the
+//! bleats feed, the sheep detail and the host-usage strip — are 12b. Recorded
+//! here as deliberately absent or deliberately partial rather than letting
+//! either read as shipped; full inventory: `docs/specs/deferred.md`.
 ```
+
+`lookout` is written as plain code, **not** as an intra-doc link. `mod lookout`
+is private (and `#[cfg(unix)]`), and a link from a crate-level doc to a private
+item is a `private_intra_doc_links` warning, which
+`RUSTDOCFLAGS="-D warnings" cargo doc` in the task gate turns into a failure.
 
 ### Step 1.6 — verify
 
 ```bash
-grep -c 'ratatui' crates/shep-cli/src/main.rs   # was 2, now 1 (the `lookout` sentence names it once)
+grep -c 'ratatui' crates/shep-cli/src/main.rs   # was 2, now 1 (the new sentence names it once)
 ```
+
+The `1` is load-bearing in both directions: `2` means the old paragraph is
+still there, `0` means the replacement dropped the word and the doc no longer
+tells a reader that this crate carries a TUI stack at all.
 
 Then:
 
@@ -1021,7 +1114,7 @@ Run `cargo test -p shep-cli --bins --all-features`.
 //! and `--bark` sits on top of that word. That is what makes both downgrades
 //! below losses of decoration rather than losses of information.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use std::ffi::OsStr;
 
 use shep_core::status::ProcStatus;
@@ -1138,17 +1231,6 @@ impl Palette {
         Self::fg(self.butter)
     }
 
-    /// The selected row.
-    ///
-    /// `REVERSED`, not a colour — so selection survives `NO_COLOR` intact.
-    /// Which row the operator has selected is the one piece of state on this
-    /// screen with no word beside it saying so, so it is the one thing that
-    /// cannot be carried by colour.
-    #[must_use]
-    pub fn selected(self) -> Style {
-        Style::default().add_modifier(Modifier::REVERSED)
-    }
-
     fn fg(colour: Option<Color>) -> Style {
         colour.map_or_else(Style::default, |colour| Style::default().fg(colour))
     }
@@ -1229,7 +1311,7 @@ pub enum Msg {
     Resize,
 }
 pub enum Effect { None, PollNow, Quit }
-pub enum KeyPress { Quit, Up, Down, Home, End, Refresh, Stop }
+pub enum KeyPress { Quit, ScrollUp, ScrollDown, ScrollTop, ScrollBottom, Refresh, Stop }
 pub enum Control { ReadOnly, Allowed }
 pub enum Link { Live, Retrying { attempt: u32 }, Lost { at_local: String } }
 pub struct App { /* ...; built by App::new(palette, control, home, now) */ }
@@ -1296,47 +1378,25 @@ mod tests {
         assert!(app.rows().iter().all(|row| row.info.id == 1));
     }
 
-    /// fails if selection is stored as an index. A snapshot replaces the whole
-    /// map two seconds at a time; an index into a re-sorted list would walk the
-    /// cursor across sheep on its own, and an operator about to press a key on
-    /// a row they did not choose is exactly the failure a control gate exists
-    /// to prevent.
+    /// fails if a snapshot that shrinks the flock leaves the viewport scrolled
+    /// past the end of it. The map is REPLACED wholesale every two seconds, so
+    /// an offset that was valid for six sheep can outlive four of them — and a
+    /// pane scrolled past its own last row draws nothing at all, which reads
+    /// as a crash rather than as a small flock.
     #[test]
-    fn selection_follows_the_sheep_not_the_row_number() {
+    fn a_snapshot_that_shrinks_the_flock_pulls_the_scroll_back() {
         let (mut app, t0) = started();
-        app.update(Msg::Key(KeyPress::Down));
-        app.update(Msg::Key(KeyPress::Down));
-        assert_eq!(app.selected_id(), Some(3));
-
-        // `web` (id 1) goes away; `worker` (id 3) is now the FIRST row.
-        app.update(Msg::Snapshot {
-            rows: vec![
-                sheep(3, "worker", ProcStatus::Online),
-                sheep(2, "api", ProcStatus::Errored),
-            ],
-            at: t0,
-        });
-        assert_eq!(app.selected_id(), Some(3), "the cursor stayed on worker");
-    }
-
-    /// fails if a snapshot that drops the selected sheep leaves the cursor
-    /// pointing at nothing. Landing on the first row is the recoverable
-    /// answer; a dangling id would make every later key a no-op with no
-    /// visible reason.
-    #[test]
-    fn deleting_the_selected_sheep_moves_the_cursor_to_the_top() {
-        let (mut app, t0) = started();
-        app.update(Msg::Key(KeyPress::End));
-        assert_eq!(app.selected_id(), Some(3));
+        app.update(Msg::Key(KeyPress::ScrollBottom));
+        assert_eq!(app.scroll(), 2);
 
         app.update(Msg::Snapshot {
             rows: vec![sheep(1, "web", ProcStatus::Online)],
             at: t0,
         });
-        assert_eq!(app.selected_id(), Some(1));
+        assert_eq!(app.scroll(), 0, "the offset came back with the flock");
 
         app.update(Msg::Snapshot { rows: vec![], at: t0 });
-        assert_eq!(app.selected_id(), None, "an empty flock selects nothing");
+        assert_eq!(app.scroll(), 0, "an empty flock scrolls nowhere");
     }
 
     /// fails if a dropped or lagged frame stops triggering an immediate poll.
@@ -1518,38 +1578,50 @@ mod tests {
         assert!(matches!(app.link(), Link::Lost { .. }));
     }
 
-    /// fails if `Up` at the top or `Down` at the bottom wraps or panics.
-    /// Clamping is the choice: wrapping a 200-sheep flock from the last row to
-    /// the first on one keypress loses the operator's place with no undo.
+    /// fails if scrolling up at the first row or down at the last one wraps or
+    /// panics. Clamping is the choice: wrapping a two-hundred-sheep flock from
+    /// the last row to the first on one keypress loses the operator's place
+    /// with nothing to undo it.
     #[test]
-    fn the_cursor_clamps_at_both_ends() {
+    fn the_scroll_offset_clamps_at_both_ends() {
         let (mut app, _) = started();
         for _ in 0..10 {
-            app.update(Msg::Key(KeyPress::Up));
+            app.update(Msg::Key(KeyPress::ScrollUp));
         }
-        assert_eq!(app.selected_id(), Some(1));
+        assert_eq!(app.scroll(), 0, "up past the first row stays on it");
         for _ in 0..10 {
-            app.update(Msg::Key(KeyPress::Down));
+            app.update(Msg::Key(KeyPress::ScrollDown));
         }
-        assert_eq!(app.selected_id(), Some(3));
-        app.update(Msg::Key(KeyPress::Home));
-        assert_eq!(app.selected_id(), Some(1));
+        assert_eq!(app.scroll(), 2, "down past the last row stays on it");
+        app.update(Msg::Key(KeyPress::ScrollTop));
+        assert_eq!(app.scroll(), 0);
+        app.update(Msg::Key(KeyPress::ScrollBottom));
+        assert_eq!(app.scroll(), 2);
     }
 
-    /// fails if `r` stops asking for a poll. It is the one key that does I/O,
-    /// and it is what an operator presses when they do not believe the screen.
+    /// fails if `r` stops asking for a poll while the link is live, or starts
+    /// pretending to ask once it is frozen. It is the one key that does I/O,
+    /// and it is what an operator presses when they do not believe the screen
+    /// — so it has to be honest in both directions. The link task ENDS at the
+    /// freeze (design decision 8), which drops its poll receiver, so an
+    /// `Effect::PollNow` after that is a `try_send` into a closed channel:
+    /// the operator presses the key and gets silence with no reason given.
     #[test]
-    fn refresh_asks_for_a_poll_even_while_frozen() {
+    fn refresh_polls_while_live_and_says_why_it_cannot_once_frozen() {
         let (mut app, _) = started();
         assert_eq!(app.update(Msg::Key(KeyPress::Refresh)), Effect::PollNow);
+
         app.update(Msg::Frozen {
             at_local: "2026-08-14 14:32:07".to_string(),
         });
         assert_eq!(
             app.update(Msg::Key(KeyPress::Refresh)),
-            Effect::PollNow,
-            "asking again after a freeze is the operator's call, not ours"
+            Effect::None,
+            "there is no link task left to ask"
         );
+        let notice = app.notice().expect("a refusal is a notice").to_string();
+        assert!(notice.contains("the shepherd is gone"));
+        assert!(notice.contains("nothing left to ask"));
     }
 
     /// fails if a notice outlives the keypress after it. A stale refusal still
@@ -1559,7 +1631,7 @@ mod tests {
         let (mut app, _) = started();
         app.update(Msg::Key(KeyPress::Stop));
         assert!(app.notice().is_some());
-        app.update(Msg::Key(KeyPress::Down));
+        app.update(Msg::Key(KeyPress::ScrollDown));
         assert!(app.notice().is_none());
     }
 }
@@ -1595,9 +1667,13 @@ Run `cargo test -p shep-cli --bins --all-features`.
 //! is lossy by construction (`tokio::sync::broadcast` drops for a lagging
 //! subscriber), so a flock view built from events alone WILL drift.
 //! [`Msg::Event`] upserts for latency; [`Msg::Snapshot`] replaces the whole map
-//! and wins every conflict. Selection is stored as an id, never an index, so a
-//! wholesale replacement two seconds apart does not walk the operator's cursor
-//! onto a different sheep.
+//! and wins every conflict. The only cursor 12a carries is a **scroll offset**
+//! — which row of the flock sits first on screen — re-clamped against the map
+//! every time it is replaced, because an offset that was valid for six sheep
+//! outlives four of them by two seconds. A *selected* row, and the reseat rule
+//! a wholesale replacement would need for it, arrive in 12b together with the
+//! detail pane that reads them; the phase plan's "What 12b gets" section
+//! records that as a decision rather than an omission.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -1637,14 +1713,14 @@ pub enum Control {
 pub enum KeyPress {
     /// `q`, `Esc`, or `Ctrl-C`.
     Quit,
-    /// `k` or `Up`.
-    Up,
-    /// `j` or `Down`.
-    Down,
-    /// `g` or `Home`.
-    Home,
-    /// `G` or `End`.
-    End,
+    /// `k` or `Up` — the viewport moves up one row.
+    ScrollUp,
+    /// `j` or `Down` — the viewport moves down one row.
+    ScrollDown,
+    /// `g` or `Home` — the top of the flock.
+    ScrollTop,
+    /// `G` or `End` — the bottom of it.
+    ScrollBottom,
     /// `r` — poll now.
     Refresh,
     /// `x` — the one action key. Refuses in both control states in 12a; see
@@ -1768,7 +1844,11 @@ impl fmt::Display for Notice {
 #[derive(Debug)]
 pub struct App {
     flock: BTreeMap<u32, Row>,
-    selected: Option<u32>,
+    /// Which row of [`Self::flock`] is first on screen. An offset, not a
+    /// selection: nothing in 12a reads "the sheep the operator is pointing
+    /// at", and the view clamps this against its own viewport height as well
+    /// ([`super::view::flock::scroll_offset`]).
+    scroll: usize,
     link: Link,
     notice: Option<Notice>,
     palette: Palette,
@@ -1791,7 +1871,7 @@ impl App {
     pub fn new(palette: Palette, control: Control, home: String, now: Instant) -> Self {
         Self {
             flock: BTreeMap::new(),
-            selected: None,
+            scroll: 0,
             link: Link::Live,
             notice: None,
             palette,
@@ -1817,7 +1897,7 @@ impl App {
                     .into_iter()
                     .map(|info| (info.id, Row { info, anchor: at }))
                     .collect();
-                self.reseat_cursor();
+                self.clamp_scroll();
                 Effect::None
             }
             Msg::Event(event) => self.on_event(event),
@@ -1865,7 +1945,7 @@ impl App {
                     let anchor = self.now;
                     self.flock.insert(info.id, Row { info, anchor });
                 }
-                self.reseat_cursor();
+                self.clamp_scroll();
                 Effect::None
             }
             // The shepherd's own outbound queue overflowed for this
@@ -1905,21 +1985,34 @@ impl App {
         self.notice = None;
         match key {
             KeyPress::Quit => Effect::Quit,
-            KeyPress::Refresh => Effect::PollNow,
-            KeyPress::Up => {
-                self.step(-1);
+            // The one key that does I/O, and it refuses honestly once the
+            // link task has ended: its poll receiver is gone by then, so an
+            // `Effect::PollNow` would be a `try_send` into a closed channel
+            // and the operator would get silence with no reason for it.
+            KeyPress::Refresh => {
+                if matches!(self.link, Link::Lost { .. }) {
+                    self.notice = Some(Notice {
+                        text: "the shepherd is gone — nothing left to ask".to_string(),
+                        grave: true,
+                    });
+                    return Effect::None;
+                }
+                Effect::PollNow
+            }
+            KeyPress::ScrollUp => {
+                self.scroll = self.scroll.saturating_sub(1);
                 Effect::None
             }
-            KeyPress::Down => {
-                self.step(1);
+            KeyPress::ScrollDown => {
+                self.scroll = (self.scroll + 1).min(self.last_row());
                 Effect::None
             }
-            KeyPress::Home => {
-                self.selected = self.flock.keys().next().copied();
+            KeyPress::ScrollTop => {
+                self.scroll = 0;
                 Effect::None
             }
-            KeyPress::End => {
-                self.selected = self.flock.keys().next_back().copied();
+            KeyPress::ScrollBottom => {
+                self.scroll = self.last_row();
                 Effect::None
             }
             KeyPress::Stop => {
@@ -1939,34 +2032,23 @@ impl App {
         }
     }
 
-    /// Moves the cursor by `delta` rows, clamped at both ends.
+    /// The index of the last row that exists, or `0` for an empty flock.
     ///
-    /// Clamped rather than wrapping: wrapping a two-hundred-sheep flock from
-    /// the last row to the first on one keypress loses the operator's place
-    /// with nothing to undo it.
-    fn step(&mut self, delta: isize) {
-        let ids: Vec<u32> = self.flock.keys().copied().collect();
-        if ids.is_empty() {
-            self.selected = None;
-            return;
-        }
-        let current = self
-            .selected
-            .and_then(|id| ids.iter().position(|&other| other == id))
-            .unwrap_or(0);
-        let next = current
-            .saturating_add_signed(delta)
-            .min(ids.len().saturating_sub(1));
-        self.selected = Some(ids[next]);
+    /// The ceiling on [`Self::scroll`]. Clamped rather than wrapping:
+    /// wrapping a two-hundred-sheep flock from the last row to the first on
+    /// one keypress loses the operator's place with nothing to undo it.
+    fn last_row(&self) -> usize {
+        self.flock.len().saturating_sub(1)
     }
 
-    /// Keeps the cursor on a sheep that still exists, after a replacement or a
-    /// delete. Falls to the first row, then to nothing.
-    fn reseat_cursor(&mut self) {
-        let still_there = self.selected.is_some_and(|id| self.flock.contains_key(&id));
-        if !still_there {
-            self.selected = self.flock.keys().next().copied();
-        }
+    /// Pulls the scroll offset back inside a flock that just got smaller.
+    ///
+    /// [`Msg::Snapshot`] replaces the map wholesale, so an offset that was
+    /// valid two seconds ago can now point past the end. A pane scrolled past
+    /// its own last row draws nothing at all, which an operator reads as a
+    /// crash rather than as a small flock.
+    fn clamp_scroll(&mut self) {
+        self.scroll = self.scroll.min(self.last_row());
     }
 
     /// The flock, in id order.
@@ -1975,10 +2057,14 @@ impl App {
         self.flock.values().collect()
     }
 
-    /// The selected sheep's id, if any.
+    /// Which row of the flock is first on screen.
+    ///
+    /// A request, not a result: the view clamps it again against its own
+    /// viewport height, because this module does not know how tall the
+    /// terminal is. See [`super::view::flock::scroll_offset`].
     #[must_use]
-    pub fn selected_id(&self) -> Option<u32> {
-        self.selected
+    pub fn scroll(&self) -> usize {
+        self.scroll
     }
 
     /// The link state, as the status bar reports it.
@@ -2081,14 +2167,30 @@ survived the snapshot. Revert.
 
 ### Step 3.5 — third MUTATION
 
-Change `selected` from `Option<u32>` semantics to an index: in `reseat_cursor`,
-replace the whole body with `self.selected = self.flock.keys().next().copied();`
-unconditionally.
+In `clamp_scroll`, replace the body with nothing (`{}`), leaving the offset
+wherever the last keypress put it.
 
-**Must go red:** `selection_follows_the_sheep_not_the_row_number` fails — the
-cursor jumped back to `api` (id 2, the lowest surviving id) on the next
-snapshot, two seconds after the operator put it on `worker`. Revert, then run
-the full task gate.
+**Must go red:** `a_snapshot_that_shrinks_the_flock_pulls_the_scroll_back`
+fails on its first assertion — the offset is still `2` against a flock of one,
+which is a pane scrolled past its own last row and therefore a pane that draws
+no rows at all. `the_scroll_offset_clamps_at_both_ends` must stay **green**: it
+covers the keypress half of the same rule, and a mutation that reddened both
+would mean the two tests are one test written twice.
+
+Revert.
+
+### Step 3.6 — fourth MUTATION
+
+In `on_key`'s `KeyPress::Refresh` arm, delete the `Link::Lost` guard so it
+returns `Effect::PollNow` unconditionally.
+
+**Must go red:** `refresh_polls_while_live_and_says_why_it_cannot_once_frozen`
+fails on its second assertion — `r` on a frozen dashboard claims to have asked
+for a poll, and the caller's `try_send` then drops it into the closed channel
+the ended link task left behind. The operator presses the one key that does I/O
+and gets nothing, with no reason on screen.
+
+Revert, then run the full task gate.
 
 ---
 
@@ -2118,8 +2220,10 @@ y = height-1           status bar: link state, control state, keys or a notice
 ```
 
 `MIN_WIDTH = 31`, `MIN_HEIGHT = 6` — the six lines above with exactly one data
-row. Below either, the whole draw is one line: `terminal too small — lookout
-needs 31x6`.
+row. Below either, the whole draw is two short lines: `too small`, then
+`need 31x6`. Short because they have to survive `set_line`'s silent truncation
+in a terminal narrower than `MIN_WIDTH`, which is the only kind of terminal
+this branch ever draws in — design decision 6.
 
 ### Step 4.1 — RED
 
@@ -2187,13 +2291,46 @@ mod tests {
         assert_eq!(fit("web", 12), "web         ");
     }
 
-    /// fails if truncation starts counting bytes. `{:<w$}` pads by CHARACTER
-    /// count, so a byte-counted width over-pads any multi-byte name — the same
-    /// bug `output::table::render_table`'s own doc records having avoided.
+    /// fails if `fit` starts counting bytes. `output::table::render_table`'s
+    /// own doc records having avoided the same bug for the same reason.
+    ///
+    /// **These assert on CONTENT, not on length**, and that is the whole
+    /// point: an earlier draft of this test only checked
+    /// `fit(..).chars().count() == width`, which is `width` in *both* branches
+    /// under either measurement — so the byte-vs-char mutation could not
+    /// redden it. The observable difference lives in the PAD branch, where a
+    /// three-character nine-byte name asks for nine columns of padding budget
+    /// it does not need and comes out short, and at the exactly-fits boundary,
+    /// where a byte count truncates a string that already fits.
     #[test]
-    fn truncation_counts_characters_not_bytes() {
-        assert_eq!(fit("日本語アプリ", 5).chars().count(), 5);
-        assert_eq!(fit("ünïcödé", 7).chars().count(), 7);
+    fn fit_counts_characters_not_bytes_when_it_pads_and_when_it_truncates() {
+        // Pad branch. `日本語` is 3 chars / 9 bytes: char-counted it gets 3
+        // trailing spaces, byte-counted it falls into the truncate branch.
+        assert_eq!(fit("日本語", 6), "日本語   ");
+        // Exactly fits. 7 chars / 11 bytes — a byte count cuts it to
+        // `ünïcöd…`.
+        assert_eq!(fit("ünïcödé", 7), "ünïcödé");
+        // Truncate branch, pinning which prefix survives.
+        assert_eq!(fit("日本語アプリ", 5), "日本語ア…");
+    }
+
+    /// fails if the viewport stops being clamped to the rows that exist. An
+    /// offset past the last row draws an empty pane, which reads as a crash
+    /// rather than as a short flock; an offset inside a flock that fits on
+    /// screen would scroll rows off the top for no reason.
+    #[test]
+    fn the_scroll_offset_never_leaves_a_gap_at_the_bottom() {
+        // Everything fits: no scrolling, whatever was asked for.
+        assert_eq!(scroll_offset(0, 10, 6), 0);
+        assert_eq!(scroll_offset(4, 10, 6), 0);
+        // Taller than the viewport: the last page is the ceiling, so the
+        // bottom row is always the flock's own last row.
+        assert_eq!(scroll_offset(0, 5, 20), 0);
+        assert_eq!(scroll_offset(7, 5, 20), 7);
+        assert_eq!(scroll_offset(19, 5, 20), 15);
+        assert_eq!(scroll_offset(usize::MAX, 5, 20), 15);
+        // Degenerate: a viewport of zero rows scrolls nowhere.
+        assert_eq!(scroll_offset(3, 0, 20), 0);
     }
 }
 ```
@@ -2220,9 +2357,18 @@ mod tests {
         crate::lookout::frames::render_text(terminal.backend().buffer())
     }
 
-    /// fails if a terminal too small to hold the pane is drawn into anyway.
-    /// Overlapping garbage in a 20-column terminal reads as a crash, and the
-    /// operator's next move is to kill the process rather than resize.
+    /// fails if a terminal too small to hold the pane is drawn into anyway,
+    /// **or if the refusal stops fitting in the terminal it is refusing
+    /// about.** Overlapping garbage in a 20-column terminal reads as a crash,
+    /// and the operator's next move is to kill the process rather than resize.
+    ///
+    /// The second half is the one that regresses silently. `Buffer::set_line`
+    /// truncates at `max_width` without complaint, and this branch exists for
+    /// terminals narrower than 31 columns — so a refusal written as one
+    /// 39-character sentence loses `31x6` off the right-hand edge at exactly
+    /// the widths that need to read it. Both assertions below are on the WHOLE
+    /// line, trimmed, rather than on `contains`, because `contains` passes on
+    /// a truncated line as happily as on a whole one.
     #[test]
     fn a_terminal_below_the_floor_says_so_instead_of_drawing() {
         let app = App::new(
@@ -2232,9 +2378,25 @@ mod tests {
             Instant::now(),
         );
         let frame = draw_to(&app, 28, 8);
-        assert!(frame.contains("terminal too small"));
-        assert!(frame.contains("31x6"));
+        let mut lines = frame.lines();
+        assert_eq!(lines.next().unwrap().trim_end(), "too small");
+        assert_eq!(lines.next().unwrap().trim_end(), "need 31x6");
         assert!(!frame.contains("STATUS"), "no header was drawn");
+
+        // Narrower still, and taller than the floor in rows: the numbers must
+        // survive here too, because a 12-column terminal is precisely the case
+        // this message exists for.
+        let cramped = draw_to(&app, 12, 8);
+        assert!(
+            cramped.lines().nth(1).unwrap().trim_end() == "need 31x6",
+            "the dimensions were cut off in the terminal that needed them"
+        );
+
+        // One row to write into: the second line has nowhere to go, and the
+        // draw must not reach past the buffer for it.
+        let single = draw_to(&app, 20, 1);
+        assert_eq!(single.lines().next().unwrap().trim_end(), "too small");
+        assert_eq!(single.lines().count(), 1);
     }
 
     /// fails if an empty flock renders as a blank pane. A bare empty screen
@@ -2351,8 +2513,6 @@ function `columns_for` in this scope``.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-
-use shep_core::status::ProcStatus;
 
 use super::super::app::{App, Row};
 use crate::output::{human_bytes, human_duration};
@@ -2564,10 +2724,12 @@ pub fn header_line(columns: &[Column], width: u16, style: Style) -> Line<'static
     Line::from(Span::styled(text, style))
 }
 
-/// One sheep's line. The STATUS cell is the only one that carries colour; a
-/// selected row is REVERSED on top of that, so selection survives `NO_COLOR`.
+/// One sheep's line. The STATUS cell is the only one that carries colour.
+///
+/// No row style beyond that: 12a has no selected row (see the phase plan's
+/// "What 12b gets"), so there is nothing here for a REVERSED modifier to mean.
 #[must_use]
-pub fn row_line(app: &App, row: &Row, columns: &[Column], width: u16, selected: bool) -> Line<'static> {
+pub fn row_line(app: &App, row: &Row, columns: &[Column], width: u16) -> Line<'static> {
     let palette = app.palette();
     let name = name_width(width, columns);
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(columns.len() * 2);
@@ -2588,11 +2750,7 @@ pub fn row_line(app: &App, row: &Row, columns: &[Column], width: u16, selected: 
         };
         spans.push(Span::styled(text, style));
     }
-    let mut line = Line::from(spans);
-    if selected {
-        line = line.style(palette.selected());
-    }
-    line
+    Line::from(spans)
 }
 
 /// One cell's text.
@@ -2622,33 +2780,25 @@ fn cell(app: &App, row: &Row, column: Column) -> String {
     }
 }
 
-/// Which slice of the flock is on screen, so the selected row is always
-/// visible.
+/// Which slice of the flock is on screen: the first row to draw, given what
+/// `App` was asked for and how many rows there is room for.
 ///
-/// Derived from the selection and the viewport every frame rather than stored:
-/// the flock map is replaced wholesale every two seconds, and a stored offset
-/// would have to be reconciled against a list that changed underneath it.
+/// `requested` is [`super::super::app::App::scroll`] — the reducer's own
+/// offset, which it clamps to the flock's length but cannot clamp to the
+/// terminal's height, because it does not know it. This is the second clamp,
+/// and it is the one that stops a scrolled pane leaving blank rows above the
+/// status bar: once the flock is taller than the viewport, the furthest down
+/// it can go is the page that ends on the last row.
 ///
-/// The rule keeps the first page still until the cursor leaves it, then scrolls
-/// one row at a time — rather than centring, which moves every row on screen
-/// on every keypress and makes a long flock unreadable while navigating.
+/// Derived every frame rather than stored: the flock map is replaced wholesale
+/// every two seconds, and a stored *result* would have to be reconciled
+/// against a list that changed underneath it.
 #[must_use]
-pub fn scroll_offset(selected_index: usize, viewport: usize, total: usize) -> usize {
+pub fn scroll_offset(requested: usize, viewport: usize, total: usize) -> usize {
     if viewport == 0 || total <= viewport {
         return 0;
     }
-    if selected_index < viewport {
-        0
-    } else {
-        (selected_index + 1 - viewport).min(total - viewport)
-    }
-}
-
-/// Whether a status is one whose uptime is still running. Not used by the view
-/// directly — kept beside the column it explains, for the next reader.
-#[must_use]
-pub const fn is_running(status: ProcStatus) -> bool {
-    matches!(status, ProcStatus::Online | ProcStatus::Starting)
+    requested.min(total - viewport)
 }
 ```
 
@@ -2720,7 +2870,7 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
             },
         ),
         None => (
-            "q quit   j/k select   g/G top/bottom   r refresh   x stop".to_string(),
+            "q quit   j/k scroll   g/G top/bottom   r refresh   x stop".to_string(),
             palette.muted(),
         ),
     };
@@ -2782,11 +2932,20 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
     let palette = app.palette();
 
     if width < MIN_WIDTH || height < MIN_HEIGHT {
-        if width > 0 && height > 0 {
-            let line = Line::from(Span::raw(format!(
-                "terminal too small — lookout needs {MIN_WIDTH}x{MIN_HEIGHT}"
-            )));
-            frame.buffer_mut().set_line(area.x, area.y, &line, width);
+        // Two nine-character lines, not one 39-character sentence.
+        // `Buffer::set_line` truncates at `max_width` in silence, and this
+        // branch exists for terminals narrower than `MIN_WIDTH` — so a refusal
+        // that does not fit inside `MIN_WIDTH` loses its own numbers at
+        // exactly the widths that need them. Nine columns is the floor at
+        // which both lines are still whole, and below that nothing helps.
+        if width == 0 || height == 0 {
+            return;
+        }
+        let first = Line::from(Span::raw("too small"));
+        frame.buffer_mut().set_line(area.x, area.y, &first, width);
+        if height >= 2 {
+            let second = Line::from(Span::raw(format!("need {MIN_WIDTH}x{MIN_HEIGHT}")));
+            frame.buffer_mut().set_line(area.x, area.y + 1, &second, width);
         }
         return;
     }
@@ -2815,14 +2974,9 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
         let line = Line::from(Span::styled("the flock is empty", palette.muted()));
         buffer.set_line(area.x, y, &line, width);
     } else {
-        let selected_index = app
-            .selected_id()
-            .and_then(|id| rows.iter().position(|row| row.info.id == id))
-            .unwrap_or(0);
-        let offset = flock::scroll_offset(selected_index, viewport, rows.len());
+        let offset = flock::scroll_offset(app.scroll(), viewport, rows.len());
         for (slot, row) in rows.iter().skip(offset).take(viewport).enumerate() {
-            let selected = Some(row.info.id) == app.selected_id();
-            let line = flock::row_line(app, row, columns, width, selected);
+            let line = flock::row_line(app, row, columns, width);
             let slot = u16::try_from(slot).unwrap_or(0);
             buffer.set_line(area.x, y + slot, &line, width);
         }
@@ -2834,7 +2988,7 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
 
 `crates/shep-cli/src/lookout/mod.rs` grows `pub mod view;`.
 
-Run `cargo test -p shep-cli --bins --all-features`. Expect green, **+9**.
+Run `cargo test -p shep-cli --bins --all-features`. Expect green, **+10**.
 
 > `view/mod.rs`'s tests call `crate::lookout::frames::render_text`, which Task 5
 > creates. Land Task 5's `frames.rs` first, or stub `render_text` here and let
@@ -2861,11 +3015,28 @@ Revert.
 
 In `fit`, replace `text.chars().count()` with `text.len()`.
 
-**Must go red:** `truncation_counts_characters_not_bytes` fails — `日本語アプリ`
-is 18 bytes, so the function truncates it to 4 characters plus an ellipsis
-instead of 5 characters. `a_name_too_long_for_its_column_ends_in_an_ellipsis`
-stays green, because every name in it is ASCII. Revert, then run the full task
-gate.
+**Must go red:** `fit_counts_characters_not_bytes_when_it_pads_and_when_it_truncates`
+fails on its FIRST assertion — `日本語` measures 9 bytes against a width of 6,
+so it takes the truncate branch instead of the pad branch and comes out
+`日本語…` where the column wanted `日本語   `. The second assertion fails too,
+for the same reason at the exactly-fits boundary.
+`a_name_too_long_for_its_column_ends_in_an_ellipsis` stays green, because every
+name in it is ASCII — which is exactly why it could never have caught this on
+its own.
+
+### Step 4.7 — third MUTATION
+
+In `draw`'s too-small branch, replace the two short lines with the single
+sentence `terminal too small — lookout needs {MIN_WIDTH}x{MIN_HEIGHT}` written
+with one `set_line`.
+
+**Must go red:** `a_terminal_below_the_floor_says_so_instead_of_drawing` fails
+on its first `assert_eq!` — at 28 columns the line reads
+`terminal too small — lookout`, and `31x6` sat at columns 35-38 and was
+truncated away by `set_line`. This is the mutation that pins the property the
+message exists for: not "a refusal is printed" but "a refusal that fits".
+
+Revert, then run the full task gate.
 
 ---
 
@@ -2881,7 +3052,20 @@ Phase 12b's layout is decided.
 - `docs/lookout/frames.txt`, `docs/lookout/frames.ansi`, `docs/lookout/README.md`
 
 **Files modified:**
-- `crates/shep-cli/src/lookout/mod.rs` — `pub mod frames;`
+- `crates/shep-cli/src/lookout/mod.rs` — `#[cfg(test)] pub mod frames;`
+
+**`#[cfg(test)]`, not a plain `pub mod`.** `shep-cli` is `[[bin]]`-only, so
+`pub` exempts nothing from `dead_code`: in a binary crate the only reachability
+root is `main`, which is why `output::Streams::out`, `ExitCode::Success`,
+`output::table::render_table` and half a dozen other `pub` items in this crate
+already carry `#[cfg_attr(windows, allow(dead_code))]` or a bare
+`#[allow(dead_code)]` with a comment saying "not called outside this module's
+own tests yet". Every item in `frames.rs` is in exactly that position —
+`render_text`, `render_ansi`, `Scene`, `Scene::ALL`, `label`, `caption`, `size`,
+`scene` and the gallery writer have no non-test caller at all — so under
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` the
+plain form fails the task gate on eight `dead_code` warnings. `view`'s tests and
+the gallery writer are both `cfg(test)`, so gating the module loses nothing.
 
 ### Step 5.1 — baseline
 
@@ -2902,7 +3086,7 @@ in the ordinary suite, and regenerating the gallery is the same command.
 | `healthy_wide` | 120x20 | a healthy flock at a comfortable width — all nine columns |
 | `errored` | 120x20 | one sheep `errored`, one `waiting-restart`, one `stopped` — the colour rule |
 | `empty` | 100x12 | an empty flock: header row, and a sentence saying it is empty |
-| `narrow` | 46x14 | what degrades, and how — four columns dropped |
+| `narrow` | 49x14 | what degrades, and how — FOLD, RESTARTS, PID and MEM dropped; CPU and UPTIME survive |
 | `too_narrow` | 28x8 | below the floor: the one-line refusal |
 | `retrying` | 120x20 | the reconnect banner, mid-ladder |
 | `frozen` | 120x20 | **the shepherd has died** — last values, frozen clock |
@@ -2958,27 +3142,53 @@ mod tests {
     #[test]
     fn every_scene_shows_the_thing_it_is_named_for() {
         assert!(render_text(&scene(Scene::Empty).1).contains("the flock is empty"));
-        assert!(render_text(&scene(Scene::TooNarrow).1).contains("terminal too small"));
+        assert!(render_text(&scene(Scene::TooNarrow).1).contains("need 31x6"));
         assert!(render_text(&scene(Scene::Frozen).1).contains("the shepherd has died"));
         assert!(render_text(&scene(Scene::Retrying).1).contains("reconnecting"));
         assert!(render_text(&scene(Scene::Refused).1).contains("--allow-control"));
         assert!(render_text(&scene(Scene::Errored).1).contains("errored"));
-        assert!(render_text(&scene(Scene::Narrow).1).contains("STATUS"));
-        assert!(
-            !render_text(&scene(Scene::Narrow).1).contains("FOLD"),
-            "the narrow tier dropped it"
-        );
         assert!(render_text(&scene(Scene::HealthyWide).1).contains("FOLD"));
+
+        // The narrow scene's caption in the gallery makes four specific
+        // claims about which columns survive at this width. Each is asserted
+        // here, so a scene rendered at a width that contradicts its own
+        // caption reddens the suite rather than shipping to Rin — `STATUS`
+        // alone would not, since STATUS is in the floor tier and present at
+        // every width the pane draws at.
+        let narrow = render_text(&scene(Scene::Narrow).1);
+        assert!(narrow.contains("CPU"), "CPU survives the narrow tier");
+        assert!(narrow.contains("UPTIME"), "and so does UPTIME");
+        for gone in ["FOLD", "RESTARTS", "PID", "MEM"] {
+            assert!(!narrow.contains(gone), "the narrow tier dropped {gone}");
+        }
     }
 
-    /// fails if a frozen scene's uptime is the same as the live one's. The
-    /// frozen frame has to look like a frame whose clock stopped — that is
-    /// what Rin is being asked to look at.
+    /// fails if a frozen frame keeps counting. This is the one thing the
+    /// frozen scene exists to show Rin, and it is the property design
+    /// decision 8 is about.
+    ///
+    /// **Rendered twice at two different clock ages and compared**, rather
+    /// than compared against the healthy scene: those two frames differ by a
+    /// banner line, five statuses and a row shift, so an `assert_ne!` between
+    /// them holds whether or not the clock stopped and cannot detect the
+    /// regression its name claims. The live pair at the bottom is what keeps
+    /// the frozen pair honest — without it, a `render_text` that emitted no
+    /// UPTIME column at all would satisfy the first assertion perfectly.
     #[test]
-    fn the_frozen_scene_and_the_healthy_scene_disagree_about_uptime() {
-        let live = render_text(&scene(Scene::HealthyWide).1);
-        let frozen = render_text(&scene(Scene::Frozen).1);
-        assert_ne!(live, frozen);
+    fn the_frozen_frame_does_not_move_however_long_the_link_stays_gone() {
+        let ten_minutes = render_text(&scene_with(Scene::Frozen, Duration::from_secs(600)));
+        let sixteen_hours = render_text(&scene_with(Scene::Frozen, Duration::from_secs(60_000)));
+        assert_eq!(
+            ten_minutes, sixteen_hours,
+            "the frozen frame's uptime column advanced after the link was lost"
+        );
+
+        let live_ten = render_text(&scene_with(Scene::HealthyWide, Duration::from_secs(600)));
+        let live_sixteen = render_text(&scene_with(Scene::HealthyWide, Duration::from_secs(60_000)));
+        assert_ne!(
+            live_ten, live_sixteen,
+            "a LIVE frame's uptime column must advance, or the assertion above passes for the wrong reason"
+        );
     }
 
     /// The frame pins. NOT wire fixtures: re-accepting these after a
@@ -3032,7 +3242,7 @@ use std::time::{Duration, Instant};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
-use ratatui::style::{Color, Modifier};
+use ratatui::style::Color;
 
 use shep_core::protocol::ProcessInfo;
 use shep_core::status::ProcStatus;
@@ -3077,7 +3287,7 @@ pub fn render_ansi(buffer: &Buffer) -> String {
             let Some(cell) = buffer.cell((x, y)) else {
                 continue;
             };
-            let wanted = sgr(cell.fg, cell.modifier);
+            let wanted = sgr(cell.fg);
             if wanted != current {
                 out.push_str("\u{1b}[0m");
                 out.push_str(&wanted);
@@ -3091,19 +3301,14 @@ pub fn render_ansi(buffer: &Buffer) -> String {
     out
 }
 
-/// The SGR sequence for one cell's foreground and modifiers.
+/// The SGR sequence for one cell's foreground.
 ///
-/// Only the three things this dashboard actually sets: an indexed or named
-/// foreground, `REVERSED` (the selected row), and `BOLD`. Anything else a
-/// future pane sets renders uncoloured rather than as a wrong colour.
-fn sgr(fg: Color, modifier: Modifier) -> String {
+/// Foreground only, because a foreground is the only thing 12a's palette sets
+/// — there is no selected row and nothing is bold. A modifier a 12b pane
+/// introduces renders unstyled here rather than as a wrong style, and this
+/// function grows a case for it then.
+fn sgr(fg: Color) -> String {
     let mut out = String::new();
-    if modifier.contains(Modifier::REVERSED) {
-        out.push_str("\u{1b}[7m");
-    }
-    if modifier.contains(Modifier::BOLD) {
-        out.push_str("\u{1b}[1m");
-    }
     match fg {
         Color::Reset => {}
         Color::Indexed(index) => {
@@ -3175,8 +3380,8 @@ impl Scene {
             Self::HealthyWide => "A healthy flock at 120 columns: all nine columns fit.",
             Self::Errored => "One errored, one waiting to restart, one stopped. Colour is on the STATUS word and nowhere else.",
             Self::Empty => "No sheep registered. The header row still prints, and a sentence says why the pane is empty.",
-            Self::Narrow => "46 columns: FOLD, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY.",
-            Self::TooNarrow => "28 columns: below the floor, the pane refuses rather than drawing overlapping garbage.",
+            Self::Narrow => "49 columns: FOLD, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY.",
+            Self::TooNarrow => "28 columns: below the floor, the pane refuses rather than drawing overlapping garbage. The refusal is two short lines so it still fits.",
             Self::Retrying => "The shepherd stopped answering. Five attempts over about eight seconds before this becomes the next frame.",
             Self::Frozen => "The ladder ran out. Last known values stay; the uptime clock has stopped; lookout does not exit.",
             Self::Refused => "`x` with actions gated off. Both refusals are literal — nothing about damage gets charming.",
@@ -3188,7 +3393,12 @@ impl Scene {
     pub const fn size(self) -> (u16, u16) {
         match self {
             Self::Empty => (100, 12),
-            Self::Narrow => (46, 14),
+            // 49, not 46. `columns_for` picks the first tier whose threshold
+            // is <= the width, and 46 lands on the `41` tier — which has
+            // already dropped CPU, so a scene rendered there would contradict
+            // its own caption in the gallery Rin reads. 49 is the `NO_MEM`
+            // tier: four columns gone, CPU and UPTIME still there.
+            Self::Narrow => (49, 14),
             Self::TooNarrow => (28, 8),
             _ => (120, 20),
         }
@@ -3197,13 +3407,29 @@ impl Scene {
 
 /// Builds one scene and returns its label with the buffer it drew into.
 ///
+/// Ten minutes of dashboard age: long enough that a frozen frame whose clock
+/// had kept running would be obvious in the gallery at a glance, and it is
+/// what both the pinned snapshots and `docs/lookout/frames.txt` render at.
+#[must_use]
+pub fn scene(which: Scene) -> (&'static str, Buffer) {
+    (which.label(), scene_with(which, Duration::from_secs(600)))
+}
+
+/// One scene, `age` after its opening snapshot.
+///
+/// The parameter exists for one test:
+/// `the_frozen_frame_does_not_move_however_long_the_link_stays_gone` renders
+/// the frozen scene at two ages and asserts the two frames are identical,
+/// which is the only shape in which "the clock stopped" is a falsifiable
+/// claim about a whole frame.
+///
 /// Deterministic by construction: the palette is forced to the 256-colour set
 /// regardless of this machine's `TERM`, the clock is an explicit `Instant`
 /// advanced by exact `Duration`s, and the frozen timestamp is a literal. A
 /// scene that read the environment or the wall clock would produce a different
 /// gallery on every machine and a snapshot that could never be pinned.
 #[must_use]
-pub fn scene(which: Scene) -> (&'static str, Buffer) {
+fn scene_with(which: Scene, age: Duration) -> Buffer {
     use std::ffi::OsStr;
 
     let palette = Palette::detect(None, Some(OsStr::new("xterm-256color")), None);
@@ -3247,23 +3473,24 @@ pub fn scene(which: Scene) -> (&'static str, Buffer) {
             app.update(Msg::Frozen {
                 at_local: "2026-08-14 14:32:07".to_string(),
             });
-            // Advance well past the freeze. Nothing on screen may move: this
-            // is the frame that proves the clock stopped with the link.
-            app.update(Msg::Tick {
-                now: t0 + Duration::from_secs(600),
-            });
         }
         Scene::Refused => {
-            app.update(Msg::Key(KeyPress::Down));
             app.update(Msg::Key(KeyPress::Stop));
         }
         _ => {}
     }
 
+    // The last tick, `age` after the opening snapshot. For every live scene
+    // this is what advances the UPTIME column; for the frozen one it must
+    // change nothing at all, because the reducer stopped accepting `now` when
+    // the link was lost. That asymmetry is the whole of design decision 8, and
+    // rendering the same scene at two ages is how it becomes testable.
+    app.update(Msg::Tick { now: t0 + age });
+
     let (width, height) = which.size();
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| draw(&app, frame)).unwrap();
-    (which.label(), terminal.backend().buffer().clone())
+    terminal.backend().buffer().clone()
 }
 
 /// One row's worth of shepherd reply, spelled out so each scene reads as a
@@ -3305,7 +3532,8 @@ find crates/shep-cli/src/lookout/snapshots -name '*.snap' | wc -l    # 8
 ### Step 5.4 — GREEN: the gallery writer
 
 Append to `frames.rs` (outside the test module, so the constant is documented
-like any other item):
+like any other item — the module itself is already `#[cfg(test)]`, so no
+per-item gate is needed):
 
 ```rust
 /// The header both gallery files open with.
@@ -3313,7 +3541,6 @@ like any other item):
 /// Not a doc comment on the test: this text is read by a person opening
 /// `docs/lookout/frames.txt` with no context at all, and it is the only place
 /// that says where those frames came from.
-#[cfg(test)]
 const GALLERY_PREAMBLE: &str = "shep lookout — Phase 12a frames
 ================================
 
@@ -3412,13 +3639,17 @@ Write it with this content — it is what a reader lands on:
 - what `shep lookout` is, and that 12a built the shell plus one pane
 - how to read `frames.txt` / `frames.ansi`, and the one command that
   regenerates both
-- **What 12a settled:** the retry-then-freeze rule and its numbers; the control
-  gate and the sentence that it is a fat-finger catch and not a security
-  boundary; the rule that colour is always redundant with text; the fixed
-  column-drop order
+- **What 12a settled:** the retry-then-freeze rule and its numbers, and that a
+  shepherd which was never running is refused like every other verb rather than
+  frozen about; the control gate and the sentence that it is a fat-finger catch
+  and not a security boundary; the rule that colour is always redundant with
+  text; the fixed column-drop order; and that the keyboard scrolls the viewport
+  but does not select a row — there is no cursor until the pane that reads one
+  exists
 - **What is still open for 12b:** where the other three panes sit and which are
-  focusable; which actions the gate lets through and what confirms them;
-  whether filter takes the CLI selector grammar or plain substring
+  focusable; whether the flock table grows a selected row and what marks it;
+  which actions the gate lets through and what confirms them; whether filter
+  takes the CLI selector grammar or plain substring
 
 ### Step 5.6 — MUTATION
 
@@ -3433,13 +3664,27 @@ end of a line bleeds it into everything below it in the file. Revert.
 
 ### Step 5.7 — second MUTATION
 
-In `Scene::size`, change `Self::Narrow` from `(46, 14)` to `(120, 14)`.
+In `Scene::size`, change `Self::Narrow` from `(49, 14)` to `(120, 14)`.
 
 **Must go red:** `every_scene_shows_the_thing_it_is_named_for` fails on the
-`!contains("FOLD")` assertion — the "narrow" scene is now wide and shows every
-column, so the gallery frame Rin was promised would show nothing about
+first `!contains(gone)` iteration — the "narrow" scene is now wide and shows
+every column, so the gallery frame Rin was promised would show nothing about
 degradation. `frames_are_pinned` reddens too, which is correct rather than
 duplicative: the snapshot *is* the frame, and this mutation changes the frame.
+
+Revert.
+
+### Step 5.8 — third MUTATION
+
+In `Scene::size`, change `Self::Narrow` from `(49, 14)` to `(46, 14)` — the
+width an earlier draft of this plan specified.
+
+**Must go red:** the same `!contains(gone)` loop passes, but
+`assert!(narrow.contains("CPU"))` fails: `columns_for(46)` picks the first tier
+whose threshold is `<= 46`, which is the `41` tier, and CPU is already gone
+there. Five columns dropped, not four. The point of this mutation is that the
+old width was not a rendering bug — it produced a perfectly good frame with a
+caption underneath it, in the gallery Rin reads, describing a different frame.
 
 Revert, then run the full task gate.
 
@@ -3476,6 +3721,39 @@ back both halves together, and it talks to the UI over two channels: `Msg`s out,
 poll requests in. The UI loop then selects over terminal input, that `Msg`
 channel, a heartbeat and the redraw gate — none of which borrow each other.
 
+### Where the first listing happens, decided once
+
+**`run_connected` opens with a `reconcile`, and every count in its tests is
+written against that.** This is stated here because the alternative is
+defensible and the two are indistinguishable at a glance: bark's `run_loop`
+(`crates/shep-cli/src/dog/bark/mod.rs:183`) starts straight at its `select!`
+with no opening listing, these tests were first drafted from it, and every
+count-based assertion in them was therefore off by one against the
+implementation on the same page — including the one that pins the drop repair,
+which passed under the mutation that was supposed to redden it.
+
+The opening `reconcile` stays, and it belongs to the *connection* rather than
+to the ladder, because a reconnect needs the same first listing a cold start
+does and there is exactly one place to put it that gets both. So: **every
+connection begins with one listing, and the poll counters below count it.**
+A test asserting "one poll" against this loop is asserting the opening listing
+happened and nothing else did.
+
+### Where the FIRST connection is opened, decided once
+
+`run_link` does not dial the first connection: it is **handed** one, already
+open, and only dials again after that one ends. The opening dial is
+`lookout::lookout`'s, before raw mode, so a shepherd that was never running
+produces the ordinary `daemon_unreachable` refusal every other client verb
+produces rather than eight seconds of alternate-screen theatre ending in
+`ExitCode::Success` — design decision 1's second half. It also removes the
+`opened_once` flag an earlier draft carried, and the bug in it: `opened_once`
+was set only by a *successful* dial, so "first dial fails, second succeeds"
+never announced [`Msg::Relinked`] and left a fully live dashboard showing
+`reconnecting (attempt 1)` forever. The condition below is `attempt > 0` —
+gated on whether a `Retrying` was **announced**, which is the thing the banner
+is showing.
+
 ### Step 6.1 — RED
 
 `crates/shep-cli/src/lookout/link.rs`, test module only:
@@ -3490,6 +3768,9 @@ mod tests {
     use shep_core::protocol::{ProcessEventKind, ProcessInfo};
     use shep_core::status::ProcStatus;
     use tokio::sync::broadcast;
+
+    // Named only from here: `run_link`'s own error arm never spells the type.
+    use crate::lookout::source::LinkError;
 
     fn sheep(id: u32) -> ProcessInfo {
         ProcessInfo::builder(id, format!("sheep-{id}"), ProcStatus::Online).build()
@@ -3534,7 +3815,7 @@ mod tests {
     ///
     /// IR-46: the wait on the message channel is bounded — a link task that
     /// never polls would otherwise hang this test rather than fail it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_lagging_subscriber_polls_immediately_instead_of_waiting() {
         let (tx, rx) = broadcast::channel(2);
         let polls = Arc::new(AtomicU64::new(0));
@@ -3559,37 +3840,44 @@ mod tests {
             BroadcastEvents(rx),
             msg_tx,
             poll_rx,
-            // A poll period far longer than this test, so ANY poll observed
-            // here is attributable to the lag and to nothing else.
+            // A poll period far longer than this test, so ANY poll beyond the
+            // opening listing is attributable to the lag and to nothing else.
             Duration::from_secs(3600),
         ));
 
+        // The repair is what this test is about, so it waits for the SNAPSHOT
+        // the repair produces rather than for the `BusLagged` notice that
+        // precedes it: `run_connected` forwards the notice first and polls
+        // second, so a test that stopped at the notice would read the counter
+        // in a race with the poll it is counting.
         let mut saw_lagged = false;
+        let mut repaired = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout_at(deadline, msg_rx.recv()).await {
-                Ok(Some(Msg::BusLagged { .. })) => saw_lagged = true,
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
-            }
-            if saw_lagged && polls.load(Ordering::SeqCst) > 0 {
+        while !(saw_lagged && repaired) {
+            let Ok(Some(msg)) = tokio::time::timeout_at(deadline, msg_rx.recv()).await else {
                 break;
+            };
+            match msg {
+                Msg::BusLagged { .. } => saw_lagged = true,
+                Msg::Snapshot { .. } if saw_lagged => repaired = true,
+                _ => {}
             }
         }
         task.abort();
 
         assert!(saw_lagged, "the lag reached the reducer");
+        assert!(repaired, "the lag was repaired by a listing rather than left to the interval");
         assert_eq!(
             polls.load(Ordering::SeqCst),
-            1,
-            "the lag caused exactly one repair poll, and the interval caused none"
+            2,
+            "the opening listing, plus exactly one repair for the lag; the one-hour interval caused none"
         );
     }
 
     /// fails if a shepherd-side drop stops triggering a repair. `Dropped` is a
     /// real, named `BusEvent` this binary understands — it must NOT fall into
     /// the catch-all arm for variants a newer shepherd added.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_shepherd_side_drop_polls_and_is_forwarded() {
         let (tx, rx) = broadcast::channel(16);
         let polls = Arc::new(AtomicU64::new(0));
@@ -3607,16 +3895,33 @@ mod tests {
             Duration::from_secs(3600),
         ));
 
-        let forwarded = tokio::time::timeout(Duration::from_secs(5), msg_rx.recv())
-            .await
-            .expect("the drop reached the reducer within five seconds");
+        // The FIRST message on this channel is the opening listing's snapshot,
+        // not the drop — every connection begins with one listing. Scanning
+        // for the drop rather than asserting on message one is the difference
+        // between testing this loop and testing bark's, which has no opening
+        // listing and is where these fixtures came from.
+        let mut forwarded = false;
+        let mut repaired = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !(forwarded && repaired) {
+            let Ok(Some(msg)) = tokio::time::timeout_at(deadline, msg_rx.recv()).await else {
+                break;
+            };
+            match msg {
+                Msg::Event(BusEvent::Dropped { count: 9 }) => forwarded = true,
+                Msg::Snapshot { .. } if forwarded => repaired = true,
+                _ => {}
+            }
+        }
         task.abort();
 
-        assert!(matches!(
-            forwarded,
-            Some(Msg::Event(BusEvent::Dropped { count: 9 }))
-        ));
-        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert!(forwarded, "the drop reached the reducer");
+        assert!(repaired, "and it triggered a repair listing");
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            2,
+            "the opening listing, plus one repair for the drop"
+        );
     }
 
     /// fails if the ladder stops being bounded, or stops ending in a freeze.
@@ -3646,10 +3951,25 @@ mod tests {
         let (msg_tx, mut msg_rx) = mpsc::channel(64);
         let (_poll_tx, poll_rx) = mpsc::channel(1);
 
+        // `run_link` is HANDED its first connection rather than dialling for
+        // it — the opening dial is `lookout::lookout`'s, before raw mode, so
+        // that a shepherd which was never there refuses like every other verb
+        // instead of freezing a dashboard about it. This opening connection
+        // ends at once: its sender is dropped, so the subscription closes on
+        // the first read and the ladder takes over.
+        let (opening_tx, opening_rx) = broadcast::channel(1);
+        drop(opening_tx);
+
         let task = tokio::spawn(run_link(
             NeverConnects {
                 attempts: Arc::clone(&attempts),
             },
+            (
+                CountingFlock {
+                    polls: Arc::new(AtomicU64::new(0)),
+                },
+                BroadcastEvents(opening_rx),
+            ),
             msg_tx,
             poll_rx,
             Duration::from_secs(2),
@@ -3668,7 +3988,10 @@ mod tests {
         .await;
         assert!(done.is_ok(), "the ladder gave up rather than retrying forever");
 
-        // 1 opening attempt + RECONNECT_ATTEMPTS re-dials.
+        // One immediate re-dial the moment the connection ended, then
+        // RECONNECT_ATTEMPTS more behind the 250/500/1000/2000/4000 ms waits.
+        // Only the delayed ones announce a `Retrying`, which is why the two
+        // counts below differ by exactly one.
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             u64::from(RECONNECT_ATTEMPTS) + 1
@@ -3692,10 +4015,21 @@ mod tests {
     /// leave the dashboard live-looking and permanently stale — worse than the
     /// freeze, because nothing says so.
     #[tokio::test(start_paused = true)]
-    async fn a_successful_relink_reports_live_and_polls_again() {
+    async fn a_successful_relink_reports_live_on_the_first_success() {
         struct FailsOnce {
             done: bool,
             polls: Arc<AtomicU64>,
+            /// Holds the reconnected subscription's SENDER open.
+            ///
+            /// Not decoration. An earlier version of this fixture built the
+            /// channel with `let (_tx, rx)` and dropped the sender on the
+            /// spot, so the "successful" relink handed back a stream that
+            /// ended on its first read; the ladder went round a second time,
+            /// and the `Relinked` this test observed came from that second
+            /// cycle. It passed while the first relink announced nothing at
+            /// all — which was the actual bug, and the one this test claims
+            /// to be about.
+            keepalive: Option<broadcast::Sender<BusEvent>>,
         }
 
         impl Shepherd for FailsOnce {
@@ -3704,7 +4038,8 @@ mod tests {
 
             async fn link(&mut self) -> Result<(Self::Flock, Self::Events), LinkError> {
                 if self.done {
-                    let (_tx, rx) = broadcast::channel(16);
+                    let (tx, rx) = broadcast::channel(16);
+                    self.keepalive = Some(tx);
                     return Ok((
                         CountingFlock {
                             polls: Arc::clone(&self.polls),
@@ -3720,34 +4055,55 @@ mod tests {
         let polls = Arc::new(AtomicU64::new(0));
         let (msg_tx, mut msg_rx) = mpsc::channel(64);
         let (_poll_tx, poll_rx) = mpsc::channel(1);
+
+        // The opening connection ends immediately, with its own counter, so
+        // `polls` below counts only what the RECONNECTED one listed.
+        let (opening_tx, opening_rx) = broadcast::channel(1);
+        drop(opening_tx);
+
         let task = tokio::spawn(run_link(
             FailsOnce {
                 done: false,
                 polls: Arc::clone(&polls),
+                keepalive: None,
             },
+            (
+                CountingFlock {
+                    polls: Arc::new(AtomicU64::new(0)),
+                },
+                BroadcastEvents(opening_rx),
+            ),
             msg_tx,
             poll_rx,
             Duration::from_secs(2),
         ));
 
+        let mut retried = false;
         let mut relinked = false;
+        let mut listed_after_relink = false;
         let _ = tokio::time::timeout(Duration::from_secs(30), async {
             while let Some(msg) = msg_rx.recv().await {
-                if matches!(msg, Msg::Relinked) {
-                    relinked = true;
-                }
-                if matches!(msg, Msg::Snapshot { .. }) && relinked {
-                    break;
+                match msg {
+                    Msg::Retrying { attempt: 1 } => retried = true,
+                    Msg::Relinked => relinked = true,
+                    Msg::Snapshot { .. } if relinked => {
+                        listed_after_relink = true;
+                        break;
+                    }
+                    _ => {}
                 }
             }
         })
         .await;
         task.abort();
 
-        assert!(relinked, "the reconnect was reported");
-        assert!(
-            polls.load(Ordering::SeqCst) >= 1,
-            "the fresh connection listed the flock"
+        assert!(retried, "the failed dial put the banner up");
+        assert!(relinked, "and the FIRST successful re-dial took it down again");
+        assert!(listed_after_relink, "the fresh connection re-listed the flock");
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "exactly the reconnected connection's opening listing"
         );
     }
 
@@ -3773,9 +4129,17 @@ mod tests {
         ));
 
         tokio::time::sleep(Duration::from_millis(1900)).await;
-        assert_eq!(polls.load(Ordering::SeqCst), 0, "nothing at t=0");
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "the opening listing, and NOTHING from the timer before its period elapsed"
+        );
         tokio::time::sleep(Duration::from_millis(2200)).await;
-        assert_eq!(polls.load(Ordering::SeqCst), 2, "t=2s and t=4s");
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            3,
+            "the opening listing, plus t=2s and t=4s"
+        );
         drop(tx);
         task.abort();
     }
@@ -3818,6 +4182,8 @@ use std::path::{Path, PathBuf};
 
 use shep_client::{Client, ConnectError, EventStream, Lagged, RequestError};
 use shep_core::protocol::{BusEvent, ProcessInfo, Request, Response};
+
+use crate::exit::ExitCode;
 
 /// The topics lookout subscribes to.
 ///
@@ -3883,14 +4249,42 @@ pub trait Shepherd: Send {
 pub enum LinkError {
     /// Nothing answered at the socket, or the handshake did not complete.
     Unreachable(String),
+    /// The shepherd answered and speaks a different wire version.
+    ///
+    /// Held apart from [`Self::Unreachable`] for one reason: it is the single
+    /// connect failure with its own exit code, and `main.rs`'s
+    /// `connect_client` — the path every other client verb takes — already
+    /// makes that distinction. A lookout that reported a version skew as
+    /// "the shepherd did not answer" would send the operator to check whether
+    /// the daemon is running, which it is.
+    Protocol(String),
     /// The shepherd answered but refused the subscription.
     Refused(String),
+}
+
+impl LinkError {
+    /// The exit code this reports when it happens on the FIRST dial, before
+    /// the dashboard exists.
+    ///
+    /// Only the first dial reaches this: once a link has been established, a
+    /// failure is a rung on [`super::link::run_link`]'s ladder and never an
+    /// exit. Derived from `ExitCode::from(&ConnectError)` at conversion time
+    /// rather than re-decided here, so this and every other verb's mapping
+    /// cannot drift apart.
+    #[must_use]
+    pub fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::Protocol(_) => ExitCode::ProtocolMismatch,
+            Self::Unreachable(_) | Self::Refused(_) => ExitCode::DaemonUnreachable,
+        }
+    }
 }
 
 impl fmt::Display for LinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unreachable(why) => write!(f, "the shepherd did not answer: {why}"),
+            Self::Protocol(why) => write!(f, "{why}"),
             Self::Refused(why) => write!(f, "the shepherd refused the subscription: {why}"),
         }
     }
@@ -3900,6 +4294,11 @@ impl core::error::Error for LinkError {}
 
 impl From<ConnectError> for LinkError {
     fn from(err: ConnectError) -> Self {
+        // `ExitCode::from(&ConnectError)` is the existing taxonomy — reused
+        // rather than re-derived, so the two cannot skew.
+        if ExitCode::from(&err) == ExitCode::ProtocolMismatch {
+            return Self::Protocol(err.to_string());
+        }
         Self::Unreachable(err.to_string())
     }
 }
@@ -3990,6 +4389,7 @@ impl Shepherd for UnixShepherd {
 //! ENDS — no more polls, no more dials, no more subscriptions. The UI loop
 //! keeps running with the last values on screen until the operator quits.
 
+use core::fmt;
 use std::time::Duration;
 
 use shep_client::{Lagged, RequestError};
@@ -3998,7 +4398,9 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 use super::app::Msg;
-use super::source::{EventSource, FlockSource, LinkError, Shepherd};
+// `LinkError` is deliberately NOT imported: the error arm below never names
+// the type, and an unused import fails `-D warnings`. The tests import it.
+use super::source::{EventSource, FlockSource, Shepherd};
 
 /// How often the flock is re-listed when nothing has gone wrong.
 ///
@@ -4032,65 +4434,109 @@ pub const RECONNECT_FIRST_WAIT: Duration = Duration::from_millis(250);
 /// The ceiling on the doubling.
 pub const RECONNECT_MAX_WAIT: Duration = Duration::from_secs(4);
 
-/// Runs the connection until it freezes.
+/// The dashboard stopped listening: its [`Msg`] channel is closed.
+///
+/// The only condition [`run_connected`] reports that is not a reconnect —
+/// every other failure it can meet is a rung on the ladder. A named type
+/// rather than `()` for two reasons, one of them a gate: an exported
+/// `Result<_, ()>` trips `clippy::result_unit_err`, which
+/// `cargo clippy -- -D warnings` turns into a task-gate failure. The other is
+/// that "the UI is gone" reads at a call site where `Err(())` does not.
+///
+/// No `#[non_exhaustive]`, for the same reason [`super::source::LinkError`]
+/// carries none: IR-20's obligation is on `pub` error types in LIBRARY crates,
+/// and shep-cli is `[[bin]]`-only. Said out loud rather than left silent,
+/// which is the half of IR-20 that applies either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiGone;
+
+impl fmt::Display for UiGone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the dashboard stopped listening")
+    }
+}
+
+impl core::error::Error for UiGone {}
+
+/// Runs `opened` and everything that replaces it, until the ladder runs out.
 ///
 /// Sends [`Msg`]s to the UI over `msgs`, and takes a request for an
 /// out-of-band poll on `polls` (the `r` key, and the reducer's own
 /// [`super::app::Effect::PollNow`]).
 ///
-/// Ends — and only ends — after sending [`Msg::Frozen`]. Everything else it can
-/// encounter is a rung on the ladder.
+/// **`opened` is handed in, already connected.** The first dial belongs to
+/// `super::lookout`, which makes it before entering raw mode so that a
+/// shepherd which was never running refuses the way every other client verb
+/// refuses — `daemon_unreachable`, exit 5, no alternate screen — instead of
+/// eight seconds of reconnect banner about a death that never happened. Rin's
+/// retry-then-freeze ruling is about a shepherd that dies *underneath* a
+/// running dashboard, and this signature is where the distinction is enforced
+/// rather than described.
+///
+/// Ends — and only ends — after sending [`Msg::Frozen`], or when the UI stops
+/// listening. Everything else it can encounter is a rung on the ladder.
 pub async fn run_link<S: Shepherd>(
     mut shepherd: S,
+    opened: (S::Flock, S::Events),
     msgs: mpsc::Sender<Msg>,
     mut polls: mpsc::Receiver<()>,
     period: Duration,
 ) {
     let mut attempt = 0u32;
     let mut wait = RECONNECT_FIRST_WAIT;
-    let mut opened_once = false;
+    let mut connection = Some(opened);
 
     loop {
-        match shepherd.link().await {
-            Ok((flock, events)) => {
-                if opened_once && msgs.send(Msg::Relinked).await.is_err() {
-                    return;
+        let (flock, events) = match connection.take() {
+            Some(pair) => pair,
+            None => match shepherd.link().await {
+                Ok(pair) => pair,
+                Err(err) => {
+                    // Not surfaced as its own Msg: the reducer's `Retrying`
+                    // state is what the banner reads, and a per-attempt error
+                    // string would put a different sentence on screen every
+                    // 250ms during an ordinary restart.
+                    let _ = err;
+                    attempt += 1;
+                    if attempt > RECONNECT_ATTEMPTS {
+                        let _ = msgs
+                            .send(Msg::Frozen {
+                                at_local: local_now(),
+                            })
+                            .await;
+                        return;
+                    }
+                    let _ = msgs.send(Msg::Retrying { attempt }).await;
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(RECONNECT_MAX_WAIT);
+                    continue;
                 }
-                opened_once = true;
-                attempt = 0;
-                wait = RECONNECT_FIRST_WAIT;
-                match run_connected(flock, events, msgs.clone(), polls, period).await {
-                    // The connection ended. `polls` comes back so the next
-                    // rung can hand it to the next connection — passed by
-                    // value rather than by `&mut` because `run_connected` is
-                    // `tokio::spawn`ed directly by its own tests, and a
-                    // spawned future cannot borrow a caller's local.
-                    Ok(returned) => polls = returned,
-                    // The UI is gone. Nothing left to report to.
-                    Err(()) => return,
-                }
-            }
-            Err(err) => {
-                // Not surfaced as its own Msg: the reducer's `Retrying` state
-                // is what the banner reads, and a per-attempt error string
-                // would put a different sentence on screen every 250ms during
-                // an ordinary restart.
-                let _ = err;
-            }
-        }
+            },
+        };
 
-        attempt += 1;
-        if attempt > RECONNECT_ATTEMPTS {
-            let _ = msgs
-                .send(Msg::Frozen {
-                    at_local: local_now(),
-                })
-                .await;
+        // `attempt > 0`, NOT "a connection was opened once before". The gate
+        // is on whether a `Retrying` was ANNOUNCED, because `Relinked` is what
+        // takes that banner down again — and this is where an earlier draft
+        // was wrong: a flag set only by a successful dial left the sequence
+        // "first dial fails, second succeeds" showing
+        // `reconnecting (attempt 1)` over a fully live dashboard, for the rest
+        // of the session.
+        if attempt > 0 && msgs.send(Msg::Relinked).await.is_err() {
             return;
         }
-        let _ = msgs.send(Msg::Retrying { attempt }).await;
-        tokio::time::sleep(wait).await;
-        wait = (wait * 2).min(RECONNECT_MAX_WAIT);
+        attempt = 0;
+        wait = RECONNECT_FIRST_WAIT;
+
+        match run_connected(flock, events, msgs.clone(), polls, period).await {
+            // The connection ended. `polls` comes back so the next rung can
+            // hand it to the next connection — passed by value rather than by
+            // `&mut` because `run_connected` is `tokio::spawn`ed directly by
+            // its own tests, and a spawned future cannot borrow a caller's
+            // local.
+            Ok(returned) => polls = returned,
+            // The UI is gone. Nothing left to report to.
+            Err(UiGone) => return,
+        }
     }
 }
 
@@ -4098,8 +4544,13 @@ pub async fn run_link<S: Shepherd>(
 /// until the subscription ends.
 ///
 /// Returns the poll receiver on `Ok`, so the next rung of the ladder can hand
-/// it to the next connection; `Err(())` when the UI's own channel has closed,
-/// which is the only condition that is not a reconnect.
+/// it to the next connection.
+///
+/// # Errors
+/// [`UiGone`] when the dashboard's own [`Msg`] channel has closed — the only
+/// condition here that is not a reconnect. A failed poll, a dropped frame, a
+/// lagging receiver and the subscription ending are all handled in place or
+/// handed back to the ladder as `Ok`.
 ///
 /// **Order matters, and it is the opposite of `bleats`'.** `bleats` lists
 /// before it subscribes, because its id/name cache has to exist before the
@@ -4115,7 +4566,10 @@ pub async fn run_connected<F: FlockSource, E: EventSource>(
     msgs: mpsc::Sender<Msg>,
     mut polls: mpsc::Receiver<()>,
     period: Duration,
-) -> Result<mpsc::Receiver<()>, ()> {
+) -> Result<mpsc::Receiver<()>, UiGone> {
+    // The opening listing. Every connection begins with one — a cold start and
+    // a reconnect need the same first snapshot, and this is the one place that
+    // serves both. Every poll count in this module's tests counts it.
     reconcile(&flock, &msgs).await?;
 
     // `interval_at`, not `interval`: a plain `tokio::time::interval` yields its
@@ -4141,13 +4595,15 @@ pub async fn run_connected<F: FlockSource, E: EventSource>(
                     // understands, so it gets a repair as well as being
                     // forwarded — it must NOT be treated as an ordinary event.
                     let repair = matches!(event, BusEvent::Dropped { .. });
-                    msgs.send(Msg::Event(event)).await.map_err(|_| ())?;
+                    msgs.send(Msg::Event(event)).await.map_err(|_| UiGone)?;
                     if repair {
                         reconcile(&flock, &msgs).await?;
                     }
                 }
                 Some(Err(Lagged { count })) => {
-                    msgs.send(Msg::BusLagged { count }).await.map_err(|_| ())?;
+                    msgs.send(Msg::BusLagged { count })
+                        .await
+                        .map_err(|_| UiGone)?;
                     reconcile(&flock, &msgs).await?;
                 }
             },
@@ -4162,7 +4618,7 @@ pub async fn run_connected<F: FlockSource, E: EventSource>(
 /// — the same call bark's own `reconcile` makes. A poll that fails because the
 /// connection is dead will be followed by the subscription ending, which is the
 /// condition that does climb the ladder.
-async fn reconcile<F: FlockSource>(flock: &F, msgs: &mpsc::Sender<Msg>) -> Result<(), ()> {
+async fn reconcile<F: FlockSource>(flock: &F, msgs: &mpsc::Sender<Msg>) -> Result<(), UiGone> {
     match flock.flock().await {
         Ok(rows) => msgs
             .send(Msg::Snapshot {
@@ -4170,7 +4626,7 @@ async fn reconcile<F: FlockSource>(flock: &F, msgs: &mpsc::Sender<Msg>) -> Resul
                 at: std::time::Instant::now(),
             })
             .await
-            .map_err(|_| ()),
+            .map_err(|_| UiGone),
         Err(RequestError::Closed) => Ok(()),
         Err(_other) => Ok(()),
     }
@@ -4189,7 +4645,7 @@ fn local_now() -> String {
 
 Run `cargo test -p shep-cli --bins --all-features`. Expect green, **+5**.
 
-### Step 6.4 — MUTATION
+### Step 6.4 — MUTATION (the one that matters)
 
 In `run_connected`'s `Some(Err(Lagged { .. }))` arm, delete the
 `reconcile(&flock, &msgs).await?;` line.
@@ -4197,11 +4653,21 @@ In `run_connected`'s `Some(Err(Lagged { .. }))` arm, delete the
 Run `cargo test -p shep-cli --bins --all-features`.
 
 **Must go red:** `a_lagging_subscriber_polls_immediately_instead_of_waiting`
-fails on its poll-count assertion — it saw the `Lagged` reach the reducer and
-saw zero repair polls, which is precisely the silent-drift failure the two-route
-design exists to prevent. `a_shepherd_side_drop_polls_and_is_forwarded` must
-stay **green**: it covers the other route, and a mutation reddening both would
-mean the two tests are one test written twice.
+fails twice over — `assert!(repaired, ...)` because no snapshot follows the
+`BusLagged`, and the poll count because it stays at `1` (the opening listing)
+where the test wants `2`. That is precisely the silent-drift failure the
+two-route design exists to prevent.
+
+**This is the check that was dead in an earlier draft, and it is worth knowing
+why**: the test asserted `polls == 1` while the implementation's opening
+`reconcile` already made that `1` on its own, so deleting the repair left the
+assertion passing. The single most load-bearing mutation in the phase went
+green. Every poll count in this module now counts the opening listing
+explicitly, which is what makes the `2` above falsifiable.
+
+`a_shepherd_side_drop_polls_and_is_forwarded` must stay **green**: it covers
+the other route, and a mutation reddening both would mean the two tests are one
+test written twice.
 
 Revert.
 
@@ -4223,9 +4689,29 @@ In `run_connected`, change `interval_at(now + period, period)` to
 `tokio::time::interval(period)`.
 
 **Must go red:** `the_scheduled_poll_lands_on_the_interval_and_not_at_zero`
-fails on its first assertion — a poll landed at t=0, from the timer's own
-startup tick rather than from anything the dashboard did. Revert, then run the
-full task gate.
+fails on its first assertion — the counter reads `2` at t=1.9s where the test
+wants `1`, because the timer's own startup tick fired a poll alongside the
+opening listing and nothing about it was attributable to the dashboard. The
+second assertion fails too, at `4` against `3`.
+
+Revert.
+
+### Step 6.7 — fourth MUTATION
+
+In `run_link`, change the relink announcement's guard from `if attempt > 0` to
+`if attempt > 1`.
+
+**Must go red:** `a_successful_relink_reports_live_on_the_first_success` fails
+on `assert!(relinked, ...)` — one failed dial then a success announces nothing,
+so `App` stays in `Link::Retrying { attempt: 1 }` and the banner reads
+`the shepherd stopped answering — reconnecting (attempt 1)` over a dashboard
+that is applying fresh snapshots. It is the mirror image of the frozen-clock
+lie this phase exists to prevent, and the fixture's `keepalive` field is what
+makes it visible: with the sender dropped the relinked connection ended at
+once, the ladder went round again, and the second cycle's `Relinked` covered
+for the first cycle's missing one.
+
+Revert, then run the full task gate.
 
 ---
 
@@ -4262,12 +4748,12 @@ mod tests {
     fn every_bound_key_resolves_to_its_press() {
         assert_eq!(map_key(&key(KeyCode::Char('q'))), Some(KeyPress::Quit));
         assert_eq!(map_key(&key(KeyCode::Esc)), Some(KeyPress::Quit));
-        assert_eq!(map_key(&key(KeyCode::Char('j'))), Some(KeyPress::Down));
-        assert_eq!(map_key(&key(KeyCode::Down)), Some(KeyPress::Down));
-        assert_eq!(map_key(&key(KeyCode::Char('k'))), Some(KeyPress::Up));
-        assert_eq!(map_key(&key(KeyCode::Up)), Some(KeyPress::Up));
-        assert_eq!(map_key(&key(KeyCode::Char('g'))), Some(KeyPress::Home));
-        assert_eq!(map_key(&key(KeyCode::Char('G'))), Some(KeyPress::End));
+        assert_eq!(map_key(&key(KeyCode::Char('j'))), Some(KeyPress::ScrollDown));
+        assert_eq!(map_key(&key(KeyCode::Down)), Some(KeyPress::ScrollDown));
+        assert_eq!(map_key(&key(KeyCode::Char('k'))), Some(KeyPress::ScrollUp));
+        assert_eq!(map_key(&key(KeyCode::Up)), Some(KeyPress::ScrollUp));
+        assert_eq!(map_key(&key(KeyCode::Char('g'))), Some(KeyPress::ScrollTop));
+        assert_eq!(map_key(&key(KeyCode::Char('G'))), Some(KeyPress::ScrollBottom));
         assert_eq!(map_key(&key(KeyCode::Char('r'))), Some(KeyPress::Refresh));
         assert_eq!(map_key(&key(KeyCode::Char('x'))), Some(KeyPress::Stop));
         assert_eq!(map_key(&key(KeyCode::Char('z'))), None);
@@ -4386,10 +4872,10 @@ pub fn map_key(event: &Event) -> Option<KeyPress> {
     }
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => Some(KeyPress::Quit),
-        KeyCode::Char('j') | KeyCode::Down => Some(KeyPress::Down),
-        KeyCode::Char('k') | KeyCode::Up => Some(KeyPress::Up),
-        KeyCode::Char('g') | KeyCode::Home => Some(KeyPress::Home),
-        KeyCode::Char('G') | KeyCode::End => Some(KeyPress::End),
+        KeyCode::Char('j') | KeyCode::Down => Some(KeyPress::ScrollDown),
+        KeyCode::Char('k') | KeyCode::Up => Some(KeyPress::ScrollUp),
+        KeyCode::Char('g') | KeyCode::Home => Some(KeyPress::ScrollTop),
+        KeyCode::Char('G') | KeyCode::End => Some(KeyPress::ScrollBottom),
         KeyCode::Char('r') => Some(KeyPress::Refresh),
         KeyCode::Char('x') => Some(KeyPress::Stop),
         _ => None,
@@ -4461,12 +4947,25 @@ pub fn install_panic_hook() {
 
 /// Enters raw mode and the alternate screen, and hides the cursor.
 ///
+/// **Fails clean.** Raw mode goes on first and the alternate screen second, so
+/// there is a window in which the first step has succeeded and the second has
+/// not — and a bare `?` there would return `Err` with raw mode still ON, to a
+/// caller that is about to return an exit code and never had a guard. The
+/// operator would be left with no echo and no line editing, which
+/// this module's own doc calls the worst failure a TUI can have. So
+/// the second step restores before it reports. The caller arms its
+/// [`RestoreGuard`] before calling this as well; both, not either, is the same
+/// argument the panic hook and the guard are two of.
+///
 /// # Errors
 /// Whatever `crossterm` could not do to the terminal.
 pub fn enter() -> io::Result<Stdout> {
     enable_raw_mode()?;
     let mut out = io::stdout();
-    crossterm::execute!(out, EnterAlternateScreen, Hide)?;
+    if let Err(err) = crossterm::execute!(out, EnterAlternateScreen, Hide) {
+        restore();
+        return Err(err);
+    }
     Ok(out)
 }
 
@@ -4502,6 +5001,17 @@ impl RestoreGuard {
         Self {
             action: Some(Box::new(action)),
         }
+    }
+}
+
+impl Default for RestoreGuard {
+    /// The same guard [`RestoreGuard::new`] builds.
+    ///
+    /// Present because `clippy::new_without_default` is a default-on style
+    /// lint and `cargo clippy -- -D warnings` is in the task gate — an
+    /// argument-less `new` with no `Default` fails it.
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -4578,13 +5088,16 @@ grep -rn 'allow.control' crates/ | wc -l          # 0
 `crates/shep-cli/src/cli.rs`'s test module:
 
 ```rust
-    /// fails if the `dash` alias stops resolving, or stops being visible in
-    /// `--help`. `dash` is pm2's own word for this screen, and
-    /// `docs/terminology.md` records it as a first-class alias rather than a
-    /// hidden one — the house rule is that every themed word has a straight
-    /// twin, forever.
+    /// fails if `dash` stops reaching the same verb as `lookout`.
+    ///
+    /// **A resolution claim, and only that.** `try_parse_from` answers
+    /// identically whether the attribute is `visible_alias` or the hidden
+    /// `alias`, so this test cannot see the difference and must not claim to:
+    /// the visibility pin belongs in
+    /// `alias_visibility_and_hiding_are_pinned`, which already owns that job
+    /// for `flock`/`bleats`/`stock`/`whisper` and is extended below.
     #[test]
-    fn dash_is_a_visible_alias_for_lookout() {
+    fn dash_and_lookout_resolve_to_the_same_verb() {
         assert!(matches!(
             Cli::try_parse_from(["shep", "dash"]).unwrap().command,
             Commands::Lookout(_)
@@ -4624,8 +5137,9 @@ mod tests {
     use futures_util::stream;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use shep_core::protocol::BusEvent;
 
-    use crate::lookout::app::{App, Control};
+    use crate::lookout::app::{App, Control, KeyPress};
     use crate::lookout::theme::Palette;
 
     /// fails if the loop stops drawing, or stops leaving on `q`. This is the
@@ -4666,6 +5180,16 @@ mod tests {
     /// fails if the loop stops asking for a poll when the reducer says to. The
     /// `Effect::PollNow` a drop produces has to reach the link task, or the
     /// repair the link task exists for never happens.
+    ///
+    /// **This test is also the starvation pin**, and it is the reason
+    /// `stream::empty()` is the key source rather than an accident of
+    /// convenience. An empty stream is `Poll::Ready(None)` on its first poll
+    /// and on every poll after it, so in a `biased` select with the keyboard
+    /// above the message channel, an implementation that did not retire the
+    /// keyboard arm would win that arm forever and never read either message
+    /// queued below — the loop would spin until the `timeout` fired and this
+    /// test would fail on its `expect`. It cannot pass by accident: the two
+    /// messages it sends are on the arm that has to be reachable.
     #[tokio::test(start_paused = true)]
     async fn a_drop_forwards_a_poll_request_to_the_link_task() {
         let (msg_tx, msg_rx) = mpsc::channel(16);
@@ -4722,6 +5246,22 @@ Run `cargo test -p shep-cli --bins --all-features`.
 
 **Expected failure — for the stated reason:** compile error, ``no variant named
 `Lookout` found for enum `Commands` ``.
+
+And **extend the existing pin** at `crates/shep-cli/src/cli.rs:942`,
+`alias_visibility_and_hiding_are_pinned` — the test that already reads
+`get_visible_aliases()` for every other aliased verb. Two edits, in the places
+its own shape dictates:
+
+```rust
+        let lookout = cmd.find_subcommand("lookout").unwrap();
+        assert_eq!(lookout.get_visible_aliases().collect::<Vec<_>>(), ["dash"]);
+```
+
+and `"lookout"` joins the `visible` list its final loop walks. `dash` is pm2's
+own word for this screen and `docs/terminology.md` records it as a first-class
+alias rather than a hidden one — the house rule is that every themed word has a
+straight twin, forever, and this is the only assertion in the crate that can
+tell `visible_alias = "dash"` from `alias = "dash"`.
 
 ### Step 8.3 — GREEN: the verb
 
@@ -4783,6 +5323,11 @@ pub struct LookoutArgs {
 //! exists.
 
 pub mod app;
+// `#[cfg(test)]`: every item in `frames` is read by tests and by the gallery
+// writer, and by nothing else. `shep-cli` is `[[bin]]`-only, so `pub` exempts
+// nothing from `dead_code` — see `output::table::render_table`, which carries
+// an `#[allow(dead_code)]` and a comment saying exactly this.
+#[cfg(test)]
 pub mod frames;
 pub mod input;
 pub mod link;
@@ -4791,7 +5336,6 @@ pub mod term;
 pub mod theme;
 pub mod view;
 
-use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -4800,10 +5344,14 @@ use futures_util::{Stream, StreamExt};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use shep_core::paths::ShepPaths;
-use shep_core::protocol::BusEvent;
 use tokio::sync::mpsc;
 
 use self::app::{App, Control, Effect, Msg};
+// The trait, for the opening dial below. `BusEvent` and `KeyPress` are named
+// only from the test module and are imported there, not here: an import used
+// solely by `#[cfg(test)]` code warns in the ordinary build, and `-D warnings`
+// makes that a task-gate failure.
+use self::source::Shepherd;
 use self::theme::Palette;
 use crate::cli::{Format, LookoutArgs};
 use crate::exit::ExitCode;
@@ -4826,12 +5374,19 @@ pub const HEARTBEAT: Duration = Duration::from_secs(1);
 /// dirty, so an idle dashboard draws nothing at all.
 pub const MIN_REDRAW: Duration = Duration::from_millis(33);
 
-/// Runs the dashboard.
+/// Runs the dashboard, and returns the [`ExitCode`] to exit with.
 ///
-/// # Errors
-/// Returns the [`ExitCode`] to exit with — [`ExitCode::Usage`] when stdout is
-/// not a terminal, [`ExitCode::Failure`] when the terminal could not be put
-/// into raw mode.
+/// Three refusals, all of them before a single escape byte is written:
+///
+/// - [`ExitCode::Usage`] when stdout is not a terminal.
+/// - [`ExitCode::DaemonUnreachable`] (or [`ExitCode::ProtocolMismatch`]) when
+///   the FIRST connection fails — see [`source::LinkError::exit_code`]. A
+///   shepherd that was never running is not the case Rin's retry-then-freeze
+///   ruling is about, and lookout refuses it exactly as `shep flock` would.
+/// - [`ExitCode::Failure`] when the terminal could not be put into raw mode.
+///
+/// After that it does not exit on its own at all: the ladder and the freeze
+/// take over, and the operator quits.
 pub async fn lookout(
     streams: &mut Streams<'_>,
     fmt: Format,
@@ -4852,6 +5407,27 @@ pub async fn lookout(
         return ExitCode::Usage;
     }
 
+    // The FIRST dial, and it happens HERE — before the palette, before the
+    // panic hook, before raw mode, and before anything has been drawn. A
+    // shepherd that was never running gets the same refusal `shep flock` gets:
+    // one error envelope on stderr and exit 5. Rin's "lookout never exits on
+    // its own" is about a shepherd that dies *underneath* a running dashboard;
+    // opening the alternate screen to spend eight seconds reconnecting to
+    // something that was never there, announcing a death that never happened
+    // and then exiting `Success`, is a different thing and a worse one.
+    //
+    // Everything after this point is the running-dashboard case, which is the
+    // one the ladder is for.
+    let mut shepherd = source::UnixShepherd::new(&paths.socket);
+    let opened = match shepherd.link().await {
+        Ok(opened) => opened,
+        Err(err) => {
+            let code = err.exit_code();
+            let _ = output::emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
+            return code;
+        }
+    };
+
     let palette = Palette::detect(
         std::env::var_os("NO_COLOR").as_deref(),
         std::env::var_os("TERM").as_deref(),
@@ -4865,9 +5441,18 @@ pub async fn lookout(
         Instant::now(),
     );
 
-    // Hook first, then raw mode, then the alternate screen — nothing that can
-    // panic in between. See `term`'s own module doc.
+    // Hook first, then the guard, then raw mode, then the alternate screen —
+    // nothing that can panic in between. See `term`'s own module doc.
     term::install_panic_hook();
+    // ARMED BEFORE `enter()`, deliberately. `enter` turns raw mode on and then
+    // enters the alternate screen; if the second step fails, an earlier draft
+    // of this function returned `Err` with raw mode still on and no guard yet
+    // in existence, leaving the operator's shell with no echo and no line
+    // editing — the failure design decision 7 calls the worst a TUI can have,
+    // reached through the error path of the very function that prevents it.
+    // `restore()` is documented idempotent and safe outside raw mode, so
+    // arming it early costs nothing on the paths that never enter.
+    let _guard = term::RestoreGuard::new();
     let out = match term::enter() {
         Ok(out) => out,
         Err(err) => {
@@ -4880,7 +5465,6 @@ pub async fn lookout(
             return ExitCode::Failure;
         }
     };
-    let _guard = term::RestoreGuard::new();
 
     let terminal = match Terminal::new(CrosstermBackend::new(out)) {
         Ok(terminal) => terminal,
@@ -4897,8 +5481,15 @@ pub async fn lookout(
 
     let (msg_tx, msg_rx) = mpsc::channel(1024);
     let (poll_tx, poll_rx) = mpsc::channel(8);
-    let shepherd = source::UnixShepherd::new(&paths.socket);
-    let link = tokio::spawn(link::run_link(shepherd, msg_tx, poll_rx, link::FLOCK_POLL));
+    // The connection opened above is handed straight in, so the link task
+    // never dials for its first one.
+    let link = tokio::spawn(link::run_link(
+        shepherd,
+        opened,
+        msg_tx,
+        poll_rx,
+        link::FLOCK_POLL,
+    ));
 
     let events = crossterm::event::EventStream::new();
     let _ = run_ui(app, terminal, events, msg_rx, poll_tx).await;
@@ -4947,6 +5538,20 @@ pub fn resolve_control(flag: bool, kv: &Path) -> Control {
 /// 3. **The link's messages.**
 /// 4. **The heartbeat**, which advances the uptime column and nothing else.
 ///
+/// **`biased` makes an exhausted arm a hazard, not a detail.** A `Stream` that
+/// has ended returns `Poll::Ready(None)` immediately and forever, and an `mpsc`
+/// whose senders are all dropped does the same — so an arm that has run dry,
+/// sitting above another one in a biased select, wins every iteration and
+/// starves everything below it for the life of the loop. Concretely: a
+/// persistent stdin read error would freeze the display while the link and the
+/// heartbeat never got polled, and a key source that ended would spin this loop
+/// at full tilt forever. So arms 2 and 3 each carry a **branch precondition**
+/// (`, if !keys_done` / `, if !link_done`) that takes them out of the running
+/// for good once their source is done. Arm 4 is unconditional, so the `select!`
+/// always has an enabled branch. Arm 1 needs the same idea in its other form —
+/// `std::future::pending()` — because a missing signal handler is not a
+/// condition that changes.
+///
 /// The redraw is not an arm: it happens after the `select!`, gated on `dirty`
 /// and on [`MIN_REDRAW`] having elapsed.
 pub async fn run_ui<B: Backend, S>(
@@ -4967,14 +5572,21 @@ where
     )
     .ok();
 
+    // Set once each, when their source runs dry. See this function's doc.
+    let mut keys_done = false;
+    let mut link_done = false;
+
     let mut dirty = true;
-    let mut last_draw = Instant::now() - MIN_REDRAW;
+    // `Option`, not `Instant::now() - MIN_REDRAW`: subtracting from a fresh
+    // `Instant` is a panic on a platform whose monotonic clock starts near
+    // zero, and "has never drawn" is what the first iteration actually means.
+    let mut last_draw: Option<Instant> = None;
 
     loop {
-        if dirty && last_draw.elapsed() >= MIN_REDRAW {
+        if dirty && last_draw.is_none_or(|at| at.elapsed() >= MIN_REDRAW) {
             let _ = terminal.draw(|frame| view::draw(&app, frame));
             dirty = false;
-            last_draw = Instant::now();
+            last_draw = Some(Instant::now());
         }
 
         let msg = tokio::select! {
@@ -4990,37 +5602,54 @@ where
                     None => std::future::pending().await,
                 }
             } => break,
-            event = events.next() => match event {
+            event = events.next(), if !keys_done => match event {
                 Some(Ok(crossterm::event::Event::Resize(..))) => Some(Msg::Resize),
                 Some(Ok(event)) => input::map_key(&event).map(Msg::Key),
-                // A key source that ended: the real one does not, and a test's
-                // does. Either way there is nothing further to read from it,
-                // and the loop keeps running on the other three arms.
-                Some(Err(_)) | None => None,
+                // A key source that has ENDED, or has started erroring. The
+                // real one does neither in ordinary use; a test's ends on its
+                // last scripted key, and a stdin whose descriptor has gone bad
+                // errors on every poll rather than once. Both conditions are
+                // permanent, and both retire this arm rather than being
+                // shrugged off: an arm that keeps completing immediately,
+                // above the link and the heartbeat in a `biased` select,
+                // freezes the display and spins the process at full tilt. The
+                // dashboard keeps running on the other arms; the operator
+                // quits with a signal.
+                Some(Err(_)) | None => {
+                    keys_done = true;
+                    None
+                }
             },
-            msg = msgs.recv() => match msg {
+            msg = msgs.recv(), if !link_done => match msg {
                 Some(msg) => Some(msg),
-                // The link task ended without freezing — only possible if it
-                // was aborted. Keep the last frame up; the operator quits.
-                None => None,
+                // Every sender dropped: the link task ended without freezing,
+                // which only happens if it was aborted. Keep the last frame up
+                // — and retire this arm, because a closed `mpsc` is `Ready`
+                // forever and would otherwise starve the heartbeat below it.
+                None => {
+                    link_done = true;
+                    None
+                }
             },
             _ = heartbeat.tick() => Some(Msg::Tick { now: Instant::now() }),
         };
 
-        let Some(msg) = msg else {
-            // Nothing to apply, but the select woke: if both the key source
-            // and the link have ended there is no work left, so yield rather
-            // than spin.
-            tokio::time::sleep(MIN_REDRAW).await;
-            continue;
-        };
+        // Nothing to apply. Not a spin risk, and it is worth naming why there
+        // are exactly three ways to get here: an unbound keypress (which needs
+        // a fresh keystroke), and each of the two sources retiring (once each,
+        // ever). Nothing on this path can repeat without something new
+        // happening, so there is no sleep and no yield.
+        let Some(msg) = msg else { continue };
 
         match app.update(msg) {
             Effect::Quit => break,
             Effect::PollNow => {
                 // `try_send`, not `send`: a full poll channel means a repair is
                 // already queued, and blocking the UI on it would stall the
-                // screen for exactly as long as the shepherd is slow.
+                // screen for exactly as long as the shepherd is slow. A CLOSED
+                // one means the link task has ended — which the reducer
+                // already accounts for, by refusing `r` outright once the link
+                // is `Lost` rather than letting a request vanish here.
                 let _ = polls.try_send(());
                 dirty = true;
             }
@@ -5097,11 +5726,22 @@ fn shep_dash_is_the_same_verb() {
     assert!(String::from_utf8(output.stderr).unwrap().contains("needs a terminal"));
 }
 
-/// fails if `--help` stops naming the flag or the alias. `--help` is where an
-/// operator learns that the dashboard is read-only by default, and the flag's
-/// own text is where they learn the gate is not a security boundary.
+/// fails if `--help` stops naming the gate. `--help` is where an operator
+/// learns that the dashboard is read-only by default, and the flag's own text
+/// is where they learn the gate is not a security boundary.
+///
+/// **Two assertions this test deliberately does not make.** It does not assert
+/// `text.contains("dash")`: the verb's own about-text says "live dashboard"
+/// and the flag's help says "the dashboard", so that substring is there
+/// whether or not the alias is — delete `visible_alias` and it still passes.
+/// The alias is pinned in `cli.rs`'s `alias_visibility_and_hiding_are_pinned`,
+/// through `get_visible_aliases()`, which is the only assertion that can tell
+/// the difference. And it asserts on `security boundary`, not on the whole
+/// sentence: `wrap_help` is enabled on this crate's clap, so clap re-wraps
+/// long help at the detected terminal width and a longer phrase can land
+/// across a line break on one machine and not another.
 #[test]
-fn shep_lookout_help_names_the_alias_and_the_gate() {
+fn shep_lookout_help_names_the_gate() {
     let home = TempDir::new().unwrap();
     let output = shep(home.path())
         .args(["lookout", "--help"])
@@ -5111,12 +5751,21 @@ fn shep_lookout_help_names_the_alias_and_the_gate() {
     assert_eq!(output.status.code(), Some(0));
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("--allow-control"));
-    assert!(text.contains("dash"));
-    assert!(text.contains("not a security boundary"));
+    assert!(text.contains("security boundary"));
 }
 ```
 
 Run `cargo test -p shep-cli --test cli_e2e --all-features`. Expect green, **+3**.
+
+**There is no e2e case for the no-shepherd refusal, and that is structural.**
+The `is_terminal` guard runs first and `assert_cmd` always gives the child a
+pipe, so a `shep lookout` launched from a test never reaches the opening dial
+— it exits `2` on the tty check before it can exit `5` on the connection. The
+order is right (a TUI in a pipe is a usage error whether or not a shepherd
+exists, and checking it first costs nothing), so the refusal is covered by
+construction rather than by a case here: the dial is the first statement after
+the guard, its `Err` arm is four lines, and `source::LinkError::exit_code` has
+the mapping. Said out loud rather than left as a gap someone finds later.
 
 ### Step 8.6 — MUTATION
 
@@ -5124,11 +5773,14 @@ In `lookout::lookout`, delete the `is_terminal` guard.
 
 Run `cargo test -p shep-cli --test cli_e2e --all-features`.
 
-**Must go red:** `shep_lookout_refuses_when_stdout_is_not_a_terminal` fails —
-and note *how* it fails, because it is the interesting part: with the guard gone
-the verb enters raw mode against a pipe and runs until `CMD_TIMEOUT` kills it,
-so the assertion that reddens is the exit code, on a process that had to be
-killed. That is why the case carries `.timeout(CMD_TIMEOUT)`.
+**Must go red:** `shep_lookout_refuses_when_stdout_is_not_a_terminal` fails on
+`assert_eq!(output.status.code(), Some(2))`, and *how* it gets there depends on
+the machine, which is worth knowing before the run: with a controlling
+terminal, `enable_raw_mode` succeeds against `/dev/tty`, the verb draws into a
+pipe and runs until `.timeout(CMD_TIMEOUT)` kills it — which is why the case
+carries that timeout. Without one, `enable_raw_mode` fails with `ENOTTY` and
+the verb exits `1`. Either way the exit code is not `2` and the case reddens;
+do not treat the timeout path as the only correct outcome.
 
 Revert.
 
@@ -5157,10 +5809,17 @@ tests clap and not the resolution. Revert, then run the full task gate.
 
 ```bash
 grep -c 'ratatui' docs/specs/deferred.md                                  # 2
+grep -c '`ratatui` is not a dependency' docs/specs/deferred.md            # 1
 grep -c 'lookout' README.md                                               # 2
 grep -c 'the terminal dashboard | `shep lookout` (alias `dash`) | no' README.md   # 1
 grep -c 'Not started: the lookout TUI' README.md                          # 1
 ```
+
+The second one carries its backticks on purpose. `deferred.md:71` reads
+`` `ratatui` is not a dependency of any crate. `` — with the crate name in
+code ticks — so the unbackticked pattern an earlier draft of Step 9.5 used
+matches nothing at HEAD, prints `0` before the edit and `0` after it, and can
+never fail. It was the only check pinning this file's rewrite.
 
 ### Step 9.2 — the CHANGELOG
 
@@ -5221,11 +5880,14 @@ built column.
 ### Step 9.5 — verify
 
 ```bash
-grep -c 'ratatui is not a dependency' docs/specs/deferred.md   # was 1, now 0
-grep -c 'Not started: the lookout TUI' README.md               # was 1, now 0
-grep -rn 'allow.control' crates/ | wc -l                       # was 0, now >= 4
-find docs/lookout -type f | wc -l                              # 3
+grep -c '`ratatui` is not a dependency' docs/specs/deferred.md   # was 1, now 0
+grep -c 'Not started: the lookout TUI' README.md                 # was 1, now 0
+grep -rn 'allow.control' crates/ | wc -l                         # was 0, now >= 4
+find docs/lookout -type f | wc -l                                # 3
 ```
+
+Backticks in the first pattern, matching Step 9.1's baseline: without them it
+prints `0` on both sides of the edit.
 
 ### Step 9.6 — the phase gate
 
@@ -5243,7 +5905,7 @@ cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-
 Plus both `benches/` gates, per CLAUDE.md.
 
 Expect the summary to have moved from **1163 passed / 0 failed / 3 ignored
-across 16 result lines** to roughly **1212 passed / 0 failed / 4 ignored across
+across 16 result lines** to roughly **1213 passed / 0 failed / 4 ignored across
 16 result lines** — the counts are a shape, the `failed` is not, and the
 `ignored` is not: it is 4, from the one gallery writer, and nothing else.
 
@@ -5257,10 +5919,10 @@ The last step of the phase is not a command. Send her:
 
 - `docs/lookout/frames.txt` and `docs/lookout/frames.ansi` (`less -R` for the
   second)
-- the three open questions from `docs/lookout/README.md`: where the other three
-  panes sit and which are focusable; which actions the gate lets through and
-  what confirms them; whether filter takes the CLI selector grammar or plain
-  substring
+- the open questions from `docs/lookout/README.md`: where the other three panes
+  sit and which are focusable; whether the flock table grows a selected row and
+  what marks it; which actions the gate lets through and what confirms them;
+  whether filter takes the CLI selector grammar or plain substring
 
 That is what 12a was for.
 
