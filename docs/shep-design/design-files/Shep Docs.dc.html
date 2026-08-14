@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>shep — docs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Space+Grotesk:wght@400;500;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --paper: #FBF6E7; --paper-2: #FFFDF5; --ink: #17251C; --ink-2: #3D5245; --ink-3: #7A8C80;
+    --line: #17251C; --hair: rgba(23,37,28,.14); --meadow: #2E8B57; --grass: #6FCB6B;
+    --bark: #E0552B; --butter: #F3C44C; --sky: #4E9DD3; --fleece: #FFFDF5;
+    --dot: rgba(23,37,28,.10); --shadow: #17251C; --code-bg: #F1EBD8;
+  }
+  [data-theme="dark"] {
+    --paper: #131E18; --paper-2: #1B2A21; --ink: #F0ECDC; --ink-2: #BFCFC2; --ink-3: #7E9186;
+    --line: #35493C; --hair: rgba(240,236,220,.14); --meadow: #59C47D; --grass: #7FD98E;
+    --bark: #FF7B4F; --butter: #F6D072; --sky: #78BEEC; --fleece: #F0ECDC;
+    --dot: rgba(240,236,220,.08); --shadow: #050A07; --code-bg: #22332A;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--paper); color: var(--ink);
+    font-family: 'Space Grotesk', system-ui, sans-serif;
+    transition: background .25s ease, color .25s ease;
+  }
+  a { color: var(--sky); text-decoration-thickness: 2px; text-underline-offset: 3px; }
+  a:hover { color: var(--bark); }
+  ::selection { background: var(--butter); color: #17251C; }
+</style>
+</helmet>
+<div style="min-height:100vh;">
+
+  <header style="position:sticky;top:0;z-index:20;background:var(--paper);border-bottom:3px solid var(--line);">
+    <div style="max-width:1340px;margin:0 auto;padding:13px 26px;display:flex;align-items:center;justify-content:space-between;gap:20px;">
+      <div style="display:flex;align-items:center;gap:14px;">
+        <a href="Shep Landing v3 scene.dc.html" style="display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--ink);">
+          <svg viewBox="0 0 104 78" style="width:40px;height:30px;flex:none;">
+            <g fill="var(--ink)"><rect x="40" y="52" width="8" height="21" rx="4"></rect><rect x="66" y="52" width="8" height="21" rx="4"></rect></g>
+            <path d="M40 20c6-9 22-10 28-2 10-3 19 4 18 13 7 4 7 15-1 19-2 8-12 11-19 8-8 5-21 4-26-3-10 1-17-7-15-16-4-8 4-18 15-19Z" fill="var(--fleece)" stroke="var(--ink)" stroke-width="4" stroke-linejoin="round"></path>
+            <ellipse cx="26" cy="34" rx="9" ry="7" transform="rotate(-28 26 34)" fill="var(--ink)"></ellipse>
+            <ellipse cx="27" cy="48" rx="15" ry="14" fill="var(--ink)"></ellipse>
+            <circle cx="22" cy="45" r="3" fill="var(--fleece)"></circle><circle cx="21.4" cy="45.6" r="1.4" fill="var(--ink)"></circle>
+          </svg>
+          <span style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:22px;letter-spacing:-.04em;">shep</span>
+        </a>
+        <span style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.12em;text-transform:uppercase;background:var(--paper-2);border:2px solid var(--line);border-radius:999px;padding:5px 11px;color:var(--ink-2);">docs · pre-release</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:18px;font-size:14.5px;font-weight:500;">
+        <a href="Shep Landing v3 scene.dc.html" style="color:var(--ink-2);text-decoration:none;" style-hover="color:var(--bark);">Home</a>
+        <a href="Shep Design Language.dc.html" style="color:var(--ink-2);text-decoration:none;" style-hover="color:var(--bark);">Design language</a>
+        <button onClick="{{ toggleTheme }}" title="Toggle theme" style="font-family:'Space Mono',monospace;font-size:14px;background:var(--paper-2);color:var(--ink);border:2.5px solid var(--line);border-radius:999px;width:36px;height:36px;cursor:pointer;box-shadow:2px 2px 0 var(--shadow);" style-hover="transform:translate(1px,1px);box-shadow:1px 1px 0 var(--shadow);">{{ themeIcon }}</button>
+        <a href="https://github.com/TurtIeSocks/shep" style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:14.5px;background:var(--ink);color:var(--paper);border:2.5px solid var(--line);border-radius:11px;padding:10px 16px;text-decoration:none;box-shadow:3px 3px 0 var(--meadow);" style-hover="transform:translate(1px,1px);box-shadow:2px 2px 0 var(--meadow);color:var(--paper);">GitHub</a>
+      </div>
+    </div>
+  </header>
+
+  <div style="max-width:1340px;margin:0 auto;display:grid;grid-template-columns:264px minmax(0,1fr);gap:0;align-items:start;">
+
+    <aside style="position:sticky;top:64px;padding:34px 24px 60px;border-right:3px solid var(--line);min-height:calc(100vh - 64px);">
+      <sc-for list="{{ nav }}" as="group" hint-placeholder-count="3">
+        <div style="margin-bottom:28px;">
+          <div style="font-family:'Space Mono',monospace;font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-3);margin-bottom:12px;">{{ group.label }}</div>
+          <div style="display:grid;gap:3px;">
+            <sc-for list="{{ group.items }}" as="item" hint-placeholder-count="4">
+              <button onClick="{{ item.go }}" style="font-family:'Space Grotesk',sans-serif;font-weight:{{ item.weight }};font-size:14.5px;text-align:left;background:{{ item.bg }};color:{{ item.fg }};border:2px solid {{ item.border }};border-radius:10px;padding:8px 11px;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:8px;" style-hover="border-color:var(--hair);">
+                <span>{{ item.label }}</span>
+                <span style="font-family:'Space Mono',monospace;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:{{ item.tagColor }};">{{ item.tag }}</span>
+              </button>
+            </sc-for>
+          </div>
+        </div>
+      </sc-for>
+      <div style="border-top:2px solid var(--hair);padding-top:18px;font-size:12.5px;line-height:1.5;color:var(--ink-3);">Docs track the repo. Anything marked <span style="font-family:'Space Mono',monospace;color:var(--bark);">soon</span> exists in <span style="font-family:'Space Mono',monospace;">/docs</span> but hasn't been brought over yet.</div>
+    </aside>
+
+    <main style="padding:44px 56px 90px;max-width:860px;">
+      <div style="font-family:'Space Mono',monospace;font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);margin-bottom:16px;">{{ crumb }}</div>
+
+      <sc-if value="{{ isStart }}" hint-placeholder-val="{{ true }}">
+        <article>
+          <h1 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:clamp(36px,4.6vw,56px);line-height:1;letter-spacing:-.04em;margin:0 0 18px;">Getting started</h1>
+          <p style="font-size:19px;line-height:1.6;color:var(--ink-2);margin:0 0 30px;text-wrap:pretty;">shep is one binary. Running it starts a daemon called the shepherd, which keeps a flock of your long-running processes alive. This page takes you from a clone to a running flock.</p>
+
+          <div style="background:var(--paper-2);border:3px solid var(--bark);border-radius:16px;padding:18px 20px;display:grid;grid-template-columns:auto minmax(0,1fr);gap:14px;align-items:start;margin:0 0 40px;">
+            <span style="font-family:'Space Mono',monospace;font-weight:700;font-size:11.5px;background:var(--bark);color:#FFFDF5;border:2px solid var(--line);border-radius:7px;padding:4px 9px;white-space:nowrap;">careful</span>
+            <p style="margin:0;font-size:15px;line-height:1.55;color:var(--ink-2);">There is no install script and no crates.io release yet. Building from source is the only path, and only macOS and Linux work. On Windows every command prints <code style="font-family:'Space Mono',monospace;font-size:13.5px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">shep does not yet support Windows</code> and exits 1.</p>
+          </div>
+
+          <h2 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:29px;letter-spacing:-.03em;margin:0 0 8px;">1. Build it</h2>
+          <p style="font-size:16.5px;line-height:1.65;color:var(--ink-2);margin:0 0 18px;">Rust 1.88 or newer, edition 2024.</p>
+          <div style="background:#0D1712;border:3px solid var(--line);border-radius:16px;padding:20px 22px;font-family:'Space Mono',monospace;font-size:13.5px;line-height:1.9;color:#E8E4D4;overflow-x:auto;white-space:pre;margin:0 0 12px;"><span style="color:#6FCB6B;">$</span> git clone https://github.com/TurtIeSocks/shep.git
+<span style="color:#6FCB6B;">$</span> cd shep
+<span style="color:#6FCB6B;">$</span> cargo build --release
+<span style="color:#6FCB6B;">$</span> ./target/release/shep --help</div>
+          <p style="font-size:15px;line-height:1.6;color:var(--ink-3);margin:0 0 40px;">Put <code style="font-family:'Space Mono',monospace;font-size:13.5px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">target/release/shep</code> on your PATH, or keep typing the full path — everything below works either way.</p>
+
+          <h2 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:29px;letter-spacing:-.03em;margin:0 0 8px;">2. Write a Flockfile</h2>
+          <p style="font-size:16.5px;line-height:1.65;color:var(--ink-2);margin:0 0 18px;">Two fields is a complete one. <code style="font-family:'Space Mono',monospace;font-size:14px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">Flockfile.toml</code>, <code style="font-family:'Space Mono',monospace;font-size:14px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">.yaml</code>, <code style="font-family:'Space Mono',monospace;font-size:14px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">.json</code> and <code style="font-family:'Space Mono',monospace;font-size:14px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">.json5</code> all work, discovered by searching ten filenames in a fixed order.</p>
+          <div style="background:var(--paper-2);border:3px solid var(--line);border-radius:16px;overflow:hidden;margin:0 0 18px;">
+            <div style="padding:12px 18px;border-bottom:2px solid var(--hair);font-family:'Space Mono',monospace;font-size:12.5px;font-weight:700;">Flockfile.toml</div>
+            <div style="padding:20px 22px;font-family:'Space Mono',monospace;font-size:13.5px;line-height:1.9;color:var(--ink-2);overflow-x:auto;">
+              <div style="white-space:pre;color:var(--bark);">[[app]]</div>
+              <div style="white-space:pre;">name   = <span style="color:var(--meadow);">"web"</span></div>
+              <div style="white-space:pre;">script = <span style="color:var(--meadow);">"./server"</span></div>
+            </div>
+          </div>
+          <div style="background:var(--paper-2);border:3px solid var(--butter);border-radius:16px;padding:18px 20px;display:grid;grid-template-columns:auto minmax(0,1fr);gap:14px;align-items:start;margin:0 0 40px;">
+            <span style="font-family:'Space Mono',monospace;font-weight:700;font-size:11.5px;background:var(--butter);color:#17251C;border:2px solid var(--line);border-radius:7px;padding:4px 9px;white-space:nowrap;">note</span>
+            <p style="margin:0;font-size:15px;line-height:1.55;color:var(--ink-2);">Unknown fields are a parse error, not a shrug — a typo tells you at load instead of at 3am. Durations and sizes are strict on purpose: <code style="font-family:'Space Mono',monospace;font-size:13.5px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">512M</code> and <code style="font-family:'Space Mono',monospace;font-size:13.5px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">30s</code> parse; <code style="font-family:'Space Mono',monospace;font-size:13.5px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">512MB</code>, <code style="font-family:'Space Mono',monospace;font-size:13.5px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">1.5G</code> and <code style="font-family:'Space Mono',monospace;font-size:13.5px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">30S</code> do not.</p>
+          </div>
+
+          <h2 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:29px;letter-spacing:-.03em;margin:0 0 8px;">3. Start the flock</h2>
+          <p style="font-size:16.5px;line-height:1.65;color:var(--ink-2);margin:0 0 18px;">You never launch the daemon yourself. <code style="font-family:'Space Mono',monospace;font-size:14px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">shep start</code> notices nothing is listening and re-execs itself in the background.</p>
+          <div style="background:#0D1712;border:3px solid var(--line);border-radius:16px;padding:20px 22px;font-family:'Space Mono',monospace;font-size:13px;line-height:1.9;color:#E8E4D4;overflow-x:auto;margin:0 0 22px;">
+            <div style="white-space:pre;"><span style="color:#6FCB6B;">$</span> shep start Flockfile.toml</div>
+            <div style="white-space:pre;"><span style="color:#6FCB6B;">$</span> shep ls</div>
+            <div style="white-space:pre;color:#7E9186;">ID  NAME    STATUS  PID   RESTARTS  CPU    MEM    UPTIME  FOLD</div>
+            <div style="white-space:pre;">1   web     <span style="color:#6FCB6B;">online</span>  1001  1         12.5%  48.1M  1m      backend</div>
+            <div style="white-space:pre;">2   worker  <span style="color:#6FCB6B;">online</span>  1002  2         12.5%  48.1M  2m      backend</div>
+            <div style="white-space:pre;">3   cron    <span style="color:#6FCB6B;">online</span>  1003  3         <span style="color:#7E9186;">-</span>      48.1M  30s     backend</div>
+          </div>
+          <p style="font-size:15px;line-height:1.6;color:var(--ink-3);margin:0 0 40px;">The CPU column prints <code style="font-family:'Space Mono',monospace;font-size:13.5px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">-</code> rather than <code style="font-family:'Space Mono',monospace;font-size:13.5px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">0.0%</code> when a reading is unavailable, because a confident zero is worse than an obvious blank.</p>
+
+          <h2 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:29px;letter-spacing:-.03em;margin:0 0 8px;">4. Watch what it prints</h2>
+          <p style="font-size:16.5px;line-height:1.65;color:var(--ink-2);margin:0 0 18px;"><code style="font-family:'Space Mono',monospace;font-size:14px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">shep bleats</code> follows the logs; <code style="font-family:'Space Mono',monospace;font-size:14px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">--no-follow</code> prints the tail and exits. If you prefer the boring word, <code style="font-family:'Space Mono',monospace;font-size:14px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">shep logs</code> is the same command and always will be.</p>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin:0 0 40px;">
+            <sc-for list="{{ aliasPairs }}" as="a" hint-placeholder-count="4">
+              <div style="background:var(--paper-2);border:2.5px solid var(--hair);border-radius:14px;padding:14px 16px;">
+                <div style="font-family:'Space Mono',monospace;font-size:14px;font-weight:700;color:var(--meadow);">{{ a.themed }}</div>
+                <div style="font-family:'Space Mono',monospace;font-size:12.5px;color:var(--ink-3);margin-top:5px;">same as {{ a.plain }}</div>
+              </div>
+            </sc-for>
+          </div>
+
+          <h2 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:29px;letter-spacing:-.03em;margin:0 0 8px;">5. Pipe it somewhere</h2>
+          <p style="font-size:16.5px;line-height:1.65;color:var(--ink-2);margin:0 0 18px;">Every command renders as <code style="font-family:'Space Mono',monospace;font-size:14px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">--format json</code> too, under a versioned envelope, so nothing has to scrape columns.</p>
+          <div style="background:#0D1712;border:3px solid var(--line);border-radius:16px;padding:20px 22px;font-family:'Space Mono',monospace;font-size:13px;line-height:1.85;color:#E8E4D4;overflow-x:auto;white-space:pre;margin:0 0 40px;">{
+  <span style="color:#78BEEC;">"schema_version"</span>: <span style="color:#F6D072;">1</span>,
+  <span style="color:#78BEEC;">"command"</span>: <span style="color:#7FD98E;">"flock"</span>,
+  <span style="color:#78BEEC;">"data"</span>: [
+    { <span style="color:#78BEEC;">"id"</span>: <span style="color:#F6D072;">1</span>, <span style="color:#78BEEC;">"name"</span>: <span style="color:#7FD98E;">"web"</span>, <span style="color:#78BEEC;">"status"</span>: <span style="color:#7FD98E;">"online"</span>, <span style="color:#78BEEC;">"pid"</span>: <span style="color:#F6D072;">1001</span>,
+      <span style="color:#78BEEC;">"restarts"</span>: <span style="color:#F6D072;">1</span>, <span style="color:#78BEEC;">"uptime_ms"</span>: <span style="color:#F6D072;">60000</span>, <span style="color:#78BEEC;">"fold"</span>: <span style="color:#7FD98E;">"backend"</span>,
+      <span style="color:#78BEEC;">"cpu_percent"</span>: <span style="color:#F6D072;">12.5</span>, <span style="color:#78BEEC;">"memory_bytes"</span>: <span style="color:#F6D072;">50462720</span>, <span style="color:#78BEEC;">"dog"</span>: <span style="color:#FF7B4F;">null</span> }
+  ]
+}</div>
+
+          <h2 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:29px;letter-spacing:-.03em;margin:0 0 18px;">Where to go next</h2>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;">
+            <sc-for list="{{ nextSteps }}" as="s" hint-placeholder-count="3">
+              <button onClick="{{ s.go }}" style="text-align:left;background:var(--paper-2);border:3px solid var(--line);border-radius:18px;box-shadow:5px 5px 0 var(--shadow);padding:20px;cursor:pointer;color:var(--ink);font-family:'Space Grotesk',sans-serif;" style-hover="transform:translate(2px,2px);box-shadow:3px 3px 0 var(--shadow);">
+                <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:17px;margin-bottom:7px;">{{ s.title }}</div>
+                <div style="font-size:14px;line-height:1.5;color:var(--ink-2);">{{ s.body }}</div>
+              </button>
+            </sc-for>
+          </div>
+        </article>
+      </sc-if>
+
+      <sc-if value="{{ isTerms }}">
+        <article>
+          <h1 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:clamp(36px,4.6vw,56px);line-height:1;letter-spacing:-.04em;margin:0 0 18px;">Terminology</h1>
+          <p style="font-size:19px;line-height:1.6;color:var(--ink-2);margin:0 0 22px;text-wrap:pretty;">The vocabulary is not decoration. A process manager gives you a lot of nouns to keep straight, and sheep are a better mnemonic than "target group" or "managed unit".</p>
+          <p style="font-size:19px;line-height:1.6;color:var(--ink-2);margin:0 0 34px;text-wrap:pretty;">Where the joke would cost clarity it gets dropped: <code style="font-family:'Space Mono',monospace;font-size:16px;background:var(--code-bg);border-radius:5px;padding:2px 7px;">kill</code> is called kill, error messages are written in plain technical English, and every themed verb has a straight alias that works forever.</p>
+
+          <h2 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:29px;letter-spacing:-.03em;margin:0 0 18px;">The lexicon</h2>
+          <div style="border:3px solid var(--line);border-radius:18px;overflow:hidden;margin:0 0 40px;">
+            <div style="display:grid;grid-template-columns:150px minmax(0,1.1fr) minmax(0,1.1fr) 74px;gap:14px;padding:13px 20px;background:var(--ink);">
+              <span style="font-family:'Space Mono',monospace;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--butter);">shep says</span>
+              <span style="font-family:'Space Mono',monospace;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:#7E9186;">means</span>
+              <span style="font-family:'Space Mono',monospace;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:#7E9186;">where you meet it</span>
+              <span style="font-family:'Space Mono',monospace;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:#7E9186;text-align:right;">built</span>
+            </div>
+            <sc-for list="{{ lexicon }}" as="l" hint-placeholder-count="15">
+              <div style="display:grid;grid-template-columns:150px minmax(0,1.1fr) minmax(0,1.1fr) 74px;gap:14px;padding:14px 20px;border-bottom:2px solid var(--hair);background:var(--paper-2);align-items:start;">
+                <span style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:15.5px;color:var(--meadow);line-height:1.3;">{{ l.term }}</span>
+                <span style="font-size:14px;line-height:1.5;color:var(--ink);">{{ l.means }}</span>
+                <span style="font-family:'Space Mono',monospace;font-size:12.5px;line-height:1.5;color:var(--ink-2);">{{ l.where }}</span>
+                <span style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:{{ l.tone }};text-align:right;">{{ l.built }}</span>
+              </div>
+            </sc-for>
+          </div>
+
+          <div style="background:var(--paper-2);border:3px solid var(--line);border-radius:18px;padding:24px 26px;margin:0 0 40px;">
+            <h3 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:20px;margin:0 0 10px;">Sheepdogs and sheep were separate ideas from the start</h3>
+            <p style="margin:0;font-size:15.5px;line-height:1.6;color:var(--ink-2);">So "dog" never means the daemon. The shepherd is the shepherd. Dogs are plugins that work for it — <code style="font-family:'Space Mono',monospace;font-size:13.5px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">metrics</code> and <code style="font-family:'Space Mono',monospace;font-size:13.5px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">bark</code> ship inside the binary, and <code style="font-family:'Space Mono',monospace;font-size:13.5px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">shep adopt</code> runs anyone else's.</p>
+          </div>
+
+          <h2 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:29px;letter-spacing:-.03em;margin:0 0 8px;">Usage rules</h2>
+          <p style="font-size:16.5px;line-height:1.65;color:var(--ink-2);margin:0 0 22px;">Readability beats theme, every time.</p>
+          <div style="display:grid;gap:14px;">
+            <sc-for list="{{ rules }}" as="r" hint-placeholder-count="5">
+              <div style="display:grid;grid-template-columns:38px minmax(0,1fr);gap:16px;align-items:start;background:var(--paper-2);border:2.5px solid var(--hair);border-radius:16px;padding:20px;">
+                <span style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:20px;color:var(--bark);">{{ r.n }}</span>
+                <div>
+                  <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:17px;margin-bottom:6px;">{{ r.title }}</div>
+                  <p style="margin:0;font-size:15px;line-height:1.6;color:var(--ink-2);">{{ r.body }}</p>
+                </div>
+              </div>
+            </sc-for>
+          </div>
+        </article>
+      </sc-if>
+
+      <sc-if value="{{ isStub }}">
+        <article>
+          <h1 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:clamp(34px,4.4vw,52px);line-height:1;letter-spacing:-.04em;margin:0 0 18px;">{{ stubTitle }}</h1>
+          <p style="font-size:19px;line-height:1.6;color:var(--ink-2);margin:0 0 34px;max-width:56ch;">{{ stubBlurb }}</p>
+          <div style="background:var(--paper-2);border:3px dashed var(--line);border-radius:20px;padding:34px;display:grid;grid-template-columns:auto minmax(0,1fr);gap:26px;align-items:center;">
+            <svg viewBox="0 0 104 78" style="width:96px;height:72px;opacity:.85;">
+              <g fill="var(--ink)"><rect x="40" y="52" width="8" height="21" rx="4"></rect><rect x="66" y="52" width="8" height="21" rx="4"></rect></g>
+              <path d="M40 20c6-9 22-10 28-2 10-3 19 4 18 13 7 4 7 15-1 19-2 8-12 11-19 8-8 5-21 4-26-3-10 1-17-7-15-16-4-8 4-18 15-19Z" fill="var(--fleece)" stroke="var(--ink)" stroke-width="4" stroke-linejoin="round"></path>
+              <ellipse cx="26" cy="34" rx="9" ry="7" transform="rotate(-28 26 34)" fill="var(--ink)"></ellipse>
+              <ellipse cx="27" cy="48" rx="15" ry="14" fill="var(--ink)"></ellipse>
+              <circle cx="20" cy="45" r="3" fill="var(--fleece)"></circle>
+              <path d="M17 44h6" stroke="var(--ink)" stroke-width="2" stroke-linecap="round"></path>
+            </svg>
+            <div>
+              <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:21px;margin-bottom:8px;">This page hasn't been written yet.</div>
+              <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:var(--ink-2);">The material exists in the repo under <code style="font-family:'Space Mono',monospace;font-size:13.5px;background:var(--code-bg);border-radius:5px;padding:1px 6px;">{{ stubSource }}</code>. It gets a real page here before 1.0.</p>
+              <a href="https://github.com/TurtIeSocks/shep/tree/main/docs" style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:15px;background:var(--ink);color:var(--paper);border:3px solid var(--line);border-radius:12px;padding:12px 18px;text-decoration:none;display:inline-block;box-shadow:4px 4px 0 var(--meadow);" style-hover="transform:translate(2px,2px);box-shadow:2px 2px 0 var(--meadow);color:var(--paper);">Read it on GitHub →</a>
+            </div>
+          </div>
+        </article>
+      </sc-if>
+
+      <div style="margin-top:56px;padding-top:26px;border-top:3px solid var(--line);display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:16px;">
+        <span style="font-family:'Space Mono',monospace;font-size:12.5px;color:var(--ink-3);">shep docs · pre-release · MIT OR Apache-2.0</span>
+        <a href="Shep Design Language.dc.html" style="font-size:14px;font-weight:700;color:var(--sky);text-decoration:none;border-bottom:2.5px solid var(--sky);">The design language →</a>
+      </div>
+    </main>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1340,&quot;height&quot;:900}}">
+class Component extends DCLogic {
+  state = { theme: "light", page: "start" };
+
+  componentDidMount() {
+    const saved = localStorage.getItem("shep-theme");
+    if (saved) this.applyTheme(saved);
+    if (location.hash === "#terminology") this.setState({ page: "terms" });
+  }
+
+  applyTheme(t) {
+    document.documentElement.setAttribute("data-theme", t);
+    localStorage.setItem("shep-theme", t);
+    this.setState({ theme: t });
+  }
+
+  go(page) {
+    this.setState({ page });
+    window.scrollTo({ top: 0 });
+  }
+
+  pages() {
+    return {
+      start: { label: "Getting started", crumb: "Start here / Getting started" },
+      flockfile: { label: "Your first Flockfile", crumb: "Start here / Your first Flockfile", title: "Your first Flockfile", blurb: "Every field a Flockfile understands, the ten filenames config discovery searches, and the strict grammar for durations and sizes.", source: "docs/specs/shep-v1.md" },
+      migration: { label: "Coming from pm2", crumb: "Start here / Coming from pm2", title: "Coming from pm2", blurb: "shep import reads a real dump.pm2 and writes a Flockfile. It starts nothing, and names on stderr everything that could not survive the trip unchanged.", source: "docs/migration.md" },
+      terms: { label: "Terminology", crumb: "Concepts / Terminology" },
+      folds: { label: "Folds", crumb: "Concepts / Folds", title: "Folds", blurb: "A fold is a namespace: shep fold backend lists one, and fold = in a Flockfile puts a sheep in it.", source: "docs/specs/shep-v1.md" },
+      channel: { label: "The shepherd channel", crumb: "Concepts / The shepherd channel", title: "The shepherd channel", blurb: "Set channel = true and your app gets a private pipe on fd 3, speaking newline JSON. shep trigger sends a named action down it and prints what each instance answered.", source: "docs/shepherd-channel.md" },
+      dogs: { label: "Dogs", crumb: "Concepts / Dogs", title: "Dogs", blurb: "A dog is a plugin the shepherd supervises for its own sake: it watches the flock rather than being part of it. metrics and bark ship inside the binary; adopt runs anyone else's.", source: "docs/dogs.md" },
+      cli: { label: "CLI", crumb: "Reference / CLI", title: "CLI reference", blurb: "Every verb, its aliases, its flags, and its exit codes — generated from the same clap tree the binary parses with.", source: "crates/shep-cli/src/cli.rs" },
+      json: { label: "JSON output", crumb: "Reference / JSON output", title: "JSON output", blurb: "The versioned envelope every command answers in under --format json, and what a schema_version bump does and does not promise.", source: "docs/specs/shep-v1.md" },
+      roadmap: { label: "What's not built", crumb: "Reference / What's not built", title: "What's not built yet", blurb: "The lookout TUI, the whistle MCP server, shep serve, scale, signal, sendline, .js Flockfiles, Windows — the full list, including the six things deliberately held back past 1.0.", source: "docs/specs/deferred.md" }
+    };
+  }
+
+  renderVals() {
+    const dark = this.state.theme === "dark";
+    const page = this.state.page;
+    const pages = this.pages();
+    const built = { start: true, terms: true };
+    const item = key => {
+      const active = page === key;
+      return {
+        label: pages[key].label,
+        weight: active ? 700 : 400,
+        bg: active ? "var(--butter)" : "transparent",
+        fg: active ? "#17251C" : "var(--ink-2)",
+        border: active ? "var(--line)" : "transparent",
+        tag: built[key] ? "" : "soon",
+        tagColor: "var(--bark)",
+        go: () => this.go(key)
+      };
+    };
+    const current = pages[page];
+    return {
+      themeIcon: dark ? "☀" : "☾",
+      toggleTheme: () => this.applyTheme(dark ? "light" : "dark"),
+      crumb: current.crumb,
+      isStart: page === "start",
+      isTerms: page === "terms",
+      isStub: !built[page],
+      stubTitle: current.title,
+      stubBlurb: current.blurb,
+      stubSource: current.source,
+      nav: [
+        { label: "Start here", items: ["start", "flockfile", "migration"].map(item) },
+        { label: "Concepts", items: ["terms", "folds", "channel", "dogs"].map(item) },
+        { label: "Reference", items: ["cli", "json", "roadmap"].map(item) }
+      ],
+      aliasPairs: [
+        { themed: "shep bleats", plain: "shep logs" },
+        { themed: "shep flock", plain: "shep list / ls" },
+        { themed: "shep muster", plain: "resurrect" },
+        { themed: "shep thatlldo", plain: "graceful stop" }
+      ],
+      nextSteps: [
+        { title: "Terminology →", body: "Fifteen words carry the whole product. Learn them once and the CLI explains itself.", go: () => this.go("terms") },
+        { title: "Coming from pm2 →", body: "Turn a real dump.pm2 into a Flockfile, and see what cluster mode costs on the way.", go: () => this.go("migration") },
+        { title: "Dogs →", body: "Turn on Prometheus metrics and webhook alerts, or adopt a binary of your own.", go: () => this.go("dogs") }
+      ],
+      lexicon: [
+        { term: "the shepherd", means: "the daemon", where: "log messages, docs", built: "yes", tone: "var(--meadow)" },
+        { term: "the flock", means: "every managed process, as a set", where: "shep flock (list, ls)", built: "yes", tone: "var(--meadow)" },
+        { term: "a sheep", means: "one managed process (singular only)", where: "shep describe <name>", built: "yes", tone: "var(--meadow)" },
+        { term: "a fold", means: "a namespace or group", where: "shep fold backend, fold = in config", built: "yes", tone: "var(--meadow)" },
+        { term: "Flockfile", means: "the app config file", where: "Flockfile.toml / .yaml / .json / .json5", built: "yes", tone: "var(--meadow)" },
+        { term: "bleats", means: "logs", where: "shep bleats (logs)", built: "yes", tone: "var(--meadow)" },
+        { term: "muster", means: "bring a saved flock back", where: "shep save, then shep muster", built: "yes", tone: "var(--meadow)" },
+        { term: "the shepherd channel", means: "a private pipe on fd 3 between daemon and app", where: "channel = true, shep trigger", built: "yes", tone: "var(--meadow)" },
+        { term: "a lamb", means: "a child process of a sheep", where: "tree-kill today, describe tree view later", built: "partly", tone: "var(--butter)" },
+        { term: "a dog", means: "a plugin process the shepherd supervises", where: "shep enable metrics, shep dogs", built: "yes", tone: "var(--meadow)" },
+        { term: "a bark", means: "a webhook alert", where: "[dog.bark.sinks] config, shep barks", built: "yes", tone: "var(--meadow)" },
+        { term: "the whistle", means: "the MCP interface agents talk to", where: "shep whistle", built: "no", tone: "var(--bark)" },
+        { term: "the lookout", means: "the terminal dashboard", where: "shep lookout (dash)", built: "no", tone: "var(--bark)" },
+        { term: "adopt / rehome", means: "register or drop a third-party dog", where: "shep adopt <name> <path>", built: "yes", tone: "var(--meadow)" },
+        { term: "that'll do", means: "graceful stop, after the real herding command", where: "shep thatlldo", built: "yes", tone: "var(--meadow)" }
+      ],
+      rules: [
+        { n: "1", title: "Straight verbs always work", body: "start, stop, restart, list, logs and delete are first-class aliases forever. Sheep terms are the personality layer, not a wall." },
+        { n: "2", title: "Destructive operations keep plain names", body: "kill, delete, exit codes and error messages carry zero whimsy — misreading one costs a process." },
+        { n: "3", title: "Types may be themed when self-evident", body: "Flock, Fold and Bark are fine. Heft as a struct name is not; it is called host." },
+        { n: "4", title: "Playful in prose, exact in reference", body: "The README can say shep keeps your flock alive. The config reference says process." },
+        { n: "5", title: "Log and error output stays technical", body: "The dog barks in webhooks, not in stderr." }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

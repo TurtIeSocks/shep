@@ -4,3 +4,6 @@
 # that the bare `/target` entry above does not cover.
 /benches/target
 *.snap.new
+
+# macOS Finder droppings
+.DS_Store

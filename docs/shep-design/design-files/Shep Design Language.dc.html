@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>shep — design language</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Space+Grotesk:wght@400;500;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --paper: #FBF6E7;
+    --paper-2: #FFFDF5;
+    --ink: #17251C;
+    --ink-2: #3D5245;
+    --ink-3: #7A8C80;
+    --line: #17251C;
+    --hair: rgba(23,37,28,.14);
+    --meadow: #2E8B57;
+    --grass: #6FCB6B;
+    --bark: #E0552B;
+    --butter: #F3C44C;
+    --sky: #4E9DD3;
+    --fleece: #FFFDF5;
+    --dot: rgba(23,37,28,.10);
+    --shadow: #17251C;
+  }
+  [data-theme="dark"] {
+    --paper: #131E18;
+    --paper-2: #1B2A21;
+    --ink: #F0ECDC;
+    --ink-2: #BFCFC2;
+    --ink-3: #7E9186;
+    --line: #35493C;
+    --hair: rgba(240,236,220,.14);
+    --meadow: #59C47D;
+    --grass: #7FD98E;
+    --bark: #FF7B4F;
+    --butter: #F6D072;
+    --sky: #78BEEC;
+    --fleece: #F0ECDC;
+    --dot: rgba(240,236,220,.10);
+    --shadow: #050A07;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'Space Grotesk', system-ui, sans-serif;
+    transition: background .25s ease, color .25s ease;
+  }
+  a { color: var(--meadow); text-decoration-thickness: 2px; text-underline-offset: 3px; }
+  a:hover { color: var(--bark); }
+  ::selection { background: var(--butter); color: #17251C; }
+</style>
+</helmet>
+<div style="min-height:100vh;background-image:radial-gradient(var(--dot) 1.5px, transparent 1.5px);background-size:24px 24px;">
+
+  <header style="max-width:1180px;margin:0 auto;padding:34px 32px 0;display:flex;align-items:center;justify-content:space-between;gap:24px;">
+    <div style="display:flex;align-items:center;gap:14px;">
+      <svg viewBox="0 0 104 78" style="width:56px;height:42px;flex:none;" aria-label="shep">
+        <g fill="var(--ink)">
+          <rect x="40" y="52" width="8" height="21" rx="4"></rect>
+          <rect x="66" y="52" width="8" height="21" rx="4"></rect>
+        </g>
+        <g fill="var(--fleece)" stroke="var(--ink)" stroke-width="4" stroke-linejoin="round">
+          <path d="M40 20c6-9 22-10 28-2 10-3 19 4 18 13 7 4 7 15-1 19-2 8-12 11-19 8-8 5-21 4-26-3-10 1-17-7-15-16-4-8 4-18 15-19Z"></path>
+        </g>
+        <g>
+          <ellipse cx="26" cy="34" rx="9" ry="7" transform="rotate(-28 26 34)" fill="var(--ink)"></ellipse>
+          <ellipse cx="27" cy="48" rx="15" ry="14" fill="var(--ink)"></ellipse>
+          <circle cx="22" cy="45" r="3" fill="var(--fleece)"></circle>
+          <circle cx="21.4" cy="45.6" r="1.4" fill="var(--ink)"></circle>
+        </g>
+      </svg>
+      <div>
+        <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:26px;letter-spacing:-.03em;line-height:1;">shep</div>
+        <div style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);margin-top:4px;">design language v1.0</div>
+      </div>
+    </div>
+    <button onClick="{{ toggleTheme }}" style="font-family:'Space Mono',monospace;font-size:12px;letter-spacing:.08em;text-transform:uppercase;background:var(--paper-2);color:var(--ink);border:2.5px solid var(--line);border-radius:999px;padding:10px 18px;cursor:pointer;box-shadow:3px 3px 0 var(--shadow);" style-hover="transform:translate(1px,1px);box-shadow:2px 2px 0 var(--shadow);">{{ themeLabel }}</button>
+  </header>
+
+  <section style="max-width:1180px;margin:0 auto;padding:56px 32px 40px;display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr);gap:48px;align-items:end;">
+    <div>
+      <div style="font-family:'Space Mono',monospace;font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--bark);margin-bottom:20px;">The house style</div>
+      <h1 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:clamp(44px,6vw,86px);line-height:.92;letter-spacing:-.045em;margin:0 0 24px;text-wrap:balance;">Cute on the<br />outside. Exact<br />where it counts.</h1>
+      <p style="font-size:19px;line-height:1.55;color:var(--ink-2);max-width:46ch;margin:0;text-wrap:pretty;">shep is a process manager written in Rust. The sheep are a mnemonic, not a costume — so the personality lives in prose, illustration and color, and drops out the moment a misread would cost someone a process.</p>
+    </div>
+    <div style="background:var(--paper-2);border:3px solid var(--line);border-radius:22px;box-shadow:7px 7px 0 var(--shadow);padding:26px;">
+      <div style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);margin-bottom:16px;">Three rules</div>
+      <ol style="margin:0;padding-left:22px;display:grid;gap:14px;font-size:15.5px;line-height:1.5;color:var(--ink-2);">
+        <li><strong style="color:var(--ink);">Whimsy in prose, plain in reference.</strong> The homepage says flock. The config table says process.</li>
+        <li><strong style="color:var(--ink);">Never charming about damage.</strong> kill, delete, errors and exit codes stay literal.</li>
+        <li><strong style="color:var(--ink);">Every themed word has a straight twin.</strong> bleats is also logs. Forever.</li>
+      </ol>
+    </div>
+  </section>
+
+  <div style="max-width:1180px;margin:0 auto;padding:0 32px;">
+    <div style="height:3px;background:var(--line);border-radius:2px;"></div>
+  </div>
+
+  <section style="max-width:1180px;margin:0 auto;padding:64px 32px;">
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:36px;">
+      <span style="font-family:'Space Mono',monospace;font-size:13px;color:var(--bark);">01</span>
+      <h2 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:38px;letter-spacing:-.03em;margin:0;">The marks</h2>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:22px;">
+
+      <div style="background:var(--paper-2);border:3px solid var(--line);border-radius:22px;box-shadow:6px 6px 0 var(--shadow);padding:28px;display:grid;gap:18px;">
+        <div style="height:150px;display:grid;place-items:center;background:var(--meadow);border-radius:14px;border:2.5px solid var(--line);">
+          <svg viewBox="0 0 104 78" style="width:120px;height:90px;">
+            <g fill="#17251C">
+              <rect x="40" y="52" width="8" height="21" rx="4"></rect>
+              <rect x="66" y="52" width="8" height="21" rx="4"></rect>
+            </g>
+            <g fill="#FFFDF5" stroke="#17251C" stroke-width="4" stroke-linejoin="round">
+              <path d="M40 20c6-9 22-10 28-2 10-3 19 4 18 13 7 4 7 15-1 19-2 8-12 11-19 8-8 5-21 4-26-3-10 1-17-7-15-16-4-8 4-18 15-19Z"></path>
+            </g>
+            <g>
+              <ellipse cx="26" cy="34" rx="9" ry="7" transform="rotate(-28 26 34)" fill="#17251C"></ellipse>
+              <ellipse cx="27" cy="48" rx="15" ry="14" fill="#17251C"></ellipse>
+              <circle cx="22" cy="45" r="3" fill="#FFFDF5"></circle>
+              <circle cx="21.4" cy="45.6" r="1.4" fill="#17251C"></circle>
+            </g>
+          </svg>
+        </div>
+        <div>
+          <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:19px;margin-bottom:6px;">A sheep</div>
+          <p style="margin:0;font-size:14.5px;line-height:1.5;color:var(--ink-2);">One managed process. Singular only — a set of them is the flock, never "sheeps" and never a bare plural.</p>
+        </div>
+      </div>
+
+      <div style="background:var(--paper-2);border:3px solid var(--line);border-radius:22px;box-shadow:6px 6px 0 var(--shadow);padding:28px;display:grid;gap:18px;">
+        <div style="height:150px;display:grid;place-items:center;background:var(--butter);border-radius:14px;border:2.5px solid var(--line);">
+          <svg viewBox="0 0 154 108" style="width:150px;height:105px;">
+            <path d="M104 52c18-2 27-14 24-29" fill="none" stroke="#17251C" stroke-width="11" stroke-linecap="round"></path>
+            <path d="M128.5 25.5 127 20" fill="none" stroke="#FFFDF5" stroke-width="7" stroke-linecap="round"></path>
+            <g fill="#1E140F" stroke="#17251C" stroke-width="4">
+              <rect x="82" y="56" width="12" height="42" rx="6"></rect>
+              <rect x="47" y="56" width="12" height="42" rx="6"></rect>
+            </g>
+            <path d="M40 56c0-13 15-22 37-22s33 8 33 21-13 22-33 22-37-8-37-21Z" fill="#2A1C15" stroke="#17251C" stroke-width="4" stroke-linejoin="round"></path>
+            <path d="M53 36c-9 5-13 12-13 20 0 9 5 16 14 20 7-5 10-12 10-20s-4-15-11-20Z" fill="#FFFDF5" stroke="#17251C" stroke-width="3.6" stroke-linejoin="round"></path>
+            <g fill="#2A1C15" stroke="#17251C" stroke-width="4">
+              <rect x="95" y="58" width="13" height="42" rx="6.5"></rect>
+              <rect x="57" y="58" width="13" height="42" rx="6.5"></rect>
+            </g>
+            <g fill="#FFFDF5" stroke="#17251C" stroke-width="3.4">
+              <rect x="82" y="84" width="12" height="14" rx="6"></rect>
+              <rect x="47" y="84" width="12" height="14" rx="6"></rect>
+              <rect x="95" y="86" width="13" height="14" rx="6.5"></rect>
+              <rect x="57" y="86" width="13" height="14" rx="6.5"></rect>
+            </g>
+            <g transform="translate(4,-8) scale(0.8)">
+              <g fill="#2A1C15" stroke="#17251C" stroke-width="5" stroke-linejoin="round">
+                <path d="M34 28c-12-5-22 2-20 14 2 12 11 20 21 18Z"></path>
+                <path d="M70 28c12-5 22 2 20 14-2 12-11 20-21 18Z"></path>
+                <path d="M32 36c0-14 9-22 20-22s20 8 20 22v10c0 15-9 24-20 24s-20-9-20-24V36Z"></path>
+              </g>
+              <path d="M52 15c4 0 6 7 6 13v14H46V28c0-6 2-13 6-13Z" fill="#FFFDF5"></path>
+              <ellipse cx="52" cy="57" rx="14" ry="10" fill="#E8D9C3" stroke="#17251C" stroke-width="3.75"></ellipse>
+              <path d="M52 63c4 0 7 3 7 7s-3 8-7 8-7-4-7-8 3-7 7-7Z" fill="#E0552B" stroke="#17251C" stroke-width="3.75"></path>
+              <path d="M52 47c5 0 8 3 8 6s-4 5-8 5-8-2-8-5 3-6 8-6Z" fill="#17251C"></path>
+              <circle cx="42" cy="38" r="4.4" fill="#FFFDF5" stroke="#17251C" stroke-width="2.5"></circle>
+              <circle cx="62" cy="38" r="4.4" fill="#FFFDF5" stroke="#17251C" stroke-width="2.5"></circle>
+              <circle cx="42.6" cy="38.8" r="2" fill="#17251C"></circle>
+              <circle cx="61.4" cy="38.8" r="2" fill="#17251C"></circle>
+            </g>
+          </svg>
+        </div>
+        <div>
+          <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:19px;margin-bottom:6px;">A dog</div>
+          <p style="margin:0;font-size:14.5px;line-height:1.5;color:var(--ink-2);">A plugin the shepherd supervises for its own sake: metrics, bark. Dogs work for the shepherd. A dog is never the daemon.</p>
+        </div>
+      </div>
+
+      <div style="background:var(--paper-2);border:3px solid var(--line);border-radius:22px;box-shadow:6px 6px 0 var(--shadow);padding:28px;display:grid;gap:18px;">
+        <div style="height:150px;display:grid;place-items:center;background:var(--ink);border-radius:14px;border:2.5px solid var(--line);">
+          <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:64px;letter-spacing:-.05em;color:var(--paper);line-height:1;">shep<span style="color:var(--grass);">.</span></div>
+        </div>
+        <div>
+          <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:19px;margin-bottom:6px;">The wordmark</div>
+          <p style="margin:0;font-size:14.5px;line-height:1.5;color:var(--ink-2);">Lowercase always, even at the start of a sentence — it is the binary's name. Bricolage Grotesque 800, tracking −5%.</p>
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:22px;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:22px;">
+      <div style="border:3px dashed var(--line);border-radius:22px;padding:24px 26px;">
+        <div style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--meadow);margin-bottom:12px;">Do</div>
+        <ul style="margin:0;padding-left:20px;display:grid;gap:8px;font-size:14.5px;line-height:1.5;color:var(--ink-2);">
+          <li>Keep 4px of clear fleece around the mark's outline at every size.</li>
+          <li>Below 32px wide, drop the legs and use the head-and-fleece silhouette only.</li>
+          <li>Put the mark on meadow, butter or ink. Never on grass — the fleece stops reading.</li>
+        </ul>
+      </div>
+      <div style="border:3px dashed var(--bark);border-radius:22px;padding:24px 26px;">
+        <div style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--bark);margin-bottom:12px;">Don't</div>
+        <ul style="margin:0;padding-left:20px;display:grid;gap:8px;font-size:14.5px;line-height:1.5;color:var(--ink-2);">
+          <li>Add a second animal. One sheep, one dog, that's the cast.</li>
+          <li>Rotate, gradient-fill, or add a drop shadow inside the mark.</li>
+          <li>Draw the sheep in distress to illustrate an error. Errors get a color, not a face.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section style="background:var(--paper-2);border-top:3px solid var(--line);border-bottom:3px solid var(--line);">
+    <div style="max-width:1180px;margin:0 auto;padding:64px 32px;">
+      <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:36px;">
+        <span style="font-family:'Space Mono',monospace;font-size:13px;color:var(--bark);">02</span>
+        <h2 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:38px;letter-spacing:-.03em;margin:0;">Color</h2>
+      </div>
+      <p style="font-size:17px;line-height:1.55;color:var(--ink-2);max-width:58ch;margin:0 0 32px;">Cream paper and ink carry every surface. Meadow is the only color that means "this works". The other four are earned: one for alerts, one for attention, one for reference, one for links.</p>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:18px;">
+        <sc-for list="{{ swatches }}" as="s" hint-placeholder-count="6">
+          <div style="border:3px solid var(--line);border-radius:18px;overflow:hidden;box-shadow:5px 5px 0 var(--shadow);">
+            <div style="height:104px;background:{{ s.bg }};"></div>
+            <div style="padding:14px 16px;background:var(--paper);border-top:3px solid var(--line);">
+              <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:16px;">{{ s.name }}</div>
+              <div style="font-family:'Space Mono',monospace;font-size:11.5px;color:var(--ink-3);margin:3px 0 8px;">{{ s.hex }}</div>
+              <div style="font-size:13px;line-height:1.45;color:var(--ink-2);">{{ s.use }}</div>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </section>
+
+  <section style="max-width:1180px;margin:0 auto;padding:64px 32px;">
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:36px;">
+      <span style="font-family:'Space Mono',monospace;font-size:13px;color:var(--bark);">03</span>
+      <h2 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:38px;letter-spacing:-.03em;margin:0;">Type</h2>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:22px;margin-bottom:34px;">
+      <div style="background:var(--paper-2);border:3px solid var(--line);border-radius:22px;padding:26px;box-shadow:6px 6px 0 var(--shadow);">
+        <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:56px;line-height:1;letter-spacing:-.04em;margin-bottom:16px;">Aa</div>
+        <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:17px;">Bricolage Grotesque</div>
+        <div style="font-family:'Space Mono',monospace;font-size:12px;color:var(--ink-3);margin-top:6px;">Display · 600, 800 · headings only</div>
+      </div>
+      <div style="background:var(--paper-2);border:3px solid var(--line);border-radius:22px;padding:26px;box-shadow:6px 6px 0 var(--shadow);">
+        <div style="font-family:'Space Grotesk',sans-serif;font-weight:500;font-size:56px;line-height:1;letter-spacing:-.02em;margin-bottom:16px;">Aa</div>
+        <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:17px;">Space Grotesk</div>
+        <div style="font-family:'Space Mono',monospace;font-size:12px;color:var(--ink-3);margin-top:6px;">Body · 400, 500, 700 · prose and UI</div>
+      </div>
+      <div style="background:var(--paper-2);border:3px solid var(--line);border-radius:22px;padding:26px;box-shadow:6px 6px 0 var(--shadow);">
+        <div style="font-family:'Space Mono',monospace;font-weight:700;font-size:52px;line-height:1;margin-bottom:20px;">Aa</div>
+        <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:17px;">Space Mono</div>
+        <div style="font-family:'Space Mono',monospace;font-size:12px;color:var(--ink-3);margin-top:6px;">Code · 400, 700 · terminals, labels, values</div>
+      </div>
+    </div>
+    <div style="display:grid;gap:0;border:3px solid var(--line);border-radius:22px;overflow:hidden;">
+      <sc-for list="{{ typeScale }}" as="t" hint-placeholder-count="5">
+        <div style="display:grid;grid-template-columns:190px minmax(0,1fr);gap:24px;align-items:center;padding:20px 26px;border-bottom:2px solid var(--hair);background:var(--paper-2);">
+          <div>
+            <div style="font-family:'Space Mono',monospace;font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);">{{ t.role }}</div>
+            <div style="font-family:'Space Mono',monospace;font-size:12.5px;color:var(--ink-2);margin-top:4px;">{{ t.spec }}</div>
+          </div>
+          <div style="font-family:{{ t.family }};font-weight:{{ t.weight }};font-size:{{ t.px }};line-height:1.15;letter-spacing:{{ t.tracking }};">{{ t.sample }}</div>
+        </div>
+      </sc-for>
+    </div>
+  </section>
+
+  <section style="background:var(--ink);color:var(--paper);border-top:3px solid var(--line);border-bottom:3px solid var(--line);">
+    <div style="max-width:1180px;margin:0 auto;padding:64px 32px;">
+      <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:36px;">
+        <span style="font-family:'Space Mono',monospace;font-size:13px;color:var(--butter);">04</span>
+        <h2 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:38px;letter-spacing:-.03em;margin:0;color:var(--paper);">Components</h2>
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:26px;">
+        <div style="background:var(--paper);color:var(--ink);border-radius:20px;padding:26px;border:3px solid var(--line);">
+          <div style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);margin-bottom:18px;">Buttons</div>
+          <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center;">
+            <span style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:16px;background:var(--meadow);color:#FFFDF5;border:3px solid #17251C;border-radius:14px;padding:13px 22px;box-shadow:4px 4px 0 #17251C;cursor:pointer;display:inline-block;" style-hover="transform:translate(2px,2px);box-shadow:2px 2px 0 #17251C;">Build from source</span>
+            <span style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:16px;background:#FFFDF5;color:#17251C;border:3px solid #17251C;border-radius:14px;padding:13px 22px;box-shadow:4px 4px 0 #17251C;cursor:pointer;display:inline-block;" style-hover="transform:translate(2px,2px);box-shadow:2px 2px 0 #17251C;">Read the docs</span>
+            <span style="font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:15px;color:#2E8B57;border-bottom:2.5px solid #2E8B57;cursor:pointer;">the lexicon →</span>
+          </div>
+        </div>
+
+        <div style="background:var(--paper);color:var(--ink);border-radius:20px;padding:26px;border:3px solid var(--line);">
+          <div style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);margin-bottom:18px;">Status pills</div>
+          <div style="display:flex;flex-wrap:wrap;gap:10px;">
+            <sc-for list="{{ statuses }}" as="st" hint-placeholder-count="5">
+              <span style="font-family:'Space Mono',monospace;font-size:12.5px;font-weight:700;background:{{ st.bg }};color:{{ st.fg }};border:2.5px solid #17251C;border-radius:999px;padding:7px 14px;display:inline-flex;align-items:center;gap:7px;">{{ st.label }}</span>
+            </sc-for>
+          </div>
+          <p style="font-size:13.5px;line-height:1.5;color:var(--ink-2);margin:18px 0 0;">Status text is the daemon's own word, lowercase, never restyled into a friendlier one.</p>
+        </div>
+      </div>
+
+      <div style="margin-top:26px;display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:26px;">
+        <div>
+          <div style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--butter);margin-bottom:14px;">Terminal block</div>
+          <div style="background:#0D1712;border:3px solid #35493C;border-radius:18px;overflow:hidden;">
+            <div style="display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:2px solid #35493C;">
+              <span style="width:11px;height:11px;border-radius:50%;background:#E0552B;display:block;"></span>
+              <span style="width:11px;height:11px;border-radius:50%;background:#F3C44C;display:block;"></span>
+              <span style="width:11px;height:11px;border-radius:50%;background:#57C46A;display:block;"></span>
+              <span style="font-family:'Space Mono',monospace;font-size:11.5px;color:#7E9186;margin-left:8px;">~/apps</span>
+            </div>
+            <div style="padding:20px;font-family:'Space Mono',monospace;font-size:13px;line-height:1.75;color:#E8E4D4;overflow-x:auto;">
+              <div style="white-space:pre;"><span style="color:#57C46A;">$</span> shep start Flockfile.toml</div>
+              <div style="white-space:pre;color:#7E9186;">shepherd not listening — starting one</div>
+              <div style="white-space:pre;"><span style="color:#57C46A;">✓</span> web      online   pid 1001</div>
+              <div style="white-space:pre;"><span style="color:#57C46A;">✓</span> worker   online   pid 1002</div>
+              <div style="white-space:pre;"><span style="color:#FF7B4F;">!</span> cron     errored  restart budget exhausted</div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--butter);margin-bottom:14px;">Callouts</div>
+          <div style="display:grid;gap:14px;">
+            <div style="background:var(--paper);border:3px solid #17251C;border-radius:16px;padding:18px 20px;display:grid;grid-template-columns:auto minmax(0,1fr);gap:14px;align-items:start;">
+              <span style="font-family:'Space Mono',monospace;font-weight:700;font-size:12px;background:#F3C44C;color:#17251C;border:2px solid #17251C;border-radius:8px;padding:3px 8px;">note</span>
+              <p style="margin:0;font-size:14.5px;line-height:1.5;color:#3D5245;"><code style="font-family:'Space Mono',monospace;font-size:13.5px;">shep logs</code> is the same command as <code style="font-family:'Space Mono',monospace;font-size:13.5px;">shep bleats</code>, and always will be.</p>
+            </div>
+            <div style="background:var(--paper);border:3px solid #E0552B;border-radius:16px;padding:18px 20px;display:grid;grid-template-columns:auto minmax(0,1fr);gap:14px;align-items:start;">
+              <span style="font-family:'Space Mono',monospace;font-weight:700;font-size:12px;background:#E0552B;color:#FFFDF5;border:2px solid #17251C;border-radius:8px;padding:3px 8px;">careful</span>
+              <p style="margin:0;font-size:14.5px;line-height:1.5;color:#3D5245;">An adopted dog runs at the shepherd's own trust level, with no isolation beyond it.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section style="max-width:1180px;margin:0 auto;padding:64px 32px;">
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:14px;">
+      <span style="font-family:'Space Mono',monospace;font-size:13px;color:var(--bark);">05</span>
+      <h2 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:38px;letter-spacing:-.03em;margin:0;">Shape and motion</h2>
+    </div>
+    <p style="font-size:17px;line-height:1.55;color:var(--ink-2);max-width:60ch;margin:0 0 32px;">One outline weight, one shadow, no blur. Everything that moves is an idle loop — nothing animates in response to scrolling except the sky.</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:22px;">
+      <div style="background:var(--paper-2);border:3px solid var(--line);border-radius:22px;box-shadow:6px 6px 0 var(--shadow);padding:28px;">
+        <div style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);margin-bottom:20px;">Shape</div>
+        <div style="display:grid;gap:16px;">
+          <sc-for list="{{ shapeRules }}" as="sr" hint-placeholder-count="4">
+            <div style="display:grid;grid-template-columns:96px minmax(0,1fr);gap:18px;align-items:center;">
+              <div style="height:56px;display:grid;place-items:center;">
+                <span style="width:{{ sr.w }};height:{{ sr.h }};background:{{ sr.fill }};border:{{ sr.border }} solid var(--line);border-radius:{{ sr.radius }};box-shadow:{{ sr.shadow }};transform:rotate({{ sr.tilt }});display:block;"></span>
+              </div>
+              <div>
+                <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:16px;margin-bottom:3px;">{{ sr.name }}</div>
+                <div style="font-size:14px;line-height:1.45;color:var(--ink-2);">{{ sr.rule }}</div>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+      <div style="background:var(--paper-2);border:3px solid var(--line);border-radius:22px;box-shadow:6px 6px 0 var(--shadow);padding:28px;">
+        <div style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);margin-bottom:20px;">Motion</div>
+        <div style="display:grid;gap:0;">
+          <sc-for list="{{ motion }}" as="m" hint-placeholder-count="5">
+            <div style="display:grid;grid-template-columns:118px minmax(0,1fr);gap:16px;padding:13px 0;border-bottom:2px solid var(--hair);align-items:baseline;">
+              <div style="font-family:'Space Mono',monospace;font-size:13px;font-weight:700;color:var(--meadow);">{{ m.name }}</div>
+              <div>
+                <div style="font-size:14.5px;line-height:1.45;color:var(--ink);">{{ m.what }}</div>
+                <div style="font-family:'Space Mono',monospace;font-size:11.5px;color:var(--ink-3);margin-top:3px;">{{ m.spec }}</div>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+        <p style="margin:18px 0 0;font-size:13.5px;line-height:1.5;color:var(--ink-2);">Give any two animals different durations and offset delays. Two sheep bobbing in lockstep reads as a loading spinner.</p>
+      </div>
+    </div>
+
+    <div style="margin-top:22px;background:var(--paper-2);border:3px solid var(--line);border-radius:22px;box-shadow:6px 6px 0 var(--shadow);padding:28px;">
+      <div style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);margin-bottom:18px;">Scenery</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:20px;">
+        <sc-for list="{{ scenery }}" as="sc" hint-placeholder-count="4">
+          <div>
+            <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:16px;margin-bottom:6px;">{{ sc.name }}</div>
+            <p style="margin:0;font-size:14px;line-height:1.5;color:var(--ink-2);">{{ sc.rule }}</p>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </section>
+
+  <section style="max-width:1180px;margin:0 auto;padding:14px 32px 90px;">
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:14px;">
+      <span style="font-family:'Space Mono',monospace;font-size:13px;color:var(--bark);">06</span>
+      <h2 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:38px;letter-spacing:-.03em;margin:0;">Voice</h2>
+    </div>
+    <p style="font-size:17px;line-height:1.55;color:var(--ink-2);max-width:60ch;margin:0 0 32px;">Four registers, and knowing which one you are in is most of the job.</p>
+    <div style="display:grid;gap:0;border:3px solid var(--line);border-radius:22px;overflow:hidden;background:var(--paper-2);">
+      <sc-for list="{{ registers }}" as="r" hint-placeholder-count="4">
+        <div style="display:grid;grid-template-columns:200px minmax(0,1fr) minmax(0,1fr);gap:22px;padding:22px 26px;border-bottom:2px solid var(--hair);align-items:start;">
+          <div>
+            <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:18px;">{{ r.where }}</div>
+            <div style="font-family:'Space Mono',monospace;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:{{ r.tone }};margin-top:5px;">{{ r.register }}</div>
+          </div>
+          <div style="font-family:'Space Mono',monospace;font-size:13.5px;line-height:1.6;color:var(--meadow);">{{ r.yes }}</div>
+          <div style="font-family:'Space Mono',monospace;font-size:13.5px;line-height:1.6;color:var(--ink-3);text-decoration:line-through;">{{ r.no }}</div>
+        </div>
+      </sc-for>
+    </div>
+
+    <div style="margin-top:44px;background:var(--grass);border:3px solid var(--line);border-radius:24px;box-shadow:8px 8px 0 var(--shadow);padding:34px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:30px;align-items:center;">
+      <div>
+        <h3 style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:30px;letter-spacing:-.03em;margin:0 0 10px;color:#17251C;">The lexicon is the design system too.</h3>
+        <p style="margin:0;font-size:16px;line-height:1.55;color:#17251C;max-width:52ch;">Fifteen words carry the whole product. Get them right and the interface explains itself; get them wrong and no amount of illustration saves it.</p>
+      </div>
+      <a href="Shep Docs.dc.html" style="font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:17px;background:#17251C;color:#FFFDF5;border:3px solid #17251C;border-radius:14px;padding:15px 24px;text-decoration:none;white-space:nowrap;box-shadow:4px 4px 0 #FFFDF5;" style-hover="transform:translate(2px,2px);box-shadow:2px 2px 0 #FFFDF5;color:#FFFDF5;">Read the lexicon →</a>
+    </div>
+  </section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1280,&quot;height&quot;:900}}">
+class Component extends DCLogic {
+  state = { theme: "light" };
+
+  componentDidMount() {
+    const saved = localStorage.getItem("shep-theme");
+    if (saved) this.applyTheme(saved);
+  }
+
+  applyTheme(t) {
+    document.documentElement.setAttribute("data-theme", t);
+    localStorage.setItem("shep-theme", t);
+    this.setState({ theme: t });
+  }
+
+  renderVals() {
+    const dark = this.state.theme === "dark";
+    return {
+      themeLabel: dark ? "☀ day pasture" : "☾ night pasture",
+      toggleTheme: () => this.applyTheme(dark ? "light" : "dark"),
+      swatches: [
+        { name: "Cream", hex: "#FBF6E7", bg: "#FBF6E7", use: "Paper. Every page starts here." },
+        { name: "Ink", hex: "#17251C", bg: "#17251C", use: "Text, every outline, every hard shadow." },
+        { name: "Meadow", hex: "#2E8B57", bg: "#2E8B57", use: "Primary. Online, healthy, go." },
+        { name: "Grass", hex: "#6FCB6B", bg: "#6FCB6B", use: "Large happy fills and terminal success." },
+        { name: "Bark", hex: "#E0552B", bg: "#E0552B", use: "Errored, refused, destructive. Nothing else." },
+        { name: "Butter", hex: "#F3C44C", bg: "#F3C44C", use: "Attention: launching, notes, highlights." },
+        { name: "Sky", hex: "#4E9DD3", bg: "#4E9DD3", use: "Reference material and inline links in docs." },
+        { name: "Fleece", hex: "#FFFDF5", bg: "#FFFDF5", use: "Cards and panels lifted off the paper." },
+        { name: "Barn", hex: "#C6432E", bg: "#C6432E", use: "Scenery only — barn walls and roofs. Never UI or status." }
+      ],
+      typeScale: [
+        { role: "Hero", spec: "Bricolage 800 · 86/80 · −4.5%", family: "'Bricolage Grotesque',sans-serif", weight: 800, px: "56px", tracking: "-.045em", sample: "keeps your flock alive" },
+        { role: "Section", spec: "Bricolage 800 · 38/44 · −3%", family: "'Bricolage Grotesque',sans-serif", weight: 800, px: "34px", tracking: "-.03em", sample: "What works today" },
+        { role: "Body", spec: "Space Grotesk 400 · 17/27", family: "'Space Grotesk',sans-serif", weight: 400, px: "17px", tracking: "0", sample: "It restarts them when they die, captures what they print, and says plainly when something is wrong." },
+        { role: "Label", spec: "Space Mono 400 · 12 · +14% caps", family: "'Space Mono',monospace", weight: 400, px: "12px", tracking: ".14em", sample: "PRE-RELEASE, AND HONEST ABOUT IT" },
+        { role: "Code", spec: "Space Mono 400 · 13/23", family: "'Space Mono',monospace", weight: 400, px: "13px", tracking: "0", sample: "shep bleats web --no-follow" }
+      ],
+      statuses: [
+        { label: "online", bg: "#57C46A", fg: "#17251C" },
+        { label: "launching", bg: "#F3C44C", fg: "#17251C" },
+        { label: "stopped", bg: "#E8E4D4", fg: "#3D5245" },
+        { label: "errored", bg: "#E0552B", fg: "#FFFDF5" },
+        { label: "dog", bg: "#17251C", fg: "#F3C44C" }
+      ],
+      shapeRules: [
+        { name: "Outline", w: "58px", h: "38px", fill: "var(--fleece)", border: "3px", radius: "12px", shadow: "none", tilt: "0deg", rule: "3px on UI, 4px on illustration and hero panels. The only thinner line is a 2px table rule." },
+        { name: "Radius", w: "58px", h: "38px", fill: "var(--butter)", border: "3px", radius: "999px", shadow: "none", tilt: "0deg", rule: "999px pills, 22px cards, 16px blocks inside cards, 14px buttons." },
+        { name: "Shadow", w: "52px", h: "36px", fill: "var(--fleece)", border: "3px", radius: "12px", shadow: "6px 6px 0 var(--shadow)", tilt: "0deg", rule: "Solid ink, equal x and y, never blurred. 3px on pills, 6px on cards, 9px on hero panels." },
+        { name: "Tilt", w: "56px", h: "38px", fill: "var(--grass)", border: "3px", radius: "12px", shadow: "5px 5px 0 var(--shadow)", tilt: "-4deg", rule: "±1.4deg maximum, and a card straightens on hover. Anything more looks broken, not hand-set." }
+      ],
+      motion: [
+        { name: "bob", what: "Sheep idling in the pasture", spec: "5–6.6s ease-in-out infinite · −7px, ±1.5deg" },
+        { name: "chew", what: "The lead sheep's head only", spec: "2.4s ease-in-out infinite · −7deg" },
+        { name: "wag", what: "The dog's tail — the fastest thing on any page", spec: "1.1s ease-in-out infinite · −14 to 16deg" },
+        { name: "twinkle", what: "Stars before the sun comes up", spec: "2.6–4.8s ease-in-out infinite · opacity .35 → 1" },
+        { name: "press", what: "Buttons and pills under the cursor", spec: "no transition · translate 2–3px, shadow shrinks the same" }
+      ],
+      scenery: [
+        { name: "The sky does the work", rule: "One fixed gradient behind the whole scene, night at the top to afternoon at the bottom. Scrolling moves you through the day; nothing else reacts to scroll." },
+        { name: "Two hill bands, always", rule: "A pale far band and a saturated near band, both 4px outlined, both cropped past the viewport edge so no seam shows." },
+        { name: "The barn is scenery", rule: "Barn red belongs to walls and roofs only. It never becomes a status, a button, or a border on a UI surface." },
+        { name: "Population", rule: "Three to five sheep and exactly one dog per scene. The dog stands apart from the flock — it watches, it is not counted." }
+      ],
+      registers: [
+        { where: "Landing page", register: "playful", tone: "#2E8B57", yes: "shep keeps your flock alive.", no: "Enterprise-grade process orchestration." },
+        { where: "Docs prose", register: "playful, precise", tone: "#2E8B57", yes: "A dog watches the flock rather than being part of it.", no: "Woof! Let's get your doggos going!" },
+        { where: "Config reference", register: "plain", tone: "#4E9DD3", yes: "instances — number of processes to run.", no: "instances — how many sheep in this pen." },
+        { where: "Errors and logs", register: "technical only", tone: "#E0552B", yes: "no shepherd channel — set channel = true", no: "Oh no, the sheep wandered off! 🐑" }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>
