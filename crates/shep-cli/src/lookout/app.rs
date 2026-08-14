@@ -45,12 +45,8 @@ use super::theme::Palette;
 /// operator's own process under the operator's own uid; anyone who can run it
 /// can run `shep stop`. The gate exists so a keystroke in a dashboard someone
 /// is reading does not become an action they did not intend.
-// Every public item below this point is not yet constructed or called
-// outside this module's own tests: Task 8 (`mod.rs`, the verb and the event
-// loop) is the real caller that wires `App`, `Msg` and friends together, and
-// it has not landed yet. `#[allow(dead_code)]` says so explicitly, same
-// convention `theme::Palette` already carries for the identical reason.
-#[allow(dead_code)]
+// Every public item below this point is wired together by `super::mod`'s
+// `lookout` and `run_ui` — the real caller for `App`, `Msg` and friends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
     /// Actions refuse. The default.
@@ -66,7 +62,6 @@ pub enum Control {
 /// A plain enum, rather than `crossterm::event::KeyEvent`, so this module and
 /// its tests never touch a terminal crate: `super::input::map_key` does the
 /// translation at the edge.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyPress {
     /// `q`, `Esc`, or `Ctrl-C`.
@@ -87,7 +82,6 @@ pub enum KeyPress {
 }
 
 /// Everything that can change the dashboard.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Msg {
     /// A `Request::ListFlock` reply landed. `at` is when it was received, and
@@ -135,7 +129,6 @@ pub enum Msg {
 }
 
 /// What the caller has to do after an update.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
     /// Nothing.
@@ -147,7 +140,6 @@ pub enum Effect {
 }
 
 /// The connection's state, as the dashboard reports it.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Link {
     /// Connected and subscribed.
@@ -167,7 +159,6 @@ pub enum Link {
 }
 
 /// One sheep's row: what the shepherd said, and when it said it.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Row {
     /// The shepherd's own snapshot of this sheep.
@@ -179,7 +170,6 @@ pub struct Row {
 
 /// A short line the status bar shows instead of the key hints, cleared by the
 /// next keypress.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     text: String,
@@ -188,7 +178,6 @@ pub struct Notice {
     grave: bool,
 }
 
-#[allow(dead_code)]
 impl Notice {
     /// Whether this notice is a refusal or a damage report rather than an
     /// informational one.
@@ -205,22 +194,20 @@ impl fmt::Display for Notice {
 }
 
 /// The whole dashboard's state.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct App {
     flock: BTreeMap<u32, Row>,
     /// Which row of [`Self::flock`] is first on screen. An offset, not a
     /// selection: nothing in 12a reads "the sheep the operator is pointing
     /// at", and the view clamps this against its own viewport height as well
-    /// (`super::view::flock::scroll_offset`, Task 4 — not an intra-doc link
-    /// yet, since that module does not exist until then).
+    /// ([`super::view::flock::scroll_offset`]).
     scroll: usize,
     link: Link,
     notice: Option<Notice>,
     palette: Palette,
     control: Control,
     /// The `$SHEP_HOME` this lookout watches, for the title line. Held here
-    /// rather than threaded through `super::view::draw`: it never changes for
+    /// rather than threaded through [`super::view::draw`]: it never changes for
     /// the life of the process, and a render function taking it as an argument
     /// would make every call site — including eight scene fixtures — carry it.
     home: String,
@@ -231,7 +218,6 @@ pub struct App {
     now: Instant,
 }
 
-#[allow(dead_code)]
 impl App {
     /// A dashboard with an empty flock, a live link, and no notice.
     #[must_use]
@@ -428,8 +414,7 @@ impl App {
     ///
     /// A request, not a result: the view clamps it again against its own
     /// viewport height, because this module does not know how tall the
-    /// terminal is. See `super::view::flock::scroll_offset` (Task 4 — not an
-    /// intra-doc link yet, since that module does not exist until then).
+    /// terminal is. See [`super::view::flock::scroll_offset`].
     #[must_use]
     pub fn scroll(&self) -> usize {
         self.scroll
@@ -489,7 +474,6 @@ impl App {
 /// Saturating `Duration` -> milliseconds. A lookout left open for 580 million
 /// years is not the failure this guards; the cast is what clippy's
 /// `cast_possible_truncation` would otherwise deny.
-#[allow(dead_code)]
 fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }

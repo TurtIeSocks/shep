@@ -23,11 +23,7 @@ use super::app::App;
 /// dashboard is broken — the same reason `output::table::render_table`
 /// prints its header row for an empty payload.
 ///
-/// Not called outside this module's own tests yet — Task 8 (`mod.rs`, the
-/// verb and the event loop) is `draw`'s real caller, and it has not landed.
-/// `#[allow(dead_code)]` says so explicitly, same convention `theme::Palette`
-/// and `app::App` already carry for the identical reason.
-#[allow(dead_code)]
+/// `draw`'s real caller is `super::mod`'s `run_ui`, once per frame.
 pub fn draw(app: &App, frame: &mut Frame<'_>) {
     let area = frame.area();
     let (width, height) = (area.width, area.height);

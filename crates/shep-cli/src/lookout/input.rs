@@ -2,11 +2,7 @@
 //! of the keyboard, kept in one small file so `super::app` never imports a
 //! terminal crate and its reducer tests never construct one.
 //!
-//! Not called outside this module's own tests yet: Task 8 (`mod.rs`, the verb
-//! and the event loop) is the real caller for [`map_key`], and it has not
-//! landed. `#[allow(dead_code)]` on it says so explicitly, same convention
-//! `theme::Palette`, `app::App` and `link::run_link` already carry for the
-//! identical reason.
+//! [`map_key`]'s real caller is `super::run_ui`'s keyboard arm.
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
@@ -26,7 +22,6 @@ use super::app::KeyPress;
 /// mapping would leave the most reflexive way out of a terminal program doing
 /// nothing, and the operator's next move — `kill -9` from another window —
 /// skips every restore path `super::term` has.
-#[allow(dead_code)]
 #[must_use]
 pub fn map_key(event: &Event) -> Option<KeyPress> {
     let Event::Key(key) = event else {

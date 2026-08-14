@@ -24,26 +24,17 @@ use crate::output::{human_bytes, human_duration};
 /// `ID` + `NAME` (floor 8) + `STATUS` (15, the width of `waiting-restart`)
 /// plus two separators. Below this the whole draw becomes one line saying
 /// so — see [`super::draw`].
-// Every public item in this file is not yet called outside this module's
-// own tests and `super::draw`, and `super::draw` itself has no caller until
-// Task 8 (`mod.rs`, the verb and the event loop) wires it into the real UI
-// loop. `#[allow(dead_code)]` says so explicitly, same convention
-// `theme::Palette` and `app::App` already carry for the identical reason.
-#[allow(dead_code)]
 pub const MIN_WIDTH: u16 = 31;
 
 /// The shortest terminal the pane will draw into: title, banner, header,
 /// rule, one data row, status bar.
-#[allow(dead_code)]
 pub const MIN_HEIGHT: u16 = 6;
 
 /// The floor on the NAME column, which takes whatever the fixed columns
 /// leave.
-#[allow(dead_code)]
 pub const NAME_MIN: u16 = 8;
 
 /// One column of the flock table.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Column {
     /// The sheep's stable numeric id.
@@ -66,7 +57,6 @@ pub enum Column {
     Fold,
 }
 
-#[allow(dead_code)]
 impl Column {
     /// The header text, matching `output::rows::FlockRows::headers` exactly
     /// — one vocabulary across both surfaces.
@@ -105,7 +95,6 @@ impl Column {
     }
 }
 
-#[allow(dead_code)]
 const ALL: &[Column] = &[
     Column::Id,
     Column::Name,
@@ -117,7 +106,6 @@ const ALL: &[Column] = &[
     Column::Uptime,
     Column::Fold,
 ];
-#[allow(dead_code)]
 const NO_FOLD: &[Column] = &[
     Column::Id,
     Column::Name,
@@ -128,7 +116,6 @@ const NO_FOLD: &[Column] = &[
     Column::Mem,
     Column::Uptime,
 ];
-#[allow(dead_code)]
 const NO_RESTARTS: &[Column] = &[
     Column::Id,
     Column::Name,
@@ -138,7 +125,6 @@ const NO_RESTARTS: &[Column] = &[
     Column::Mem,
     Column::Uptime,
 ];
-#[allow(dead_code)]
 const NO_PID: &[Column] = &[
     Column::Id,
     Column::Name,
@@ -147,7 +133,6 @@ const NO_PID: &[Column] = &[
     Column::Mem,
     Column::Uptime,
 ];
-#[allow(dead_code)]
 const NO_MEM: &[Column] = &[
     Column::Id,
     Column::Name,
@@ -155,9 +140,7 @@ const NO_MEM: &[Column] = &[
     Column::Cpu,
     Column::Uptime,
 ];
-#[allow(dead_code)]
 const NO_CPU: &[Column] = &[Column::Id, Column::Name, Column::Status, Column::Uptime];
-#[allow(dead_code)]
 const FLOOR: &[Column] = &[Column::Id, Column::Name, Column::Status];
 
 /// Width thresholds, widest first. Each entry is the narrowest terminal that
@@ -169,7 +152,6 @@ const FLOOR: &[Column] = &[Column::Id, Column::Name, Column::Status];
 /// and MEM are the last two numbers to go because they are the ones that
 /// explain WHY something is wrong. `ID NAME STATUS` is the floor because
 /// those three are the pane.
-#[allow(dead_code)]
 const TIERS: &[(u16, &[Column])] = &[
     (90, ALL),
     (78, NO_FOLD),
@@ -181,7 +163,6 @@ const TIERS: &[(u16, &[Column])] = &[
 ];
 
 /// The widest column set that fits `width`.
-#[allow(dead_code)]
 #[must_use]
 pub fn columns_for(width: u16) -> &'static [Column] {
     TIERS
@@ -191,7 +172,6 @@ pub fn columns_for(width: u16) -> &'static [Column] {
 }
 
 /// What NAME gets, once the fixed columns and the separators are paid for.
-#[allow(dead_code)]
 #[must_use]
 pub fn name_width(width: u16, columns: &[Column]) -> u16 {
     let fixed: u16 = columns.iter().map(|column| column.width()).sum();
@@ -211,7 +191,6 @@ pub fn name_width(width: u16, columns: &[Column]) -> u16 {
 ///
 /// A truncated name that looked whole would be a name an operator types into
 /// `shep stop`, so the ellipsis is not cosmetic.
-#[allow(dead_code)]
 #[must_use]
 pub fn fit(text: &str, width: u16) -> String {
     let width = usize::from(width);
@@ -230,7 +209,6 @@ pub fn fit(text: &str, width: u16) -> String {
 }
 
 /// The header line: every column name, muted.
-#[allow(dead_code)]
 #[must_use]
 pub fn header_line(columns: &[Column], width: u16, style: Style) -> Line<'static> {
     let name = name_width(width, columns);
@@ -254,7 +232,6 @@ pub fn header_line(columns: &[Column], width: u16, style: Style) -> Line<'static
 /// No row style beyond that: 12a has no selected row (see the phase plan's
 /// "What 12b gets"), so there is nothing here for a REVERSED modifier to
 /// mean.
-#[allow(dead_code)]
 #[must_use]
 pub fn row_line(app: &App, row: &Row, columns: &[Column], width: u16) -> Line<'static> {
     let palette = app.palette();
@@ -286,7 +263,6 @@ pub fn row_line(app: &App, row: &Row, columns: &[Column], width: u16) -> Line<'s
 /// `output::rows::FlockRows::rows` does and for the same stated reason: an
 /// empty cell in a padded table is indistinguishable from a rendering bug,
 /// and `0.0%` would claim a measurement the shepherd never made.
-#[allow(dead_code)]
 fn cell(app: &App, row: &Row, column: Column) -> String {
     let info = &row.info;
     match column {
@@ -326,7 +302,6 @@ fn cell(app: &App, row: &Row, column: Column) -> String {
 /// Derived every frame rather than stored: the flock map is replaced
 /// wholesale every two seconds, and a stored *result* would have to be
 /// reconciled against a list that changed underneath it.
-#[allow(dead_code)]
 #[must_use]
 pub fn scroll_offset(requested: usize, viewport: usize, total: usize) -> usize {
     if viewport == 0 || total <= viewport {

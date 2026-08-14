@@ -261,6 +261,20 @@ async fn run(cli: Cli) -> ExitCode {
         };
     }
 
+    // Not in the locked block below, for the reason that block's own comment
+    // gives: this verb runs until the operator quits, and a `StdoutLock` held
+    // across that lifetime wedges the first off-thread write. It also owns
+    // stdout directly, through the terminal, which a guard would fight.
+    if let Commands::Lookout(ref args) = cli.command {
+        let mut out = std::io::stdout();
+        let mut err = std::io::stderr();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+        };
+        return lookout::lookout(&mut streams, fmt, &paths, args).await;
+    }
+
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
     let mut streams = Streams {
@@ -411,6 +425,7 @@ async fn run(cli: Cli) -> ExitCode {
         | Commands::Startup(_)
         | Commands::Unstartup(_)
         | Commands::Bleats(_)
+        | Commands::Lookout(_)
         | Commands::Dog(_) => {
             unreachable!("handled above: before the shared $SHEP_HOME gate, or on unlocked handles")
         }

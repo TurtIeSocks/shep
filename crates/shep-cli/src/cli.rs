@@ -199,6 +199,20 @@ pub enum Commands {
     /// Show or follow bleats (log output) for one or more sheep.
     #[command(visible_alias = "logs")]
     Bleats(BleatsArgs),
+    /// Watch the flock on a live dashboard.
+    ///
+    /// Reads the shepherd two ways at once: it subscribes to the event bus so
+    /// the screen moves as things happen, and it re-lists the flock every two
+    /// seconds so a dropped event cannot leave the screen quietly wrong.
+    ///
+    /// If the shepherd stops answering, lookout re-dials a few times and then
+    /// says so and stops updating. The values on screen stay exactly as they
+    /// were, and it does not exit — you do.
+    ///
+    /// Needs a terminal: with stdout redirected it refuses rather than writing
+    /// escape sequences into a file.
+    #[command(visible_alias = "dash")]
+    Lookout(LookoutArgs),
     /// Reopen log files after an external rotator has renamed them.
     Reopen(ReopenArgs),
     /// Empty the log files of one or more sheep, or the shepherd's own.
@@ -556,6 +570,19 @@ pub struct BleatsArgs {
     /// Only stdout
     #[arg(long, conflicts_with = "err")]
     pub out: bool,
+}
+
+/// Arguments to `shep lookout`.
+#[derive(Debug, clap::Args)]
+pub struct LookoutArgs {
+    /// Let the dashboard act on a sheep. Off by default.
+    ///
+    /// A guard against a keystroke in a window you were reading, not a
+    /// security boundary: lookout runs as you, so anything it could do you can
+    /// already do with `shep stop`. Can also be set with `shep set
+    /// lookout.allow_control true`; this flag wins.
+    #[arg(long)]
+    pub allow_control: bool,
 }
 
 /// Arguments to `shep reopen`.
@@ -961,6 +988,9 @@ mod tests {
             ["sendline"]
         );
 
+        let lookout = cmd.find_subcommand("lookout").unwrap();
+        assert_eq!(lookout.get_visible_aliases().collect::<Vec<_>>(), ["dash"]);
+
         for hidden in ["thatlldo", "daemon", "dog"] {
             assert!(
                 cmd.find_subcommand(hidden).unwrap().is_hide_set(),
@@ -971,6 +1001,7 @@ mod tests {
             "start",
             "flock",
             "bleats",
+            "lookout",
             "reload",
             "reopen",
             "flush",
@@ -1063,5 +1094,48 @@ mod tests {
                 Commands::Whisper(_)
             ));
         }
+    }
+
+    /// fails if `dash` stops reaching the same verb as `lookout`.
+    ///
+    /// **A resolution claim, and only that.** `try_parse_from` answers
+    /// identically whether the attribute is `visible_alias` or the hidden
+    /// `alias`, so this test cannot see the difference and must not claim to:
+    /// the visibility pin belongs in
+    /// `alias_visibility_and_hiding_are_pinned`, which already owns that job
+    /// for `flock`/`bleats`/`stock`/`whisper` and is extended below.
+    #[test]
+    fn dash_and_lookout_resolve_to_the_same_verb() {
+        use clap::Parser;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "dash"]).unwrap().command,
+            Commands::Lookout(_)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "lookout"]).unwrap().command,
+            Commands::Lookout(_)
+        ));
+    }
+
+    /// fails if the control gate stops being off by default, or stops being
+    /// reachable from the flag. Rin's ruling: acting on a sheep needs a flag or
+    /// config, mirroring `whistle.allow_control`.
+    #[test]
+    fn actions_are_off_unless_the_flag_says_otherwise() {
+        use clap::Parser;
+        let Commands::Lookout(default) = Cli::try_parse_from(["shep", "lookout"]).unwrap().command
+        else {
+            panic!("lookout parses to its own variant")
+        };
+        assert!(!default.allow_control);
+
+        let Commands::Lookout(flagged) =
+            Cli::try_parse_from(["shep", "lookout", "--allow-control"])
+                .unwrap()
+                .command
+        else {
+            panic!("lookout parses to its own variant")
+        };
+        assert!(flagged.allow_control);
     }
 }

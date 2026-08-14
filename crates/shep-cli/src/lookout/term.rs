@@ -27,15 +27,11 @@
 //! `TestBackend` so the UI loop itself is testable. The four lines below keep
 //! that seam and cost nothing.
 //!
-//! Not called by the dashboard itself yet: Task 8 (`mod.rs`, the verb and
-//! the event loop) is the real caller for [`enter`] and [`RestoreGuard`],
-//! and it has not landed. `#[allow(dead_code)]` on those items says so
-//! explicitly, same convention `theme::Palette`, `app::App` and
-//! `link::run_link` already carry for the identical reason.
-//! [`install_panic_hook`] is the one exception — [`probe_panic_for_test`]
-//! calls it from behind an env-var gate in `main`, permanently, so its own
-//! ordering can be checked by a headless subprocess test instead of the
-//! by-hand `script` session Task 7's report describes doing once and
+//! [`enter`] and [`RestoreGuard`]'s real caller is `super::mod`'s `lookout`.
+//! [`install_panic_hook`] has an additional, permanent caller —
+//! [`probe_panic_for_test`] calls it from behind an env-var gate in `main`,
+//! so its own ordering can be checked by a headless subprocess test instead
+//! of the by-hand `script` session Task 7's report describes doing once and
 //! deleting.
 
 use std::io::{self, Stdout, Write};
@@ -50,7 +46,6 @@ use crossterm::terminal::{
 /// Every step ignores its own failure: this runs from a panic hook, where
 /// there is nothing sensible to do with an error and where returning one would
 /// mean skipping the steps after it. Safe to call twice, and routinely is.
-#[allow(dead_code)]
 pub fn restore() {
     let mut out = io::stdout();
     let _ = crossterm::execute!(out, LeaveAlternateScreen, Show);
@@ -108,7 +103,6 @@ pub fn probe_panic_for_test() -> ! {
 ///
 /// # Errors
 /// Whatever `crossterm` could not do to the terminal.
-#[allow(dead_code)]
 pub fn enter() -> io::Result<Stdout> {
     enable_raw_mode()?;
     let mut out = io::stdout();
@@ -126,7 +120,6 @@ pub fn enter() -> io::Result<Stdout> {
 /// under test is "the guard runs its action exactly once when it goes out of
 /// scope", and that is what regresses if someone converts this to a plain
 /// struct with a manual teardown call.
-#[allow(dead_code)]
 pub struct RestoreGuard {
     action: Option<Box<dyn FnOnce()>>,
 }
@@ -141,14 +134,12 @@ impl core::fmt::Debug for RestoreGuard {
 
 impl RestoreGuard {
     /// A guard that calls [`restore`] when it is dropped.
-    #[allow(dead_code)]
     #[must_use]
     pub fn new() -> Self {
         Self::with_action(restore)
     }
 
     /// A guard that calls `action` when it is dropped.
-    #[allow(dead_code)]
     #[must_use]
     pub fn with_action(action: impl FnOnce() + 'static) -> Self {
         Self {

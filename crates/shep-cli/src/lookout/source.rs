@@ -20,11 +20,9 @@
 //! over its error type to serve both callers, is a worse trade than the
 //! duplication — the repetition here is of shape, not of meaning.
 //!
-//! Not called outside this module's own tests yet: Task 8 (`mod.rs`, the verb
-//! and the event loop) is the real caller for every public item below, and it
-//! has not landed. `#[allow(dead_code)]` on each says so explicitly, same
-//! convention `theme::Palette` and `app::App` already carry for the identical
-//! reason.
+//! Every public item below is wired together by `super::mod`'s `lookout` — the
+//! opening dial — and by `super::link::run_link`, which drives both traits
+//! through the rest of a connection's life.
 
 use core::fmt;
 use core::future::Future;
@@ -46,12 +44,10 @@ use crate::exit::ExitCode;
 /// would make lookout the highest-volume subscriber on the bus for no visible
 /// reason — and would manufacture the very `Dropped`/`Lagged` condition
 /// [`super::link`] exists to survive.
-#[allow(dead_code)]
 pub const TOPICS: &[&str] = &["process.*", "daemon.*"];
 
 /// Reading the flock. `&self`, so [`super::link::run_connected`] can hold it
 /// across the same `select!` that holds an [`EventSource`] mutably.
-#[allow(dead_code)]
 pub trait FlockSource: Send + Sync {
     /// The flock as it stands.
     ///
@@ -62,7 +58,6 @@ pub trait FlockSource: Send + Sync {
 }
 
 /// One source of bus frames.
-#[allow(dead_code)]
 pub trait EventSource: Send {
     /// The next frame; `Err(`[`Lagged`]`)` when this client's own receiver fell
     /// behind and discarded frames; `None` when the subscription ends, which
@@ -76,7 +71,6 @@ pub trait EventSource: Send {
 /// reconnect rebuilds the request path and the subscription at the same
 /// moment, and a signature that let a caller replace one without the other
 /// would admit a state the real connection cannot be in.
-#[allow(dead_code)]
 pub trait Shepherd: Send {
     /// This connection's request half.
     type Flock: FlockSource;
@@ -101,7 +95,6 @@ pub trait Shepherd: Send {
 /// is `[[bin]]`-only — there is no downstream to break, and every match on this
 /// type is in this crate. Stated here rather than left silent, which is the
 /// half of IR-20 that applies either way.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkError {
     /// Nothing answered at the socket, or the handshake did not complete.
@@ -128,7 +121,6 @@ impl LinkError {
     /// exit. Derived from `ExitCode::from(&ConnectError)` at conversion time
     /// rather than re-decided here, so this and every other verb's mapping
     /// cannot drift apart.
-    #[allow(dead_code)]
     #[must_use]
     pub fn exit_code(&self) -> ExitCode {
         match self {
@@ -162,7 +154,6 @@ impl From<ConnectError> for LinkError {
 }
 
 /// The request half of a live connection.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ClientFlock(Client);
 
@@ -185,7 +176,6 @@ impl EventSource for EventStream {
 }
 
 /// The real thing: a socket path that can be dialled again.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct UnixShepherd {
     socket: PathBuf,
@@ -193,7 +183,6 @@ pub struct UnixShepherd {
 
 impl UnixShepherd {
     /// Watches the shepherd listening at `socket`.
-    #[allow(dead_code)]
     #[must_use]
     pub fn new(socket: &Path) -> Self {
         Self {

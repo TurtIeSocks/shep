@@ -12,7 +12,6 @@ use super::super::app::{App, Control, Link};
 use super::flock::fit;
 
 /// The title: what this is, where it points, and how big the flock is.
-#[allow(dead_code)]
 #[must_use]
 pub fn title_line(app: &App, home: &str, width: u16) -> Line<'static> {
     let palette = app.palette();
@@ -34,7 +33,6 @@ pub fn title_line(app: &App, home: &str, width: u16) -> Line<'static> {
 /// what happened, and it names when the values stopped being current, so an
 /// operator reading a screen full of `online` knows exactly how much to
 /// trust it.
-#[allow(dead_code)]
 #[must_use]
 pub fn banner_line(app: &App) -> Option<Line<'static>> {
     let palette = app.palette();
@@ -53,7 +51,6 @@ pub fn banner_line(app: &App) -> Option<Line<'static>> {
 
 /// The bottom line: a notice if there is one, else the key hints; then the
 /// control state, always.
-#[allow(dead_code)]
 #[must_use]
 pub fn status_line(app: &App, width: u16) -> Line<'static> {
     let palette = app.palette();
@@ -100,7 +97,6 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
 /// user can `awk` over beats one that looks nice; the same instinct applies
 /// to a pane an operator reads at 3am, and a full border costs two columns
 /// and two rows of the thing they are trying to read.
-#[allow(dead_code)]
 #[must_use]
 pub fn rule_line(style: Style, width: u16) -> Line<'static> {
     Line::from(Span::styled("─".repeat(usize::from(width)), style))

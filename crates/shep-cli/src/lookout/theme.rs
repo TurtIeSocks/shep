@@ -25,15 +25,9 @@ use shep_core::status::ProcStatus;
 
 /// The four semantic colours, resolved for one terminal.
 ///
-/// Constructed once at startup by [`Palette::detect`] and carried in
-/// `super::app::App`; never re-derived per frame.
-///
-/// Not constructed outside this module's own tests yet: `App` (Task 3) and
-/// `view::draw` (Task 4) are its real callers, and neither exists until its
-/// own task lands. `#[allow(dead_code)]` says so explicitly rather than
-/// inventing a call site nothing needs yet — same convention
-/// `output::table::render_table` already carries for the same reason.
-#[allow(dead_code)]
+/// Constructed once at startup — by `super::mod`'s `lookout`, from
+/// `Palette::detect` — and carried in `super::app::App`; never re-derived per
+/// frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     meadow: Option<Color>,
@@ -42,7 +36,6 @@ pub struct Palette {
     ink3: Option<Color>,
 }
 
-#[allow(dead_code)]
 impl Palette {
     /// Resolves the palette from the environment, taken as arguments rather
     /// than read here.

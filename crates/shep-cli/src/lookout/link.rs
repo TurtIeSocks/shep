@@ -21,11 +21,8 @@
 //! ENDS — no more polls, no more dials, no more subscriptions. The UI loop
 //! keeps running with the last values on screen until the operator quits.
 //!
-//! Not called outside this module's own tests yet: Task 8 (`mod.rs`, the verb
-//! and the event loop) is the real caller for [`run_link`] and everything it
-//! touches, and it has not landed. `#[allow(dead_code)]` on each public item
-//! below says so explicitly, same convention `theme::Palette` and `app::App`
-//! already carry for the identical reason.
+//! [`run_link`]'s real caller is `super::mod`'s `lookout`, which spawns it
+//! alongside the UI loop.
 
 use core::fmt;
 use std::time::Duration;
@@ -49,7 +46,6 @@ use super::source::{EventSource, FlockSource, Shepherd};
 /// scale: the bark dog's fallback poll is 30s because nothing is watching it,
 /// and the memory-limit sampler is 15s because it walks the process table — a
 /// `ListFlock` is a map lookup and one frame each way.
-#[allow(dead_code)]
 pub const FLOCK_POLL: Duration = Duration::from_secs(2);
 
 /// How many times the link re-dials before it gives up and freezes.
@@ -65,15 +61,12 @@ pub const FLOCK_POLL: Duration = Duration::from_secs(2);
 /// Thirty seconds would leave a dead dashboard claiming to be live for half a
 /// minute. Two would flip to frozen during an ordinary restart and teach the
 /// operator to distrust the banner.
-#[allow(dead_code)]
 pub const RECONNECT_ATTEMPTS: u32 = 5;
 
 /// The wait before the first re-dial.
-#[allow(dead_code)]
 pub const RECONNECT_FIRST_WAIT: Duration = Duration::from_millis(250);
 
 /// The ceiling on the doubling.
-#[allow(dead_code)]
 pub const RECONNECT_MAX_WAIT: Duration = Duration::from_secs(4);
 
 /// The dashboard stopped listening: its [`Msg`] channel is closed.
@@ -89,7 +82,6 @@ pub const RECONNECT_MAX_WAIT: Duration = Duration::from_secs(4);
 /// carries none: IR-20's obligation is on `pub` error types in LIBRARY crates,
 /// and shep-cli is `[[bin]]`-only. Said out loud rather than left silent,
 /// which is the half of IR-20 that applies either way.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UiGone;
 
@@ -118,7 +110,6 @@ impl core::error::Error for UiGone {}
 ///
 /// Ends — and only ends — after sending [`Msg::Frozen`], or when the UI stops
 /// listening. Everything else it can encounter is a rung on the ladder.
-#[allow(dead_code)]
 pub async fn run_link<S: Shepherd>(
     mut shepherd: S,
     opened: (S::Flock, S::Events),
@@ -204,7 +195,6 @@ pub async fn run_link<S: Shepherd>(
 /// event in the gap for no gain. `Shepherd::link` has already subscribed by the
 /// time this is called; the listing below is the first thing that happens
 /// after.
-#[allow(dead_code)]
 pub async fn run_connected<F: FlockSource, E: EventSource>(
     flock: F,
     mut events: E,
@@ -263,7 +253,6 @@ pub async fn run_connected<F: FlockSource, E: EventSource>(
 /// — the same call bark's own `reconcile` makes. A poll that fails because the
 /// connection is dead will be followed by the subscription ending, which is the
 /// condition that does climb the ladder.
-#[allow(dead_code)]
 async fn reconcile<F: FlockSource>(flock: &F, msgs: &mpsc::Sender<Msg>) -> Result<(), UiGone> {
     match flock.flock().await {
         Ok(rows) => msgs
@@ -284,7 +273,6 @@ async fn reconcile<F: FlockSource>(flock: &F, msgs: &mpsc::Sender<Msg>) -> Resul
 /// formatter — see [`Msg::Frozen`]'s own doc. Local, not UTC, for the same
 /// reason `output::table::local_timestamp` is: this is read during an incident,
 /// at a terminal, by someone thinking in wall-clock time.
-#[allow(dead_code)]
 fn local_now() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }

@@ -3988,3 +3988,68 @@ fn two_real_shep_processes_writing_concurrently_lose_no_keys() {
         "two concurrent shep set processes must not lose each other's keys: {envelope}"
     );
 }
+
+/// fails if `shep lookout` writes terminal escapes into a pipe. `assert_cmd`
+/// captures stdout, so this exercises the not-a-tty refusal exactly as a
+/// `shep lookout > dash.txt` would — and it is the case that keeps a redirected
+/// dashboard from corrupting a file. Also proves the verb does not HANG
+/// without a terminal, which is the regression that would cost CI a job rather
+/// than a test (IR-46: `.timeout(CMD_TIMEOUT)` is on the chain).
+#[test]
+fn shep_lookout_refuses_when_stdout_is_not_a_terminal() {
+    let home = TempDir::new().unwrap();
+    let output = shep(home.path())
+        .arg("lookout")
+        .timeout(CMD_TIMEOUT)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("needs a terminal"));
+}
+
+/// fails if the `dash` alias stops reaching the same verb. Same refusal, same
+/// code, through the other spelling.
+#[test]
+fn shep_dash_is_the_same_verb() {
+    let home = TempDir::new().unwrap();
+    let output = shep(home.path())
+        .arg("dash")
+        .timeout(CMD_TIMEOUT)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("needs a terminal")
+    );
+}
+
+/// fails if `--help` stops naming the gate. `--help` is where an operator
+/// learns that the dashboard is read-only by default, and the flag's own text
+/// is where they learn the gate is not a security boundary.
+///
+/// **Two assertions this test deliberately does not make.** It does not assert
+/// `text.contains("dash")`: the verb's own about-text says "live dashboard"
+/// and the flag's help says "the dashboard", so that substring is there
+/// whether or not the alias is — delete `visible_alias` and it still passes.
+/// The alias is pinned in `cli.rs`'s `alias_visibility_and_hiding_are_pinned`,
+/// through `get_visible_aliases()`, which is the only assertion that can tell
+/// the difference. And it asserts on `security boundary`, not on the whole
+/// sentence: `wrap_help` is enabled on this crate's clap, so clap re-wraps
+/// long help at the detected terminal width and a longer phrase can land
+/// across a line break on one machine and not another.
+#[test]
+fn shep_lookout_help_names_the_gate() {
+    let home = TempDir::new().unwrap();
+    let output = shep(home.path())
+        .args(["lookout", "--help"])
+        .timeout(CMD_TIMEOUT)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("--allow-control"));
+    assert!(text.contains("security boundary"));
+}
