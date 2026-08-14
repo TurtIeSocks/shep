@@ -27,12 +27,16 @@
 //! `TestBackend` so the UI loop itself is testable. The four lines below keep
 //! that seam and cost nothing.
 //!
-//! Not called outside this module's own tests yet: Task 8 (`mod.rs`, the verb
-//! and the event loop) is the real caller for [`install_panic_hook`],
-//! [`enter`] and [`RestoreGuard`], and it has not landed. `#[allow(dead_code)]`
-//! on each public item below says so explicitly, same convention
-//! `theme::Palette`, `app::App` and `link::run_link` already carry for the
-//! identical reason.
+//! Not called by the dashboard itself yet: Task 8 (`mod.rs`, the verb and
+//! the event loop) is the real caller for [`enter`] and [`RestoreGuard`],
+//! and it has not landed. `#[allow(dead_code)]` on those items says so
+//! explicitly, same convention `theme::Palette`, `app::App` and
+//! `link::run_link` already carry for the identical reason.
+//! [`install_panic_hook`] is the one exception — [`probe_panic_for_test`]
+//! calls it from behind an env-var gate in `main`, permanently, so its own
+//! ordering can be checked by a headless subprocess test instead of the
+//! by-hand `script` session Task 7's report describes doing once and
+//! deleting.
 
 use std::io::{self, Stdout, Write};
 
@@ -57,13 +61,37 @@ pub fn restore() {
 /// Chains a restoring panic hook in front of whatever hook is installed.
 ///
 /// Call before [`enter`], and only once per process.
-#[allow(dead_code)]
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore();
         previous(info);
     }));
+}
+
+/// Installs the panic hook, then panics on purpose.
+///
+/// Exists for exactly one caller: `main`, gated behind the
+/// `SHEP_TERM_PANIC_PROBE` environment variable so it can never fire by
+/// accident and never appears on the command surface — no clap variant, no
+/// `--help` entry, same reasoning as the hidden `daemon`/`dog` subcommands.
+///
+/// This is the permanent replacement for the by-hand check Phase 12a's
+/// Task 7 report describes doing once, under `script`, and then deleting:
+/// confirming that [`install_panic_hook`] restores the terminal BEFORE the
+/// previous hook prints its backtrace, so a crash lands on a cooked
+/// main-screen terminal rather than a raw alternate one.
+/// `tests/term_panic_order.rs` drives this function through a real
+/// subprocess and checks the byte order of the two writes.
+///
+/// # Panics
+/// Always — that is the entire point. The message names what is being
+/// tested so a stray run (there should never be one) is self-explanatory in
+/// a crash report.
+#[track_caller]
+pub fn probe_panic_for_test() -> ! {
+    install_panic_hook();
+    panic!("shep_term_panic_probe: deliberate panic exercising restore-before-backtrace ordering");
 }
 
 /// Enters raw mode and the alternate screen, and hides the cursor.

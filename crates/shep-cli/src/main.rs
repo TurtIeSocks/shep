@@ -73,6 +73,14 @@ use shep_core::paths::ShepPaths;
 
 #[tokio::main]
 async fn main() {
+    // A hidden, env-gated hook for `tests/term_panic_order.rs` — not a
+    // clap variant, so it carries no `--help` entry and no command-surface
+    // footprint. See `lookout::term::probe_panic_for_test`'s doc for why
+    // this exists and what it replaces.
+    #[cfg(unix)]
+    if std::env::var_os("SHEP_TERM_PANIC_PROBE").is_some() {
+        lookout::term::probe_panic_for_test();
+    }
     let cli = Cli::parse();
     let code = run(cli).await;
     std::process::exit(code as i32);
