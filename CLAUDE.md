@@ -175,7 +175,12 @@ cutover, the dogs subsystem with working metrics and bark dogs, and an
 audit-debt phase. Phase 11 merged too: the six remaining daemon-surface
 verbs — `shep stock` (alias `scale`), `shep signal`, `shep whisper` (alias
 `sendline`), the KV store's `set`/`get`/`unset`, lambs in `describe`, and
-the `channel.*` bus topic.
+the `channel.*` bus topic. Phase 12a merged: `shep lookout`'s shell and its
+flock table pane — dependency, terminal lifecycle, palette, event loop, link
+supervision, and a table that subscribes to the bus and polls every two
+seconds to repair drift. The bleats feed, the sheep detail pane and the
+host-usage strip are Phase 12b; rendered frames for that decision are in
+`docs/lookout/frames.txt`.
 
 What's built vs. deferred to v1.1+: [docs/specs/deferred.md](docs/specs/deferred.md).
 Windows is 0%, not partial — every verb prints "not yet supported" and exits.

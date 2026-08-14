@@ -87,7 +87,7 @@ The whole vocabulary, and whether it exists yet.
 | a dog | a plugin process the shepherd supervises | `shep enable metrics`, `shep dogs` | yes |
 | a bark | a webhook alert | `[dog.bark.sinks]` config, `shep barks` | yes |
 | the whistle | the MCP interface agents talk to | `shep whistle` | no |
-| the lookout | the terminal dashboard | `shep lookout` (alias `dash`) | no |
+| the lookout | the terminal dashboard | `shep lookout` (alias `dash`) | partly |
 | adopt / rehome | register or drop a third-party dog | `shep adopt <name> <path>` | yes |
 | that'll do | graceful stop, after the real herding command | `shep thatlldo` | yes |
 | stock | change how many instances of an app run (the stocking rate) | `shep stock <name> <count>` (alias `scale`) | yes |
@@ -164,10 +164,16 @@ shepherd running, and two writers racing it lose nothing.
 
 ## What's not built yet
 
-Not started: the lookout TUI, the whistle MCP server, `shep serve`,
-`shep dev` and `shep runtime`, `.js` Flockfiles, a `schemars`-exported
-config JSON schema, a CLI-flag config layer, and openrc and BSD `rc.d`
-units.
+Not started: the whistle MCP server, `shep serve`, `shep dev` and
+`shep runtime`, `.js` Flockfiles, a `schemars`-exported config JSON schema, a
+CLI-flag config layer, and openrc and BSD `rc.d` units.
+
+The lookout has its shell and its flock table pane; the bleats feed, the
+sheep detail pane and the host-usage strip are still to come, and so is
+search/filter and the actions the control gate refuses today. Rendered
+frames of what exists so far are in
+[docs/lookout/frames.txt](docs/lookout/frames.txt) (`frames.ansi` for the
+coloured version, read with `less -R`).
 
 Windows is last, and it is genuinely zero rather than partial. The workspace
 cross-compiles for it, a check restored this phase and currently passing, but

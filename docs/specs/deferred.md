@@ -67,8 +67,16 @@ for what phase is next.
 Prometheus exposition only; no `otel` cargo feature exists in
 `crates/shep-cli/Cargo.toml`.
 
-**lookout** (spec §9, §13) — the ratatui TUI (`lookout`/`dash` verb).
-`ratatui` is not a dependency of any crate.
+**lookout's other three panes** (spec §9, §13) — `shep lookout` ships its
+shell and its flock table (Phase 12a). The bleats feed, the sheep detail pane
+and the host-usage strip are not built, and neither is search/filter. Actions
+have a gate (`--allow-control`, `lookout.allow_control`) and a refusal; there
+are no actions behind it yet. lookout does not subscribe to `log.*` — the feed
+that would read it does not exist, and a dashboard that subscribed anyway would
+be the highest-volume subscriber on the bus for a pane it does not draw.
+Rendered frames of what 12a built are in
+[docs/lookout/frames.txt](../lookout/frames.txt), for Rin to look at before
+12b's layout is decided.
 
 **whistle** (spec §8, §13) — the MCP stdio server (`whistle` verb). `rmcp`
 is not a dependency of any crate.
