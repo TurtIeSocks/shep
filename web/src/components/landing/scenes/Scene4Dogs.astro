@@ -1,0 +1,103 @@
+---
+/*
+ * Scene 4 — dogs. Copy verbatim from docs/shep-design/README.md,
+ * "Screens > 1. Landing page > Scene copy" #4.
+ */
+import SceneSection from "../SceneSection.astro";
+---
+
+<SceneSection id="scene-4" columnWidth="min(560px, 50vw)">
+  <div class="card">
+    <div class="kicker-row">
+      <span class="chip" aria-hidden="true"></span>
+      <div class="kicker">two ship inside the binary</div>
+    </div>
+    <h2>Dogs work for the shepherd.</h2>
+    <p>
+      A dog is a plugin the shepherd supervises for its own sake: it watches
+      the flock rather than being part of it.
+    </p>
+    <div class="terminal">
+      <div class="line"><span class="prompt">$</span> shep enable metrics</div>
+      <div class="line muted">prometheus on 127.0.0.1:9615</div>
+      <div class="line"><span class="prompt">$</span> shep enable bark</div>
+      <div class="line muted">alerts to discord, slack, or your own json</div>
+    </div>
+  </div>
+</SceneSection>
+
+<style>
+  .card {
+    background: var(--barn);
+    border: 4px solid var(--line);
+    border-radius: 26px;
+    box-shadow: 9px 9px 0 var(--shadow);
+    padding: 32px;
+    transform: rotate(1deg);
+  }
+
+  .kicker-row {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    margin-bottom: 14px;
+  }
+
+  .chip {
+    width: 24px;
+    height: 24px;
+    border: 3px solid var(--ink);
+    border-radius: 50%;
+    background: var(--butter);
+    display: block;
+  }
+
+  .kicker {
+    font-family: "Space Mono", monospace;
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: #fbe8df;
+  }
+
+  h2 {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: clamp(28px, 3.6vw, 44px);
+    line-height: 1;
+    letter-spacing: -0.04em;
+    margin: 0 0 16px;
+    color: var(--fleece);
+  }
+
+  p {
+    margin: 0 0 18px;
+    font-size: 16px;
+    line-height: 1.5;
+    color: #fbe8df;
+  }
+
+  .terminal {
+    background: var(--illus-terminal-bg);
+    border: 3px solid var(--ink);
+    border-radius: 16px;
+    padding: 16px 18px;
+    font-family: "Space Mono", monospace;
+    font-size: 12.5px;
+    line-height: 1.9;
+    color: var(--illus-terminal-text);
+    overflow-x: auto;
+  }
+
+  .terminal .line {
+    white-space: pre;
+  }
+
+  .prompt {
+    color: var(--grass);
+  }
+
+  .muted {
+    color: var(--illus-terminal-muted);
+  }
+</style>

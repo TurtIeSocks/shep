@@ -1,0 +1,185 @@
+---
+/*
+ * CTA band + footer bar. Copy verbatim from docs/shep-design/README.md,
+ * "Screens > 1. Landing page > CTA footer", except "1030 tests" -> "Over a
+ * thousand tests": that literal count already drifted once (README.md's
+ * own copy made this exact fix — "Tested by trying to break it. Over a
+ * thousand tests..." — so this page follows the source-of-truth voice
+ * instead of reintroducing a number that decays every phase).
+ */
+import Sheep from "../marks/Sheep.astro";
+
+const flock = [
+  { width: 72, dur: "5.2s", delay: "0s" },
+  { width: 104, dur: "6.1s", delay: ".5s" },
+  { width: 58, dur: "4.6s", delay: "1.1s" },
+  { width: 88, dur: "5.7s", delay: ".2s" },
+  { width: 66, dur: "6.6s", delay: ".8s" },
+];
+---
+
+<section class="cta">
+  <div class="inner">
+    <div class="row">
+      <div class="copy">
+        <h2>Build it and tell me<br />what breaks.</h2>
+        <p>
+          Rust 1.88 or newer, edition 2024. Over a thousand tests, and every
+          task ends with a mutation pass: break a line on purpose, confirm a
+          test goes red, put it back.
+        </p>
+      </div>
+      <div class="buttons">
+        <a href="https://github.com/TurtIeSocks/shep" class="btn butter press" style="--shadow-offset:6px; --shadow-color:var(--ink); --press-offset:3px;">
+          Clone the repo
+        </a>
+        <a href="/docs" class="btn cream press" style="--shadow-offset:6px; --shadow-color:var(--ink); --press-offset:3px;">
+          Read the docs
+        </a>
+      </div>
+    </div>
+    <div class="flock" aria-hidden="true">
+      {flock.map((f) => (
+        <Sheep width={f.width} bob bobDuration={f.dur} bobDelay={f.delay} />
+      ))}
+    </div>
+  </div>
+  <div class="bar">
+    <div class="bar-inner">
+      <span class="license">MIT OR Apache-2.0, at your option.</span>
+      <div class="links">
+        <a href="/docs">Docs</a>
+        <a href="/design-language">Design language</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .cta {
+    position: relative;
+    z-index: 7;
+    background: var(--grass-deep);
+    border-top: 4px solid var(--line);
+    padding: 70px 0 0;
+    overflow-x: hidden;
+  }
+
+  .inner {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 0 28px;
+  }
+
+  .row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 36px;
+    align-items: center;
+  }
+
+  h2 {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: clamp(32px, 4.6vw, 60px);
+    line-height: 0.95;
+    letter-spacing: -0.045em;
+    margin: 0 0 14px;
+    color: var(--fleece);
+  }
+
+  .copy p {
+    margin: 0;
+    font-size: 18px;
+    line-height: 1.5;
+    color: #d6eadb;
+    max-width: 46ch;
+  }
+
+  .buttons {
+    display: grid;
+    gap: 13px;
+  }
+
+  .btn {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    border: 4px solid var(--line);
+    border-radius: 16px;
+    padding: 17px 30px;
+    text-decoration: none;
+    text-align: center;
+    white-space: nowrap;
+  }
+
+  .btn.butter {
+    background: var(--butter);
+    color: var(--ink);
+  }
+
+  .btn.cream {
+    background: var(--fleece);
+    color: var(--ink);
+  }
+
+  .flock {
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    gap: 22px;
+    margin-top: 44px;
+  }
+
+  .bar {
+    background: var(--ink);
+    margin-top: -4px;
+    border-top: 4px solid var(--ink);
+  }
+
+  .bar-inner {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 26px 28px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+  }
+
+  .license {
+    font-family: "Space Mono", monospace;
+    font-size: 12.5px;
+    color: #8fbfa4;
+  }
+
+  .links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    font-size: 14.5px;
+  }
+
+  .links a {
+    color: var(--fleece);
+    text-decoration: none;
+  }
+
+  .links a:hover {
+    color: var(--butter);
+  }
+
+  /* Responsive first pass (docs/shep-design/README.md, "Responsive"):
+     single-column stack below ~640px instead of squeezing the button
+     column into whatever space is left beside the heading. */
+  @media (max-width: 640px) {
+    .row {
+      grid-template-columns: 1fr;
+    }
+
+    .buttons {
+      justify-items: stretch;
+    }
+  }
+</style>

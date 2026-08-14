@@ -1,0 +1,133 @@
+---
+/*
+ * Scene 2 — the flock, listed. Copy + `shep ls` sample verbatim from
+ * docs/shep-design/README.md, "Screens > 1. Landing page > Scene copy" #2.
+ */
+import SceneSection from "../SceneSection.astro";
+---
+
+<SceneSection id="scene-2" columnWidth="min(660px, 56vw)">
+  <div class="label">the flock, listed</div>
+  <div class="terminal">
+    <div class="chrome">
+      <span class="dot red"></span>
+      <span class="dot yellow"></span>
+      <span class="dot green"></span>
+      <span class="title">~/apps</span>
+    </div>
+    <div class="body">
+      <div class="line"><span class="prompt">$</span> shep ls</div>
+      <div class="line muted">ID  NAME    STATUS  PID   RESTARTS  CPU    MEM    UPTIME  FOLD</div>
+      <div class="line">1   web     <span class="online">online</span>  1001  1         12.5%  48.1M  1m      backend</div>
+      <div class="line">2   worker  <span class="online">online</span>  1002  2         12.5%  48.1M  2m      backend</div>
+      <div class="line">3   cron    <span class="online">online</span>  1003  3         <span class="muted">-</span>      48.1M  30s     backend</div>
+    </div>
+  </div>
+  <p class="note">
+    The CPU column prints <code>-</code> rather than <code>0.0%</code> when a
+    reading is unavailable. A confident zero is worse than an obvious blank.
+  </p>
+</SceneSection>
+
+<style>
+  .label {
+    font-family: "Space Mono", monospace;
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink);
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 999px;
+    padding: 7px 15px;
+    display: inline-block;
+    box-shadow: 3px 3px 0 var(--shadow);
+    margin-bottom: 16px;
+  }
+
+  .terminal {
+    background: var(--illus-terminal-bg);
+    border: 4px solid var(--line);
+    border-radius: 22px;
+    box-shadow: 9px 9px 0 var(--shadow);
+    overflow: hidden;
+  }
+
+  .chrome {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 18px;
+    border-bottom: 3px solid var(--illus-terminal-border);
+  }
+
+  .dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    display: block;
+  }
+
+  .dot.red {
+    background: var(--bark);
+  }
+
+  .dot.yellow {
+    background: var(--butter);
+  }
+
+  .dot.green {
+    background: var(--grass);
+  }
+
+  .chrome .title {
+    font-family: "Space Mono", monospace;
+    font-size: 11.5px;
+    color: var(--illus-terminal-muted);
+    margin-left: 8px;
+  }
+
+  .body {
+    padding: 20px;
+    font-family: "Space Mono", monospace;
+    font-size: 13px;
+    line-height: 1.85;
+    color: var(--illus-terminal-text);
+    overflow-x: auto;
+  }
+
+  .body .line {
+    white-space: pre;
+  }
+
+  .prompt {
+    color: var(--grass);
+  }
+
+  .online {
+    color: var(--grass);
+  }
+
+  .muted {
+    color: var(--illus-terminal-muted);
+  }
+
+  .note {
+    font-size: 16px;
+    line-height: 1.5;
+    color: var(--ink);
+    font-weight: 500;
+    margin: 20px 0 0;
+    max-width: 48ch;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    padding: 16px 20px;
+    box-shadow: 5px 5px 0 var(--shadow);
+  }
+
+  .note code {
+    font-family: "Space Mono", monospace;
+    font-size: 14.5px;
+  }
+</style>

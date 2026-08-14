@@ -1,0 +1,90 @@
+---
+/*
+ * Scene 5 — pre-release, honestly. Copy verbatim from docs/shep-design/
+ * README.md, "Screens > 1. Landing page > Scene copy" #5. Still accurate:
+ * matches README.md's own "Status: pre-release" note and docs/specs/
+ * deferred.md's Windows section (0%, not partial) as of this build.
+ */
+import SceneSection from "../SceneSection.astro";
+---
+
+<SceneSection id="scene-5" columnWidth="min(580px, 50vw)">
+  <div class="card">
+    <div class="kicker-row">
+      <span class="chip">pre-release</span>
+      <span class="kicker-label">and honest about it</span>
+    </div>
+    <p>
+      Not on crates.io. No tagged release. No install script. You build it
+      from source, and it runs on macOS and Linux. On Windows every command
+      prints <code>shep does not yet support Windows</code> and exits 1 — a
+      real answer, but not a useful one.
+    </p>
+    <a href="#chalkboard" class="cta press" style="--shadow-offset:5px; --press-offset:2px;">
+      See exactly what's missing
+    </a>
+  </div>
+</SceneSection>
+
+<style>
+  .card {
+    background: var(--paper-2);
+    border: 4px solid var(--bark);
+    border-radius: 26px;
+    box-shadow: 9px 9px 0 var(--shadow);
+    padding: 32px;
+    transform: rotate(-0.8deg);
+  }
+
+  .kicker-row {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    margin-bottom: 14px;
+  }
+
+  .chip {
+    font-family: "Space Mono", monospace;
+    font-weight: 700;
+    font-size: 11.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    background: var(--bark);
+    color: var(--fleece);
+    border: 2.5px solid var(--line);
+    border-radius: 8px;
+    padding: 5px 10px;
+  }
+
+  .kicker-label {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 18px;
+    color: var(--ink);
+  }
+
+  p {
+    margin: 0 0 16px;
+    font-size: 16px;
+    line-height: 1.55;
+    color: var(--ink-2);
+  }
+
+  p code {
+    font-family: "Space Mono", monospace;
+    font-size: 14.5px;
+  }
+
+  .cta {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 16px;
+    background: var(--bark);
+    color: var(--fleece);
+    border: 3px solid var(--line);
+    border-radius: 14px;
+    padding: 14px 22px;
+    text-decoration: none;
+    display: inline-block;
+  }
+</style>

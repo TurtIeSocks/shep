@@ -1,0 +1,87 @@
+---
+/*
+ * One lexicon signpost card (docs/shep-design/README.md, "Screens >
+ * 1. Landing page > Lexicon"). Content comes from web/src/data/lexicon.ts.
+ */
+import type { LexiconSignpost } from "../../data/lexicon";
+
+interface Props extends LexiconSignpost {}
+
+const { term, meaning, cli, bg, fg, tilt } = Astro.props;
+---
+
+<div class="signpost-wrap">
+  <div class="post" aria-hidden="true"></div>
+  <div class="card" style={`background:${bg};transform:rotate(${tilt});`}>
+    <div class="screws">
+      <span></span>
+      <span></span>
+    </div>
+    <div class="term" style={`color:${fg}`}>{term}</div>
+    <div class="meaning" style={`color:${fg}`}>{meaning}</div>
+    <div class="cli" style={`color:${fg}`}>{cli}</div>
+  </div>
+</div>
+
+<style>
+  .signpost-wrap {
+    position: relative;
+    padding-top: 26px;
+  }
+
+  .post {
+    position: absolute;
+    top: 0;
+    left: 50%;
+    width: 6px;
+    height: 30px;
+    background: var(--ink);
+    transform: translateX(-50%);
+    border-radius: 3px;
+  }
+
+  .card {
+    border: 4px solid var(--line);
+    border-radius: 20px;
+    box-shadow: 6px 6px 0 var(--shadow);
+    padding: 22px 24px;
+  }
+
+  .screws {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+
+  .screws span {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--ink);
+    display: block;
+  }
+
+  .term {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 23px;
+    letter-spacing: -0.03em;
+    margin-bottom: 8px;
+  }
+
+  .meaning {
+    font-size: 15px;
+    line-height: 1.5;
+    opacity: 0.9;
+  }
+
+  .cli {
+    font-family: "Space Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    opacity: 0.62;
+    margin-top: 12px;
+  }
+</style>

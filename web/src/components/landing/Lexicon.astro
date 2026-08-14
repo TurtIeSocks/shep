@@ -1,0 +1,89 @@
+---
+/*
+ * The lexicon section (#pasture). Heading + lede are verbatim design copy
+ * (docs/shep-design/README.md, "Screens > 1. Landing page > Lexicon");
+ * the six signpost cards are DATA from web/src/data/lexicon.ts, sourced
+ * from docs/terminology.md — see that file's header comment.
+ */
+import SignpostCard from "./SignpostCard.astro";
+import { lexiconSignposts } from "../../data/lexicon";
+---
+
+<section id="pasture" class="lexicon">
+  <div class="inner">
+    <h2>Fifteen words carry the whole product.</h2>
+    <p class="lede">
+      The sheep are a mnemonic, not a costume. Where the joke would cost
+      clarity it gets dropped — and every themed verb has a straight alias
+      that works forever.
+    </p>
+    <div class="grid">
+      {lexiconSignposts.map((s) => <SignpostCard {...s} />)}
+    </div>
+    <div class="more">
+      <a href="/docs/terminology" class="press" style="--shadow-offset:6px; --shadow-color:var(--fleece); --press-offset:3px;">
+        All fifteen terms →
+      </a>
+    </div>
+  </div>
+</section>
+
+<style>
+  .lexicon {
+    position: relative;
+    z-index: 6;
+    background: var(--grass);
+    border-top: 4px solid var(--line);
+    padding: 76px 0 90px;
+    overflow-x: hidden;
+  }
+
+  .inner {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 0 28px;
+  }
+
+  h2 {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: clamp(32px, 4.4vw, 58px);
+    line-height: 0.98;
+    letter-spacing: -0.04em;
+    margin: 0 0 14px;
+    color: var(--ink);
+    max-width: 22ch;
+  }
+
+  .lede {
+    font-size: 18.5px;
+    line-height: 1.5;
+    color: var(--ink);
+    max-width: 52ch;
+    margin: 0 0 44px;
+    font-weight: 500;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(258px, 1fr));
+    gap: 26px;
+  }
+
+  .more {
+    margin-top: 38px;
+  }
+
+  .more a {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    background: var(--ink);
+    color: var(--fleece);
+    border: 4px solid var(--line);
+    border-radius: 16px;
+    padding: 16px 26px;
+    text-decoration: none;
+    display: inline-block;
+  }
+</style>

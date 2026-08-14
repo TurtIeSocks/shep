@@ -1,0 +1,114 @@
+---
+/*
+ * The chalkboard (#chalkboard). Frame/heading copy verbatim from
+ * docs/shep-design/README.md, "Screens > 1. Landing page > Chalkboard";
+ * the item pills are DATA from web/src/data/chalkboard.ts, sourced from
+ * docs/specs/deferred.md — see that file's header comment.
+ */
+import { notBuiltYet } from "../../data/chalkboard";
+---
+
+<section id="chalkboard" class="chalkboard-section">
+  <div class="inner">
+    <div class="frame">
+      <div class="slate">
+        <div class="kicker">today on the board</div>
+        <h2>What's not built yet</h2>
+        <p>
+          Windows is last, and it is genuinely zero rather than partial: the
+          crate compiles and its unit tests pass there in CI, which is not
+          the same thing as working.
+        </p>
+        <div class="pills">
+          {
+            notBuiltYet.map((item) => (
+              <span class="pill">
+                <span class="x">✗</span>
+                {item}
+              </span>
+            ))
+          }
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .chalkboard-section {
+    position: relative;
+    z-index: 7;
+    background: var(--paper);
+    padding: 0 0 80px;
+  }
+
+  .inner {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 0 28px;
+  }
+
+  .frame {
+    background: #8a5a33;
+    border: 4px solid var(--line);
+    border-radius: 26px;
+    box-shadow: 9px 9px 0 var(--shadow);
+    padding: 18px;
+  }
+
+  .slate {
+    background: #25423a;
+    border: 4px solid var(--ink);
+    border-radius: 16px;
+    padding: 38px 34px;
+  }
+
+  .kicker {
+    font-family: "Space Mono", monospace;
+    font-size: 12px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: #8fbfa4;
+    margin-bottom: 12px;
+  }
+
+  h2 {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: clamp(30px, 4vw, 50px);
+    line-height: 1;
+    letter-spacing: -0.04em;
+    margin: 0 0 14px;
+    color: var(--illus-moon);
+  }
+
+  p {
+    font-size: 17.5px;
+    line-height: 1.55;
+    color: #cfe0d3;
+    max-width: 60ch;
+    margin: 0 0 28px;
+  }
+
+  .pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 11px;
+  }
+
+  .pill {
+    font-family: "Space Mono", monospace;
+    font-size: 13.5px;
+    color: var(--illus-moon);
+    border: 2.5px dashed #7fa890;
+    border-radius: 999px;
+    padding: 8px 15px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .x {
+    color: #ff9a72;
+  }
+</style>

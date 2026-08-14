@@ -1,0 +1,166 @@
+---
+/*
+ * "Why you'd switch" features grid. Copy verbatim from docs/shep-design/
+ * README.md, "Screens > 1. Landing page > Features", cross-checked against
+ * README.md's "What works today" section (same claims, same order of
+ * ideas) for accuracy as of this build. Not moved to a data/ file: unlike
+ * the lexicon and chalkboard, this prose has no single decaying source
+ * doc it tracks — it's voice copy, same as the scene copy above it.
+ */
+interface Feature {
+  n: string;
+  chip: string;
+  tilt: string;
+  title: string;
+  body: string;
+}
+
+const features: Feature[] = [
+  {
+    n: "1",
+    chip: "var(--butter)",
+    tilt: "-.9deg",
+    title: "There is no shepd",
+    body: "Daemonizing means the shep binary re-execs itself with a hidden subcommand, detaches, and reports readiness back over a pipe once its socket is bound.",
+  },
+  {
+    n: "2",
+    chip: "var(--grass)",
+    tilt: ".7deg",
+    title: "A crash loop isn't a healthy start",
+    body: "Exponential backoff, a restart budget, and min_uptime so a process that dies immediately is never mistaken for one that came up fine.",
+  },
+  {
+    n: "3",
+    chip: "#93D6F0",
+    tilt: "-.6deg",
+    title: "Everything renders as JSON",
+    body: "Every command answers under a versioned envelope with a schema_version, so you can pipe it somewhere instead of scraping columns out of a table.",
+  },
+  {
+    n: "4",
+    chip: "var(--bark)",
+    tilt: "1deg",
+    title: "reload's own --help says it isn't zero-downtime",
+    body: "shep binds no sockets, so an overlap only works if your app sets SO_REUSEPORT itself. Measured on Linux: an app that drains its listener loses nothing.",
+  },
+  {
+    n: "5",
+    chip: "var(--butter)",
+    tilt: "-1deg",
+    title: "pm2's source was read exactly once",
+    body: "By a dedicated tracing phase whose only output was behavior specs. Implementation never opens that source — a rule written into the repo's contributor instructions.",
+  },
+  {
+    n: "6",
+    chip: "var(--grass)",
+    tilt: ".8deg",
+    title: "shep import brings your dump.pm2 over",
+    body: "It starts nothing, names every clustered app on stderr, and refuses to silently swallow env keys it cannot place.",
+  },
+];
+---
+
+<section class="features">
+  <div class="inner">
+    <h2>Why you'd switch</h2>
+    <p class="lede">
+      Same feature list as pm2. Different opinions about what a supervisor
+      owes you at 3am.
+    </p>
+    <div class="grid">
+      {
+        features.map((f) => (
+          <div class="card" style={`transform:rotate(${f.tilt});`}>
+            <div class="chip" style={`background:${f.chip};`}>{f.n}</div>
+            <h3>{f.title}</h3>
+            <p>{f.body}</p>
+          </div>
+        ))
+      }
+    </div>
+  </div>
+</section>
+
+<style>
+  .features {
+    position: relative;
+    z-index: 7;
+    background: var(--paper);
+    border-top: 4px solid var(--line);
+    padding: 76px 0;
+  }
+
+  .inner {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 0 28px;
+  }
+
+  h2 {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: clamp(32px, 4.4vw, 58px);
+    line-height: 0.98;
+    letter-spacing: -0.04em;
+    margin: 0 0 14px;
+  }
+
+  .lede {
+    font-size: 18.5px;
+    line-height: 1.5;
+    color: var(--ink-2);
+    max-width: 52ch;
+    margin: 0 0 44px;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 26px;
+  }
+
+  .card {
+    background: var(--paper-2);
+    border: 4px solid var(--line);
+    border-radius: 24px;
+    box-shadow: 7px 7px 0 var(--shadow);
+    padding: 26px;
+    transition: none;
+  }
+
+  .card:hover {
+    transform: rotate(0deg) translate(-2px, -3px) !important;
+    box-shadow: 10px 10px 0 var(--shadow);
+  }
+
+  .chip {
+    width: 44px;
+    height: 44px;
+    border: 3px solid var(--line);
+    border-radius: 14px;
+    display: grid;
+    place-items: center;
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 19px;
+    color: var(--ink);
+    margin-bottom: 16px;
+  }
+
+  h3 {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 21px;
+    letter-spacing: -0.025em;
+    margin: 0 0 10px;
+    line-height: 1.15;
+  }
+
+  .card p {
+    margin: 0;
+    font-size: 15.5px;
+    line-height: 1.55;
+    color: var(--ink-2);
+  }
+</style>

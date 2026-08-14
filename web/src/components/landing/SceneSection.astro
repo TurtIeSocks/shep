@@ -1,0 +1,60 @@
+---
+/*
+ * Shared shell for the five landing content scenes (docs/shep-design/
+ * README.md, "Landing page > Structure", row 5). Each scene is a full
+ * viewport-height section with its content in a column on the left, so the
+ * sticky pasture scenery stays visible on the right.
+ */
+interface Props {
+  id: string;
+  columnWidth?: string;
+}
+
+const { id, columnWidth = "min(600px, 54vw)" } = Astro.props;
+---
+
+<section id={id} class="scene">
+  <div class="inner">
+    <div class="column" style={`width:${columnWidth}`}>
+      <slot />
+    </div>
+  </div>
+</section>
+
+<style>
+  .scene {
+    position: relative;
+    z-index: 5;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    padding: 110px 0 60px;
+  }
+
+  .inner {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 0 28px;
+    width: 100%;
+  }
+
+  .column {
+    max-width: 100%;
+  }
+
+  /* Responsive first pass (docs/shep-design/README.md, "Responsive"). Every
+     scene's column width is a desktop vw-fraction beside scenery
+     (min(600px,54vw), etc.) — below ~680px that fraction gets uncomfortably
+     narrow, so let the column claim most of the viewport instead. This
+     turns each scene into a single-column stack with scenery visible as a
+     band behind/below the card rather than a column beside it. */
+  @media (max-width: 680px) {
+    .scene {
+      padding: 90px 0 48px;
+    }
+
+    .column {
+      width: min(92vw, 520px) !important;
+    }
+  }
+</style>

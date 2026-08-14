@@ -1,0 +1,127 @@
+---
+/*
+ * Landing nav. Sticky, overlaps the hero via a negative bottom margin (see
+ * docs/shep-design/README.md, "Screens > 1. Landing page > Nav").
+ * No theme toggle here — the landing page has none; see tokens.css's note
+ * on --grass-deep / --barn having no dark override.
+ */
+import Sheep from "../marks/Sheep.astro";
+---
+
+<nav class="landing-nav">
+  <div class="bar">
+    <a href="#scene-1" class="logo press" style="--shadow-offset:4px;">
+      <Sheep width={38} />
+      <span class="wordmark">shep</span>
+    </a>
+    <div class="links">
+      <a href="#pasture" class="pill press lexicon" style="--shadow-offset:4px;">Lexicon</a>
+      <a href="/docs" class="pill press butter" style="--shadow-offset:4px;">Docs</a>
+      <a
+        href="https://github.com/TurtIeSocks/shep"
+        class="pill press ink"
+        style="--shadow-offset:4px; --shadow-color:var(--barn);"
+      >
+        GitHub
+      </a>
+    </div>
+  </div>
+</nav>
+
+<style>
+  .landing-nav {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    margin-bottom: -91px;
+  }
+
+  .bar {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 20px 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 999px;
+    padding: 8px 18px 8px 12px;
+    text-decoration: none;
+  }
+
+  .wordmark {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 23px;
+    letter-spacing: -0.04em;
+    color: var(--ink);
+  }
+
+  .links {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .pill {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 15px;
+    background: var(--paper-2);
+    color: var(--ink);
+    border: 3px solid var(--line);
+    border-radius: 999px;
+    padding: 11px 18px;
+    text-decoration: none;
+  }
+
+  .pill.butter {
+    background: var(--butter);
+  }
+
+  .pill.ink {
+    background: var(--ink);
+    color: var(--paper-2);
+  }
+
+  /* Responsive first pass (docs/shep-design/README.md, "Responsive" — this
+     needs a mobile pass designed rather than derived). The nav's three
+     pills plus the logo lockup don't fit one row under ~520px. Shrinking
+     first; below ~400px even that isn't enough room for all four, and the
+     nav deliberately stays single-row rather than wrapping — this bar is
+     position:sticky with a negative bottom margin sized to *this* row's
+     height so it overlaps the hero correctly (see the handoff's Nav
+     section); a second row would grow the bar past what that margin
+     cancels and expose a strip of plain page background above the sky.
+     Lexicon is the one pill that's a "nice to have" (its section is one
+     scroll away either way), so it's what goes. */
+  @media (max-width: 520px) {
+    .bar {
+      padding: 14px 16px;
+      gap: 10px;
+    }
+
+    .links {
+      gap: 8px;
+    }
+
+    .pill {
+      font-size: 13px;
+      padding: 9px 14px;
+    }
+  }
+
+  @media (max-width: 400px) {
+    .lexicon {
+      display: none;
+    }
+  }
+</style>

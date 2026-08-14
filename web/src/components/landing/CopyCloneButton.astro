@@ -1,0 +1,80 @@
+---
+/*
+ * Hero copy-to-clipboard button (docs/shep-design/README.md,
+ * "Interactions > Copy button"). Writes the clone command, flips its label
+ * copy -> copied, and reverts after 1800ms.
+ */
+const CLONE_COMMAND = "git clone https://github.com/TurtIeSocks/shep.git";
+---
+
+<button type="button" class="copy-clone press" style="--shadow-offset:6px; --press-offset:3px;" data-copy-clone data-clone-command={CLONE_COMMAND}>
+  <span class="prompt">$</span> git clone github.com/TurtIeSocks/shep
+  <span class="label" data-copy-label>copy</span>
+</button>
+
+<style>
+  .copy-clone {
+    font-family: "Space Mono", monospace;
+    font-size: 13.5px;
+    background: var(--paper-2);
+    color: var(--ink);
+    border: 3px solid var(--line);
+    border-radius: 16px;
+    padding: 15px 19px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 11px;
+    white-space: nowrap;
+  }
+
+  .prompt {
+    color: var(--grass-deep);
+    font-weight: 700;
+  }
+
+  .label {
+    font-family: "Space Grotesk", sans-serif;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    border-left: 2px solid var(--hair);
+    padding-left: 11px;
+  }
+
+  /* Responsive first pass (docs/shep-design/README.md, "Responsive"). The
+     command text is white-space:nowrap by design (it reads as one typed
+     line) but that overflows a phone-width viewport and forces the whole
+     page to scroll horizontally. Below ~480px, wrap it and drop to a
+     smaller size instead. */
+  @media (max-width: 480px) {
+    .copy-clone {
+      white-space: normal;
+      font-size: 12px;
+      max-width: 100%;
+    }
+  }
+</style>
+
+<script>
+  const REVERT_DELAY_MS = 1800;
+
+  document
+    .querySelectorAll<HTMLButtonElement>("[data-copy-clone]")
+    .forEach((button) => {
+      const label = button.querySelector<HTMLSpanElement>("[data-copy-label]");
+      const command = button.dataset.cloneCommand ?? "";
+      let revertTimer: ReturnType<typeof setTimeout> | undefined;
+
+      button.addEventListener("click", () => {
+        navigator.clipboard?.writeText(command);
+        if (label) label.textContent = "copied";
+        clearTimeout(revertTimer);
+        revertTimer = setTimeout(() => {
+          if (label) label.textContent = "copy";
+        }, REVERT_DELAY_MS);
+      });
+    });
+</script>

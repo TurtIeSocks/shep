@@ -4,39 +4,64 @@ import "../styles/global.css";
 interface Props {
   title: string;
   description?: string;
+  /**
+   * "auto" (default) — respect localStorage's `shep-theme`, falling back to
+   * `prefers-color-scheme`. Used by docs and the design-language page, both
+   * of which carry a visible theme toggle.
+   *
+   * "light" — always light, full stop, no localStorage read and no system
+   * check. The landing page has no theme toggle (tokens.css's note on
+   * --grass-deep / --barn explains why) and its palette is a fixed
+   * illustration, not a themed UI — design-files/Shep Landing v3
+   * scene.dc.html's own <style> block defines only a `:root` light palette
+   * with no dark variant at all. Without this, a visitor with a
+   * system-level dark preference gets tokens.css's global dark override
+   * applied to a page that was never designed to receive it — the hero's
+   * cream headline text (color: var(--fleece)) would render in
+   * dark-mode's near-black --paper-2, invisible against the night sky.
+   */
+  theme?: "auto" | "light";
 }
 
-const { title, description } = Astro.props;
+const { title, description, theme = "auto" } = Astro.props;
 ---
 
 <!doctype html>
 <html lang="en">
   <head>
     <!--
-      Theme init: sets data-theme="dark" on <html> before first paint so
-      there's no flash. shep-theme in localStorage wins; otherwise falls
-      back to prefers-color-scheme. is:inline keeps this unbundled and
-      synchronous — it must run before CSS paints, not after hydration.
+      Theme init: sets data-theme on <html> before first paint so there's no
+      flash. is:inline keeps this unbundled and synchronous — it must run
+      before CSS paints, not after hydration. See the `theme` prop doc above
+      for why "light" pages skip localStorage/prefers-color-scheme entirely.
     -->
-    <script is:inline>
-      (function () {
-        try {
-          var stored = localStorage.getItem("shep-theme");
-          var theme =
-            stored ||
-            (window.matchMedia("(prefers-color-scheme: dark)").matches
-              ? "dark"
-              : "light");
-          if (theme === "dark") {
-            document.documentElement.setAttribute("data-theme", "dark");
-          } else {
-            document.documentElement.setAttribute("data-theme", "light");
-          }
-        } catch (e) {
-          /* localStorage unavailable (private mode, etc.) — default light */
-        }
-      })();
-    </script>
+    {
+      theme === "light" ? (
+        <script is:inline>
+          document.documentElement.setAttribute("data-theme", "light");
+        </script>
+      ) : (
+        <script is:inline>
+          (function () {
+            try {
+              var stored = localStorage.getItem("shep-theme");
+              var theme =
+                stored ||
+                (window.matchMedia("(prefers-color-scheme: dark)").matches
+                  ? "dark"
+                  : "light");
+              if (theme === "dark") {
+                document.documentElement.setAttribute("data-theme", "dark");
+              } else {
+                document.documentElement.setAttribute("data-theme", "light");
+              }
+            } catch (e) {
+              /* localStorage unavailable (private mode, etc.) — default light */
+            }
+          })();
+        </script>
+      )
+    }
 
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />

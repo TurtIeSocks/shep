@@ -1,158 +1,47 @@
 ---
 /*
- * Milestone 1 scaffold check — not the landing page. Confirms the tokens,
- * fonts, marks, motion, and theme mechanism all work together. The real
- * landing page (docs/shep-design/README.md, "Screens > 1") is Part 2.
+ * The landing page (docs/shep-design/README.md, "Screens > 1. Landing
+ * page"; design-files/Shep Landing v3 scene.dc.html is the pixel source).
+ * Structure: Nav, then one SkyStage wrapper (the sticky-pasture trick —
+ * see that component's own doc comment) holding the five content scenes
+ * and the lexicon section, then three independent bands in normal flow:
+ * features, chalkboard, CTA footer.
  */
 import Base from "../layouts/Base.astro";
-import ThemeToggle from "../components/ThemeToggle.astro";
-import Sheep from "../components/marks/Sheep.astro";
-import Dog from "../components/marks/Dog.astro";
-import Barn from "../components/marks/Barn.astro";
+import Nav from "../components/landing/Nav.astro";
+import SkyStage from "../components/landing/SkyStage.astro";
+import Scene1Hero from "../components/landing/scenes/Scene1Hero.astro";
+import Scene2Flock from "../components/landing/scenes/Scene2Flock.astro";
+import Scene3Flockfile from "../components/landing/scenes/Scene3Flockfile.astro";
+import Scene4Dogs from "../components/landing/scenes/Scene4Dogs.astro";
+import Scene5PreRelease from "../components/landing/scenes/Scene5PreRelease.astro";
+import Lexicon from "../components/landing/Lexicon.astro";
+import Features from "../components/landing/Features.astro";
+import Chalkboard from "../components/landing/Chalkboard.astro";
+import CtaFooter from "../components/landing/CtaFooter.astro";
 ---
 
-<Base title="shep — design system scaffold" description="Design-system scaffold for the shep marketing site.">
-  <main>
-    <header class="topbar">
-      <span class="wordmark">shep<span class="dot">.</span></span>
-      <ThemeToggle variant="icon" />
-    </header>
-
-    <section class="marks">
-      <div class="mark-card">
-        <Sheep width={110} bob bobDuration="5s" chewing />
-        <p>sheep · 110px · bobbing, chewing</p>
-      </div>
-      <div class="mark-card">
-        <Sheep width={28} />
-        <p>sheep · 28px · legs dropped</p>
-      </div>
-      <div class="mark-card">
-        <Dog width={138} wag />
-        <p>dog · 138px · tail wagging</p>
-      </div>
-      <div class="mark-card">
-        <Barn width={220} />
-        <p>barn · 220px</p>
-      </div>
-    </section>
-
-    <section class="swatches">
-      {["paper", "paper-2", "ink", "meadow", "grass", "grass-deep", "bark", "butter", "sky", "barn"].map((name) => (
-        <div class="swatch">
-          <div class="chip" style={`background:var(--${name});`}></div>
-          <code>--{name}</code>
-        </div>
-      ))}
-    </section>
-
-    <section class="press-demo">
-      <button class="pill press" style="--shadow-offset:4px;">press me</button>
-    </section>
-
-    <section class="type-demo">
-      <h1>Bricolage Grotesque 800</h1>
-      <p>Space Grotesk 400 — the quick flock jumps over the lazy dog.</p>
-      <code>Space Mono 400 — $ shep ls</code>
-    </section>
-  </main>
+<Base
+  title="shep — a process manager for your flock"
+  description="shep keeps your flock alive: a process manager written in Rust, a clean-room pm2 rewrite with a sheep-and-sheepdog vocabulary."
+  theme="light"
+>
+  <Nav />
+  <SkyStage>
+    <Scene1Hero />
+    <Scene2Flock />
+    <Scene3Flockfile />
+    <Scene4Dogs />
+    <Scene5PreRelease />
+    <Lexicon />
+  </SkyStage>
+  <Features />
+  <Chalkboard />
+  <CtaFooter />
 </Base>
 
-<style>
-  main {
-    max-width: 960px;
-    margin: 0 auto;
-    padding: 32px 24px 80px;
-    display: grid;
-    gap: 40px;
-  }
-
-  .topbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-
-  .wordmark {
-    font-family: "Bricolage Grotesque", sans-serif;
-    font-weight: 800;
-    font-size: 28px;
-    letter-spacing: -0.05em;
-  }
-
-  .wordmark .dot {
-    color: var(--grass);
-  }
-
-  .marks {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 24px;
-  }
-
-  .mark-card {
-    display: grid;
-    place-items: center;
-    gap: 12px;
-    background: var(--paper-2);
-    border: 3px solid var(--line);
-    border-radius: 22px;
-    box-shadow: 6px 6px 0 var(--shadow);
-    padding: 28px 20px;
-    text-align: center;
-  }
-
-  .mark-card p {
-    margin: 0;
-    font-family: "Space Mono", monospace;
-    font-size: 12px;
-    color: var(--ink-3);
-  }
-
-  .swatches {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-    gap: 14px;
-  }
-
-  .swatch {
-    display: grid;
-    gap: 8px;
-  }
-
-  .chip {
-    height: 56px;
-    border: 3px solid var(--line);
-    border-radius: 12px;
-  }
-
-  .swatch code {
-    font-family: "Space Mono", monospace;
-    font-size: 12px;
-    color: var(--ink-2);
-  }
-
-  .pill {
-    font-family: "Bricolage Grotesque", sans-serif;
-    font-weight: 800;
-    font-size: 15px;
-    background: var(--grass-deep);
-    color: var(--fleece);
-    border: 3px solid var(--line);
-    border-radius: 999px;
-    padding: 12px 22px;
-    cursor: pointer;
-  }
-
-  .type-demo {
-    display: grid;
-    gap: 10px;
-  }
-
-  .type-demo code {
-    background: var(--code-bg);
-    border-radius: 6px;
-    padding: 4px 8px;
-    width: fit-content;
+<style is:global>
+  html {
+    scroll-behavior: smooth;
   }
 </style>

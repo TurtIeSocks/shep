@@ -1,0 +1,90 @@
+---
+/*
+ * Scene 3 — the Flockfile card. Copy verbatim from docs/shep-design/
+ * README.md, "Screens > 1. Landing page > Scene copy" #3.
+ */
+import SceneSection from "../SceneSection.astro";
+---
+
+<SceneSection id="scene-3" columnWidth="min(600px, 52vw)">
+  <div class="card">
+    <div class="kicker">two fields is a whole Flockfile</div>
+    <h2>A typo fails at load, not at 3am.</h2>
+    <div class="toml">
+      <div class="line key">[[app]]</div>
+      <div class="line">name   = <span class="str">"web"</span></div>
+      <div class="line">script = <span class="str">"./server"</span></div>
+    </div>
+    <p>
+      Unknown fields are a parse error rather than a shrug, and sizes are
+      strict on purpose: <code>512M</code> and <code>30s</code> parse;
+      <code>512MB</code> and <code>1.5G</code> do not.
+    </p>
+  </div>
+</SceneSection>
+
+<style>
+  .card {
+    background: var(--paper-2);
+    border: 4px solid var(--line);
+    border-radius: 26px;
+    box-shadow: 9px 9px 0 var(--shadow);
+    padding: 32px;
+    transform: rotate(-1.2deg);
+  }
+
+  .kicker {
+    font-family: "Space Mono", monospace;
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--barn);
+    margin-bottom: 14px;
+  }
+
+  h2 {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: clamp(28px, 3.6vw, 44px);
+    line-height: 1;
+    letter-spacing: -0.04em;
+    margin: 0 0 16px;
+    color: var(--ink);
+  }
+
+  .toml {
+    background: var(--paper);
+    border: 3px solid var(--line);
+    border-radius: 16px;
+    padding: 18px 20px;
+    font-family: "Space Mono", monospace;
+    font-size: 14px;
+    line-height: 1.85;
+    color: var(--ink-2);
+    margin-bottom: 16px;
+  }
+
+  .toml .line {
+    white-space: pre;
+  }
+
+  .toml .key {
+    color: var(--barn);
+  }
+
+  .toml .str {
+    color: var(--grass-deep);
+  }
+
+  p {
+    margin: 0;
+    font-size: 16px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+
+  p code {
+    font-family: "Space Mono", monospace;
+    font-size: 14.5px;
+  }
+</style>

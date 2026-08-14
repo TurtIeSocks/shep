@@ -1,0 +1,368 @@
+---
+/*
+ * The landing page's structural trick (docs/shep-design/README.md,
+ * "Landing page > Structure" table + the top-level "THE STRUCTURAL TRICK"
+ * note). One relative wrapper holds, in z-order:
+ *
+ *   0  fixed sky gradient spanning the whole stage (night -> dawn -> noon)
+ *   1  stars / moon / sun / sheep-clouds, positioned in vh down the stage
+ *   2  a STICKY pasture (position:sticky; top:0; height:100vh;
+ *      margin-bottom:-100vh) so the scenery pins while content scrolls
+ *   3  a night wash that multiplies over the top and fades out
+ *   4  a barn glow, second sticky layer
+ *   5+ <slot /> — the five content scenes and the lexicon section, which
+ *      must live INSIDE this same wrapper: the stage's total height (driven
+ *      by that slotted content) is what the sticky pasture pins against.
+ *
+ * Nothing here animates on scroll — the only scroll effect is this fixed
+ * gradient being revealed behind the sticky scenery as the page moves.
+ */
+import Sheep from "../marks/Sheep.astro";
+import Dog from "../marks/Dog.astro";
+import Barn from "../marks/Barn.astro";
+
+const stars = [
+  [8, 14, 3, 3.1], [16, 38, 2, 4.2], [24, 8, 2.5, 2.6], [33, 24, 3, 3.8], [41, 7, 2, 4.6],
+  [49, 30, 2.5, 3.2], [57, 13, 3, 2.9], [64, 35, 2, 4.1], [72, 9, 2.5, 3.5], [79, 27, 3, 2.7],
+  [86, 16, 2, 4.4], [92, 38, 2.5, 3.3], [12, 52, 2, 3.9], [68, 56, 2.5, 4.8],
+  [37, 62, 2, 3.4], [83, 66, 2.5, 4.1], [22, 72, 2, 3.7], [58, 78, 2, 4.5],
+].map(([x, y, d, dur]) => ({ x, y, d, dur }));
+
+const posts = [30, 180, 330, 480, 630, 780, 930, 1080, 1230, 1350];
+
+const clouds = [
+  { left: "8%", top: "52vh", width: "150px" },
+  { right: "14%", top: "128vh", width: "112px" },
+  { left: "34%", top: "262vh", width: "184px" },
+  { right: "9%", top: "332vh", width: "132px" },
+  { left: "12%", top: "392vh", width: "96px" },
+];
+
+const grazing = [
+  { left: "7%", bottom: "9vh", width: 110, bobDuration: "5s", bobDelay: "0s", chewing: true },
+  { left: "31%", bottom: "4vh", width: 86, bobDuration: "6.4s", bobDelay: ".9s", chewing: false },
+  { left: "56%", bottom: "11vh", width: 68, bobDuration: "5.6s", bobDelay: ".4s", chewing: false },
+];
+---
+
+<div class="stage">
+  <div class="sky-gradient"></div>
+
+  <div class="stars">
+    {stars.map((s) => (
+      <span
+        class="star anim-twinkle"
+        style={`left:${s.x}%;top:${s.y}%;width:${s.d}px;height:${s.d}px;--twinkle-duration:${s.dur}s;`}
+      />
+    ))}
+  </div>
+
+  <div class="moon">
+    <span class="crater" style="left:16px;top:22px;width:13px;height:13px;" />
+    <span class="crater" style="left:42px;top:16px;width:9px;height:9px;" />
+    <span class="crater" style="left:34px;top:44px;width:16px;height:16px;" />
+  </div>
+
+  <div class="sun" aria-hidden="true"></div>
+
+  <div class="clouds">
+    {clouds.map((c) => (
+      <div
+        class="cloud"
+        style={`${c.left ? `left:${c.left};` : `right:${c.right};`}top:${c.top};width:${c.width};`}
+      >
+        <svg viewBox="0 0 104 78" width="100%" aria-hidden="true">
+          <path
+            d="M40 20c6-9 22-10 28-2 10-3 19 4 18 13 7 4 7 15-1 19-2 8-12 11-19 8-8 5-21 4-26-3-10 1-17-7-15-16-4-8 4-18 15-19Z"
+            fill="var(--fleece)"
+            stroke="var(--ink)"
+            stroke-width="3.4"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </div>
+    ))}
+  </div>
+
+  <div class="pasture" aria-hidden="true">
+    <div class="far-hill">
+      <svg viewBox="0 0 1200 210" preserveAspectRatio="none" width="100%" height="100%">
+        <path
+          d="M0 118C170 62 360 132 560 104 760 76 950 30 1200 84V210H0Z"
+          fill="var(--illus-far-hill)"
+          stroke="var(--ink)"
+          stroke-width="4"
+        />
+      </svg>
+    </div>
+
+    <div class="barn">
+      <Barn width={300} />
+    </div>
+
+    <div class="near-hill">
+      <svg viewBox="0 0 1200 260" preserveAspectRatio="none" width="100%" height="100%">
+        <path
+          d="M0 92C220 52 470 116 700 88 930 60 1050 96 1200 70V260H0Z"
+          fill="var(--grass)"
+          stroke="var(--ink)"
+          stroke-width="4"
+        />
+      </svg>
+    </div>
+
+    <div class="fence">
+      <svg viewBox="0 0 1400 76" preserveAspectRatio="none" width="100%" height="100%">
+        <g fill="var(--fleece)" stroke="var(--ink)" stroke-width="4">
+          <rect x="0" y="22" width="1400" height="12" rx="3" />
+          <rect x="0" y="48" width="1400" height="12" rx="3" />
+          {posts.map((a) => <path d={`M${a} 74V14l14-10 14 10v60Z`} />)}
+        </g>
+      </svg>
+    </div>
+
+    {grazing.map((sheep) => (
+      <div
+        class="grazing-sheep"
+        style={`left:${sheep.left};bottom:${sheep.bottom};`}
+      >
+        <Sheep
+          width={sheep.width}
+          bob
+          bobDuration={sheep.bobDuration}
+          bobDelay={sheep.bobDelay}
+          chewing={sheep.chewing}
+        />
+      </div>
+    ))}
+
+    <div class="watch-dog">
+      <Dog width={138} wag />
+    </div>
+  </div>
+
+  <div class="night-wash"></div>
+
+  <div class="barn-glow-layer">
+    <div class="barn-glow"></div>
+  </div>
+
+  <slot />
+</div>
+
+<style>
+  .stage {
+    position: relative;
+  }
+
+  .sky-gradient {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    background: linear-gradient(
+      180deg,
+      #0e1730 0%,
+      #152342 4.8%,
+      #26386a 10.2%,
+      #4c4a83 15%,
+      #8c5f84 19.1%,
+      #c97a5a 23.2%,
+      #e7a468 27.3%,
+      #f1c98d 31.4%,
+      #dde6e0 36.8%,
+      #bfe2f2 43.6%,
+      #9bd8f1 51.8%,
+      #b9e5f7 60%,
+      #cfebf8 68.2%,
+      #cfebf8 100%
+    );
+  }
+
+  .stars {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 36vh;
+    z-index: 1;
+  }
+
+  .star {
+    position: absolute;
+    border-radius: 50%;
+    background: var(--fleece);
+  }
+
+  .moon {
+    position: absolute;
+    left: 17%;
+    top: 9vh;
+    width: 76px;
+    height: 76px;
+    border-radius: 50%;
+    background: var(--illus-moon);
+    border: 4px solid var(--line);
+    box-shadow: 5px 5px 0 rgba(14, 23, 48, 0.35);
+    z-index: 1;
+  }
+
+  .crater {
+    position: absolute;
+    border-radius: 50%;
+    background: var(--illus-moon-craters);
+    display: block;
+  }
+
+  .sun {
+    position: absolute;
+    left: 60%;
+    top: 224vh;
+    width: 124px;
+    height: 124px;
+    border-radius: 50%;
+    background: var(--butter);
+    border: 4px solid var(--line);
+    box-shadow: 6px 6px 0 rgba(23, 37, 28, 0.16);
+    z-index: 1;
+  }
+
+  .clouds {
+    z-index: 1;
+  }
+
+  .cloud {
+    position: absolute;
+  }
+
+  .pasture {
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    margin-bottom: -100vh;
+    overflow: hidden;
+    z-index: 2;
+    pointer-events: none;
+  }
+
+  .far-hill {
+    position: absolute;
+    left: -4%;
+    right: -4%;
+    bottom: 8%;
+    height: 43vh;
+  }
+
+  .near-hill {
+    position: absolute;
+    left: -4%;
+    right: -4%;
+    bottom: 0;
+    height: 27vh;
+  }
+
+  .fence {
+    position: absolute;
+    left: -6%;
+    right: -6%;
+    bottom: 7vh;
+    height: 54px;
+  }
+
+  .barn {
+    position: absolute;
+    right: 6%;
+    bottom: 26%;
+    width: min(300px, 26vw);
+  }
+
+  /* Barn.astro sizes its own wrapper from the `width` prop (a fixed px
+     figure for a standalone mark); here it must instead fill this
+     already-responsive min(300px,26vw) container. */
+  .barn :global(.barn-mark) {
+    width: 100% !important;
+  }
+
+  .grazing-sheep {
+    position: absolute;
+  }
+
+  .watch-dog {
+    position: absolute;
+    right: 25%;
+    bottom: 5vh;
+    width: 138px;
+  }
+
+  .night-wash {
+    position: absolute;
+    inset: 0;
+    z-index: 3;
+    pointer-events: none;
+    mix-blend-mode: multiply;
+    background: linear-gradient(
+      180deg,
+      rgba(16, 26, 52, 0.72) 0%,
+      rgba(16, 26, 52, 0.66) 8.2%,
+      rgba(22, 34, 64, 0.5) 15%,
+      rgba(40, 40, 72, 0.3) 20.5%,
+      rgba(90, 70, 60, 0.12) 25.9%,
+      rgba(255, 255, 255, 0) 32.7%,
+      rgba(255, 255, 255, 0) 100%
+    );
+  }
+
+  .barn-glow-layer {
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    margin-bottom: -100vh;
+    z-index: 4;
+    pointer-events: none;
+  }
+
+  .barn-glow {
+    position: absolute;
+    right: calc(6% + min(300px, 26vw) / 2 - 66px);
+    bottom: calc(26% + min(300px, 26vw) * 0.62 - 66px);
+    width: 132px;
+    height: 132px;
+    border-radius: 50%;
+    background: radial-gradient(
+      circle,
+      rgba(247, 228, 176, 0.72) 0%,
+      rgba(243, 196, 76, 0.34) 36%,
+      rgba(243, 196, 76, 0) 70%
+    );
+  }
+
+  /* Responsive first pass (docs/shep-design/README.md, "Responsive": "scenery
+     reduced to a band rather than removed"). The grazing sheep and dog are
+     fixed-px marks positioned by percentage — comfortable spacing at
+     desktop widths, crowded and overlapping under ~600px where three sheep
+     plus a dog compete for less than 400px of horizontal room. Scaling the
+     whole cluster down (rather than repositioning each one) keeps their
+     relative composition intact. */
+  @media (max-width: 600px) {
+    .grazing-sheep,
+    .watch-dog {
+      transform: scale(0.62);
+    }
+
+    .grazing-sheep {
+      transform-origin: bottom left;
+    }
+
+    .watch-dog {
+      transform-origin: bottom right;
+    }
+
+    .far-hill,
+    .near-hill {
+      height: 22vh;
+    }
+
+    .fence {
+      bottom: 4vh;
+    }
+  }
+</style>
