@@ -602,11 +602,18 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
             code: RpcErrorCode::Internal,
             message: err.to_string(),
         },
-        // Unlike the two `Internal`-under-protest mappings above, this one
-        // needs no revisiting: every `InvalidScale` is something the caller
-        // asked for that it can ask differently — a count of `0`, a dog, or
-        // (unreachably, through this path) a rescaled config `normalize`
-        // itself refused.
+        // Every `InvalidScale` is something the caller asked for that it can
+        // ask differently — a count of `0`, a dog, an app whose earlier scale
+        // is still shutting instances down, or (unreachably, through this
+        // path) a rescaled config `normalize` itself refused.
+        //
+        // The departures shape is the one exception to that reading, and it
+        // is why this mapping is no longer described as needing no
+        // revisiting: "wait and ask again" is a CONFLICT, the same thing
+        // `ReloadInFlight` above is. Both belong under a conflict code the
+        // wire does not have yet, and `InvalidConfig` carrying the message is
+        // the better of the two codes that exist — see
+        // `SupervisorError::InvalidScale`'s own doc for the argument.
         SupervisorError::InvalidScale(msg) => RpcError {
             code: RpcErrorCode::InvalidConfig,
             message: msg.clone(),

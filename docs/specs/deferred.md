@@ -374,6 +374,13 @@ What each of those does NOT do, recorded so it is not rediscovered as drift:
 - `scale` has no relative `+N`/`-N` form and will not grow one — an absolute
   count is idempotent and pm2's relative-remove path is one of the crashes
   the trace notes exist to keep us from reproducing.
+- `scale` is refused while the same app still has instances shutting down
+  from an earlier scale or delete, the way it is already refused mid-reload.
+  A scale-down's reply is the survivors and does not wait for the departures,
+  so those slots are still registered; a second scale counting them answered
+  `Ok` for a flock that then shrank underneath the muster roll. Two `shep
+  scale` calls back to back in a provisioning script need a wait between
+  them, bounded by the app's own `kill_timeout`.
 - `signal` refuses `SIGSTOP`: a stopped sheep still reads `online` in every
   listing the shepherd can produce, so accepting it would put the flock in a
   state shep cannot report.

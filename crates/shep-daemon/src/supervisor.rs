@@ -438,17 +438,32 @@ pub enum SupervisorError {
     /// A `Scale` the engine will not perform; carries the refusal in plain
     /// English, naming what to do instead.
     ///
-    /// Three shapes reach it: a count of `0` (`normalize` refuses
+    /// Four shapes reach it: a count of `0` (`normalize` refuses
     /// `instances == 0`, so accepting it here would admit a config the
     /// engine's own validator rejects — `shep delete` is the verb), a target
-    /// that is a dog (one process by contract, spec §8), and a rescaled
-    /// config that failed `normalize`, which is unreachable through this
-    /// path and is carried rather than `expect`ed because a supervisor does
-    /// not panic on peer input.
+    /// that is a dog (one process by contract, spec §8), an app with
+    /// departures still in flight (`Actor::handle_scale` has the account), and a
+    /// rescaled config that failed `normalize`, which is unreachable through
+    /// this path and is carried rather than `expect`ed because a supervisor
+    /// does not panic on peer input.
     ///
     /// Maps to [`RpcErrorCode::InvalidConfig`](shep_core::protocol::RpcErrorCode::InvalidConfig),
     /// not `Internal`: every one of those is something the caller asked for
     /// that it can ask differently.
+    ///
+    /// The departures shape is a CONFLICT — ask again in a moment, not ask
+    /// something else — and so has the same claim to a code of its own that
+    /// [`Self::ReloadInFlight`] has and does not get. It rides here rather
+    /// than in a variant of its own for two reasons. It is a scale the
+    /// engine will not perform, carrying its refusal in plain English and
+    /// naming the wait, which is exactly this variant's contract. And the
+    /// only place a new variant could map to today is `Internal`, where
+    /// `ReloadInFlight` already sits under protest: filing an actionable
+    /// refusal under "unexpected daemon-side failure" would be strictly
+    /// worse for the operator than `InvalidConfig`, which at least says the
+    /// request is the thing to change. A conflict code on the wire is the
+    /// real fix, and it is a protocol change both refusals should move to at
+    /// once.
     InvalidScale(String),
     /// At least one log pump could not open a log path again, so that stream
     /// has no file to write to. Carries one
@@ -2537,6 +2552,41 @@ impl<R: ProcessRunner> Actor<R> {
     /// a caller is allowed to wait for. The answer is the survivors; the
     /// departures report themselves on the bus as `process.delete`. Same split
     /// [`Self::handle_reload`] already makes.
+    ///
+    /// # Why a scale is refused while departures are still in flight
+    ///
+    /// Because the reply does not wait for them, a departing instance stays
+    /// REGISTERED — marked [`SheepSlot::pending_delete`], partway through a
+    /// kill ladder — until its exit lands. It is still in the map this
+    /// function counts `current` off. So `shep scale web 1 && shep scale web
+    /// 4` against an app that does not die instantly on `SIGTERM` (which is
+    /// every app that drains connections on shutdown) used to find four
+    /// slots, three of them doomed, call the second scale a no-op, answer
+    /// `Ok` with four instances and no shortfall, and let `rpc` record
+    /// `instances = 4` into the muster roll. The three then finished their
+    /// ladders and the flock settled to one. The roll said four. A later
+    /// `shep save` froze the lie, and a reboot brought up a count that had
+    /// never run — the same class the partial-scale write-back below exists
+    /// to close, arriving through a door it does not cover.
+    ///
+    /// Refused rather than counted around, and this is the choice worth
+    /// arguing. Counting only the slots not marked for deletion would make
+    /// the second scale spawn three fresh instances — into slots the
+    /// departures still hold, while their ladders are still running, so the
+    /// app briefly runs seven processes and the new ones' `SHEP_INSTANCE`
+    /// values and log paths depend on when the old ones happen to die. The
+    /// flock's shape is the thing being changed; a second command issued
+    /// against it mid-change is a question with no stable answer, and
+    /// answering it with a guess is what produced the divergence in the
+    /// first place. A refusal names the wait, and the wait is bounded by the
+    /// app's own `kill_timeout`.
+    ///
+    /// Symmetric with the `reloads` guard directly above it, for the same
+    /// reason: both refuse a command that would reshape an app another
+    /// command is still reshaping. The refusal reaches the operator as
+    /// [`SupervisorError::InvalidScale`] rather than a variant of its own —
+    /// see that variant's doc for why a conflict is carried by the scale's
+    /// own refusal type here.
     fn handle_scale(
         &mut self,
         name: &str,
@@ -2573,6 +2623,22 @@ impl<R: ProcessRunner> Actor<R> {
         }
         if self.reloads.contains_key(name) {
             let _ = reply.send(Err(SupervisorError::ReloadInFlight(name.to_string())));
+            return;
+        }
+        // Counted rather than merely detected: the number is the only thing
+        // that tells the operator how much of the flock is still moving, and
+        // `current - leaving` is the count the next scale will actually start
+        // from.
+        let leaving = slots
+            .iter()
+            .filter(|(_, id)| self.sheep.get(id).is_some_and(|slot| slot.pending_delete))
+            .count();
+        if leaving > 0 {
+            let _ = reply.send(Err(SupervisorError::InvalidScale(format!(
+                "{name} has {leaving} instance(s) still shutting down from an \
+                 earlier command; wait for them to leave `shep flock` and scale \
+                 again"
+            ))));
             return;
         }
 
@@ -7843,6 +7909,89 @@ mod tests {
             answer.await.unwrap().unwrap_err(),
             SupervisorError::ReloadInFlight("web".to_string())
         );
+    }
+
+    /// fails if a scale can be issued against an app whose EARLIER scale is still
+    /// shutting instances down. The reply to a scale-down is the survivors and
+    /// deliberately does not wait for the departures, so those slots stay
+    /// registered — and a second scale counting them found four where one was
+    /// going to be left, called itself a no-op, answered `Ok` with four instances
+    /// and no shortfall, and let `rpc` record `instances = 4` into the muster
+    /// roll. The flock then settled to one. Two `shep scale` calls in a
+    /// provisioning script is the ordinary way to reach that.
+    ///
+    /// The doomed three `never_reports_its_exit`, which is what makes the case
+    /// deterministic rather than a race against its own kill ladders: the marker
+    /// under test is set the moment the departure is claimed and is independent
+    /// of how the child eventually dies. An app that merely drains connections on
+    /// `SIGTERM` — every app that drains connections on shutdown — sits in the
+    /// same state for its whole `kill_timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn a_scale_is_refused_while_an_earlier_ones_departures_are_still_leaving() {
+        // Scripts go out in spawn order, so instance 0 — the survivor — gets the
+        // first and the three a scale-down removes get the other three.
+        let h = harness(vec![
+            ProcScript::never_exits(),
+            ProcScript::never_reports_its_exit(),
+            ProcScript::never_reports_its_exit(),
+            ProcScript::never_reports_its_exit(),
+        ]);
+        start_app(
+            &h,
+            AppConfig {
+                instances: 4,
+                ..AppConfig::minimal("web", "./srv")
+            },
+        )
+        .await;
+
+        let down = h.ctx.supervisor.scale("web", 1).await.unwrap();
+        assert_eq!(down.instances.len(), 1);
+
+        let err = h.ctx.supervisor.scale("web", 4).await.unwrap_err();
+
+        let SupervisorError::InvalidScale(message) = err else {
+            panic!("expected InvalidScale, got {err:?}");
+        };
+        assert!(
+            message.contains("3 instance(s) still shutting down"),
+            "the refusal has to say how much of the flock is still moving: {message}"
+        );
+        assert!(
+            message.contains("shep flock"),
+            "the refusal has to name what to wait for: {message}"
+        );
+    }
+
+    /// fails if the departures guard outlives the departures. A refusal that
+    /// never lifts would be worse than the divergence it replaces — the operator
+    /// could not scale the app again at all without restarting it.
+    ///
+    /// `never_exits` rather than the case above's wedged scripts: these obey
+    /// `SIGTERM`, so the ladders end with no clock to advance and `settle_to` is
+    /// the forcing mechanism (IR-46).
+    #[tokio::test(start_paused = true)]
+    async fn a_scale_is_accepted_again_once_the_departures_have_left() {
+        // Four for the first flock, three for the instances the scale back up
+        // spawns.
+        let h = harness(vec![ProcScript::never_exits(); 7]);
+        start_app(
+            &h,
+            AppConfig {
+                instances: 4,
+                ..AppConfig::minimal("web", "./srv")
+            },
+        )
+        .await;
+
+        h.ctx.supervisor.scale("web", 1).await.unwrap();
+        settle_to(&h, "web", 1).await;
+
+        let up = h.ctx.supervisor.scale("web", 4).await.unwrap();
+
+        assert_eq!(up.instances.len(), 4);
+        assert_eq!(up.shortfall, None);
+        assert_eq!(instance_slots_of(&h, "web").await, vec![0, 1, 2, 3]);
     }
 
     /// fails if a scale forgets to write the new count back onto the app. Without
