@@ -1,0 +1,24 @@
+---
+source: crates/shep-cli/src/lookout/frames.rs
+expression: render_text(&buffer)
+---
+shep lookout   /home/rin/.shep                                                                            6 in the flock
+ID    NAME                                    STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+0     web                                     online           48211    0         3.4%    182.0M    1h 25m    edge      
+1     web                                     online           48212    0         2.9%    178.0M    1h 26m    edge      
+2     api                                     errored          -        14        -       -         1h 18m    edge      
+3     billing-reconciliation-worker           waiting-restart  -        3         -       -         1h 19m    -         
+4     cron                                    stopped          -        0         -       -         1h 21m    -         
+5     metrics                                 online           48240    0         0.4%    11.0M     1h 32m    -         
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+q quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only

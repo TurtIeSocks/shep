@@ -4,6 +4,7 @@
 //! sibling `docs/lookout/README.md`.
 
 pub mod app;
+#[cfg(test)]
 pub mod frames;
 pub mod theme;
 pub mod view;

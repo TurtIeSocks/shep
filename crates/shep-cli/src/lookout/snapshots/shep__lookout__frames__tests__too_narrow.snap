@@ -1,0 +1,6 @@
+---
+source: crates/shep-cli/src/lookout/frames.rs
+expression: render_text(&buffer)
+---
+too small                   
+need 31x6

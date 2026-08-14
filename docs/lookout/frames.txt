@@ -1,0 +1,182 @@
+shep lookout — Phase 12a frames
+================================
+
+These are real frames, rendered headlessly through ratatui's TestBackend by
+
+    cargo test -p shep-cli --bins --all-features -- --ignored write_the_gallery
+
+Nothing here is a mockup.
+
+frames.ansi is the same eight frames with colour; read it with `less -R`.
+
+They are here to be looked at BEFORE Phase 12b's layout is decided. 12a
+builds the shell and one pane on purpose — the bleats feed, the sheep detail
+pane and the host-usage strip are 12b, and how those three sit beside this
+one is the decision these frames exist to inform.
+
+
+=== healthy_wide  (120x20) ===
+A healthy flock at 120 columns: all nine columns fit.
+
+shep lookout   /home/rin/.shep                                                                            6 in the flock
+ID    NAME                                    STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+0     web                                     online           48211    0         3.4%    182.0M    1h 25m    edge      
+1     web                                     online           48212    0         2.9%    178.0M    1h 26m    edge      
+2     api                                     online           48219    1         7.1%    241.0M    1h 28m    edge      
+3     billing-reconciliation-worker           online           48230    0         0.8%    96.0M     1h 29m    -         
+4     cron                                    online           48233    0         0.1%    8.0M      1h 31m    -         
+5     metrics                                 online           48240    0         0.4%    11.0M     1h 32m    -         
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+q quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only
+
+=== errored  (120x20) ===
+One errored, one waiting to restart, one stopped. Colour is on the STATUS word and nowhere else.
+
+shep lookout   /home/rin/.shep                                                                            6 in the flock
+ID    NAME                                    STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+0     web                                     online           48211    0         3.4%    182.0M    1h 25m    edge      
+1     web                                     online           48212    0         2.9%    178.0M    1h 26m    edge      
+2     api                                     errored          -        14        -       -         1h 18m    edge      
+3     billing-reconciliation-worker           waiting-restart  -        3         -       -         1h 19m    -         
+4     cron                                    stopped          -        0         -       -         1h 21m    -         
+5     metrics                                 online           48240    0         0.4%    11.0M     1h 32m    -         
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+q quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only
+
+=== empty  (100x12) ===
+No sheep registered. The header row still prints, and a sentence says why the pane is empty.
+
+shep lookout   /home/rin/.shep                                                        0 in the flock
+ID    NAME                STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────
+the flock is empty                                                                                  
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+q quit   j/k scroll   g/G top/bottom   r refresh   x stop                                  read-only
+
+=== narrow  (49x14) ===
+49 columns: FOLD, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY.
+
+shep lookout   /home/rin/.shep     6 in the flock
+ID    NAME      STATUS           CPU     UPTIME  
+─────────────────────────────────────────────────
+0     web       online           3.4%    1h 25m  
+1     web       online           2.9%    1h 26m  
+2     api       online           7.1%    1h 28m  
+3     billing…  online           0.8%    1h 29m  
+4     cron      online           0.1%    1h 31m  
+5     metrics   online           0.4%    1h 32m  
+                                                 
+                                                 
+                                                 
+                                                 
+q quit   j/k scroll   g/G top/bottom   …read-only
+
+=== too_narrow  (28x8) ===
+28 columns: below the floor, the pane refuses rather than drawing overlapping garbage. The refusal is two short lines so it still fits.
+
+too small                   
+need 31x6                   
+                            
+                            
+                            
+                            
+                            
+                            
+
+=== retrying  (120x20) ===
+The shepherd stopped answering. Five attempts over about eight seconds before this becomes the next frame.
+
+shep lookout   /home/rin/.shep                                                                            6 in the flock
+the shepherd stopped answering — reconnecting (attempt 3)                                                               
+ID    NAME                                    STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+0     web                                     online           48211    0         3.4%    182.0M    1h 25m    edge      
+1     web                                     online           48212    0         2.9%    178.0M    1h 26m    edge      
+2     api                                     online           48219    1         7.1%    241.0M    1h 28m    edge      
+3     billing-reconciliation-worker           online           48230    0         0.8%    96.0M     1h 29m    -         
+4     cron                                    online           48233    0         0.1%    8.0M      1h 31m    -         
+5     metrics                                 online           48240    0         0.4%    11.0M     1h 32m    -         
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+q quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only
+
+=== frozen  (120x20) ===
+The ladder ran out. Last known values stay; the uptime clock has stopped; lookout does not exit.
+
+shep lookout   /home/rin/.shep                                                                            6 in the flock
+the shepherd has died — these values are frozen as of 2026-08-14 14:32:07                                               
+ID    NAME                                    STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+0     web                                     online           48211    0         3.4%    182.0M    1h 15m    edge      
+1     web                                     online           48212    0         2.9%    178.0M    1h 16m    edge      
+2     api                                     errored          -        14        -       -         1h 18m    edge      
+3     billing-reconciliation-worker           waiting-restart  -        3         -       -         1h 19m    -         
+4     cron                                    stopped          -        0         -       -         1h 21m    -         
+5     metrics                                 online           48240    0         0.4%    11.0M     1h 22m    -         
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+q quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only
+
+=== refused  (120x20) ===
+`x` with actions gated off. Both refusals are literal — nothing about damage gets charming.
+
+shep lookout   /home/rin/.shep                                                                            6 in the flock
+ID    NAME                                    STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+0     web                                     online           48211    0         3.4%    182.0M    1h 25m    edge      
+1     web                                     online           48212    0         2.9%    178.0M    1h 26m    edge      
+2     api                                     online           48219    1         7.1%    241.0M    1h 28m    edge      
+3     billing-reconciliation-worker           online           48230    0         0.8%    96.0M     1h 29m    -         
+4     cron                                    online           48233    0         0.1%    8.0M      1h 31m    -         
+5     metrics                                 online           48240    0         0.4%    11.0M     1h 32m    -         
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+read-only: actions need --allow-control                                                                        read-only
