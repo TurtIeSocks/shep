@@ -6,5 +6,7 @@
 pub mod app;
 #[cfg(test)]
 pub mod frames;
+pub mod link;
+pub mod source;
 pub mod theme;
 pub mod view;
