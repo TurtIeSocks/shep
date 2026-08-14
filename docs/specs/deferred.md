@@ -354,12 +354,14 @@ populated only by `ListFlock`/`Describe` (`rpc::with_live_stats`); the CLI
 renders them as the `CPU`/`MEM` columns (`FlockRows`, `output::human_bytes`).
 
 **The six daemon-surface verbs** (spec §4, §5, §6, §9) **shipped** on
-`feat/phase11-verbs`: `shep scale <name> <count>` (absolute counts only —
+`feat/phase11-verbs`: `shep stock <name> <count>` (`scale` stays as a
+visible alias; absolute counts only —
 scale-up fills the lowest free instance slots, scale-down releases the
 highest, and the new count is written back to the muster roll so a reboot
 keeps it); `shep signal <selector> <signal>`, delivered to each sheep's own
 process and not its group, over `signals::OperatorSignal`'s nine names;
-`shep sendline <selector> <line>`, for apps whose Flockfile opts in with
+`shep whisper <selector> <line>` (`sendline` stays as a visible alias), for
+apps whose Flockfile opts in with
 `stdin = true`; the KV store (`shep set`/`get`/`unset` over
 `shep_core::kv`, a `0600` `$SHEP_HOME/kv.json` under the same sibling-lockfile
 and atomic-rename shape `barks.jsonl` and `shep.toml` already use, reachable
