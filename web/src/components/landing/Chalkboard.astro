@@ -15,9 +15,9 @@ import { notBuiltYet } from "../../data/chalkboard";
         <div class="kicker">today on the board</div>
         <h2>What's not built yet</h2>
         <p>
-          Windows is last, and it is genuinely zero rather than partial: the
-          crate compiles and its unit tests pass there in CI, which is not
-          the same thing as working.
+          Windows is last, and it is genuinely zero rather than partial. The
+          workspace cross-compiles for it and that check runs on every change,
+          but no test has ever executed there, only a compile.
         </p>
         <div class="pills">
           {
