@@ -95,7 +95,7 @@ ID    NAME      STATUS           CPU     UPTIME
                                                  
                                                  
                                                  
-q quit   j/k scroll   g/G top/bottom   …read-only
+q quit   j/k scroll   g/G top/bottom  … read-only
 
 === too_narrow  (28x8) ===
 28 columns: below the floor, the pane refuses rather than drawing overlapping garbage. The refusal is two short lines so it still fits.

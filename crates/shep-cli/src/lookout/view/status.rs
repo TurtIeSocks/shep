@@ -79,9 +79,18 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         Control::Allowed => "control enabled",
     };
     let right_len = u16::try_from(right.chars().count()).unwrap_or(0);
+    // `+ 1` reserves one column of gap so a truncated left side's `…` never
+    // butts straight against the label. Without it `fit` fills every column
+    // up to `right`, and a truncation and a right-aligned label landing on
+    // the same frame is the ordinary case, not a corner one — see the
+    // `narrow` gallery scene, 49 columns wide, where this shipped without it.
+    // The gap rides inside the right span, styled the same as the label
+    // rather than as its own `Span::raw`, so the two-span, single-colour
+    // shape of every wider scene's status line is unchanged byte-for-byte.
+    let left_width = width.saturating_sub(right_len).saturating_sub(1);
     Line::from(vec![
-        Span::styled(fit(&left, width.saturating_sub(right_len)), left_style),
-        Span::styled(right, palette.muted()),
+        Span::styled(fit(&left, left_width), left_style),
+        Span::styled(format!(" {right}"), palette.muted()),
     ])
 }
 
@@ -95,4 +104,69 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
 #[must_use]
 pub fn rule_line(style: Style, width: u16) -> Line<'static> {
     Line::from(Span::styled("─".repeat(usize::from(width)), style))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::lookout::app::App;
+    use crate::lookout::theme::Palette;
+
+    /// fails if the truncated key hint ever butts straight against the
+    /// control-state label again. Pinned at 49 columns — the `narrow`
+    /// gallery scene's own width — because that is exactly where the bug
+    /// shipped: the default hint is 57 characters, the label 9, and at this
+    /// width the hint truncates while the label still fits, which is the
+    /// one combination that makes a missing gap visible.
+    #[test]
+    fn a_truncated_hint_still_leaves_a_gap_before_the_control_label() {
+        let palette = Palette::detect(None, Some(OsStr::new("xterm-256color")), None);
+        let app = App::new(
+            palette,
+            Control::ReadOnly,
+            "/home/rin/.shep".to_string(),
+            Instant::now(),
+        );
+        let line = status_line(&app, 49);
+        let rendered: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert_eq!(rendered.chars().count(), 49, "must fill the full width");
+        assert!(
+            rendered.ends_with(" read-only"),
+            "expected a space before the label, got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("…read-only"),
+            "the ellipsis must not butt straight against the label: {rendered:?}"
+        );
+    }
+
+    /// fails if the gap logic breaks the ordinary, untruncated case — a wide
+    /// terminal where the hint fits with room to spare.
+    #[test]
+    fn a_wide_status_line_still_pads_out_to_the_full_width() {
+        let palette = Palette::detect(None, Some(OsStr::new("xterm-256color")), None);
+        let app = App::new(
+            palette,
+            Control::Allowed,
+            "/home/rin/.shep".to_string(),
+            Instant::now(),
+        );
+        let line = status_line(&app, 120);
+        let rendered: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert_eq!(rendered.chars().count(), 120);
+        assert!(rendered.ends_with(" control enabled"));
+    }
 }
