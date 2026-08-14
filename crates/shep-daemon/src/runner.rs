@@ -760,7 +760,7 @@ pub struct SpawnSpec {
     pub err_file: PathBuf,
     /// Open the shepherd channel (fd 3 socketpair)
     pub channel: bool,
-    /// Pipe the child's stdin, so `shep sendline` can write to it. `false`
+    /// Pipe the child's stdin, so `shep whisper` can write to it. `false`
     /// gives the child `/dev/null` on fd 0, which is what every sheep gets
     /// unless its config sets `stdin = true`.
     pub stdin: bool,

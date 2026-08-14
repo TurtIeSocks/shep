@@ -159,7 +159,7 @@ pub struct AppConfig {
     /// real cost weighed against spec §14.11's single-digit-MB idle-RSS
     /// goal, so a channel is opened only when something asks for one.
     pub channel: bool,
-    /// Open a pipe on this sheep's stdin, so `shep sendline` can write to it.
+    /// Open a pipe on this sheep's stdin, so `shep whisper` can write to it.
     ///
     /// Defaults to `false`, and the default is the decision rather than a
     /// convenience. Without it a sheep gets `/dev/null` on fd 0, which is what
@@ -179,7 +179,7 @@ pub struct AppConfig {
     /// Unlike `channel`, nothing implies this: `wait_ready` and
     /// `shutdown_with_message` both need fd 3 and so turn `channel` on for you,
     /// while nothing in shep needs a sheep's stdin except an operator typing
-    /// `shep sendline`. A sheep without it answers a `no_stdin` row and names
+    /// `shep whisper`. A sheep without it answers a `no_stdin` row and names
     /// this field.
     ///
     /// The pipe's write end lives as long as the sheep does, so the app sees

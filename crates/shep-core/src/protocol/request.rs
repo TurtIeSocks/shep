@@ -92,7 +92,7 @@ pub enum Request {
         /// Which sheep
         selector: SelectorSpec,
     },
-    /// Set how many instances one app runs (see `shep scale`).
+    /// Set how many instances one app runs (see `shep stock`).
     ///
     /// # Why a name and not a selector
     ///
@@ -172,7 +172,7 @@ pub enum Request {
         /// [`RpcErrorCode::InvalidConfig`].
         signal: String,
     },
-    /// Write one line to every matched sheep's stdin (see `shep sendline`).
+    /// Write one line to every matched sheep's stdin (see `shep whisper`).
     SendLine {
         /// Which sheep. No default, matching every other verb that reaches a
         /// running process.
@@ -1207,7 +1207,7 @@ mod tests {
 
     /// fails if `Scale` grows a selector. It takes an app NAME, and that is the
     /// design: `instances` is a per-app number and instance slots are allocated
-    /// per name-group, so `shep scale /web.*/ 4` would have to mean either four
+    /// per name-group, so `shep stock /web.*/ 4` would have to mean either four
     /// each or four total and there is no reading of it that is not a guess.
     #[test]
     fn a_scale_request_names_one_app_and_a_count() {
@@ -1285,7 +1285,7 @@ mod tests {
         };
         let json = serde_json::to_string(&request).unwrap();
         // Escaped, not literal: the frame stays one JSON object. Rejecting it is
-        // the daemon's job (see `shep sendline`), not serde's, and this pins that
+        // the daemon's job (see `shep whisper`), not serde's, and this pins that
         // the wire itself does not quietly split it.
         assert!(json.contains(r#""line":"a\nb""#), "{json}");
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);

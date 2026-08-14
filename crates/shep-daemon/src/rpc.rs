@@ -349,7 +349,7 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
         Request::Scale { name, count } => match ctx.supervisor.scale(&name, count).await {
             Ok(scaled) => {
                 // Recorded UNCONDITIONALLY, and this line is the whole reason
-                // `scale` hands back the config at all: without it `shep scale
+                // `scale` hands back the config at all: without it `shep stock
                 // web 4` followed by `shep save` writes a roll saying
                 // `instances = 2`, and the scale is silently undone by the next
                 // reboot — a bug that cannot be seen until the machine comes

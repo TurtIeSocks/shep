@@ -31,9 +31,9 @@ Free on crates.io (verified 2026-08-07): `shep`, `shepd`, plus reserves `bleat`,
 | host machine | host | **the heft** (sheep bound to their hill) | subtle: docs + host-metrics naming |
 | graceful reload (an overlap, not zero downtime) | reload | reload (verb stays) — strategies **come-bye** / **away** if we ever name them | reload internals, maybe strategy flags |
 | kill escalation | kill | kill (stays — clarity beats cuteness on destructive ops) | — |
-| change instance count | scale | **scale** — plain name, shipped Phase 11; a sheepier name is Rin's to pick in a later brainstorm | `shep scale <name> <count>` |
-| send a signal to one process | signal | **signal** — plain name, same pending brainstorm | `shep signal <selector> <signal>` |
-| write to a process's stdin | sendline | **sendline** — plain name, same pending brainstorm | `shep sendline <selector> <line>` |
+| change instance count | scale | **stock** — "stocking rate" is the real husbandry term for how many animals a piece of land runs, not a pun; `shep scale` stays as an alias | `shep stock <name> <count>` |
+| send a signal to one process | signal | **signal** — stays plain, deliberately: `shep signal web SIGKILL` is a loaded gun, and rule 2 below keeps destructive/precise operations free of whimsy, the same reason `kill` stayed `kill` | `shep signal <selector> <signal>` |
+| write to a process's stdin | sendline | **whisper** — completes the pair `bleats` already started: bleats is what the sheep says to you, whisper is what you say to the sheep, down a channel nobody else hears; `shep sendline` stays as an alias | `shep whisper <selector> <line>` |
 | ad-hoc key/value store | kv store | **set** / **get** / **unset** — plain names, not themed | `shep set`, `shep get`, `shep unset` |
 
 ## Usage rules (readability > theme)

@@ -85,24 +85,25 @@ pub enum Commands {
     Reload(SelectorArgs),
     /// Delete one or more sheep from the flock.
     Delete(SelectorArgs),
-    /// Set how many instances one app runs.
+    /// Set how many instances one app runs — the stocking rate.
     ///
-    /// An absolute count, not a change: `shep scale web 4` means web has four
+    /// An absolute count, not a change: `shep stock web 4` means web has four
     /// instances afterwards, whatever it had before. There is no +N/-N form —
     /// run it twice and get the same flock.
     ///
-    /// Scaling up fills the lowest free instance slots; scaling down releases
-    /// the highest, so scaling out and back returns the same slot numbers, the
+    /// Stocking up fills the lowest free instance slots; stocking down releases
+    /// the highest, so stocking out and back returns the same slot numbers, the
     /// same SHEP_INSTANCE values and the same log files it started with.
     ///
     /// Exits as soon as the shepherd accepts, printing the instances that
-    /// remain. On a scale-down the departing instances are still running their
+    /// remain. On a stock-down the departing instances are still running their
     /// stop ladders at that point; they report themselves on the bus, under
     /// process.delete.
     ///
     /// The new count is written to the muster roll, so `shep save` and a
     /// reboot keep it.
-    Scale(ScaleArgs),
+    #[command(visible_alias = "scale")]
+    Stock(StockArgs),
     /// List the flock.
     #[command(visible_aliases = ["list", "ls"])]
     Flock,
@@ -191,8 +192,8 @@ pub enum Commands {
     /// `sent` means the bytes were written and flushed to the pipe, not that
     /// the app read them. A pipe holds 64 KiB before it blocks, so a short line
     /// to an app that never reads its stdin is still `sent`.
-    #[command(name = "sendline")]
-    SendLine(SendLineArgs),
+    #[command(visible_alias = "sendline")]
+    Whisper(WhisperArgs),
     /// List one fold.
     Fold(FoldArgs),
     /// Show or follow bleats (log output) for one or more sheep.
@@ -323,7 +324,7 @@ pub struct SelectorArgs {
     pub selector: String,
 }
 
-/// Arguments to `shep scale`.
+/// Arguments to `shep stock`.
 ///
 /// Not [`SelectorArgs`], and this is the only lifecycle verb that is not.
 /// `instances` is a per-app number, so the target is an app NAME: no `all`,
@@ -331,7 +332,7 @@ pub struct SelectorArgs {
 /// either four each or four in total, and neither reading is more obviously
 /// right.
 #[derive(Debug, clap::Args)]
-pub struct ScaleArgs {
+pub struct StockArgs {
     /// The app's name
     pub name: String,
     /// How many instances it runs afterwards
@@ -372,14 +373,14 @@ pub struct SignalArgs {
     pub signal: String,
 }
 
-/// Arguments to `shep sendline`.
+/// Arguments to `shep whisper`.
 ///
 /// Not [`SelectorArgs`]: this verb needs a second positional, the line
 /// itself. The selector stays required — no `default_value` — for the same
-/// reason every running-process verb's does: an accidental `shep sendline`
+/// reason every running-process verb's does: an accidental `shep whisper`
 /// should be a usage error, never sent to the whole flock.
 #[derive(Debug, clap::Args)]
-pub struct SendLineArgs {
+pub struct WhisperArgs {
     /// name, id, `all`, `/regex/`, or `fold:<name>`
     pub selector: String,
     /// The line, without a trailing newline — shep adds exactly one
@@ -683,23 +684,37 @@ mod tests {
         assert_eq!(args.selector, "web");
     }
 
-    /// fails if clap accepts `shep scale web 0`. The refusal exists daemon-side
+    /// fails if clap accepts `shep stock web 0`. The refusal exists daemon-side
     /// too, and deliberately in both places — but a usage error should not cost a
     /// connection, and `range(1..)` is what puts the accepted range into `--help`.
     #[test]
-    fn scale_refuses_a_count_of_zero_before_it_reaches_the_wire() {
+    fn stock_refuses_a_count_of_zero_before_it_reaches_the_wire() {
         use clap::Parser;
-        assert!(Cli::try_parse_from(["shep", "scale", "web", "0"]).is_err());
-        assert!(Cli::try_parse_from(["shep", "scale", "web", "1"]).is_ok());
+        assert!(Cli::try_parse_from(["shep", "stock", "web", "0"]).is_err());
+        assert!(Cli::try_parse_from(["shep", "stock", "web", "1"]).is_ok());
     }
 
-    /// fails if `scale` grows a default target. `shep scale 4` must be a usage
-    /// error, never "scale whatever app happens to be first".
+    /// fails if `stock` grows a default target. `shep stock 4` must be a usage
+    /// error, never "stock whatever app happens to be first".
     #[test]
-    fn scale_requires_both_the_name_and_the_count() {
+    fn stock_requires_both_the_name_and_the_count() {
         use clap::Parser;
-        assert!(Cli::try_parse_from(["shep", "scale"]).is_err());
-        assert!(Cli::try_parse_from(["shep", "scale", "web"]).is_err());
+        assert!(Cli::try_parse_from(["shep", "stock"]).is_err());
+        assert!(Cli::try_parse_from(["shep", "stock", "web"]).is_err());
+    }
+
+    /// Precedent: [`list_and_ls_both_reach_flock`]. Fails if `scale` stops
+    /// being a visible alias for `stock`, or if either spelling stops
+    /// reaching [`Commands::Stock`].
+    #[test]
+    fn stock_and_scale_both_reach_stock() {
+        use clap::Parser;
+        for argv in [["shep", "stock", "web", "3"], ["shep", "scale", "web", "3"]] {
+            assert!(matches!(
+                Cli::try_parse_from(argv).unwrap().command,
+                Commands::Stock(_)
+            ));
+        }
     }
 
     /// Every verb sharing [`SelectorArgs`] must refuse to run without one.
@@ -917,11 +932,12 @@ mod tests {
         assert_eq!(home_arg.get_env(), Some(std::ffi::OsStr::new("SHEP_HOME")));
     }
 
-    /// Pins `Flock`'s and `Bleats`'s visible aliases, and that the hidden
-    /// verbs (`thatlldo`, the internal `daemon` re-exec target) stay hidden
-    /// from `--help`. A `visible_aliases`/`aliases` swap, or a dropped
-    /// `hide = true`, passes every other test in this module but changes
-    /// user-facing behavior silently.
+    /// Pins `Flock`'s, `Bleats`'s, `Stock`'s and `Whisper`'s visible
+    /// aliases, and that the hidden verbs (`thatlldo`, the internal `daemon`
+    /// re-exec target) stay hidden from `--help`. A
+    /// `visible_aliases`/`aliases` swap, or a dropped `hide = true`, passes
+    /// every other test in this module but changes user-facing behavior
+    /// silently.
     #[test]
     fn alias_visibility_and_hiding_are_pinned() {
         use clap::CommandFactory;
@@ -935,6 +951,15 @@ mod tests {
 
         let bleats = cmd.find_subcommand("bleats").unwrap();
         assert_eq!(bleats.get_visible_aliases().collect::<Vec<_>>(), ["logs"]);
+
+        let stock = cmd.find_subcommand("stock").unwrap();
+        assert_eq!(stock.get_visible_aliases().collect::<Vec<_>>(), ["scale"]);
+
+        let whisper = cmd.find_subcommand("whisper").unwrap();
+        assert_eq!(
+            whisper.get_visible_aliases().collect::<Vec<_>>(),
+            ["sendline"]
+        );
 
         for hidden in ["thatlldo", "daemon", "dog"] {
             assert!(
@@ -951,6 +976,8 @@ mod tests {
             "flush",
             "barks",
             "trigger",
+            "stock",
+            "whisper",
             "enable",
             "disable",
             "adopt",
@@ -1010,16 +1037,31 @@ mod tests {
         );
     }
 
-    /// Pins the spelling spec §9 gives — `sendline`, one word — against
-    /// clap's own default: a `SendLine` variant's kebab-case rename would be
-    /// `send-line`, which is why the variant carries an explicit
-    /// `#[command(name = "sendline")]`. Both halves matter: a passing
-    /// `shep sendline` alone would not catch `send-line` staying wired
-    /// alongside it as an unintended second spelling.
+    /// Pins the spelling spec §9 gives — `sendline`, one word, never
+    /// `send-line` — now carried as a literal `visible_alias` rather than a
+    /// kebab-cased derive, so nothing wires up the two-word spelling by
+    /// accident.
     #[test]
     fn sendline_is_spelled_one_word() {
         use clap::Parser;
         assert!(Cli::try_parse_from(["shep", "sendline", "web", "gc"]).is_ok());
         assert!(Cli::try_parse_from(["shep", "send-line", "web", "gc"]).is_err());
+    }
+
+    /// Precedent: [`logs_reaches_bleats`]. Fails if `sendline` stops being a
+    /// visible alias for `whisper`, or if either spelling stops reaching
+    /// [`Commands::Whisper`].
+    #[test]
+    fn sendline_reaches_whisper() {
+        use clap::Parser;
+        for argv in [
+            ["shep", "whisper", "web", "gc"],
+            ["shep", "sendline", "web", "gc"],
+        ] {
+            assert!(matches!(
+                Cli::try_parse_from(argv).unwrap().command,
+                Commands::Whisper(_)
+            ));
+        }
     }
 }

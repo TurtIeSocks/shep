@@ -2558,7 +2558,7 @@ impl<R: ProcessRunner> Actor<R> {
     /// Because the reply does not wait for them, a departing instance stays
     /// REGISTERED — marked [`SheepSlot::pending_delete`], partway through a
     /// kill ladder — until its exit lands. It is still in the map this
-    /// function counts `current` off. So `shep scale web 1 && shep scale web
+    /// function counts `current` off. So `shep stock web 1 && shep stock web
     /// 4` against an app that does not die instantly on `SIGTERM` (which is
     /// every app that drains connections on shutdown) used to find four
     /// slots, three of them doomed, call the second scale a no-op, answer
@@ -7846,7 +7846,7 @@ mod tests {
         assert!(message.contains("delete"), "{message}");
     }
 
-    /// fails if an unregistered name is anything but NotFound. `shep scale typo 4`
+    /// fails if an unregistered name is anything but NotFound. `shep stock typo 4`
     /// exiting 0 would be the worst answer available.
     #[tokio::test(start_paused = true)]
     async fn scaling_an_unregistered_app_is_not_found() {
@@ -7917,7 +7917,7 @@ mod tests {
     /// registered — and a second scale counting them found four where one was
     /// going to be left, called itself a no-op, answered `Ok` with four instances
     /// and no shortfall, and let `rpc` record `instances = 4` into the muster
-    /// roll. The flock then settled to one. Two `shep scale` calls in a
+    /// roll. The flock then settled to one. Two `shep stock` calls in a
     /// provisioning script is the ordinary way to reach that.
     ///
     /// The doomed three `never_reports_its_exit`, which is what makes the case
@@ -7995,7 +7995,7 @@ mod tests {
     }
 
     /// fails if a scale forgets to write the new count back onto the app. Without
-    /// this, `shep scale web 4 && shep save` records `instances = 2` and the next
+    /// this, `shep stock web 4 && shep save` records `instances = 2` and the next
     /// reboot silently reverts the scale — the bug is invisible until the machine
     /// comes back.
     ///
@@ -11737,7 +11737,7 @@ mod tests {
         assert_eq!(rows[0].outcome, SignalOutcome::Delivered);
     }
 
-    // --- SendLine: `shep sendline`, one selector in, one row per matched
+    // --- SendLine: `shep whisper`, one selector in, one row per matched
     // sheep out ---
 
     /// fails if a line does not reach the sheep's pipe. The fake records what
@@ -11861,7 +11861,7 @@ mod tests {
     /// argument is only true if the waits run CONCURRENTLY. Awaited in a
     /// `for` loop — which is what `spawn_trigger_task` does, and what this
     /// task was first written to copy — three wedged sheep cost six seconds,
-    /// the caller's budget expires first, and `shep sendline all` answers
+    /// the caller's budget expires first, and `shep whisper all` answers
     /// `DeadlineExceeded` instead of the three honest `not_written` rows the
     /// outcome enum exists to deliver.
     ///

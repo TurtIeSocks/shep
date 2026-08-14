@@ -51,13 +51,13 @@ use commands::muster;
 #[cfg(unix)]
 use commands::query;
 #[cfg(unix)]
-use commands::sendline;
-#[cfg(unix)]
 use commands::signal;
 #[cfg(unix)]
 use commands::startup;
 #[cfg(unix)]
 use commands::trigger;
+#[cfg(unix)]
+use commands::whisper;
 use exit::ExitCode;
 #[cfg(unix)]
 use launch::launch_daemon;
@@ -282,8 +282,8 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => lifecycle::delete(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
-        Commands::Scale(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => lifecycle::scale(&client, &mut streams, fmt, args).await,
+        Commands::Stock(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => lifecycle::stock(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
         Commands::Trigger(ref args) => match connect_client(&mut streams, fmt, &paths).await {
@@ -294,8 +294,8 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => signal::signal(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
-        Commands::SendLine(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => sendline::sendline(&client, &mut streams, fmt, args).await,
+        Commands::Whisper(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => whisper::whisper(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
         Commands::Flock => match connect_client(&mut streams, fmt, &paths).await {

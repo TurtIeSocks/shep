@@ -90,9 +90,9 @@ The whole vocabulary, and whether it exists yet.
 | the lookout | the terminal dashboard | `shep lookout` (alias `dash`) | no |
 | adopt / rehome | register or drop a third-party dog | `shep adopt <name> <path>` | yes |
 | that'll do | graceful stop, after the real herding command | `shep thatlldo` | yes |
-| scale | change how many instances of an app run | `shep scale <name> <count>` | yes |
+| stock | change how many instances of an app run (the stocking rate) | `shep stock <name> <count>` (alias `scale`) | yes |
 | signal | send a signal to one sheep's own process | `shep signal <selector> <signal>` | yes |
-| sendline | write a line to a sheep's stdin | `shep sendline <selector> <line>` | yes |
+| whisper | write a line to a sheep's stdin | `shep whisper <selector> <line>` (alias `sendline`) | yes |
 | set / get / unset | the flat key-value junk drawer | `shep set`, `shep get`, `shep unset` | yes |
 
 Sheepdogs and sheep were separate ideas from the start, so "dog" never means

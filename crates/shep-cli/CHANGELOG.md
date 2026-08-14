@@ -12,10 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
-- Add `shep scale <name> <count>`.
+- Add `shep stock <name> <count>` (alias `scale`) — "stocking rate" is the
+  husbandry term for how many animals a piece of land runs.
 - Add `shep signal <selector> <signal>`.
-- Add `shep sendline <selector> <line>`, for apps whose Flockfile sets
-  `stdin = true`.
+- Add `shep whisper <selector> <line>` (alias `sendline`), for apps whose
+  Flockfile sets `stdin = true`. Completes the pair `bleats` already
+  started: bleats is what the sheep says to you, whisper is what you say
+  to the sheep.
 - Add `shep set` / `shep get` / `shep unset` (spec §5's KV store). They read
   and write `$SHEP_HOME/kv.json` directly and never connect to the shepherd.
 - `shep describe` renders each sheep's lambs beneath its row, captioned with

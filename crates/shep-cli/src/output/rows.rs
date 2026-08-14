@@ -1101,7 +1101,7 @@ fn describe_signal_outcome(outcome: &SignalOutcome) -> (&'static str, String) {
 }
 
 /// `Response::SentLine(Vec<LineReply>)` — one row per matched sheep, each
-/// carrying what happened when the shepherd tried to write `shep sendline`'s
+/// carrying what happened when the shepherd tried to write `shep whisper`'s
 /// line to its stdin.
 ///
 /// Shaped exactly like [`TriggeredRows`]/[`SignalledRows`], for the same

@@ -14,10 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `signals::OperatorSignal`, the nine signals `shep signal` may name;
   `Request::Signal` / `Response::Signalled` / `SignalReply` / `SignalOutcome`.
-- Add `Request::Scale` / `Response::Scaled` — set an app's instance count.
+- Add `Request::Scale` / `Response::Scaled` — set an app's instance count,
+  the stocking rate; the CLI verb is `shep stock` (alias `scale`).
 - Add `AppConfig::stdin` (default `false`) — pipe a sheep's stdin so `shep
-  sendline` can reach it; `Request::SendLine` / `Response::SentLine` /
-  `LineReply` / `LineOutcome`.
+  whisper` (alias `sendline`) can reach it; `Request::SendLine` /
+  `Response::SentLine` / `LineReply` / `LineOutcome`.
 - Add `Lamb` and `ProcessInfo::lambs` — a sheep's process-tree members,
   populated by `Describe` only. `None` means the reply did not walk for them,
   never that there are none.

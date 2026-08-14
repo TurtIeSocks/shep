@@ -1,4 +1,4 @@
-//! `sendline`: write one line to matched sheep's stdin.
+//! `whisper`: write one line to matched sheep's stdin.
 //!
 //! One verb, one call site, following `trigger`/`signal`'s own precedent:
 //! inlining the one match this needs reads more plainly than a shared
@@ -17,7 +17,7 @@
 //!
 //! A row's own outcome — `Sent`, `NoStdin`, `NotWritten` — is never a
 //! request failure: the daemon reports it per matched sheep, following
-//! `Trigger`/`Signal`'s own precedent, so `shep sendline` exits
+//! `Trigger`/`Signal`'s own precedent, so `shep whisper` exits
 //! non-`Success` only when the RPC itself failed (a malformed selector or
 //! line caught locally, a selector that matched nothing, a daemon this
 //! client could not reach). What each row says is `SentLineRows`'s job
@@ -31,18 +31,18 @@
 use shep_client::Client;
 use shep_core::protocol::{Request, Response, SelectorSpec};
 
-use crate::cli::{Format, SendLineArgs};
+use crate::cli::{Format, WhisperArgs};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
 use crate::output::{SentLineRows, Streams, emit, emit_error, write_outcome};
 
 /// Writes `args.line` to the stdin of the sheep matching `args.selector`,
 /// and renders one row per match.
-pub async fn sendline(
+pub async fn whisper(
     client: &Client,
     streams: &mut Streams<'_>,
     fmt: Format,
-    args: &SendLineArgs,
+    args: &WhisperArgs,
 ) -> ExitCode {
     let selector = match parse_selector(streams, fmt, &args.selector) {
         Ok(selector) => SelectorSpec::from(&selector),
@@ -64,7 +64,7 @@ pub async fn sendline(
 
     match client.request(body).await {
         Ok(Response::SentLine(rows)) => {
-            write_outcome(emit(&mut *streams.out, fmt, "sendline", SentLineRows(rows)))
+            write_outcome(emit(&mut *streams.out, fmt, "whisper", SentLineRows(rows)))
         }
         Ok(_unrecognised) => {
             let message = "the daemon answered with a response this client does not understand";
@@ -91,8 +91,8 @@ mod tests {
 
     use super::*;
 
-    fn args(selector: &str, line: &str) -> SendLineArgs {
-        SendLineArgs {
+    fn args(selector: &str, line: &str) -> WhisperArgs {
+        WhisperArgs {
             selector: selector.to_string(),
             line: line.to_string(),
         }
@@ -101,7 +101,7 @@ mod tests {
     /// Runs the verb against a fake daemon that captures envelopes, and hands
     /// back the exit code, stdout, stderr and the capture channel.
     async fn run(
-        args: &SendLineArgs,
+        args: &WhisperArgs,
     ) -> (
         ExitCode,
         Vec<u8>,
@@ -118,7 +118,7 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
             };
-            sendline(&client, &mut streams, Format::Table, args).await
+            whisper(&client, &mut streams, Format::Table, args).await
         };
         (code, out, err, envelopes)
     }
@@ -210,7 +210,7 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
             };
-            sendline(&client, &mut streams, Format::Table, &args("ghost", "gc")).await
+            whisper(&client, &mut streams, Format::Table, &args("ghost", "gc")).await
         };
         assert_eq!(code, ExitCode::NotFound);
         assert!(out.is_empty());

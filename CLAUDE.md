@@ -173,8 +173,9 @@ Phases 1–10 merged: shep-core, the daemon supervision engine, log plane, the
 actions over the shepherd channel (now with a correlation id), the pm2
 cutover, the dogs subsystem with working metrics and bark dogs, and an
 audit-debt phase. Phase 11 merged too: the six remaining daemon-surface
-verbs — `shep scale`, `shep signal`, `shep sendline`, the KV store's
-`set`/`get`/`unset`, lambs in `describe`, and the `channel.*` bus topic.
+verbs — `shep stock` (alias `scale`), `shep signal`, `shep whisper` (alias
+`sendline`), the KV store's `set`/`get`/`unset`, lambs in `describe`, and
+the `channel.*` bus topic.
 
 What's built vs. deferred to v1.1+: [docs/specs/deferred.md](docs/specs/deferred.md).
 Windows is 0%, not partial — every verb prints "not yet supported" and exits.

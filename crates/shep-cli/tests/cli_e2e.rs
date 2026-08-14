@@ -3195,18 +3195,18 @@ fn signal_reaches_the_signal_verb_and_delivers() {
     graceful_kill(dir.path());
 }
 
-// --- Scale -------------------------------------------------------------
+// --- Stock -------------------------------------------------------------
 
-/// `shep scale` reaches the scale verb and no other, against a real daemon:
-/// scaling up spawns the new instances, scaling back down drains the extras.
+/// `shep stock` reaches the stock verb and no other, against a real daemon:
+/// stocking up spawns the new instances, stocking back down drains the extras.
 ///
 /// Both directions are polled through `shep flock` rather than trusted off
-/// `scale`'s own exit — a scale-down accepts before the departing instances'
-/// stop ladders finish (see `Commands::Scale`'s own doc), so the flock
-/// settling to one row is the real assertion, and a scale-down that never
+/// `stock`'s own exit — a stock-down accepts before the departing instances'
+/// stop ladders finish (see `Commands::Stock`'s own doc), so the flock
+/// settling to one row is the real assertion, and a stock-down that never
 /// settles fails the test on `FLOCK_DEADLINE` rather than hanging it (IR-46).
 #[test]
-fn scale_reaches_the_scale_verb_and_settles_the_flock() {
+fn stock_reaches_the_stock_verb_and_settles_the_flock() {
     let dir = tempfile::tempdir().unwrap();
     let script = write_test_script(&dir);
     let mut guard = DaemonGuard::default();
@@ -3221,19 +3221,19 @@ fn scale_reaches_the_scale_verb_and_settles_the_flock() {
     guard.adopt_home(dir.path());
     assert_success(&started);
 
-    let scaled_up = shep(dir.path())
+    let stocked_up = shep(dir.path())
         .arg("--format")
         .arg("json")
-        .arg("scale")
+        .arg("stock")
         .arg("sheep")
         .arg("3")
         .output()
         .unwrap();
-    assert_success(&scaled_up);
-    let envelope: serde_json::Value = serde_json::from_slice(&scaled_up.stdout).unwrap();
+    assert_success(&stocked_up);
+    let envelope: serde_json::Value = serde_json::from_slice(&stocked_up.stdout).unwrap();
     assert_eq!(
-        envelope["command"], "scale",
-        "`shep scale` must reach the scale verb and no other: {envelope}"
+        envelope["command"], "stock",
+        "`shep stock` must reach the stock verb and no other: {envelope}"
     );
 
     let grown = poll_flock_data(dir.path(), FLOCK_DEADLINE, |data| {
@@ -3242,7 +3242,7 @@ fn scale_reaches_the_scale_verb_and_settles_the_flock() {
     assert_eq!(
         grown.as_array().unwrap().len(),
         3,
-        "scaling up must settle at three instances: {grown}"
+        "stocking up must settle at three instances: {grown}"
     );
     assert!(
         grown
@@ -3253,13 +3253,13 @@ fn scale_reaches_the_scale_verb_and_settles_the_flock() {
         "every instance must still belong to `sheep`: {grown}"
     );
 
-    let scaled_down = shep(dir.path())
-        .arg("scale")
+    let stocked_down = shep(dir.path())
+        .arg("stock")
         .arg("sheep")
         .arg("1")
         .output()
         .unwrap();
-    assert_success(&scaled_down);
+    assert_success(&stocked_down);
 
     let settled = poll_flock_data(dir.path(), FLOCK_DEADLINE, |data| {
         data.as_array().is_some_and(|rows| rows.len() == 1)
@@ -3267,7 +3267,44 @@ fn scale_reaches_the_scale_verb_and_settles_the_flock() {
     assert_eq!(
         settled.as_array().unwrap().len(),
         1,
-        "scaling down must settle back to one instance: {settled}"
+        "stocking down must settle back to one instance: {settled}"
+    );
+
+    graceful_kill(dir.path());
+}
+
+/// `shep scale` is `stock`'s visible alias: it must still reach a real
+/// daemon and produce the same primary-command name in its envelope as
+/// `shep stock` does — the alias reaches the same verb, not a shadow of it.
+#[test]
+fn scale_alias_reaches_stock_against_a_real_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("sheep")
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    let scaled = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("scale")
+        .arg("sheep")
+        .arg("2")
+        .output()
+        .unwrap();
+    assert_success(&scaled);
+    let envelope: serde_json::Value = serde_json::from_slice(&scaled.stdout).unwrap();
+    assert_eq!(
+        envelope["command"], "stock",
+        "`shep scale` is an alias for `stock`, and must reach it: {envelope}"
     );
 
     graceful_kill(dir.path());

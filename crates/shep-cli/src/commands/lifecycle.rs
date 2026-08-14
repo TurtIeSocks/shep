@@ -16,7 +16,7 @@ use shep_client::{Client, START_DEADLINE};
 use shep_core::config::{AppConfig, FlockFormat, Flockfile, FlockfileError};
 use shep_core::protocol::{Request, Response, SelectorSpec};
 
-use crate::cli::{Format, ScaleArgs, SelectorArgs, StartArgs};
+use crate::cli::{Format, SelectorArgs, StartArgs, StockArgs};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
 use crate::output::{DeletedIds, FlockRows, Render, Streams, emit, emit_error, write_outcome};
@@ -360,25 +360,26 @@ pub async fn delete(
     .await
 }
 
-/// Sets `args.name`'s instance count, and renders the instances that remain.
+/// Sets `args.name`'s instance count (the stocking rate), and renders the
+/// instances that remain.
 ///
-/// No `parse_selector` call, unlike every other verb in this module: `scale`
-/// takes a name. See [`ScaleArgs`]'s own doc for why.
+/// No `parse_selector` call, unlike every other verb in this module: `stock`
+/// takes a name. See [`StockArgs`]'s own doc for why.
 ///
 /// Sends `Request::Scale` with `START_DEADLINE`, not the client's default: a
-/// scale-up spawns processes, which is the same work `start` already asks
+/// stock-up spawns processes, which is the same work `start` already asks
 /// for the longer budget to cover.
-pub async fn scale(
+pub async fn stock(
     client: &Client,
     streams: &mut Streams<'_>,
     fmt: Format,
-    args: &ScaleArgs,
+    args: &StockArgs,
 ) -> ExitCode {
     request_and_render(
         client,
         streams,
         fmt,
-        "scale",
+        "stock",
         Request::Scale {
             name: args.name.clone(),
             count: args.count,
@@ -716,7 +717,7 @@ mod tests {
         }
     }
 
-    /// fails if the envelope carries anything but the name and the count. `scale`
+    /// fails if the envelope carries anything but the name and the count. `stock`
     /// is the one verb here that does NOT parse a selector, and a copy-pasted
     /// `parse_selector` would turn `web` into `SelectorSpec::Name("web")` and send
     /// a frame the daemon has no arm for.
@@ -731,11 +732,11 @@ mod tests {
             out: &mut out,
             err: &mut err,
         };
-        let _ = scale(
+        let _ = stock(
             &client,
             &mut streams,
             Format::Table,
-            &ScaleArgs {
+            &StockArgs {
                 name: "web".to_string(),
                 count: 4,
             },
@@ -756,7 +757,7 @@ mod tests {
     /// is the shape an operator will actually type, and it has to come back as
     /// exit 4 with the daemon's own sentence, not as a generic failure.
     #[tokio::test]
-    async fn an_invalid_scale_exits_invalid_config_and_prints_the_reason() {
+    async fn an_invalid_stock_exits_invalid_config_and_prints_the_reason() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.sock");
         let (client, _served) = fake_client_replying_err(
@@ -772,11 +773,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
             };
-            scale(
+            stock(
                 &client,
                 &mut streams,
                 Format::Table,
-                &ScaleArgs {
+                &StockArgs {
                     name: "web".to_string(),
                     count: 1,
                 },
