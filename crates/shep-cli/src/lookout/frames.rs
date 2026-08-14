@@ -172,10 +172,10 @@ impl Scene {
         match self {
             Self::HealthyWide => "A healthy flock at 120 columns: all nine columns fit.",
             Self::Errored => {
-                "One errored, one waiting to restart, one stopped. Colour is on the STATUS word and nowhere else."
+                "One errored, one waiting to restart, one stopped. Each row's own STATUS cell is the only coloured cell in that row — but stopped shares the chrome's muted grey, so its STATUS word does not stand out from the frame around it."
             }
             Self::Empty => {
-                "No sheep registered. The header row still prints, and a sentence says why the pane is empty."
+                "No sheep registered. The header row still prints, and a plain sentence says the pane is empty rather than leaving it blank."
             }
             Self::Narrow => {
                 "49 columns: FOLD, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY."
@@ -513,6 +513,34 @@ mod tests {
         for gone in ["FOLD", "RESTARTS", "PID", "MEM"] {
             assert!(!narrow.contains(gone), "the narrow tier dropped {gone}");
         }
+
+        // The errored scene's caption makes two claims: each row's own
+        // STATUS cell is the only coloured cell in that row (so `online`,
+        // `errored` and `waiting-restart` each get their own status
+        // colour), and `stopped` happens to share the chrome's muted grey
+        // rather than standing out from it. Both are asserted against the
+        // ANSI rendering, since plain text carries no colour to check.
+        let errored_ansi = render_ansi(&scene(Scene::Errored).1);
+        assert!(
+            errored_ansi.contains("\u{1b}[38;5;29monline"),
+            "online's STATUS cell gets meadow"
+        );
+        assert!(
+            errored_ansi.contains("\u{1b}[38;5;166merrored"),
+            "errored's STATUS cell gets bark"
+        );
+        assert!(
+            errored_ansi.contains("\u{1b}[38;5;221mwaiting-restart"),
+            "waiting-restart's STATUS cell gets butter"
+        );
+        assert!(
+            errored_ansi.contains("\u{1b}[38;5;245mID"),
+            "the header row is muted grey, the same token stopped's STATUS uses"
+        );
+        assert!(
+            errored_ansi.contains("\u{1b}[38;5;245mstopped"),
+            "stopped's STATUS cell shares the chrome's muted grey rather than standing out"
+        );
     }
 
     /// fails if a frozen frame keeps counting. This is the one thing the

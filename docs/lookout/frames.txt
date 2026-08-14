@@ -40,7 +40,7 @@ ID    NAME                                    STATUS           PID      RESTARTS
 q quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only
 
 === errored  (120x20) ===
-One errored, one waiting to restart, one stopped. Colour is on the STATUS word and nowhere else.
+One errored, one waiting to restart, one stopped. Each row's own STATUS cell is the only coloured cell in that row — but stopped shares the chrome's muted grey, so its STATUS word does not stand out from the frame around it.
 
 shep lookout   /home/rin/.shep                                                                            6 in the flock
 ID    NAME                                    STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
@@ -64,7 +64,7 @@ ID    NAME                                    STATUS           PID      RESTARTS
 q quit   j/k scroll   g/G top/bottom   r refresh   x stop                                                      read-only
 
 === empty  (100x12) ===
-No sheep registered. The header row still prints, and a sentence says why the pane is empty.
+No sheep registered. The header row still prints, and a plain sentence says the pane is empty rather than leaving it blank.
 
 shep lookout   /home/rin/.shep                                                        0 in the flock
 ID    NAME                STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
