@@ -388,6 +388,7 @@ mod tests {
             run: home.join("run"),
             socket,
             barks: home.join("barks.jsonl"),
+            kv: home.join("kv.json"),
             home,
         }
     }

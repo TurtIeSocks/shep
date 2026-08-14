@@ -203,6 +203,7 @@ mod tests {
             run: PathBuf::from("/home/rin/.shep/run"),
             socket: PathBuf::from("/home/rin/.shep/run/shep.sock"),
             barks: PathBuf::from("/home/rin/.shep/barks.jsonl"),
+            kv: PathBuf::from("/home/rin/.shep/kv.json"),
         }
     }
 

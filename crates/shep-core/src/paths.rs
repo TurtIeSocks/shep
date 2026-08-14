@@ -27,6 +27,8 @@ pub struct ShepPaths {
     pub socket: PathBuf,
     /// Bark history ring: `barks.jsonl`
     pub barks: PathBuf,
+    /// Key/value store: `kv.json`
+    pub kv: PathBuf,
 }
 
 impl ShepPaths {
@@ -60,6 +62,7 @@ impl ShepPaths {
             pids: home.join("pids"),
             socket: run.join("shep.sock"),
             barks: home.join("barks.jsonl"),
+            kv: home.join("kv.json"),
             run,
             home,
         }
@@ -86,6 +89,7 @@ mod tests {
         assert_eq!(p.run, Path::new("/home/rin/.shep/run"));
         assert_eq!(p.socket, Path::new("/home/rin/.shep/run/shep.sock"));
         assert_eq!(p.barks, Path::new("/home/rin/.shep/barks.jsonl"));
+        assert_eq!(p.kv, Path::new("/home/rin/.shep/kv.json"));
     }
 
     #[test]

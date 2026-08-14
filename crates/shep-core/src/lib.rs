@@ -22,6 +22,7 @@
 
 pub mod barks;
 pub mod config;
+pub mod kv;
 pub mod paths;
 pub mod protocol;
 pub mod selector;
