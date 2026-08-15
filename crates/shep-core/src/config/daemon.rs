@@ -893,9 +893,17 @@ otel = "/usr/local/bin/shep-otel"
         assert_eq!(cfg.daemon.log_level, LogLevel::Info);
     }
 
-    // fails if an absent flag overwrites the layer below with a default —
-    // the classic `Option`-flattening bug, and the one a `bool` field
-    // instead of `Option<bool>` would guarantee.
+    // Pins that `load` (the two-layer file+env path) and `load_layered`
+    // (the three-layer file+env+flags path `load` itself delegates to)
+    // agree when no flag is set. It does NOT catch a `bool` field standing
+    // in for `Option<bool>`: `load` routes through `load_layered` on both
+    // sides of the `assert_eq!`, so a mutation on that line lands on both
+    // sides alike and this test stays green. That guard is
+    // `file_sets_values_and_keeps_dog_sections_raw` and `env_overrides_file`
+    // in this file, and cli_e2e's
+    // `shep_log_json_makes_the_daemons_own_records_json` — each pins an
+    // actual value coming through a specific layer, which a flattened
+    // `Option<bool>` would get wrong.
     #[test]
     fn an_absent_flag_leaves_every_lower_layer_alone() {
         let src = "[daemon]\nlog_json = true\nlog_level = \"debug\"\nsocket = \"/tmp/s.sock\"\n";
