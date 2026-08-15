@@ -1,8 +1,8 @@
 # Phase 12b — the lookout's three remaining panes
 
 `shep lookout`'s bleats feed, sheep detail pane and host-usage strip: the
-three panes spec §9 names and Phase 12a deliberately did not build. Against
-merged `main` at `ed09740`.
+three panes spec §9 names and Phase 12a deliberately did not build. Every
+baseline below was re-measured on merged `main` at `ac8bc8a`.
 
 ## Rin's decision, and what it rules out
 
@@ -149,12 +149,12 @@ asserting it.
 Phase 12a shipped three verification steps that could not fail — including a
 "terminal too small" message 39 characters long, rendered by a truncating call
 and asserted at 28 columns. So: **every non-cargo check below prints what it
-prints TODAY, at `ed09740`, on this machine.** Run the baseline command
+prints TODAY, at `ac8bc8a`, on this machine.** Run the baseline command
 *before* you make the change. If it does not print what this plan says, stop
 and say so — the check is broken, not the tree.
 
 ```bash
-git rev-parse --short HEAD                                          # ed09740
+git merge-base --is-ancestor ac8bc8a HEAD && echo "baselines apply"   # see below
 find crates -name '*.snap' | wc -l                                  # 12
 find crates/shep-cli/src/lookout/snapshots -name '*.snap' | wc -l   #  8
 find crates/shep-cli/src/lookout -name '*.rs' | wc -l               # 11
@@ -172,25 +172,40 @@ grep -c 'Phase 12a' docs/lookout/README.md                          #  2
 grep -rn '12b' crates/ | wc -l                                      # 11
 ```
 
-**`ed09740`, not `fc3534b`.** The first draft of this plan pinned `fc3534b`
-and by the time it was reviewed HEAD was two commits past it; it is now three.
-The two commits since are `c9b39a8` (`web/` only) and `ed09740` (a plan file
-under `docs/`), and `a56acd3` is this plan itself — none of them touches
-`crates/`, so the **1219 passed / 0 failed / 4 ignored** workspace figure
-measured at `fc3534b` still holds. Confirm that rather than assuming it:
-`git show --stat --oneline c9b39a8 a56acd3 ed09740 | grep -c '^ crates/'`
-must print `0`. If it does not, re-measure the workspace baseline before
-starting.
+**Not `git rev-parse HEAD == <sha>`, and this matters.** The first draft of
+this plan asserted `HEAD` was `fc3534b`; by the time it was reviewed HEAD was
+two commits past it, and by the time the review was applied it was four. **The
+tip is a moving target on purpose**: Phase 13 (`whistle`) is landing in a
+parallel worktree, and by its own rule the executor would have stopped on the
+plan's very first command, for a reason that has nothing to do with this phase.
 
-**Cargo.lock's package count is deliberately not on that list.** It was `326`
-at `fc3534b` and it is `326` at `ed09740`, but **Phase 13 (`whistle`) is in
-flight in a parallel worktree and adds packages** — it was `340` in the working
-tree while this revision was written. An absolute literal here would stop an
-executor for a reason that has nothing to do with this phase. So the check
-becomes a *comparison*, not a literal: record the number at Step 3.1, and
-Step 10.5 asserts it is unchanged **across this phase**. That is the whole of
-the dependency argument anyway — 12b adds no crate — and a delta is what
-proves it.
+So the baselines are pinned to the *content* rather than to the tip. They were
+measured at `ac8bc8a` and they hold for any HEAD that is a descendant of it and
+that has not touched lookout's sources. Confirm that, once, before starting:
+
+```bash
+git merge-base --is-ancestor ac8bc8a HEAD;  echo "EXIT=$?"   # 0
+git diff --name-only ac8bc8a HEAD -- 'crates/*/src/' | wc -l # 0
+```
+
+If the second one is not `0`, re-run the fifteen greps above and the workspace
+count below before trusting any number in this plan.
+
+The **1219 passed / 0 failed / 4 ignored** workspace figure was measured at
+`fc3534b`. The four commits between it and `ac8bc8a` are `c9b39a8` (`web/`
+only), `a56acd3` and `ed09740` (plan files under `docs/`), and `ac8bc8a`
+(three manifests and `Cargo.lock`). None touches a `src/` tree, so the figure
+still stands — and that is the same check as the one above, run over a wider
+range.
+
+**Cargo.lock's package count is deliberately not on the baseline list.** It was
+`326` at `fc3534b` and `340` at `ac8bc8a`, because that commit is Phase 13
+adding `rmcp` and `schemars`. A literal would have been wrong within a day of
+being written. So the check is a *comparison*, not a literal: record the number
+at Step 3.1, and Step 10.5 asserts it is unchanged **across this phase**. That
+is the whole of the dependency argument anyway — 12b adds no crate — and a
+delta is what proves it, whatever the absolute number happens to be that
+week.
 
 `find … | wc -l`, never a bare glob: under zsh a glob with no match raises
 `no matches found` and exits non-zero, indistinguishable from a check that
@@ -5178,9 +5193,10 @@ cargo test --workspace --all-features;                                      echo
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features;  echo "EXIT=$?"
 ```
 
-Baseline for the third, measured at `fc3534b` and still standing at `ed09740`
-(nothing between them touches `crates/` — see "Every check in this plan states
-its baseline"): **1219 passed / 0 failed / 4 ignored across 17 result lines.**
+Baseline for the third, measured at `fc3534b` and still standing at `ac8bc8a`
+— nothing between them touches a `src/` tree, which "Every check in this plan
+states its baseline" gives you a command for:
+**1219 passed / 0 failed / 4 ignored across 17 result lines.**
 
 Expected after this phase: **roughly 1264 / 0 / 4 across 17 lines** — 1219 plus
 the 45 this plan's tasks add, task by task in execution order:
