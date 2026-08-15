@@ -3,6 +3,7 @@ source: crates/shep-cli/src/lookout/frames.rs
 expression: render_text(&buffer)
 ---
 shep lookout   /home/rin/.shep                                                                            6 in the flock
+host  not read yet   flock cpu 14.7%   flock mem 716.0M                                                                 
   ID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 > 0     web                                   online           48211    0         3.4%    182.0M    1h 25m    edge      
@@ -13,9 +14,8 @@ shep lookout   /home/rin/.shep                                                  
   5     metrics                               online           48240    0         0.4%    11.0M     1h 32m    -         
                                                                                                                         
                                                                                                                         
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+bleats  web  out then err  from the log files, re-read with each listing                                                
                                                                                                                         
                                                                                                                         
                                                                                                                         

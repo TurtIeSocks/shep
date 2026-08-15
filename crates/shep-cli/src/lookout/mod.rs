@@ -615,6 +615,78 @@ mod tests {
         );
     }
 
+    /// fails if a heartbeat does not put the host strip on the frame. The
+    /// other half of `the_heartbeat_asks_the_local_reader_for_a_host_sample`
+    /// above, which could only assert the call because the strip was not
+    /// drawable yet. This is the end-to-end: a `Local` that reports a
+    /// sample, one heartbeat, and the numbers on the rendered frame.
+    ///
+    /// It is the only check in the phase that would catch a heartbeat that
+    /// sampled and a `draw` that ignored the result, or the reverse.
+    ///
+    /// **Not `start_paused`, for the same reason
+    /// `a_burst_of_selection_moves_costs_one_read_and_not_one_per_key` isn't**:
+    /// the redraw that would carry the sampled host onto the frame is gated
+    /// on `MIN_REDRAW`, which reads real `std::time::Instant`, and a paused
+    /// clock's virtual sleeps resolve in microseconds of real time — so the
+    /// gate would never actually open and the loop would exit on its first,
+    /// pre-heartbeat draw every time. This one measured the same way:
+    /// deterministically red under `start_paused`, on every run. The
+    /// heartbeat's first tick still fires immediately regardless of the
+    /// clock (interval semantics, not this gate), so the real wait below only
+    /// has to outlast `MIN_REDRAW`, not `HEARTBEAT`.
+    ///
+    /// IR-46: bounded by a real, short nudge-then-quit and a real, generous
+    /// `timeout` — this cannot hang.
+    #[tokio::test]
+    async fn a_heartbeat_puts_the_host_strip_on_the_frame() {
+        let (msg_tx, msg_rx) = mpsc::channel(64);
+        let (poll_tx, _poll_rx) = mpsc::channel(4);
+        let local = FakeLocal {
+            sample: Some(crate::lookout::view::fixtures::sample()),
+            ..FakeLocal::default()
+        };
+
+        tokio::spawn(async move {
+            // The nudge, not the quit: `may_draw` is only re-checked at the
+            // top of the next loop iteration, so real time elapsing while
+            // the loop sits blocked in `select!` is never observed on its
+            // own — see `a_burst_of_selection_moves_costs_one_read_and_not_
+            // one_per_key`'s own comment for the same mechanism. `Msg::Resize`
+            // wakes the loop once real time has cleared `MIN_REDRAW`, which
+            // is when the redraw carrying the already-sampled host actually
+            // happens.
+            tokio::time::sleep(MIN_REDRAW * 3).await;
+            let _ = msg_tx.send(Msg::Resize).await;
+            tokio::time::sleep(MIN_REDRAW).await;
+            let _ = msg_tx.send(Msg::Key(KeyPress::Quit)).await;
+        });
+
+        let app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/tmp/shep".to_string(),
+            Instant::now(),
+        );
+        let terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let terminal = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_ui(app, terminal, stream::empty(), msg_rx, poll_tx, local),
+        )
+        .await
+        .expect("the loop left within ten seconds");
+
+        let frame = crate::lookout::frames::render_text(terminal.backend().buffer());
+        assert!(
+            frame.contains("host  load 2.31 4.10 3.88 / 10 cores"),
+            "the strip drew the sample the heartbeat took: {frame}"
+        );
+        assert!(
+            !frame.contains("not read yet"),
+            "and not the pre-heartbeat sentence"
+        );
+    }
+
     /// fails if a burst of keypresses costs one two-file read per key.
     ///
     /// `input::map_key` drops `KeyEventKind::Repeat`, but ordinary terminals

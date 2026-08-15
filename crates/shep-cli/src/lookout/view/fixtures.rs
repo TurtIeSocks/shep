@@ -169,6 +169,28 @@ pub fn sheep_with_lambs() -> ProcessInfo {
         .build()
 }
 
+/// A dashboard with twelve sheep and a full bleats feed — Task 8's own
+/// fixture, for the checks that need every pane to have more than it can
+/// show: the flock table needs rows to prove it kept the middle of the
+/// screen, and the feed needs enough lines to fill its reserved rows so a
+/// short terminal's layout sweep can tell a genuine hole in the arithmetic
+/// apart from a pane that is up but has nothing to say.
+pub fn full_app() -> App {
+    let mut app = app_with(flock_of(12, 12), plain());
+    app.update(Msg::Bleats {
+        tail: Tail {
+            lines: (0..10)
+                .map(|n| line(Stream::Out, &format!("line-{n}")))
+                .collect(),
+            missed_lines: 0,
+            missed_bytes: 0,
+            read_bytes: 1_024,
+            note: None,
+        },
+    });
+    app
+}
+
 /// One tail line, tagged with the stream it came from.
 pub fn line(stream: Stream, text: &str) -> TailLine {
     TailLine {

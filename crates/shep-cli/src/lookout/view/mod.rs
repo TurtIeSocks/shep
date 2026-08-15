@@ -12,8 +12,13 @@ pub mod flock;
 pub mod host;
 pub mod status;
 
+// `pub`, not private: Task 8's `a_heartbeat_puts_the_host_strip_on_the_frame`
+// lives in `super::super::mod`'s own `mod tests` (it drives `run_ui`, and
+// that is where `run_ui`'s other tests and `FakeLocal` already are), and it
+// needs `fixtures::sample()` from there. `#[cfg(test)]` still keeps every
+// item out of the ordinary build, the same shape `lookout::frames` uses.
 #[cfg(test)]
-mod fixtures;
+pub mod fixtures;
 
 use ratatui::Frame;
 use ratatui::text::{Line, Span};
@@ -27,6 +32,117 @@ use super::app::App;
 /// marker's gutter ([`flock::GUTTER`], 2). Below this the whole draw becomes
 /// two short lines saying so.
 pub const MIN_TERM_WIDTH: u16 = flock::MIN_WIDTH + flock::GUTTER;
+
+/// Rows the chrome always takes: title, column header, rule, status bar.
+///
+/// The banner is deliberately not in this count — it is one row only when
+/// the link is not live, and every caller that needs the worst case adds it
+/// separately, the way `every_pane_tier_fits_the_height_it_claims` does.
+///
+/// `#[cfg(test)]`: `draw` lays the four chrome rows out one `y += 1` at a
+/// time rather than summing them first, so this has no production call
+/// site — its only reader is the test that proves `PANE_TIERS` leaves
+/// enough room for chrome, a banner and a table, the same shape
+/// `lookout::frames` already uses for a module read only by tests.
+#[cfg(test)]
+const CHROME_ROWS: u16 = 4;
+
+/// The host strip is one line.
+const HOST_ROWS: u16 = 1;
+
+/// The detail pane: one rule and three lines.
+const DETAIL_ROWS: u16 = 4;
+
+/// The bleats feed: one rule, one header, five lines.
+const FEED_ROWS: u16 = 7;
+
+/// Which optional panes a terminal of a given height gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Panes {
+    /// The host-usage strip, under the title.
+    pub host: bool,
+    /// The sheep detail pane, under the table.
+    pub detail: bool,
+    /// The bleats feed, under that.
+    pub feed: bool,
+}
+
+impl Panes {
+    /// The flock table alone — 12a's frame, and what every terminal shorter
+    /// than [`PANE_TIERS`]' last threshold gets.
+    pub const NONE: Self = Self {
+        host: false,
+        detail: false,
+        feed: false,
+    };
+
+    /// How many rows these panes take together.
+    ///
+    /// `#[cfg(test)]`: `draw` claims each pane's rows off `floor` one
+    /// constant at a time as it lays the bottom stack out, so it never needs
+    /// the sum — only `every_pane_tier_fits_the_height_it_claims` does, to
+    /// check that sum against `PANE_TIERS`' own thresholds.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn rows(self) -> u16 {
+        let mut rows = 0;
+        if self.host {
+            rows += HOST_ROWS;
+        }
+        if self.detail {
+            rows += DETAIL_ROWS;
+        }
+        if self.feed {
+            rows += FEED_ROWS;
+        }
+        rows
+    }
+}
+
+/// Height thresholds, tallest first. Each entry is the shortest terminal that
+/// still gets that pane set.
+///
+/// The drop order is least-diagnostic-first and it is a decision, not an
+/// accident of ordering — see this module's own doc and the phase plan's
+/// design decision 8. 24 is not arbitrary either: it is the classic terminal
+/// height, and the table is chosen so a plain 80×24 gets all three panes with
+/// a flock table worth reading.
+const PANE_TIERS: &[(u16, Panes)] = &[
+    (
+        24,
+        Panes {
+            host: true,
+            detail: true,
+            feed: true,
+        },
+    ),
+    (
+        18,
+        Panes {
+            host: true,
+            detail: false,
+            feed: true,
+        },
+    ),
+    (
+        14,
+        Panes {
+            host: true,
+            detail: false,
+            feed: false,
+        },
+    ),
+    (MIN_HEIGHT, Panes::NONE),
+];
+
+/// The widest pane set that fits `height`.
+#[must_use]
+pub fn panes_for(height: u16) -> Panes {
+    PANE_TIERS
+        .iter()
+        .find(|(threshold, _)| height >= *threshold)
+        .map_or(Panes::NONE, |(_, panes)| *panes)
+}
 
 /// Renders the whole dashboard.
 ///
@@ -64,7 +180,12 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
         return;
     }
 
+    let panes = panes_for(height);
     let mut y = area.y;
+    // The status bar's own row. Held once, up front: the bottom stack below
+    // is laid out UPWARD from it, so nothing has to know the flock table's
+    // length before deciding where the table ends.
+    let bottom = area.y + height - 1;
     let buffer = frame.buffer_mut();
 
     buffer.set_line(
@@ -78,6 +199,11 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
     if let Some(banner) = status::banner_line(app) {
         buffer.set_line(area.x, y, &banner, width);
         y += 1;
+    }
+
+    if panes.host {
+        buffer.set_line(area.x, y, &host::strip_line(app, width), width);
+        y += HOST_ROWS;
     }
 
     // width >= MIN_TERM_WIDTH, checked above, so this never underflows.
@@ -95,8 +221,22 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
     buffer.set_line(area.x, y, &status::rule_line(palette.muted(), width), width);
     y += 1;
 
-    // Everything from here to the line above the status bar.
-    let viewport = usize::from(area.y + height - 1 - y);
+    // The bottom stack, laid out UPWARD from the status bar: whichever of
+    // the detail pane and the feed are up claim their rows off `bottom`
+    // first, and the table gets whatever is left between `y` and `floor`.
+    let mut floor = bottom;
+    let feed_at = panes.feed.then(|| {
+        floor -= FEED_ROWS;
+        floor
+    });
+    let detail_at = panes.detail.then(|| {
+        floor -= DETAIL_ROWS;
+        floor
+    });
+
+    // Everything from `y` up to `floor`, exactly as Task 2 left it, save for
+    // the viewport now stopping at `floor` rather than at the status bar.
+    let viewport = usize::from(floor - y);
     let rows = app.rows();
     if rows.is_empty() {
         let line = Line::from(Span::styled("the flock is empty", palette.muted()));
@@ -121,12 +261,33 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
         }
     }
 
-    buffer.set_line(
-        area.x,
-        area.y + height - 1,
-        &status::status_line(app, width),
-        width,
-    );
+    if let Some(top) = detail_at {
+        buffer.set_line(
+            area.x,
+            top,
+            &status::rule_line(palette.muted(), width),
+            width,
+        );
+        for (offset, line) in detail::detail_lines(app, width).iter().enumerate() {
+            let offset = u16::try_from(offset).unwrap_or(0);
+            buffer.set_line(area.x, top + 1 + offset, line, width);
+        }
+    }
+    if let Some(top) = feed_at {
+        buffer.set_line(
+            area.x,
+            top,
+            &status::rule_line(palette.muted(), width),
+            width,
+        );
+        let rows = usize::from(FEED_ROWS - 1);
+        for (offset, line) in bleats::feed_lines(app, width, rows).iter().enumerate() {
+            let offset = u16::try_from(offset).unwrap_or(0);
+            buffer.set_line(area.x, top + 1 + offset, line, width);
+        }
+    }
+
+    buffer.set_line(area.x, bottom, &status::status_line(app, width), width);
 }
 
 #[cfg(test)]
@@ -322,5 +483,182 @@ mod tests {
         for (width, height) in [(1, 1), (20, 3), (31, 6), (80, 24), (250, 60), (400, 200)] {
             let _ = draw_to(&app, width, height);
         }
+    }
+
+    /// fails if a tier can render taller than the terminal it was chosen for.
+    /// The height twin of `every_tier_fits_the_width_it_claims`, and the check
+    /// that makes the tier table a claim rather than a wish: every tier's
+    /// fixed rows, plus a banner, plus a flock table worth having, must fit in
+    /// that tier's own threshold.
+    #[test]
+    fn every_pane_tier_fits_the_height_it_claims() {
+        for height in flock::MIN_HEIGHT..=200 {
+            let panes = panes_for(height);
+            let fixed = CHROME_ROWS + 1 /* banner */ + panes.rows();
+            // A tier that shows a pane must leave the table at least three
+            // rows; the floor tier, which shows none, only has to leave one —
+            // which is what MIN_HEIGHT has always meant.
+            let floor = if panes.rows() == 0 { 1 } else { 3 };
+            assert!(
+                fixed + floor <= height,
+                "height {height} chose {panes:?}, needing {} rows",
+                fixed + floor
+            );
+        }
+    }
+
+    /// fails if the drop order changes without someone re-arguing it. The
+    /// DETAIL pane goes first because it is the most redundant thing on the
+    /// screen — every number on it but the log paths is in the row above it.
+    /// The FEED goes second: its content exists nowhere else, but five lines
+    /// of a busy log is thin. The HOST STRIP goes last: one row, and nothing
+    /// else on the dashboard says anything about the machine.
+    #[test]
+    fn panes_drop_in_a_fixed_order_as_the_terminal_shortens() {
+        assert_eq!(
+            panes_for(60),
+            Panes {
+                host: true,
+                detail: true,
+                feed: true
+            }
+        );
+        assert_eq!(
+            panes_for(24),
+            Panes {
+                host: true,
+                detail: true,
+                feed: true
+            }
+        );
+        assert_eq!(
+            panes_for(23),
+            Panes {
+                host: true,
+                detail: false,
+                feed: true
+            }
+        );
+        assert_eq!(
+            panes_for(18),
+            Panes {
+                host: true,
+                detail: false,
+                feed: true
+            }
+        );
+        assert_eq!(
+            panes_for(17),
+            Panes {
+                host: true,
+                detail: false,
+                feed: false
+            }
+        );
+        assert_eq!(
+            panes_for(14),
+            Panes {
+                host: true,
+                detail: false,
+                feed: false
+            }
+        );
+        assert_eq!(panes_for(13), Panes::NONE);
+        assert_eq!(
+            panes_for(flock::MIN_HEIGHT),
+            Panes::NONE,
+            "12a's frame, untouched"
+        );
+    }
+
+    /// fails if a pane ever draws over the status bar, over the flock table,
+    /// or off the bottom of the buffer. `Buffer::set_line` outside the area is
+    /// a panic in debug and a silent no-op otherwise, and the arithmetic here
+    /// has four moving parts.
+    ///
+    /// A live sweep, not a `timeout`: `draw` is synchronous, so a timer around
+    /// it would complete on its first poll and bound nothing.
+    #[test]
+    fn every_pane_lands_inside_its_own_rows_across_the_size_sweep() {
+        let mut app = fixtures::full_app();
+        app.update(Msg::Frozen {
+            at_local: "2026-08-14 14:32:07".to_string(),
+        });
+        for height in flock::MIN_HEIGHT..=60 {
+            for width in [MIN_TERM_WIDTH, 40, 51, 80, 120, 200] {
+                let frame = draw_to(&app, width, height);
+                let lines: Vec<&str> = frame.lines().collect();
+                let panes = panes_for(height);
+
+                // NOT `lines.len() == height`: `frames::render_text` maps
+                // `(0..area.height)` over `(0..area.width)` by construction,
+                // so that holds for any `draw` whatsoever — including one that
+                // drew nothing at all. It is a property of the renderer, not
+                // of this layout, and asserting it here would be a check that
+                // cannot fail.
+                let last = lines.last().unwrap();
+                assert!(
+                    last.contains("read-only"),
+                    "the status bar survived at {width}x{height}: {last:?}"
+                );
+                // The row above the status bar belongs to the bottom-most pane
+                // that is up, so it is never blank — a blank one means the
+                // upward layout left a hole, which is the failure mode the
+                // arithmetic here actually has.
+                if panes.feed || panes.detail {
+                    let above = lines[lines.len() - 2];
+                    assert!(
+                        !above.trim().is_empty(),
+                        "a blank row above the status bar at {width}x{height}"
+                    );
+                }
+                // And every pane that is up appears exactly once, so nothing
+                // overlapped anything else.
+                if panes.host {
+                    assert_eq!(
+                        lines.iter().filter(|l| l.starts_with("host  ")).count(),
+                        1,
+                        "the strip at {width}x{height}"
+                    );
+                }
+                if panes.feed {
+                    assert_eq!(
+                        lines.iter().filter(|l| l.starts_with("bleats  ")).count(),
+                        1,
+                        "the feed header at {width}x{height}"
+                    );
+                }
+                if panes.detail {
+                    // The PATH prefix, not a bare `out  ` — the feed's own
+                    // body lines are tagged `out  ` too, and counting those
+                    // would make this assertion depend on how many log lines
+                    // the fixture happens to carry.
+                    assert_eq!(
+                        lines
+                            .iter()
+                            .filter(|l| l.starts_with("out  /home/rin/.shep/logs/"))
+                            .count(),
+                        1,
+                        "the detail pane's out path at {width}x{height}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// fails if the flock table stops being the spine. Rin's ruling in one
+    /// test: whatever else is on screen, the table gets the remainder, and at
+    /// the tier where all three panes are up it still has room for more than
+    /// a couple of rows.
+    #[test]
+    fn the_flock_table_keeps_the_middle_of_the_screen() {
+        let app = fixtures::full_app(); // twelve sheep
+        let frame = draw_to(&app, 120, 24);
+        let data_rows = frame
+            .lines()
+            .filter(|line| line.starts_with("  ") || line.starts_with("> "))
+            .filter(|line| line.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+            .count();
+        assert!(data_rows >= 5, "the table got {data_rows} rows at 120x24");
     }
 }
