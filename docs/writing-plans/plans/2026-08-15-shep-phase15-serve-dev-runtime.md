@@ -36,7 +36,7 @@ this project signs off by deleting its own `docs/specs/deferred.md` entry, in
 a Task-12-shaped final task. So:
 
 ```bash
-grep -c 'whistle' docs/specs/deferred.md                    # Phase 13 done when 0 (3 today)
+grep -c 'the MCP stdio server' docs/specs/deferred.md         # Phase 13 done when 0 (1 today)
 grep -c "lookout's other three panes" docs/specs/deferred.md # Phase 12b done when 0 (1 today)
 ```
 
@@ -747,6 +747,21 @@ chose. Per request there is **no `canonicalize` at all**. Instead:
   and take the file type from **`File::metadata` on the open handle**, never
   from a second stat of the path.
 
+**This refuses more than "leaves the root."** Refusing every symlink
+component, intermediate or leaf, means an in-docroot symlink that points
+*inside* the docroot — `dist/current -> ../releases/2026-08-15`, a symlinked
+`assets/` — now 404s too, where a canonicalize-then-`starts_with` design would
+have served it. That is an ordinary deploy layout, and it is a deliberate cost
+of closing the TOCTOU, not a side effect: distinguishing "points inside" from
+"points outside" would mean canonicalizing the target to compare it against
+the root, which is the per-request `canonicalize` this design exists to avoid,
+and on the timing that matters most — between that canonicalize and the open.
+**Only the docroot itself may be a symlink; nothing under it may be, in either
+direction.** Say so in the module doc, in `--help` for `shep serve`, in Step
+12.3's divergence list, and in `docs/migration.md` beside the listing and
+dotfile flips — an operator who deploys with a `current -> release-N` symlink
+inside the docroot hits a 404 with no explanation otherwise.
+
 **That closes the TOCTOU, and it needs no new dependency and no `unsafe`.**
 The earlier draft accepted the race, and both halves of its argument were
 wrong. It claimed the only fix was `openat2(RESOLVE_BENEATH)` — Linux-only,
@@ -1241,12 +1256,12 @@ cargo test -p shep-cli --bins --all-features                      # record every
 **`--bins` alone, and only in this task.** shep-cli has no `lib` target today,
 so `cargo test -p shep-cli --lib` is not a run of zero tests — it is
 `error: no library targets found in package 'shep-cli'`, exiting non-zero. Do
-not put it in a baseline script. From Task 2 onward the command is
-`--lib --bins`, and by then both halves exist: after this task the library
-holds every unit test in the crate and `--bins` alone runs the three
-three-line entry points and nothing else. That inversion is the trap; it is
-described here rather than demonstrated, because demonstrating it costs a
-failing command.
+not put it in a baseline script. From this task's Step 1.9 onward — once
+Step 1.2's move has happened — the command is `--lib --bins`, and by then both
+halves exist: after the move the library holds every unit test in the crate
+and `--bins` alone runs the three three-line entry points and nothing else.
+That inversion is the trap; it is described here rather than demonstrated,
+because demonstrating it costs a failing command.
 
 ### Step 1.2 — the move
 
@@ -1499,7 +1514,14 @@ use cli::{AdoptArgs, Commands, DaemonArgs, Format};`, and the existing
 `save_parses_to_its_own_command` in this same module carries a doc comment
 saying exactly why it imports `Commands` locally. Follow it. Tasks 9 and 11
 write their siblings inside `commands/`, which is `#[cfg(unix)]` wholesale, so
-**those** do not need the local import — do not cargo-cult it there.
+**those** do not need the local import — do not cargo-cult it there. Neither
+does a test written inside `cli.rs`'s own `mod tests` (Task 7's
+`serve_binds_loopback_on_port_8080_unless_told_otherwise` is one): that module
+already opens with `use super::*;`, which brings `Commands` into scope without
+help, and `cli::Commands` does not even resolve from inside
+`crate::cli::tests` — there is no `cli` item in scope there. The local import
+in this step is specifically for `main.rs`/`lib.rs`'s own module, where
+`Commands` is reached only through the `#[cfg(unix)]` top-level `use`.
 
 And a sixth, for the attribute Task 1 adds:
 
@@ -2210,12 +2232,25 @@ and not just a pass.
 
 ```bash
 grep -c "fn resolve" crates/shep-cli/src/serve/path.rs        # 1
-grep -c "canonicalize" crates/shep-cli/src/serve/fs.rs        # 0 (grep exits 1) — per request
+sed '/^#\[cfg(test)\]/,$d' crates/shep-cli/src/serve/fs.rs | grep -c 'fs::canonicalize'   # 0
 grep -c "std::fs::" crates/shep-cli/src/serve/path.rs         # 0 (grep exits 1) — the module is pure
-grep -c "O_NOFOLLOW" crates/shep-cli/src/serve/fs.rs          # 1
+grep -c "custom_flags" crates/shep-cli/src/serve/fs.rs        # 1
 cargo test -p shep-cli --lib --bins --all-features            # baseline +13
 cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu
 ```
+
+Both `fs.rs` checks are scoped past the file's own doc comments and test
+module, and past the file itself: `fs.rs` does not exist before this task, so
+there is no today-number for either — only the count once Step 3.3's code and
+Step 3.3's tests both exist. A whole-file `grep -c "canonicalize"` would print
+around five once written: `contain`'s doc comment says "canonicalize" once and
+"canonicalizes" once, and three of the five tests below call
+`std::fs::canonicalize` to build their fixtures — none of that is the
+per-request canonicalize this check exists to forbid, so the grep is narrowed
+to the call form and to the code above the `#[cfg(test)]` line. Likewise a
+whole-file `grep -c "O_NOFOLLOW"` would print three, because `open_regular`'s
+doc comment names the flag twice before the code that sets it; counting
+`custom_flags` instead counts the one call site.
 
 The thirteen, by name, since a total is not a check: `path.rs` adds
 `the_traversal_shapes_are_each_refused_for_their_own_reason`,
@@ -2859,7 +2894,7 @@ async fn a_connection_that_stops_reading_is_dropped_at_the_deadline() { … }
 
 ### Step 6.4 — MUTATION
 
-Three, one at a time:
+Six, one at a time:
 
 1. Move the auth check to **after** path resolution. Expected:
    `an_unauthenticated_request_is_401_whatever_the_path_says` fails on
@@ -2891,10 +2926,20 @@ Three, one at a time:
 
 ```bash
 grep -c "fn respond" crates/shep-cli/src/serve/worker.rs   # 1 — one seam, not several
-grep -c "nosniff" crates/shep-cli/src/serve/worker.rs      # 1 — written once, in respond
+sed '/^#\[cfg(test)\]/,$d' crates/shep-cli/src/serve/worker.rs | grep -c 'X-Content-Type-Options'   # 1
 cargo test -p shep-cli --lib --bins --all-features         # baseline +16
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
+
+`worker.rs` does not exist before this task either, so there is no
+today-number — only the count once Step 6.2's code and Step 6.3's tests both
+exist. A whole-file `grep -c "nosniff"` would print five: two of the
+integration tests below carry it in their own names
+(`a_css_file_is_served_as_css_with_nosniff`,
+`a_listing_omits_hidden_entries_and_carries_nosniff`), and a third asserts it
+by header value. None of that is the header-writing code the check exists to
+pin down, so the grep targets the header name, and is cut to the code above
+the `#[cfg(test)]` line.
 
 ---
 
@@ -3014,13 +3059,15 @@ Then either:
 /// canonical order, so `shep describe` shows the same line for the same
 /// server however it was typed.
 ///
-/// **`--auth`'s path is canonicalized here too, for exactly the same reason
-/// and with a worse failure mode.** `shep serve ./dist --auth ./creds`
-/// validates the file successfully in the registering half — so the operator
-/// sees no error at all — and then registers a sheep that resolves `./creds`
-/// against the shepherd's cwd, does not find it, and crash-loops. A relative
-/// docroot produces a 404; a relative creds path produces a server that never
-/// starts, after a green registration.
+/// **`root` and `auth` both arrive already canonical — the caller
+/// canonicalizes both, for the same reason, before building this line.**
+/// `shep serve ./dist --auth ./creds` validates the file successfully in the
+/// registering half — so the operator sees no error at all — and then, if
+/// `--auth` were forwarded uncanonicalized, would register a sheep that
+/// resolves `./creds` against the shepherd's cwd, does not find it, and
+/// crash-loops. A relative docroot produces a 404; a relative creds path
+/// produces a server that never starts, after a green registration. This
+/// function only ever emits the paths it is handed.
 ///
 /// **`--name` and `--fold` are deliberately NOT in the output.** They are
 /// registration-time facts — which sheep this is and which fold it joins —
@@ -3117,7 +3164,7 @@ the Windows cross-check as well:
     #[test]
     fn serve_binds_loopback_on_port_8080_unless_told_otherwise() {
         use clap::Parser;
-        use cli::Commands;
+        use std::net::{IpAddr, Ipv4Addr};
         let cli = Cli::try_parse_from(["shep", "serve", "./x"]).unwrap();
         let Commands::Serve(args) = cli.command else { panic!("expected serve") };
         assert_eq!(args.bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -3197,11 +3244,19 @@ exists for — the operator is told the server is exposed, the registered sheep
 binds loopback, and every request from the LAN is refused by a server that
 reported success.
 
-Third: pass `--auth`'s path through unchanged instead of canonicalized.
+Third: in `sheep_args`, emit `args.auth` instead of the `auth` parameter.
 Expected: `the_registered_command_line_is_absolute_and_carries_every_flag`
-fails on the `/srv/creds` row. In production this one is invisible until the
-sheep's first restart, because the registering half already validated the file
-by the operator's cwd.
+fails on the `/srv/creds` row, because the unit test hands `sheep_args` an
+already-canonical `Some(Path::new("/srv/creds"))` and asserts that value comes
+back unchanged — it pins that `sheep_args` emits the parameter it is given,
+not that the caller canonicalizes. (`root` has the same gap for the same
+reason: the unit test cannot see past `sheep_args`'s own boundary.) Whether the
+caller in `commands::serve::serve` actually canonicalizes `--auth` before
+calling `sheep_args` is not visible to any test in this step; if that needs
+pinning, it needs its own case in Step 7.5's e2e tier, over a real relative
+`--auth` path and a real restart. In production, a caller that skipped it
+would be invisible until the sheep's first restart, because the registering
+half already validated the file by the operator's cwd.
 
 ### Step 7.6 — verification and gate
 
@@ -3794,7 +3849,10 @@ const fn should_split(pid: u32, supervise: bool, forced: bool) -> bool {
 if !should_split(std::process::id(), args.supervise, forced) {
     return foreground::run(options).await;
 }
-run_init().await
+// `Infallible` is an ordinary uninhabited enum, not the never type `!`, so it
+// does not coerce to `ExitCode` as a bare tail expression — the empty match
+// is what performs that coercion.
+match run_init().await {}
 ```
 
 ```rust
@@ -3956,8 +4014,8 @@ Four, one at a time.
 grep -c "tokio::process" crates/shep-cli/src/commands/reap.rs   # 0 (grep exits 1) — load-bearing
 sed '/^#\[cfg(test)\]/,$d' crates/shep-cli/src/commands/reap.rs | grep -c 'unwrap()\|expect('   # 0
 sed '/^#\[cfg(test)\]/,$d' crates/shep-cli/src/commands/reap.rs | grep -c 'panic!\|\[0\]'      # 0
-grep -c "std::process::exit" crates/shep-cli/src/commands/reap.rs  # 1, and exactly one
-grep -rn "std::process::exit" crates/shep-cli/src | wc -l          # 1 — the whole crate
+grep -c '^\s*std::process::exit(' crates/shep-cli/src/commands/reap.rs        # 1
+grep -rn 'std::process::exit(' crates/shep-cli/src --include='*.rs' | grep -v '///' | wc -l   # 1
 grep -c "SHEP_FORCE_INIT" crates/shep-cli/src/commands/runtime.rs  # 1
 cargo test -p shep-cli --lib --bins --all-features                 # baseline +5
 cargo test -p shep-cli --test init --all-features                  # 2 on macOS, 3 on Linux
@@ -3988,9 +4046,15 @@ task that is wrong by construction. The second `sed` line catches the two forms
 the first misses, indexing and a bare `panic!`.
 
 The two `std::process::exit` greps are decision 14's exception written as a
-check: exactly one in `reap.rs`, and exactly one in the crate. If the second
-prints 2, either Task 1 left the old `main`'s call behind or somebody else
-decided the funnel was optional.
+check, and both are scoped to the call rather than the word: `run_init`'s own
+doc comment (Step 10.3) says "`std::process::exit`" twice while explaining why
+that call is allowed to exist there, so a plain `grep -c "std::process::exit"`
+on `reap.rs` prints 3, not 1, and the same whole-crate grep prints 3 as well —
+neither number is wrong, they are just counting doc prose alongside code. The
+`^\s*` anchor and the `grep -v '///'` filter drop those two mentions and count
+only the call itself: one in `reap.rs`, and one in the crate, both after
+Task 10. If the crate-wide count is anything other than 1, either Task 1 left
+the old `main`'s call behind or somebody else decided the funnel was optional.
 
 ---
 
@@ -4269,7 +4333,13 @@ the "Not deferred" section, with the divergences named:
   the supervisor's own process;
 - `serve`'s remaining symlink race, stated as what it is: the leaf open is
   `O_NOFOLLOW`, the component walk is not atomic, and what that leaves an
-  attacker is a refusal or a directory they already controlled.
+  attacker is a refusal or a directory they already controlled;
+- **any symlink under the docroot is refused, not only one that leaves it** —
+  only the docroot itself may be a symlink. An in-docroot symlink that points
+  back inside the docroot (`dist/current -> ../releases/2026-08-15`, a
+  symlinked `assets/`) 404s, where pm2's serve and a canonicalize-then-check
+  design both serve it. Decision 5 names this the deliberate cost of closing
+  the TOCTOU without a per-request `canonicalize`.
 
 Checks: `grep -c "static file server as a managed sheep" docs/specs/deferred.md`
 goes `1 → 0`; `grep -cF 'one `[[bin]]`'` goes `1 → 0`; and
@@ -4334,12 +4404,13 @@ recording rather than rewriting:
 ### Step 12.6 — the rest
 
 - `docs/migration.md`: a `pm2 serve` → `shep serve` section naming the listing
-  default flip, **the dotfile refusal and `--hidden`**, and the missing
-  `PM2_SERVE_*` variables, and a `pm2-runtime` → `shep runtime` section with a
-  Dockerfile that sets `ENV SHEP_HOME=/shep` and uses
-  `ENTRYPOINT ["shep-runtime"]`. Both default changes are things a migrating
-  operator will notice as a regression before they notice as a fix, so each
-  gets the one-line reason next to it.
+  default flip, **the dotfile refusal and `--hidden`**, **and in-docroot
+  symlinks being refused (only the docroot itself may be one)**, and the
+  missing `PM2_SERVE_*` variables, and a `pm2-runtime` → `shep runtime`
+  section with a Dockerfile that sets `ENV SHEP_HOME=/shep` and uses
+  `ENTRYPOINT ["shep-runtime"]`. All three default changes are things a
+  migrating operator will notice as a regression before they notice as a fix,
+  so each gets the one-line reason next to it.
 - `docs/releasing.md`: the artefact list now has **three** binaries, not one.
   Whatever that file says about what `cargo install shep-cli` produces needs the
   other two named. Read it before editing — it was written the night before this
