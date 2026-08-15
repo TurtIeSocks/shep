@@ -25,6 +25,8 @@ mod launch;
 #[cfg(unix)]
 mod lookout;
 mod output;
+#[cfg(unix)]
+mod whistle;
 
 use std::path::PathBuf;
 
