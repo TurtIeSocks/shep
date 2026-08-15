@@ -2,7 +2,7 @@
 
 `shep lookout`'s bleats feed, sheep detail pane and host-usage strip: the
 three panes spec §9 names and Phase 12a deliberately did not build. Against
-merged `main` at `fc3534b`.
+merged `main` at `ed09740`.
 
 ## Rin's decision, and what it rules out
 
@@ -55,10 +55,46 @@ plus its flock table.
   `RUSTDOCFLAGS="-D warnings" cargo doc`. One cargo command at a time, `$?`
   captured directly, never through a pipe — in zsh a pipeline's `$?` is the
   last command's and `${PIPESTATUS[0]}` is empty.
+- **The full task gate does not run after every task, and that is deliberate.**
+  See "Where the gate runs" below — running it mid-chain would fail on
+  `dead_code` for code that is about to be live.
 - Baseline **1219 passed / 0 failed / 4 ignored across 17 result lines.**
 - Terminology: the daemon is "the shepherd" and only that; one managed process
   is "a sheep", the plural is always "the flock"; a sheep's children are
   "lambs". Destructive operations and error text stay plain.
+
+### Where the gate runs, and why not after every task
+
+shep-cli is `[[bin]]`-only. In a normal build the only reachability root is
+`main`, so **anything reached solely from `#[cfg(test)] mod tests` is
+`dead_code`** — `frames.rs`'s own module doc records this rule and is the
+reason that module is `#[cfg(test)]` rather than a plain `pub mod`. The
+workspace does not deny `dead_code` in `[workspace.lints.rust]`, so
+`cargo test -p shep-cli --bins` only *warns*; but
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` — the
+task gate's second command — **fails**.
+
+Four things in this phase are written before their call site exists:
+`tail::read` (Task 5 → called in Task 6), `LocalReader`/`Local` (Task 3 →
+Task 6), `host::strip_line` (Task 4 → Task 8), `detail::detail_lines`
+(Task 7 → Task 8). Running the full gate after any of those four would fail
+on code that is correct and about to be reachable.
+
+So the cadence is:
+
+- **After Tasks 1, 2, 3, 4, 5, 6 and 7** — the inner loop only:
+  `cargo fmt --all --check`, then
+  `cargo test -p shep-cli --bins --all-features`. Each task's Step _.x says so.
+- **After Task 8** — the full task gate. Task 8 is the task that wires every
+  one of those four into `draw`, so it is the first point at which the tree is
+  reachability-complete.
+- **After Task 9 and Task 10** — the full task gate again, and the phase gate
+  at Task 10.
+
+**Do not reach for `#[allow(dead_code)]`.** It would sit on code that is live
+two tasks later, and nobody would remove it. If the gate fails on `dead_code`
+at Task 8 or later, that is a real finding: something got written and never
+wired.
 
 ### Reading the counts
 
@@ -113,12 +149,12 @@ asserting it.
 Phase 12a shipped three verification steps that could not fail — including a
 "terminal too small" message 39 characters long, rendered by a truncating call
 and asserted at 28 columns. So: **every non-cargo check below prints what it
-prints TODAY, at `fc3534b`, on this machine.** Run the baseline command
+prints TODAY, at `ed09740`, on this machine.** Run the baseline command
 *before* you make the change. If it does not print what this plan says, stop
 and say so — the check is broken, not the tree.
 
 ```bash
-git rev-parse --short HEAD                                          # fc3534b
+git rev-parse --short HEAD                                          # ed09740
 find crates -name '*.snap' | wc -l                                  # 12
 find crates/shep-cli/src/lookout/snapshots -name '*.snap' | wc -l   #  8
 find crates/shep-cli/src/lookout -name '*.rs' | wc -l               # 11
@@ -130,10 +166,31 @@ grep -rnF 'log.*' crates/shep-cli/src/lookout/ | wc -l              #  1  (the c
 grep -rn 'sysinfo' crates/shep-cli/src/lookout/ | wc -l             #  0
 grep -rn 'MIN_WIDTH' crates/shep-cli/src/lookout/ | wc -l           #  8
 grep -c '31x6' crates/shep-cli/src/lookout/view/mod.rs              #  3
+grep -rn '31x6' crates/ | wc -l                                     #  5  (view/mod.rs 3, frames.rs 1, one snapshot)
 grep -c '^=== ' docs/lookout/frames.txt                             #  8
 grep -c 'Phase 12a' docs/lookout/README.md                          #  2
-grep -c '^\[\[package\]\]' Cargo.lock                               # 326
+grep -rn '12b' crates/ | wc -l                                      # 11
 ```
+
+**`ed09740`, not `fc3534b`.** The first draft of this plan pinned `fc3534b`
+and by the time it was reviewed HEAD was two commits past it; it is now three.
+The two commits since are `c9b39a8` (`web/` only) and `ed09740` (a plan file
+under `docs/`), and `a56acd3` is this plan itself — none of them touches
+`crates/`, so the **1219 passed / 0 failed / 4 ignored** workspace figure
+measured at `fc3534b` still holds. Confirm that rather than assuming it:
+`git show --stat --oneline c9b39a8 a56acd3 ed09740 | grep -c '^ crates/'`
+must print `0`. If it does not, re-measure the workspace baseline before
+starting.
+
+**Cargo.lock's package count is deliberately not on that list.** It was `326`
+at `fc3534b` and it is `326` at `ed09740`, but **Phase 13 (`whistle`) is in
+flight in a parallel worktree and adds packages** — it was `340` in the working
+tree while this revision was written. An absolute literal here would stop an
+executor for a reason that has nothing to do with this phase. So the check
+becomes a *comparison*, not a literal: record the number at Step 3.1, and
+Step 10.5 asserts it is unchanged **across this phase**. That is the whole of
+the dependency argument anyway — 12b adds no crate — and a delta is what
+proves it.
 
 `find … | wc -l`, never a bare glob: under zsh a glob with no match raises
 `no matches found` and exits non-zero, indistinguishable from a check that
@@ -289,16 +346,70 @@ rather than a shrug:
   shows the **newest** lines and never blocks, never buffers, and never grows.
   A sheep writing 100 MB/s costs one seek and one 64 KiB read per refresh, the
   same as a sheep writing nothing.
-- Everything between the previous read and the window is **skipped**, and the
-  pane says so. `LocalReader` remembers each file's length at the previous
-  read; when the file has grown by more than the bytes the rendered lines
-  cover, the feed's header is replaced by
-  `… 3.8M written since the last read is not shown`, in `attention` (butter,
-  not bark — see decision 6). That number is exact and computable, and Task 5
-  pins it against a real temp file.
+- Everything the pane does not show is **counted**, and the pane says so. This
+  is the part the first draft of this plan got wrong, and it is worth being
+  precise about, because "the feed lies" is the failure this whole decision
+  exists to avoid.
+
+**Lines go missing in three different places, and only two of them can be
+counted in lines.**
+
+| where | how much | known as |
+|---|---|---|
+| below the 64 KiB window | unknown number of lines | **bytes**, exactly |
+| inside the window, above `FEED_TAIL_LINES` | exact | **lines**, exactly |
+| inside `Tail::lines`, above the five rows the pane has | exact | **lines**, exactly |
+
+The first draft counted only the first row, which is the **rare** case — a
+4 MB burst. The ordinary case is the last two rows: `Tail::lines` holds up to
+40 lines per file and the pane renders five of them, so a sheep writing thirty
+lines between two polls loses twenty-five of them **with `missed_bytes` at
+zero**. A pane that looked complete in exactly that case would be lying
+whenever the flock is busy, which is when someone is watching it.
+
+So the tail carries two counts, not one:
+
+- **`Tail::missed_lines`** — lines the reader read and then discarded: those
+  above `FEED_TAIL_LINES` per file, plus the partial line a window boundary
+  cut in half. Exact.
+- **`Tail::missed_bytes`** — bytes appended since the previous read that fell
+  **below** the window and were therefore never read at all. Exact as a byte
+  count; the number of lines in them is genuinely unknowable without reading
+  them, which is the whole point of the window. Zero on the first read of a
+  file, and zero when the file shrank.
+
+The pane adds the third quantity itself — `feed.lines.len() - body`, the lines
+it holds and has no room for — and renders **one** header line, which is the
+ordinary header when nothing was lost and a notice when something was:
+
+| what was lost | the header the operator reads |
+|---|---|
+| nothing | `bleats  api  out then err  from the log files, re-read with each listing` |
+| lines only | `bleats  api  … 25 earlier lines not shown` |
+| bytes only | `bleats  api  … 3.8M written before these lines was never read` |
+| both | `bleats  api  … 25 earlier lines not shown, and 3.8M before them never read` |
+
+in `attention` (butter, not bark — see decision 6) for all three notice forms.
+
+**The wording is doing work in the two byte cases.** "was never read" rather
+than "is not shown": the pane cannot say how many lines are in those bytes,
+and a phrasing that put a line count on them would be inventing one. Saying
+what it *did* — it did not read them — is the honest form, and it is what an
+operator needs in order to know that `tail -f` on the path in the detail pane
+would tell them more than this pane can.
+
+**The gap notice REPLACES the ordinary header rather than sitting beside it.**
+Two header rows would cost one of the five content rows, on the frame where
+content is already scarce. The cost is that the `out then err` disclaimer is
+off screen exactly when the gap notice is up; that is the right way round —
+the notice is the more urgent of the two — and the disclaimer is in the
+pane's own module doc, in the gallery caption, and on every frame where there
+is no gap.
+
 - A feed that silently showed the newest 5 lines of a 4 MB burst, with nothing
   saying 4 MB had gone by, would be the single most misleading thing on this
-  screen. The gap notice is the price of choosing a poller.
+  screen. So would one that silently showed 5 of 30 lines. The notice is the
+  price of choosing a poller, and it is priced in lines as well as bytes.
 
 **What (d) loses, stated rather than discovered.**
 
@@ -344,19 +455,57 @@ Moving the selection also returns `Effect::RefreshFeed` — but only when the
 selection actually changed, so holding `k` at the top of the flock does not
 re-read a file per keypress.
 
+**And not while the link is lost, either.** The snapshot path freezes for
+free; the key path does not, and that is a hole rather than a subtlety: `j` on
+a frozen dashboard would re-read live log files and repaint the feed with
+content newer than the banner saying "these values are frozen as of 14:32:07".
+That is the same contradiction on one frame that decision 7 refuses for the
+host strip, and 12a's
+`the_frozen_frame_does_not_move_however_long_the_link_stays_gone` cannot catch
+it because it presses no keys.
+
+So `select_at` returns `Effect::None` while `Link::Lost`, **after** moving the
+selection. The cursor still moves and the detail pane still re-renders — from
+the frozen listing, which is the only thing on screen that is allowed to
+change, because the operator asked for it and it describes data that is
+already on the frame. No file is touched. Task 1 has the reducer test.
+
 ### 3. The blocking read happens on the UI task, and that is deliberate.
 
 `std::fs`, not `tokio::fs`: shep-cli's tokio does not carry the `fs` feature,
 and `commands/bleats.rs` already makes and states this call for the same
-bounded read. Per refresh the feed costs at most two `open`+`stat`+`seek`+
-64 KiB `read` pairs — 128 KiB every two seconds, on a task that is otherwise
-asleep. `spawn_blocking` for that would add a task, a channel and a race
-between the reply and the next snapshot, to hide about a millisecond.
+bounded read. One refresh costs at most two `open`+`stat`+`seek`+64 KiB `read`
+pairs. `spawn_blocking` for that would add a task, a channel and a race between
+the reply and the next snapshot, to hide about a millisecond.
+
+**How often a refresh happens is the half that has to be stated honestly.**
+Two triggers, not one:
+
+- **The two-second listing.** 128 KiB every two seconds, on a task that is
+  otherwise asleep. This is the steady state and it is the number the choice
+  of a poller was made against.
+- **A selection that moved.** `input::map_key` drops `KeyEventKind::Repeat`,
+  but ordinary terminals deliver auto-repeat as a *stream of Press events*, so
+  a held `j` on a two-hundred-sheep flock arrives as one moved selection per
+  repeat — twenty to thirty a second on a normal key-repeat rate. Unbounded,
+  that is 128 KiB per keypress, synchronously, on the task that also owns the
+  redraw.
+
+Restating the bound would be the cheap answer and it would be a bad one: the
+worst case is not a documentation problem, it is a busy loop with a syscall in
+it. So the read is **coalesced onto the redraw gate**, which already exists:
+`Effect::RefreshFeed` sets `feed_dirty`, and `run_ui` does the read in the same
+place `MIN_REDRAW` gates the draw. Three lines, the same shape as the thing
+next to it, and it turns the worst case into **one two-file read per 33 ms
+while a key is held** — with the read happening immediately before the frame
+that shows its result, which is also the only ordering that is correct.
 
 The bound is what makes this defensible, so the bound is a constant with a
-test, not a hope: `FEED_WINDOW_BYTES` (64 KiB) and `FEED_TAIL_LINES` (40).
-Task 5's test writes a 4 MiB file and asserts the reader touched a bounded
-number of bytes and returned a bounded number of lines.
+live assertion, not a hope: `FEED_WINDOW_BYTES` (64 KiB) and `FEED_TAIL_LINES`
+(40). Task 5's tests write a 4 MiB file and assert on `Tail::read_bytes` —
+the bytes the reader actually pulled off disk — rather than on the size of
+what it returned, and one of them keeps the file **growing during the read**,
+because a static fixture cannot catch a reader that is bounded by the writer.
 
 ### 4. The detail pane renders what the listing already answered. Nothing more.
 
@@ -436,8 +585,16 @@ carries the whole meaning on its own; muting it is a loss of decoration.
 ### 7. Frozen means frozen, including the host strip.
 
 The host strip reads *this machine*, which lookout can still observe after the
-shepherd dies. It stops anyway: while `Link::Lost`, the UI loop does not sample
-and the reducer would ignore the sample if it did.
+shepherd dies. It stops anyway: the reducer's `Msg::Host` arm returns early
+while `Link::Lost` and the strip keeps its last values.
+
+**One enforcement point, in the reducer, not two.** An earlier draft of this
+sentence said the UI loop also declines to sample. It does not, and it should
+not: the loop would then carry a second copy of a rule the reducer already
+owns, and the two could drift. The heartbeat samples unconditionally — it is a
+memory read and a load average, microseconds — and the reducer decides whether
+the dashboard is allowed to believe it. That is the same division the uptime
+clock already uses for `Msg::Tick`.
 
 The alternative — one line ticking over on a screen whose banner says "these
 values are frozen as of 14:32:07" — is a contradiction on the same frame, and
@@ -502,13 +659,33 @@ Two things this settles.
 never ambiguous about whose memory it is quoting. A bare `mem 12.4G` beside a
 bare `mem 706.0M` is a puzzle.
 
-**Segments drop from the right when they do not fit**, in that order: `up`
-first (a host that has been up six days explains nothing about right now), then
-`flock mem`, then `flock cpu`, then `host mem`, leaving the load average, which
-is the single most useful number about a machine running a process manager.
-This is a `while` loop over a `Vec<String>`, not a threshold table: the strip is
-one line built from five parts, and a `TIERS`-shaped table for it would be
-ceremony.
+**The order matters and the mechanism does not.** The order above is
+least-useful-last-first: `up` goes first when the line does not fit (a host
+that has been up six days explains nothing about right now), then `flock mem`,
+then `flock cpu`, then `host mem`, leaving the load average — the single most
+useful number about a machine running a process manager.
+
+**That fitting is `flock::fit`, the same call every other line on this screen
+already goes through.** An earlier draft of this decision built a second
+mechanism for it: a `Vec<String>` of five segments, a `while … pop()` loop, a
+`joined_width` helper, and a test that walked every width from 200 down to 10
+recording the order things vanished. That is a second, differently-shaped
+fitting path beside the one the rest of the screen uses, and Rin's ruling for
+this phase is "all three panes, kept as plain as the flock table, no elaborate
+layout". It is cut.
+
+Nothing is lost by cutting it, which is why this is the easy call rather than
+a concession: the segments are joined **in the drop order, left to right**, so
+truncating from the right *is* the drop order, for free and with no code. The
+only difference is that a segment can be cut mid-word — `flock me…` — instead
+of vanishing whole, and the `…` says so, exactly as it does on every name in
+the table above it. `fit` also pads to exactly `width`, so the strip cannot
+overflow the terminal by construction, which is the property the drop loop was
+there to guarantee.
+
+The test that survives is the one that can fail: at 200 columns every segment
+is present and self-labelled, and at 40 columns the line still begins with the
+load average and ends with a visible `…`.
 
 `load … / 10 cores` comes from `std::thread::available_parallelism()` — std, no
 new call per sample, read once when `LocalReader` is constructed. A load average
@@ -561,7 +738,21 @@ repetition here is of shape, not of meaning."
 `run_ui`'s `select!` is `biased` and its arm-retirement reasoning is the
 subtlest thing in the module. This phase adds **no arm to it**. The host sample
 rides the existing 1-second heartbeat arm; the feed rides `Effect::RefreshFeed`
-off a message that was already arriving. Sampling memory and a load average
+off a message that was already arriving.
+
+**Task 6 owns that wiring, and it is named here because the first draft of
+this plan left it unowned.** Task 4 built the strip, the `Msg::Host` variant
+and its reducer arm; Task 8 put the strip on screen; and *no task changed the
+heartbeat arm*, which still yielded `Msg::Tick` and nothing else. Every test
+and every gallery frame injects `Msg::Host` directly, so nothing would have
+caught it — and the shipped binary would have drawn `host  not read yet`
+forever, under a strip Rin had approved from `frames.txt`. Task 6 is where
+`run_ui` gains its `local: L` parameter, so Task 6 is where the heartbeat arm
+gains `app.update(Msg::Host { sample: local.host() })`, and Step 6.2 has a
+`run_ui` test that drives one heartbeat with a `FakeLocal` and asserts
+`host  load` is on the drawn frame.
+
+Sampling memory and a load average
 costs microseconds and no process-table walk (`RefreshKind::nothing()
 .with_memory(...)` — deliberately *not* `.with_processes(...)`, which is what
 makes `dog::metrics`' sampler expensive enough that shep-daemon's own memory
@@ -585,6 +776,25 @@ unconditionally — a reducer that answered its own feed update with another
 refresh request would loop the UI task at full tilt, and the `let _ =` at the
 call site is deliberate rather than lazy. Task 6 has a test that pins it.
 
+**Growing this enum breaks a match in a file the reducer's task does not
+otherwise touch.** `crates/shep-cli/src/lookout/mod.rs`'s `match app.update(msg)`
+is exhaustive over three arms with no wildcard, so `Effect::RefreshFeed` is an
+immediate E0004 there — which would mean Task 1 could not compile, its
+verification step could not run, and every baseline count downstream of it was
+anchored to a build that never happened. Task 1 therefore lists `mod.rs` among
+its files and lands a stub arm there, which Task 6 replaces with the real read.
+
+**The same question, asked of every other type this phase grows:**
+
+| type | grown by | exhaustive matches that must be updated in the same task |
+|---|---|---|
+| `Effect` | Task 1 (`RefreshFeed`) | `lookout/mod.rs`'s `match app.update(msg)` — **the E0004 above**. Nothing else matches `Effect`; `link.rs` only names it in a doc link. |
+| `Msg` | Task 4 (`Host`), Task 6 (`Bleats`) | `App::update`'s match, in `app.rs`, which each of those tasks already owns. `link.rs`, `mod.rs`, `view/mod.rs` and `frames.rs` **construct** `Msg` but never match on it. |
+| `KeyPress` | Task 1 (four renames, no new variant) | `App::on_key` and `input::map_key`, both in Task 1's files. A rename is a compile error at every use, which is the correct kind of red. |
+| `Scene` | Task 9 (six variants) | `label`, `caption`, `size` and `scene_with`, all four in `frames.rs`, which Task 9 owns. `size`'s `_ => (120, 20)` arm is a wildcard, so it will *not* error — Step 9.2 changes it explicitly for that reason. |
+| `Stream`, `Panes` | new types | nothing matched them before they existed. |
+| `Column`, `Link`, `Control`, `DogSource` | **not grown by this phase** | — |
+
 ---
 
 ## Task order and dependencies
@@ -592,18 +802,28 @@ call site is deliberate rather than lazy. Task 6 has a test that pins it.
 ```
 Task 1  selection in the reducer            (app.rs)          — no deps
 Task 2  the gutter, the marker, the floors  (view/, flock.rs) — needs 1
-Task 3  the Local trait and the host sample (source.rs)       — no deps
+Task 5  the bounded tail reader and the gap (tail.rs)         — no deps
+Task 3  the Local trait and the host sample (source.rs)       — needs 5
 Task 4  the host strip                      (view/host.rs)    — needs 2, 3
-Task 5  the bounded tail reader and the gap (tail.rs)         — needs 3
-Task 6  the bleats feed pane                (view/bleats.rs)  — needs 1, 5
+Task 6  the bleats feed pane                (view/bleats.rs)  — needs 1, 3, 5
 Task 7  the sheep detail pane               (view/detail.rs)  — needs 1, 2
 Task 8  height tiers and the layout         (view/mod.rs)     — needs 4, 6, 7
 Task 9  the frames: scenes, captions, gallery                  — needs 8
 Task 10 docs, the phase gate, the cross-checks                 — needs 9
 ```
 
-Tasks 1 and 3 are independent and may run in parallel. So may 5 and 7 once
-their inputs land. Everything else is a chain, because it is one screen.
+**Execution order: 1, 2, 5, 3, 4, 6, 7, 8, 9, 10.** The numbers are labels and
+this list is the order — 5 runs before 3, and the sections below are in
+numeric order rather than execution order. The first draft of this plan had
+the dependency backwards (`Task 5 — needs 3`), which is impossible: Task 3's
+`Local` trait declares `fn tail(&mut self, ..) -> super::tail::Tail` and
+`LocalReader::tail` calls `super::tail::read`, neither of which exists until
+Task 5 creates the module. Task 3 could not have compiled, so its verification
+step could not have run, and Task 5's own baseline was measured against it.
+
+Tasks 1 and 5 are independent and may run in parallel. So may 7 and the
+3→4→6 leg once Task 2 lands. Everything else is a chain, because it is one
+screen.
 
 ---
 
@@ -613,11 +833,32 @@ Replace the scroll offset with a selection, add the reseat rule, add
 `Effect::RefreshFeed`, and rename the four keys that no longer scroll.
 
 **Files:** `crates/shep-cli/src/lookout/app.rs`,
-`crates/shep-cli/src/lookout/input.rs`.
+`crates/shep-cli/src/lookout/input.rs`,
+`crates/shep-cli/src/lookout/view/status.rs`,
+`crates/shep-cli/src/lookout/mod.rs`,
+`crates/shep-cli/src/lookout/view/mod.rs` (one call site — see Step 1.4).
 
-**Expected delta:** +5 tests in `shep-cli --bins` (three new reducer tests, one
-new input test, one rewritten). Two existing reducer tests are rewritten in
-place, not added.
+`mod.rs` and `status.rs` are not optional extras:
+
+- **`mod.rs`** matches `app.update(msg)` exhaustively over
+  `Effect::Quit | Effect::PollNow | Effect::None` with **no wildcard**
+  (`mod.rs:339-350`), so adding `Effect::RefreshFeed` is an immediate E0004
+  there. Without a stub arm in this task the crate does not compile, Step 1.4
+  cannot run, and every count downstream is anchored to a build that never
+  happened. The stub is two lines and Task 6 replaces it.
+- **`status.rs:74`** is the status bar's key hint —
+  `q quit   j/k scroll   g/G top/bottom   r refresh` — printed on every one of
+  the gallery frames. This task renames the keys *because* names that say the
+  pane scrolls would be lying, and the hint is the only one of those names an
+  operator actually reads. Renaming the enum and leaving the hint would be the
+  exact failure this task exists to fix, on the one surface that is visible.
+
+**Expected delta:** +7 tests in `shep-cli --bins` — five new reducer tests, one
+new input test, one new status test. **Three** existing tests are rewritten in
+place rather than added: `every_bound_key_resolves_to_its_press` (input.rs),
+`a_snapshot_that_shrinks_the_flock_pulls_the_scroll_back` and
+`the_scroll_offset_clamps_at_both_ends` (both app.rs, both assert on
+`app.scroll()`, which this task deletes).
 
 ### Step 1.1 — baseline
 
@@ -625,11 +866,17 @@ place, not added.
 grep -c 'pub fn scroll' crates/shep-cli/src/lookout/app.rs                # 1
 grep -rn 'ScrollUp\|ScrollDown\|ScrollTop\|ScrollBottom' crates/ | wc -l  # 24
 grep -c 'RefreshFeed' crates/shep-cli/src/lookout/app.rs                  # 0
+grep -c 'j/k scroll' crates/shep-cli/src/lookout/view/status.rs           # 1
+grep -c 'j/k select' crates/shep-cli/src/lookout/view/status.rs           # 0
+grep -rn 'app.scroll()' crates/ | wc -l                                   # 5
 cargo test -p shep-cli --bins --all-features                              # 379 passed; 0 failed; 2 ignored
 ```
 
-The `RefreshFeed` count is `0` today and must be non-zero after — this is the
-one check in this task that cannot pass before the change.
+The `RefreshFeed` and `j/k select` counts are `0` today and must be non-zero
+after — those are the two checks in this task that cannot pass before the
+change. `app.scroll()`'s five call sites are the work: one accessor
+definition, three assertions in two tests being rewritten, and `view/mod.rs`'s
+`scroll_offset` call, which is Task 2's.
 
 ### Step 1.2 — RED
 
@@ -738,6 +985,65 @@ correct kind of red for a rename.
             Effect::None,
             "a frozen dashboard does not re-read anything"
         );
+    }
+```
+
+    /// fails if a frozen dashboard reads a log file. The snapshot path
+    /// freezes for free — no snapshots arrive after `Msg::Frozen` — but the
+    /// KEY path does not, and `j` on a frozen screen would repaint the feed
+    /// with content newer than the banner saying the values are frozen as of
+    /// 14:32:07. That is the contradiction on one frame that design decision 7
+    /// refuses for the host strip, and 12a's
+    /// `the_frozen_frame_does_not_move_however_long_the_link_stays_gone`
+    /// cannot catch it, because it presses no keys.
+    ///
+    /// The cursor still MOVES: the detail pane re-rendering from the frozen
+    /// listing is the operator reading data already on the frame, which is
+    /// allowed. It is touching the disk that is not.
+    #[test]
+    fn a_frozen_dashboard_moves_the_cursor_without_touching_a_file() {
+        let (mut app, _) = started();
+        app.update(Msg::Frozen { at_local: "2026-08-14 14:32:07".to_string() });
+
+        assert_eq!(
+            app.update(Msg::Key(KeyPress::SelectDown)),
+            Effect::None,
+            "no file is read once the link is lost"
+        );
+        assert_eq!(app.selected(), Some(2), "but the cursor moved anyway");
+        assert_eq!(app.update(Msg::Key(KeyPress::SelectLast)), Effect::None);
+        assert_eq!(app.selected(), Some(3));
+    }
+```
+
+And in `view/status.rs`'s `mod tests`:
+
+```rust
+    /// fails if the key hint keeps saying `scroll` after the keys stopped
+    /// scrolling. This is the only one of the four renamed names an operator
+    /// ever reads — it is on every frame in the gallery — so leaving it would
+    /// be shipping the exact lie this task exists to remove, on the one
+    /// surface where it is visible.
+    ///
+    /// The replacement is the same 48 characters as the original, so
+    /// `a_truncated_hint_still_leaves_a_gap_before_the_control_label` at 49
+    /// columns is measuring the same thing it measured before.
+    #[test]
+    fn the_key_hint_says_what_the_keys_now_do() {
+        let app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/home/rin/.shep".to_string(),
+            Instant::now(),
+        );
+        let hint: String = status_line(&app, 200)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(hint.contains("j/k select"), "got {hint:?}");
+        assert!(hint.contains("g/G first/last"), "got {hint:?}");
+        assert!(!hint.contains("scroll"), "the pane no longer scrolls: {hint:?}");
     }
 ```
 
@@ -943,23 +1249,83 @@ Accessors — `scroll()` is deleted, three arrive:
     }
 ```
 
+`select_at` also carries the frozen gate, which is why it — and not
+`select_by` — is the single place that returns the effect:
+
+```rust
+        self.selected = next;
+        // The cursor moved; whether anything is READ is a separate question.
+        // A frozen dashboard re-reading live log files would put content on
+        // screen newer than the banner saying the values are frozen, which is
+        // the contradiction design decision 7 refuses for the host strip. The
+        // detail pane still re-renders, from the frozen listing — that is data
+        // already on the frame.
+        if matches!(self.link, Link::Lost { .. }) {
+            return Effect::None;
+        }
+        Effect::RefreshFeed
+```
+
+### Step 1.3b — GREEN: `mod.rs`'s stub arm, and the status hint
+
+`mod.rs:339-350`'s `match app.update(msg)` is exhaustive with no wildcard, so
+it gains a fourth arm in this task or the crate does not compile:
+
+```rust
+            // Task 6 replaces this with the read. Until then the reducer's
+            // request is honoured by redrawing and nothing else — which is
+            // correct, because there is no feed on screen yet to refresh.
+            Effect::RefreshFeed => dirty = true,
+```
+
+`status.rs:74`'s hint, in the `None` arm:
+
+```rust
+        None => (
+            // `select`/`first/last`, not `scroll`/`top/bottom`: the pane
+            // carries a cursor now and the viewport is derived from it. Same
+            // 48 characters as the 12a text, so the truncation test at 49
+            // columns still measures what it was written to measure.
+            "q quit   j/k select   g/G first/last   r refresh".to_string(),
+            palette.muted(),
+        ),
+```
+
 Rewrite `a_snapshot_that_shrinks_the_flock_pulls_the_scroll_back` in place as
 `a_snapshot_that_shrinks_the_flock_pulls_the_selection_back`, asserting on
 `selected_index()` where it asserted on `scroll()`.
 
+Rewrite `the_scroll_offset_clamps_at_both_ends` in place as
+`the_selection_clamps_at_both_ends` — same three key sequences, same reason in
+its doc comment (wrapping a two-hundred-sheep flock on one keypress loses the
+operator's place), asserting `selected_index()` where it asserted `scroll()`.
+**The first draft of this plan missed this one**: it named only the snapshot
+test, and this one asserts on `app.scroll()` three times, so the task would
+have ended on a build error rather than on a green run.
+
 ### Step 1.4 — verify
 
 ```bash
+cargo fmt --all --check
 cargo test -p shep-cli --bins --all-features
 ```
 
-Expect `384 passed; 0 failed; 2 ignored` — 379 + 5. `view/mod.rs` and
-`frames.rs` still compile because neither names `scroll()` directly; `draw`'s
-call to `flock::scroll_offset` is Task 2's.
+Expect `386 passed; 0 failed; 2 ignored` — 379 + 7. Not the full task gate:
+see "Where the gate runs" in Global constraints.
+
+`view/mod.rs` calls `flock::scroll_offset(app.scroll(), ..)`, and `scroll()` is
+deleted here — so this task changes that one call site to
+`app.selected_index().unwrap_or(0)` even though the rest of `view/mod.rs` is
+Task 2's. `scroll_offset` still has its 12a signature at this point and still
+means "the offset asked for", so the call compiles and the pane behaves as it
+did; Task 2 changes what the function computes.
 
 ```bash
 grep -c 'RefreshFeed' crates/shep-cli/src/lookout/app.rs        # was 0; now ≥ 6
+grep -c 'RefreshFeed' crates/shep-cli/src/lookout/mod.rs        # was 0; now 1 (the stub arm)
 grep -rn 'ScrollUp\|ScrollDown\|ScrollTop\|ScrollBottom' crates/ | wc -l   # was 24; now 0
+grep -c 'j/k select' crates/shep-cli/src/lookout/view/status.rs # was 0; now 1
+grep -rn 'app.scroll()' crates/ | wc -l                         # was 5; now 0
 ```
 
 ### Step 1.5 — MUTATION
@@ -984,6 +1350,15 @@ In `select_at`, return `Effect::RefreshFeed` unconditionally instead of
 `a_selection_that_moves_refreshes_the_feed_and_one_that_cannot_does_not` must
 fail on its third assertion. Revert.
 
+### Step 1.7 — third MUTATION
+
+In `select_at`, delete the `Link::Lost` early return.
+`a_frozen_dashboard_moves_the_cursor_without_touching_a_file` must fail on its
+first assertion — `Effect::RefreshFeed` where `Effect::None` was expected —
+**and its second assertion must still pass**, because the cursor is supposed
+to move either way. If the second one fails too, the gate was put in the wrong
+place: it belongs after the move, not before it. Revert.
+
 ---
 
 ## Task 2 — the gutter, the marker, and the two floors
@@ -992,22 +1367,42 @@ The flock table moves two columns right; the selected row gets a `>`; the
 terminal's width floor becomes 33 while the table's stays 31.
 
 **Files:** `crates/shep-cli/src/lookout/view/flock.rs`,
-`crates/shep-cli/src/lookout/view/mod.rs`.
+`crates/shep-cli/src/lookout/view/mod.rs`,
+`crates/shep-cli/src/lookout/frames.rs`.
 
-**Expected delta:** +3 tests. Eight snapshots are re-accepted (every frame
-shifts two columns) — see the note in Task 9 about why that is correct and not
-a wire-fixture violation.
+`frames.rs` is in the list because of one line: `frames.rs:497` asserts
+`render_text(&scene(Scene::TooNarrow).1).contains("need 31x6")`. Step 2.1's
+baseline in the first draft grepped only `view/mod.rs`, found three hits, and
+never saw this fourth one — so the task would have gone red in a file it did
+not list, at a step that claimed to be green.
+
+**Expected delta:** **+2 net** — three new tests, and one deleted.
+`view/flock.rs:403 the_scroll_offset_never_leaves_a_gap_at_the_bottom` asserts
+`scroll_offset(7, 5, 20) == 7`; the centring formula returns `5`. It is not
+edited, it is **deleted and superseded** by
+`the_offset_keeps_the_selection_visible_and_centred_where_it_can`, which
+asserts everything it asserted plus the property the old one could not state
+(the selection is inside the window). Say so in the deleting commit.
+
+Eight snapshots are re-accepted (every frame shifts two columns) — see the
+note in Task 9 about why that is correct and not a wire-fixture violation.
 
 ### Step 2.1 — baseline
 
 ```bash
+grep -rn '31x6' crates/ | wc -l                             # 5
 grep -c '31x6' crates/shep-cli/src/lookout/view/mod.rs      # 3
-grep -c '33x6' crates/shep-cli/src/lookout/view/mod.rs      # 0
+grep -c '31x6' crates/shep-cli/src/lookout/frames.rs        # 1
+grep -rn '33x6' crates/ | wc -l                             # 0
 grep -c 'GUTTER' crates/shep-cli/src/lookout/view/mod.rs    # 0
 ```
 
-`33x6` is `0` today and must be non-zero after: this is what makes the rewritten
+The fifth `31x6` is in `snapshots/…too_narrow.snap`, which `cargo insta` will
+re-accept. `33x6` is `0` everywhere today and must be non-zero after: that is
+what makes the rewritten
 `a_terminal_below_the_floor_says_so_instead_of_drawing` a check that can fail.
+**Run the first grep, not the second alone** — the first draft of this plan ran
+only the second and missed both the `frames.rs` assertion and the snapshot.
 
 ### Step 2.2 — RED
 
@@ -1066,6 +1461,18 @@ In `flock.rs`:
 
 The exhaustive loop at the end is the assertion that matters; the literals
 above it are there so a failure names a specific case rather than a triple.
+
+**Delete `the_scroll_offset_never_leaves_a_gap_at_the_bottom` in the same
+commit.** It is not a test this change breaks by accident: it asserts
+`scroll_offset(7, 5, 20) == 7`, which is the *old* contract — "the offset is
+what the caller asked for, clamped" — and the new contract is "the offset is
+wherever the cursor needs the window to be". Both of its surviving clauses
+(everything fits ⇒ 0; the last page is the ceiling) are in the replacement
+above, at the same literals.
+
+`frames.rs:497`'s `need 31x6` becomes `need 33x6` in the same commit. It is
+one character of edit and it is the only assertion outside `view/mod.rs` that
+names the floor.
 
 In `view/mod.rs`, rewrite the floor test's three `31x6` literals to `33x6` and
 add:
@@ -1221,9 +1628,13 @@ The offset call becomes:
 ```bash
 cargo test -p shep-cli --bins --all-features                 # 8 snapshot failures expected
 cargo insta accept --workspace                               # or review each with `cargo insta review`
-cargo test -p shep-cli --bins --all-features                 # 387 passed; 0 failed; 2 ignored
-grep -c '33x6' crates/shep-cli/src/lookout/view/mod.rs       # was 0; now 3
+cargo fmt --all --check
+cargo test -p shep-cli --bins --all-features                 # 388 passed; 0 failed; 2 ignored
+grep -rn '33x6' crates/ | wc -l                              # was 0; now 5
+grep -rn '31x6' crates/ | wc -l                              # was 5; now 0
 ```
+
+388 is 386 + 3 − 1. Still the inner loop only, not the full task gate.
 
 Then read one accepted snapshot by eye and confirm the two-column shift is
 present and uniform:
@@ -1261,6 +1672,12 @@ rows below the last sheep. Revert.
 
 Everything lookout reads that does not come off the socket, behind one trait.
 
+**Runs AFTER Task 5**, not before it. `Local::tail` returns
+`super::tail::Tail` and `LocalReader::tail` calls `super::tail::read`; neither
+the module nor the function exists until Task 5 creates them, so this task
+cannot compile before it. The first draft of this plan had the arrow the other
+way round.
+
 **Files:** `crates/shep-cli/src/lookout/source.rs`.
 
 **Expected delta:** +3 tests.
@@ -1269,15 +1686,20 @@ Everything lookout reads that does not come off the socket, behind one trait.
 
 ```bash
 grep -rn 'sysinfo' crates/shep-cli/src/lookout/ | wc -l        # 0
-grep -c '^\[\[package\]\]' Cargo.lock                          # 326
+grep -c '^\[\[package\]\]' Cargo.lock                          # RECORD IT — see below
 cargo tree -p shep-cli --all-features 2>/dev/null | grep -c 'sysinfo v'   # ≥ 1 — record the exact number
 ```
 
-The last one is the measurement that matters. `sysinfo` is **already** an
-unconditional shep-cli dependency (`dog::metrics`' `shep_host_*` series), so
-this task must not change either count. Record both numbers before and after
-and say so in the task report — that is the whole of the dependency argument,
-and it is a measurement rather than a claim.
+Both counts are **recorded, not asserted against a literal**. `sysinfo` is
+already an unconditional shep-cli dependency (`dog::metrics`' `shep_host_*`
+series), so what this task has to prove is that **neither number moves across
+this phase** — which is a delta, and a delta needs a before as well as an
+after. Write both into the task report; Step 10.5 compares against them.
+
+A literal would be worse than useless here: the count was `326` at `ed09740`
+and `340` in the working tree while this plan was revised, because Phase 13
+(`whistle`) is adding dependencies in a parallel worktree. An executor who
+stopped on `326 != 340` would be stopping on somebody else's phase.
 
 ### Step 3.2 — RED
 
@@ -1316,18 +1738,25 @@ and it is a measurement rather than a claim.
     /// `Reading::host` says so in its own doc — and a strip rendering an
     /// unsupported platform as `0.00 load, 0 bytes` would be a lie the
     /// operator has no way to detect.
+    ///
+    /// Branched on `IS_SUPPORTED_SYSTEM` rather than asserting it.
+    /// `sysinfo::IS_SUPPORTED_SYSTEM` is a `const bool`, and both
+    /// `assert!(IS_SUPPORTED_SYSTEM)` and its negation trip
+    /// `clippy::assertions_on_constants`, which is on by default and denied by
+    /// the gate's `-D warnings`. The workspace carries no `allow` for it.
     #[test]
     fn an_unsupported_platform_reports_nothing_rather_than_zero() {
         let mut local = LocalReader::new();
-        match local.host() {
-            // This machine supports it, so the numbers must be real ones.
-            Some(sample) => {
-                assert!(sysinfo::IS_SUPPORTED_SYSTEM);
-                assert!(sample.memory_total_bytes > 0, "a supported host has memory");
-                assert!(sample.memory_used_bytes <= sample.memory_total_bytes);
-                assert!(sample.cores.is_some_and(|cores| cores >= 1));
-            }
-            None => assert!(!sysinfo::IS_SUPPORTED_SYSTEM),
+        if sysinfo::IS_SUPPORTED_SYSTEM {
+            let sample = local.host().expect("a supported platform samples");
+            assert!(sample.memory_total_bytes > 0, "a supported host has memory");
+            // `<`, not `<=`: see Step 3.6 — the weaker form survives a
+            // mutation that reports used == total, which is the whole point of
+            // running the mutation.
+            assert!(sample.memory_used_bytes < sample.memory_total_bytes);
+            assert!(sample.cores.is_some_and(|cores| cores >= 1));
+        } else {
+            assert!(local.host().is_none(), "no numbers where there is nothing to read");
         }
     }
 
@@ -1414,6 +1843,18 @@ impl LocalReader {
     }
 }
 
+/// Same as [`LocalReader::new`].
+///
+/// `clippy::new_without_default` is on by default and the gate denies
+/// warnings: an argument-less `new` with no `Default` fails it.
+/// [`super::term::RestoreGuard`] carries this impl and this sentence for the
+/// same reason — the repetition is the lint's, not this module's.
+impl Default for LocalReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Local for LocalReader {
     fn host(&mut self) -> Option<HostSample> {
         if !sysinfo::IS_SUPPORTED_SYSTEM {
@@ -1457,11 +1898,25 @@ pub const TOPICS: &[&str] = &["process.*", "daemon.*"];
 
 ### Step 3.4 — verify
 
+The imports this task adds to `source.rs`, spelled out because three of them
+are easy to miss and two are re-exports rather than the crates they look like:
+
+```rust
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+```
+
 ```bash
-cargo test -p shep-cli --bins --all-features                             # 390 passed
-grep -c '^\[\[package\]\]' Cargo.lock                                   # still 326
+cargo fmt --all --check
+cargo test -p shep-cli --bins --all-features                             # 399 passed
+grep -c '^\[\[package\]\]' Cargo.lock                                   # unchanged from Step 3.1
 cargo tree -p shep-cli --all-features 2>/dev/null | grep -c 'sysinfo v'  # unchanged from Step 3.1
 ```
+
+399 is 396 + 3 — Task 5 has already run, so the running count comes from it
+and not from Task 2. Inner loop only; the full gate runs at Task 8.
 
 ### Step 3.5 — MUTATION
 
@@ -1778,16 +2233,20 @@ empty iterator rather than `None`).
 The answer to design decision 1, made concrete: a window from the end of each
 file, a line cap on top of it, and an exact count of what was skipped.
 
+**Runs immediately after Task 2 and before Task 3**, which needs this module
+to exist.
+
 **Files:** new `crates/shep-cli/src/lookout/tail.rs`;
 `crates/shep-cli/src/lookout/mod.rs` (one `pub mod` line).
 
-**Expected delta:** +6 tests.
+**Expected delta:** +8 tests.
 
 ### Step 5.1 — baseline
 
 ```bash
 find crates/shep-cli/src/lookout -name '*.rs' | wc -l   # 11
-grep -rn 'written since the last read' crates/ | wc -l  # 0
+grep -rn 'earlier lines not shown' crates/ | wc -l      # 0
+grep -rn 'never read' crates/ | wc -l                   # 0
 ```
 
 ### The types
@@ -1834,6 +2293,15 @@ pub struct TailLine {
 }
 
 /// What one refresh of the feed found.
+///
+/// **Two miss counters, not one, and the reason is the whole of design
+/// decision 1.** Lines go missing in three places: below the byte window
+/// (unknowable in lines, exact in bytes), above [`FEED_TAIL_LINES`] inside the
+/// window (exact), and above the five rows the pane has (exact, and the pane's
+/// own to compute). The first draft of this plan counted only the first, which
+/// is the RARE case; the ordinary case — a sheep writing thirty lines between
+/// two polls, overrunning no window at all — went unreported, and the pane
+/// looked complete exactly when the flock was busy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tail {
     /// The newest lines, oldest first — `out`'s tail, then `err`'s.
@@ -1843,18 +2311,45 @@ pub struct Tail {
     /// files on, and guessing one from file order would be wrong exactly when
     /// a sheep writes to both at once. `bleats`' module doc records the same
     /// limitation for the same reason. The pane renders the LAST rows of this
-    /// list, so a crash on stderr survives a chatty stdout.
+    /// list, so a crash on stderr survives a chatty stdout — and its header
+    /// says `out then err` rather than `out+err`, because `+` reads as one
+    /// merged stream and this is two files end to end.
     pub lines: Vec<TailLine>,
-    /// Bytes appended since the previous read that [`Self::lines`] does not
-    /// cover.
+    /// Lines this read **saw and discarded**, summed over both files.
     ///
-    /// Zero on the first read of a file — showing the tail of a file's history
-    /// is not a gap — and zero when the file shrank, which is what a rotation
-    /// or a `shep flush` looks like from here. Non-zero is the normal case for
-    /// a busy sheep, and the pane says so where it cannot be missed: a feed
-    /// that silently showed the newest five lines of a four-megabyte burst
-    /// would be the most misleading thing on this screen.
+    /// Those above [`FEED_TAIL_LINES`], plus one for the partial line a window
+    /// boundary cut in half. Exact, and non-zero in the ordinary case: a
+    /// window holds hundreds of lines and the cap keeps forty.
+    ///
+    /// The partial line is counted as **one** whether or not the boundary
+    /// happened to fall exactly between two lines — the reader cannot tell
+    /// without reading a byte it deliberately did not read, and over-counting
+    /// by one is the safe direction. Claiming completeness is the failure this
+    /// counter exists to prevent; being one pessimistic is not.
+    pub missed_lines: usize,
+    /// Bytes appended since the previous read that fell **below** the window
+    /// and were therefore never read at all.
+    ///
+    /// Exact as a byte count. The number of LINES in them is genuinely
+    /// unknowable — reading them is the thing the window exists to avoid — so
+    /// the pane says "was never read" about these rather than putting a line
+    /// count on them it would have to invent.
+    ///
+    /// Zero on the first read of a file: showing the tail of a file's history
+    /// is not a gap *between two reads*, and a four-megabyte notice every time
+    /// an operator selected a long-running sheep would train them to ignore
+    /// the notice. Nothing is hidden by that, because the lines the window and
+    /// the cap dropped are still in [`Self::missed_lines`]. Zero too when the
+    /// file shrank, which is what a rotation or a `shep flush` looks like from
+    /// here.
     pub missed_bytes: u64,
+    /// Bytes this refresh actually pulled off disk, both files together.
+    ///
+    /// The bound design decision 3 claims, exposed so the tests can assert it
+    /// **live** rather than argue it in a comment. Never above
+    /// `2 * FEED_WINDOW_BYTES`, and — this is the part a static fixture cannot
+    /// check — not above it even while the sheep is writing during the read.
+    pub read_bytes: u64,
     /// Why there is nothing to show, when there is nothing to show.
     ///
     /// A sentence that names the CAUSE, not one that restates the fact. "the
@@ -1875,7 +2370,11 @@ pub struct Tail {
     /// A live assertion, not a `tokio::time::timeout` — `read` is synchronous,
     /// so a timer around it would complete on the first poll and bound
     /// nothing. What can actually go wrong here is unbounded growth, so that
-    /// is what is asserted.
+    /// is what is asserted — **on `read_bytes`, the quantity that would
+    /// grow**, and not on the size of what came back. Forty short lines are
+    /// under 64 KiB for any implementation whatsoever, including one that read
+    /// the whole four megabytes and then threw them away; an assertion that
+    /// cannot distinguish those two is not asserting the bound.
     #[test]
     fn a_four_megabyte_file_costs_one_window_and_forty_lines() {
         let dir = tempfile::tempdir().unwrap();
@@ -1890,13 +2389,108 @@ pub struct Tail {
 
         let mut seen = BTreeMap::new();
         let tail = read(&mut seen, Some(&path), None);
-        assert_eq!(tail.lines.len(), FEED_TAIL_LINES);
-        let held: usize = tail.lines.iter().map(|l| l.text.len()).sum();
+
         assert!(
-            held < usize::try_from(FEED_WINDOW_BYTES).unwrap(),
-            "held {held} bytes of a 4 MiB file"
+            tail.read_bytes <= FEED_WINDOW_BYTES,
+            "the reader pulled {} bytes off a 4 MiB file",
+            tail.read_bytes
         );
-        assert_eq!(tail.missed_bytes, 0, "the first read of a file is not a gap");
+        assert_eq!(tail.lines.len(), FEED_TAIL_LINES);
+        assert_eq!(
+            tail.missed_bytes, 0,
+            "the first read of a file is not a gap BETWEEN READS"
+        );
+        // …and that is only defensible because the lines it did drop are
+        // counted. Without this the pane draws five lines of four million and
+        // says nothing.
+        assert!(
+            tail.missed_lines > 400,
+            "a 64 KiB window of 121-byte lines holds ~540 of them and keeps 40; \
+             counted only {}",
+            tail.missed_lines
+        );
+    }
+
+    /// fails if the reader stops counting the lines it discarded to honour
+    /// [`FEED_TAIL_LINES`]. **This is the ordinary case the first draft of
+    /// this plan missed entirely**, and it is the one that matters: sixty
+    /// lines fit comfortably inside one 64 KiB window, so `missed_bytes` is
+    /// zero and nothing about the byte accounting fires — while twenty of
+    /// those lines are dropped by the cap. A pane handed a zero here draws
+    /// five lines of sixty and looks complete, which it does exactly when the
+    /// flock is busy and someone is watching.
+    #[test]
+    fn the_lines_the_cap_dropped_are_counted_even_when_no_bytes_were_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-out.log");
+        let sixty: String = (0..60).map(|n| format!("line-{n}\n")).collect();
+        assert!(
+            sixty.len() < usize::try_from(FEED_WINDOW_BYTES).unwrap(),
+            "the fixture has to sit well inside one window or it tests the wrong thing"
+        );
+        std::fs::write(&path, &sixty).unwrap();
+
+        let mut seen = BTreeMap::new();
+        let tail = read(&mut seen, Some(&path), None);
+        assert_eq!(tail.missed_bytes, 0, "nothing overran the window");
+        assert_eq!(tail.lines.len(), FEED_TAIL_LINES);
+        assert_eq!(tail.missed_lines, 20, "sixty in, forty kept");
+        assert_eq!(tail.lines[0].text, "line-20", "and it is the NEWEST forty");
+    }
+
+    /// fails if the reader is bounded by the WRITER rather than by itself.
+    ///
+    /// `read_to_end` after a seek reads to the file's CURRENT end, not to the
+    /// `len` that was just `stat`ed — so a sheep appending while the read is
+    /// in flight makes both the read and its `Vec` grow past 64 KiB without
+    /// limit, on the UI task. That is precisely the writer-bounded behaviour
+    /// design decision 1 chose files over the bus to avoid, reintroduced by
+    /// one missing call.
+    ///
+    /// **A static fixture cannot catch it**, however large: by the time the
+    /// test runs the file has stopped growing, and `len` and the true end
+    /// agree. So this one keeps a writer appending for the whole read.
+    ///
+    /// IR-46: bounded by construction — a fixed number of appends, a fixed
+    /// number of reads, and the writer joined before the assertions. Nothing
+    /// here waits on a condition, so it cannot hang whatever the reader does.
+    #[test]
+    fn a_file_that_grows_during_the_read_is_still_bounded_by_the_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-out.log");
+        // A megabyte to start with, so every read takes the seek branch rather
+        // than the whole-file one.
+        std::fs::write(&path, "seed\n".repeat(200_000)).unwrap();
+
+        let writing = path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&writing)
+                .unwrap();
+            let chunk = "w".repeat(64 * 1024 - 1);
+            for _ in 0..512 {
+                writeln!(file, "{chunk}").unwrap();
+            }
+        });
+
+        let mut seen = BTreeMap::new();
+        let mut worst = 0;
+        for _ in 0..200 {
+            worst = worst.max(read(&mut seen, Some(&path), None).read_bytes);
+        }
+        writer.join().unwrap();
+
+        assert!(
+            worst <= FEED_WINDOW_BYTES,
+            "one read pulled {worst} bytes off a file that was still being written"
+        );
+        // And the writer actually ran: a green run on a file that never grew
+        // would be this test passing for the wrong reason.
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > 32 * 1024 * 1024,
+            "the writer did not get far enough for this test to mean anything"
+        );
     }
 
     /// fails if the gap notice stops being exact, or stops appearing at all.
@@ -1922,13 +2516,35 @@ pub struct Tail {
         drop(file);
 
         let second = read(&mut seen, Some(&path), None);
-        assert!(second.missed_bytes > 4 * 1024 * 1024 - 1024, "got {}", second.missed_bytes);
-        assert!(second.missed_bytes < 5 * 1024 * 1024);
+        // `missed_bytes` is what was NEVER READ — everything appended below
+        // the window. The last 64 KiB WAS read, so it is not in this number.
+        // That upper bound is what distinguishes this definition from
+        // `len - previous - covered`, which the first draft used and which
+        // double-counted the lines the reader dropped: that form would return
+        // slightly MORE than the whole burst and redden the second assertion.
+        assert!(
+            second.missed_bytes > 4 * 1024 * 1024 - 2 * FEED_WINDOW_BYTES,
+            "got {}",
+            second.missed_bytes
+        );
+        assert!(
+            second.missed_bytes < 4 * 1024 * 1024,
+            "the last window WAS read, so it does not belong in the gap: {}",
+            second.missed_bytes
+        );
         assert_eq!(second.lines.last().unwrap().text, "four", "the NEWEST lines survive");
+        assert_eq!(
+            second.missed_lines, 1,
+            "the four-megabyte line the window cut in half is one line, counted"
+        );
 
-        // A third read with nothing appended reports no gap at all.
+        // A third read with nothing appended reports no gap between reads —
+        // but still reports the line the window cuts, because that is still
+        // true, and a pane that stopped saying so would start claiming a
+        // completeness it does not have.
         let third = read(&mut seen, Some(&path), None);
         assert_eq!(third.missed_bytes, 0);
+        assert_eq!(third.missed_lines, 1);
     }
 
     /// fails if a file that SHRANK is reported as a gap. A rotation or a
@@ -1945,6 +2561,7 @@ pub struct Tail {
         std::fs::write(&path, "fresh\n").unwrap();
         let after = read(&mut seen, Some(&path), None);
         assert_eq!(after.missed_bytes, 0);
+        assert_eq!(after.missed_lines, 0, "and nothing was dropped either");
         assert_eq!(after.lines.len(), 1);
         assert_eq!(after.lines[0].text, "fresh");
     }
@@ -1968,6 +2585,10 @@ pub struct Tail {
             tail.lines
         );
         assert_eq!(tail.lines.last().unwrap().text, "whole-line");
+        assert_eq!(
+            tail.missed_lines, 1,
+            "dropped is not the same as hidden: the cut line is counted"
+        );
     }
 
     /// fails if the two files stop being distinguishable, or if stderr stops
@@ -2039,7 +2660,35 @@ pub struct Tail {
             "got {:?}",
             silent.note
         );
+
+        // A FIFTH reason, and the one that is easy to miss: a file with
+        // content but no newline anywhere in the last window. `lines` is empty
+        // and `read_bytes` is 64 KiB, so "has written nothing yet" would be
+        // flatly false — and false in the direction an operator acts on.
+        let unterminated = dir.path().join("one-long-line.log");
+        std::fs::write(
+            &unterminated,
+            "q".repeat(usize::try_from(FEED_WINDOW_BYTES).unwrap() + 10),
+        )
+        .unwrap();
+        let long = read(&mut seen, Some(&unterminated), None);
+        assert!(long.lines.is_empty());
+        assert!(long.read_bytes > 0, "it read plenty; it just found no line");
+        assert!(
+            long.note.as_deref().unwrap().contains("no complete line"),
+            "got {:?}",
+            long.note
+        );
     }
+```
+
+The imports these tests need, since three of them are easy to miss:
+
+```rust
+    use std::collections::BTreeMap;
+    use std::io::Write as _;   // `writeln!` into a `File`
+
+    use super::*;
 ```
 
 ### Step 5.3 — GREEN
@@ -2074,10 +2723,12 @@ pub fn read(
     for (stream, path) in [(Stream::Out, out), (Stream::Err, err)] {
         let Some(path) = path else { continue };
         match read_window(seen, path) {
-            Ok((lines, missed)) => {
-                tail.missed_bytes = tail.missed_bytes.saturating_add(missed);
+            Ok(window) => {
+                tail.read_bytes = tail.read_bytes.saturating_add(window.read_bytes);
+                tail.missed_bytes = tail.missed_bytes.saturating_add(window.never_read);
+                tail.missed_lines = tail.missed_lines.saturating_add(window.dropped);
                 tail.lines.extend(
-                    lines.into_iter().map(|text| TailLine { stream, text }),
+                    window.lines.into_iter().map(|text| TailLine { stream, text }),
                 );
             }
             // The shepherd creates both files at spawn, so a missing one means
@@ -2092,40 +2743,83 @@ pub fn read(
     }
 
     if tail.lines.is_empty() {
-        tail.note = Some(if notes.is_empty() {
-            "this sheep has written nothing yet".to_string()
-        } else {
+        tail.note = Some(if !notes.is_empty() {
             notes.join("; ")
+        } else if tail.read_bytes > 0 {
+            // Read plenty and found no terminator in any of it: one line
+            // longer than the whole window. "has written nothing yet" would be
+            // flatly false here, and false in the direction an operator acts
+            // on — they would go looking for a sheep that was never started
+            // instead of at a sheep writing one enormous line.
+            format!(
+                "this sheep's last {} of log contains no complete line",
+                human_bytes(FEED_WINDOW_BYTES)
+            )
+        } else {
+            "this sheep has written nothing yet".to_string()
         });
     }
     tail
 }
 
-/// The last [`FEED_TAIL_LINES`] lines of one file, and how many bytes have
-/// been appended since the previous read that those lines do not cover.
+/// What one file's window yielded.
+///
+/// A struct rather than a tuple: four returns, three of them counters that
+/// differ only in what they count, is exactly the shape where positional
+/// returns get transposed at the call site and nothing complains.
+struct Window {
+    /// The lines that survived both bounds, oldest first.
+    lines: Vec<String>,
+    /// Lines this read saw and discarded: those above [`FEED_TAIL_LINES`],
+    /// plus one for the partial line the window boundary cut.
+    dropped: usize,
+    /// Bytes appended since the previous read that fell below the window and
+    /// were never read.
+    never_read: u64,
+    /// Bytes this read pulled off disk. Never above [`FEED_WINDOW_BYTES`].
+    read_bytes: u64,
+}
+
+/// One file's window: the last [`FEED_TAIL_LINES`] lines of it, what it had to
+/// discard to get there, and what it never read at all.
 ///
 /// # Errors
 /// The file could not be opened, `stat`ed, seeked or read — notably
 /// [`std::io::ErrorKind::NotFound`] and `EISDIR`, which [`read`] treats
 /// differently from each other.
-fn read_window(
-    seen: &mut BTreeMap<PathBuf, u64>,
-    path: &Path,
-) -> std::io::Result<(Vec<String>, u64)> {
+fn read_window(seen: &mut BTreeMap<PathBuf, u64>, path: &Path) -> std::io::Result<Window> {
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let start = len.saturating_sub(FEED_WINDOW_BYTES);
     if start > 0 {
         file.seek(SeekFrom::Start(start))?;
     }
-    let mut window = Vec::new();
-    file.read_to_end(&mut window)?;
+
+    // `.take(..)`, and this one call is what design decision 3's entire bound
+    // rests on. `read_to_end` alone reads to the file's CURRENT end, not to
+    // the `len` that was just `stat`ed — so a sheep appending while this read
+    // is in flight makes both the read and this `Vec` grow without limit, on
+    // the UI task. That is the writer-bounded behaviour decision 1 chose files
+    // over the bus to avoid, reintroduced by one missing call, and no fixture
+    // that has stopped growing can catch it.
+    let mut window =
+        Vec::with_capacity(usize::try_from(len.min(FEED_WINDOW_BYTES)).unwrap_or(0));
+    (&mut file).take(FEED_WINDOW_BYTES).read_to_end(&mut window)?;
+    let read_bytes = u64::try_from(window.len()).unwrap_or(u64::MAX);
 
     // A window boundary can land mid-line. Half a line shown as a whole one is
-    // a lie, so the bytes up to and including the first newline are discarded.
+    // a lie, so the bytes up to and including the first newline are discarded
+    // — and COUNTED, because a discarded line is one the pane is not showing.
+    //
+    // Counted as one whether or not the boundary happened to fall exactly
+    // between two lines: telling those apart needs the byte at `start - 1`,
+    // which is a byte this function deliberately did not read. Over-counting
+    // by one is the safe direction; claiming completeness is not.
+    let mut dropped = usize::from(start > 0);
     let bytes: &[u8] = if start > 0 {
         match window.iter().position(|&byte| byte == b'\n') {
             Some(newline) => &window[newline + 1..],
+            // No newline in a whole window: it is all the middle of one line.
             None => &[],
         }
     } else {
@@ -2138,58 +2832,108 @@ fn read_window(
         lines.pop();
     }
     let keep_from = lines.len().saturating_sub(FEED_TAIL_LINES);
+    dropped += keep_from;
     lines.drain(..keep_from);
 
-    // What the kept lines actually cover, in bytes, terminators included. The
-    // gap is what grew beyond that — `saturating_sub` twice, so a file that
-    // SHRANK (a rotation, a `shep flush`) reports no gap rather than sixteen
-    // exabytes.
-    let covered: u64 = lines
-        .iter()
-        .map(|line| u64::try_from(line.len()).unwrap_or(u64::MAX).saturating_add(1))
-        .sum();
+    // Bytes that were NEVER READ: those appended since the previous read that
+    // fell below the window. Not `len - previous - covered`, which the first
+    // draft used: that form counts the bytes of the lines this reader saw and
+    // dropped, which `dropped` already counts in lines, so the two
+    // double-count each other and neither is exactly anything.
+    //
+    // `saturating_sub`, so a file that SHRANK — a rotation, a `shep flush` —
+    // reports zero rather than sixteen exabytes.
     let previous = seen.insert(path.to_path_buf(), len);
-    let missed = match previous {
+    let never_read = match previous {
         // The first read of a file shows the tail of its history. That is not
-        // a gap, and reporting it as one would put a four-megabyte notice on
-        // screen every time an operator selected a long-running sheep.
+        // a gap BETWEEN READS, and a four-megabyte notice every time an
+        // operator selected a long-running sheep would train them to ignore
+        // the notice. Nothing is hidden by this: the lines the window and the
+        // cap dropped are in `dropped` either way.
         None => 0,
-        Some(previous) => len.saturating_sub(previous).saturating_sub(covered),
+        Some(previous) => start.saturating_sub(previous),
     };
-    Ok((lines, missed))
+    Ok(Window { lines, dropped, never_read, read_bytes })
 }
+```
+
+The imports, spelled out because `Read` is needed only for `take` and is easy
+to leave out:
+
+```rust
+use std::collections::BTreeMap;
+use std::io::{Read as _, Seek as _, SeekFrom};
+use std::path::{Path, PathBuf};
+
+use crate::output::human_bytes;
 ```
 
 ### Step 5.4 — verify
 
 ```bash
-cargo test -p shep-cli --bins --all-features                  # 401 passed; 0 failed; 2 ignored
-grep -rn 'written since the last read' crates/ | wc -l        # still 0 — that string is Task 6's
+cargo fmt --all --check
+cargo test -p shep-cli --bins --all-features                  # 396 passed; 0 failed; 2 ignored
+grep -rn 'earlier lines not shown' crates/ | wc -l            # still 0 — that string is Task 6's
 ```
 
-### Step 5.5 — MUTATION
+396 is 388 + 8. Inner loop only: `tail::read` has no caller in `main`'s tree
+until Task 6, so the full gate would fail on `dead_code` for code that is
+correct. See "Where the gate runs".
 
-Delete the `seen` bookkeeping — always return `missed = 0`:
+### Step 5.5 — MUTATION: the byte gap
+
+Delete the `seen` bookkeeping — always report nothing never-read:
 
 ```rust
     let _ = seen.insert(path.to_path_buf(), len);
-    Ok((lines, 0))   // MUTATION
+    let never_read = 0;   // MUTATION
 ```
 
 `a_file_that_grew_between_reads_reports_the_bytes_it_skipped` must fail on its
-`missed_bytes > 4 MiB - 1 KiB` assertion. This is the single most important
-mutation in the phase: it turns the feed back into the silent-truncation
-version design decision 1 rejected, and nothing else on the screen would say
-so. Revert.
+first `missed_bytes` assertion. Revert.
 
-### Step 5.6 — second MUTATION
+### Step 5.6 — second MUTATION: the line gap
+
+Delete `dropped += keep_from` — count only the partial line.
+`the_lines_the_cap_dropped_are_counted_even_when_no_bytes_were_skipped` must
+fail (`20` becomes `0`), and so must
+`a_four_megabyte_file_costs_one_window_and_forty_lines`' `missed_lines > 400`.
+
+**This is the single most important mutation in the phase**, and it is the one
+the first draft of this plan could not have run, because it had no counter to
+delete. It turns the feed back into the version that shows five lines of sixty
+and says nothing — the silent-truncation feed decision 1 rejected — in the
+ORDINARY case, where no byte window is overrun and no other check on this
+screen would notice. Revert.
+
+### Step 5.7 — third MUTATION: the reader's bound
+
+In `read_window`, drop the `.take(FEED_WINDOW_BYTES)`:
+
+```rust
+    file.read_to_end(&mut window)?;   // MUTATION
+```
+
+`a_file_that_grows_during_the_read_is_still_bounded_by_the_reader` must fail;
+`a_four_megabyte_file_costs_one_window_and_forty_lines` must **still pass**,
+which is the finding — a fixture that has stopped growing cannot tell the two
+implementations apart, and that is why the growing one exists.
+
+If the growing test does not redden, the writer is not getting scheduled
+between the `stat` and the `read`. Raise the chunk count from 512 and re-run
+rather than accepting a check that cannot fail; if it still will not redden on
+this machine, say so in the task report with the number you got to. Revert.
+
+### Step 5.8 — fourth MUTATION
 
 In `read_window`, `lines.truncate(FEED_TAIL_LINES)` instead of
 `lines.drain(..keep_from)` — keep the OLDEST lines rather than the newest.
 `a_file_that_grew_between_reads_reports_the_bytes_it_skipped` must fail on
-`assert_eq!(second.lines.last().unwrap().text, "four")`. Revert.
+`assert_eq!(second.lines.last().unwrap().text, "four")`, and
+`the_lines_the_cap_dropped_are_counted_even_when_no_bytes_were_skipped` on
+`lines[0] == "line-20"`. Revert.
 
-### Step 5.7 — third MUTATION
+### Step 5.9 — fifth MUTATION
 
 In `read_window`, drop the partial-line discard (always use `&window`).
 `a_window_boundary_discards_the_partial_line_it_lands_in` must fail — a line
