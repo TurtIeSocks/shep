@@ -13,16 +13,18 @@
 //! uid and can already run `shep stop`. See [`gate`] for what the control
 //! gate is and, more importantly, what it is not.
 //!
-//! Task 9 lands `catalogue` (`#[cfg(test)]` only): a renderer for
-//! `docs/whistle/tools.md` off [`Whistle::router`], plus the tests that pin
-//! every claim in it against the two live routers below. Nothing in this
-//! module reaches for it yet.
+//! [`catalogue`] (`#[cfg(test)]` only) renders `docs/whistle/tools.md` off
+//! [`Whistle::router`], and pins every claim in it against the two live
+//! routers below — nothing outside its own tests calls into it.
 
 pub mod control;
 pub mod facts;
 pub mod gate;
 pub mod read;
 pub mod shepherd;
+
+#[cfg(test)]
+pub mod catalogue;
 
 use std::io::Write;
 
