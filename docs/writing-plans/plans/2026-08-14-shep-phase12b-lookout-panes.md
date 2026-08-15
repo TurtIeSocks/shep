@@ -291,8 +291,11 @@ has a test in this plan that would redden if the property were lost.
    not have to be re-derived.
 3. **Every coloured cell sits beside a word carrying the same meaning,** so
    `NO_COLOR` and a 16-colour terminal lose decoration and never information.
-   Three new coloured things arrive this phase — the detail pane's STATUS word,
-   the feed's `err` tag, the gap notice — and all three are words already.
+   **Two** new coloured things arrive this phase — the detail pane's STATUS
+   word and the feed's gap notice — and both are words already. The feed's
+   `err` tag is not a third: it is muted, per item 4, so nothing about it is a
+   colour to lose. The selection marker is not one either, which is the whole
+   of design decision 6.
 4. **`--bark` red means errored, refused and destructive and NOTHING else.**
    The feed's `err` tag is `--bark`: a line a sheep wrote to stderr is not an
    error by construction. Design decision 6 resolves this — the tag is muted,
@@ -867,16 +870,20 @@ grep -c 'pub fn scroll' crates/shep-cli/src/lookout/app.rs                # 1
 grep -rn 'ScrollUp\|ScrollDown\|ScrollTop\|ScrollBottom' crates/ | wc -l  # 24
 grep -c 'RefreshFeed' crates/shep-cli/src/lookout/app.rs                  # 0
 grep -c 'j/k scroll' crates/shep-cli/src/lookout/view/status.rs           # 1
+grep -rn 'j/k scroll' crates/ | wc -l                                     # 7 — the source, plus six snapshots
 grep -c 'j/k select' crates/shep-cli/src/lookout/view/status.rs           # 0
-grep -rn 'app.scroll()' crates/ | wc -l                                   # 5
+grep -rn 'app.scroll()' crates/ | wc -l                                   # 8
 cargo test -p shep-cli --bins --all-features                              # 379 passed; 0 failed; 2 ignored
 ```
 
 The `RefreshFeed` and `j/k select` counts are `0` today and must be non-zero
 after — those are the two checks in this task that cannot pass before the
-change. `app.scroll()`'s five call sites are the work: one accessor
-definition, three assertions in two tests being rewritten, and `view/mod.rs`'s
-`scroll_offset` call, which is Task 2's.
+change. `app.scroll()`'s **eight** call sites are the work — measured, not
+estimated, because the first draft of this section guessed five: three in
+`a_snapshot_that_shrinks_the_flock_pulls_the_scroll_back`, four in
+`the_scroll_offset_clamps_at_both_ends`, and one in `view/mod.rs`'s
+`scroll_offset` call. The accessor's own definition is `pub fn scroll(&self)`
+and does not match this grep.
 
 ### Step 1.2 — RED
 
@@ -1325,6 +1332,7 @@ grep -c 'RefreshFeed' crates/shep-cli/src/lookout/app.rs        # was 0; now ≥
 grep -c 'RefreshFeed' crates/shep-cli/src/lookout/mod.rs        # was 0; now 1 (the stub arm)
 grep -rn 'ScrollUp\|ScrollDown\|ScrollTop\|ScrollBottom' crates/ | wc -l   # was 24; now 0
 grep -c 'j/k select' crates/shep-cli/src/lookout/view/status.rs # was 0; now 1
+grep -rn 'j/k scroll' crates/ | wc -l                           # was 7; now 6 — the six SNAPSHOTS, until Task 2 re-accepts them
 grep -rn 'app.scroll()' crates/ | wc -l                         # was 5; now 0
 ```
 
@@ -1418,11 +1426,12 @@ In `flock.rs`:
     /// plain.
     #[test]
     fn the_marker_is_one_ascii_column_wide_in_both_states() {
-        assert_eq!(mark(true), ">");
+        // The two literals ARE the test. `chars().count() == 1` and
+        // `is_ascii()` were in the first draft and cannot fail once these two
+        // have passed — `">"` is one ASCII char by inspection — so they were
+        // three assertions dressed as five.
+        assert_eq!(mark(true), ">", "not `▸`: East-Asian Ambiguous width would shift the row");
         assert_eq!(mark(false), " ");
-        assert_eq!(mark(true).chars().count(), 1);
-        assert_eq!(mark(false).chars().count(), 1);
-        assert!(mark(true).is_ascii(), "an ambiguous-width glyph would shift the row");
     }
 
     /// fails if the viewport stops keeping the selection on screen, or stops
@@ -1680,7 +1689,8 @@ way round.
 
 **Files:** `crates/shep-cli/src/lookout/source.rs`.
 
-**Expected delta:** +3 tests.
+**Expected delta:** +2 tests. The first draft said three; one of them could not
+fail and is not written — see the end of Step 3.2.
 
 ### Step 3.1 — baseline
 
@@ -1760,19 +1770,34 @@ stopped on `326 != 340` would be stopping on somebody else's phase.
         }
     }
 
-    /// fails if the core count is re-read on every sample. It comes from
-    /// `std::thread::available_parallelism`, which does not change for the
-    /// life of a process, and the strip renders it beside the load average on
-    /// a one-second heartbeat.
+    /// fails if the load average's denominator stops coming from std.
+    ///
+    /// `sysinfo` can also report a CPU count, from its own cpu list, and it is
+    /// the obvious thing to reach for while writing a `sysinfo` sampler — but
+    /// the two can disagree (an affinity mask, a cgroup quota), and the number
+    /// this strip needs is the one the load average is actually spread across.
     #[test]
-    fn the_core_count_is_read_once_and_then_carried() {
+    fn the_core_count_comes_from_std_and_not_from_sysinfo() {
         let mut local = LocalReader::new();
-        let first = local.host().and_then(|sample| sample.cores);
-        let second = local.host().and_then(|sample| sample.cores);
-        assert_eq!(first, second);
-        assert_eq!(first, LocalReader::new().host().and_then(|s| s.cores));
+        assert_eq!(
+            local.host().and_then(|sample| sample.cores),
+            std::thread::available_parallelism().ok().map(NonZeroUsize::get),
+        );
     }
 ```
+
+**`the_core_count_is_read_once_and_then_carried` is deliberately not here**,
+and it was in the first draft. It asserted that two consecutive samples return the
+same `cores`, and that a fresh `LocalReader` agrees — which is true whether the
+value is cached in the struct or re-read on every call, because
+`available_parallelism()` returns the same number every time it is asked. It
+could not fail for the reason it existed, which is the shape this plan's own
+"three shapes a dead check takes" section is about.
+
+The caching is real and worth doing; it is simply not observable from outside
+the type, so it is a code-review property and this plan says so rather than
+pretending a test covers it. What IS observable is *which* number ended up
+there, which is the test above.
 
 ### Step 3.3 — GREEN
 
@@ -1910,12 +1935,12 @@ use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 ```bash
 cargo fmt --all --check
-cargo test -p shep-cli --bins --all-features                             # 399 passed
+cargo test -p shep-cli --bins --all-features                             # 398 passed
 grep -c '^\[\[package\]\]' Cargo.lock                                   # unchanged from Step 3.1
 cargo tree -p shep-cli --all-features 2>/dev/null | grep -c 'sysinfo v'  # unchanged from Step 3.1
 ```
 
-399 is 396 + 3 — Task 5 has already run, so the running count comes from it
+398 is 396 + 2 — Task 5 has already run, so the running count comes from it
 and not from Task 2. Inner loop only; the full gate runs at Task 8.
 
 ### Step 3.5 — MUTATION
@@ -2482,15 +2507,26 @@ fn segments(app: &App) -> Vec<String> {
 conversion — and `uptime_seconds` is a `u64` of seconds since boot, which
 overflows `u64` milliseconds only after 584 million years.
 
+The imports `view/host.rs`'s `mod tests` needs, since two of them come from
+the parent module rather than from this one:
+
+```rust
+    use super::*;
+    use super::super::MIN_TERM_WIDTH;
+    use super::super::fixtures::{flock_of, rendered, sample, with_host, with_host_none};
+    use shep_core::protocol::ProcessInfo;
+    use shep_core::status::ProcStatus;
+```
+
 ### Step 4.5 — verify
 
 ```bash
 cargo fmt --all --check
-cargo test -p shep-cli --bins --all-features        # 404 passed; 0 failed; 2 ignored
+cargo test -p shep-cli --bins --all-features        # 403 passed; 0 failed; 2 ignored
 grep -rn 'Msg::Host' crates/ | wc -l                # was 0; now ≥ 4
 ```
 
-404 is 399 + 5.
+403 is 398 + 5.
 
 The strip is not on screen yet — `draw` does not call it until Task 8. That is
 deliberate: it keeps the layout rewrite in one task instead of five.
@@ -3857,17 +3893,37 @@ redraw gate, and why that matters — the arm-retirement reasoning above it is
 the subtlest thing in the module and nothing here should make a reader
 re-derive it.
 
+The imports `view/bleats.rs` and its `mod tests` need:
+
+```rust
+// module
+use ratatui::text::{Line, Span};
+
+use super::super::app::App;
+use super::super::tail::Stream;
+use super::flock::fit;
+use crate::output::human_bytes;
+
+// mod tests
+    use super::*;
+    use super::super::fixtures::{
+        coloured, line, render_all, with_feed, with_feed_and_palette,
+        with_feed_and_selection, with_no_selection,
+    };
+    use super::super::super::tail::Tail;
+```
+
 ### Step 6.4 — verify
 
 ```bash
 cargo fmt --all --check
-cargo test -p shep-cli --bins --all-features                    # 414 passed; 0 failed; 2 ignored
+cargo test -p shep-cli --bins --all-features                    # 413 passed; 0 failed; 2 ignored
 grep -rn 'earlier lines not shown' crates/ | wc -l              # was 0; now ≥ 3
 grep -c 'local.host()' crates/shep-cli/src/lookout/mod.rs       # was 0; now 1
 grep -c 'feed_dirty' crates/shep-cli/src/lookout/mod.rs         # was 0; now 4
 ```
 
-414 is 404 + 10. Still the inner loop: `detail::detail_lines` and
+413 is 403 + 10. Still the inner loop: `detail::detail_lines` and
 `host::strip_line` are both still unreachable from `main`, so the clippy gate
 would fail on `dead_code`. Task 8 is where it runs.
 
@@ -4119,15 +4175,31 @@ fn path_line(
 }
 ```
 
+The imports `view/detail.rs`'s `mod tests` needs — `DogSource` is in the
+module rather than the tests, beside the other `shep_core` types:
+
+```rust
+// module
+use shep_core::protocol::DogSource;
+
+// mod tests
+    use super::*;
+    use super::super::fixtures::{
+        coloured, render_all, sheep_with_lambs, with_selection, with_selection_and_palette,
+    };
+    use shep_core::protocol::ProcessInfo;
+    use shep_core::status::ProcStatus;
+```
+
 ### Step 7.4 — verify
 
 ```bash
 cargo fmt --all --check
-cargo test -p shep-cli --bins --all-features               # 418 passed; 0 failed; 2 ignored
+cargo test -p shep-cli --bins --all-features               # 417 passed; 0 failed; 2 ignored
 grep -rn 'Describe' crates/shep-cli/src/lookout/ | wc -l   # still 0
 ```
 
-418 is 414 + 4. Inner loop only — `detail::detail_lines` has no caller in
+417 is 413 + 4. Inner loop only — `detail::detail_lines` has no caller in
 `main`'s tree until Task 8.
 
 `Describe` is the scope fence for this phase, and it is checked rather than
@@ -4520,7 +4592,7 @@ cargo test -p shep-cli --bins --all-features        # 422 passed; 0 failed; 2 ig
 grep -c 'host::strip_line\|detail::detail_lines\|bleats::feed_lines' crates/shep-cli/src/lookout/view/mod.rs   # was 0; now 3
 ```
 
-422 is 418 + 5.
+422 is 417 + 5.
 
 `insta review` rather than `insta accept` here, deliberately: this is the first
 time the three panes appear on a frame, and the reviewer's eye is the only
@@ -4586,9 +4658,13 @@ task. Revert.
 TUI, so it is a deliverable and not scaffolding.
 
 **Files:** `crates/shep-cli/src/lookout/frames.rs`, its `snapshots/`,
-`docs/lookout/frames.txt`, `docs/lookout/frames.ansi`.
+`docs/lookout/frames.txt`, `docs/lookout/frames.ansi`,
+`crates/shep-cli/src/lookout/view/status.rs` (one stale doc comment — see
+Step 9.2).
 
-**Expected delta:** +5 tests, snapshots 8 → 14, `ignored` stays at 4.
+**Expected delta:** +2 tests, snapshots 8 → 14, `ignored` stays at 4. Two
+existing `frames.rs` tests are rewritten in place rather than added — see
+Step 9.2's list.
 
 ### Step 9.1 — baseline
 
@@ -4597,6 +4673,7 @@ find crates/shep-cli/src/lookout/snapshots -name '*.snap' | wc -l   # 8
 grep -c '^=== ' docs/lookout/frames.txt                             # 8
 grep -rn '#\[ignore' crates/ | wc -l                                # 16
 grep -c 'Phase 12a' crates/shep-cli/src/lookout/frames.rs           # 1
+grep -c '120' crates/shep-cli/src/lookout/frames.rs                 # 3 — a caption, `Scene::size`'s default arm, one test literal
 ```
 
 ### THE RULE FOR THIS TASK
@@ -4640,6 +4717,61 @@ which has already dropped CPU — and the scene would contradict its own caption
 in the gallery Rin reads. 12a's own comment records making this exact
 correction once already, for the same reason.
 
+**Five edits this table implies that a table cell does not make**, each of
+which has to be written out or it will not happen:
+
+1. **`Scene::size`'s default arm becomes `(120, 30)`.** It is
+   `_ => (120, 20)` today, and `_` is a wildcard, so adding six variants will
+   compile silently and render four of them at the wrong height. `Empty` gains
+   its own arm at `(100, 28)`, `Narrow` moves to `(51, 14)`, and the six new
+   scenes each get one.
+2. **`frames.rs`'s `the_plain_renderer_is_one_line_per_row_and_no_escapes`
+   hardcodes `text.lines().count() == 20`** for `HealthyWide`. It becomes
+   `30`. The `120` in the same test is unchanged.
+3. **`frames.rs:497`'s `need 31x6`** — already changed to `33x6` by Task 2.
+   Confirm it, do not change it twice.
+4. **`sheep()` gains both log paths.** It takes eight arguments and already
+   carries `#[allow(clippy::too_many_arguments)]`; adding two more would make
+   it ten. Derive them instead, inside the function:
+   `.out_file(Some(format!("/home/rin/.shep/logs/{name}-{id}-out.log")))` and
+   the matching `-err`. Deterministic, no new parameters, and it gives the
+   detail pane something to render and `no_detail` something to assert the
+   absence of.
+5. **`view/status.rs`'s `a_truncated_hint_still_leaves_a_gap_before_the
+   _control_label`** says it is pinned at 49 columns because that is "the
+   `narrow` gallery scene's own width". After this task it is not. The test
+   stays at 49 — 49 is still exactly where a 48-character hint truncates while
+   a 9-character label fits, which is the property — but the sentence claiming
+   it mirrors a scene becomes false and is rewritten to say what 49 actually
+   is. A comment that outlives what it described is the same species of rot as
+   a false caption.
+
+### Step 9.2b — the selection, which four assertions depend on
+
+`scene_with` moves the selection with two `Msg::Key(KeyPress::SelectDown)`
+before the scene-specific messages, for `HealthyWide`, `Errored`, `NoDetail`,
+`FeedGap`, `FeedMissing`, `Cramped` and `HostUnknown`:
+
+```rust
+    // Onto `api`, id 2, in both flocks — the third row of each. A fresh
+    // snapshot selects the FIRST id, so without this every "sheep 2  api"
+    // and "bleats  api" assertion below is asserting about `web` at id 0 and
+    // failing for a reason that has nothing to do with the pane.
+    if !matches!(which, Scene::Empty | Scene::Narrow | Scene::TooNarrow | Scene::TableOnly) {
+        app.update(Msg::Key(KeyPress::SelectDown));
+        app.update(Msg::Key(KeyPress::SelectDown));
+    }
+```
+
+The four excluded scenes have either no flock (`Empty`) or no pane below the
+table to describe, so moving the cursor in them would change a snapshot for no
+reason. `Errored`'s caption claims the selection is parked on the errored
+sheep, which is id 2 in its flock, so it is in.
+
+**Order matters for `Frozen`.** Its `Msg::Host` and its selection are applied
+**before** `Msg::Frozen`, because the reducer refuses both after — which is the
+property, and which the two-age frame comparison then pins.
+
 `scene_with` gains the two new messages, built directly rather than through a
 `Local` fake — a scene needs determinism, not a trait:
 
@@ -4664,10 +4796,21 @@ correction once already, for the same reason.
     }
 ```
 
-and a feed, varying by scene: ordinary lines, a `missed_bytes: 4_012_000`
-burst for `feed_gap`, and a `note` for `feed_missing`. The `Msg::Host` for the
-frozen scene is applied **before** `Msg::Frozen`, because the reducer refuses
-it after — which is the property, and which the two-age comparison then pins.
+and a feed, varying by scene:
+
+- **most scenes** — six or so ordinary `Stream::Out` lines, `missed_lines: 0`,
+  `missed_bytes: 0`, so the ordinary header is what the gallery shows;
+- **`feed_gap`** — thirty lines with `missed_lines: 500` and
+  `missed_bytes: 4_012_000`, which is the both-kinds case: the header reads
+  `… 525 earlier lines not shown, and 3.8M before them never read`
+  (500 the reader dropped, plus 25 the five-row pane has no room for, and
+  `human_bytes(4_012_000)` is `3.8M`). This is the frame that has to be
+  legible, because it is the one an operator sees during an incident;
+- **`feed_missing`** — no lines, no counts, and a `note` naming the cause.
+
+The `Msg::Host` and the two `SelectDown`s for the frozen scene are applied
+**before** `Msg::Frozen`, because the reducer refuses both after — which is the
+property, and which the two-age comparison then pins.
 
 ### Step 9.3 — RED: the caption pins
 
@@ -4717,12 +4860,14 @@ caption clause. The captions and their pins, written together:
         assert_eq!(lines.next().unwrap().trim_end(), "too small");
         assert_eq!(lines.next().unwrap().trim_end(), "need 33x6");
 
-        // "The feed under a burst: four megabytes were written between two
-        //  reads and are not on screen, and the pane says so instead of
-        //  showing five lines as though they were all of it."
+        // "The feed under a burst: four megabytes were never read and some
+        //  hundreds of lines were read and dropped. The pane counts both, and
+        //  counts them separately, because it knows the second exactly and
+        //  cannot know how many lines are in the first."
         let gap = render_text(&scene(Scene::FeedGap).1);
-        assert!(gap.contains("written since the last read is not shown"));
+        assert!(gap.contains("earlier lines not shown"), "the lines it dropped");
         assert!(gap.contains("3.8M"), "the exact figure, not a vague one");
+        assert!(gap.contains("never read"), "and what it never looked at");
         assert!(!gap.contains("re-read with each listing"), "the gap replaces the header");
 
         // "The selected sheep has never written a log in this $SHEP_HOME. The
@@ -4733,9 +4878,18 @@ caption clause. The captions and their pins, written together:
         // "20 rows: the detail pane is the first to go, because every number
         //  on it but the log paths is already in the row above it."
         let no_detail = render_text(&scene(Scene::NoDetail).1);
-        assert!(no_detail.contains("bleats  "), "the feed stayed");
+        assert!(no_detail.contains("bleats  api"), "the feed stayed, on the selection");
         assert!(no_detail.contains("host  load"), "and so did the strip");
-        assert!(!no_detail.contains("sheep 2  api"), "the detail pane went");
+        // The ABSENCE, pinned to something only the detail pane can emit. The
+        // first draft asserted `!contains("sheep 2  api")`, which passes just
+        // as well when the selection is on sheep 0 and the pane drew
+        // perfectly — a check that cannot fail for the reason it exists. The
+        // log-path prefix is the detail pane's alone: the feed's body lines
+        // are tagged `out  ` too, but they carry log TEXT, not a path.
+        assert!(
+            !no_detail.contains("out  /home/rin/.shep/logs/"),
+            "the detail pane went"
+        );
 
         // "12 rows: no optional panes at all. This is 12a's frame, and the
         //  only thing that changed is the two-column gutter the marker sits in."
@@ -4749,9 +4903,63 @@ caption clause. The captions and their pins, written together:
         //  overlaps."
         let cramped = render_text(&scene(Scene::Cramped).1);
         assert!(cramped.contains('…'), "something truncated, visibly");
-        for line in cramped.lines() {
-            assert_eq!(line.chars().count(), 33, "no row over- or under-ran");
+        // NOT `line.chars().count() == 33` on every row: `render_text` maps
+        // `(0..area.width)` for every row by construction, so that is true of
+        // any frame at any width, including a blank one. What "nothing
+        // overlaps" actually means is that each pane's own marker appears
+        // exactly once, which is a claim about this layout.
+        for marker in ["host  ", "bleats  ", "out  /home/rin/.shep/logs/"] {
+            assert_eq!(
+                cramped.lines().filter(|line| line.starts_with(marker)).count(),
+                1,
+                "{marker:?} appears once at 33 columns"
+            );
         }
+        assert!(
+            cramped.lines().last().unwrap().contains("read-only"),
+            "and the status bar is still the last row"
+        );
+
+        // The four scenes carried over from 12a all changed meaning this
+        // phase — three panes, a marker, a strip, and 20 rows becoming 30 —
+        // so their captions were rewritten and each new clause is pinned here
+        // rather than left as prose nobody checked.
+
+        // "The shepherd stopped answering. Five attempts over about eight
+        //  seconds before this becomes the next frame. Every pane below the
+        //  table keeps describing the selected sheep from the last listing."
+        let retrying = render_text(&scene(Scene::Retrying).1);
+        assert!(retrying.contains("reconnecting"));
+        assert!(retrying.contains("sheep 2  api"), "the detail pane is still up");
+        assert!(retrying.contains("host  load"), "and so is the strip");
+
+        // "The ladder ran out. Last known values stay, the uptime clock has
+        //  stopped, and so has the host strip — one line ticking over on a
+        //  frozen screen is a contradiction on the same frame."
+        let frozen = render_text(&scene(Scene::Frozen).1);
+        assert!(frozen.contains("the shepherd has died"));
+        assert!(
+            frozen.contains("host  load 2.31 4.10 3.88 / 10 cores"),
+            "the strip kept its LAST values rather than blanking"
+        );
+
+        // "One errored, one waiting to restart, one stopped, with the
+        //  selection parked on the errored sheep. Each row's own STATUS cell
+        //  is the only coloured cell in that row."
+        let errored = render_text(&scene(Scene::Errored).1);
+        assert!(errored.contains("errored"));
+        assert!(errored.contains("sheep 2  api"), "the selection is on the errored sheep");
+        assert_eq!(
+            errored.lines().filter(|line| line.starts_with('>')).count(),
+            1,
+            "exactly one marker, on that row"
+        );
+
+        // "`x` with actions gated off. Both refusals are literal — nothing
+        //  about damage gets charming — and the panes below carry on."
+        let refused = render_text(&scene(Scene::Refused).1);
+        assert!(refused.contains("--allow-control"));
+        assert!(refused.contains("bleats  api"), "a refusal does not blank the screen");
 
         // "sysinfo reports this platform unsupported. The strip says so and
         //  keeps the flock's own totals, which lookout can always compute."
@@ -4776,8 +4984,11 @@ Plus one test that makes the rule itself mechanical:
             assert!(caption.len() > 30, "{} has a stub caption", which.label());
             assert!(caption.ends_with('.'), "{}'s caption is not a sentence", which.label());
         }
-        assert_eq!(labels.len(), Scene::ALL.len());
-        assert_eq!(labels.len(), 14);
+        // `labels.len() == Scene::ALL.len()` is not asserted: the `insert`
+        // above already guarantees it, so it would be a line that cannot fail.
+        // The literal can — it is what catches a scene added to the enum and
+        // not to `ALL`, or the reverse.
+        assert_eq!(Scene::ALL.len(), 14);
     }
 ```
 
@@ -4839,8 +5050,14 @@ every pane below the table describes that one sheep.
 
 The feed reads the selected sheep's log files from disk and re-reads them with
 each flock listing. It is not a live subscription, and it says so on its own
-header line — a sheep writing faster than the two-second refresh has its
-skipped output counted and reported rather than silently dropped.
+header line: `out then err` because the two files are shown end to end with no
+interleaving, and `re-read with each listing` because a two-second gap in this
+pane is the refresh, not the sheep.
+
+When the pane cannot show everything, the header says what went instead. Lines
+it read and dropped are counted exactly; bytes below its 64 KiB window were
+never read at all, so those are reported in bytes, because nothing counted the
+lines in them and guessing would be worse than saying so.
 ";
 ```
 
@@ -4849,19 +5066,31 @@ skipped output counted and reported rather than silently dropped.
 ```bash
 cargo test -p shep-cli --bins --all-features                        # snapshot failures for six new scenes
 cargo insta review                                                  # accept each new scene AFTER LOOKING AT IT
-cargo test -p shep-cli --bins --all-features                        # 420 passed; 0 failed; 2 ignored
+cargo test -p shep-cli --bins --all-features                        # 424 passed; 0 failed; 2 ignored
 find crates/shep-cli/src/lookout/snapshots -name '*.snap' | wc -l   # was 8; now 14
 grep -rn '#\[ignore' crates/ | wc -l                                # still 16
 cargo test -p shep-cli --bins --all-features -- --ignored write_the_gallery
 grep -c '^=== ' docs/lookout/frames.txt                             # was 8; now 14
 ```
 
-**Then re-run Task 4's first mutation**, which had no red at the time: delete
-the `Link::Lost` early return from the `Msg::Host` arm.
-`the_frozen_frame_does_not_move_however_long_the_link_stays_gone` must now
-fail, because the frozen scene carries a host sample and the strip is on
-screen. If it does not fail, the frozen scene is not getting a host sample and
-the scene builder is wrong. Revert.
+424 is 422 + 2. Then the full task gate again, each from its own command.
+
+**Then re-run Task 4's mutation at the frame level**: delete the `Link::Lost`
+early return from the `Msg::Host` arm.
+
+Two tests must now fail. `a_frozen_dashboard_ignores_a_host_sample` reddens in
+the reducer, where it has reddened since Task 4 — Task 4's own step covers
+that. The one being checked here is
+`the_frozen_frame_does_not_move_however_long_the_link_stays_gone`, which
+renders the frozen scene at two clock ages and compares the frames byte for
+byte: it reddens only because the frozen scene carries a host sample and the
+strip is on screen, and it is the only check in the phase that would catch a
+strip that kept updating *on the frame Rin is looking at* rather than in the
+reducer.
+
+If that second one does not fail, the frozen scene is not getting a host sample
+and the scene builder is wrong — the two-age comparison is comparing two frames
+whose strips both say `not read yet`. Revert.
 
 ### Step 9.7 — read the gallery
 
@@ -4893,7 +5122,16 @@ grep -c 'Phase 12a' docs/lookout/README.md                    # 2
 grep -c 'are Phase 12b' crates/shep-cli/src/lookout/mod.rs    # 1
 grep -c '12b' crates/shep-cli/src/cli.rs                      # 0 — but 'this phase wires the gate' is there
 grep -rn '12b' crates/ | wc -l                                # 11
+grep -c 'Tasks 7-11 land' crates/shep-cli/src/output/table.rs # 1
 ```
+
+That last one is a sentence that has been stale since Phase 11:
+`output::table::human_duration` carries `#[allow(dead_code)]` and a doc saying
+it has "no real caller until Tasks 7-11 land". Tasks 7-11 landed, and this
+phase gives it two more callers (`view/host.rs` and `view/detail.rs`), so the
+`allow` and its sentence both go. Removing it is not cosmetic: an
+`#[allow(dead_code)]` left on live code is the thing that makes the next real
+`dead_code` finding invisible.
 
 Every one of those eleven is a sentence saying a pane does not exist yet. All
 eleven are now false. This step is not cosmetic: a module doc that says the
@@ -4935,10 +5173,16 @@ cargo test --workspace --all-features;                                      echo
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features;  echo "EXIT=$?"
 ```
 
-Baseline for the third, measured at `fc3534b` on this machine:
-**1219 passed / 0 failed / 4 ignored across 17 result lines.** Expected after
-this phase: **roughly 1260 / 0 / 4 across 17 lines.** The pass count is a
-shape; `failed = 0`, `ignored = 4` and `17 lines` are not.
+Baseline for the third, measured at `fc3534b` and still standing at `ed09740`
+(nothing between them touches `crates/` — see "Every check in this plan states
+its baseline"): **1219 passed / 0 failed / 4 ignored across 17 result lines.**
+
+Expected after this phase: **roughly 1264 / 0 / 4 across 17 lines** — 1219 plus
+the 45 this plan's tasks add, task by task in execution order:
+7 + 2 + 8 + 2 + 5 + 10 + 4 + 5 + 2, where Task 2's `2` is three new tests less
+the one `view/flock.rs` test it deletes. The pass count is a shape and the
+arithmetic above is there so that a number far off it is a signal rather than a
+shrug; `failed = 0`, `ignored = 4` and `17 lines` are not shapes.
 
 ### Step 10.4 — the phase gate
 
@@ -4971,10 +5215,17 @@ zsh is the last command's, so none of these may be piped into anything.
 ### Step 10.5 — the dependency measurement, restated
 
 ```bash
-grep -c '^\[\[package\]\]' Cargo.lock                                     # 326, unchanged
+grep -c '^\[\[package\]\]' Cargo.lock                                     # equal to Step 3.1's number
 cargo tree -p shep-cli --all-features 2>/dev/null | grep -c 'sysinfo v'   # unchanged from Step 3.1
 git diff --numstat Cargo.lock                                             # 0 lines either way
 ```
+
+**Compared against Step 3.1's recorded numbers, not against a literal.** Phase
+13 (`whistle`) is adding packages in a parallel worktree, so an absolute figure
+here would stop an executor for a reason that has nothing to do with this
+phase. What 12b has to prove is that it added nothing, and that is a delta.
+`git diff --numstat` is the one that settles it outright: if `Cargo.lock` has
+no changed lines on this branch, no count can have moved.
 
 `git diff --numstat`, not `git diff | grep '^-'` — a unified diff opens every
 file's hunk with `--- a/<path>`, which `grep '^-'` matches, so that form can
@@ -4985,10 +5236,25 @@ never print zero.
 ```bash
 grep -rn '12b' crates/ | wc -l          # was 11; expect 0 or 1 (the feed's own argument may cite the phase)
 grep -rn 'not built yet\|is Phase 12' crates/shep-cli/src/lookout/ | wc -l
+grep -c 'Tasks 7-11 land' crates/shep-cli/src/output/table.rs   # was 1; now 0
+grep -rn 'j/k scroll' crates/ | wc -l                           # was 7; now 0
+grep -rn 'out+err' crates/ | wc -l                              # 0 before and after
 ```
 
 The second one should find only `x`'s refusal (`stop is not built yet`), which
 is still true. Anything else is a sentence that outlived what it described.
+
+The last two are about the two phrases on surfaces an operator reads. They are
+different in kind and the difference is worth stating rather than letting a
+reader assume both are checks:
+
+- **`j/k scroll` is a real check.** It is `7` today — the hint in `status.rs`
+  and six snapshots that render it — and `0` after, so it can fail.
+- **`out+err` is `0` before and after**, because it is a string this phase
+  considered and did not ship: the feed header says `out then err`, since `+`
+  reads as one merged stream and there is no merge. It cannot fail today and it
+  is here as a guard against reintroduction, not as evidence. Saying which of
+  the two it is costs one line and stops the next reader counting it as proof.
 
 ---
 
@@ -5005,4 +5271,7 @@ touches `web/` or `docs/shep-design/`.
 > pane, and a bleats feed that reads the selected sheep's log files from disk
 > rather than subscribing to `log.*` — so a busy flock costs one bounded read
 > per refresh instead of making the dashboard the highest-volume subscriber on
-> the bus, and the bytes it skips are counted and shown.
+> the bus. What the feed cannot show, it says: the lines it read and dropped
+> counted exactly, and the bytes below its window reported as bytes, because
+> nothing counted the lines in those and guessing would be worse than saying
+> so.
