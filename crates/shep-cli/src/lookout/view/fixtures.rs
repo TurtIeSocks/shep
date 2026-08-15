@@ -132,6 +132,43 @@ pub fn with_no_selection() -> App {
     app_with(Vec::new(), plain())
 }
 
+/// A TWO-sheep dashboard with the selection on `info`, which sorts second.
+///
+/// Two, and the selection not on row 0, on purpose: Task 7's first mutation
+/// replaces `selected_row()` with `rows().first()`, and a one-sheep fixture
+/// would make that mutation invisible.
+pub fn with_selection(info: ProcessInfo) -> App {
+    with_selection_and_palette(info, plain())
+}
+
+/// The same, at a given palette.
+pub fn with_selection_and_palette(info: ProcessInfo, palette: Palette) -> App {
+    assert!(
+        info.id > 0,
+        "the decoy takes id 0, so the sheep under test cannot"
+    );
+    let decoy = ProcessInfo::builder(0, "decoy", ProcStatus::Online).build();
+    let mut app = app_with(vec![decoy, info], palette);
+    app.update(Msg::Key(KeyPress::SelectDown));
+    app
+}
+
+/// A sheep whose listing DID carry lambs.
+///
+/// `ListFlock` never populates this field — that is the whole of design
+/// decision 4 — so this fixture is deliberately impossible. The pane must not
+/// mention lambs even when handed some, because the failure being guarded is a
+/// heading or a caption promising a list, not a missing `if let`.
+pub fn sheep_with_lambs() -> ProcessInfo {
+    ProcessInfo::builder(9, "gateway", ProcStatus::Online)
+        .pid(Some(48_301))
+        .lambs(Some(vec![
+            Lamb::new(48_302, "node"),
+            Lamb::new(48_303, "sh"),
+        ]))
+        .build()
+}
+
 /// One tail line, tagged with the stream it came from.
 pub fn line(stream: Stream, text: &str) -> TailLine {
     TailLine {
