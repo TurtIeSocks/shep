@@ -40,6 +40,8 @@ use shep_core::protocol::ProcessInfo;
 use shep_core::status::ProcStatus;
 
 use super::app::{App, Control, KeyPress, Msg};
+use super::source::HostSample;
+use super::tail::{Stream, Tail, TailLine};
 use super::theme::Palette;
 use super::view::draw;
 
@@ -119,7 +121,7 @@ fn sgr(fg: Color) -> String {
 /// The scenes the frame snapshots pin and the gallery renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scene {
-    /// A healthy flock at a comfortable width.
+    /// A healthy flock at a comfortable width, all three panes up.
     HealthyWide,
     /// One sheep errored, one waiting to restart, one stopped.
     Errored,
@@ -135,6 +137,19 @@ pub enum Scene {
     Frozen,
     /// The read-only refusal.
     Refused,
+    /// 20 rows: the 18-tier. The detail pane is gone; the strip and the feed
+    /// are not.
+    NoDetail,
+    /// 12 rows: below every optional-pane threshold. 12a's frame.
+    TableOnly,
+    /// The feed under a burst: lines dropped and bytes never read.
+    FeedGap,
+    /// The selected sheep has never written a log in this `$SHEP_HOME`.
+    FeedMissing,
+    /// 33x26: the narrowest terminal that still draws all three panes.
+    Cramped,
+    /// `sysinfo` reports this platform unsupported.
+    HostUnknown,
 }
 
 impl Scene {
@@ -148,6 +163,12 @@ impl Scene {
         Self::Retrying,
         Self::Frozen,
         Self::Refused,
+        Self::NoDetail,
+        Self::TableOnly,
+        Self::FeedGap,
+        Self::FeedMissing,
+        Self::Cramped,
+        Self::HostUnknown,
     ];
 
     /// The snapshot name and the gallery heading.
@@ -162,35 +183,65 @@ impl Scene {
             Self::Retrying => "retrying",
             Self::Frozen => "frozen",
             Self::Refused => "refused",
+            Self::NoDetail => "no_detail",
+            Self::TableOnly => "table_only",
+            Self::FeedGap => "feed_gap",
+            Self::FeedMissing => "feed_missing",
+            Self::Cramped => "cramped",
+            Self::HostUnknown => "host_unknown",
         }
     }
 
     /// One sentence saying what this frame is for, printed above it in the
-    /// gallery so Rin does not have to hold eight of them in her head.
+    /// gallery so Rin does not have to hold fourteen of them in her head.
+    ///
+    /// Every clause here is pinned by an assertion in
+    /// `every_scene_shows_the_thing_it_is_named_for` — a caption may not say
+    /// a thing the frame is not asserted to show.
     #[must_use]
     pub const fn caption(self) -> &'static str {
         match self {
-            Self::HealthyWide => "A healthy flock at 120 columns: all nine columns fit.",
+            Self::HealthyWide => {
+                "All three panes at 120x30: the host strip under the title, the detail pane and the bleats feed under the table. `>` marks the selected sheep, and every pane below the table describes it."
+            }
             Self::Errored => {
-                "One errored, one waiting to restart, one stopped. Each row's own STATUS cell is the only coloured cell in that row — but stopped shares the chrome's muted grey, so its STATUS word does not stand out from the frame around it."
+                "One errored, one waiting to restart, one stopped, with the selection parked on the errored sheep. Each row's own STATUS cell is the only coloured cell in that row."
             }
             Self::Empty => {
-                "No sheep registered. The header row still prints, and a plain sentence says the pane is empty rather than leaving it blank."
+                "No sheep registered. Each of the three panes says why it is empty, and the three sentences are different because the three reasons are."
             }
             Self::Narrow => {
-                "51 columns: FOLD, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY."
+                "51 columns: FOLD, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY. The host strip fits; the detail pane and the feed do not, at 14 rows."
             }
             Self::TooNarrow => {
-                "28 columns: below the floor, the pane refuses rather than drawing overlapping garbage. The refusal is two short lines so it still fits."
+                "28 columns: below the floor, the pane refuses rather than drawing overlapping garbage. Two short lines, so the refusal still fits the terminal it is refusing about."
             }
             Self::Retrying => {
-                "The shepherd stopped answering. Five attempts over about eight seconds before this becomes the next frame."
+                "The shepherd stopped answering. Five attempts over about eight seconds before this becomes the next frame. Every pane below the table keeps describing the selected sheep from the last listing."
             }
             Self::Frozen => {
-                "The ladder ran out. Last known values stay; the uptime clock has stopped; lookout does not exit."
+                "The ladder ran out. Last known values stay, the uptime clock has stopped, and so has the host strip — one line ticking over on a frozen screen is a contradiction on the same frame."
             }
             Self::Refused => {
-                "`x` with actions gated off. Both refusals are literal — nothing about damage gets charming."
+                "`x` with actions gated off. Both refusals are literal — nothing about damage gets charming — and the panes below carry on."
+            }
+            Self::NoDetail => {
+                "20 rows: the detail pane is the first to go, because every number on it but the log paths is already in the row above it."
+            }
+            Self::TableOnly => {
+                "12 rows: no optional panes at all. This is 12a's frame, and the only thing that changed is the two-column gutter the marker sits in."
+            }
+            Self::FeedGap => {
+                "The feed under a burst: four megabytes were never read and some hundreds of lines were read and dropped. The pane counts both, and counts them separately, because it knows the second exactly and cannot know how many lines are in the first."
+            }
+            Self::FeedMissing => {
+                "The selected sheep has never written a log in this $SHEP_HOME. The feed names that cause rather than sitting blank."
+            }
+            Self::Cramped => {
+                "33 columns, 26 rows: the narrowest terminal that draws, with all three panes up. Everything truncates with an ellipsis; nothing overlaps."
+            }
+            Self::HostUnknown => {
+                "`sysinfo` reports this platform unsupported. The strip says so and keeps the flock's own totals, which lookout can always compute."
             }
         }
     }
@@ -199,7 +250,7 @@ impl Scene {
     #[must_use]
     pub const fn size(self) -> (u16, u16) {
         match self {
-            Self::Empty => (100, 12),
+            Self::Empty => (100, 28),
             // 51, not 46 and not 49. `columns_for` runs on `width - GUTTER`
             // (Task 2: the selection marker's two-column gutter, phase plan
             // design decision 6), so the table only sees `width - 2` — a
@@ -210,7 +261,13 @@ impl Scene {
             // and UPTIME still there.
             Self::Narrow => (51, 14),
             Self::TooNarrow => (28, 8),
-            _ => (120, 20),
+            Self::NoDetail => (120, 20),
+            Self::TableOnly => (120, 12),
+            Self::Cramped => (33, 26),
+            // HealthyWide, Errored, Retrying, Frozen, Refused, FeedGap,
+            // FeedMissing, HostUnknown: every scene that carries all three
+            // optional panes at their ordinary rows.
+            _ => (120, 30),
         }
     }
 }
@@ -379,6 +436,52 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         now: t0 + Duration::from_secs(7),
     });
 
+    // Onto `api`, id 2, in both flocks — the third row of each. A fresh
+    // snapshot selects the FIRST id, so without this every "sheep 2  api"
+    // and "bleats  api" assertion below is asserting about `web` at id 0 and
+    // failing for a reason that has nothing to do with the pane.
+    //
+    // The four excluded scenes have either no flock (`Empty`) or no pane
+    // below the table to describe (`Narrow`, `TooNarrow`, `TableOnly`), so
+    // moving the cursor in them would change a snapshot for no reason.
+    if !matches!(
+        which,
+        Scene::Empty | Scene::Narrow | Scene::TooNarrow | Scene::TableOnly
+    ) {
+        app.update(Msg::Key(KeyPress::SelectDown));
+        app.update(Msg::Key(KeyPress::SelectDown));
+    }
+
+    // Every live scene gets a host sample. The FROZEN one gets it too, and
+    // that is load-bearing: `the_frozen_frame_does_not_move_however_long_the
+    // _link_stays_gone` renders the frozen scene at two clock ages and
+    // compares the frames byte for byte, so a host strip that kept updating
+    // after the link was lost reddens it with no new assertion written. A
+    // frozen scene with no host sample would leave that mutation uncaught —
+    // Task 4's own mutation step says so out loud.
+    if which == Scene::HostUnknown {
+        app.update(Msg::Host { sample: None });
+    } else {
+        app.update(Msg::Host {
+            sample: Some(HostSample {
+                load: (2.31, 4.10, 3.88),
+                cores: Some(10),
+                memory_total_bytes: 32 << 30,
+                memory_used_bytes: 12 * (1 << 30) + (410 << 20),
+                uptime_seconds: 6 * 86_400 + 3 * 3_600,
+            }),
+        });
+    }
+
+    app.update(Msg::Bleats {
+        tail: feed_for(which),
+    });
+
+    // The `Msg::Host` above and the two `SelectDown`s are applied BEFORE
+    // `Msg::Frozen` below, because the reducer refuses both after — which is
+    // the property, and which the two-age comparison in
+    // `the_frozen_frame_does_not_move_however_long_the_link_stays_gone` then
+    // pins.
     match which {
         Scene::Retrying => {
             app.update(Msg::Retrying { attempt: 3 });
@@ -408,8 +511,86 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
     terminal.backend().buffer().clone()
 }
 
+/// The bleats feed each scene is given, before `Msg::Bleats` carries it in.
+///
+/// **most scenes** — six ordinary `Stream::Out` lines, `missed_lines: 0`,
+/// `missed_bytes: 0`, so the ordinary header is what the gallery shows.
+///
+/// **`FeedGap`** — thirty lines with `missed_lines: 500` and
+/// `missed_bytes: 4_012_000`: the both-kinds case. The header reads
+/// `… 525 earlier lines not shown, and 3.8M before them never read` — 500
+/// the reader dropped, plus 25 the five-row pane has no room for, and
+/// `human_bytes(4_012_000)` is `3.8M`. This is the frame that has to be
+/// legible, because it is the one an operator sees during an incident.
+///
+/// **`FeedMissing`** — no lines, no counts, and a `note` naming the cause,
+/// mirroring [`super::tail::read`]'s own wording for a log file that was
+/// never created.
+fn feed_for(which: Scene) -> Tail {
+    match which {
+        // Mirrors what `super::mod`'s `run_ui` would actually send: an empty
+        // flock has no selected row, so `out`/`err` are both `None` and
+        // `tail::read` takes its own early return with this exact note.
+        // Anything else here would show stale feed content under a header
+        // that says nobody is selected, which is a real inconsistency this
+        // gallery must not ship.
+        Scene::Empty => Tail {
+            lines: Vec::new(),
+            missed_lines: 0,
+            missed_bytes: 0,
+            read_bytes: 0,
+            note: Some("the shepherd did not report a log path for this sheep".to_string()),
+        },
+        Scene::FeedGap => Tail {
+            lines: (0..30)
+                .map(|n| TailLine {
+                    stream: Stream::Out,
+                    text: format!("GET /v1/orders/{n} 200 {}ms", 8 + n % 40),
+                })
+                .collect(),
+            missed_lines: 500,
+            missed_bytes: 4_012_000,
+            read_bytes: 65_536,
+            note: None,
+        },
+        Scene::FeedMissing => Tail {
+            lines: Vec::new(),
+            missed_lines: 0,
+            missed_bytes: 0,
+            read_bytes: 0,
+            note: Some("this sheep has not written a log in this $SHEP_HOME".to_string()),
+        },
+        _ => Tail {
+            lines: [
+                "listening on 0.0.0.0:8080",
+                "GET /healthz 200 3ms",
+                "GET /v1/orders 200 44ms",
+                "POST /v1/orders 201 88ms",
+                "GET /v1/orders/8821 200 9ms",
+                "connection pool: 14/50 in use",
+            ]
+            .into_iter()
+            .map(|text| TailLine {
+                stream: Stream::Out,
+                text: text.to_string(),
+            })
+            .collect(),
+            missed_lines: 0,
+            missed_bytes: 0,
+            read_bytes: 512,
+            note: None,
+        },
+    }
+}
+
 /// One row's worth of shepherd reply, spelled out so each scene reads as a
 /// plausible flock rather than as six copies of one sheep.
+///
+/// The two log paths are DERIVED from `name` and `id` rather than taken as
+/// two more parameters — this already carries
+/// `#[allow(clippy::too_many_arguments)]` at eight, and ten would be worse.
+/// Deterministic, and it gives the detail pane something to render and
+/// `no_detail` something to assert the absence of.
 #[allow(clippy::too_many_arguments)]
 fn sheep(
     id: u32,
@@ -428,6 +609,8 @@ fn sheep(
         .cpu_percent(cpu)
         .memory_bytes(memory)
         .fold(fold.map(str::to_string))
+        .out_file(Some(format!("/home/rin/.shep/logs/{name}-{id}-out.log")))
+        .err_file(Some(format!("/home/rin/.shep/logs/{name}-{id}-err.log")))
         .build()
 }
 
@@ -436,7 +619,7 @@ fn sheep(
 /// Not a doc comment on the test: this text is read by a person opening
 /// `docs/lookout/frames.txt` with no context at all, and it is the only
 /// place that says where those frames came from.
-const GALLERY_PREAMBLE: &str = "shep lookout — Phase 12a frames
+const GALLERY_PREAMBLE: &str = "shep lookout — Phase 12b frames
 ================================
 
 These are real frames, rendered headlessly through ratatui's TestBackend by
@@ -445,12 +628,22 @@ These are real frames, rendered headlessly through ratatui's TestBackend by
 
 Nothing here is a mockup.
 
-frames.ansi is the same eight frames with colour; read it with `less -R`.
+frames.ansi is the same fourteen frames with colour; read it with `less -R`.
 
-They are here to be looked at BEFORE Phase 12b's layout is decided. 12a
-builds the shell and one pane on purpose — the bleats feed, the sheep detail
-pane and the host-usage strip are 12b, and how those three sit beside this
-one is the decision these frames exist to inform.
+All four panes are here: the flock table (the spine), the host-usage strip,
+the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
+every pane below the table describes that one sheep.
+
+The feed reads the selected sheep's log files from disk and re-reads them with
+each flock listing. It is not a live subscription, and it says so on its own
+header line: `out then err` because the two files are shown end to end with no
+interleaving, and `re-read with each listing` because a two-second gap in this
+pane is the refresh, not the sheep.
+
+When the pane cannot show everything, the header says what went instead. Lines
+it read and dropped are counted exactly; bytes below its 64 KiB window were
+never read at all, so those are reported in bytes, because nothing counted the
+lines in them and guessing would be worse than saying so.
 ";
 
 #[cfg(test)]
@@ -464,7 +657,7 @@ mod tests {
     #[test]
     fn the_plain_renderer_is_one_line_per_row_and_no_escapes() {
         let text = render_text(&scene(Scene::HealthyWide).1);
-        assert_eq!(text.lines().count(), 20);
+        assert_eq!(text.lines().count(), 30);
         assert!(!text.contains('\u{1b}'), "plain means plain");
         for line in text.lines() {
             assert_eq!(line.chars().count(), 120, "every row is the full width");
@@ -494,35 +687,195 @@ mod tests {
     /// assertion is the one sentence that scene exists to show Rin — if one
     /// of these stops being true, the frame she is looking at is not the
     /// frame this plan promised her.
+    ///
+    /// Every clause of every caption in [`Scene::caption`] is pinned by one
+    /// assertion here — the rule this task adds, stated in its own words in
+    /// the plan: "every clause of every caption is one assertion here, or it
+    /// is deleted from the caption."
     #[test]
+    #[allow(clippy::too_many_lines)] // fourteen captions, each pinned clause by clause
     fn every_scene_shows_the_thing_it_is_named_for() {
-        assert!(render_text(&scene(Scene::Empty).1).contains("the flock is empty"));
-        assert!(render_text(&scene(Scene::TooNarrow).1).contains("need 33x6"));
-        assert!(render_text(&scene(Scene::Frozen).1).contains("the shepherd has died"));
-        assert!(render_text(&scene(Scene::Retrying).1).contains("reconnecting"));
-        assert!(render_text(&scene(Scene::Refused).1).contains("--allow-control"));
-        assert!(render_text(&scene(Scene::Errored).1).contains("errored"));
-        assert!(render_text(&scene(Scene::HealthyWide).1).contains("FOLD"));
+        // "All three panes at 120x30: the host strip under the title, the
+        //  detail pane and the bleats feed under the table. `>` marks the
+        //  selected sheep, and every pane below the table describes it."
+        let wide = render_text(&scene(Scene::HealthyWide).1);
+        assert!(wide.contains("FOLD"), "every column fits at 120 columns");
+        assert!(
+            wide.contains("host  load 2.31 4.10 3.88 / 10 cores"),
+            "the host strip"
+        );
+        assert!(
+            wide.contains("sheep 2  api"),
+            "the detail pane, on the selected sheep"
+        );
+        assert!(
+            wide.contains("bleats  api"),
+            "and the feed, on the same one"
+        );
+        assert_eq!(
+            wide.lines().filter(|line| line.starts_with('>')).count(),
+            1,
+            "exactly one selection marker"
+        );
 
-        // The narrow scene's caption in the gallery makes four specific
-        // claims about which columns survive at this width. Each is
-        // asserted here, so a scene rendered at a width that contradicts
-        // its own caption reddens the suite rather than shipping to Rin —
-        // `STATUS` alone would not, since STATUS is in the floor tier and
-        // present at every width the pane draws at.
+        // "No sheep registered. Each of the three panes says why it is empty,
+        //  and the three sentences are different because the three reasons
+        //  are."
+        let empty = render_text(&scene(Scene::Empty).1);
+        assert!(
+            empty.contains("the flock is empty"),
+            "the table's own sentence"
+        );
+        assert!(
+            empty.contains("no sheep selected: the flock is empty"),
+            "the detail pane's"
+        );
+        assert!(empty.contains("bleats  no sheep is selected"), "the feed's");
+        assert!(
+            empty.contains("flock cpu -"),
+            "and the strip shows no reading, not zero"
+        );
+
+        // "51 columns: FOLD, RESTARTS, PID and MEM are gone, in that order.
+        //  CPU and UPTIME survive because they explain WHY. The host strip
+        //  fits; the detail pane and the feed do not, at 14 rows."
         let narrow = render_text(&scene(Scene::Narrow).1);
-        assert!(narrow.contains("CPU"), "CPU survives the narrow tier");
-        assert!(narrow.contains("UPTIME"), "and so does UPTIME");
+        assert!(narrow.contains("CPU") && narrow.contains("UPTIME"));
         for gone in ["FOLD", "RESTARTS", "PID", "MEM"] {
             assert!(!narrow.contains(gone), "the narrow tier dropped {gone}");
         }
+        assert!(narrow.contains("host  load"), "the strip is up at 14 rows");
+        assert!(!narrow.contains("bleats  "), "the feed is not");
+        assert!(
+            !narrow.contains("sheep 0  "),
+            "and neither is the detail pane"
+        );
 
-        // The errored scene's caption makes two claims: each row's own
-        // STATUS cell is the only coloured cell in that row (so `online`,
-        // `errored` and `waiting-restart` each get their own status
-        // colour), and `stopped` happens to share the chrome's muted grey
-        // rather than standing out from it. Both are asserted against the
-        // ANSI rendering, since plain text carries no colour to check.
+        // "28 columns: below the floor, the pane refuses rather than drawing
+        //  overlapping garbage. Two short lines, so the refusal still fits the
+        //  terminal it is refusing about."
+        let too_narrow = render_text(&scene(Scene::TooNarrow).1);
+        let mut lines = too_narrow.lines();
+        assert_eq!(lines.next().unwrap().trim_end(), "too small");
+        assert_eq!(lines.next().unwrap().trim_end(), "need 33x6");
+
+        // "The feed under a burst: four megabytes were never read and some
+        //  hundreds of lines were read and dropped. The pane counts both, and
+        //  counts them separately, because it knows the second exactly and
+        //  cannot know how many lines are in the first."
+        let gap = render_text(&scene(Scene::FeedGap).1);
+        assert!(
+            gap.contains("earlier lines not shown"),
+            "the lines it dropped"
+        );
+        assert!(gap.contains("3.8M"), "the exact figure, not a vague one");
+        assert!(gap.contains("never read"), "and what it never looked at");
+        assert!(
+            !gap.contains("re-read with each listing"),
+            "the gap replaces the header"
+        );
+
+        // "The selected sheep has never written a log in this $SHEP_HOME. The
+        //  feed names that cause rather than sitting blank."
+        let missing = render_text(&scene(Scene::FeedMissing).1);
+        assert!(missing.contains("has not written a log in this $SHEP_HOME"));
+
+        // "20 rows: the detail pane is the first to go, because every number
+        //  on it but the log paths is already in the row above it."
+        let no_detail = render_text(&scene(Scene::NoDetail).1);
+        assert!(
+            no_detail.contains("bleats  api"),
+            "the feed stayed, on the selection"
+        );
+        assert!(no_detail.contains("host  load"), "and so did the strip");
+        // The ABSENCE, pinned to something only the detail pane can emit. The
+        // first draft asserted `!contains("sheep 2  api")`, which passes just
+        // as well when the selection is on sheep 0 and the pane drew
+        // perfectly — a check that cannot fail for the reason it exists. The
+        // log-path prefix is the detail pane's alone: the feed's body lines
+        // are tagged `out  ` too, but they carry log TEXT, not a path.
+        assert!(
+            !no_detail.contains("out  /home/rin/.shep/logs/"),
+            "the detail pane went"
+        );
+
+        // "12 rows: no optional panes at all. This is 12a's frame, and the
+        //  only thing that changed is the two-column gutter the marker sits in."
+        let table_only = render_text(&scene(Scene::TableOnly).1);
+        assert!(!table_only.contains("host  load"));
+        assert!(!table_only.contains("bleats  "));
+        assert!(table_only.contains("STATUS"), "the table is still there");
+
+        // "33 columns, 26 rows: the narrowest terminal that draws, with all
+        //  three panes up. Everything truncates with an ellipsis; nothing
+        //  overlaps."
+        let cramped = render_text(&scene(Scene::Cramped).1);
+        assert!(cramped.contains('…'), "something truncated, visibly");
+        // NOT `line.chars().count() == 33` on every row: `render_text` maps
+        // `(0..area.width)` for every row by construction, so that is true of
+        // any frame at any width, including a blank one. What "nothing
+        // overlaps" actually means is that each pane's own marker appears
+        // exactly once, which is a claim about this layout.
+        for marker in ["host  ", "bleats  ", "out  /home/rin/.shep/logs/"] {
+            assert_eq!(
+                cramped
+                    .lines()
+                    .filter(|line| line.starts_with(marker))
+                    .count(),
+                1,
+                "{marker:?} appears once at 33 columns"
+            );
+        }
+        assert!(
+            cramped.lines().last().unwrap().contains("read-only"),
+            "and the status bar is still the last row"
+        );
+
+        // The four scenes carried over from 12a all changed meaning this
+        // phase — three panes, a marker, a strip, and 20 rows becoming 30 —
+        // so their captions were rewritten and each new clause is pinned here
+        // rather than left as prose nobody checked.
+
+        // "The shepherd stopped answering. Five attempts over about eight
+        //  seconds before this becomes the next frame. Every pane below the
+        //  table keeps describing the selected sheep from the last listing."
+        let retrying = render_text(&scene(Scene::Retrying).1);
+        assert!(retrying.contains("reconnecting"));
+        assert!(
+            retrying.contains("sheep 2  api"),
+            "the detail pane is still up"
+        );
+        assert!(retrying.contains("host  load"), "and so is the strip");
+
+        // "The ladder ran out. Last known values stay, the uptime clock has
+        //  stopped, and so has the host strip — one line ticking over on a
+        //  frozen screen is a contradiction on the same frame."
+        let frozen = render_text(&scene(Scene::Frozen).1);
+        assert!(frozen.contains("the shepherd has died"));
+        assert!(
+            frozen.contains("host  load 2.31 4.10 3.88 / 10 cores"),
+            "the strip kept its LAST values rather than blanking"
+        );
+
+        // "One errored, one waiting to restart, one stopped, with the
+        //  selection parked on the errored sheep. Each row's own STATUS cell
+        //  is the only coloured cell in that row."
+        let errored = render_text(&scene(Scene::Errored).1);
+        assert!(errored.contains("errored"));
+        assert!(
+            errored.contains("sheep 2  api"),
+            "the selection is on the errored sheep"
+        );
+        assert_eq!(
+            errored.lines().filter(|line| line.starts_with('>')).count(),
+            1,
+            "exactly one marker, on that row"
+        );
+        // Each row's own STATUS cell is the only coloured cell in that row:
+        // `online`, `errored` and `waiting-restart` each get their own
+        // status colour, and `stopped` happens to share the chrome's muted
+        // grey rather than standing out from it. Only the ANSI rendering
+        // carries colour to check this against.
         let errored_ansi = render_ansi(&scene(Scene::Errored).1);
         assert!(
             errored_ansi.contains("\u{1b}[38;5;29monline"),
@@ -544,6 +897,76 @@ mod tests {
             errored_ansi.contains("\u{1b}[38;5;245mstopped"),
             "stopped's STATUS cell shares the chrome's muted grey rather than standing out"
         );
+
+        // "`x` with actions gated off. Both refusals are literal — nothing
+        //  about damage gets charming — and the panes below carry on."
+        let refused = render_text(&scene(Scene::Refused).1);
+        assert!(refused.contains("--allow-control"));
+        assert!(
+            refused.contains("bleats  api"),
+            "a refusal does not blank the screen"
+        );
+
+        // "sysinfo reports this platform unsupported. The strip says so and
+        //  keeps the flock's own totals, which lookout can always compute."
+        let unknown = render_text(&scene(Scene::HostUnknown).1);
+        assert!(unknown.contains("host  usage is not available on this platform"));
+        assert!(
+            unknown.contains("flock cpu"),
+            "the half lookout can compute survives"
+        );
+    }
+
+    /// fails if a scene is added to [`Scene::ALL`] without a caption, or with
+    /// a caption nobody pinned. The second half cannot be checked by a
+    /// machine — but the first half can, and a scene with no caption is how
+    /// an unpinned one gets in.
+    #[test]
+    fn every_scene_has_a_caption_and_a_distinct_label() {
+        let mut labels = std::collections::BTreeSet::new();
+        for which in Scene::ALL {
+            assert!(
+                labels.insert(which.label()),
+                "two scenes share {}",
+                which.label()
+            );
+            let caption = which.caption();
+            assert!(caption.len() > 30, "{} has a stub caption", which.label());
+            assert!(
+                caption.ends_with('.'),
+                "{}'s caption is not a sentence",
+                which.label()
+            );
+        }
+        // `labels.len() == Scene::ALL.len()` is not asserted: the `insert`
+        // above already guarantees it, so it would be a line that cannot
+        // fail. The literal can — it is what catches a scene added to the
+        // enum and not to `ALL`, or the reverse.
+        assert_eq!(Scene::ALL.len(), 14);
+    }
+
+    /// fails if a 12b pane introduced a text MODIFIER. `sgr` renders
+    /// foregrounds only — its own doc says a modifier would come out unstyled
+    /// — and this phase deliberately introduced none: the selection marker is
+    /// a character, not a `REVERSED` row, precisely so `NO_COLOR` and a
+    /// 16-colour terminal lose nothing. If this ever reddens, `sgr` needs a
+    /// case before the gallery is regenerated, or the modifier needs
+    /// removing.
+    #[test]
+    fn no_scene_uses_a_modifier_the_ansi_renderer_would_drop() {
+        for which in Scene::ALL {
+            let buffer = scene(*which).1;
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    let cell = &buffer[(buffer.area.x + x, buffer.area.y + y)];
+                    assert!(
+                        cell.modifier.is_empty(),
+                        "{} has a modifier at {x},{y}",
+                        which.label()
+                    );
+                }
+            }
+        }
     }
 
     /// fails if a frozen frame keeps counting. This is the one thing the

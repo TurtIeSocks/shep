@@ -3,7 +3,7 @@ source: crates/shep-cli/src/lookout/frames.rs
 expression: render_text(&buffer)
 ---
 shep lookout   /home/rin/.shep                                                                            6 in the flock
-host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
+host  usage is not available on this platform   flock cpu 14.7%   flock mem 716.0M                                      
   ID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   0     web                                   online           48211    0         3.4%    182.0M    1h 25m    edge      

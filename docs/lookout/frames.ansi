@@ -1,4 +1,4 @@
-shep lookout — Phase 12a frames
+shep lookout — Phase 12b frames
 ================================
 
 These are real frames, rendered headlessly through ratatui's TestBackend by
@@ -7,51 +7,37 @@ These are real frames, rendered headlessly through ratatui's TestBackend by
 
 Nothing here is a mockup.
 
-frames.ansi is the same eight frames with colour; read it with `less -R`.
+frames.ansi is the same fourteen frames with colour; read it with `less -R`.
 
-They are here to be looked at BEFORE Phase 12b's layout is decided. 12a
-builds the shell and one pane on purpose — the bleats feed, the sheep detail
-pane and the host-usage strip are 12b, and how those three sit beside this
-one is the decision these frames exist to inform.
+All four panes are here: the flock table (the spine), the host-usage strip,
+the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
+every pane below the table describes that one sheep.
 
+The feed reads the selected sheep's log files from disk and re-reads them with
+each flock listing. It is not a live subscription, and it says so on its own
+header line: `out then err` because the two files are shown end to end with no
+interleaving, and `re-read with each listing` because a two-second gap in this
+pane is the refresh, not the sheep.
 
-=== healthy_wide  (120x20) ===
-A healthy flock at 120 columns: all nine columns fit.
-
-shep lookout   /home/rin/.shep                                                                            [0m[38;5;245m6 in the flock[0m
-[0m[38;5;245mID    NAME                                    STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
-[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-0     web                                     [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
-1     web                                     [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
-2     api                                     [0m[38;5;29monline         [0m  48219    1         7.1%    241.0M    1h 28m    edge      [0m
-3     billing-reconciliation-worker           [0m[38;5;29monline         [0m  48230    0         0.8%    96.0M     1h 29m    -         [0m
-4     cron                                    [0m[38;5;29monline         [0m  48233    0         0.1%    8.0M      1h 31m    -         [0m
-5     metrics                                 [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 32m    -         [0m
-                                                                                                                        [0m
-                                                                                                                        [0m
-                                                                                                                        [0m
-                                                                                                                        [0m
-                                                                                                                        [0m
-                                                                                                                        [0m
-                                                                                                                        [0m
-                                                                                                                        [0m
-                                                                                                                        [0m
-                                                                                                                        [0m
-[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh                                                               read-only[0m
+When the pane cannot show everything, the header says what went instead. Lines
+it read and dropped are counted exactly; bytes below its 64 KiB window were
+never read at all, so those are reported in bytes, because nothing counted the
+lines in them and guessing would be worse than saying so.
 
 
-=== errored  (120x20) ===
-One errored, one waiting to restart, one stopped. Each row's own STATUS cell is the only coloured cell in that row — but stopped shares the chrome's muted grey, so its STATUS word does not stand out from the frame around it.
+=== healthy_wide  (120x30) ===
+All three panes at 120x30: the host strip under the title, the detail pane and the bleats feed under the table. `>` marks the selected sheep, and every pane below the table describes it.
 
 shep lookout   /home/rin/.shep                                                                            [0m[38;5;245m6 in the flock[0m
-[0m[38;5;245mID    NAME                                    STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           [0m
+  [0m[38;5;245mID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-0     web                                     [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
-1     web                                     [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
-2     api                                     [0m[38;5;166merrored        [0m  -        14        -       -         1h 18m    edge      [0m
-3     billing-reconciliation-worker           [0m[38;5;221mwaiting-restart[0m  -        3         -       -         1h 19m    -         [0m
-4     cron                                    [0m[38;5;245mstopped        [0m  -        0         -       -         1h 21m    -         [0m
-5     metrics                                 [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 32m    -         [0m
+  0     web                                   [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
+  1     web                                   [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
+> 2     api                                   [0m[38;5;29monline         [0m  48219    1         7.1%    241.0M    1h 28m    edge      [0m
+  3     billing-reconciliation-worker         [0m[38;5;29monline         [0m  48230    0         0.8%    96.0M     1h 29m    -         [0m
+  4     cron                                  [0m[38;5;29monline         [0m  48233    0         0.1%    8.0M      1h 31m    -         [0m
+  5     metrics                               [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 32m    -         [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -60,16 +46,61 @@ shep lookout   /home/rin/.shep                                                  
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-                                                                                                                        [0m
-                                                                                                                        [0m
-[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh                                                               read-only[0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m   cpu 7.1%   mem 241.0M   fold edge                      [0m
+[0m[38;5;245mout  /home/rin/.shep/logs/api-2-out.log                                                                                 [0m
+[0m[38;5;245merr  /home/rin/.shep/logs/api-2-err.log                                                                                 [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+[0m[38;5;221mbleats  api  … 1 earlier line not shown                                                                                 [0m
+[0m[38;5;245mout  [0mGET /healthz 200 3ms                                                                                               [0m
+[0m[38;5;245mout  [0mGET /v1/orders 200 44ms                                                                                            [0m
+[0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
+[0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
+[0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
 
 
-=== empty  (100x12) ===
-No sheep registered. The header row still prints, and a plain sentence says the pane is empty rather than leaving it blank.
+=== errored  (120x30) ===
+One errored, one waiting to restart, one stopped, with the selection parked on the errored sheep. Each row's own STATUS cell is the only coloured cell in that row.
+
+shep lookout   /home/rin/.shep                                                                            [0m[38;5;245m6 in the flock[0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%   flock mem 371.0M   up 6d 3h            [0m
+  [0m[38;5;245mID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+  0     web                                   [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
+  1     web                                   [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
+> 2     api                                   [0m[38;5;166merrored        [0m  -        14        -       -         1h 18m    edge      [0m
+  3     billing-reconciliation-worker         [0m[38;5;221mwaiting-restart[0m  -        3         -       -         1h 19m    -         [0m
+  4     cron                                  [0m[38;5;245mstopped        [0m  -        0         -       -         1h 21m    -         [0m
+  5     metrics                               [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 32m    -         [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+sheep 2  api   [0m[38;5;166merrored[0m   pid -   restarts 14   uptime 1h 18m   cpu -   mem -   fold edge                                [0m
+[0m[38;5;245mout  /home/rin/.shep/logs/api-2-out.log                                                                                 [0m
+[0m[38;5;245merr  /home/rin/.shep/logs/api-2-err.log                                                                                 [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+[0m[38;5;221mbleats  api  … 1 earlier line not shown                                                                                 [0m
+[0m[38;5;245mout  [0mGET /healthz 200 3ms                                                                                               [0m
+[0m[38;5;245mout  [0mGET /v1/orders 200 44ms                                                                                            [0m
+[0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
+[0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
+[0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
+
+
+=== empty  (100x28) ===
+No sheep registered. Each of the three panes says why it is empty, and the three sentences are different because the three reasons are.
 
 shep lookout   /home/rin/.shep                                                        [0m[38;5;245m0 in the flock[0m
-[0m[38;5;245mID    NAME                STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu -   flock mem -   up 6d 3h[0m
+  [0m[38;5;245mID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────[0m
 [0m[38;5;245mthe flock is empty[0m                                                                                  [0m
                                                                                                     [0m
@@ -79,33 +110,48 @@ shep lookout   /home/rin/.shep                                                  
                                                                                                     [0m
                                                                                                     [0m
                                                                                                     [0m
-[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh                                           read-only[0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+[0m[38;5;245mno sheep selected: the flock is empty                                                               [0m
+                                                                                                    [0m
+                                                                                                    [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+[0m[38;5;245mbleats  no sheep is selected                                                                        [0m
+[0m[38;5;245mthe shepherd did not report a log path for this sheep                                               [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                           read-only[0m
 
 
-=== narrow  (49x14) ===
-49 columns: FOLD, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY.
+=== narrow  (51x14) ===
+51 columns: FOLD, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY. The host strip fits; the detail pane and the feed do not, at 14 rows.
 
-shep lookout   /home/rin/.shep     [0m[38;5;245m6 in the flock[0m
-[0m[38;5;245mID    NAME      STATUS           CPU     UPTIME  [0m
-[0m[38;5;245m─────────────────────────────────────────────────[0m
-0     web       [0m[38;5;29monline         [0m  3.4%    1h 25m  [0m
-1     web       [0m[38;5;29monline         [0m  2.9%    1h 26m  [0m
-2     api       [0m[38;5;29monline         [0m  7.1%    1h 28m  [0m
-3     billing…  [0m[38;5;29monline         [0m  0.8%    1h 29m  [0m
-4     cron      [0m[38;5;29monline         [0m  0.1%    1h 31m  [0m
-5     metrics   [0m[38;5;29monline         [0m  0.4%    1h 32m  [0m
-                                                 [0m
-                                                 [0m
-                                                 [0m
-                                                 [0m
-[0m[38;5;245mq quit   j/k scroll   g/G top/bottom  … read-only[0m
+shep lookout   /home/rin/.shep       [0m[38;5;245m6 in the flock[0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12…[0m
+  [0m[38;5;245mID    NAME      STATUS           CPU     UPTIME  [0m
+[0m[38;5;245m───────────────────────────────────────────────────[0m
+> 0     web       [0m[38;5;29monline         [0m  3.4%    1h 25m  [0m
+  1     web       [0m[38;5;29monline         [0m  2.9%    1h 26m  [0m
+  2     api       [0m[38;5;29monline         [0m  7.1%    1h 28m  [0m
+  3     billing…  [0m[38;5;29monline         [0m  0.8%    1h 29m  [0m
+  4     cron      [0m[38;5;29monline         [0m  0.1%    1h 31m  [0m
+  5     metrics   [0m[38;5;29monline         [0m  0.4%    1h 32m  [0m
+                                                   [0m
+                                                   [0m
+                                                   [0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r… read-only[0m
 
 
 === too_narrow  (28x8) ===
-28 columns: below the floor, the pane refuses rather than drawing overlapping garbage. The refusal is two short lines so it still fits.
+28 columns: below the floor, the pane refuses rather than drawing overlapping garbage. Two short lines, so the refusal still fits the terminal it is refusing about.
 
 too small                   [0m
-need 31x6                   [0m
+need 33x6                   [0m
                             [0m
                             [0m
                             [0m
@@ -114,19 +160,20 @@ need 31x6                   [0m
                             [0m
 
 
-=== retrying  (120x20) ===
-The shepherd stopped answering. Five attempts over about eight seconds before this becomes the next frame.
+=== retrying  (120x30) ===
+The shepherd stopped answering. Five attempts over about eight seconds before this becomes the next frame. Every pane below the table keeps describing the selected sheep from the last listing.
 
 shep lookout   /home/rin/.shep                                                                            [0m[38;5;245m6 in the flock[0m
 [0m[38;5;221mthe shepherd stopped answering — reconnecting (attempt 3)[0m                                                               [0m
-[0m[38;5;245mID    NAME                                    STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           [0m
+  [0m[38;5;245mID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-0     web                                     [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
-1     web                                     [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
-2     api                                     [0m[38;5;29monline         [0m  48219    1         7.1%    241.0M    1h 28m    edge      [0m
-3     billing-reconciliation-worker           [0m[38;5;29monline         [0m  48230    0         0.8%    96.0M     1h 29m    -         [0m
-4     cron                                    [0m[38;5;29monline         [0m  48233    0         0.1%    8.0M      1h 31m    -         [0m
-5     metrics                                 [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 32m    -         [0m
+  0     web                                   [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
+  1     web                                   [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
+> 2     api                                   [0m[38;5;29monline         [0m  48219    1         7.1%    241.0M    1h 28m    edge      [0m
+  3     billing-reconciliation-worker         [0m[38;5;29monline         [0m  48230    0         0.8%    96.0M     1h 29m    -         [0m
+  4     cron                                  [0m[38;5;29monline         [0m  48233    0         0.1%    8.0M      1h 31m    -         [0m
+  5     metrics                               [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 32m    -         [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -134,24 +181,34 @@ shep lookout   /home/rin/.shep                                                  
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-                                                                                                                        [0m
-                                                                                                                        [0m
-[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh                                                               read-only[0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m   cpu 7.1%   mem 241.0M   fold edge                      [0m
+[0m[38;5;245mout  /home/rin/.shep/logs/api-2-out.log                                                                                 [0m
+[0m[38;5;245merr  /home/rin/.shep/logs/api-2-err.log                                                                                 [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+[0m[38;5;221mbleats  api  … 1 earlier line not shown                                                                                 [0m
+[0m[38;5;245mout  [0mGET /healthz 200 3ms                                                                                               [0m
+[0m[38;5;245mout  [0mGET /v1/orders 200 44ms                                                                                            [0m
+[0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
+[0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
+[0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
 
 
-=== frozen  (120x20) ===
-The ladder ran out. Last known values stay; the uptime clock has stopped; lookout does not exit.
+=== frozen  (120x30) ===
+The ladder ran out. Last known values stay, the uptime clock has stopped, and so has the host strip — one line ticking over on a frozen screen is a contradiction on the same frame.
 
 shep lookout   /home/rin/.shep                                                                            [0m[38;5;245m6 in the flock[0m
 [0m[38;5;166mthe shepherd has died — these values are frozen as of 2026-08-14 14:32:07[0m                                               [0m
-[0m[38;5;245mID    NAME                                    STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%   flock mem 371.0M   up 6d 3h            [0m
+  [0m[38;5;245mID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-0     web                                     [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 15m    edge      [0m
-1     web                                     [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 16m    edge      [0m
-2     api                                     [0m[38;5;166merrored        [0m  -        14        -       -         1h 18m    edge      [0m
-3     billing-reconciliation-worker           [0m[38;5;221mwaiting-restart[0m  -        3         -       -         1h 19m    -         [0m
-4     cron                                    [0m[38;5;245mstopped        [0m  -        0         -       -         1h 21m    -         [0m
-5     metrics                                 [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 22m    -         [0m
+  0     web                                   [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 15m    edge      [0m
+  1     web                                   [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 16m    edge      [0m
+> 2     api                                   [0m[38;5;166merrored        [0m  -        14        -       -         1h 18m    edge      [0m
+  3     billing-reconciliation-worker         [0m[38;5;221mwaiting-restart[0m  -        3         -       -         1h 19m    -         [0m
+  4     cron                                  [0m[38;5;245mstopped        [0m  -        0         -       -         1h 21m    -         [0m
+  5     metrics                               [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 22m    -         [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -159,23 +216,33 @@ shep lookout   /home/rin/.shep                                                  
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-                                                                                                                        [0m
-                                                                                                                        [0m
-[0m[38;5;245mq quit   j/k scroll   g/G top/bottom   r refresh                                                               read-only[0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+sheep 2  api   [0m[38;5;166merrored[0m   pid -   restarts 14   uptime 1h 18m   cpu -   mem -   fold edge                                [0m
+[0m[38;5;245mout  /home/rin/.shep/logs/api-2-out.log                                                                                 [0m
+[0m[38;5;245merr  /home/rin/.shep/logs/api-2-err.log                                                                                 [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+[0m[38;5;221mbleats  api  … 1 earlier line not shown                                                                                 [0m
+[0m[38;5;245mout  [0mGET /healthz 200 3ms                                                                                               [0m
+[0m[38;5;245mout  [0mGET /v1/orders 200 44ms                                                                                            [0m
+[0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
+[0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
+[0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
 
 
-=== refused  (120x20) ===
-`x` with actions gated off. Both refusals are literal — nothing about damage gets charming.
+=== refused  (120x30) ===
+`x` with actions gated off. Both refusals are literal — nothing about damage gets charming — and the panes below carry on.
 
 shep lookout   /home/rin/.shep                                                                            [0m[38;5;245m6 in the flock[0m
-[0m[38;5;245mID    NAME                                    STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           [0m
+  [0m[38;5;245mID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-0     web                                     [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
-1     web                                     [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
-2     api                                     [0m[38;5;29monline         [0m  48219    1         7.1%    241.0M    1h 28m    edge      [0m
-3     billing-reconciliation-worker           [0m[38;5;29monline         [0m  48230    0         0.8%    96.0M     1h 29m    -         [0m
-4     cron                                    [0m[38;5;29monline         [0m  48233    0         0.1%    8.0M      1h 31m    -         [0m
-5     metrics                                 [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 32m    -         [0m
+  0     web                                   [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
+  1     web                                   [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
+> 2     api                                   [0m[38;5;29monline         [0m  48219    1         7.1%    241.0M    1h 28m    edge      [0m
+  3     billing-reconciliation-worker         [0m[38;5;29monline         [0m  48230    0         0.8%    96.0M     1h 29m    -         [0m
+  4     cron                                  [0m[38;5;29monline         [0m  48233    0         0.1%    8.0M      1h 31m    -         [0m
+  5     metrics                               [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 32m    -         [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -184,6 +251,193 @@ shep lookout   /home/rin/.shep                                                  
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-                                                                                                                        [0m
-                                                                                                                        [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m   cpu 7.1%   mem 241.0M   fold edge                      [0m
+[0m[38;5;245mout  /home/rin/.shep/logs/api-2-out.log                                                                                 [0m
+[0m[38;5;245merr  /home/rin/.shep/logs/api-2-err.log                                                                                 [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+[0m[38;5;221mbleats  api  … 1 earlier line not shown                                                                                 [0m
+[0m[38;5;245mout  [0mGET /healthz 200 3ms                                                                                               [0m
+[0m[38;5;245mout  [0mGET /v1/orders 200 44ms                                                                                            [0m
+[0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
+[0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
+[0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
 [0m[38;5;166mread-only: actions need --allow-control                                                                       [0m[38;5;245m read-only[0m
+
+
+=== no_detail  (120x20) ===
+20 rows: the detail pane is the first to go, because every number on it but the log paths is already in the row above it.
+
+shep lookout   /home/rin/.shep                                                                            [0m[38;5;245m6 in the flock[0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           [0m
+  [0m[38;5;245mID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+  0     web                                   [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
+  1     web                                   [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
+> 2     api                                   [0m[38;5;29monline         [0m  48219    1         7.1%    241.0M    1h 28m    edge      [0m
+  3     billing-reconciliation-worker         [0m[38;5;29monline         [0m  48230    0         0.8%    96.0M     1h 29m    -         [0m
+  4     cron                                  [0m[38;5;29monline         [0m  48233    0         0.1%    8.0M      1h 31m    -         [0m
+  5     metrics                               [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 32m    -         [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+[0m[38;5;221mbleats  api  … 1 earlier line not shown                                                                                 [0m
+[0m[38;5;245mout  [0mGET /healthz 200 3ms                                                                                               [0m
+[0m[38;5;245mout  [0mGET /v1/orders 200 44ms                                                                                            [0m
+[0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
+[0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
+[0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
+
+
+=== table_only  (120x12) ===
+12 rows: no optional panes at all. This is 12a's frame, and the only thing that changed is the two-column gutter the marker sits in.
+
+shep lookout   /home/rin/.shep                                                                            [0m[38;5;245m6 in the flock[0m
+  [0m[38;5;245mID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+> 0     web                                   [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
+  1     web                                   [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
+  2     api                                   [0m[38;5;29monline         [0m  48219    1         7.1%    241.0M    1h 28m    edge      [0m
+  3     billing-reconciliation-worker         [0m[38;5;29monline         [0m  48230    0         0.8%    96.0M     1h 29m    -         [0m
+  4     cron                                  [0m[38;5;29monline         [0m  48233    0         0.1%    8.0M      1h 31m    -         [0m
+  5     metrics                               [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 32m    -         [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
+
+
+=== feed_gap  (120x30) ===
+The feed under a burst: four megabytes were never read and some hundreds of lines were read and dropped. The pane counts both, and counts them separately, because it knows the second exactly and cannot know how many lines are in the first.
+
+shep lookout   /home/rin/.shep                                                                            [0m[38;5;245m6 in the flock[0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           [0m
+  [0m[38;5;245mID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+  0     web                                   [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
+  1     web                                   [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
+> 2     api                                   [0m[38;5;29monline         [0m  48219    1         7.1%    241.0M    1h 28m    edge      [0m
+  3     billing-reconciliation-worker         [0m[38;5;29monline         [0m  48230    0         0.8%    96.0M     1h 29m    -         [0m
+  4     cron                                  [0m[38;5;29monline         [0m  48233    0         0.1%    8.0M      1h 31m    -         [0m
+  5     metrics                               [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 32m    -         [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m   cpu 7.1%   mem 241.0M   fold edge                      [0m
+[0m[38;5;245mout  /home/rin/.shep/logs/api-2-out.log                                                                                 [0m
+[0m[38;5;245merr  /home/rin/.shep/logs/api-2-err.log                                                                                 [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+[0m[38;5;221mbleats  api  … 525 earlier lines not shown, and 3.8M before them never read                                             [0m
+[0m[38;5;245mout  [0mGET /v1/orders/25 200 33ms                                                                                         [0m
+[0m[38;5;245mout  [0mGET /v1/orders/26 200 34ms                                                                                         [0m
+[0m[38;5;245mout  [0mGET /v1/orders/27 200 35ms                                                                                         [0m
+[0m[38;5;245mout  [0mGET /v1/orders/28 200 36ms                                                                                         [0m
+[0m[38;5;245mout  [0mGET /v1/orders/29 200 37ms                                                                                         [0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
+
+
+=== feed_missing  (120x30) ===
+The selected sheep has never written a log in this $SHEP_HOME. The feed names that cause rather than sitting blank.
+
+shep lookout   /home/rin/.shep                                                                            [0m[38;5;245m6 in the flock[0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           [0m
+  [0m[38;5;245mID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+  0     web                                   [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
+  1     web                                   [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
+> 2     api                                   [0m[38;5;29monline         [0m  48219    1         7.1%    241.0M    1h 28m    edge      [0m
+  3     billing-reconciliation-worker         [0m[38;5;29monline         [0m  48230    0         0.8%    96.0M     1h 29m    -         [0m
+  4     cron                                  [0m[38;5;29monline         [0m  48233    0         0.1%    8.0M      1h 31m    -         [0m
+  5     metrics                               [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 32m    -         [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m   cpu 7.1%   mem 241.0M   fold edge                      [0m
+[0m[38;5;245mout  /home/rin/.shep/logs/api-2-out.log                                                                                 [0m
+[0m[38;5;245merr  /home/rin/.shep/logs/api-2-err.log                                                                                 [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+[0m[38;5;245mbleats  api  out then err  from the log files, re-read with each listing                                                [0m
+[0m[38;5;245mthis sheep has not written a log in this $SHEP_HOME                                                                     [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
+
+
+=== cramped  (33x26) ===
+33 columns, 26 rows: the narrowest terminal that draws, with all three panes up. Everything truncates with an ellipsis; nothing overlaps.
+
+shep lookout   /ho…[0m[38;5;245m6 in the flock[0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 c…[0m
+  [0m[38;5;245mID    NAME      STATUS         [0m
+[0m[38;5;245m─────────────────────────────────[0m
+  0     web       [0m[38;5;29monline         [0m
+  1     web       [0m[38;5;29monline         [0m
+> 2     api       [0m[38;5;29monline         [0m
+  3     billing…  [0m[38;5;29monline         [0m
+  4     cron      [0m[38;5;29monline         [0m
+  5     metrics   [0m[38;5;29monline         [0m
+                                 [0m
+                                 [0m
+                                 [0m
+                                 [0m
+[0m[38;5;245m─────────────────────────────────[0m
+sheep 2  api   [0m[38;5;29monline[0m   pid 4821…[0m
+[0m[38;5;245mout  /home/rin/.shep/logs/api-2-…[0m
+[0m[38;5;245merr  /home/rin/.shep/logs/api-2-…[0m
+[0m[38;5;245m─────────────────────────────────[0m
+[0m[38;5;221mbleats  api  … 1 earlier line no…[0m
+[0m[38;5;245mout  [0mGET /healthz 200 3ms        [0m
+[0m[38;5;245mout  [0mGET /v1/orders 200 44ms     [0m
+[0m[38;5;245mout  [0mPOST /v1/orders 201 88ms    [0m
+[0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms [0m
+[0m[38;5;245mout  [0mconnection pool: 14/50 in u…[0m
+[0m[38;5;245mq quit   j/k select   … read-only[0m
+
+
+=== host_unknown  (120x30) ===
+`sysinfo` reports this platform unsupported. The strip says so and keeps the flock's own totals, which lookout can always compute.
+
+shep lookout   /home/rin/.shep                                                                            [0m[38;5;245m6 in the flock[0m
+[0m[38;5;245mhost  usage is not available on this platform   flock cpu 14.7%   flock mem 716.0M                                      [0m
+  [0m[38;5;245mID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+  0     web                                   [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
+  1     web                                   [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
+> 2     api                                   [0m[38;5;29monline         [0m  48219    1         7.1%    241.0M    1h 28m    edge      [0m
+  3     billing-reconciliation-worker         [0m[38;5;29monline         [0m  48230    0         0.8%    96.0M     1h 29m    -         [0m
+  4     cron                                  [0m[38;5;29monline         [0m  48233    0         0.1%    8.0M      1h 31m    -         [0m
+  5     metrics                               [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 32m    -         [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+                                                                                                                        [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m   cpu 7.1%   mem 241.0M   fold edge                      [0m
+[0m[38;5;245mout  /home/rin/.shep/logs/api-2-out.log                                                                                 [0m
+[0m[38;5;245merr  /home/rin/.shep/logs/api-2-err.log                                                                                 [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+[0m[38;5;221mbleats  api  … 1 earlier line not shown                                                                                 [0m
+[0m[38;5;245mout  [0mGET /healthz 200 3ms                                                                                               [0m
+[0m[38;5;245mout  [0mGET /v1/orders 200 44ms                                                                                            [0m
+[0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
+[0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
+[0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m

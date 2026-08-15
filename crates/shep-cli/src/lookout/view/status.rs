@@ -89,8 +89,9 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
     // `+ 1` reserves one column of gap so a truncated left side's `…` never
     // butts straight against the label. Without it `fit` fills every column
     // up to `right`, and a truncation and a right-aligned label landing on
-    // the same frame is the ordinary case, not a corner one — see the
-    // `narrow` gallery scene, 49 columns wide, where this shipped without it.
+    // the same frame is the ordinary case, not a corner one — see
+    // `a_truncated_hint_still_leaves_a_gap_before_the_control_label` below,
+    // pinned at the exact width where this shipped without it.
     // The gap rides inside the right span, styled the same as the label
     // rather than as its own `Span::raw`, so the two-span, single-colour
     // shape of every wider scene's status line is unchanged byte-for-byte.
@@ -122,11 +123,15 @@ mod tests {
     use crate::lookout::theme::Palette;
 
     /// fails if the truncated key hint ever butts straight against the
-    /// control-state label again. Pinned at 49 columns — the `narrow`
-    /// gallery scene's own width — because that is exactly where the bug
-    /// shipped: the default hint is 48 characters, the label 9, and at this
-    /// width the hint truncates while the label still fits, which is the
-    /// one combination that makes a missing gap visible.
+    /// control-state label again. Pinned at 49 columns, not because any
+    /// gallery scene happens to be that width, but because that is exactly
+    /// where the bug shipped: the default hint is 48 characters, the label
+    /// 9, and at this width the hint truncates while the label still fits,
+    /// which is the one combination that makes a missing gap visible. (An
+    /// earlier version of this comment tied the width to the `narrow`
+    /// gallery scene; `narrow` moved to 51 columns in Phase 12b, and this
+    /// test did not need to move with it — 49 is a property of the hint and
+    /// the label, not of any one scene.)
     #[test]
     fn a_truncated_hint_still_leaves_a_gap_before_the_control_label() {
         let palette = Palette::detect(None, Some(OsStr::new("xterm-256color")), None);

@@ -25,10 +25,10 @@ sheep 2  api   online   pid 48219   restarts 1   uptime 1h 28m   cpu 7.1%   mem 
 out  /home/rin/.shep/logs/api-2-out.log                                                                                 
 err  /home/rin/.shep/logs/api-2-err.log                                                                                 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-bleats  api  … 1 earlier line not shown                                                                                 
-out  GET /healthz 200 3ms                                                                                               
-out  GET /v1/orders 200 44ms                                                                                            
-out  POST /v1/orders 201 88ms                                                                                           
-out  GET /v1/orders/8821 200 9ms                                                                                        
-out  connection pool: 14/50 in use                                                                                      
+bleats  api  … 525 earlier lines not shown, and 3.8M before them never read                                             
+out  GET /v1/orders/25 200 33ms                                                                                         
+out  GET /v1/orders/26 200 34ms                                                                                         
+out  GET /v1/orders/27 200 35ms                                                                                         
+out  GET /v1/orders/28 200 36ms                                                                                         
+out  GET /v1/orders/29 200 37ms                                                                                         
 q quit   j/k select   g/G first/last   r refresh                                                               read-only
