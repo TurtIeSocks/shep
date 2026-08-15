@@ -135,6 +135,14 @@ pub enum Msg {
         /// What the sampler saw, or `None` on an unsupported platform.
         sample: Option<super::source::HostSample>,
     },
+    /// One refresh of the selected sheep's log files, in answer to an
+    /// [`Effect::RefreshFeed`] this reducer asked for.
+    ///
+    /// Returns [`Effect::None`] unconditionally; see its arm.
+    Bleats {
+        /// What the read found, including what it could not show.
+        tail: super::tail::Tail,
+    },
 }
 
 /// What the caller has to do after an update.
@@ -248,6 +256,12 @@ pub struct App {
     /// True once a sample has come back `None` — the two `None`s mean
     /// different things and the strip says different sentences for them.
     host_unsupported: bool,
+    /// The selected sheep's most recent output, as of the last refresh.
+    /// [`Tail::default`](super::tail::Tail::default) before the first one —
+    /// an empty, unlabelled tail, which
+    /// [`super::view::bleats::feed_lines`] reads the same way it reads a
+    /// sheep that has genuinely written nothing.
+    feed: super::tail::Tail,
 }
 
 impl App {
@@ -265,6 +279,7 @@ impl App {
             now,
             host: None,
             host_unsupported: false,
+            feed: super::tail::Tail::default(),
         }
     }
 
@@ -338,6 +353,14 @@ impl App {
                 }
                 self.host_unsupported = sample.is_none();
                 self.host = sample;
+                Effect::None
+            }
+            // Always `Effect::None`. A reducer that answered its own feed
+            // update with another refresh request would spin the UI task at
+            // full tilt; the `let _ =` at the call site in `run_ui` is
+            // deliberate rather than lazy.
+            Msg::Bleats { tail } => {
+                self.feed = tail;
                 Effect::None
             }
         }
@@ -577,6 +600,12 @@ impl App {
     #[must_use]
     pub fn host_unsupported(&self) -> bool {
         self.host_unsupported
+    }
+
+    /// The selected sheep's most recent output, as of the last refresh.
+    #[must_use]
+    pub fn feed(&self) -> &super::tail::Tail {
+        &self.feed
     }
 
     /// One sheep's uptime as of this dashboard's own clock, in milliseconds.
@@ -1125,6 +1154,21 @@ mod tests {
         assert!(
             !app.host_unsupported(),
             "and a refused sample changes no flag"
+        );
+    }
+
+    /// fails if `Msg::Bleats` starts asking for another refresh. A reducer
+    /// that answered its own feed update with `Effect::RefreshFeed` would
+    /// spin the UI task at full tilt, re-reading two files as fast as the
+    /// loop can go — the one recursion this design can have.
+    #[test]
+    fn applying_a_tail_does_not_ask_for_another_one() {
+        let (mut app, _) = started();
+        assert_eq!(
+            app.update(Msg::Bleats {
+                tail: super::super::tail::Tail::default()
+            }),
+            Effect::None
         );
     }
 }

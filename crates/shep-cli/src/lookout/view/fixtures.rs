@@ -99,6 +99,47 @@ pub fn with_host_none(flock: Vec<ProcessInfo>, unsupported: bool) -> App {
     app
 }
 
+/// A dashboard with a flock of three sheep, the first one selected, and
+/// `tail` applied as this refresh's feed.
+pub fn with_feed(tail: Tail) -> App {
+    let mut app = app_with(flock_of(3, 0), plain());
+    app.update(Msg::Bleats { tail });
+    app
+}
+
+/// Like [`with_feed`], but selects sheep `id` first — for the tests that
+/// need the header to name a specific sheep.
+pub fn with_feed_and_selection(tail: Tail, id: u32) -> App {
+    let mut app = app_with(flock_of(3, 0), plain());
+    for _ in 0..id {
+        app.update(Msg::Key(KeyPress::SelectDown));
+    }
+    app.update(Msg::Bleats { tail });
+    app
+}
+
+/// Like [`with_feed`], but with an explicit palette — for the one test that
+/// asserts on a specific foreground colour.
+pub fn with_feed_and_palette(tail: Tail, palette: Palette) -> App {
+    let mut app = app_with(flock_of(3, 0), palette);
+    app.update(Msg::Bleats { tail });
+    app
+}
+
+/// A dashboard with an empty flock: nothing is selected, so the feed's own
+/// "no sheep is selected" line is what renders.
+pub fn with_no_selection() -> App {
+    app_with(Vec::new(), plain())
+}
+
+/// One tail line, tagged with the stream it came from.
+pub fn line(stream: Stream, text: &str) -> TailLine {
+    TailLine {
+        stream,
+        text: text.to_string(),
+    }
+}
+
 /// One rendered line, styles discarded.
 pub fn rendered(line: &Line<'static>) -> String {
     line.spans

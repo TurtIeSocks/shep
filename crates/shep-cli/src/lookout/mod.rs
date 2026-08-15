@@ -189,7 +189,15 @@ pub async fn lookout(
     ));
 
     let events = crossterm::event::EventStream::new();
-    let _ = run_ui(app, terminal, events, msg_rx, poll_tx).await;
+    let _ = run_ui(
+        app,
+        terminal,
+        events,
+        msg_rx,
+        poll_tx,
+        source::LocalReader::new(),
+    )
+    .await;
     link.abort();
     ExitCode::Success
 }
@@ -251,15 +259,27 @@ pub fn resolve_control(flag: bool, kv: &Path) -> Control {
 ///
 /// The redraw is not an arm: it happens after the `select!`, gated on `dirty`
 /// and on [`MIN_REDRAW`] having elapsed.
-pub async fn run_ui<B: Backend, S>(
+///
+/// **This phase adds no arm to the `select!` above.** The host sample rides
+/// arm 4, the heartbeat: sampling memory and a load average costs
+/// microseconds and no process-table walk, so it rides along for free rather
+/// than re-deriving the arm-retirement reasoning this doc just walked
+/// through. The feed rides the redraw gate below instead of an arm at all —
+/// `Effect::RefreshFeed` sets `feed_dirty`, and the read happens immediately
+/// before the frame that shows its result, coalescing a held key's burst of
+/// moved selections into one read per [`MIN_REDRAW`] window rather than one
+/// per keypress. See the phase plan's design decisions 3 and 11.
+pub async fn run_ui<B: Backend, S, L>(
     mut app: App,
     mut terminal: Terminal<B>,
     events: S,
     mut msgs: mpsc::Receiver<Msg>,
     polls: mpsc::Sender<()>,
+    mut local: L,
 ) -> Terminal<B>
 where
     S: Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin,
+    L: source::Local,
 {
     let mut events = events;
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
@@ -272,13 +292,34 @@ where
     let mut link_done = false;
 
     let mut dirty = true;
+    // Set by `Effect::RefreshFeed` and cleared once the coalesced read below
+    // has run. See the doc above this function for why this is a flag rather
+    // than an `mpsc` arm.
+    let mut feed_dirty = false;
     // `Option`, not `Instant::now() - MIN_REDRAW`: subtracting from a fresh
     // `Instant` is a panic on a platform whose monotonic clock starts near
     // zero, and "has never drawn" is what the first iteration actually means.
     let mut last_draw: Option<Instant> = None;
 
     loop {
-        if dirty && last_draw.is_none_or(|at| at.elapsed() >= MIN_REDRAW) {
+        // One gate, read once, so the feed cannot be refreshed on a frame
+        // that is not about to be drawn — and, more importantly, is
+        // refreshed BEFORE the frame that shows it rather than after.
+        let may_draw = last_draw.is_none_or(|at| at.elapsed() >= MIN_REDRAW);
+        if feed_dirty && may_draw {
+            // The paths are cloned out before `app` is borrowed mutably.
+            let (out, err) = app.selected_row().map_or((None, None), |row| {
+                (row.info.out_file.clone(), row.info.err_file.clone())
+            });
+            let tail = local.tail(out.as_deref().map(Path::new), err.as_deref().map(Path::new));
+            // `let _`: `Msg::Bleats` returns `Effect::None` by construction —
+            // see its arm in the reducer — and acting on a returned effect
+            // here would be the one place this design could recurse.
+            let _ = app.update(Msg::Bleats { tail });
+            feed_dirty = false;
+            dirty = true;
+        }
+        if dirty && may_draw {
             let _ = terminal.draw(|frame| view::draw(&app, frame));
             dirty = false;
             last_draw = Some(Instant::now());
@@ -326,7 +367,21 @@ where
                     None
                 }
             },
-            _ = heartbeat.tick() => Some(Msg::Tick { now: Instant::now() }),
+            _ = heartbeat.tick() => {
+                // The host sample rides this arm rather than adding a fifth
+                // one. The `biased` select's arm-retirement reasoning is the
+                // subtlest thing in this module and this phase deliberately
+                // does not re-derive it; sampling memory and a load average
+                // is microseconds and no process-table walk.
+                //
+                // Sampled unconditionally, and REFUSED by the reducer once
+                // the link is lost — one enforcement point, the same
+                // division `Msg::Tick` and the uptime clock already use.
+                // `let _`: `Msg::Host` returns `Effect::None` by
+                // construction.
+                let _ = app.update(Msg::Host { sample: local.host() });
+                Some(Msg::Tick { now: Instant::now() })
+            }
         };
 
         // Nothing to apply. Not a spin risk, and it is worth naming why there
@@ -348,10 +403,17 @@ where
                 let _ = polls.try_send(());
                 dirty = true;
             }
-            // Task 6 replaces this with the read. Until then the reducer's
-            // request is honoured by redrawing and nothing else — which is
-            // correct, because there is no feed on screen yet to refresh.
-            Effect::RefreshFeed => dirty = true,
+            // Not the read. `Effect::RefreshFeed` arrives once per moved
+            // selection, and ordinary terminals deliver a held `j` as
+            // twenty to thirty Press events a second — so doing the I/O
+            // here would put a synchronous 128 KiB read behind every
+            // repeat, on the task that also owns the redraw. Coalesced onto
+            // `MIN_REDRAW` above instead, which is the same gate the draw
+            // already uses.
+            Effect::RefreshFeed => {
+                feed_dirty = true;
+                dirty = true;
+            }
             Effect::None => dirty = true,
         }
     }
@@ -361,14 +423,43 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use futures_util::stream;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use shep_core::protocol::BusEvent;
+    use shep_core::protocol::{BusEvent, ProcessInfo};
+    use shep_core::status::ProcStatus;
 
     use crate::lookout::app::{App, Control, KeyPress};
+    use crate::lookout::source::{HostSample, Local};
+    use crate::lookout::tail::Tail;
     use crate::lookout::theme::Palette;
+
+    /// A `Local` that touches no disk: a fixed sample, a fixed tail, and a
+    /// count of each call. `Arc`, because `run_ui` takes the reader by value
+    /// and only gives the terminal back.
+    #[derive(Clone, Default)]
+    struct FakeLocal {
+        sample: Option<HostSample>,
+        hosts: Arc<AtomicUsize>,
+        tails: Arc<AtomicUsize>,
+    }
+
+    impl Local for FakeLocal {
+        fn host(&mut self) -> Option<HostSample> {
+            self.hosts.fetch_add(1, Ordering::Relaxed);
+            self.sample
+        }
+
+        fn tail(&mut self, _out: Option<&Path>, _err: Option<&Path>) -> Tail {
+            self.tails.fetch_add(1, Ordering::Relaxed);
+            Tail::default()
+        }
+    }
 
     /// fails if the loop stops drawing, or stops leaving on `q`. This is the
     /// whole loop under test with no terminal and no socket: a `TestBackend`
@@ -397,7 +488,7 @@ mod tests {
         drop(msg_tx);
         let done = tokio::time::timeout(
             Duration::from_secs(10),
-            run_ui(app, terminal, keys, msg_rx, poll_tx),
+            run_ui(app, terminal, keys, msg_rx, poll_tx, FakeLocal::default()),
         )
         .await;
         let terminal = done.expect("the loop left on `q` within ten seconds");
@@ -438,7 +529,14 @@ mod tests {
         let terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         let _ = tokio::time::timeout(
             Duration::from_secs(10),
-            run_ui(app, terminal, stream::empty(), msg_rx, poll_tx),
+            run_ui(
+                app,
+                terminal,
+                stream::empty(),
+                msg_rx,
+                poll_tx,
+                FakeLocal::default(),
+            ),
         )
         .await
         .expect("the loop left within ten seconds");
@@ -465,6 +563,148 @@ mod tests {
             resolve_control(true, &kv),
             Control::Allowed,
             "the flag wins over a store that says no"
+        );
+    }
+
+    /// fails if **nothing ever produces a `Msg::Host`.** The strip renders
+    /// from `App::host`, the reducer arm was written in Task 4, and every
+    /// pane test and every gallery frame injects the message directly — so a
+    /// heartbeat that still yielded only `Msg::Tick` leaves the shipped
+    /// binary drawing `host  not read yet` forever with nothing red anywhere
+    /// on the suite. That is what the first draft of this plan shipped, and
+    /// it is invisible to every other check in the phase.
+    ///
+    /// Asserted on the READER rather than on a frame, because at this task
+    /// the strip is not on screen yet — `draw` does not call it until
+    /// Task 8, and Task 8 adds `a_heartbeat_puts_the_host_strip_on_the_frame`
+    /// for the other half. What is testable here is the call, and the
+    /// missing call is the bug.
+    ///
+    /// IR-46: bounded — a `timeout` around a genuinely async loop, and a quit
+    /// queued on a timer, so it cannot hang.
+    #[tokio::test(start_paused = true)]
+    async fn the_heartbeat_asks_the_local_reader_for_a_host_sample() {
+        let (msg_tx, msg_rx) = mpsc::channel(64);
+        let (poll_tx, _poll_rx) = mpsc::channel(4);
+        let local = FakeLocal::default();
+        let hosts = Arc::clone(&local.hosts);
+
+        // After the 1-second heartbeat, so the tick lands first.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            let _ = msg_tx.send(Msg::Key(KeyPress::Quit)).await;
+        });
+
+        let app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/tmp/shep".to_string(),
+            Instant::now(),
+        );
+        let terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_ui(app, terminal, stream::empty(), msg_rx, poll_tx, local),
+        )
+        .await
+        .expect("the loop left within ten seconds");
+
+        assert!(
+            hosts.load(Ordering::Relaxed) >= 1,
+            "the heartbeat fired and never sampled the host"
+        );
+    }
+
+    /// fails if a burst of keypresses costs one two-file read per key.
+    ///
+    /// `input::map_key` drops `KeyEventKind::Repeat`, but ordinary terminals
+    /// deliver auto-repeat as a stream of Press events — so a held `j` on a
+    /// long flock is twenty to thirty moved selections a second, and an
+    /// uncoalesced `Effect::RefreshFeed` would put a synchronous 128 KiB
+    /// read behind every one of them, on the task that also owns the
+    /// redraw. The read is coalesced onto the `MIN_REDRAW` gate for that
+    /// reason, so a burst costs one read rather than twenty-one.
+    ///
+    /// `assert_eq!(1)` and not `<= 2`: the exact number is the property. One
+    /// snapshot and twenty moves arrive with no time between them, so
+    /// nothing is read until the clock passes `MIN_REDRAW`, and then it is
+    /// read once.
+    ///
+    /// **Not `start_paused`, and that is a deviation from the plan's draft
+    /// worth stating rather than silently carrying.** `MIN_REDRAW`'s gate
+    /// reads [`std::time::Instant`] — real wall-clock, deliberately, so
+    /// `App`'s clock model stays usable outside a tokio runtime at all
+    /// (`App`'s own doc: "No clock. Every `Instant` arrives on the
+    /// message"). A *paused* tokio clock auto-advances `tokio::time::sleep`
+    /// in virtual time with no matching real delay — measured on this
+    /// machine, a virtual 1.5s sleep under `start_paused` completes in
+    /// ~30µs of real time — so a version of this test on a paused clock
+    /// could never see `MIN_REDRAW` actually elapse and would fail no
+    /// matter how the coalescing is implemented: not flaky, deterministically
+    /// red, confirmed over five runs. So this test runs the real clock and
+    /// waits out a real (short) multiple of `MIN_REDRAW` instead of a virtual
+    /// 1.5s, which is what the property under test — a real wall-clock gate
+    /// — actually needs.
+    ///
+    /// IR-46: bounded by a real, short sleep and a real, generous timeout —
+    /// this cannot hang.
+    #[tokio::test]
+    async fn a_burst_of_selection_moves_costs_one_read_and_not_one_per_key() {
+        let (msg_tx, msg_rx) = mpsc::channel(64);
+        let (poll_tx, _poll_rx) = mpsc::channel(4);
+        let local = FakeLocal::default();
+        let tails = Arc::clone(&local.tails);
+
+        let at = Instant::now();
+        msg_tx
+            .send(Msg::Snapshot {
+                rows: (0..8)
+                    .map(|id| {
+                        ProcessInfo::builder(id, format!("sheep-{id}"), ProcStatus::Online).build()
+                    })
+                    .collect(),
+                at,
+            })
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            msg_tx.send(Msg::Key(KeyPress::SelectDown)).await.unwrap();
+        }
+        tokio::spawn(async move {
+            // A nudge, not the quit: the redraw gate is read once per loop
+            // iteration, right before the (possibly blocking) receive, so
+            // real time elapsing WHILE the loop is blocked waiting for the
+            // next message is never observed by that check — only the next
+            // iteration's check sees it. `Msg::Resize` (any message would
+            // do; this one touches neither the feed nor the selection)
+            // wakes the loop once real time has cleared `MIN_REDRAW`, so
+            // the burst's still-pending `feed_dirty` is read on THIS
+            // iteration rather than staying stale until `Quit` breaks the
+            // loop before the gate is ever re-checked.
+            tokio::time::sleep(MIN_REDRAW * 3).await;
+            let _ = msg_tx.send(Msg::Resize).await;
+            tokio::time::sleep(MIN_REDRAW).await;
+            let _ = msg_tx.send(Msg::Key(KeyPress::Quit)).await;
+        });
+
+        let app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/tmp/shep".to_string(),
+            Instant::now(),
+        );
+        let terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_ui(app, terminal, stream::empty(), msg_rx, poll_tx, local),
+        )
+        .await
+        .expect("the loop left within five seconds");
+
+        assert_eq!(
+            tails.load(Ordering::Relaxed),
+            1,
+            "a snapshot and twenty selection moves must coalesce into one read"
         );
     }
 }

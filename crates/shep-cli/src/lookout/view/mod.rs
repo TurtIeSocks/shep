@@ -6,6 +6,7 @@
 //! render path both testable and cheap to keep working across a ratatui
 //! release. See the phase plan's design decision 5b for the argument.
 
+pub mod bleats;
 pub mod flock;
 pub mod host;
 pub mod status;
