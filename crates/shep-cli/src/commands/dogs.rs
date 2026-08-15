@@ -121,7 +121,7 @@ pub async fn enable(
 }
 
 /// `enable`'s daemon half, split out from [`enable`] so a test can drive it
-/// against a [`shep_client::testing`] fake without racing a second, real
+/// against a `shep_client::testing` fake without racing a second, real
 /// connection to the same socket the fake's own fixture already opened —
 /// [`crate::commands::lifecycle::resolve_target`] is split out of `start`
 /// for the same reason: hermetic testability of the part that has a seam.
