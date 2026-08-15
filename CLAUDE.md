@@ -180,7 +180,13 @@ flock table pane — dependency, terminal lifecycle, palette, event loop, link
 supervision, and a table that subscribes to the bus and polls every two
 seconds to repair drift. The bleats feed, the sheep detail pane and the
 host-usage strip are Phase 12b; rendered frames for that decision are in
-`docs/lookout/frames.txt`.
+`docs/lookout/frames.txt`. Phase 13 merged: `shep whistle`, the MCP server
+over stdio (`rmcp`) — nine tools, five read-only and always present, four
+that mutate and present only when `[whistle] allow_control = true` in
+`shep.toml`; `start_sheep` narrowed to already-registered sheep; every
+daemon refusal a control tool can meet reaches the model as an in-band tool
+result, not a protocol error. `docs/whistle/README.md` and the generated
+`docs/whistle/tools.md` are the operator contract.
 
 What's built vs. deferred to v1.1+: [docs/specs/deferred.md](docs/specs/deferred.md).
 Windows is 0%, not partial — every verb prints "not yet supported" and exits.

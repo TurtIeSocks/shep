@@ -199,9 +199,9 @@ pub async fn lookout(
 /// `shep set lookout.allow_control true` — rather than a new `[lookout]`
 /// section in `shep.toml`, because this gate is the operator's own and not the
 /// shepherd's: lookout runs as the operator, and the shepherd cannot tell one
-/// of its keypresses from a `shep stop`. `whistle.allow_control` is daemon-side
-/// for the opposite reason — its control tools act for a client nobody is
-/// watching.
+/// of its keypresses from a `shep stop`. `[whistle] allow_control` in
+/// `$SHEP_HOME/shep.toml` is daemon-side for the opposite reason — its
+/// control tools act for a client nobody is watching.
 ///
 /// A store that cannot be read is read as "no". A dashboard that failed open on
 /// an unreadable file would be a gate that disappears exactly when something is

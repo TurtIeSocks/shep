@@ -36,8 +36,8 @@ corrected. That matters more than usual here for two reasons.
 
 The first is that shep is genuinely pre-release, and the README already says
 so. Windows is zero rather than partial, lookout has one of its four panes,
-whistle and `shep serve` and `shep dev` do not exist, and CI has never run on
-its own. A `0.1.0` on crates.io is a normal release under semver, and cargo
+`shep serve` and `shep dev` do not exist, and CI has never run on its own. A
+`0.1.0` on crates.io is a normal release under semver, and cargo
 resolves it for anyone who writes `shep-core = "0.1"`. A pre-release version
 is excluded from that matching by the semver spec, so `0.1.0-alpha.1` cannot
 be picked up by accident. Nobody ends up depending on this by writing a
@@ -200,7 +200,7 @@ cross-compiles for the target, and the README, the crate descriptions and the
 `shep-daemon` readme all say plainly that supervision is unix only. An alpha
 is allowed to have an unsupported platform. A `1.0.0` is not.
 
-**Several v1.0 spec items are unbuilt.** whistle, `shep serve`, `shep dev` and
+**Several v1.0 spec items are unbuilt.** `shep serve`, `shep dev` and
 `shep runtime`, `.js` Flockfiles, the schemars schema, the CLI-flag config
 layer, openrc and BSD `rc.d` units, and three of lookout's four panes. All of
 them are named in [specs/deferred.md](specs/deferred.md), and none of them

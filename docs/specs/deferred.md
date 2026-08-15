@@ -25,7 +25,7 @@ order:
    first (`kill_signal` accepts a typo and then sends the wrong signal
    forever; an on-time `ActionReply` can be matched to the wrong request),
    then the wire and config asymmetries, then the tooling and doc staleness.
-2. **The rest of the v1.0 surface** — lookout, whistle, serve, dev/runtime,
+2. **The rest of the v1.0 surface** — lookout, serve, dev/runtime,
    `.js` Flockfile, schemars, the daemon-config flags layer, and openrc +
    BSD rc.d.
 3. **The Windows functional tier — last** (Rin, 2026-08-12). It is the one
@@ -34,7 +34,8 @@ order:
    better once nothing else is in flight to confound it.
 
 **Dogs** (spec §8) was originally queued first and has since shipped, on
-`feat/phase9-dogs`; see "Not deferred" below for what landed.
+`feat/phase9-dogs`; see "Not deferred" below for what landed. **whistle**
+(spec §8, §13) has since shipped too, on Phase 13; same section.
 
 Ordering is not priority. Windows is last because its estimate is the
 weakest, not because it matters least.
@@ -78,9 +79,6 @@ Rendered frames of what 12a built are in
 [docs/lookout/frames.txt](../lookout/frames.txt), for Rin to look at before
 12b's layout is decided.
 
-**whistle** (spec §8, §13) — the MCP stdio server (`whistle` verb). `rmcp`
-is not a dependency of any crate.
-
 **serve** (spec §9, §13) — static file server as a managed sheep. `axum`
 and `tower-http` are not dependencies of any crate.
 
@@ -111,7 +109,13 @@ of `main.rs::run` prints "shep does not yet support Windows" and exits
 all work; the `node -p 'JSON.stringify(require(p))'` fallback does not.
 
 **schemars JSON-schema export** (spec §5) — `AppConfig` has no `schemars`
-derive; no schema ships in `assets/` (the directory does not exist).
+derive; no schema ships in `assets/` (the directory does not exist). The
+dependency question is settled, not open: whistle's own payload types derive
+`JsonSchema`, so `schemars 1.2.2` is now a declared, direct, versioned
+dependency of `shep-cli` (Phase 13) — at zero extra compiled crates, since
+`rmcp`'s `server` feature already pulls it, but still an edge this project
+owns and holds a `-Z minimal-versions` floor for. What is left for
+`AppConfig` is a derive and a writer, not a dependency decision.
 
 **Daemon-config flags layer** (spec §5) — layering is `file < SHEP_* env`
 today; the third, CLI-flag layer over the top does not exist.
@@ -412,3 +416,32 @@ What each of those does NOT do, recorded so it is not rediscovered as drift:
 - `channel.*` carries child→shepherd traffic only. The shepherd's own
   `shutdown` and `action` writes are already reported by `process.stop` and by
   `Response::Triggered`; adding them stays additive if that changes.
+
+**whistle** (spec §8, §13) **shipped**: `shep whistle`, an MCP server over
+stdio (`rmcp`), nine tools — five read-only, always present, and four that
+act, present only when `[whistle] allow_control = true` in
+`$SHEP_HOME/shep.toml`. Gated-off tools are absent from the tool list, not
+present and refusing. `start_sheep` is narrowed to an already-registered
+sheep rather than the wider Flockfile/script form `shep start` takes, and
+every other daemon refusal a control tool can meet — a reload already in
+flight, an unknown sheep, a stopped shepherd — reaches the model as an
+in-band tool result rather than a protocol error. Operator-facing contract:
+`docs/whistle/README.md` and the generated `docs/whistle/tools.md`.
+
+Spec §14.7 says control tools "require the daemon flag
+`whistle.allow_control = true`" (`docs/specs/shep-v1.md:405-406`). That
+sentence stays as written — the spec is not rewritten to match an
+implementation — but Phase 13 reads "daemon flag" as the `[whistle]` section
+of `$SHEP_HOME/shep.toml`, per §14.7's own "daemon config, not CLI flag",
+and there is no `--allow-control` CLI flag on `shep whistle` at all.
+
+What §8/§13 name beyond this and remain open: HTTP/SSE transport (above,
+under "Committed to v1.1+ by design"), and MCP resources, prompts, sampling,
+completions, subscriptions and tasks — `get_info` advertises tools only.
+Five verbs an operator can run today have deliberately no tool at all:
+`delete_sheep` and `flush` are irreversible in a way the four control tools
+are not; `kill` takes the shepherd itself down, and whistle's own connection
+with it; `signal_sheep` and `whisper` take free-form input whose blast
+radius is not shep's to bound; `scale_flock` takes a count a model can be
+off by an order of magnitude on. That is a judgement about what an agent
+should be trusted with, not a technical limit, and it is Rin's to overrule.

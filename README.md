@@ -86,7 +86,7 @@ The whole vocabulary, and whether it exists yet.
 | a lamb | a child process of a sheep | tree-kill, `describe`'s tree view | yes |
 | a dog | a plugin process the shepherd supervises | `shep enable metrics`, `shep dogs` | yes |
 | a bark | a webhook alert | `[dog.bark.sinks]` config, `shep barks` | yes |
-| the whistle | the MCP interface agents talk to | `shep whistle` | no |
+| the whistle | the MCP interface agents talk to | `shep whistle` | yes |
 | the lookout | the terminal dashboard | `shep lookout` (alias `dash`) | partly |
 | adopt / rehome | register or drop a third-party dog | `shep adopt <name> <path>` | yes |
 | that'll do | graceful stop, after the real herding command | `shep thatlldo` | yes |
@@ -162,11 +162,20 @@ neither a Flockfile nor `shep.toml` has a field for. Works with no
 shepherd running, and two writers racing it lose nothing.
 [docs/kv.md](docs/kv.md) is the guide.
 
+**Talking to an agent.** `shep whistle` speaks the Model Context Protocol
+over stdio, so an agent host can reach the same flock a person reaches with
+`shep flock`, `shep stop`, `shep restart`. Five read-only tools are there
+from the start: `list_flock`, `describe_sheep`, `get_metrics`, `tail_bleats`,
+`list_barks`. The four that act, `start_sheep`, `stop_sheep`,
+`restart_sheep`, `reload_sheep`, only exist once `[whistle] allow_control =
+true` is set in `shep.toml`. [docs/whistle/README.md](docs/whistle/README.md)
+covers the gate, and why it has no CLI flag.
+
 ## What's not built yet
 
-Not started: the whistle MCP server, `shep serve`, `shep dev` and
-`shep runtime`, `.js` Flockfiles, a `schemars`-exported config JSON schema, a
-CLI-flag config layer, and openrc and BSD `rc.d` units.
+Not started: `shep serve`, `shep dev` and `shep runtime`, `.js` Flockfiles, a
+`schemars`-exported config JSON schema, a CLI-flag config layer, and openrc
+and BSD `rc.d` units.
 
 The lookout has its shell and its flock table pane; the bleats feed, the
 sheep detail pane and the host-usage strip are still to come, and so is
