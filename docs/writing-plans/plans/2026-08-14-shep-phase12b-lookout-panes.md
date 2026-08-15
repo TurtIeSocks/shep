@@ -1940,25 +1940,255 @@ byte it has, and if one does, the strip is the least of its problems), re-run,
 and confirm the mutation now reddens. A mutation that reveals a weak assertion
 is a mutation that did its job.
 
+
+---
+
+## Shared test fixtures — `lookout/view/fixtures.rs`
+
+Three pane test modules and Task 8's layout sweep need the same dozen
+`App`-building helpers. **The first draft of this plan used fifteen of them and
+defined none**, which is the Phase 11 failure this project has already paid for
+once — twenty-five test bodies written against helpers that did not exist.
+They are written out here, once, with the task that lands each block named.
+
+`#[cfg(test)] mod fixtures;` in `view/mod.rs`, not a plain `pub mod` — same
+reason `lookout::frames` is gated that way: shep-cli is `[[bin]]`-only, so
+anything reached only from tests is `dead_code` in a normal build.
+
+**Every helper drives a real `App` through `App::update`.** `App`'s fields are
+private and stay that way. A fixture that reached past the reducer could build
+states the reducer cannot produce, and a pane test that passes on an impossible
+state proves nothing about the pane.
+
+### Landed by Task 4
+
+```rust
+//! Fixtures the pane test modules share. See the phase plan for why they live
+//! in one file rather than three.
+
+use std::ffi::OsStr;
+use std::time::Instant;
+
+use ratatui::text::Line;
+use shep_core::protocol::{Lamb, ProcessInfo};
+use shep_core::status::ProcStatus;
+
+use super::super::app::{App, Control, KeyPress, Msg};
+use super::super::source::HostSample;
+use super::super::tail::{Stream, Tail, TailLine};
+use super::super::theme::Palette;
+
+/// No colour at all: the palette every fixture uses unless the test is about
+/// colour.
+pub fn plain() -> Palette {
+    Palette::detect(None, None, None)
+}
+
+/// The 256-colour palette, for the two tests that assert on a specific
+/// foreground.
+pub fn coloured() -> Palette {
+    Palette::detect(None, Some(OsStr::new("xterm-256color")), None)
+}
+
+/// A dashboard with `flock` listed and nothing else applied.
+pub fn app_with(flock: Vec<ProcessInfo>, palette: Palette) -> App {
+    let t0 = Instant::now();
+    let mut app = App::new(palette, Control::ReadOnly, "/home/rin/.shep".to_string(), t0);
+    app.update(Msg::Snapshot { rows: flock, at: t0 });
+    app
+}
+
+/// `count` online sheep, the first `with_readings` of which report cpu and
+/// memory. The rest report neither, which is the case the `-` assertions need.
+pub fn flock_of(count: u32, with_readings: u32) -> Vec<ProcessInfo> {
+    (0..count)
+        .map(|id| {
+            let reports = id < with_readings;
+            ProcessInfo::builder(id, format!("sheep-{id}"), ProcStatus::Online)
+                .pid(Some(48_000 + id))
+                .uptime_ms(4_512_000)
+                .cpu_percent(reports.then_some(3.5))
+                .memory_bytes(reports.then_some(182 << 20))
+                .out_file(Some(format!("/home/rin/.shep/logs/sheep-{id}-out.log")))
+                .err_file(Some(format!("/home/rin/.shep/logs/sheep-{id}-err.log")))
+                .build()
+        })
+        .collect()
+}
+
+/// One plausible host reading: the same numbers the gallery's scenes use, so a
+/// failure here and a frame Rin is looking at name the same figures.
+pub fn sample() -> HostSample {
+    HostSample {
+        load: (2.31, 4.10, 3.88),
+        cores: Some(10),
+        memory_total_bytes: 32 << 30,
+        memory_used_bytes: 12 * (1 << 30) + (410 << 20),
+        uptime_seconds: 6 * 86_400 + 3 * 3_600,
+    }
+}
+
+/// A dashboard that has had one host sample applied.
+pub fn with_host(sample: HostSample, flock: Vec<ProcessInfo>) -> App {
+    let mut app = app_with(flock, plain());
+    app.update(Msg::Host { sample: Some(sample) });
+    app
+}
+
+/// A dashboard with no host reading — **and the two ways there are of having
+/// none are not the same state.**
+///
+/// `unsupported: true` applies `Msg::Host { sample: None }`, which is what a
+/// platform `sysinfo` does not support produces; the reducer sets
+/// `host_unsupported` from it and the strip says so.
+/// `unsupported: false` applies **no `Msg::Host` at all**, which is the state
+/// before the first heartbeat, and the strip says `not read yet` instead.
+/// Passing a `None` sample for the second would produce the first, and the
+/// test asserting the two sentences differ would pass by rendering one of them
+/// twice.
+pub fn with_host_none(flock: Vec<ProcessInfo>, unsupported: bool) -> App {
+    let mut app = app_with(flock, plain());
+    if unsupported {
+        app.update(Msg::Host { sample: None });
+    }
+    app
+}
+
+/// One rendered line, styles discarded.
+pub fn rendered(line: &Line<'static>) -> String {
+    line.spans.iter().map(|span| span.content.as_ref()).collect()
+}
+
+/// Several rendered lines, newline-joined. Newline-joined and not
+/// concatenated, so an assertion can anchor on a line boundary.
+pub fn render_all(lines: &[Line<'static>]) -> String {
+    lines.iter().map(rendered).collect::<Vec<_>>().join("\n")
+}
+```
+
+### Landed by Task 6
+
+```rust
+/// One tail line.
+pub fn line(stream: Stream, text: &str) -> TailLine {
+    TailLine { stream, text: text.to_string() }
+}
+
+/// A three-sheep dashboard whose feed is `tail`, with `web` selected.
+///
+/// Through `Msg::Bleats` rather than by writing `App::feed`: the field is
+/// private, and a fixture that set it directly could produce a feed the
+/// reducer would never have accepted.
+pub fn with_feed(tail: Tail) -> App {
+    with_feed_and_palette(tail, plain())
+}
+
+/// The same, at a given palette.
+pub fn with_feed_and_palette(tail: Tail, palette: Palette) -> App {
+    let mut app = app_with(flock_of(3, 3), palette);
+    app.update(Msg::Bleats { tail });
+    app
+}
+
+/// The same, with the selection moved onto sheep `index` — `1` is `sheep-1`.
+///
+/// The selection is moved BEFORE the tail is applied, because moving it is
+/// what asks for a refresh in the real loop and applying the tail is the
+/// answer to that.
+pub fn with_feed_and_selection(tail: Tail, index: usize) -> App {
+    let mut app = app_with(flock_of(3, 3), plain());
+    for _ in 0..index {
+        app.update(Msg::Key(KeyPress::SelectDown));
+    }
+    app.update(Msg::Bleats { tail });
+    app
+}
+
+/// An empty flock: nothing is selected, and nothing can be.
+pub fn with_no_selection() -> App {
+    app_with(Vec::new(), plain())
+}
+```
+
+### Landed by Task 7
+
+```rust
+/// A TWO-sheep dashboard with the selection on `info`, which sorts second.
+///
+/// Two, and the selection not on row 0, on purpose: Task 7's first mutation
+/// replaces `selected_row()` with `rows().first()`, and a one-sheep fixture
+/// would make that mutation invisible.
+pub fn with_selection(info: ProcessInfo) -> App {
+    with_selection_and_palette(info, plain())
+}
+
+/// The same, at a given palette.
+pub fn with_selection_and_palette(info: ProcessInfo, palette: Palette) -> App {
+    assert!(info.id > 0, "the decoy takes id 0, so the sheep under test cannot");
+    let decoy = ProcessInfo::builder(0, "decoy", ProcStatus::Online).build();
+    let mut app = app_with(vec![decoy, info], palette);
+    app.update(Msg::Key(KeyPress::SelectDown));
+    app
+}
+
+/// A sheep whose listing DID carry lambs.
+///
+/// `ListFlock` never populates this field — that is the whole of design
+/// decision 4 — so this fixture is deliberately impossible. The pane must not
+/// mention lambs even when handed some, because the failure being guarded is a
+/// heading or a caption promising a list, not a missing `if let`.
+pub fn sheep_with_lambs() -> ProcessInfo {
+    ProcessInfo::builder(9, "gateway", ProcStatus::Online)
+        .pid(Some(48_301))
+        .lambs(Some(vec![Lamb::new(48_302, "node"), Lamb::new(48_303, "sh")]))
+        .build()
+}
+```
+
+### Landed by Task 8
+
+```rust
+/// Twelve sheep, a host sample and a feed: everything on screen at once, for
+/// the tests that are about the LAYOUT rather than about any one pane.
+pub fn full_app() -> App {
+    let mut app = with_host(sample(), flock_of(12, 8));
+    app.update(Msg::Key(KeyPress::SelectDown));
+    app.update(Msg::Bleats {
+        tail: Tail {
+            lines: (0..12)
+                .map(|n| line(Stream::Out, &format!("GET /healthz 200 {n}ms")))
+                .collect(),
+            missed_lines: 0,
+            missed_bytes: 0,
+            read_bytes: 4_096,
+            note: None,
+        },
+    });
+    app
+}
+```
+
 ---
 
 ## Task 4 — `lookout/view/host.rs`: the host-usage strip
 
-One line, five self-labelled segments, dropped from the right when they do not
-fit.
+One line, five self-labelled segments, truncated by the same `fit` every other
+line on this screen goes through.
 
-**Files:** new `crates/shep-cli/src/lookout/view/host.rs`;
-`crates/shep-cli/src/lookout/app.rs` (the `Msg::Host` arm and the accessor);
-`crates/shep-cli/src/lookout/view/mod.rs` (the `pub mod` line only — the
-layout is Task 8).
+**Files:** new `crates/shep-cli/src/lookout/view/host.rs`; new
+`crates/shep-cli/src/lookout/view/fixtures.rs` (see "Shared test fixtures");
+`crates/shep-cli/src/lookout/app.rs` (the `Msg::Host` variant, its arm, and
+two accessors); `crates/shep-cli/src/lookout/view/mod.rs` (two `mod` lines
+only — the layout is Task 8).
 
-**Expected delta:** +5 tests.
+**Expected delta:** +5 tests — four in `view/host.rs`, one in `app.rs`.
 
 ### Step 4.1 — baseline
 
 ```bash
 find crates/shep-cli/src/lookout/view -name '*.rs' | wc -l   # 3
 grep -rn 'flock cpu' crates/ | wc -l                         # 0
+grep -rn 'Msg::Host' crates/ | wc -l                         # 0
 ```
 
 ### Step 4.2 — RED
@@ -1977,35 +2207,35 @@ grep -rn 'flock cpu' crates/ | wc -l                         # 0
         }
     }
 
-    /// fails if the drop order changes without someone re-arguing it. `up`
-    /// goes first — a host that has been up six days explains nothing about
-    /// right now — and the load average is last to go, because it is the
-    /// single most useful number about a machine running a process manager.
+    /// fails if the strip stops truncating visibly, or if the load average
+    /// stops being the segment that survives a narrow terminal.
     ///
-    /// The widths are derived from the rendered segments rather than written
-    /// as literals, so this test does not have to be edited every time a
-    /// number gains a digit.
+    /// There is no drop loop and no width table. The segments are joined in
+    /// the drop order — least useful last — and `flock::fit` truncates from
+    /// the right, so truncating IS the drop order and this is the whole of the
+    /// fitting behaviour. An earlier draft built a second mechanism for it and
+    /// a test that walked every width from 200 down to 10 recording the order
+    /// things vanished; Rin's ruling for this phase is "as plain as the flock
+    /// table", and the ellipsis on every other line of the screen is the
+    /// precedent. Three widths, not a hundred and ninety.
     #[test]
-    fn segments_drop_from_the_right_in_a_fixed_order() {
+    fn a_narrow_strip_truncates_visibly_and_keeps_the_load_average() {
         let app = with_host(sample(), flock_of(4, 1));
+
+        let narrow = rendered(&strip_line(&app, 40));
+        assert!(narrow.starts_with("host  load"), "got {narrow:?}");
+        assert!(narrow.ends_with('…'), "a truncation the operator can see: {narrow:?}");
+        assert!(!narrow.contains("up "), "`up` is the first thing off the end");
+
+        // At the floor the strip still says whose number it is quoting, which
+        // is the reason every segment carries its own label.
+        let floor = rendered(&strip_line(&app, MIN_TERM_WIDTH));
+        assert!(floor.starts_with("host  load"), "got {floor:?}");
+
+        // And where it fits, nothing is cut.
         let full = rendered(&strip_line(&app, 200));
-        let full_width = u16::try_from(full.trim_end().chars().count()).unwrap();
-
-        let one_short = rendered(&strip_line(&app, full_width - 1));
-        assert!(!one_short.contains("up "), "`up` is the first to go");
-        assert!(one_short.contains("flock mem"), "and nothing else went with it");
-
-        // Walk the width down and record the order things disappear.
-        let mut gone = Vec::new();
-        for width in (10..=full_width).rev() {
-            let line = rendered(&strip_line(&app, width));
-            for segment in ["up ", "flock mem", "flock cpu", "host mem", "host  load"] {
-                if !line.contains(segment) && !gone.contains(&segment) {
-                    gone.push(segment);
-                }
-            }
-        }
-        assert_eq!(gone, vec!["up ", "flock mem", "flock cpu", "host mem", "host  load"]);
+        assert!(!full.contains('…'));
+        assert!(full.contains("up 6d"), "the last segment is there: {full:?}");
     }
 
     /// fails if an unknown flock reading renders as zero. `ProcessInfo`'s own
@@ -2042,37 +2272,98 @@ grep -rn 'flock cpu' crates/ | wc -l                         # 0
         assert!(rendered(&strip_line(&unsupported, 200)).contains("flock cpu"));
     }
 
-    /// fails if the strip ever renders wider than the terminal it was given.
-    /// `Buffer::set_line` truncates in silence, so a strip that overflowed
-    /// would lose its rightmost segment without the drop logic ever running —
-    /// which is the bug the drop logic exists to prevent, hidden.
+```
+
+**`the_strip_never_exceeds_the_width_it_was_given` is deliberately not here.**
+The first draft carried it, and it could not fail: `strip_line` returns
+`flock::fit(..)`, and `fit` returns **exactly** `width` characters in every
+branch — it pads when short and truncates with `…` when long
+(`view/flock.rs:195-209`). `line.chars().count() <= usize::from(width)` is
+therefore true for any `segments` whatsoever, including one where the fitting
+never happened at all, which is the one thing it claimed to be testing. The
+property is real and it is `fit`'s, pinned by `fit`'s own tests in `flock.rs`.
+
+And in `app.rs`'s `mod tests`:
+
+```rust
+    /// fails if a frozen dashboard accepts a host reading. The strip reads
+    /// THIS machine, which lookout can still see after the shepherd dies — so
+    /// this is the one pane that could keep ticking, and one line ticking over
+    /// on a screen whose banner says the values are frozen as of 14:32:07 is a
+    /// contradiction on the same frame.
+    ///
+    /// Asserted in the reducer, which is the single place the rule lives:
+    /// `run_ui`'s heartbeat samples unconditionally and this arm decides
+    /// whether the dashboard is allowed to believe it, exactly as
+    /// `Msg::Tick` and the uptime clock already work.
     #[test]
-    fn the_strip_never_exceeds_the_width_it_was_given() {
-        let app = with_host(sample(), flock_of(40, 3));
-        for width in [MIN_TERM_WIDTH, 40, 51, 80, 100, 120, 200, 400] {
-            let line = rendered(&strip_line(&app, width));
-            assert!(
-                line.chars().count() <= usize::from(width),
-                "{} chars at width {width}",
-                line.chars().count()
-            );
-        }
+    fn a_frozen_dashboard_ignores_a_host_sample() {
+        let (mut app, _) = started();
+        app.update(Msg::Host { sample: Some(HostSample {
+            load: (2.31, 4.10, 3.88),
+            cores: Some(10),
+            memory_total_bytes: 32 << 30,
+            memory_used_bytes: 12 << 30,
+            uptime_seconds: 600,
+        })});
+        assert!(app.host().is_some(), "a live dashboard takes the sample");
+
+        app.update(Msg::Frozen { at_local: "2026-08-14 14:32:07".to_string() });
+        let frozen = app.host();
+        assert_eq!(app.update(Msg::Host { sample: None }), Effect::None);
+        assert_eq!(app.host(), frozen, "the last values stay, unchanged");
+        assert!(!app.host_unsupported(), "and a refused sample changes no flag");
     }
 ```
 
 ### Step 4.3 — GREEN: the reducer's half
 
-`App` gains one field and one accessor:
+**`Msg` grows a variant, and the variant needs writing out.** The workspace
+denies `missing_docs` and every existing `Msg` variant documents each of its
+fields; the first draft of this plan wrote only the match arm, which is a deny
+on first build.
+
+```rust
+    /// One reading of the machine this lookout is running on, off the 1-second
+    /// heartbeat. `None` means `sysinfo` does not support this platform —
+    /// which is a real, expected case, not a failure.
+    ///
+    /// Refused once the link is lost: see this arm in [`App::update`].
+    Host {
+        /// What the sampler saw, or `None` on an unsupported platform.
+        sample: Option<super::source::HostSample>,
+    },
+```
+
+`App` gains two fields and two accessors:
 
 ```rust
     /// The last host reading, or `None` before the first heartbeat and on a
-    /// platform `sysinfo` does not support. [`Self::host_supported`] tells the
-    /// strip which of the two it is looking at.
+    /// platform `sysinfo` does not support. [`Self::host_unsupported`] tells
+    /// the strip which of the two it is looking at.
     host: Option<HostSample>,
-    /// False once a sample has come back `None` from a supported platform's
-    /// sampler — the two `None`s mean different things and the strip says
-    /// different sentences for them.
+    /// True once a sample has come back `None` — the two `None`s mean
+    /// different things and the strip says different sentences for them.
     host_unsupported: bool,
+```
+
+```rust
+    /// The last host reading, or `None` if there has not been one.
+    #[must_use]
+    pub fn host(&self) -> Option<HostSample> {
+        self.host
+    }
+
+    /// Whether [`Self::host`] is `None` because the platform cannot be read,
+    /// rather than because no heartbeat has fired yet.
+    ///
+    /// The strip says `usage is not available on this platform` for the first
+    /// and `not read yet` for the second. They are different facts and an
+    /// operator seeing the wrong one waits for numbers that are never coming.
+    #[must_use]
+    pub fn host_unsupported(&self) -> bool {
+        self.host_unsupported
+    }
 ```
 
 ```rust
@@ -2102,11 +2393,13 @@ grep -rn 'flock cpu' crates/ | wc -l                         # 0
 //! narrow terminal must never leave a bare `mem 12.4G` beside a bare
 //! `mem 706.0M`.
 //!
-//! Segments drop from the RIGHT when they do not fit, least useful first:
-//! `up`, then the flock's memory, then its CPU, then the host's memory,
-//! leaving the load average. A `while` loop over a `Vec<String>` rather than
-//! a threshold table like [`super::flock::TIERS`] — this is one line built
-//! from five parts, and a tier table for it would be ceremony.
+//! Segments are joined **in the drop order** — `up` last, then the flock's
+//! memory, its CPU, the host's memory, with the load average first — and the
+//! line is fitted with [`super::flock::fit`], the same call every other line
+//! on this screen goes through. Truncating from the right therefore IS the
+//! drop order, with no second mechanism to maintain, and the `…` says so the
+//! way it does on every truncated name in the table above. See the phase
+//! plan's design decision 9 for the machinery that was cut and why.
 
 use ratatui::text::{Line, Span};
 
@@ -2116,15 +2409,11 @@ use crate::output::{human_bytes, human_duration};
 /// The strip, fitted to `width`.
 #[must_use]
 pub fn strip_line(app: &App, width: u16) -> Line<'static> {
-    let mut segments = segments(app);
-    while joined_width(&segments) > usize::from(width) && segments.len() > 1 {
-        segments.pop();
-    }
     // One `Span`, muted: nothing on this line is damage, and nothing on it is
     // a status word. Colour here would be decoration with no meaning behind
     // it, which is the one thing the palette module forbids.
     Line::from(Span::styled(
-        super::flock::fit(&segments.join("   "), width),
+        super::flock::fit(&segments(app).join("   "), width),
         app.palette().muted(),
     ))
 }
@@ -2180,16 +2469,12 @@ fn segments(app: &App) -> Vec<String> {
         |mem| format!("flock mem {}", human_bytes(mem)),
     ));
 
+    // Last, and therefore the first thing a narrow terminal loses: a host that
+    // has been up six days explains nothing about right now.
     if let Some(host) = app.host() {
         out.push(format!("up {}", human_duration(host.uptime_seconds * 1_000)));
     }
     out
-}
-
-/// How wide `segments` would render, separators included.
-fn joined_width(segments: &[String]) -> usize {
-    segments.iter().map(|s| s.chars().count()).sum::<usize>()
-        + segments.len().saturating_sub(1) * 3
 }
 ```
 
@@ -2200,24 +2485,37 @@ overflows `u64` milliseconds only after 584 million years.
 ### Step 4.5 — verify
 
 ```bash
-cargo test -p shep-cli --bins --all-features        # 395 passed; 0 failed; 2 ignored
+cargo fmt --all --check
+cargo test -p shep-cli --bins --all-features        # 404 passed; 0 failed; 2 ignored
+grep -rn 'Msg::Host' crates/ | wc -l                # was 0; now ≥ 4
 ```
 
+404 is 399 + 5.
+
 The strip is not on screen yet — `draw` does not call it until Task 8. That is
-deliberate: it keeps the layout rewrite in one task instead of five. Clippy
-will not complain, because `view/host.rs` is reached from its own tests.
+deliberate: it keeps the layout rewrite in one task instead of five.
+
+**Do not run the full task gate here.** `host::strip_line` has no caller in
+`main`'s tree until Task 8, and shep-cli is `[[bin]]`-only, so
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` fails on
+`dead_code` for code that is correct. The first draft of this plan claimed
+"clippy will not complain, because `view/host.rs` is reached from its own
+tests" — `frames.rs`'s own module doc records that this is exactly backwards,
+which is why that module is `#[cfg(test)]`. See "Where the gate runs".
 
 ### Step 4.6 — MUTATION
 
 In the `Msg::Host` arm, delete the `Link::Lost` early return.
-Nothing in this task's own tests reddens — **and that is the finding**. The
-test that catches it is 12a's
-`the_frozen_frame_does_not_move_however_long_the_link_stays_gone`, and it only
-catches it once the frozen scene carries a host sample and the strip is on
-screen. Record this in the task report as an explicit dependency: **Task 9 must
-give the frozen scene a host sample, and Step 9.6 re-runs this mutation.** A
-mutation with no red is a gap in coverage, and writing it down is what stops it
-being discovered in review instead.
+`a_frozen_dashboard_ignores_a_host_sample` must fail on
+`assert_eq!(app.host(), frozen)`.
+
+The first draft of this plan had no test here at all and said so — "nothing in
+this task's own tests reddens, and that is the finding" — deferring the catch
+to Task 9's frame comparison. Deferring a catch five tasks is how a gap gets
+shipped, and a reducer rule is testable in the reducer. **Step 9.6 still
+re-runs this mutation at the frame level**, because the two catch different
+things: this one proves the reducer refuses the sample, and that one proves the
+strip is on screen and drawing from it. Revert.
 
 ### Step 4.7 — second MUTATION
 
@@ -2944,35 +3242,56 @@ beginning `zzzz…PARTIAL-HEAD` appears. Revert.
 ## Task 6 — `lookout/view/bleats.rs`: the feed pane
 
 **Files:** new `crates/shep-cli/src/lookout/view/bleats.rs`;
-`crates/shep-cli/src/lookout/app.rs` (`Msg::Bleats` and the accessor);
-`crates/shep-cli/src/lookout/mod.rs` (`Effect::RefreshFeed`'s handler in
-`run_ui`).
+`crates/shep-cli/src/lookout/view/fixtures.rs` (the feed block);
+`crates/shep-cli/src/lookout/app.rs` (the `Msg::Bleats` variant, its arm and
+the accessor); `crates/shep-cli/src/lookout/mod.rs` — **three changes, not
+one**: `run_ui` gains its `local: L` parameter, the `Effect::RefreshFeed` stub
+Task 1 left becomes a coalesced read, **and the heartbeat arm starts producing
+`Msg::Host`**; `crates/shep-cli/src/lookout/view/mod.rs` (the `pub mod` line).
 
-**Expected delta:** +6 tests.
+The heartbeat is the one to read twice. Task 4 wrote `Msg::Host`, its reducer
+arm and the strip; **nothing produced the message.** Every pane test and every
+gallery frame injects it directly, so the whole phase would have gone green
+with the shipped binary drawing `host  not read yet` forever, under a strip Rin
+had approved from `frames.txt`. `run_ui` gains `local` here, so the sampling
+belongs here.
+
+**Expected delta:** +10 tests — seven in `view/bleats.rs`, one in `app.rs`,
+two in `lookout/mod.rs`.
 
 ### Step 6.1 — baseline
 
 ```bash
-grep -rn 'written since the last read' crates/ | wc -l   # 0
+grep -rn 'earlier lines not shown' crates/ | wc -l       # 0
 grep -c 'Msg::Bleats' crates/shep-cli/src/lookout/mod.rs # 0
+grep -c 'local.host()' crates/shep-cli/src/lookout/mod.rs # 0
+grep -c 'feed_dirty' crates/shep-cli/src/lookout/mod.rs  # 0
+grep -c 'Msg::Tick' crates/shep-cli/src/lookout/mod.rs   # 1 — the heartbeat arm, which this task changes
 ```
 
 ### Step 6.2 — RED
 
 ```rust
-    /// fails if the gap notice stops reaching the screen. Task 5 makes the
-    /// number exact; this is the half that makes it visible, and without it
-    /// the feed silently shows five lines of a four-megabyte burst.
+    /// fails if the BYTE half of the gap notice stops reaching the screen.
+    /// Task 5 makes the number exact; this is the half that makes it visible,
+    /// and without it the feed silently shows five lines of a four-megabyte
+    /// burst.
+    ///
+    /// "was never read", not "is not shown": the pane cannot say how many
+    /// lines are in those bytes — reading them is what the window exists to
+    /// avoid — so it says what the reader DID rather than inventing a count.
     #[test]
-    fn a_gap_replaces_the_header_and_says_how_much_went_by() {
+    fn a_byte_gap_replaces_the_header_and_says_how_much_was_never_read() {
         let app = with_feed(Tail {
             lines: vec![line(Stream::Out, "still here")],
+            missed_lines: 0,
             missed_bytes: 4_000_000,
+            read_bytes: 65_536,
             note: None,
         });
         let rendered = render_all(&feed_lines(&app, 120, 6));
         assert!(
-            rendered.contains("3.8M written since the last read is not shown"),
+            rendered.contains("3.8M written before these lines was never read"),
             "got {rendered:?}"
         );
         // And the ordinary header is gone while the gap notice is up: two
@@ -2980,36 +3299,108 @@ grep -c 'Msg::Bleats' crates/shep-cli/src/lookout/mod.rs # 0
         assert!(!rendered.contains("re-read with each listing"));
     }
 
+    /// fails if the pane claims completeness in the ORDINARY case. **This is
+    /// the test the first draft of this plan did not have**, and its absence
+    /// was the phase's worst defect: thirty lines fit inside one 64 KiB window
+    /// with room to spare, so `missed_bytes` is zero and the byte notice never
+    /// fires — while twenty-five of those thirty lines are not on screen. A
+    /// feed that lies is worse than no feed, and it would have lied exactly
+    /// when the flock was busy, which is when someone is watching it.
+    #[test]
+    fn a_pane_that_cannot_show_every_line_it_holds_says_how_many() {
+        let app = with_feed(Tail {
+            lines: (0..30).map(|n| line(Stream::Out, &format!("line-{n}"))).collect(),
+            missed_lines: 0,
+            missed_bytes: 0,
+            read_bytes: 4_096,
+            note: None,
+        });
+        let rendered = render_all(&feed_lines(&app, 120, 6));
+        assert!(rendered.contains("… 25 earlier lines not shown"), "got {rendered:?}");
+        assert!(
+            !rendered.contains("never read"),
+            "no bytes were skipped, so nothing may claim any were: {rendered:?}"
+        );
+    }
+
+    /// fails if the two kinds of loss get merged into one number. They are
+    /// different facts: the reader COUNTED the lines it dropped, and it never
+    /// looked at the bytes below the window at all. Adding an invented line
+    /// count for the second, or dropping the first because the second is
+    /// bigger, would both be the pane claiming to know something it does not.
+    #[test]
+    fn both_kinds_of_gap_are_named_separately_in_one_line() {
+        let app = with_feed(Tail {
+            lines: (0..30).map(|n| line(Stream::Out, &format!("line-{n}"))).collect(),
+            missed_lines: 500,
+            missed_bytes: 4_000_000,
+            read_bytes: 131_072,
+            note: None,
+        });
+        let rendered = render_all(&feed_lines(&app, 200, 6));
+        assert!(
+            rendered.contains("… 525 earlier lines not shown, and 3.8M before them never read"),
+            "500 the reader dropped plus 25 the pane has no room for: {rendered:?}"
+        );
+    }
+
     /// fails if the ordinary header stops naming the sheep, the streams, or
     /// the fact that this is a re-read rather than a live stream. An operator
     /// who reads this pane as `tail -f` will draw wrong conclusions from a
     /// two-second gap in a log, and the pane is the only place that can say
     /// so.
+    ///
+    /// `out then err`, not `out+err`. `+` reads as one merged stream, and this
+    /// is two files rendered end to end with no interleaving at all — a log
+    /// line carries no timestamp, so there is no key to merge on. A sheep with
+    /// forty stdout lines and one old stderr line shows the stale stderr line
+    /// UNDER the fresh stdout ones, and the header is the only place on screen
+    /// that can say why.
     #[test]
     fn the_header_says_which_sheep_and_that_it_is_a_re_read() {
         let app = with_feed_and_selection(
-            Tail { lines: vec![line(Stream::Out, "hello")], missed_bytes: 0, note: None },
-            "api",
+            Tail {
+                lines: vec![line(Stream::Out, "hello")],
+                missed_lines: 0,
+                missed_bytes: 0,
+                read_bytes: 6,
+                note: None,
+            },
+            1,
         );
         let rendered = render_all(&feed_lines(&app, 120, 6));
-        assert!(rendered.contains("bleats  api"), "got {rendered:?}");
-        assert!(rendered.contains("out+err"), "got {rendered:?}");
+        assert!(rendered.contains("bleats  sheep-1"), "got {rendered:?}");
+        assert!(rendered.contains("out then err"), "got {rendered:?}");
+        assert!(!rendered.contains("out+err"), "`+` reads as a merge: {rendered:?}");
         assert!(rendered.contains("re-read with each listing"), "got {rendered:?}");
     }
 
-    /// fails if the pane stops showing the NEWEST lines. A feed that scrolled
-    /// off the bottom would show an operator the beginning of a burst and hide
-    /// its end, which is the opposite of what a dashboard is for.
+    /// fails if the pane stops showing the NEWEST lines, **or stops saying
+    /// that the older ones went**. A feed that scrolled off the bottom would
+    /// show an operator the beginning of a burst and hide its end, which is
+    /// the opposite of what a dashboard is for; a feed that showed the end and
+    /// said nothing about the beginning would look complete, which is worse.
+    ///
+    /// The first draft of this test asserted only the ordering, and so
+    /// certified the silence as correct.
     #[test]
-    fn the_pane_shows_the_last_lines_that_fit_and_not_the_first() {
+    fn the_pane_shows_the_last_lines_that_fit_and_says_so() {
         let app = with_feed(Tail {
             lines: (0..40).map(|n| line(Stream::Out, &format!("line-{n}"))).collect(),
+            missed_lines: 0,
             missed_bytes: 0,
+            read_bytes: 4_096,
             note: None,
         });
         let rendered = render_all(&feed_lines(&app, 120, 6));
-        assert!(rendered.contains("line-39"), "the newest line is on screen");
-        assert!(!rendered.contains("line-0\n"), "the oldest is not");
+        for n in 35..40 {
+            assert!(rendered.contains(&format!("out  line-{n}")), "line-{n} is on screen");
+        }
+        assert!(!rendered.contains("out  line-34"), "and line-34 is not: {rendered:?}");
+        assert!(
+            rendered.contains("… 35 earlier lines not shown"),
+            "and the pane says the other thirty-five went: {rendered:?}"
+        );
     }
 
     /// fails if `err` stops being distinguishable from `out` by TEXT, or
@@ -3022,7 +3413,9 @@ grep -c 'Msg::Bleats' crates/shep-cli/src/lookout/mod.rs # 0
         let app = with_feed_and_palette(
             Tail {
                 lines: vec![line(Stream::Out, "fine"), line(Stream::Err, "warning")],
+                missed_lines: 0,
                 missed_bytes: 0,
+                read_bytes: 32,
                 note: None,
             },
             palette,
@@ -3046,7 +3439,9 @@ grep -c 'Msg::Bleats' crates/shep-cli/src/lookout/mod.rs # 0
     fn an_empty_feed_prints_the_reason_rather_than_nothing() {
         let app = with_feed(Tail {
             lines: Vec::new(),
+            missed_lines: 0,
             missed_bytes: 0,
+            read_bytes: 0,
             note: Some("this sheep has written nothing yet".to_string()),
         });
         let rendered = render_all(&feed_lines(&app, 120, 6));
@@ -3070,10 +3465,173 @@ grep -c 'Msg::Bleats' crates/shep-cli/src/lookout/mod.rs # 0
     }
 ```
 
+And in `lookout/mod.rs`'s `mod tests`, against a `FakeLocal` that reads nothing
+and counts what it was asked for:
+
+```rust
+    /// A `Local` that touches no disk: a fixed sample, a fixed tail, and a
+    /// count of each call. `Arc`, because `run_ui` takes the reader by value
+    /// and only gives the terminal back.
+    #[derive(Clone, Default)]
+    struct FakeLocal {
+        sample: Option<HostSample>,
+        hosts: Arc<AtomicUsize>,
+        tails: Arc<AtomicUsize>,
+    }
+
+    impl Local for FakeLocal {
+        fn host(&mut self) -> Option<HostSample> {
+            self.hosts.fetch_add(1, Ordering::Relaxed);
+            self.sample
+        }
+
+        fn tail(&mut self, _out: Option<&Path>, _err: Option<&Path>) -> Tail {
+            self.tails.fetch_add(1, Ordering::Relaxed);
+            Tail::default()
+        }
+    }
+
+    /// fails if **nothing ever produces a `Msg::Host`.** The strip renders
+    /// from `App::host`, the reducer arm was written in Task 4, and every pane
+    /// test and every gallery frame injects the message directly — so a
+    /// heartbeat that still yielded only `Msg::Tick` leaves the shipped binary
+    /// drawing `host  not read yet` forever with nothing red anywhere on the
+    /// suite. That is what the first draft of this plan shipped, and it is
+    /// invisible to every other check in the phase.
+    ///
+    /// Asserted on the READER rather than on a frame, because at this task the
+    /// strip is not on screen yet — `draw` does not call it until Task 8, and
+    /// Task 8 adds `a_heartbeat_puts_the_host_strip_on_the_frame` for the
+    /// other half. What is testable here is the call, and the missing call is
+    /// the bug.
+    ///
+    /// IR-46: bounded — a `timeout` around a genuinely async loop, and a quit
+    /// queued on a timer, so it cannot hang.
+    #[tokio::test(start_paused = true)]
+    async fn the_heartbeat_asks_the_local_reader_for_a_host_sample() {
+        let (msg_tx, msg_rx) = mpsc::channel(64);
+        let (poll_tx, _poll_rx) = mpsc::channel(4);
+        let local = FakeLocal::default();
+        let hosts = Arc::clone(&local.hosts);
+
+        // After the 1-second heartbeat, so the tick lands first.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            let _ = msg_tx.send(Msg::Key(KeyPress::Quit)).await;
+        });
+
+        let app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/tmp/shep".to_string(),
+            Instant::now(),
+        );
+        let terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_ui(app, terminal, stream::empty(), msg_rx, poll_tx, local),
+        )
+        .await
+        .expect("the loop left within ten seconds");
+
+        assert!(
+            hosts.load(Ordering::Relaxed) >= 1,
+            "the heartbeat fired and never sampled the host"
+        );
+    }
+
+    /// fails if a burst of keypresses costs one two-file read per key.
+    ///
+    /// `input::map_key` drops `KeyEventKind::Repeat`, but ordinary terminals
+    /// deliver auto-repeat as a stream of Press events — so a held `j` on a
+    /// long flock is twenty to thirty moved selections a second, and an
+    /// uncoalesced `Effect::RefreshFeed` would put a synchronous 128 KiB read
+    /// behind every one of them, on the task that also owns the redraw. The
+    /// read is coalesced onto the `MIN_REDRAW` gate for that reason, so a
+    /// burst costs one read rather than twenty-one.
+    ///
+    /// `assert_eq!(1)` and not `<= 2`: the exact number is the property. One
+    /// snapshot and twenty moves arrive with no time between them, so nothing
+    /// is read until the clock passes `MIN_REDRAW`, and then it is read once.
+    ///
+    /// IR-46: bounded, same shape as the test above.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_selection_moves_costs_one_read_and_not_one_per_key() {
+        let (msg_tx, msg_rx) = mpsc::channel(64);
+        let (poll_tx, _poll_rx) = mpsc::channel(4);
+        let local = FakeLocal::default();
+        let tails = Arc::clone(&local.tails);
+
+        let at = Instant::now();
+        msg_tx
+            .send(Msg::Snapshot {
+                rows: (0..8)
+                    .map(|id| {
+                        ProcessInfo::builder(id, format!("sheep-{id}"), ProcStatus::Online).build()
+                    })
+                    .collect(),
+                at,
+            })
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            msg_tx.send(Msg::Key(KeyPress::SelectDown)).await.unwrap();
+        }
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            let _ = msg_tx.send(Msg::Key(KeyPress::Quit)).await;
+        });
+
+        let app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/tmp/shep".to_string(),
+            Instant::now(),
+        );
+        let terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_ui(app, terminal, stream::empty(), msg_rx, poll_tx, local),
+        )
+        .await
+        .expect("the loop left within ten seconds");
+
+        assert_eq!(
+            tails.load(Ordering::Relaxed),
+            1,
+            "a snapshot and twenty selection moves must coalesce into one read"
+        );
+    }
+```
+
 ### Step 6.3 — GREEN
 
+**`Msg` grows its second variant of the phase**, and it needs writing out —
+`missing_docs` is denied and every existing variant documents its fields:
+
+```rust
+    /// One refresh of the selected sheep's log files, in answer to an
+    /// [`Effect::RefreshFeed`] this reducer asked for.
+    ///
+    /// Returns [`Effect::None`] unconditionally; see its arm.
+    Bleats {
+        /// What the read found, including what it could not show.
+        tail: super::tail::Tail,
+    },
+```
+
 `App` gains `feed: Tail` (defaulting to `Tail::default()`), a `feed()`
-accessor, and the arm:
+accessor:
+
+```rust
+    /// The selected sheep's most recent output, as of the last refresh.
+    #[must_use]
+    pub fn feed(&self) -> &Tail {
+        &self.feed
+    }
+```
+
+and the arm:
 
 ```rust
             // Always `Effect::None`. A reducer that answered its own feed
@@ -3100,39 +3658,46 @@ pub fn feed_lines(app: &App, width: u16, rows: usize) -> Vec<Line<'static>> {
     let palette = app.palette();
     let mut out = Vec::with_capacity(rows);
     let feed = app.feed();
+    let body = rows.saturating_sub(1);
+
+    // Lines go missing in three places and this is where two of them are
+    // added up: the ones the READER discarded (above the forty-line cap, plus
+    // the line the window boundary cut) and the ones this PANE holds and has
+    // no room for. Both exact. The third — bytes below the window — cannot be
+    // counted in lines at all and is reported separately, in bytes. See the
+    // phase plan's design decision 1.
+    let lost_lines = feed.missed_lines + feed.lines.len().saturating_sub(body);
 
     out.push(match app.selected_row() {
         None => Line::from(Span::styled(
             fit("bleats  no sheep is selected", width),
             palette.muted(),
         )),
-        Some(row) if feed.missed_bytes > 0 => Line::from(Span::styled(
-            fit(
-                &format!(
-                    "bleats  {}  … {} written since the last read is not shown",
-                    row.info.name,
-                    human_bytes(feed.missed_bytes)
+        Some(row) => match gap_notice(lost_lines, feed.missed_bytes) {
+            Some(notice) => Line::from(Span::styled(
+                fit(&format!("bleats  {}  {notice}", row.info.name), width),
+                // Attention, not alarm: a sheep writing faster than a
+                // two-second poll is busy, not broken. `--bark` means errored,
+                // refused and destructive.
+                palette.attention(),
+            )),
+            // `out then err`, not `out+err`: `+` reads as one merged stream,
+            // and there is no merge — a log line carries no timestamp, so
+            // there is no key to interleave two files on. This header is the
+            // only place on screen that can say so.
+            None => Line::from(Span::styled(
+                fit(
+                    &format!(
+                        "bleats  {}  out then err  from the log files, re-read with each listing",
+                        row.info.name
+                    ),
+                    width,
                 ),
-                width,
-            ),
-            // Attention, not alarm: a sheep writing faster than a two-second
-            // poll is busy, not broken. `--bark` means errored, refused and
-            // destructive.
-            palette.attention(),
-        )),
-        Some(row) => Line::from(Span::styled(
-            fit(
-                &format!(
-                    "bleats  {}  out+err  from the log files, re-read with each listing",
-                    row.info.name
-                ),
-                width,
-            ),
-            palette.muted(),
-        )),
+                palette.muted(),
+            )),
+        },
     });
 
-    let body = rows.saturating_sub(1);
     if feed.lines.is_empty() {
         if let Some(note) = feed.note.as_deref() {
             out.push(Line::from(Span::styled(fit(note, width), palette.muted())));
@@ -3158,48 +3723,158 @@ pub fn feed_lines(app: &App, width: u16, rows: usize) -> Vec<Line<'static>> {
     }
     out
 }
+
+/// What the header says about what is not on screen, or `None` when
+/// everything is.
+///
+/// **Two quantities, because they are two different facts, and merging them
+/// would mean inventing one of them.** `lines` is exact — the reader counted
+/// what it discarded and the pane counts what it has no room for. `bytes` is
+/// exact as bytes and *unknowable as lines*: reading them is precisely what
+/// the 64 KiB window exists to avoid. So the wording for the byte half says
+/// what the reader DID — it never read them — rather than putting a line count
+/// on them that nothing measured.
+fn gap_notice(lines: usize, bytes: u64) -> Option<String> {
+    match (lines, bytes) {
+        (0, 0) => None,
+        (0, bytes) => Some(format!(
+            "… {} written before these lines was never read",
+            human_bytes(bytes)
+        )),
+        (lines, 0) => Some(format!("… {}", earlier_lines(lines))),
+        (lines, bytes) => Some(format!(
+            "… {}, and {} before them never read",
+            earlier_lines(lines),
+            human_bytes(bytes)
+        )),
+    }
+}
+
+/// `1 earlier line` / `25 earlier lines`. A sentence with the wrong plural on
+/// it reads as a rendering bug, and this one is on screen during an incident.
+fn earlier_lines(count: usize) -> String {
+    if count == 1 {
+        "1 earlier line not shown".to_string()
+    } else {
+        format!("{count} earlier lines not shown")
+    }
+}
 ```
 
-`run_ui`'s new effect arm:
+### Step 6.3b — GREEN: `run_ui`, in three places
+
+**One.** The signature gains the reader, and the three call sites
+(`mod.rs:191`, and the two in `mod tests`) pass one:
 
 ```rust
+pub async fn run_ui<B: Backend, S, L>(
+    mut app: App,
+    mut terminal: Terminal<B>,
+    events: S,
+    mut msgs: mpsc::Receiver<Msg>,
+    polls: mpsc::Sender<()>,
+    mut local: L,
+) -> Terminal<B>
+where
+    S: Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin,
+    L: source::Local,
+```
+
+`lookout()` passes `source::LocalReader::new()`; the two existing tests pass a
+`FakeLocal::default()`, which samples nothing and returns `Tail::default()`.
+
+**Two.** `Effect::RefreshFeed` — the stub Task 1 left — becomes a *request*,
+not a read. The read itself moves up to the redraw gate:
+
+```rust
+            // Not the read. `Effect::RefreshFeed` arrives once per moved
+            // selection, and ordinary terminals deliver a held `j` as twenty
+            // to thirty Press events a second — so doing the I/O here would
+            // put a synchronous 128 KiB read behind every repeat, on the task
+            // that also owns the redraw. Coalesced onto `MIN_REDRAW` below,
+            // which is three lines and the same gate the draw already uses.
             Effect::RefreshFeed => {
-                // The paths are cloned out before `app` is borrowed mutably.
-                let (out, err) = app.selected_row().map_or((None, None), |row| {
-                    (row.info.out_file.clone(), row.info.err_file.clone())
-                });
-                let tail = local.tail(
-                    out.as_deref().map(Path::new),
-                    err.as_deref().map(Path::new),
-                );
-                // `let _`: `Msg::Bleats` returns `Effect::None` by
-                // construction — see its arm in the reducer — and acting on a
-                // returned effect here would be the one place this design
-                // could recurse.
-                let _ = app.update(Msg::Bleats { tail });
+                feed_dirty = true;
                 dirty = true;
             }
 ```
 
-and `run_ui` gains `mut local: L` with `L: Local`, wired from `lookout()` as
-`source::LocalReader::new()`. `run_ui`'s doc comment gains one paragraph saying
-the `select!` gained **no arm** this phase and why that matters (the
-arm-retirement reasoning above it is the subtlest thing in the module).
+and at the top of the loop, where `MIN_REDRAW` already lives:
 
-The two existing `run_ui` tests get a `FakeLocal` that returns
-`(None, Tail::default())`.
+```rust
+        // One gate, read once, so the feed cannot be refreshed on a frame that
+        // is not about to be drawn — and, more importantly, is refreshed
+        // BEFORE the frame that shows it rather than after.
+        let may_draw = last_draw.is_none_or(|at| at.elapsed() >= MIN_REDRAW);
+        if feed_dirty && may_draw {
+            // The paths are cloned out before `app` is borrowed mutably.
+            let (out, err) = app.selected_row().map_or((None, None), |row| {
+                (row.info.out_file.clone(), row.info.err_file.clone())
+            });
+            let tail = local.tail(
+                out.as_deref().map(Path::new),
+                err.as_deref().map(Path::new),
+            );
+            // `let _`: `Msg::Bleats` returns `Effect::None` by construction —
+            // see its arm in the reducer — and acting on a returned effect
+            // here would be the one place this design could recurse.
+            let _ = app.update(Msg::Bleats { tail });
+            feed_dirty = false;
+            dirty = true;
+        }
+        if dirty && may_draw {
+            let _ = terminal.draw(|frame| view::draw(&app, frame));
+            dirty = false;
+            last_draw = Some(Instant::now());
+        }
+```
+
+with `let mut feed_dirty = false;` beside `let mut dirty = true;`.
+
+**Three — and this is the one the first draft of this plan left out
+entirely.** The heartbeat arm starts producing the host sample:
+
+```rust
+            _ = heartbeat.tick() => {
+                // The host sample rides this arm rather than adding a fifth
+                // one. The `biased` select's arm-retirement reasoning is the
+                // subtlest thing in this module and this phase deliberately
+                // does not re-derive it; sampling memory and a load average is
+                // microseconds and no process-table walk.
+                //
+                // Sampled unconditionally, and REFUSED by the reducer once the
+                // link is lost — one enforcement point, the same division
+                // `Msg::Tick` and the uptime clock already use. `let _`:
+                // `Msg::Host` returns `Effect::None` by construction.
+                let _ = app.update(Msg::Host { sample: local.host() });
+                Some(Msg::Tick { now: Instant::now() })
+            }
+```
+
+`run_ui`'s doc comment gains one paragraph saying the `select!` gained **no
+arm** this phase, that the host sample rides arm 4 and the feed rides the
+redraw gate, and why that matters — the arm-retirement reasoning above it is
+the subtlest thing in the module and nothing here should make a reader
+re-derive it.
 
 ### Step 6.4 — verify
 
 ```bash
-cargo test -p shep-cli --bins --all-features                    # 407 passed; 0 failed; 2 ignored
-grep -rn 'written since the last read' crates/ | wc -l          # was 0; now ≥ 2
+cargo fmt --all --check
+cargo test -p shep-cli --bins --all-features                    # 414 passed; 0 failed; 2 ignored
+grep -rn 'earlier lines not shown' crates/ | wc -l              # was 0; now ≥ 3
+grep -c 'local.host()' crates/shep-cli/src/lookout/mod.rs       # was 0; now 1
+grep -c 'feed_dirty' crates/shep-cli/src/lookout/mod.rs         # was 0; now 4
 ```
+
+414 is 404 + 10. Still the inner loop: `detail::detail_lines` and
+`host::strip_line` are both still unreachable from `main`, so the clippy gate
+would fail on `dead_code`. Task 8 is where it runs.
 
 ### Step 6.5 — MUTATION
 
 In `feed_lines`, `.take(body)` instead of `.skip(skip)`.
-`the_pane_shows_the_last_lines_that_fit_and_not_the_first` must fail. Revert.
+`the_pane_shows_the_last_lines_that_fit_and_says_so` must fail. Revert.
 
 ### Step 6.6 — second MUTATION
 
@@ -3207,13 +3882,45 @@ Style the `err` tag with `palette.alarm()`.
 `the_stream_tag_is_a_word_and_stderr_is_not_bark` must fail on its span sweep.
 Revert.
 
+### Step 6.7 — third MUTATION: the line half of the gap
+
+In `feed_lines`, drop the pane's own term:
+`let lost_lines = feed.missed_lines;`.
+`a_pane_that_cannot_show_every_line_it_holds_says_how_many` and
+`the_pane_shows_the_last_lines_that_fit_and_says_so` must both fail, and
+`both_kinds_of_gap_are_named_separately_in_one_line` must fail on the number
+(500 rather than 525). **The byte test must still pass**, which is the finding:
+this mutation restores exactly the first draft's behaviour, and the byte-only
+check that draft carried could not see it. Revert.
+
+### Step 6.8 — fourth MUTATION: the sample nobody takes
+
+In the heartbeat arm, delete the `app.update(Msg::Host { .. })` line so the arm
+yields only `Msg::Tick` again — the first draft's behaviour.
+`the_heartbeat_asks_the_local_reader_for_a_host_sample` must fail.
+
+Then check the second half of the finding: **run the whole suite with the
+mutation still applied** and confirm that this is the *only* red. Every pane
+test and every gallery frame injects `Msg::Host` directly, so if any other
+check reddens, it is coupled to the loop in a way nothing has written down.
+Revert.
+
+### Step 6.9 — fifth MUTATION: the coalescing
+
+Move the read back into the `Effect::RefreshFeed` arm — do the I/O there and
+drop `feed_dirty` entirely.
+`a_burst_of_selection_moves_costs_one_read_and_not_one_per_key` must fail with
+21 reads rather than 1. Revert.
+
 ---
 
 ## Task 7 — `lookout/view/detail.rs`: the sheep detail pane
 
 Three lines about the selected sheep, from the listing already in hand.
 
-**Files:** new `crates/shep-cli/src/lookout/view/detail.rs`.
+**Files:** new `crates/shep-cli/src/lookout/view/detail.rs`;
+`crates/shep-cli/src/lookout/view/fixtures.rs` (the selection block);
+`crates/shep-cli/src/lookout/view/mod.rs` (the `pub mod` line).
 
 **Expected delta:** +4 tests.
 
@@ -3223,6 +3930,12 @@ Three lines about the selected sheep, from the listing already in hand.
 grep -rn 'no sheep selected' crates/ | wc -l    # 0
 grep -rn 'lambs' crates/shep-cli/src/lookout/ | wc -l   # 0 — and it stays 0
 ```
+
+The helpers this task's tests use — `with_selection`,
+`with_selection_and_palette`, `sheep_with_lambs`, `render_all` — are in
+"Shared test fixtures". `with_selection` builds a **two**-sheep flock with the
+selection on the second, which is what makes Step 7.5's mutation able to
+redden; a one-sheep fixture would make it invisible.
 
 ### Step 7.2 — RED
 
@@ -3409,20 +4122,28 @@ fn path_line(
 ### Step 7.4 — verify
 
 ```bash
-cargo test -p shep-cli --bins --all-features               # 411 passed; 0 failed; 2 ignored
-grep -rn 'lambs\|Describe' crates/shep-cli/src/lookout/ | wc -l   # still 0
+cargo fmt --all --check
+cargo test -p shep-cli --bins --all-features               # 418 passed; 0 failed; 2 ignored
+grep -rn 'Describe' crates/shep-cli/src/lookout/ | wc -l   # still 0
 ```
 
-That last one is the scope fence for this phase, and it is checked rather than
-trusted.
+418 is 414 + 4. Inner loop only — `detail::detail_lines` has no caller in
+`main`'s tree until Task 8.
+
+`Describe` is the scope fence for this phase, and it is checked rather than
+trusted. **`lambs` is no longer greppable to zero**, because
+`fixtures::sheep_with_lambs` names it on purpose: the pane must stay silent
+about lambs even when handed some, since the failure being guarded is a
+caption promising a list, not a missing `if let`. Grep for `Describe` alone.
 
 ### Step 7.5 — MUTATION
 
 In `detail_lines`, replace `app.selected_row()` with `app.rows().first().copied()`.
-`the_pane_adds_the_full_name_and_both_log_paths` must fail once the fixture has
-more than one sheep — **check that it does**; if `with_selection` builds a
-one-sheep flock, the mutation cannot redden and the fixture needs a second
-sheep before the mutation is meaningful. Revert.
+`the_pane_adds_the_full_name_and_both_log_paths` must fail: `with_selection`
+builds a two-sheep flock with a `decoy` at id 0 and the selection moved onto
+the sheep under test, so `first()` returns the wrong one. If it passes, the
+fixture is not the one in "Shared test fixtures" — a one-sheep flock makes this
+mutation invisible, which is why the fixture asserts `info.id > 0`. Revert.
 
 ### Step 7.6 — second MUTATION
 
@@ -3436,16 +4157,30 @@ Revert.
 
 Everything built so far reaches the screen.
 
-**Files:** `crates/shep-cli/src/lookout/view/mod.rs`.
+**Files:** `crates/shep-cli/src/lookout/view/mod.rs`;
+`crates/shep-cli/src/lookout/view/fixtures.rs` (`full_app`);
+`crates/shep-cli/src/lookout/mod.rs` (one `run_ui` test).
 
-**Expected delta:** +4 tests, and all eight snapshots re-accepted again.
+**Expected delta:** +5 tests, and all eight snapshots re-accepted again.
+
+**This is the task the full gate runs after.** Every one of the four modules
+written before its call site — `tail::read`, `LocalReader`, `host::strip_line`,
+`detail::detail_lines` — is wired into `draw` or `run_ui` by the end of it, so
+this is the first point at which the tree is reachability-complete and
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` can pass.
+See "Where the gate runs".
 
 ### Step 8.1 — baseline
 
 ```bash
 grep -c 'panes_for' crates/shep-cli/src/lookout/view/mod.rs   # 0
 grep -c 'HOST_ROWS\|DETAIL_ROWS\|FEED_ROWS' crates/shep-cli/src/lookout/view/mod.rs   # 0
+grep -c 'host::strip_line\|detail::detail_lines\|bleats::feed_lines' crates/shep-cli/src/lookout/view/mod.rs   # 0
 ```
+
+The third one is the reachability check: it is `0` before this task and must be
+`3` after, which is the same fact the clippy gate is about to assert the hard
+way.
 
 ### The layout, by arithmetic
 
@@ -3529,18 +4264,106 @@ in advance.
         for height in MIN_HEIGHT..=60 {
             for width in [MIN_TERM_WIDTH, 40, 51, 80, 120, 200] {
                 let frame = draw_to(&app, width, height);
-                assert_eq!(
-                    frame.lines().count(),
-                    usize::from(height),
-                    "{width}x{height} drew the wrong number of rows"
-                );
-                let last = frame.lines().last().unwrap();
+                let lines: Vec<&str> = frame.lines().collect();
+                let panes = panes_for(height);
+
+                // NOT `lines.len() == height`: `frames::render_text` maps
+                // `(0..area.height)` over `(0..area.width)` by construction,
+                // so that holds for any `draw` whatsoever — including one that
+                // drew nothing at all. It is a property of the renderer, not
+                // of this layout, and asserting it here would be a check that
+                // cannot fail.
+                let last = lines.last().unwrap();
                 assert!(
                     last.contains("read-only"),
                     "the status bar survived at {width}x{height}: {last:?}"
                 );
+                // The row above the status bar belongs to the bottom-most pane
+                // that is up, so it is never blank — a blank one means the
+                // upward layout left a hole, which is the failure mode the
+                // arithmetic here actually has.
+                if panes.feed || panes.detail {
+                    let above = lines[lines.len() - 2];
+                    assert!(
+                        !above.trim().is_empty(),
+                        "a blank row above the status bar at {width}x{height}"
+                    );
+                }
+                // And every pane that is up appears exactly once, so nothing
+                // overlapped anything else.
+                if panes.host {
+                    assert_eq!(
+                        lines.iter().filter(|l| l.starts_with("host  ")).count(),
+                        1,
+                        "the strip at {width}x{height}"
+                    );
+                }
+                if panes.feed {
+                    assert_eq!(
+                        lines.iter().filter(|l| l.starts_with("bleats  ")).count(),
+                        1,
+                        "the feed header at {width}x{height}"
+                    );
+                }
+                if panes.detail {
+                    // The PATH prefix, not a bare `out  ` — the feed's own
+                    // body lines are tagged `out  ` too, and counting those
+                    // would make this assertion depend on how many log lines
+                    // the fixture happens to carry.
+                    assert_eq!(
+                        lines
+                            .iter()
+                            .filter(|l| l.starts_with("out  /home/rin/.shep/logs/"))
+                            .count(),
+                        1,
+                        "the detail pane's out path at {width}x{height}"
+                    );
+                }
             }
         }
+    }
+
+    /// fails if a heartbeat does not put the host strip on the frame. The
+    /// other half of Task 6's `the_heartbeat_asks_the_local_reader_for_a_host
+    /// _sample`, which could only assert the call because the strip was not
+    /// drawable yet. This is the end-to-end: a `Local` that reports a sample,
+    /// one heartbeat, and the numbers on the rendered frame.
+    ///
+    /// It is the only check in the phase that would catch a heartbeat that
+    /// sampled and a `draw` that ignored the result, or the reverse.
+    ///
+    /// IR-46: bounded — a quit queued on a timer, inside a `timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_puts_the_host_strip_on_the_frame() {
+        let (msg_tx, msg_rx) = mpsc::channel(64);
+        let (poll_tx, _poll_rx) = mpsc::channel(4);
+        let local = FakeLocal { sample: Some(fixtures::sample()), ..FakeLocal::default() };
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            let _ = msg_tx.send(Msg::Key(KeyPress::Quit)).await;
+        });
+
+        let app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/tmp/shep".to_string(),
+            Instant::now(),
+        );
+        let terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let terminal = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_ui(app, terminal, stream::empty(), msg_rx, poll_tx, local),
+        )
+        .await
+        .expect("the loop left within ten seconds");
+
+        let frame = crate::lookout::frames::render_text(terminal.backend().buffer());
+        assert!(
+            frame.contains("host  load 2.31 4.10 3.88 / 10 cores"),
+            "the strip drew the sample the heartbeat took: {frame}"
+        );
+        assert!(!frame.contains("not read yet"), "and not the pre-heartbeat sentence");
     }
 
     /// fails if the flock table stops being the spine. Rin's ruling in one
@@ -3559,6 +4382,15 @@ in advance.
         assert!(data_rows >= 5, "the table got {data_rows} rows at 120x24");
     }
 ```
+
+The last of those five goes in **`lookout/mod.rs`**'s `mod tests`, not
+`view/mod.rs`'s — it drives `run_ui`, and that is where `run_ui`'s other tests
+and `FakeLocal` already are. The other four are `view/mod.rs`'s.
+
+For it to reach `fixtures::sample()`, `view/mod.rs` declares the fixtures
+module as `#[cfg(test)] pub mod fixtures;` — the same shape
+`lookout::frames` already uses (`mod.rs:26-27`: `#[cfg(test)]` on a `pub mod`,
+so the items exist under `cargo test` and do not exist at all otherwise).
 
 ### Step 8.3 — GREEN
 
@@ -3684,12 +4516,30 @@ backstop.
 ```bash
 cargo test -p shep-cli --bins --all-features        # snapshot failures expected
 cargo insta review                                  # LOOK at these — the panes are new
-cargo test -p shep-cli --bins --all-features        # 415 passed; 0 failed; 2 ignored
+cargo test -p shep-cli --bins --all-features        # 422 passed; 0 failed; 2 ignored
+grep -c 'host::strip_line\|detail::detail_lines\|bleats::feed_lines' crates/shep-cli/src/lookout/view/mod.rs   # was 0; now 3
 ```
+
+422 is 418 + 5.
 
 `insta review` rather than `insta accept` here, deliberately: this is the first
 time the three panes appear on a frame, and the reviewer's eye is the only
 thing that catches a pane rendering in the wrong place at a plausible size.
+
+**Then the full task gate, for the first time this phase**, each from its own
+command with `$?` read directly:
+
+```bash
+cargo fmt --all --check;                                                    echo "EXIT=$?"
+cargo clippy --workspace --all-targets --all-features -- -D warnings;       echo "EXIT=$?"
+cargo test --workspace --all-features;                                      echo "EXIT=$?"
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features;  echo "EXIT=$?"
+```
+
+The clippy run is the one carrying information here: everything written in
+Tasks 3-7 has been unreachable from `main` until this task wired it, so this is
+the run that proves nothing was written and then forgotten. A `dead_code`
+failure here names a real gap — do not silence it, wire it.
 
 ### Step 8.5 — MUTATION
 
@@ -3712,7 +4562,20 @@ Lay the bottom stack out downward instead of upward — compute `detail_at` from
 `y` rather than `floor`.
 `every_pane_lands_inside_its_own_rows_across_the_size_sweep` must fail: at a
 short terminal the detail pane lands on the flock table's rows and the status
-bar is overwritten or missing. Revert.
+bar is overwritten or missing. Confirm it fails on one of the **new**
+assertions — the `out  ` count, or the non-blank row above the status bar —
+and not only on the old row-count one, which is gone precisely because it
+could not distinguish this. Revert.
+
+### Step 8.8 — fourth MUTATION
+
+In `draw`, drop the `host::strip_line` call, leaving `panes.host` to reserve a
+row nothing writes into.
+`a_heartbeat_puts_the_host_strip_on_the_frame` must fail, and so must
+`every_pane_lands_inside_its_own_rows_across_the_size_sweep`'s `host  ` count.
+The pane-count assertions are what turn "the layout reserved the right rows"
+into "the right things are in them", and that distinction is the whole of this
+task. Revert.
 
 ---
 
