@@ -131,9 +131,10 @@ const MIN_CRON_SLEEP: UpDuration = UpDuration::from_millis(1_000);
 /// **This lives in the shepherd's config file and nowhere else.** There is no
 /// `--allow-control` flag and no `SHEP_*` variable, deliberately: spec §14.7
 /// rules that whistle's gate is daemon config because config is auditable and
-/// flags are per-invocation, and whistle's launcher is an agent host whose own
-/// config file writes the argv. A flag would let the same edit that adds the
-/// MCP server open the gate, in the same line, invisibly.
+/// flags are per-invocation. That is a legibility argument, not a
+/// containment one — `--home`/`SHEP_HOME` already choose which `shep.toml`
+/// gets read, so a flag would open nothing those don't already; a boolean in
+/// a file just leaves a diff and an mtime an operator can audit.
 ///
 /// The shepherd itself never reads this key — `shep whistle` reads the file
 /// directly, at startup, in its own process. It is here because this struct is

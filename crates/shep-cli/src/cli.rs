@@ -226,8 +226,10 @@ pub enum Commands {
     /// That gate is a guard against an agent acting on its own reading of
     /// your flock, not a security boundary: whistle runs as you, so anything
     /// it could do you can already do with `shep stop`. There is deliberately
-    /// no flag for it — an agent host writes its own launch command, and a
-    /// flag would let the same edit that adds this server open the gate.
+    /// no flag for it — legibility, not containment: a boolean in
+    /// `shep.toml` has a diff and an mtime an operator can audit, and
+    /// `--home`/`SHEP_HOME` already choose which `shep.toml` that is, so a
+    /// flag would open nothing those don't already.
     Whistle,
     /// Reopen log files after an external rotator has renamed them.
     Reopen(ReopenArgs),
