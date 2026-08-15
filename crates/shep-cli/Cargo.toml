@@ -48,6 +48,18 @@ shep-client.workspace = true
 # resolved version, matching `Cargo.lock`'s single `sysinfo` entry both
 # before and after this change.
 sysinfo.workspace = true
+# `serve`'s basic-auth comparison, through `hmac::sign`/`hmac::verify` — see
+# `serve/auth.rs`'s `credentials_match` doc comment for why it is `hmac` and
+# not `constant_time`/`digest` as this phase's plan originally specified:
+# `ring::constant_time` is `deprecated_constant_time` under an alias in the
+# 0.17.14 this workspace resolves, and its own doc comment disclaims side-
+# channel guarantees for external callers. Adds ZERO crates to the tree —
+# `tokio-rustls` above already pulls this exact version in for the bark
+# dog's TLS (Cargo.lock resolves one `ring`), and this crate already pays
+# ring's `cc` build script on every cross-compile. Named directly rather
+# than reached through `tokio_rustls::rustls`: rustls does not re-export
+# ring's hmac, and a crate that uses a dependency says so.
+ring = { version = "0.17", default-features = false }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "env", "wrap_help"] }
 # `default-features = false` is a no-op here — clap_complete's own default
 # feature set is empty — kept for consistency with the workspace rule.

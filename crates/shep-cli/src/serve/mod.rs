@@ -11,7 +11,10 @@
 //!
 //! `mime` and `listing` are pure like `path`: an extension-to-content-type
 //! table and the autoindex HTML renderer, neither touching a filesystem or
-//! a `cfg`.
+//! a `cfg`. `auth` is pure-ish: its own permission-mode check is the one
+//! unix-only piece, isolated to a single internal function so the rest —
+//! the creds parse and the constant-time basic-auth comparison — stays
+//! portable like the others.
 
 mod path;
 
@@ -21,3 +24,5 @@ mod fs;
 mod mime;
 
 mod listing;
+
+mod auth;
