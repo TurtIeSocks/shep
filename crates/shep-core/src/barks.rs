@@ -347,6 +347,14 @@ impl RingLock {
     /// # Errors
     /// Never — the signature matches the unix arm so the caller has one
     /// shape.
+    /// # Non-unix
+    /// There is no lock here — this returns a handle that holds nothing, and
+    /// two concurrent writers can lose each other's edits. That is sound only
+    /// because every verb refuses on Windows before reaching this code
+    /// (`shep-cli`'s entry point). Anyone un-gating Windows must build the
+    /// lock first: `LockFileEx` is mandatory rather than advisory, so the
+    /// unix design does not port directly, but `OpenOptionsExt::share_mode(0)`
+    /// is safe std and needs a retry loop where `flock` blocks.
     #[cfg(not(unix))]
     fn acquire(_path: &Path) -> std::io::Result<Self> {
         Ok(Self {})
