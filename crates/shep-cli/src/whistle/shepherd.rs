@@ -22,13 +22,10 @@ use crate::exit::ExitCode;
 /// Not an error enum, so IR-20's `#[non_exhaustive]` rule does not apply; and
 /// shep-cli is `[[bin]]`-only, so nothing here is in a library crate at all.
 ///
-/// `super::read`'s five tools (Task 6) are the first real callers of
-/// [`Self::call`]/[`Self::call_with_ack`], each holding one as
-/// `Whistle::shepherd` — reached transitively through `read`'s own
-/// `#[allow(dead_code)]` router, so those two methods need no allow of
-/// their own. [`Self::new`] is different: nothing in `main` constructs a
-/// `Whistle` (and so a `Shepherd`) yet — that's Task 8's job, building one
-/// from `ShepPaths::socket` — so it alone still carries the allow.
+/// `super::read`'s five tools and `super::control`'s four both call
+/// [`Self::call`]/[`Self::call_with_ack`] through `Whistle::shepherd`, one
+/// held per `Whistle`. `Whistle::new` (`whistle/mod.rs`) builds that
+/// `Shepherd` with [`Self::new`], from `ShepPaths::socket`.
 #[derive(Debug, Clone)]
 pub struct Shepherd {
     socket: PathBuf,
@@ -36,10 +33,6 @@ pub struct Shepherd {
 
 impl Shepherd {
     /// Wraps a socket path. Connects to nothing until [`Self::call`].
-    ///
-    /// Not called outside this module's and `super::read`'s own tests yet:
-    /// see the struct's own doc for why.
-    #[allow(dead_code)]
     #[must_use]
     pub fn new(socket: PathBuf) -> Self {
         Self { socket }
@@ -100,9 +93,7 @@ impl Shepherd {
 /// what a model can act on.
 ///
 /// [`Shepherd::call_with_ack`] is its only call site — reached from every
-/// tool in `super::read` (Task 6) once `super::read`'s router is itself
-/// reachable, which is Task 8's job; that router's own `#[allow(dead_code)]`
-/// covers this transitively until then.
+/// tool in `super::read` and `super::control`.
 fn connect_refusal(socket: &Path, err: &ConnectError) -> CallToolResult {
     let _ = socket; // named in the signature for call-site readability; the
     // path itself comes out of `err`'s own Display.
@@ -129,9 +120,8 @@ fn connect_refusal(socket: &Path, err: &ConnectError) -> CallToolResult {
 /// yet. A model reading "api is already being reloaded" can act on that. A
 /// model reading a nicer code whistle invented would be reading fiction.
 ///
-/// Reached the same way [`connect_refusal`] is: through `super::read`'s
-/// tools, transitively covered by that router's `#[allow(dead_code)]` until
-/// Task 8 wires it into `main`.
+/// Reached the same way [`connect_refusal`] is: through `super::read`'s and
+/// `super::control`'s tools.
 fn refusal(err: &RequestError) -> CallToolResult {
     let (code, message) = match err {
         // `ExitCode::from(RpcErrorCode)` then `code_str()`, rather than a

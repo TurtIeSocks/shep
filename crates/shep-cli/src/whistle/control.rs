@@ -23,16 +23,9 @@ use super::read::SheepName;
 use super::shepherd;
 
 // `vis = "pub(crate)"` for the same reason `read.rs` carries it: the macro's
-// generated constructor is private by default and `Whistle::new`'s caller
-// (Task 8, `whistle/mod.rs`) calls it from the PARENT module. See the plan's
+// generated constructor is private by default and `Whistle::new`
+// (`whistle/mod.rs`) calls it from the PARENT module. See the plan's
 // "Every rmcp API this plan names" section.
-//
-// `#[allow(dead_code)]`: nothing calls `control_router` (or, transitively,
-// any tool method below) outside this module's own tests yet — Task 8 is
-// what wires `Whistle::new` and this router into `shep whistle`'s dispatch,
-// gated behind `[whistle] allow_control`. Same scaffolding pattern
-// `read::read_only_router` already carries.
-#[allow(dead_code)]
 #[tool_router(router = control_router, vis = "pub(crate)")]
 impl Whistle {
     /// Start a registered sheep that is not currently running.

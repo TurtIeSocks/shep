@@ -64,9 +64,9 @@ impl Whistle {
     ///
     /// Nothing in `main` needs to list a whistle's tools, only to serve
     /// them, so every caller of this is `#[cfg(test)]` — this module's own
-    /// gate tests below, and Task 9's `catalogue`. `#[allow(dead_code)]`
-    /// says so explicitly rather than leaving an unexplained warning on a
-    /// non-test build.
+    /// gate tests below, and `catalogue`. `#[allow(dead_code)]` says so
+    /// explicitly rather than leaving an unexplained warning on a non-test
+    /// build.
     #[allow(dead_code)]
     #[must_use]
     pub fn router(&self) -> &ToolRouter<Self> {
@@ -116,7 +116,7 @@ impl Whistle {
     /// to turn this on" clause rather than re-typing it: `gate.rs`'s own doc
     /// names this as one of three places that must say the same thing — the
     /// other two are the malformed-config notice in [`whistle`] just below,
-    /// and Task 9's tool catalogue.
+    /// and the tool catalogue.
     fn instructions(&self) -> String {
         match self.control {
             gate::Control::ReadOnly => format!(

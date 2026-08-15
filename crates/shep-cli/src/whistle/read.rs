@@ -33,7 +33,6 @@ use crate::dog::metrics::sample_host;
 /// model can reach. A string `"all"` means an app literally called `all` and
 /// matches nothing else. One line of code, and the entire class of "the model
 /// wrote a selector that matched more than it meant" is gone.
-#[allow(dead_code)]
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SheepName {
     /// The sheep's name, exactly as `list_flock` reports it.
@@ -41,7 +40,6 @@ pub struct SheepName {
 }
 
 /// `tail_bleats`' arguments.
-#[allow(dead_code)]
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TailParams {
     /// The sheep's name.
@@ -52,7 +50,6 @@ pub struct TailParams {
 }
 
 /// `list_barks`' arguments.
-#[allow(dead_code)]
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BarksParams {
     /// How many of the most recent alerts. Default 50, clamped to 200.
@@ -70,17 +67,9 @@ const MAX_TAIL: u32 = 200;
 // `vis = "pub(crate)"` is REQUIRED, not decoration. The macro emits
 // `#vis fn #router() -> ToolRouter<Self>` with `vis` defaulting to nothing
 // (rmcp-macros/tool_router.rs:25-27, 68-72), i.e. private to THIS module —
-// and `Whistle::new`'s caller (Task 8, `whistle/mod.rs`) calls it from the
-// PARENT module. A private associated fn is visible in its defining module
-// and that module's descendants; a parent is neither, so without this the
-// call is `E0624`.
-//
-// `#[allow(dead_code)]`: nothing calls `read_only_router` (or, transitively,
-// any tool method below) outside this module's own tests yet — Task 8 is
-// what wires `Whistle::new` and this router into `shep whistle`'s dispatch.
-// Same scaffolding pattern `shepherd::Shepherd` and `gate::Control` already
-// carry.
-#[allow(dead_code)]
+// and `Whistle::new` (`whistle/mod.rs`) calls it from the PARENT module. A
+// private associated fn is visible in its defining module and that module's
+// descendants; a parent is neither, so without this the call is `E0624`.
 #[tool_router(router = read_only_router, vis = "pub(crate)")]
 impl Whistle {
     /// Every sheep and dog the shepherd has registered, with status, pid,

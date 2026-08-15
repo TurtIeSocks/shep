@@ -24,11 +24,8 @@ use shep_core::config::DaemonConfig;
 /// Not an error enum, so IR-20's `#[non_exhaustive]` rule does not apply; and
 /// shep-cli is `[[bin]]`-only, so nothing here is in a library crate at all.
 ///
-/// Not constructed outside this module's own tests yet: the `Whistle`
-/// handler that builds a router from this is Task 8. `#[allow(dead_code)]`
-/// says so explicitly rather than inventing a call site nothing needs yet —
-/// same pattern as `output::table::render_table`.
-#[allow(dead_code)]
+/// `Whistle::new` (`super::mod`) picks the router from this value, and
+/// `Control::how_to_open` supplies the refusal text its `get_info` returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
     /// The four control tools are not registered. The default.
@@ -49,9 +46,8 @@ impl Control {
     /// the `Allowed` arm to say something different later without moving any
     /// of them.
     ///
-    /// Not called outside this module's own tests yet: `get_info`'s
-    /// instructions and the malformed-config stderr notice are Task 8's.
-    #[allow(dead_code)]
+    /// Called from `get_info`'s read-only branch and from the
+    /// malformed-config stderr notice `super::whistle` prints.
     #[must_use]
     pub const fn how_to_open(self) -> &'static str {
         "control tools are off; add `[whistle]` with `allow_control = true` to \
@@ -86,9 +82,8 @@ impl Control {
 /// whistle` both select the `shep.toml` this function is handed. The launcher
 /// is the boundary, in argv, environment and file alike.
 ///
-/// Not called outside this module's own tests yet: the verb that reads
-/// `shep.toml` and calls this is Task 8's `whistle::whistle`.
-#[allow(dead_code)]
+/// Called by `whistle::whistle` (`super::mod`), which reads `shep.toml`
+/// once at startup and hands its text here.
 #[must_use]
 pub fn resolve_control(shep_toml: Option<&str>) -> Control {
     match DaemonConfig::load(shep_toml, &|_| None) {
