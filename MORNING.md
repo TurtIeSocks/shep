@@ -17,16 +17,18 @@ yours.
 
 ### Deploy the site
 
-Cloudflare Pages, and `web/README.md` has the first-time steps. The short of it:
-point it at this repo, root directory `web`, build command `npm run build`,
-output `dist`, Node version from `.nvmrc`.
+GitHub Pages, at `https://shep.turtlesocks.dev`. You already set the Pages
+source to GitHub Actions and pointed the domain at it, so the missing half was
+the workflow — `.github/workflows/pages.yml` now builds `web/` and publishes
+it. Nothing to click; it fires on push to `main`.
 
-It is Cloudflare rather than GitHub Pages for two real reasons, not taste. The
-repo is private and Cloudflare builds private repos on the free plan, where the
-GitHub Pages equivalent is a paid feature. And the site's internal links are
-root-relative, so a GitHub Pages project subpath would 404 seventeen of them.
+It runs automatically where `test.yml` does not, because it is one ubuntu job
+at 1x rather than 19 jobs with five on the 10x and 2x runners. Its paths filter
+also watches `README.md`, `docs/specs/deferred.md` and `docs/terminology.md`,
+because the site parses those at build time — a stale claim fails the build
+rather than shipping, which only works if editing one of them redeploys.
 
-Three pages exist: the landing scene, the docs (Getting started and Terminology
+Three pages: the landing scene, the docs (Getting started and Terminology
 written, eight honest stubs), and the design-language reference. 13 routes,
 build green, light and dark.
 

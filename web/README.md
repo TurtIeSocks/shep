@@ -40,66 +40,43 @@ Node version is pinned in `.nvmrc` (`nvm use` picks it up automatically).
 
 ## Deploy
 
-**Target: Cloudflare Pages**, connected directly to this GitHub repo. Two
-reasons drove that over the other static hosts:
+**Target: GitHub Pages**, at `https://shep.turtlesocks.dev`. The Pages source
+is set to **GitHub Actions** in the repository settings, and the custom domain
+is configured there too — so there is no `CNAME` file in `public/`, which is a
+branch-deploy mechanism and would only be dead weight here. If the domain ever
+resets itself, adding `web/public/CNAME` containing the bare hostname is the
+belt-and-braces fix.
 
-1. **The repo is private**, and Cloudflare Pages builds from a private repo
-   for free via its own GitHub App — it needs neither a public repo nor a
-   paid GitHub plan, unlike GitHub Pages (whose Pages feature is a paid-plan
-   feature on a private repo, and which would also run its build through
-   GitHub Actions — the same billing surface `docs/specs/deferred.md`
-   documents keeping on manual dispatch only, to avoid metered minutes on a
-   private repo).
-2. **The site's internal links are hardcoded root-relative paths**
-   (`href="/docs/terminology"`, `href="/design-language"`, etc. — grep
-   `src/` for `href="/` to see the full set), not run through Astro's `base`
-   config. Cloudflare Pages serves a project at the root of its own
-   subdomain (`<project>.pages.dev`), so those links resolve correctly with
-   zero changes. A GitHub Pages *project* page, by contrast, serves from
-   `/shep/` — every one of those hardcoded links would 404 there unless
-   they were all rewritten to go through `import.meta.env.BASE_URL`, which
-   is real surface area this pass didn't take on.
+`.github/workflows/pages.yml` does the work: `npm ci` and `npm run build` in
+`web/`, then `upload-pages-artifact` and `deploy-pages`. Node comes from
+`web/.nvmrc` via `node-version-file`, so the pinned version has exactly one
+home rather than being restated in the workflow.
 
-Nothing in this repo needs to change for that to work — Cloudflare Pages'
-git integration takes the build command and output directory as dashboard
-settings, not a config file. These are the exact values to enter, and the
-steps to connect it for the first time.
+Two things about it are deliberate.
 
-### First-time setup (dashboard, no CLI)
+**It runs on push, where the Rust CI does not.** `test.yml` is dispatch-only
+because one run is 19 jobs, five of them on the macOS and Windows runners that
+bill at 10x and 2x on a private repo. This is one ubuntu job of a couple of
+minutes at 1x, so that arithmetic does not reach it.
 
-1. Go to [dash.cloudflare.com](https://dash.cloudflare.com) → **Workers &
-   Pages** → **Create** → **Pages** → **Connect to Git**. Sign in (or create
-   a free account) and authorize the Cloudflare Pages GitHub App.
-2. Grant it access to `TurtIeSocks/shep` specifically (or all repos, if
-   preferred) — the private repo will show up in the picker once the app
-   has access. Select it.
-3. On the "Set up builds" screen, since the site lives in `web/` rather
-   than the repo root:
-   - **Root directory:** `web`
-   - **Framework preset:** Astro (Cloudflare autodetects this from
-     `package.json`; if it doesn't, set it manually)
-   - **Build command:** `npm run build`
-   - **Build output directory:** `dist`
-   - **Environment variable:** `NODE_VERSION` = `22.12.0` (matches
-     `web/.nvmrc` — Cloudflare doesn't read `.nvmrc` on its own, so this is
-     the one setting that needs typing in by hand)
-4. Click **Save and Deploy**. First build takes a couple of minutes; watch
-   it stream in the dashboard.
-5. Once it's green, the site is live at the `*.pages.dev` URL Cloudflare
-   assigns (shown on the project's dashboard page). A custom domain can be
-   attached later from the project's **Custom domains** tab — no rebuild
-   needed, just DNS.
+**Its paths filter names three files outside `web/`** — `README.md`,
+`docs/specs/deferred.md` and `docs/terminology.md`. The site parses those at
+build time rather than restating them (see `src/data/*.ts`), so a claim that
+goes stale fails the build instead of shipping. That only holds if editing one
+of them actually triggers a deploy, hence the filter. Add to it if a new
+`src/data/` file starts reading somewhere new.
 
-### After that
+The site's internal links are hardcoded root-relative paths — `href="/docs/terminology"`,
+`href="/design-language"`, and so on; grep `src/` for `href="/` for the full
+set — rather than going through Astro's `base`. At the apex of a custom domain
+those resolve exactly as written. This is the one thing that would break if the
+site were ever served from a project URL like `user.github.io/shep/`, where
+every one of them would 404; moving there would mean routing them all through
+`import.meta.env.BASE_URL` first.
 
-Every future push to `main` redeploys automatically — that's the point of
-the git integration, and it's the one piece of this pipeline that isn't
-manual-dispatch-gated, because it costs Cloudflare's build minutes, not
-GitHub Actions minutes, so the private-repo billing concern that keeps the
-Rust CI on manual dispatch doesn't apply here. Pull requests get their own
-preview deployment URL automatically too, useful for reviewing a docs or
-design change before it lands on the real domain.
+### Checking a change before it ships
 
-To redeploy without a new commit (e.g. after changing an environment
-variable), use **Retry deployment** on the project's **Deployments** tab —
-still no CLI needed.
+`npm run build && npm run preview` serves the production build locally, which
+is the same output the workflow uploads. Worth doing for anything touching
+`src/data/`, since those files fail the build loudly on a mismatch and the
+error is much easier to read locally than in a workflow log.

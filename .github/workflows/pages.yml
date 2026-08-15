@@ -1,0 +1,69 @@
+name: pages
+# Builds `web/` and publishes it to GitHub Pages, served at
+# https://shep.turtlesocks.dev. The Pages source is set to "GitHub Actions"
+# in the repository settings, and the custom domain lives there too — with
+# an Actions-based deploy there is no `CNAME` file in the artifact.
+#
+# Unlike test.yml, this one runs on every push rather than by dispatch only.
+# test.yml is gated because one run is 19 jobs, five of them on the macOS
+# and Windows runners that bill at 10x and 2x on a private repo. This is a
+# single ubuntu job of a couple of minutes at 1x, so the arithmetic that
+# keeps the Rust CI manual does not reach it.
+#
+# The paths filter names three files outside `web/` on purpose: the site
+# parses them at build time (see `web/src/data/*.ts`) rather than restating
+# them, so that a stale claim fails the build instead of shipping. The
+# lexicon table comes from README.md, the "not built yet" chalkboard from
+# docs/specs/deferred.md, and the terminology page from docs/terminology.md.
+# Editing one of those without redeploying would leave the site asserting
+# something the repo no longer says.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "README.md"
+      - "docs/specs/deferred.md"
+      - "docs/terminology.md"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, and never cancel one in flight: a half-applied
+# deploy is worse than a site that is a minute out of date.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Reads web/.nvmrc, so the pinned version has exactly one home.
+          node-version-file: web/.nvmrc
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
