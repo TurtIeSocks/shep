@@ -549,18 +549,13 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
 fn feed_for(which: Scene) -> Tail {
     match which {
         // Mirrors what `super::mod`'s `run_ui` would actually send: an empty
-        // flock has no selected row, so `out`/`err` are both `None` and
-        // `tail::read` takes its own early return with this exact note.
-        // Anything else here would show stale feed content under a header
-        // that says nobody is selected, which is a real inconsistency this
+        // flock has no selected row, and `run_ui` never calls `tail::read`
+        // at all in that case — its own header, "bleats  no sheep is
+        // selected", is the pane's complete sentence. A note here would
+        // show stale feed content, or the wrong sentence, under a header
+        // that already says nobody is selected — a real inconsistency this
         // gallery must not ship.
-        Scene::Empty => Tail {
-            lines: Vec::new(),
-            missed_lines: 0,
-            missed_bytes: 0,
-            read_bytes: 0,
-            note: Some("the shepherd did not report a log path for this sheep".to_string()),
-        },
+        Scene::Empty => Tail::default(),
         Scene::FeedGap => Tail {
             lines: (0..30)
                 .map(|n| TailLine {

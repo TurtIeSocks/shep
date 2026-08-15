@@ -312,11 +312,25 @@ where
         // refreshed BEFORE the frame that shows it rather than after.
         let may_draw = last_draw.is_none_or(|at| at.elapsed() >= MIN_REDRAW);
         if feed_dirty && may_draw {
-            // The paths are cloned out before `app` is borrowed mutably.
-            let (out, err) = app.selected_row().map_or((None, None), |row| {
-                (row.info.out_file.clone(), row.info.err_file.clone())
-            });
-            let tail = local.tail(out.as_deref().map(Path::new), err.as_deref().map(Path::new));
+            // Nothing selected means an empty flock (`App::reseat` keeps the
+            // selection on a real sheep whenever one exists), and the pane's
+            // own header already says so ("bleats  no sheep is selected").
+            // `tail::read`'s `(None, None)` early return exists for a
+            // DIFFERENT case — a selected sheep whose shepherd predates the
+            // `out_file`/`err_file` fields — and reusing it here would print
+            // that sentence under a header naming a sheep that does not
+            // exist. Skipping the read keeps the header the pane's one and
+            // only sentence for this case, matching the table and detail
+            // panes' own single-sentence pattern for the same state.
+            let tail = match app.selected_row() {
+                None => tail::Tail::default(),
+                Some(row) => {
+                    // The paths are cloned out before `app` is borrowed
+                    // mutably.
+                    let (out, err) = (row.info.out_file.clone(), row.info.err_file.clone());
+                    local.tail(out.as_deref().map(Path::new), err.as_deref().map(Path::new))
+                }
+            };
             // `let _`: `Msg::Bleats` returns `Effect::None` by construction —
             // see its arm in the reducer — and acting on a returned effect
             // here would be the one place this design could recurse.
