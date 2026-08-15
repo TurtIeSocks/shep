@@ -7,10 +7,14 @@
 //! the schema-carrying payload twins every tool returns. Task 6 lands
 //! [`read`], the five read-only tools, and with them the minimal [`Whistle`]
 //! below — just enough for `#[tool_router]` to have a `Self` to attach to.
-//! The verb itself (`get_info`, the stdio serve loop, wiring `Whistle::new`
-//! into `shep whistle`'s dispatch) is Task 8; nothing here is reachable from
-//! `main` yet.
+//! Task 7 lands [`control`], the four tools the gate can withhold, reaching
+//! the daemon through the same `shepherd` field. The verb itself
+//! (`get_info`, the stdio serve loop, wiring `Whistle::new` into `shep
+//! whistle`'s dispatch, and deciding whether `control::control_router` is
+//! added on top of `read::read_only_router`) is Task 8; nothing here is
+//! reachable from `main` yet.
 
+pub(crate) mod control;
 pub(crate) mod facts;
 pub(crate) mod gate;
 pub(crate) mod read;
