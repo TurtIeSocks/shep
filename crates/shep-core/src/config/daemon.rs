@@ -121,6 +121,36 @@ impl LogLevel {
 /// times more often than the tightest schedule can fire.
 const MIN_CRON_SLEEP: UpDuration = UpDuration::from_millis(1_000);
 
+/// The `[whistle]` section
+///
+/// One key, and it is a gate rather than a tuning knob: `shep whistle`'s four
+/// control tools (`start_sheep`, `stop_sheep`, `restart_sheep`,
+/// `reload_sheep`) exist only when this is `true`, and its five read-only
+/// tools exist regardless.
+///
+/// **This lives in the shepherd's config file and nowhere else.** There is no
+/// `--allow-control` flag and no `SHEP_*` variable, deliberately: spec §14.7
+/// rules that whistle's gate is daemon config because config is auditable and
+/// flags are per-invocation, and whistle's launcher is an agent host whose own
+/// config file writes the argv. A flag would let the same edit that adds the
+/// MCP server open the gate, in the same line, invisibly.
+///
+/// The shepherd itself never reads this key — `shep whistle` reads the file
+/// directly, at startup, in its own process. It is here because this struct is
+/// the grammar of `shep.toml`, and a `[whistle]` section the grammar did not
+/// know about would be an unknown field: `RawDaemonConfig` denies those, so
+/// before this existed a file that turned the gate on stopped the shepherd
+/// from booting at all.
+///
+/// `Debug` is derived rather than redacted (IR-41): one boolean, no secret,
+/// nothing a `{:?}` could leak.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct WhistleSection {
+    /// Whether `shep whistle` offers its control tools. Default `false`.
+    pub allow_control: bool,
+}
+
 /// Parsed daemon configuration with raw per-dog sections
 ///
 /// Dog sections stay untyped here: each dog deserializes its own
@@ -129,6 +159,8 @@ const MIN_CRON_SLEEP: UpDuration = UpDuration::from_millis(1_000);
 pub struct DaemonConfig {
     /// The `[daemon]` section
     pub daemon: DaemonSection,
+    /// The `[whistle]` section
+    pub whistle: WhistleSection,
     /// Raw `[dog.<name>]` sections keyed by dog name
     pub dog: BTreeMap<String, toml::Table>,
 }
@@ -138,6 +170,7 @@ impl fmt::Debug for DaemonConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DaemonConfig")
             .field("daemon", &self.daemon)
+            .field("whistle", &self.whistle)
             .field("dog", &format_args!("<{} tables>", self.dog.len()))
             .finish()
     }
@@ -147,6 +180,7 @@ impl fmt::Debug for DaemonConfig {
 #[serde(deny_unknown_fields, default)]
 struct RawDaemonConfig {
     daemon: DaemonSection,
+    whistle: WhistleSection,
     dog: BTreeMap<String, toml::Table>,
 }
 
@@ -173,6 +207,7 @@ impl DaemonConfig {
         };
         let mut cfg = Self {
             daemon: raw.daemon,
+            whistle: raw.whistle,
             dog: raw.dog,
         };
         if let Some(v) = env("SHEP_LOG_JSON") {
@@ -556,6 +591,62 @@ otel = "/usr/local/bin/shep-otel"
         ));
     }
 
+    // fails if `[whistle]` stops being a section the shepherd will start
+    // with. This is not a hypothetical: `RawDaemonConfig` denies unknown
+    // fields, so before this section existed the same input returned
+    // `DaemonConfigError::Toml` and `shep daemon` exited 4 — an operator who
+    // turned whistle's control tools on lost their shepherd on the next
+    // boot.
+    #[test]
+    fn a_whistle_section_parses_and_defaults_to_refusing_control() {
+        let cfg = DaemonConfig::load(Some("[whistle]\nallow_control = true\n"), &no_env).unwrap();
+        assert!(cfg.whistle.allow_control);
+
+        let absent = DaemonConfig::load(Some("[daemon]\nlog_level = \"info\"\n"), &no_env).unwrap();
+        assert!(
+            !absent.whistle.allow_control,
+            "a file with no [whistle] section leaves control off"
+        );
+
+        // The third case, and it is a DIFFERENT code path from the second:
+        // an absent `[whistle]` table is filled by `RawDaemonConfig`'s own
+        // container-level `#[serde(default)]`, which never consults the
+        // field's serde default at all. A present-but-empty table is the
+        // only input that does. Without this line, a field-level
+        // `#[serde(default = "...")]` on `allow_control` could flip the gate
+        // open and no test in this file would notice — which is exactly
+        // what the first draft's mutation assumed it was proving.
+        let empty_table = DaemonConfig::load(Some("[whistle]\n"), &no_env).unwrap();
+        assert!(
+            !empty_table.whistle.allow_control,
+            "a [whistle] section with no keys leaves control off"
+        );
+    }
+
+    // fails if the section silently accepts a key it does not implement. A
+    // `[whistle] allow_contro = true` typo that parsed would leave an
+    // operator certain the gate was open and whistle certain it was shut,
+    // with nothing anywhere saying otherwise.
+    #[test]
+    fn a_misspelled_whistle_key_is_a_named_error() {
+        let err =
+            DaemonConfig::load(Some("[whistle]\nallow_contro = true\n"), &no_env).unwrap_err();
+        let DaemonConfigError::Toml(message) = err else {
+            panic!("a misspelled key is a TOML error, got {err:?}")
+        };
+        // The full quoted form, not the bare stem: `"allow_control"` also
+        // contains `"allow_contro"`, so an assertion on the stem would pass
+        // on a message that named only what serde EXPECTED and never quoted
+        // what the operator actually wrote. serde's `deny_unknown_fields`
+        // message is "unknown field `allow_contro`, expected
+        // `allow_control`", and the closing backtick is what distinguishes
+        // the two.
+        assert!(
+            message.contains("unknown field `allow_contro`"),
+            "the message quotes the key that was not understood: {message}"
+        );
+    }
+
     #[test]
     fn debug_redacts_dog_values() {
         // Dog tables carry things like webhook URLs; a lazy derive(Debug)
@@ -564,7 +655,7 @@ otel = "/usr/local/bin/shep-otel"
         let cfg = DaemonConfig::load(Some("[dog.metrics]\nport = 9615"), &no_env).unwrap();
         assert_eq!(
             format!("{cfg:?}"),
-            "DaemonConfig { daemon: DaemonSection { log_json: false, log_level: Warn, socket: None, enabled_dogs: [], adopted_dogs: {}, max_cron_sleep: None }, dog: <1 tables> }"
+            "DaemonConfig { daemon: DaemonSection { log_json: false, log_level: Warn, socket: None, enabled_dogs: [], adopted_dogs: {}, max_cron_sleep: None }, whistle: WhistleSection { allow_control: false }, dog: <1 tables> }"
         );
     }
 }
