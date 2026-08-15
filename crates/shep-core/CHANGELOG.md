@@ -12,6 +12,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `DaemonConfig::load_layered` and `DaemonOverrides` — a third
+  `file < SHEP_* env < flags` layer over the `file < env` `load` already did.
+  `load` keeps its exact signature and semantics; `load_layered` validates
+  exactly once, after all three layers are merged, so a good override can
+  rescue a `shep.toml` whose own value is below the floor. `DaemonOverrides`
+  is `#[non_exhaustive]` with a consuming-self builder, because it grows a
+  field every time the hidden `daemon` subcommand grows a flag.
+- Add `config::parse_daemon_bool` — the shared `1|0|true|false` grammar
+  `SHEP_LOG_JSON` and `--log-json` both parse through, so the two never drift
+  apart into different boolean spellings.
+- Add a non-default `schema` feature: `JsonSchema` for the Flockfile
+  document, `AppConfig`, `ProbeConfig`, `ProbeKind`, `MemSize`, `UpDuration`,
+  and `config::flockfile_schema_json`, which renders the document schema as
+  pretty-printed JSON. Off by default; `shep-cli` turns it on. The schema
+  describes the deserializer, not the `normalize` step — `kill_signal` is an
+  unconstrained string in the schema even though `normalize` narrows it to
+  five signal names afterward.
+- Accept and ignore `$schema` at the Flockfile top level — a JSON/JSON5
+  editor's own convention for pointing at a schema file, read by
+  `RawFlockfile` and discarded. Does not touch `AppConfig`, which is on the
+  wire; `PROTOCOL_VERSION` is unaffected.
 - Add `signals::OperatorSignal`, the nine signals `shep signal` may name;
   `Request::Signal` / `Response::Signalled` / `SignalReply` / `SignalOutcome`.
 - Add `Request::Scale` / `Response::Scaled` — set an app's instance count,
@@ -394,6 +415,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changes
 
+- `config::DaemonConfig` is `#[non_exhaustive]`. Outside shep-core it can no
+  longer be built with a struct literal or `..Default::default()`. **A
+  breaking change for any out-of-tree struct-literal construction.** It is
+  for field growth — `DaemonConfig` gains a section roughly every phase — not
+  for validation: the type is not a proof token and does not become one,
+  fields stay `pub`, and holding one does not prove it was validated. The
+  escape hatch if that ever needs to change is a public `validate`, not
+  private fields.
 - `protocol::ProcessInfo` is `#[non_exhaustive]` — construct it with
   `ProcessInfo::builder`. Fields remain `pub`; reading and assigning are
   unchanged. A future field is no longer a breaking change for downstream

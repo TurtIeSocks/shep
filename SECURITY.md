@@ -166,6 +166,17 @@ security writeup for the daemon-wide rundown of what this crate writes to
 disk). Anyone who can read `$SHEP_HOME` — the daemon's own user, or root —
 can read every secret held in any managed app's `env` table.
 
+### Flockfiles
+
+**Config files are data, with one opt-in exception.** `shep-core` parses
+every Flockfile format with strict serde and executes nothing; it does not
+spawn a process on any path. A `.js` Flockfile is the exception and is
+reached only through `shep start <path> --flockfile`, which runs the file
+through `node`. `shep start` always takes an explicit target, and
+shep-core's ten-name discovery order — reserved for a future no-argument
+form, and used by nothing today — contains no `.js` name, so it cannot
+route to node either.
+
 ### Adopted dogs
 
 IF an operator runs `shep adopt <name> <path>`, THEN:

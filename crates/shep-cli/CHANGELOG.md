@@ -12,6 +12,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `--flockfile` to `shep start`. With it, `shep start <path> --flockfile`
+  reads `<path>` as a Flockfile by extension — including `.js`, evaluated by
+  shelling out to
+  `node -e "try { process.stdout.write(JSON.stringify(require(process.argv[1]))); } catch (err) { process.stderr.write(err && err.message ? String(err.message) : String(err)); process.exitCode = 1; }" <path>`
+  and feeding the JSON result through the existing parser — instead of
+  treating it as a script. Not `node -p` bare: node's own crash dump on an
+  uncaught exception ends with a trailing `Node.js vX.Y.Z` banner line, so
+  scraping the last non-blank line of stderr would quote the banner instead
+  of the actual error; the try/catch writes `err.message` to stderr itself
+  instead. `shep start server.js` with no flag is unchanged: it still starts
+  `server.js`. The flag is on `start` only, not `restart`, `reload`, or
+  `import`.
+- Add the hidden `shep schema` verb — prints the Flockfile JSON Schema to
+  stdout. The same rendering is committed at
+  `crates/shep-core/assets/flockfile.schema.json`, drift-guarded by an
+  `include_str!` test in shep-core; regenerate with `cargo run -p shep-cli --
+  schema > crates/shep-core/assets/flockfile.schema.json`.
+- Add `--log-json[=BOOL]`, `--log-level <LEVEL>`, `--socket <PATH>` and
+  `--max-cron-sleep <DUR>` to the hidden `shep daemon` verb — a third
+  `file < env < flags` layer over `shep.toml` and the `SHEP_*` variables,
+  validated once after all three are merged so a flag can rescue a broken
+  file.
+- Add `--init <systemd|openrc|launchd|freebsd-rc|openbsd-rc>` to
+  `shep startup` and `shep unstartup`, overriding the runtime probe below on
+  any target.
+- Add openrc, FreeBSD `rc.d`, and OpenBSD `rc.d` renderers to `shep startup` /
+  `shep unstartup`, alongside the existing systemd and launchd renderers.
+  None of the three has been executed on its own operating system — no
+  FreeBSD, OpenBSD, or openrc host exists here. They are pure `format!`
+  output pinned by exact-string tests, the same tier the systemd unit has
+  always had. openrc's script polls the shepherd's own control socket in
+  `start_post()` to decide when the service is up, because openrc has no
+  `sd_notify` equivalent; FreeBSD gets the same poll through
+  `start_postcmd`; OpenBSD's `rc.subr` has no post-start hook at all, so its
+  script reports started as soon as the process is spawned and says so in
+  its own header comment.
 - Add `shep lookout` (alias `dash`), the terminal dashboard: the flock table,
   the bleats feed, the sheep detail pane, and a host-usage strip, all on one
   screen. The flock table stays the spine and subscribes to the bus so the
@@ -772,6 +808,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   legibility a diffable file gives an auditor. Writes nothing to stdout but
   the JSON-RPC wire; a `shep.toml` that fails to parse reads as the gate
   shut, never open, and prints the parse failure to stderr.
+
+### Changes
+
+- **A Linux host with no `/run/systemd/system` is now refused instead of
+  being written a systemd unit.** `shep startup` used to write and enable a
+  `Type=notify` unit unconditionally on any Linux target, including a
+  container with no init to ever read it. It now probes at runtime —
+  `/run/systemd/system` a directory means systemd, `/run/openrc/softlevel` or
+  `/run/openrc` a directory means openrc, neither means refuse, naming both
+  paths — because systemd and openrc share one compile target and cannot be
+  told apart any other way. This is the phase's one user-visible regression:
+  a container that got a (useless) unit before now gets a refusal. `--init
+  systemd` restores the old behaviour where that is actually wanted.
 
 ### Fixes
 

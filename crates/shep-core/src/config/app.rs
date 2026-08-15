@@ -11,6 +11,7 @@ use crate::values::{MemSize, UpDuration};
 /// How a health probe checks a sheep
 // wire format: changing these strings is a breaking change
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeKind {
     /// HTTP GET must return 2xx
@@ -24,6 +25,7 @@ pub enum ProbeKind {
 /// Readiness/liveness probe configuration (spec §7)
 // wire format: changing field names/defaults is a breaking change
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ProbeConfig {
     /// Probe mechanism
@@ -66,6 +68,7 @@ fn default_failure_threshold() -> u32 {
 /// ```
 // wire format: changing field names/defaults is a breaking change
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct AppConfig {
     /// Unique sheep name (required)

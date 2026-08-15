@@ -18,9 +18,9 @@ pub(crate) mod unit;
 
 use std::path::{Path, PathBuf};
 
-use unit::{Init, UnitSpec};
+use unit::UnitSpec;
 
-use crate::cli::{Format, StartupArgs};
+use crate::cli::{Format, Init, StartupArgs};
 use crate::exit::ExitCode;
 use crate::output::{
     StartupStep, StartupSteps, Streams, emit, emit_error, emit_notice, write_outcome,
@@ -33,10 +33,55 @@ use crate::output::{
 /// surface for one call site.
 const DEFAULT_HOME_DIR: &str = ".shep";
 
-/// The mode a generated unit is created with: readable by everyone (the init
-/// system reads it as whatever user it runs as), writable only by the root
-/// that wrote it.
-const UNIT_MODE: u32 = 0o644;
+/// The mode a generated unit is created with.
+///
+/// A systemd unit and a launchd plist are **read** by their init system:
+/// 0644. An openrc script and a BSD rc.d script are **executed**: 0755.
+/// Shipping an openrc script at 0644 fails at the next reboot, which is the
+/// worst possible time to find out.
+pub(crate) const fn unit_mode(init: Init) -> u32 {
+    match init {
+        Init::Systemd | Init::Launchd => 0o644,
+        Init::Openrc | Init::FreebsdRc | Init::OpenbsdRc => 0o755,
+    }
+}
+
+/// Where a generated unit for `init` is written, for `user`.
+///
+/// Systemd and launchd keep calling their own existing formatters —
+/// `unit::systemd_unit_path`/`unit::launchd_plist_path` — rather than
+/// restating their format strings here. The other three name a file
+/// `unstartup` has to be able to find under any init an operator names with
+/// `--init`, which is why this is a function of `Init` alone rather than
+/// something `plan` only ever calls for the detected one.
+pub(crate) fn unit_path_for(init: Init, user: &str) -> PathBuf {
+    match init {
+        Init::Systemd => unit::systemd_unit_path(user),
+        Init::Launchd => unit::launchd_plist_path(user),
+        Init::Openrc => PathBuf::from(format!("/etc/init.d/shep-{user}")),
+        Init::FreebsdRc => PathBuf::from(format!("/usr/local/etc/rc.d/shep_{user}")),
+        Init::OpenbsdRc => PathBuf::from(format!("/etc/rc.d/shep_{user}")),
+    }
+}
+
+/// Whether `user` can appear in a BSD rc script's variable names.
+///
+/// `rcvar` and `rcctl` turn the service name into **shell variable names**
+/// (`shep_<user>_enable`, `shep_<user>_flags`). A username containing `-` or
+/// `.` — `web-app` and `deploy.svc` are both legal on both systems —
+/// produces `shep_web-app_enable`, which is not a valid `sh` variable, and
+/// the script then fails at `load_rc_config` with a syntax error naming a
+/// line number rather than a user.
+///
+/// systemd and openrc name *files*, not variables, and are unaffected. Do
+/// not add this check there.
+pub(crate) fn is_rc_safe_user(user: &str) -> bool {
+    let mut chars = user.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && user.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
 
 /// A step that did what it was asked.
 const OK: &str = "ok";
@@ -233,6 +278,24 @@ pub(crate) fn install(
             "launchctl",
             &["bootstrap", "system", &plan.unit_path.display().to_string()],
         )),
+        Init::Openrc => {
+            steps.push(run_step(
+                "rc-update",
+                &["add", &unit_file_name(plan), "default"],
+            ));
+            steps.push(run_step("rc-service", &[&unit_file_name(plan), "start"]));
+        }
+        Init::FreebsdRc => {
+            steps.push(run_step(
+                "sysrc",
+                &[&format!("{}_enable=YES", unit_file_name(plan))],
+            ));
+            steps.push(run_step("service", &[&unit_file_name(plan), "start"]));
+        }
+        Init::OpenbsdRc => {
+            steps.push(run_step("rcctl", &["enable", &unit_file_name(plan)]));
+            steps.push(run_step("rcctl", &["start", &unit_file_name(plan)]));
+        }
     }
     report(streams, fmt, "startup", steps)
 }
@@ -319,11 +382,32 @@ pub(crate) fn remove(
             ));
             steps.push(remove_unit(plan));
         }
+        Init::Openrc => {
+            steps.push(run_step("rc-service", &[&unit_file_name(plan), "stop"]));
+            steps.push(run_step(
+                "rc-update",
+                &["del", &unit_file_name(plan), "default"],
+            ));
+            steps.push(remove_unit(plan));
+        }
+        Init::FreebsdRc => {
+            steps.push(run_step("service", &[&unit_file_name(plan), "stop"]));
+            steps.push(run_step(
+                "sysrc",
+                &["-x", &format!("{}_enable", unit_file_name(plan))],
+            ));
+            steps.push(remove_unit(plan));
+        }
+        Init::OpenbsdRc => {
+            steps.push(run_step("rcctl", &["stop", &unit_file_name(plan)]));
+            steps.push(run_step("rcctl", &["disable", &unit_file_name(plan)]));
+            steps.push(remove_unit(plan));
+        }
     }
     report(streams, fmt, "unstartup", steps)
 }
 
-/// Renders the unit and writes it at [`UNIT_MODE`], as one step.
+/// Renders the unit and writes it at [`unit_mode`], as one step.
 ///
 /// The mode is requested at `open` time rather than set afterwards, matching
 /// `launch::launch_command`'s own discipline: a create-then-chmod sequence
@@ -337,12 +421,16 @@ fn write_unit(plan: &StartupPlan) -> StartupStep {
     let rendered = match plan.init {
         Init::Systemd => unit::systemd_unit(&plan.spec),
         Init::Launchd => unit::launchd_plist(&plan.spec),
+        Init::Openrc => unit::openrc_script(&plan.spec),
+        Init::FreebsdRc => unit::freebsd_rc_script(&plan.spec),
+        Init::OpenbsdRc => unit::openbsd_rc_script(&plan.spec),
     };
+    let mode = unit_mode(plan.init);
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(UNIT_MODE)
+        .mode(mode)
         .open(&plan.unit_path)
         .and_then(|mut file| {
             file.write_all(rendered.as_bytes())?;
@@ -353,7 +441,7 @@ fn write_unit(plan: &StartupPlan) -> StartupStep {
             // shipped mode deterministic; it acts on the open descriptor,
             // so there is no path to race, and it only ever widens from a
             // mode that was already no wider than this one.
-            file.set_permissions(std::fs::Permissions::from_mode(UNIT_MODE))
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
         });
     StartupStep {
         action: "wrote",
@@ -434,7 +522,13 @@ fn report(
 /// A `$SHEP_HOME` with a space in it is a legal path, and an unquoted one
 /// would become two arguments — the operator would paste a command that
 /// installs a unit carrying half the path they meant.
-fn shell_quote(word: &str) -> String {
+///
+/// `pub(crate)` rather than private: [`unit::freebsd_rc_script`] and
+/// [`unit::openbsd_rc_script`] reuse it as the single-quote former their own
+/// doc comments describe, for a value that will be re-evaluated by a nested
+/// shell — a different job from `unit`'s own double-quote escaper, and the
+/// two compose there.
+pub(crate) fn shell_quote(word: &str) -> String {
     let safe = |b: &u8| b.is_ascii_alphanumeric() || b"_./:@%+=-".contains(b);
     if !word.is_empty() && word.as_bytes().iter().all(safe) {
         return word.to_string();
@@ -471,19 +565,73 @@ fn refuse(streams: &mut Streams<'_>, fmt: Format, code: ExitCode, message: &str)
     code
 }
 
-/// systemd on Linux, launchd on macOS. No runtime detection: there is
-/// nothing else either target could be, and openrc and the BSD rc.d scripts
-/// are named as deferred in `docs/specs/deferred.md`.
-const fn current_init() -> Option<Init> {
+/// Which init a Linux host running these two probes is on.
+///
+/// A pure function so the ORDER is testable on a machine that is not Linux.
+/// systemd wins a tie: `/run/systemd/system` is exactly what `sd_booted(3)`
+/// checks and is the only probe here with an upstream contract behind it,
+/// and a host with both present is a host running systemd with openrc
+/// leftovers rather than the other way round.
+///
+/// [`current_init`]'s Linux arm is the only non-test caller, and that arm is
+/// `#[cfg]`-ed away on every other target — narrowed the same way the old
+/// `Init` variants were before this task moved them, rather than
+/// blanket-allowed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const fn linux_init(systemd: bool, openrc: bool) -> Option<Init> {
+    if systemd {
+        Some(Init::Systemd)
+    } else if openrc {
+        Some(Init::Openrc)
+    } else {
+        None
+    }
+}
+
+/// The init system this host is actually running, or `None` when it is one
+/// shep has no renderer for.
+///
+/// Linux is a **runtime** probe: systemd and openrc share one target triple,
+/// so `target_os` cannot tell them apart, and until this existed a Linux host
+/// running openrc was silently written a systemd unit whose failure surfaced
+/// only when `systemctl` turned out not to exist. The ordering lives in
+/// [`linux_init`], which is compiled and tested everywhere; this function is
+/// the two filesystem reads that feed it.
+///
+/// Every other target is a compile-time fact: there is nothing else macOS,
+/// FreeBSD or OpenBSD could be.
+///
+/// **This is stricter than what it replaces.** A Linux container with no
+/// `/run/systemd/system` used to get a systemd unit written into it and now
+/// gets a refusal. That is the right answer — a unit with no init to read it
+/// does nothing — but it is a case that worked before, so `--init` exists to
+/// override this entirely.
+fn current_init() -> Option<Init> {
     #[cfg(target_os = "linux")]
     {
-        Some(Init::Systemd)
+        linux_init(
+            Path::new("/run/systemd/system").is_dir(),
+            Path::new("/run/openrc/softlevel").exists() || Path::new("/run/openrc").is_dir(),
+        )
     }
     #[cfg(target_os = "macos")]
     {
         Some(Init::Launchd)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "freebsd")]
+    {
+        Some(Init::FreebsdRc)
+    }
+    #[cfg(target_os = "openbsd")]
+    {
+        Some(Init::OpenbsdRc)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd"
+    )))]
     {
         None
     }
@@ -495,10 +643,12 @@ const fn current_init() -> Option<Init> {
 /// a function three cases can be stated about; an empty one is treated as
 /// unset, since that is what a shell that exported it without a value means.
 fn plan(explicit_home: Option<&Path>, args: &StartupArgs) -> Result<StartupPlan, Refusal> {
-    let Some(init) = current_init() else {
+    let Some(init) = args.init.or_else(current_init) else {
         return Err(Refusal {
             code: ExitCode::Failure,
-            message: "shep writes a systemd unit or a launchd plist; this platform has neither"
+            message: "could not tell which init system is running: neither \
+                      /run/systemd/system nor /run/openrc is present. Name one \
+                      with --init (systemd, openrc, launchd, freebsd-rc, openbsd-rc)"
                 .to_string(),
         });
     };
@@ -514,11 +664,18 @@ fn plan(explicit_home: Option<&Path>, args: &StartupArgs) -> Result<StartupPlan,
         sudo_user.as_deref(),
         &invoking_user()?,
     );
+    if matches!(init, Init::FreebsdRc | Init::OpenbsdRc) && !is_rc_safe_user(&user) {
+        return Err(Refusal {
+            code: ExitCode::Usage,
+            message: format!(
+                "a BSD rc.d script turns the user name into a shell variable, so {user} \
+                 cannot be used: it must start with a letter or underscore and contain \
+                 only letters, digits and underscores. Pass --user with a name that does."
+            ),
+        });
+    }
     let passwd_home = passwd_home(&user)?;
-    let unit_path = match init {
-        Init::Systemd => unit::systemd_unit_path(&user),
-        Init::Launchd => unit::launchd_plist_path(&user),
-    };
+    let unit_path = unit_path_for(init, &user);
     Ok(StartupPlan {
         init,
         label: unit::launchd_label(&user),
@@ -887,10 +1044,10 @@ mod tests {
             .unwrap()
             .permissions()
             .mode();
-        // A literal, deliberately, not `UNIT_MODE`: a test comparing the
-        // constant against itself passes for whatever the constant is
-        // changed to, and a mutation to 0o666 went uncaught by exactly that
-        // until this line stopped naming it.
+        // A literal, deliberately, not `unit_mode(Init::Systemd)`: a test
+        // comparing the function's own return value against itself passes
+        // for whatever that value is changed to, and a mutation to 0o666
+        // went uncaught by exactly that until this line stopped naming it.
         assert_eq!(mode & 0o777, 0o644, "mode was {:o}", mode & 0o777);
 
         assert_eq!(remove_unit(&plan).result, OK);
@@ -987,5 +1144,94 @@ mod tests {
             !failure_line(&output("")).is_empty(),
             "a command that failed silently still has to say so"
         );
+    }
+
+    /// fails if a systemd unit or launchd plist stops being read-only, or an
+    /// openrc/rc.d script stops being executable. A unit an init system
+    /// cannot read is a boot that restores nothing; a script that is not
+    /// executable fails at the next reboot, the worst possible time to
+    /// find out.
+    #[test]
+    fn the_mode_is_read_only_for_units_and_executable_for_scripts() {
+        assert_eq!(unit_mode(Init::Systemd), 0o644);
+        assert_eq!(unit_mode(Init::Launchd), 0o644);
+        assert_eq!(unit_mode(Init::Openrc), 0o755);
+        assert_eq!(unit_mode(Init::FreebsdRc), 0o755);
+        assert_eq!(unit_mode(Init::OpenbsdRc), 0o755);
+    }
+
+    /// fails if the probe order ever flips. systemd wins a tie because
+    /// `/run/systemd/system` is the check `sd_booted(3)` makes; a host with
+    /// both is a systemd host with openrc leftovers. Untestable as a
+    /// filesystem probe on this machine — which is the whole reason the
+    /// ordering is a pure function.
+    #[test]
+    fn systemd_wins_when_both_linux_probes_are_true() {
+        assert_eq!(linux_init(true, true), Some(Init::Systemd));
+        assert_eq!(linux_init(true, false), Some(Init::Systemd));
+        assert_eq!(linux_init(false, true), Some(Init::Openrc));
+        assert_eq!(linux_init(false, false), None);
+    }
+
+    /// fails if `--init` stops overriding detection — the escape hatch for a
+    /// container with no /run/systemd/system, and the only way a macOS
+    /// machine renders a systemd unit at all.
+    #[test]
+    fn an_explicit_init_beats_detection() {
+        use clap::Parser as _;
+
+        use crate::cli::{Cli, Commands};
+
+        let cli = Cli::try_parse_from(["shep", "startup", "--init", "openrc"]).unwrap();
+        match cli.command {
+            Commands::Startup(args) => assert_eq!(args.init, Some(Init::Openrc)),
+            other => panic!("expected Startup, got {other:?}"),
+        }
+    }
+
+    /// fails if `--init` stops choosing the unit PATH — which is the half
+    /// that matters for `unstartup`. A unit installed under one init has to
+    /// be removable after the host has changed to another, and that is a
+    /// claim about which file gets removed, not about which struct the two
+    /// verbs share. (`Startup` and `Unstartup` both take `StartupArgs`, so a
+    /// test that only checked that both parse `--init` could barely fail.)
+    #[test]
+    fn each_init_names_its_own_unit_path() {
+        assert_eq!(
+            unit_path_for(Init::Openrc, "deploy"),
+            PathBuf::from("/etc/init.d/shep-deploy")
+        );
+        assert_eq!(
+            unit_path_for(Init::FreebsdRc, "deploy"),
+            PathBuf::from("/usr/local/etc/rc.d/shep_deploy")
+        );
+        assert_eq!(
+            unit_path_for(Init::OpenbsdRc, "deploy"),
+            PathBuf::from("/etc/rc.d/shep_deploy")
+        );
+        // systemd and launchd keep the paths they already had
+        assert_eq!(
+            unit_path_for(Init::Systemd, "deploy"),
+            unit::systemd_unit_path("deploy")
+        );
+        assert_eq!(
+            unit_path_for(Init::Launchd, "deploy"),
+            unit::launchd_plist_path("deploy")
+        );
+    }
+
+    /// fails if a username `rcvar`/`rcctl` cannot turn into a shell variable
+    /// stops being refused, or if a safe one is refused by mistake. `web-app`
+    /// and `deploy.svc` are both legal usernames and both illegal shell
+    /// variable fragments; a script built from one fails at
+    /// `load_rc_config` naming a line number rather than the user.
+    #[test]
+    fn a_user_name_that_cannot_be_a_shell_variable_is_refused() {
+        for ok in ["deploy", "www", "_shep", "app2"] {
+            assert!(is_rc_safe_user(ok), "{ok} should be accepted");
+        }
+        for bad in ["web-app", "deploy.svc", "2fast", "", "ünicode"] {
+            assert!(!is_rc_safe_user(bad), "{bad} should be refused");
+        }
     }
 }

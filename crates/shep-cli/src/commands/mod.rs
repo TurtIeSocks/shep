@@ -12,6 +12,7 @@ pub mod lifecycle;
 pub mod logs;
 pub mod muster;
 pub mod query;
+pub mod schema;
 pub(crate) mod selector;
 pub(crate) mod shep_toml;
 pub mod signal;

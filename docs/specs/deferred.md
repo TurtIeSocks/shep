@@ -102,37 +102,10 @@ PID-1 zombie reaping). Neither verb exists, nor the `shep-runtime`/
 `shep-dev` `[[bin]]` aliases spec §3 describes — `shep-cli/Cargo.toml` has
 one `[[bin]]`.
 
-**openrc and BSD rc.d units** (spec §11) — `shep startup` writes a systemd
-unit (`Type=notify`) on Linux and a `LaunchDaemon` plist on macOS; spec §11
-names four init systems and there is no renderer for the other two.
-`commands::startup::current_init` picks the renderer by compile target only
-(`target_os = "linux"` → systemd, `target_os = "macos"` → launchd), with no
-runtime check for which init system is actually active. A target that is
-neither — a BSD host, principally — is refused before any file is written,
-with a platform-level message naming neither renderer by name. A Linux host
-that runs openrc instead of systemd is not detected at all: `shep startup`
-still writes a systemd unit and tries to enable it, and the failure surfaces
-only when `systemctl` turns out not to exist.
-
 **Windows functional tier** (spec §11) — 0%, not partial. The Windows arm
 of `main.rs::run` prints "shep does not yet support Windows" and exits
 `Failure` for every verb; `boot`, `sys`, `server`, `tokio_runner` are all
 `#[cfg(unix)]`. Named-pipe transport and Job Objects: absent.
-
-**`.js` Flockfile** (spec §5) — TOML/YAML/JSON/JSON5 discovery and parsing
-all work; the `node -p 'JSON.stringify(require(p))'` fallback does not.
-
-**schemars JSON-schema export** (spec §5) — `AppConfig` has no `schemars`
-derive; no schema ships in `assets/` (the directory does not exist). The
-dependency question is settled, not open: whistle's own payload types derive
-`JsonSchema`, so `schemars 1.2.2` is now a declared, direct, versioned
-dependency of `shep-cli` (Phase 13) — at zero extra compiled crates, since
-`rmcp`'s `server` feature already pulls it, but still an edge this project
-owns and holds a `-Z minimal-versions` floor for. What is left for
-`AppConfig` is a derive and a writer, not a dependency decision.
-
-**Daemon-config flags layer** (spec §5) — layering is `file < SHEP_* env`
-today; the third, CLI-flag layer over the top does not exist.
 
 ## Known debt, recorded rather than built
 
@@ -196,21 +169,35 @@ error with no sentence naming the limit (104 bytes on macOS, 108 on Linux) or
 the variable responsible. Low impact and a small fix — a length check ahead of
 the bind that names both — but not this task's subject.
 
-### `DaemonConfig` is not a proof token, unlike `ResolvedApp`
+### `DaemonConfig` is not a proof token, unlike `ResolvedApp` — resolved, Phase 14
+
+Phase 14's daemon-config flags layer was the thing that would force this
+question, and it landed, so the question is answered rather than open.
 
 `ResolvedApp` keeps its `config` private so that holding one proves it went
-through `normalize` (`normalize.rs:63`). `DaemonConfig` does not: its `daemon`
-and `dog` fields are `pub`, and the one validation it performs — the
-`max_cron_sleep` floor — happens inline inside `DaemonConfig::load`
-(`daemon.rs:203-210`) rather than in a `validate` step a hand-built value would
-also have to pass.
+through `normalize`. `DaemonConfig` does not, and does not become one:
+`validate` moved out of `load` into its own private method, called once at
+the bottom of the new `load_layered` (`file < env < flags`, exactly one
+validation pass, so a good `--max-cron-sleep` can rescue a broken
+`shep.toml`) — but `daemon` and `dog` stay `pub`, the same as before.
 
-Nothing constructs one by hand today outside tests, so nothing is currently
-wrong. Deferred because making the fields private and splitting `validate` out
-of `load` is an architectural call on a type whose shape is Rin's to decide,
-not a defect with a known fix. What would force it: any production path that
-assembles a `DaemonConfig` from something other than a file — the daemon-config
-flags layer, for instance.
+The type is `#[non_exhaustive]` now, and that attribute is **for field
+growth**, not for this. `DaemonConfig` has grown a section per phase and will
+grow another; without the attribute each one is a breaking change for an
+out-of-tree struct literal. It does **not** prove a value was validated:
+`#[non_exhaustive]` blocks a struct literal and functional-update syntax from
+outside the crate, but not field mutation —
+`DaemonConfig::default().daemon.max_cron_sleep = Some(…)` compiles fine and
+walks straight past it. The contract is stated in the type's own doc comment,
+not enforced: `load` and `load_layered` are the validating constructors, and a
+caller that mutates a loaded config afterwards is out of contract, silently.
+
+Nothing in this codebase is in that position today — every call site loads a
+`DaemonConfig` and consumes it within a few lines (`run_daemon`, the dogs
+subsystem's `[dog.<name>]` read, whistle's `gate.rs`) — so nothing is
+currently wrong. The escape hatch, if an out-of-tree caller ever needs to
+mutate a loaded config and re-check it, is to make `validate` `pub`: a
+one-line, non-breaking addition. Fields do not need to go private for that.
 
 ### `ProcessInfo` fuses four concerns behind one discriminator
 
@@ -339,6 +326,32 @@ dependency this phase's review declined to add for a cosmetic gap. What would
 force it: an operator running `shep lookout` against sheep with CJK names or
 logs, where a missing `…` is confusing rather than theoretical.
 
+### A `.js` Flockfile has no evaluation timeout
+
+A `.js` module handed to `require()` and never returning — one that starts a
+server at require time rather than exporting config — hangs `shep start`
+forever. There is no bound on the wait.
+
+Not built because a bound means a reaper thread in a crate that forbids
+unsafe code (`#![forbid(unsafe_code)]` on shep-cli), for a case where the
+process is in the foreground, attached to the operator's own terminal, and
+already interruptible with Ctrl-C. What would force it: any path that
+evaluates a `.js` Flockfile unattended — a CI job or a provisioning script
+running `shep start` non-interactively, where nobody is watching to press
+Ctrl-C.
+
+### The missing-node error message has no test
+
+`shep start <path>.js --flockfile` on a machine with no `node` on `PATH`
+produces a specific sentence (`crates/shep-cli/src/commands/lifecycle.rs`),
+but nothing exercises that code path under test. Producing it for real needs
+a `PATH` with no `node` on it, and mutating `PATH` for the duration of one
+test means `std::env::set_var`, which is `unsafe` in edition 2024 — in a
+crate that forbids unsafe code. The sentence is pinned instead as an exact
+substring in `docs/migration.md`, which drifts from the code the moment
+either one is edited without the other, `grep`-checked but not
+`cargo test`-checked.
+
 ## Not deferred
 
 **Dogs** (spec §8) **shipped**: the dog contract (`shep_daemon::dogs`,
@@ -388,13 +401,46 @@ rule, not stated in the spec itself.
 writes a Flockfile whose every app passes `shep_core::config::normalize`.
 The migration-guide half is `docs/migration.md`.
 
-**`shep startup` / `shep unstartup`** (spec §9, §11) **shipped** for two of
-spec §11's four init systems: `commands::startup` renders a systemd
-`Type=notify` unit or a `launchd` `LaunchDaemon` plist
-(`commands::startup::unit`), installs or removes it privilege-gated by
-`geteuid()`, and `shep daemon --foreground` (`crates/shep-daemon/src/notify.rs`)
-reports `READY=1` once the muster restore has finished so the unit does not
-go green over an empty flock. openrc and BSD rc.d remain open, above.
+**`shep startup` / `shep unstartup`** (spec §9, §11) **shipped** for all four
+of spec §11's init systems, as of Phase 14: `commands::startup` renders a
+systemd `Type=notify` unit, a `launchd` `LaunchDaemon` plist, an openrc init
+script, or a FreeBSD/OpenBSD `rc.d` script (`commands::startup::unit`),
+installs or removes it privilege-gated by `geteuid()`, and `shep daemon
+--foreground` (`crates/shep-daemon/src/notify.rs`) reports `READY=1` once the
+muster restore has finished so the systemd unit does not go green over an
+empty flock. On Linux, which init is active is now a runtime probe —
+`/run/systemd/system` a directory means systemd, `/run/openrc/softlevel` or
+`/run/openrc` a directory means openrc, neither means refuse naming both
+paths — because systemd and openrc share one `target_os` and cannot be told
+apart at compile time. FreeBSD and OpenBSD still resolve at compile time; the
+probe only exists because Linux needed it. `--init
+<systemd|openrc|launchd|freebsd-rc|openbsd-rc>` on `startup` and `unstartup`
+overrides the probe on any target.
+
+Three caveats, stated rather than buried:
+
+- **Behaviour change on Linux.** Before Phase 14, every Linux build got
+  `Init::Systemd` unconditionally, so a container with no
+  `/run/systemd/system` was written a systemd unit that nothing would ever
+  read. It is now refused — the correct answer, but a case that worked before
+  and does not after. `--init systemd` restores the old behaviour for a
+  container where that is actually wanted.
+- **openrc has no readiness protocol.** There is no `sd_notify` analogue, so
+  the openrc script's `start_post()` polls the shepherd's own control socket
+  instead and blocks the "started" verdict until the first request is
+  answered — which happens only after the muster restore and the dogs are up,
+  the same milestone `READY=1` proves on systemd, one step later. FreeBSD gets
+  the same poll through `start_postcmd`. OpenBSD's `rc.subr` has no
+  documented post-start hook at all; its script reports started as soon as
+  the process is spawned and says so in its own header comment, naming
+  `shep flock` as the real check.
+- **None of the three new scripts has been executed on its own operating
+  system.** No FreeBSD, OpenBSD, or openrc host exists on this machine. They
+  are pure `format!` output pinned by exact-string tests — the same tier the
+  systemd unit has always had, since it too has only ever been *rendered*, on
+  a Mac. That is a real and adequate tier for text; it is not a claim that the
+  scripts work. Nothing in the docs claims the BSD or openrc scripts are
+  supported until someone reports back from a host that actually runs one.
 
 **CPU and memory in `shep flock`/`shep describe`** (spec §9's observability
 surface) **shipped**: `limits::stats` (`SheepStats`, `StatsState`) samples
@@ -454,6 +500,52 @@ What each of those does NOT do, recorded so it is not rediscovered as drift:
 - `channel.*` carries child→shepherd traffic only. The shepherd's own
   `shutdown` and `action` writes are already reported by `process.stop` and by
   `Response::Triggered`; adding them stays additive if that changes.
+
+**`.js` Flockfile** (spec §5) **shipped**, Phase 14, with a ruling narrower
+than the spec's own phrasing suggests: explicit only, never by directory
+discovery and never by extension alone. `shep start <path> --flockfile` reads
+`<path>` by shelling out to `node -e` with a small `try`/`catch` wrapper
+(`JS_BRIDGE_SCRIPT` in `lifecycle.rs`) that requires the module and writes
+its JSON to stdout, or `err.message` to stderr on failure — not `node -p`
+bare, whose crash dump on an uncaught exception ends with a trailing
+`Node.js vX.Y.Z` banner line rather than the actual error — and feeding the
+result through the existing JSON parser; without the flag,
+`shep start server.js` still means exactly what it always has — start
+`server.js` as a script. The ten-name `DISCOVERY_ORDER` is unchanged and still
+has no `.js` entry in it. The document it reads is Flockfile-shaped (an `app`
+array, sheep-native field names), not a pm2 `ecosystem.config.js` — pointing
+`--flockfile` at a real pm2 ecosystem file gets serde's own `unknown field
+`apps`, expected `app`` refusal, and `shep import` remains the only pm2 path.
+A `.js` module that never returns hangs `shep start` forever; there is no
+timeout, recorded as known debt below.
+
+**schemars JSON-schema export** (spec §5) **shipped**, Phase 14, behind a
+non-default `schema` feature on shep-core that shep-cli turns on. The schema
+describes the Flockfile **document** (generated from `RawFlockfile`, the
+private type serde actually deserializes into, not from `AppConfig` alone —
+an `AppConfig`-only schema would reject every real Flockfile, since a
+Flockfile is `{"$schema": …, "app": […]}` and not an `AppConfig` object
+itself), with `AppConfig` and its nested types referenced from `$defs`. It is
+committed at `crates/shep-core/assets/flockfile.schema.json`, generated by the
+hidden `shep schema` verb, and drift-guarded by an `include_str!` plus a
+co-located test in shep-core — editing an `AppConfig` field or its doc comment
+without regenerating the artefact fails `cargo test -p shep-core`. The schema
+describes the deserializer, not the `normalize` step: `kill_signal` is an
+unconstrained string in the schema even though `normalize` narrows it to five
+signal names later.
+
+**Daemon-config flags layer** (spec §5) **shipped**, Phase 14:
+`DaemonConfig::load_layered` adds a third layer, `file < env < flags`, over
+the `file < env` `load` already did. `shep daemon` gains `--log-json[=BOOL]`,
+`--log-level <LEVEL>`, `--socket <PATH>` and `--max-cron-sleep <DUR>`, one
+per `SHEP_*` variable `load` already reads and no others — `enabled_dogs` and
+`adopted_dogs` stay `shep enable`/`shep adopt`-only, with no env or flag layer
+of their own. Validation happens once, after all three layers are merged, so
+a good `--max-cron-sleep` can rescue a `shep.toml` whose own value is below
+the floor — the same reasoning that already governed `file < env`. The
+boolean grammar (`1|0|true|false`) is shared between the env reader and the
+flag's `value_parser` through one exported function, `parse_daemon_bool`,
+rather than widened to clap's own broader `yes/no/y/n/on/off` grammar.
 
 **whistle** (spec §8, §13) **shipped**: `shep whistle`, an MCP server over
 stdio (`rmcp`), nine tools — five read-only, always present, and four that

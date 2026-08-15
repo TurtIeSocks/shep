@@ -29,7 +29,7 @@
 use std::ffi::OsStr;
 use std::io::IsTerminal;
 
-use shep_core::config::{DaemonConfig, DaemonConfigError};
+use shep_core::config::{DaemonConfig, DaemonConfigError, DaemonOverrides};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::DogSource;
 use shep_core::values::UpDuration;
@@ -191,15 +191,19 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
 /// Runs the supervisor in this process until a signal or `KillDaemon`.
 ///
 /// Loads `shep.toml` (a missing file is not an error — see
-/// [`read_daemon_config_source`]) plus `SHEP_*` environment overrides, installs
-/// the log subscriber those two knobs configure (see
-/// [`install_log_subscriber`]), folds `args` in via [`boot_options`] —
-/// which is also where `[daemon] enabled_dogs`/`adopted_dogs` become the
-/// dogs `boot` starts once the flock is back — then boots and serves. The
-/// re-exec'd child inherits a real environment on
-/// purpose (`launch::launch_command` deliberately does not `.env_clear()`), so
-/// `SHEP_LOG_JSON`, `SHEP_LOG_LEVEL`, `SHEP_SOCKET`, and
-/// `SHEP_MAX_CRON_SLEEP` are read straight from `std::env::var`.
+/// [`read_daemon_config_source`]) layered under `SHEP_*` environment
+/// overrides and, on top of those, the `daemon` subcommand's own flags (spec
+/// §5's `file < env < flags` — see [`daemon_overrides`]), installs the log
+/// subscriber those layers configure (see [`install_log_subscriber`]), folds
+/// `args` in via [`boot_options`] — which is also where `[daemon]
+/// enabled_dogs`/`adopted_dogs` become the dogs `boot` starts once the flock
+/// is back — then boots and serves. The re-exec'd child inherits a real
+/// environment on purpose (`launch::launch_command` deliberately does not
+/// `.env_clear()`), so `SHEP_LOG_JSON`, `SHEP_LOG_LEVEL`, `SHEP_SOCKET`, and
+/// `SHEP_MAX_CRON_SLEEP` are read straight from `std::env::var` — the
+/// environment is the *middle* layer now, not the top one; `--log-json`,
+/// `--log-level`, `--socket` and `--max-cron-sleep` on the invocation itself
+/// win over all of it.
 /// `$NOTIFY_SOCKET` is read here too — the one read of it in the workspace
 /// — and is the one variable in that list shep does not own the name of:
 /// an init system sets it, and `--foreground` is what decides whether it is
@@ -221,8 +225,9 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
 pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), DaemonRunError> {
     let env = |key: &str| std::env::var(key).ok();
     let file_source = read_daemon_config_source(&paths)?;
-    let config =
-        DaemonConfig::load(file_source.as_deref(), &env).map_err(DaemonRunError::Config)?;
+    let overrides = daemon_overrides(args);
+    let config = DaemonConfig::load_layered(file_source.as_deref(), &env, &overrides)
+        .map_err(DaemonRunError::Config)?;
     install_log_subscriber(&config);
     // The one read of this variable in the workspace, here beside every
     // `SHEP_*` override rather than inside shep-daemon — see
@@ -235,6 +240,21 @@ pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), Daemo
         .run()
         .await
         .map_err(DaemonRunError::Run)
+}
+
+/// Builds the CLI-flag layer of `file < env < flags` (spec §5) from the
+/// `daemon` subcommand's own arguments.
+///
+/// Extracted out of [`run_daemon`] rather than inlined so the chain from
+/// argv to a validated [`DaemonConfig`] is testable without booting anything
+/// — see `every_daemon_flag_reaches_the_config` below.
+#[must_use]
+pub fn daemon_overrides(args: &DaemonArgs) -> DaemonOverrides {
+    DaemonOverrides::new()
+        .log_json(args.log_json)
+        .log_level(args.log_level)
+        .socket(args.socket.clone())
+        .max_cron_sleep(args.max_cron_sleep)
 }
 
 /// Builds [`BootOptions`] from `config`, the `daemon` subcommand's own
@@ -333,6 +353,42 @@ pub fn daemon_exit_code(err: &DaemonRunError) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shep_core::config::LogLevel;
+
+    /// fails if `run_daemon` builds its overrides from the wrong fields, or
+    /// drops one. Drives the config assembly, not the boot — booting a real
+    /// shepherd is `daemon_e2e`'s job. Asserts all four fields rather than
+    /// sampling one, which is what makes the mutation below land on exactly
+    /// one assertion.
+    #[test]
+    fn every_daemon_flag_reaches_the_config() {
+        let args = DaemonArgs {
+            no_restore: false,
+            foreground: false,
+            log_json: Some(true),
+            log_level: Some(LogLevel::Trace),
+            socket: Some(std::path::PathBuf::from("/tmp/flag.sock")),
+            max_cron_sleep: Some(UpDuration::from_millis(120_000)),
+        };
+        let cfg = DaemonConfig::load_layered(
+            Some(
+                "[daemon]\nlog_json = false\nlog_level = \"error\"\nsocket = \"/tmp/file.sock\"\n",
+            ),
+            &|_| None,
+            &daemon_overrides(&args),
+        )
+        .unwrap();
+        assert!(cfg.daemon.log_json);
+        assert_eq!(cfg.daemon.log_level, LogLevel::Trace);
+        assert_eq!(
+            cfg.daemon.socket,
+            Some(std::path::PathBuf::from("/tmp/flag.sock"))
+        );
+        assert_eq!(
+            cfg.daemon.max_cron_sleep,
+            Some(UpDuration::from_millis(120_000))
+        );
+    }
 
     /// Colour is a terminal's business and `NO_COLOR`'s, in that order.
     ///
@@ -365,6 +421,10 @@ mod tests {
             &DaemonArgs {
                 no_restore: false,
                 foreground: false,
+                log_json: None,
+                log_level: None,
+                socket: None,
+                max_cron_sleep: None,
             },
             None,
         );
@@ -399,6 +459,10 @@ otel = "/usr/local/bin/shep-otel"
             &DaemonArgs {
                 no_restore: false,
                 foreground: false,
+                log_json: None,
+                log_level: None,
+                socket: None,
+                max_cron_sleep: None,
             },
             None,
         );
@@ -433,7 +497,11 @@ otel = "/usr/local/bin/shep-otel"
                 &configured,
                 &DaemonArgs {
                     no_restore: false,
-                    foreground: false
+                    foreground: false,
+                    log_json: None,
+                    log_level: None,
+                    socket: None,
+                    max_cron_sleep: None,
                 },
                 None
             )
@@ -447,7 +515,11 @@ otel = "/usr/local/bin/shep-otel"
                 &unset,
                 &DaemonArgs {
                     no_restore: false,
-                    foreground: false
+                    foreground: false,
+                    log_json: None,
+                    log_level: None,
+                    socket: None,
+                    max_cron_sleep: None,
                 },
                 None
             )
@@ -469,6 +541,10 @@ otel = "/usr/local/bin/shep-otel"
             &DaemonArgs {
                 no_restore: true,
                 foreground: false,
+                log_json: None,
+                log_level: None,
+                socket: None,
+                max_cron_sleep: None,
             },
             None,
         );
@@ -486,6 +562,10 @@ otel = "/usr/local/bin/shep-otel"
             &DaemonArgs {
                 no_restore: false,
                 foreground: false,
+                log_json: None,
+                log_level: None,
+                socket: None,
+                max_cron_sleep: None,
             },
             None,
         );
@@ -499,6 +579,10 @@ otel = "/usr/local/bin/shep-otel"
             &DaemonArgs {
                 no_restore: false,
                 foreground: true,
+                log_json: None,
+                log_level: None,
+                socket: None,
+                max_cron_sleep: None,
             },
             Some(OsStr::new("/run/systemd/notify")),
         );
@@ -515,6 +599,10 @@ otel = "/usr/local/bin/shep-otel"
             &DaemonArgs {
                 no_restore: false,
                 foreground: true,
+                log_json: None,
+                log_level: None,
+                socket: None,
+                max_cron_sleep: None,
             },
             None,
         );
@@ -525,6 +613,10 @@ otel = "/usr/local/bin/shep-otel"
             &DaemonArgs {
                 no_restore: false,
                 foreground: false,
+                log_json: None,
+                log_level: None,
+                socket: None,
+                max_cron_sleep: None,
             },
             Some(OsStr::new("/run/systemd/notify")),
         );
@@ -544,6 +636,10 @@ otel = "/usr/local/bin/shep-otel"
             &DaemonArgs {
                 no_restore: false,
                 foreground: true,
+                log_json: None,
+                log_level: None,
+                socket: None,
+                max_cron_sleep: None,
             },
             Some(OsStr::new("/run/systemd/notify")),
         );

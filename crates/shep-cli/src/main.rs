@@ -56,6 +56,8 @@ use commands::muster;
 #[cfg(unix)]
 use commands::query;
 #[cfg(unix)]
+use commands::schema;
+#[cfg(unix)]
 use commands::signal;
 #[cfg(unix)]
 use commands::startup;
@@ -225,6 +227,17 @@ async fn run(cli: Cli) -> ExitCode {
                 err: &mut err,
             };
             return startup::unstartup(&mut streams, fmt, args);
+        }
+        // Needs no `$SHEP_HOME` at all — same reasoning as `Completions`
+        // just above, and the same early spot for it.
+        Commands::Schema => {
+            let mut out = std::io::stdout().lock();
+            let mut err = std::io::stderr().lock();
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            return schema::schema(&mut streams, fmt);
         }
         _ => {}
     }
@@ -437,6 +450,7 @@ async fn run(cli: Cli) -> ExitCode {
         | Commands::Daemon(_)
         | Commands::Startup(_)
         | Commands::Unstartup(_)
+        | Commands::Schema
         | Commands::Bleats(_)
         | Commands::Lookout(_)
         | Commands::Whistle

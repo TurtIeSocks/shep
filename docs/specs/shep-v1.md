@@ -162,11 +162,26 @@ impl lands v1.1).
 
 **Flockfile** (per-app config): TOML preferred, YAML + JSON + JSON5 accepted;
 `.js`
-config via `node -p 'JSON.stringify(require(p))'` (requires node on PATH,
-documented). Discovery order in cwd: `Flockfile.{toml,yaml,yml,json,json5}`
+config via `node -e` with a try/catch bridge script that requires the module
+and writes its JSON to stdout (requires node on PATH, documented) — not
+`node -p` bare, whose crash-dump on failure hides the real error behind a
+trailing `Node.js vX.Y.Z` banner. Discovery order in cwd:
+`Flockfile.{toml,yaml,yml,json,json5}`
 then lowercase `flockfile.*` in the same order. Schema = `AppConfig` in shep-core
-(schemars-exported JSON schema ships in assets for editor completion). Field
-set per map.md app_spec; sheep-native names, no pm2 aliases.
+(schemars-exported JSON schema ships in `crates/shep-core/assets/`, generated
+from the parser's own document type and describing the whole document — not
+just `AppConfig` — for editor completion). Field set per map.md app_spec;
+sheep-native names, no pm2 aliases.
+
+**Amended, Phase 14 (Rin's ruling).** `.js` is read only when named
+explicitly with `shep start <path> --flockfile`. Directory discovery never
+selects a `.js` file and the ten-name order above is unchanged, because
+reading one runs `node` on it: entering a cloned repository and running
+`shep start` must not execute code that repository contains. `shep start
+server.js` with no flag still means what it always has — run `server.js` as a
+script. The document `--flockfile` reads is Flockfile-shaped (the `app` key,
+sheep-native field names), not a pm2 `ecosystem.config.js`; `shep import`
+remains the pm2 path.
 
 **Daemon config** `$SHEP_HOME/shep.toml`: `[daemon]` (log policy, socket
 overrides), `[dog.<name>]` sections (each dog's typed config), alert rules

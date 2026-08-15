@@ -50,6 +50,27 @@ pub enum TargetError {
         /// exactly what was tried.
         target: String,
     },
+    /// `--flockfile` was given for a path whose extension names no format
+    /// this can read.
+    UnknownFlockfileFormat {
+        /// The path as the operator wrote it.
+        path: PathBuf,
+    },
+    /// A `.js` Flockfile could not be evaluated. `node_missing` separates
+    /// "install node" from "your config threw", because they are different
+    /// problems with different fixes and different exit codes.
+    ///
+    /// Carries no separate `path` field: every `detail` string below is
+    /// already built with the path baked in (decision 3's own sentences),
+    /// so a second copy would be dead weight — literally, `cargo clippy -D
+    /// warnings` flags an unread `path` field here, because
+    /// `#[derive(Debug)]` does not count as a read for dead-code analysis.
+    Js {
+        /// What went wrong, already phrased for the operator.
+        detail: String,
+        /// `true` when node itself was not found on `PATH`.
+        node_missing: bool,
+    },
 }
 
 impl std::fmt::Display for TargetError {
@@ -64,6 +85,12 @@ impl std::fmt::Display for TargetError {
                 f,
                 "{target} is not `-`, a recognised Flockfile, or an existing path"
             ),
+            Self::UnknownFlockfileFormat { path } => write!(
+                f,
+                "--flockfile needs a .toml, .yaml, .yml, .json, .json5 or .js file; {} is none of those",
+                path.display()
+            ),
+            Self::Js { detail, .. } => f.write_str(detail),
         }
     }
 }
@@ -73,7 +100,9 @@ impl core::error::Error for TargetError {
         match self {
             Self::Stdin(err) | Self::Read { source: err, .. } => Some(err),
             Self::Flockfile(err) => Some(err),
-            Self::Unresolvable { .. } => None,
+            Self::Unresolvable { .. } | Self::UnknownFlockfileFormat { .. } | Self::Js { .. } => {
+                None
+            }
         }
     }
 }
@@ -85,19 +114,142 @@ fn target_exit_code(err: &TargetError) -> ExitCode {
         TargetError::Stdin(_) => ExitCode::Failure,
         TargetError::Read { .. } | TargetError::Unresolvable { .. } => ExitCode::Usage,
         TargetError::Flockfile(_) => ExitCode::InvalidConfig,
+        TargetError::UnknownFlockfileFormat { .. } => ExitCode::Usage,
+        TargetError::Js {
+            node_missing: true, ..
+        } => ExitCode::Failure,
+        TargetError::Js {
+            node_missing: false,
+            ..
+        } => ExitCode::InvalidConfig,
     }
+}
+
+/// The script handed to `node -e`. Wraps the `require` in its own
+/// `try`/`catch` rather than letting an uncaught exception crash node and
+/// relying on node's own crash-dump formatting — see this function's doc for
+/// why. `process.argv[1]` is the absolute path, per `-e`'s argv layout
+/// (identical to `-p`'s).
+const JS_BRIDGE_SCRIPT: &str = "try { \
+     process.stdout.write(JSON.stringify(require(process.argv[1]))); \
+ } catch (err) { \
+     process.stderr.write(err && err.message ? String(err.message) : String(err)); \
+     process.exitCode = 1; \
+ }";
+
+/// Evaluates a `.js` Flockfile through node and returns its JSON.
+///
+/// The path is passed as an **argument**, never interpolated into the
+/// JavaScript source: a path containing `'`, `\` or a newline would
+/// otherwise escape the string literal, and adding a second way to inject
+/// code into a file whose own code we are already about to run is
+/// gratuitous. Under `-p` / `-e`, node puts the first user argument at
+/// `process.argv[1]`.
+///
+/// The path must be absolute — `require("x.js")` with no leading `./` is a
+/// *package* specifier and resolves against `node_modules`, not the cwd.
+///
+/// stdin is `/dev/null` so a config module that reads stdin cannot eat the
+/// operator's terminal; stdout and stderr are captured so node's own message
+/// can be quoted back.
+///
+/// **Runs `-e` with an in-script `try`/`catch`, not `-p` bare.** Letting
+/// `require` throw uncaught and scraping node's own crash-dump formatting
+/// was tried first and does not work on a current node: verified empirically
+/// against v26.5.0, the crash dump always ends with a trailing `Node.js
+/// vX.Y.Z` banner line, so "the last non-blank line of stderr" — the
+/// extraction this module used to use — quotes the banner, or a stack frame,
+/// never the message. `err.message` is written to stderr ourselves instead,
+/// which is what makes the sentence below actually name the failure. This
+/// stays inside the same mechanic the design calls for (`-p` / `-e` both put
+/// the path at `process.argv[1]`, never in the source), so it is a narrower
+/// implementation choice, not a different design.
+///
+/// **There is no timeout.** A module that never returns — one that starts a
+/// server at require time — hangs here. The process is in the foreground and
+/// interruptible; adding a bound means a reaper thread in a crate that
+/// forbids unsafe code. Recorded in `docs/specs/deferred.md`.
+///
+/// **The `node_missing` sentence has no unit test and no automated pin**,
+/// for the same reason the stdin gap a few functions up admits its own:
+/// producing it needs a `PATH` without node, and `std::env::set_var` is
+/// `unsafe` in edition 2024 in a crate that forbids unsafe. `docs/migration.md`
+/// quotes this sentence for an operator without node installed; nothing
+/// re-checks that quote against this `format!` after the fact, so the two
+/// are kept in step by hand. If this sentence changes, update
+/// `docs/migration.md`'s quote in the same commit.
+///
+/// # Errors
+///
+/// - [`TargetError::Read`] — the path could not be canonicalized.
+/// - [`TargetError::Js`] with `node_missing` — node is not on `PATH`.
+/// - [`TargetError::Js`] — node ran and failed, or could not be spawned.
+fn evaluate_js_flockfile(path: &Path) -> Result<String, TargetError> {
+    let absolute = std::fs::canonicalize(path).map_err(|source| TargetError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(JS_BRIDGE_SCRIPT)
+        .arg(&absolute)
+        .stdin(std::process::Stdio::null())
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(TargetError::Js {
+                detail: format!(
+                    "reading a .js Flockfile runs it through node, and node was not found on PATH; \
+                     install node, or convert {} to a .toml Flockfile",
+                    path.display()
+                ),
+                node_missing: true,
+            });
+        }
+        Err(err) => {
+            return Err(TargetError::Js {
+                detail: format!("could not run node for {}: {err}", path.display()),
+                node_missing: false,
+            });
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason = stderr
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("node exited non-zero and said nothing");
+        return Err(TargetError::Js {
+            detail: format!("node could not evaluate {}: {reason}", path.display()),
+            node_missing: false,
+        });
+    }
+    String::from_utf8(output.stdout).map_err(|_utf8_error| TargetError::Js {
+        detail: format!("node printed non-UTF-8 output for {}", path.display()),
+        node_missing: false,
+    })
 }
 
 /// Resolves `target` into the [`AppConfig`]s `start` should register, in
 /// this fixed order — do not widen it (spec fidelity; input-format widening
 /// is a top drift risk):
 ///
-/// 1. `target == "-"` — `stdin` is Flockfile JSON.
-/// 2. `target`'s extension is one [`FlockFormat::from_path`] recognises —
+/// 1. `target == "-"` — `stdin` is Flockfile JSON. `as_flockfile` is ignored
+///    here; stdin is already a Flockfile by construction.
+/// 2. `as_flockfile` is set — read by extension: a format
+///    [`FlockFormat::from_path`] recognises parses as it does today; `.js`
+///    goes through the node bridge ([`evaluate_js_flockfile`]); anything
+///    else is [`TargetError::UnknownFlockfileFormat`], naming the
+///    extensions accepted.
+/// 3. `target`'s extension is one [`FlockFormat::from_path`] recognises —
 ///    read and [`Flockfile::parse`] it in that format.
-/// 3. Any other existing path — one [`AppConfig::minimal`], named `name` if
+/// 4. Any other existing path — one [`AppConfig::minimal`], named `name` if
 ///    given, else the path's file stem, with `target` itself as the script.
-/// 4. Nothing matched — [`TargetError::Unresolvable`], naming `target`.
+/// 5. Nothing matched — [`TargetError::Unresolvable`], naming `target`.
+///
+/// With `as_flockfile` false, every branch behaves exactly as it did before
+/// this parameter existed — that property is what Task 1's mutations check.
 ///
 /// `stdin` is bytes the caller already read, never read here — `start`
 /// reads the real process stdin only when `target == "-"` and hands the
@@ -111,11 +263,16 @@ fn target_exit_code(err: &TargetError) -> ExitCode {
 ///   but the file could not be read.
 /// - [`TargetError::Flockfile`] — the source read fine but failed Flockfile
 ///   validation.
+/// - [`TargetError::UnknownFlockfileFormat`] — `as_flockfile` is set and
+///   `target`'s extension names no readable format.
+/// - [`TargetError::Js`] — `as_flockfile` is set, `target` is a `.js` file,
+///   and node could not be run or could not evaluate it.
 /// - [`TargetError::Unresolvable`] — `target` matched none of the above.
 pub fn resolve_target(
     target: &str,
     name: Option<&str>,
     stdin: &[u8],
+    as_flockfile: bool,
 ) -> Result<Vec<AppConfig>, TargetError> {
     let path = Path::new(target);
     match (target, FlockFormat::from_path(path)) {
@@ -130,6 +287,26 @@ pub fn resolve_target(
                 .map(|flockfile| flockfile.apps)
                 .map_err(TargetError::Flockfile)
         }
+        (_, format) if as_flockfile => match format {
+            Some(format) => {
+                let source = std::fs::read_to_string(path).map_err(|source| TargetError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                Flockfile::parse(&source, format)
+                    .map(|flockfile| flockfile.apps)
+                    .map_err(TargetError::Flockfile)
+            }
+            None if path.extension().and_then(|e| e.to_str()) == Some("js") => {
+                let json = evaluate_js_flockfile(path)?;
+                Flockfile::parse(&json, FlockFormat::Json)
+                    .map(|flockfile| flockfile.apps)
+                    .map_err(TargetError::Flockfile)
+            }
+            None => Err(TargetError::UnknownFlockfileFormat {
+                path: path.to_path_buf(),
+            }),
+        },
         (_, Some(format)) => {
             let source = std::fs::read_to_string(path).map_err(|source| TargetError::Read {
                 path: path.to_path_buf(),
@@ -222,7 +399,8 @@ pub async fn start(
         Vec::new()
     };
 
-    let mut apps = match resolve_target(&args.target, args.name.as_deref(), &stdin) {
+    let mut apps = match resolve_target(&args.target, args.name.as_deref(), &stdin, args.flockfile)
+    {
         Ok(apps) => apps,
         Err(err) => return fail_target(streams, fmt, &err),
     };
@@ -405,6 +583,7 @@ mod tests {
             target: target.to_string(),
             name: None,
             fold: None,
+            flockfile: false,
         }
     }
 
@@ -422,8 +601,13 @@ mod tests {
     fn a_dash_target_reads_a_flockfile_from_stdin_as_json() {
         // `app`, not `apps` — the wire key is renamed and unknown keys are a
         // hard error (flockfile.rs:23-32).
-        let apps =
-            resolve_target("-", None, br#"{"app":[{"name":"web","script":"./srv"}]}"#).unwrap();
+        let apps = resolve_target(
+            "-",
+            None,
+            br#"{"app":[{"name":"web","script":"./srv"}]}"#,
+            false,
+        )
+        .unwrap();
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].name, "web");
     }
@@ -433,7 +617,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("flock.toml");
         std::fs::write(&path, "[[app]]\nname = \"web\"\nscript = \"./srv\"\n").unwrap();
-        let apps = resolve_target(path.to_str().unwrap(), None, b"").unwrap();
+        let apps = resolve_target(path.to_str().unwrap(), None, b"", false).unwrap();
         assert_eq!(apps[0].name, "web");
     }
 
@@ -442,7 +626,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.js");
         std::fs::write(&path, "").unwrap();
-        let apps = resolve_target(path.to_str().unwrap(), None, b"").unwrap();
+        let apps = resolve_target(path.to_str().unwrap(), None, b"", false).unwrap();
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].name, "server");
         assert_eq!(apps[0].script, path.to_str().unwrap());
@@ -453,8 +637,127 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.js");
         std::fs::write(&path, "").unwrap();
-        let apps = resolve_target(path.to_str().unwrap(), Some("api"), b"").unwrap();
+        let apps = resolve_target(path.to_str().unwrap(), Some("api"), b"", false).unwrap();
         assert_eq!(apps[0].name, "api");
+    }
+
+    /// fails if `.js` is ever routed to the node bridge without the flag —
+    /// the regression that would break `shep start server.js` for every
+    /// user who has ever typed it. Deliberately a sibling of
+    /// `any_other_existing_path_becomes_one_minimal_app_named_for_its_stem`.
+    #[test]
+    fn a_js_file_without_the_flag_is_still_a_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.js");
+        std::fs::write(&path, "throw new Error('this must never be evaluated')").unwrap();
+        let apps = resolve_target(path.to_str().unwrap(), None, b"", false).unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "server");
+        assert_eq!(apps[0].script, path.to_str().unwrap());
+    }
+
+    /// fails if `--flockfile` changes how a recognised extension is read.
+    #[test]
+    fn the_flag_does_not_change_a_toml_flockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flock.toml");
+        std::fs::write(&path, "[[app]]\nname = \"web\"\nscript = \"./srv\"\n").unwrap();
+        let with = resolve_target(path.to_str().unwrap(), None, b"", true).unwrap();
+        let without = resolve_target(path.to_str().unwrap(), None, b"", false).unwrap();
+        assert_eq!(with, without);
+    }
+
+    /// fails if an unreadable extension under the flag falls through to the
+    /// script arm instead of refusing — which would silently start the
+    /// operator's config file as a program.
+    #[test]
+    fn the_flag_refuses_an_extension_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flock.ini");
+        std::fs::write(&path, "").unwrap();
+        let err = resolve_target(path.to_str().unwrap(), None, b"", true).unwrap_err();
+        assert!(matches!(err, TargetError::UnknownFlockfileFormat { .. }));
+        assert_eq!(target_exit_code(&err), ExitCode::Usage);
+    }
+
+    /// Returns `true` when node is on PATH. The `.js` cases below are the
+    /// only tests in the workspace that need a second runtime, and a machine
+    /// without node must not fail the suite.
+    ///
+    /// The `eprintln!` is not the guard: libtest captures the output of a
+    /// test that PASSES and prints it only on failure, so a skip is
+    /// invisible under a plain `cargo test` — which is exactly the host this
+    /// helper exists for. `SHEP_REQUIRE_NODE=1` is the guard. Set it on any
+    /// machine that has node (the task gate below does) and a broken helper
+    /// is a panic rather than a green run over three tests that never ran.
+    fn node_available() -> bool {
+        let ok = std::process::Command::new("node")
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(
+            ok || std::env::var_os("SHEP_REQUIRE_NODE").is_none(),
+            "SHEP_REQUIRE_NODE is set but node is not usable on PATH"
+        );
+        if !ok {
+            eprintln!("SKIPPED: node is not on PATH; the .js Flockfile cases did not run");
+        }
+        ok
+    }
+
+    #[test]
+    fn a_js_flockfile_under_the_flag_is_evaluated() {
+        if !node_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flock.js");
+        std::fs::write(
+            &path,
+            "module.exports = { app: [{ name: \"web\", script: \"./srv\" }] };",
+        )
+        .unwrap();
+        let apps = resolve_target(path.to_str().unwrap(), None, b"", true).unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "web");
+    }
+
+    /// fails if a throwing config is reported as anything but InvalidConfig,
+    /// or if node's own message is dropped on the floor.
+    #[test]
+    fn a_js_flockfile_that_throws_is_an_invalid_config_quoting_node() {
+        if !node_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flock.js");
+        std::fs::write(&path, "throw new Error('sheep dip empty');").unwrap();
+        let err = resolve_target(path.to_str().unwrap(), None, b"", true).unwrap_err();
+        assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
+        assert!(err.to_string().contains("sheep dip empty"), "got: {err}");
+    }
+
+    /// fails if a pm2 ecosystem file is accepted, or if the refusal stops
+    /// naming the key the operator has to change. Decision 2: this feature
+    /// reads a Flockfile-shaped .js, and serde's own message is the answer.
+    #[test]
+    fn a_pm2_ecosystem_shape_is_refused_naming_the_right_key() {
+        if !node_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ecosystem.config.js");
+        std::fs::write(
+            &path,
+            "module.exports = { apps: [{ name: \"web\", script: \"./srv\" }] };",
+        )
+        .unwrap();
+        let err = resolve_target(path.to_str().unwrap(), None, b"", true).unwrap_err();
+        assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
+        let msg = err.to_string();
+        assert!(msg.contains("apps"), "must name what was written: {msg}");
+        assert!(msg.contains("app"), "must name what was expected: {msg}");
     }
 
     /// Drives the VERB, not `resolve_target`, so the assertion covers the

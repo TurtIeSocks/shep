@@ -136,9 +136,13 @@ ID  NAME  OUTCOME     DETAIL
 ```
 
 **Surviving reboots.** `shep save` writes a muster roll. `shep startup`
-installs a systemd unit (`Type=notify`) or a launchd plist that runs
-`shep muster` at boot. It never escalates its own privileges: without root it
-prints the exact command you should run and exits non-zero.
+writes an init unit that brings the flock back at boot — a systemd unit
+(`Type=notify`) on Linux, a launchd plist on macOS, or, named explicitly
+with `--init` or picked automatically at runtime, an openrc script or a
+FreeBSD/OpenBSD `rc.d` script. The last two are rendered and pinned by
+exact-string tests; nobody on this project has run them on their own init
+system yet. It never escalates its own privileges: without root it prints
+the exact command you should run and exits non-zero.
 
 **Dogs.** `shep enable metrics` turns on a Prometheus endpoint at
 `127.0.0.1:9615`; `shep enable bark` watches the flock and posts alerts to
@@ -173,9 +177,14 @@ covers the gate, and why it has no CLI flag.
 
 ## What's not built yet
 
-Not started: `shep serve`, `shep dev` and `shep runtime`, `.js` Flockfiles, a
-`schemars`-exported config JSON schema, a CLI-flag config layer, and openrc
-and BSD `rc.d` units.
+Not started: `shep serve`, `shep dev`, and `shep runtime` — nothing behind
+those names exists yet. Everything else that used to be on this list shipped
+this phase: `.js` Flockfiles (behind an explicit `--flockfile` flag, never by
+extension alone — see [docs/migration.md](docs/migration.md)), the
+`schemars`-exported config JSON schema, a CLI-flag layer over `shep.toml`,
+and the openrc and BSD `rc.d` unit renderers. The last two are rendered and
+pinned by exact-string tests; nobody on this project has run them on their
+own init system yet.
 
 The lookout ships all four panes — the flock table, the bleats feed, the
 sheep detail pane, and the host-usage strip. Search/filter is still to come,

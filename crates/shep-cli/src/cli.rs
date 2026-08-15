@@ -50,6 +50,37 @@ pub enum Format {
     Json,
 }
 
+/// Which init system a unit is written for.
+///
+/// Five variants, all constructible on every target: `--init` lets an
+/// operator name one directly, which is also what lets a macOS machine
+/// exercise the systemd, openrc and rc.d renderers at all. Selection without
+/// the flag is `commands::startup::current_init` — a runtime probe on Linux,
+/// where systemd and openrc share one target triple, and a compile-time fact
+/// everywhere else, where nothing else the target could be exists.
+///
+/// It lives in `cli.rs` rather than beside the renderers because `cli.rs`
+/// compiles on **every** target while `mod commands` is `#[cfg(unix)]`. A
+/// field on `StartupArgs` naming a type from a unix-only module breaks
+/// `cargo check --workspace --all-targets --all-features --target
+/// x86_64-pc-windows-gnu`, which is a phase-gate command. `Format` above is
+/// the precedent: a `clap::ValueEnum` the parse surface owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum Init {
+    /// Linux + systemd: a unit file, `Type=notify`.
+    Systemd,
+    /// Linux + openrc: an `openrc-run` script. No readiness protocol — see
+    /// the renderer's own doc.
+    Openrc,
+    /// macOS: a `LaunchDaemon` plist.
+    Launchd,
+    /// FreeBSD: an `/etc/rc.subr` script under `/usr/local/etc/rc.d`.
+    FreebsdRc,
+    /// OpenBSD: an `/etc/rc.d/rc.subr` script under `/etc/rc.d`.
+    OpenbsdRc,
+}
+
 /// Every verb the binary understands.
 #[derive(Debug, clap::Subcommand)]
 pub enum Commands {
@@ -285,11 +316,16 @@ pub enum Commands {
     Import(ImportArgs),
     /// Install an init unit so the shepherd starts at boot.
     ///
-    /// Writes a systemd unit (Linux) or a launchd plist (macOS) for the
-    /// target user, carrying this binary's own path, that user's
-    /// $SHEP_HOME, and the PATH of this invocation — which is what makes an
-    /// interpreter installed under ~/.bun or ~/.cargo findable after a
-    /// reboot.
+    /// Writes an init unit for the target user — a systemd unit
+    /// (`Type=notify`), a launchd plist, an openrc script, or a FreeBSD or
+    /// OpenBSD `rc.d` script, picked automatically for the running target
+    /// or named explicitly with `--init` below. Every unit carries this
+    /// binary's own path, that user's $SHEP_HOME, and the PATH of this
+    /// invocation — which is what makes an interpreter installed under
+    /// ~/.bun or ~/.cargo findable after a reboot.
+    ///
+    /// The openrc and BSD scripts are rendered and pinned by exact-string
+    /// tests; nobody on this project has run them on their own init system.
     ///
     /// Needs root, and never asks for it: without it this prints the exact
     /// command to run and exits non-zero, so a script notices. Under sudo
@@ -300,7 +336,8 @@ pub enum Commands {
     /// sudo's own secure_path before shep ever saw it, and shows the exact
     /// PATH about to go into the unit so you can check it yourself.
     Startup(StartupArgs),
-    /// Disable and remove the unit `startup` installed.
+    /// Disable and remove whichever unit `startup` installed — systemd,
+    /// openrc, launchd, or a BSD `rc.d` script.
     ///
     /// Needs root under the same rule: without it, prints the command to
     /// run and exits non-zero. A unit that is not there is reported absent
@@ -321,6 +358,11 @@ pub enum Commands {
     /// `<this binary> dog <name>`; not for direct use.
     #[command(hide = true)]
     Dog(DogArgs),
+    /// Print the Flockfile JSON Schema. Hidden: the schema is committed at
+    /// `crates/shep-core/assets/flockfile.schema.json`, and this is how it is
+    /// regenerated.
+    #[command(hide = true)]
+    Schema,
 }
 
 /// Arguments to `shep start`.
@@ -334,6 +376,15 @@ pub struct StartArgs {
     /// Fold to place this sheep in
     #[arg(long)]
     pub fold: Option<String>,
+    /// Read TARGET as a Flockfile rather than as a script path.
+    ///
+    /// Required for a `.js` Flockfile and the only way to reach one: shep
+    /// reads a `.js` config by running it through node, which is arbitrary
+    /// code execution, so it never happens because a file merely has that
+    /// extension. Without this flag `shep start server.js` starts
+    /// `server.js` as a script, which is what it has always meant.
+    #[arg(long)]
+    pub flockfile: bool,
 }
 
 /// Arguments shared by every verb that targets an existing selection of the
@@ -641,15 +692,21 @@ pub struct ImportArgs {
 
 /// Arguments shared by `shep startup` and `shep unstartup`.
 ///
-/// One struct for both verbs, and one field: the unit is named after the
-/// user it runs the shepherd as, so that user is the only thing either verb
-/// needs to be told. `--home` is read from [`GlobalArgs`] by `startup` and
-/// ignored by `unstartup`, which removes a unit rather than writing one.
+/// One struct for both verbs: the unit is named after the user it runs the
+/// shepherd as, and, since Task 6, after which init system it targets.
+/// `--home` is read from [`GlobalArgs`] by `startup` and ignored by
+/// `unstartup`, which removes a unit rather than writing one.
 #[derive(Debug, clap::Args)]
 pub struct StartupArgs {
     /// The user the unit runs the shepherd as (default: $SUDO_USER, else the invoking user)
     #[arg(long)]
     pub user: Option<String>,
+    /// Write a unit for this init system instead of the detected one.
+    ///
+    /// `unstartup` takes it too: a unit installed under one init has to be
+    /// removable after the host has changed to another.
+    #[arg(long, value_enum)]
+    pub init: Option<Init>,
 }
 
 /// Arguments to `shep completions`.
@@ -661,6 +718,15 @@ pub struct CompletionArgs {
 }
 
 /// Arguments to the hidden `shep daemon` subcommand.
+///
+/// The last four are the CLI-flag layer of spec §5's `file < env < flags`,
+/// one per `SHEP_*` variable `DaemonConfig::load` already reads. They live
+/// here rather than on `GlobalArgs` because they configure **the shepherd**,
+/// and this is the only invocation that runs one — `--log-level` on
+/// `shep flock` would configure nothing.
+///
+/// Their real audience is an init unit's `ExecStart`, which can now say
+/// `shep daemon --foreground --log-level info` without a config file.
 #[derive(Debug, clap::Args)]
 pub struct DaemonArgs {
     /// Boot without restoring the saved muster roll
@@ -670,6 +736,48 @@ pub struct DaemonArgs {
     /// daemonized, and report readiness once the flock is back
     #[arg(long)]
     pub foreground: bool,
+    /// Emit the shepherd's own logs as JSON lines (overrides shep.toml and
+    /// SHEP_LOG_JSON). Accepts 1, 0, true, false; bare means true.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = bool_flag
+    )]
+    pub log_json: Option<bool>,
+    /// Lowest severity of the shepherd's own records that reaches its log
+    #[arg(long, value_name = "LEVEL", value_parser = log_level_flag)]
+    pub log_level: Option<shep_core::config::LogLevel>,
+    /// Control-socket path override
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+    /// Longest a cron worker sleeps before re-deriving its next occurrence
+    #[arg(long, value_name = "DURATION", value_parser = duration_flag)]
+    pub max_cron_sleep: Option<shep_core::values::UpDuration>,
+}
+
+/// clap value parser over shep's own four boolean spellings — NOT clap's
+/// `BoolishValueParser`, which also takes yes/no/y/n/on/off and would widen
+/// the grammar on the flag side only.
+fn bool_flag(value: &str) -> Result<bool, String> {
+    shep_core::config::parse_daemon_bool(value)
+        .ok_or_else(|| format!("expected one of 1, 0, true, false; got `{value}`"))
+}
+
+/// clap value parser over [`shep_core::config::LogLevel::from_name`] — the
+/// same lowercase-only grammar `SHEP_LOG_LEVEL` accepts.
+fn log_level_flag(value: &str) -> Result<shep_core::config::LogLevel, String> {
+    shep_core::config::LogLevel::from_name(value).ok_or_else(|| {
+        format!("expected one of off, error, warn, info, debug, trace; got `{value}`")
+    })
+}
+
+/// clap value parser over `UpDuration`'s `FromStr`.
+fn duration_flag(value: &str) -> Result<shep_core::values::UpDuration, String> {
+    value
+        .parse::<shep_core::values::UpDuration>()
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -680,6 +788,50 @@ mod tests {
     fn the_command_tree_parses_and_is_internally_consistent() {
         use clap::CommandFactory;
         Cli::command().debug_assert(); // clap's own structural self-check
+    }
+
+    #[test]
+    fn log_json_has_three_states() {
+        use clap::Parser;
+        let cases = [
+            (vec!["shep", "daemon"], None),
+            (vec!["shep", "daemon", "--log-json"], Some(true)),
+            (vec!["shep", "daemon", "--log-json=false"], Some(false)),
+            (vec!["shep", "daemon", "--log-json=1"], Some(true)),
+        ];
+        for (argv, expected) in cases {
+            match Cli::try_parse_from(&argv).unwrap().command {
+                Commands::Daemon(args) => assert_eq!(args.log_json, expected, "{argv:?}"),
+                other => panic!("expected Daemon, got {other:?}"),
+            }
+        }
+    }
+
+    /// fails if the flag grammar widens past the env grammar — the exact
+    /// drift `parse_daemon_bool` exists to prevent.
+    #[test]
+    fn the_flag_bool_grammar_matches_the_env_grammar() {
+        use clap::Parser;
+        for wider in ["--log-json=yes", "--log-json=on", "--log-json=TRUE"] {
+            assert!(
+                Cli::try_parse_from(["shep", "daemon", wider]).is_err(),
+                "{wider} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn start_takes_a_flockfile_flag_and_defaults_it_off() {
+        use clap::Parser;
+        let plain = Cli::try_parse_from(["shep", "start", "srv.js"]).unwrap();
+        let flagged = Cli::try_parse_from(["shep", "start", "srv.js", "--flockfile"]).unwrap();
+        match (plain.command, flagged.command) {
+            (Commands::Start(a), Commands::Start(b)) => {
+                assert!(!a.flockfile, "absent means script form");
+                assert!(b.flockfile);
+            }
+            other => panic!("expected two Start commands, got {other:?}"),
+        }
     }
 
     #[test]
