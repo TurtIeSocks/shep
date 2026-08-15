@@ -243,19 +243,29 @@ pub(crate) fn openrc_script(spec: &UnitSpec) -> String {
 /// [`super::is_rc_safe_user`] rejects: `name`, `rcvar`, and every
 /// `shep_<user>_*` name below are shell **identifiers**, not values, so
 /// `spec.user` is interpolated into them raw. Every other interpolated value
-/// goes through [`sh_double_quoted`], same reasoning as [`openrc_script`].
+/// that only one shell ever reads goes through [`sh_double_quoted`], same
+/// reasoning as [`openrc_script`] — that covers `home` and `working_dir`,
+/// and covers `exec` in `start_postcmd`, where the script's own shell both
+/// builds the double-quoted string and executes it directly.
 ///
-/// `${name}_env` is the one field that needs more than that:
-/// `rc.subr(8)` documents it as a list of environment variables that gets
-/// word-split into arguments for `env(1)`, so an unescaped space in `home`
-/// or `path` would silently become two environment entries rather than one.
-/// Its two values are single-quoted first with [`shell_quote`] so the
-/// word-split cannot touch them, then escaped a second time for the
-/// double-quoted context the whole line sits in:
-/// `sh_double_quoted(shell_quote(value))`.
+/// `${name}_env` and `command_args` are the two fields that need more than
+/// that, because each is read a *second* time by a shell other than the one
+/// that built the string: `rc.subr(8)` documents `${name}_env` as a list of
+/// environment variables that gets word-split into arguments for `env(1)`,
+/// and it expands `$command_args` unquoted into `daemon(8)`'s argv — so an
+/// unescaped space in `home`, `path`, or `exec` would silently become two
+/// environment entries, or two argv elements, rather than one. All three
+/// values are single-quoted first with [`shell_quote`] so the second
+/// shell's word-split cannot touch them, then escaped a second time for the
+/// double-quoted context the whole line sits in when the first shell builds
+/// it: `sh_double_quoted(shell_quote(value))`. `exec` needs both forms —
+/// [`sh_double_quoted`] alone for `start_postcmd`'s direct invocation, and
+/// the two-context form for `command_args` — because the same path is read
+/// by a different number of shells depending on which line it lands on.
 pub(crate) fn freebsd_rc_script(spec: &UnitSpec) -> String {
     let user = &spec.user;
     let exec = sh_double_quoted(&spec.exec.display().to_string());
+    let exec_arg = sh_double_quoted(&shell_quote(&spec.exec.display().to_string()));
     let home = sh_double_quoted(&spec.home.display().to_string());
     let working_dir = sh_double_quoted(&spec.working_dir.display().to_string());
     let home_env = sh_double_quoted(&shell_quote(&spec.home.display().to_string()));
@@ -281,7 +291,7 @@ pub(crate) fn freebsd_rc_script(spec: &UnitSpec) -> String {
          \n\
          pidfile=\"/var/run/shep_{user}.pid\"\n\
          command=\"/usr/sbin/daemon\"\n\
-         command_args=\"-P ${{pidfile}} -r -f {exec} daemon --foreground\"\n\
+         command_args=\"-P ${{pidfile}} -r -f {exec_arg} daemon --foreground\"\n\
          \n\
          start_postcmd=\"shep_{user}_poststart\"\n\
          \n\
@@ -338,9 +348,17 @@ pub(crate) fn freebsd_rc_script(spec: &UnitSpec) -> String {
 /// two values are single-quoted for the shell that evaluates the string
 /// ([`shell_quote`]) and then escaped a second time for the double-quoted
 /// context they sit in here ([`sh_double_quoted`]).
+///
+/// `exec` sits in that same second-shell path: `daemon="{exec}"` is read
+/// directly by this script's own shell, but `${{daemon}}` is then
+/// interpolated unquoted into the string `rc_exec` hands to `su -c`, so it
+/// is `su`'s spawned shell — not this one — that word-splits it. `exec`
+/// therefore needs the identical two-context treatment as `home`/`path`
+/// above, not the single [`sh_double_quoted`] this script's other
+/// identifier-only fields use.
 pub(crate) fn openbsd_rc_script(spec: &UnitSpec) -> String {
     let user = &spec.user;
-    let exec = sh_double_quoted(&spec.exec.display().to_string());
+    let exec = sh_double_quoted(&shell_quote(&spec.exec.display().to_string()));
     let working_dir = sh_double_quoted(&spec.working_dir.display().to_string());
     let home_display = spec.home.display();
     let home_env = sh_double_quoted(&shell_quote(&spec.home.display().to_string()));
@@ -784,6 +802,40 @@ mod tests {
         let rendered = freebsd_rc_script(&s);
         assert!(
             rendered.contains("PATH='/opt/my tools/bin:/usr/bin'"),
+            "the space must stay inside the single-quoted word: {rendered}"
+        );
+    }
+
+    /// fails if an `exec` path containing a space splits into two argv
+    /// elements when `rc.subr` later expands `$command_args` unquoted into
+    /// `daemon(8)`'s argv. Without the two-context escape, `daemon(8)`
+    /// would be handed `/opt/my` and `tools/shep` as separate arguments and
+    /// would exec the wrong (nonexistent) file at the next reboot.
+    #[test]
+    fn a_path_with_a_space_stays_one_freebsd_command_args_word() {
+        let mut s = spec();
+        s.exec = PathBuf::from("/opt/my tools/shep");
+        let rendered = freebsd_rc_script(&s);
+        assert!(
+            rendered.contains("-f '/opt/my tools/shep' daemon --foreground"),
+            "the space must stay inside the single-quoted word: {rendered}"
+        );
+        assert!(
+            rendered.contains("if \"/opt/my tools/shep\" --home"),
+            "start_postcmd's own direct invocation stays single-escaped: {rendered}"
+        );
+    }
+
+    /// fails if an `exec` path containing a space splits into two words once
+    /// `${daemon}` is interpolated unquoted into the string `rc_exec` hands
+    /// to `su -c`, which spawns a second shell that word-splits it.
+    #[test]
+    fn a_path_with_a_space_stays_one_openbsd_daemon_word() {
+        let mut s = spec();
+        s.exec = PathBuf::from("/opt/my tools/shep");
+        let rendered = openbsd_rc_script(&s);
+        assert!(
+            rendered.contains("daemon=\"'/opt/my tools/shep'\""),
             "the space must stay inside the single-quoted word: {rendered}"
         );
     }
