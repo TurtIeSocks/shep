@@ -63,7 +63,7 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
                 palette.attention()
             },
         ),
-        // `x` (stop) is bound and always refuses in 12a — see `App::on_key`
+        // `x` (stop) is bound and still always refuses — see `App::on_key`
         // — so it is left out of the hint rather than marked somehow. This
         // file's own standing rule is that every sentence here is literal;
         // a hint that needs a footnote to be true is not literal, it is an
@@ -72,8 +72,9 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         None => (
             // `select`/`first/last`, not `scroll`/`top/bottom`: the pane
             // carries a cursor now and the viewport is derived from it. Same
-            // 48 characters as the 12a text, so the truncation test at 49
-            // columns still measures what it was written to measure.
+            // 48 characters as the original 12a scroll-hint text, so the
+            // truncation test at 49 columns still measures what it was
+            // written to measure.
             "q quit   j/k select   g/G first/last   r refresh".to_string(),
             palette.muted(),
         ),

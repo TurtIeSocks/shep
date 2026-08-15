@@ -6,9 +6,10 @@
 //! headlessly. It is also, for exactly the same reason, what lets a reviewer
 //! SEE the dashboard without running it — so this module's output is a
 //! deliverable (`docs/lookout/frames.txt`, `docs/lookout/frames.ansi`) and
-//! not only test scaffolding. That is the whole point of Phase 12a: Rin
-//! decides what Phase 12b's layout looks like from these frames, not from a
-//! spec sentence.
+//! not only test scaffolding. That is the whole point of this module: Rin
+//! decides what a layout looks like from these frames, not from a spec
+//! sentence — the way Phase 12a decided 12b's and a later phase will decide
+//! search/filter's and the actions'.
 //!
 //! **Why not `TestBackend`'s own `Display`.** Two reasons, both practical:
 //! its exact framing is an upstream presentation detail that can change
@@ -98,10 +99,12 @@ pub fn render_ansi(buffer: &Buffer) -> String {
 
 /// The SGR sequence for one cell's foreground.
 ///
-/// Foreground only, because a foreground is the only thing 12a's palette
-/// sets — there is no selected row and nothing is bold. A modifier a 12b
-/// pane introduces renders unstyled here rather than as a wrong style, and
-/// this function grows a case for it then.
+/// Foreground only, because a foreground is the only thing this palette
+/// sets anywhere on screen — no pane uses bold, reversed, or any other
+/// modifier; the selected row is shown by a marker character, not a style.
+/// `no_scene_uses_a_modifier_the_ansi_renderer_would_drop` is the standing
+/// check. A future pane that introduces one renders unstyled here rather
+/// than as a wrong style, and this function grows a case for it then.
 fn sgr(fg: Color) -> String {
     let mut out = String::new();
     match fg {

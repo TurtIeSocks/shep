@@ -603,8 +603,7 @@ mod tests {
                 // check existed — would put its content inside
                 // `table_body_start..table_body_end` and this loop would
                 // catch it on the next line.
-                let table_body_start =
-                    2 + if panes.host { HOST_ROWS } else { 0 } + 2;
+                let table_body_start = 2 + if panes.host { HOST_ROWS } else { 0 } + 2;
                 let mut floor = height - 1;
                 if panes.feed {
                     floor -= FEED_ROWS;

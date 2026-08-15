@@ -250,9 +250,9 @@ pub fn header_line(columns: &[Column], width: u16, style: Style) -> Line<'static
 
 /// One sheep's line. The STATUS cell is the only one that carries colour.
 ///
-/// No row style beyond that: 12a has no selected row (see the phase plan's
-/// "What 12b gets"), so there is nothing here for a REVERSED modifier to
-/// mean.
+/// No row style beyond that: the selected row is shown by the marker in the
+/// gutter column ([`mark`]), not by a REVERSED modifier on the row's own
+/// text — this function has no notion of "selected" to key one off at all.
 #[must_use]
 pub fn row_line(app: &App, row: &Row, columns: &[Column], width: u16) -> Line<'static> {
     let palette = app.palette();

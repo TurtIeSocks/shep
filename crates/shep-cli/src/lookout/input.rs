@@ -60,7 +60,8 @@ mod tests {
     /// fails if a key stops resolving, or starts resolving to the wrong thing.
     /// `x` in particular: it is the one key wired to an action, so a keymap
     /// that silently rebound it would be a keymap that acts on the wrong
-    /// intent once 12b makes the action real.
+    /// intent once a future phase makes the action real — it still refuses
+    /// today, in both control states.
     #[test]
     fn every_bound_key_resolves_to_its_press() {
         assert_eq!(map_key(&key(KeyCode::Char('q'))), Some(KeyPress::Quit));

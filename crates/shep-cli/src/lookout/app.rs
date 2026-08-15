@@ -51,8 +51,9 @@ use super::theme::Palette;
 pub enum Control {
     /// Actions refuse. The default.
     ReadOnly,
-    /// Actions are permitted — in 12a there are none, so they refuse with a
-    /// different sentence.
+    /// Actions are permitted — there is still exactly one action key
+    /// (`x`, stop) and no action lands behind the gate yet, so it refuses
+    /// too, with a different sentence.
     Allowed,
 }
 
@@ -76,7 +77,7 @@ pub enum KeyPress {
     SelectLast,
     /// `r` — poll now.
     Refresh,
-    /// `x` — the one action key. Refuses in both control states in 12a; see
+    /// `x` — the one action key. Refuses in both control states, today; see
     /// the plan's design decision 2.
     Stop,
 }
