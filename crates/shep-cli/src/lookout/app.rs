@@ -359,7 +359,19 @@ impl App {
             // update with another refresh request would spin the UI task at
             // full tilt; the `let _ =` at the call site in `run_ui` is
             // deliberate rather than lazy.
+            //
+            // The `Link::Lost` guard is load-bearing, not decorative: `run_ui`
+            // arms its coalesced read from a `feed_dirty` flag set BEFORE a
+            // freeze can land, so a read requested a moment earlier can still
+            // be in flight when `Msg::Frozen` arrives and this arm sees the
+            // stale read after it. Without the guard that read reaches the
+            // rendered frame under a banner saying the values are frozen —
+            // the same contradiction-on-one-frame design decision 7 already
+            // refuses for the host strip and the uptime clock.
             Msg::Bleats { tail } => {
+                if matches!(self.link, Link::Lost { .. }) {
+                    return Effect::None;
+                }
                 self.feed = tail;
                 Effect::None
             }
@@ -1169,6 +1181,55 @@ mod tests {
                 tail: super::super::tail::Tail::default()
             }),
             Effect::None
+        );
+    }
+
+    /// fails if a frozen dashboard applies a coalesced feed read that landed
+    /// after the freeze. `refresh_feed` already refuses to ISSUE a read once
+    /// the link is `Link::Lost`, but `run_ui`'s coalesced read is armed by a
+    /// `feed_dirty` flag set BEFORE the freeze — a read requested a moment
+    /// before `Msg::Frozen` can still be in flight when it lands, and without
+    /// a guard here the `Msg::Bleats` arm would apply it anyway. That is the
+    /// same contradiction-on-one-frame design decision 7 already refuses for
+    /// the host strip and the uptime clock; the single enforcement point for
+    /// the feed has to live in this arm; nothing upstream can catch a read
+    /// that was already in flight when the freeze landed.
+    #[test]
+    fn a_frozen_dashboard_ignores_a_bleats_tail_in_flight_at_the_freeze() {
+        let (mut app, _) = started();
+        let live_tail = super::super::tail::Tail {
+            lines: vec![super::super::tail::TailLine {
+                stream: super::super::tail::Stream::Out,
+                text: "read before the freeze".to_string(),
+            }],
+            ..Default::default()
+        };
+        app.update(Msg::Bleats {
+            tail: live_tail.clone(),
+        });
+        assert_eq!(app.feed(), &live_tail, "a live dashboard takes the tail");
+
+        app.update(Msg::Frozen {
+            at_local: "2026-08-14 14:32:07".to_string(),
+        });
+
+        let in_flight_tail = super::super::tail::Tail {
+            lines: vec![super::super::tail::TailLine {
+                stream: super::super::tail::Stream::Out,
+                text: "read after the freeze".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            app.update(Msg::Bleats {
+                tail: in_flight_tail
+            }),
+            Effect::None
+        );
+        assert_eq!(
+            app.feed(),
+            &live_tail,
+            "the tail read after the freeze must not reach the rendered frame"
         );
     }
 }
