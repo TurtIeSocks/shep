@@ -11,7 +11,7 @@ pub mod probe;
 
 pub use app::{AppConfig, ProbeConfig, ProbeKind};
 pub use cron::{CronParseError, CronSchedule, CronScheduleError};
-pub use daemon::{DaemonConfig, DaemonConfigError, LogLevel};
+pub use daemon::{DaemonConfig, DaemonConfigError, DaemonOverrides, LogLevel, parse_daemon_bool};
 #[cfg(feature = "schema")]
 pub use flockfile::flockfile_schema_json;
 pub use flockfile::{FlockFormat, Flockfile, FlockfileError, discover};

@@ -156,6 +156,41 @@ pub struct WhistleSection {
 ///
 /// Dog sections stay untyped here: each dog deserializes its own
 /// `[dog.<name>]` table so dog config schemas live with the dog code.
+///
+/// `#[non_exhaustive]`: this struct has grown a section per phase — `whistle`
+/// most recently — and each one would otherwise be a breaking change for an
+/// out-of-tree struct literal. That is IR-20's ordinary reasoning applied to
+/// a struct. **It is not a validation gate**, and this type is deliberately
+/// not the proof token [`crate::config::ResolvedApp`] is: the attribute blocks
+/// struct literals and functional-update syntax from outside this crate, but
+/// not field mutation, and [`Self::default`] followed by an assignment to
+/// `daemon.max_cron_sleep` reaches an unvalidated value without a literal.
+///
+/// The contract is therefore stated, not enforced. [`Self::load`] and
+/// [`Self::load_layered`] are the validating constructors; a caller that
+/// mutates a loaded config afterwards is out of contract, and shep-core does
+/// not detect it and, with public fields, cannot.
+///
+/// That is the right trade here because nothing ever *receives* one of these.
+/// `ResolvedApp` protects a property of travel — the supervisor is handed one
+/// and must trust normalization it cannot see. Every production site loads a
+/// `DaemonConfig` and consumes it within a few lines (`run_daemon` renders it
+/// straight into `BootOptions`; shep-daemon's `dogs` reads one
+/// `[dog.<name>]` table; shep-cli's `whistle::gate` reads one boolean), and
+/// the daemon holds a `BootOptions`, not this. Guarding the one
+/// `max_cron_sleep` floor against a caller who is already out of contract
+/// would cost accessors for every field of every section, including a
+/// `BTreeMap<String, toml::Table>` two crates legitimately read. If an
+/// out-of-tree caller ever does need to mutate and re-check, the answer is to
+/// make `validate` public — one line, non-breaking — not to privatise the
+/// fields. `docs/specs/deferred.md` records this as resolved.
+///
+/// Nothing in the repository observes the attribute itself: it is invisible
+/// inside the defining crate, and seeing it needs a `trybuild` compile-fail
+/// tier this project declined once already for `ProcessInfo` (see
+/// `tests/process_info_builder_from_outside_the_crate.rs`, which admits the
+/// same gap and is required to stay shep-core's only `tests/` file).
+#[non_exhaustive]
 #[derive(Clone, Default, PartialEq)]
 pub struct DaemonConfig {
     /// The `[daemon]` section
@@ -188,6 +223,10 @@ struct RawDaemonConfig {
 impl DaemonConfig {
     /// Builds config from optional file source + environment overrides
     ///
+    /// `file < env`, validated. Equivalent to
+    /// [`Self::load_layered`] with an empty [`DaemonOverrides`]; unchanged
+    /// for every existing caller.
+    ///
     /// # Errors
     ///
     /// - [`DaemonConfigError::Toml`] — the file source is invalid TOML.
@@ -196,11 +235,36 @@ impl DaemonConfig {
     ///   `SHEP_LOG_LEVEL` accepts a [`LogLevel`] name;
     ///   `SHEP_MAX_CRON_SLEEP` parses as an [`UpDuration`]).
     /// - [`DaemonConfigError::BelowMinimum`] — the effective
-    ///   `max_cron_sleep` (file or `SHEP_MAX_CRON_SLEEP`, whichever won) is
+    ///   `max_cron_sleep` (file, `SHEP_MAX_CRON_SLEEP`, whichever won) is
     ///   below the floor.
     pub fn load(
         file_source: Option<&str>,
         env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self, DaemonConfigError> {
+        Self::load_layered(file_source, env, &DaemonOverrides::new())
+    }
+
+    /// Builds config from optional file source + environment + CLI-flag
+    /// overrides
+    ///
+    /// `file < env < flags` (spec §5), validated exactly once, at the end —
+    /// see the private `validate` method below for why validating per layer
+    /// instead would be wrong.
+    ///
+    /// # Errors
+    ///
+    /// - [`DaemonConfigError::Toml`] — the file source is invalid TOML.
+    /// - [`DaemonConfigError::BadEnvValue`] — a `SHEP_*` value is not
+    ///   parseable (`SHEP_LOG_JSON` accepts `1|0|true|false`;
+    ///   `SHEP_LOG_LEVEL` accepts a [`LogLevel`] name;
+    ///   `SHEP_MAX_CRON_SLEEP` parses as an [`UpDuration`]).
+    /// - [`DaemonConfigError::BelowMinimum`] — the effective
+    ///   `max_cron_sleep` (file, `SHEP_MAX_CRON_SLEEP`, or
+    ///   `--max-cron-sleep`, whichever won) is below the floor.
+    pub fn load_layered(
+        file_source: Option<&str>,
+        env: &dyn Fn(&str) -> Option<String>,
+        overrides: &DaemonOverrides,
     ) -> Result<Self, DaemonConfigError> {
         let raw: RawDaemonConfig = match file_source {
             Some(src) => toml::from_str(src).map_err(|e| DaemonConfigError::Toml(e.to_string()))?,
@@ -212,10 +276,9 @@ impl DaemonConfig {
             dog: raw.dog,
         };
         if let Some(v) = env("SHEP_LOG_JSON") {
-            cfg.daemon.log_json = match v.as_str() {
-                "1" | "true" => true,
-                "0" | "false" => false,
-                _ => return Err(DaemonConfigError::BadEnvValue("SHEP_LOG_JSON", v)),
+            cfg.daemon.log_json = match parse_daemon_bool(&v) {
+                Some(value) => value,
+                None => return Err(DaemonConfigError::BadEnvValue("SHEP_LOG_JSON", v)),
             };
         }
         if let Some(v) = env("SHEP_LOG_LEVEL") {
@@ -227,12 +290,13 @@ impl DaemonConfig {
         if let Some(v) = env("SHEP_SOCKET") {
             cfg.daemon.socket = Some(std::path::PathBuf::from(v));
         }
-        // Provenance needs no tracking beyond this one flag: if the env var
-        // was present it won, so the key it's validated (and reported)
-        // under is its own; otherwise the value came from the file (or is
-        // unset) and the key is the TOML one. Validating each layer as it
-        // is read instead would make a good SHEP_MAX_CRON_SLEEP unable to
-        // rescue a broken shep.toml, which is not what "file < env" means.
+        // Provenance needs no tracking beyond this one flag: whichever layer
+        // last wrote max_cron_sleep is the key the refusal names, so the
+        // operator is pointed at the thing they can actually edit.
+        // Validating each layer as it is read instead would make a good
+        // SHEP_MAX_CRON_SLEEP unable to rescue a broken shep.toml, or a good
+        // --max-cron-sleep unable to rescue either, which is not what
+        // "file < env < flags" means.
         let mut max_cron_sleep_key = "max_cron_sleep";
         if let Some(v) = env("SHEP_MAX_CRON_SLEEP") {
             let parsed = v
@@ -241,16 +305,145 @@ impl DaemonConfig {
             cfg.daemon.max_cron_sleep = Some(parsed);
             max_cron_sleep_key = "SHEP_MAX_CRON_SLEEP";
         }
-        if let Some(value) = cfg.daemon.max_cron_sleep
+        if let Some(value) = overrides.log_json {
+            cfg.daemon.log_json = value;
+        }
+        if let Some(value) = overrides.log_level {
+            cfg.daemon.log_level = value;
+        }
+        if let Some(value) = &overrides.socket {
+            cfg.daemon.socket = Some(value.clone());
+        }
+        if let Some(value) = overrides.max_cron_sleep {
+            cfg.daemon.max_cron_sleep = Some(value);
+            max_cron_sleep_key = "--max-cron-sleep";
+        }
+        cfg.validate(max_cron_sleep_key)?;
+        Ok(cfg)
+    }
+
+    /// Checks every invariant a `DaemonConfig` carries, whatever layers
+    /// produced it.
+    ///
+    /// One call site, at the bottom of [`Self::load_layered`], and that is
+    /// the point: validating per layer would stop a good `--max-cron-sleep`
+    /// from rescuing a broken `shep.toml`, which is not what
+    /// `file < env < flags` means. The same reasoning the env layer already
+    /// carries, extended one layer up.
+    ///
+    /// `key` is provenance — the spelling the operator actually set, so the
+    /// refusal names the thing they can edit.
+    ///
+    /// Private. It guards construction, not mutation: a caller outside this
+    /// crate can assign to a `pub` field afterwards and this never runs
+    /// again. See the type's own doc for why that is accepted rather than
+    /// closed.
+    ///
+    /// # Errors
+    ///
+    /// - [`DaemonConfigError::BelowMinimum`] — `max_cron_sleep` is under the
+    ///   floor that keeps the cron loop from spinning.
+    fn validate(&self, key: &'static str) -> Result<(), DaemonConfigError> {
+        if let Some(value) = self.daemon.max_cron_sleep
             && value < MIN_CRON_SLEEP
         {
             return Err(DaemonConfigError::BelowMinimum {
-                key: max_cron_sleep_key,
+                key,
                 value,
                 min: MIN_CRON_SLEEP,
             });
         }
-        Ok(cfg)
+        Ok(())
+    }
+}
+
+/// The CLI-flag layer of `file < env < flags` (spec §5).
+///
+/// Every field is `Option`: `None` means the flag was absent and the layer
+/// below wins. Nothing here validates — [`DaemonConfig::load_layered`] runs
+/// [`DaemonConfig`]'s single validation pass once, after all three layers,
+/// so a flag can rescue a file the layer below would have rejected.
+///
+/// `#[non_exhaustive]` because this type grows a field every time the hidden
+/// `daemon` subcommand grows a flag; that is anticipated by construction, not
+/// hypothetical — the same field-growth reasoning [`DaemonConfig`] carries,
+/// and like it, not a claim that the value was validated. Build one with
+/// [`Self::new`] and the chained setters — the consuming-self shape
+/// `ProcessInfo::builder` already uses in this workspace, and the shape
+/// `#[non_exhaustive]` requires, since it rules out struct literals and
+/// functional update from outside.
+///
+/// `Debug` is derived rather than redacted (IR-41): four values, none of
+/// them a secret — a socket path and a log level are already visible in
+/// `ps`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DaemonOverrides {
+    /// `--log-json`
+    pub log_json: Option<bool>,
+    /// `--log-level`
+    pub log_level: Option<LogLevel>,
+    /// `--socket`
+    pub socket: Option<PathBuf>,
+    /// `--max-cron-sleep`
+    pub max_cron_sleep: Option<UpDuration>,
+}
+
+impl DaemonOverrides {
+    /// An empty layer — every flag absent.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the `--log-json` override.
+    #[must_use]
+    pub fn log_json(mut self, value: Option<bool>) -> Self {
+        self.log_json = value;
+        self
+    }
+
+    /// Sets the `--log-level` override.
+    #[must_use]
+    pub fn log_level(mut self, value: Option<LogLevel>) -> Self {
+        self.log_level = value;
+        self
+    }
+
+    /// Sets the `--socket` override.
+    #[must_use]
+    pub fn socket(mut self, value: Option<PathBuf>) -> Self {
+        self.socket = value;
+        self
+    }
+
+    /// Sets the `--max-cron-sleep` override.
+    #[must_use]
+    pub fn max_cron_sleep(mut self, value: Option<UpDuration>) -> Self {
+        self.max_cron_sleep = value;
+        self
+    }
+}
+
+/// The boolean grammar of `shep.toml` and the `SHEP_*` environment: `1`, `0`,
+/// `true`, `false`, and nothing else.
+///
+/// One function so the file/env layer and the `--log-json` flag cannot drift.
+/// clap's own `BoolishValueParser` additionally accepts
+/// `yes`/`no`/`y`/`n`/`on`/`off`; using it would widen the grammar on the flag
+/// side only, and widening an input grammar beyond spec is a named drift risk
+/// on this project.
+///
+/// The name says whose grammar this is on purpose. It is not a general
+/// boolean parser and must not be widened into one: the whole value of
+/// exporting it is that there is exactly one answer to "what counts as true
+/// in shep's daemon config".
+#[must_use]
+pub fn parse_daemon_bool(value: &str) -> Option<bool> {
+    match value {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
     }
 }
 
@@ -646,6 +839,85 @@ otel = "/usr/local/bin/shep-otel"
             message.contains("unknown field `allow_contro`"),
             "the message quotes the key that was not understood: {message}"
         );
+    }
+
+    // fails if validation moves back into a per-layer position — the flags
+    // layer must be able to rescue a file the layer below would reject,
+    // which is what `file < env < flags` means. Same rule the env layer's
+    // own comment already states.
+    #[test]
+    fn a_flag_rescues_a_below_floor_file_value() {
+        let cfg = DaemonConfig::load_layered(
+            Some("[daemon]\nmax_cron_sleep = \"500\"\n"),
+            &no_env,
+            &DaemonOverrides::new().max_cron_sleep(Some(UpDuration::from_millis(300_000))),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.daemon.max_cron_sleep,
+            Some(UpDuration::from_millis(300_000))
+        );
+    }
+
+    // fails if a below-floor FLAG is accepted, or if the refusal names the
+    // TOML key the operator did not set.
+    #[test]
+    fn a_below_floor_flag_is_refused_naming_the_flag() {
+        let err = DaemonConfig::load_layered(
+            None,
+            &no_env,
+            &DaemonOverrides::new().max_cron_sleep(Some(UpDuration::from_millis(500))),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            DaemonConfigError::BelowMinimum {
+                key: "--max-cron-sleep",
+                value: UpDuration::from_millis(500),
+                min: MIN_CRON_SLEEP,
+            }
+        );
+        assert!(err.to_string().contains("--max-cron-sleep"), "got: {err}");
+    }
+
+    // fails if a flag stops beating the env layer.
+    #[test]
+    fn a_flag_beats_the_environment() {
+        let env = |k: &str| (k == "SHEP_LOG_LEVEL").then(|| "trace".to_string());
+        let cfg = DaemonConfig::load_layered(
+            Some("[daemon]\nlog_level = \"error\"\n"),
+            &env,
+            &DaemonOverrides::new().log_level(Some(LogLevel::Info)),
+        )
+        .unwrap();
+        assert_eq!(cfg.daemon.log_level, LogLevel::Info);
+    }
+
+    // fails if an absent flag overwrites the layer below with a default —
+    // the classic `Option`-flattening bug, and the one a `bool` field
+    // instead of `Option<bool>` would guarantee.
+    #[test]
+    fn an_absent_flag_leaves_every_lower_layer_alone() {
+        let src = "[daemon]\nlog_json = true\nlog_level = \"debug\"\nsocket = \"/tmp/s.sock\"\n";
+        let layered =
+            DaemonConfig::load_layered(Some(src), &no_env, &DaemonOverrides::new()).unwrap();
+        let plain = DaemonConfig::load(Some(src), &no_env).unwrap();
+        assert_eq!(layered, plain);
+    }
+
+    #[test]
+    fn the_bool_grammar_is_exactly_four_spellings() {
+        assert_eq!(parse_daemon_bool("1"), Some(true));
+        assert_eq!(parse_daemon_bool("0"), Some(false));
+        assert_eq!(parse_daemon_bool("true"), Some(true));
+        assert_eq!(parse_daemon_bool("false"), Some(false));
+        for wider in ["yes", "no", "on", "off", "TRUE", "y"] {
+            assert_eq!(
+                parse_daemon_bool(wider),
+                None,
+                "{wider} must not be a boolean here"
+            );
+        }
     }
 
     #[test]
