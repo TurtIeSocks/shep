@@ -234,13 +234,15 @@ const TAIL_WINDOW_BYTES: u64 = 256 * 1024;
 /// [`TAIL_WINDOW_BYTES`] window from the end of the file, then `limit` once
 /// that window is split into lines.
 ///
-/// Returns the lines and whether the LINE cap was what cut them short — the
-/// caller needs to tell "this is all of it" from "this is the last N", and
+/// Returns the lines and whether EITHER bound was what cut them short — the
+/// caller needs to tell "this is all of it" from "this is not", and
 /// `whistle`'s `tail_bleats` (`crate::whistle::read`) surfaces that to a
 /// model as `BleatTail::truncated`. A model that cannot tell the two apart
-/// concludes a busy app went quiet. A tail cut short by
-/// [`TAIL_WINDOW_BYTES`] instead reports `false` here: that is a byte cap,
-/// not a line cap, and honest for what this return value promises.
+/// concludes a busy app went quiet. The line cap and the byte window are
+/// both real ways to lose the older half of a log — a sheep logging long
+/// structured lines fills [`TAIL_WINDOW_BYTES`] in under `limit` lines — so
+/// a caller that only asked the line cap would report `false` on a tail
+/// that is, in fact, not the whole story.
 ///
 /// `limit` is a parameter rather than a constant because there are now two
 /// callers with two answers: [`tail_log_files`] passes [`TAIL_LINES`], which
@@ -268,6 +270,9 @@ pub(crate) fn read_tail(path: &Path, limit: usize) -> io::Result<(Vec<String>, b
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let start = len.saturating_sub(TAIL_WINDOW_BYTES);
+    // `start > 0` means the byte window itself left content behind, before
+    // a single line has been counted — the file is bigger than the window.
+    let window_truncated = start > 0;
     if start > 0 {
         file.seek(SeekFrom::Start(start))?;
     }
@@ -290,7 +295,7 @@ pub(crate) fn read_tail(path: &Path, limit: usize) -> io::Result<(Vec<String>, b
         lines.pop();
     }
     let keep_from = lines.len().saturating_sub(limit);
-    let truncated = keep_from > 0;
+    let truncated = window_truncated || keep_from > 0;
     lines.drain(..keep_from);
     Ok((lines, truncated))
 }
@@ -1471,6 +1476,29 @@ mod tests {
             "web | short\n",
             "no fragment of the long line may reach stdout ({} bytes rendered)",
             rendered.len()
+        );
+    }
+
+    /// `truncated` must report `true` when the byte window is what cut the
+    /// tail short, even when the line cap never binds — a sheep logging a
+    /// few long, structured lines can fill `TAIL_WINDOW_BYTES` in far fewer
+    /// than `limit` lines. Before this test, `read_tail` reported `false`
+    /// here, and `whistle`'s `tail_bleats` handed a model exactly that
+    /// wrong answer.
+    #[test]
+    fn read_tail_reports_truncated_on_a_byte_window_cut_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let long_line = "x".repeat(usize::try_from(TAIL_WINDOW_BYTES).unwrap() + 1024);
+        let content = format!("{long_line}\nshort\n");
+        let path = dir.path().join("web-out.log");
+        std::fs::write(&path, &content).unwrap();
+
+        let (lines, truncated) = read_tail(&path, TAIL_LINES).unwrap();
+
+        assert_eq!(lines, vec!["short".to_string()]);
+        assert!(
+            truncated,
+            "the file exceeds the byte window, so this tail is not the whole log"
         );
     }
 

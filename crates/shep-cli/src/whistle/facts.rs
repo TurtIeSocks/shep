@@ -266,10 +266,10 @@ pub struct BleatTail {
     pub out: Vec<String>,
     /// Lines from the stderr log, oldest first.
     pub err: Vec<String>,
-    /// True when the tail was cut short by the line cap rather than by the
-    /// end of the file. A model that cannot tell "this is all of it" from
-    /// "this is the last 50" will draw the wrong conclusion from a quiet
-    /// log.
+    /// True when the tail was cut short — by the line cap, by the 256 KiB
+    /// read window, or both — rather than reaching the start of the file.
+    /// A model that cannot tell "this is all of it" from "this is the last
+    /// 50" will draw the wrong conclusion from a quiet log.
     pub truncated: bool,
 }
 
