@@ -33,6 +33,20 @@ pub struct Flockfile {
 #[cfg_attr(feature = "schema", schemars(rename = "Flockfile"))]
 #[serde(deny_unknown_fields)]
 struct RawFlockfile {
+    /// The editor's schema hint, read and discarded.
+    ///
+    /// This is the "future schema key" the comment above anticipated, added
+    /// HERE explicitly rather than by relaxing `deny_unknown_fields`: a
+    /// typo'd key must still fail loudly, and exactly one more key is now
+    /// legal. shep does not validate against the named schema and makes no
+    /// promise about it — it is a hint for the operator's editor, which is
+    /// the only consumer that ever reads it.
+    ///
+    /// TOML Flockfiles do not need it: taplo's `#:schema <url>` directive is
+    /// a comment, invisible to serde. JSON and JSON5 have no comment an
+    /// editor agrees to look in, which is why this field exists at all.
+    #[serde(default, rename = "$schema")]
+    schema: Option<String>,
     #[serde(default, rename = "app")]
     apps: Vec<AppConfig>,
 }
@@ -161,10 +175,14 @@ impl Flockfile {
                 json5::from_str(source).map_err(|e| FlockfileError::Json5(e.to_string()))?
             }
         };
-        if raw.apps.is_empty() {
+        let RawFlockfile {
+            schema: _schema,
+            apps,
+        } = raw;
+        if apps.is_empty() {
             return Err(FlockfileError::NoApps);
         }
-        Ok(Self { apps: raw.apps })
+        Ok(Self { apps })
     }
 }
 
@@ -642,5 +660,38 @@ args = ["job.py"]
         let max_memory = resolved(&schema, ref_node);
         assert_eq!(max_memory["type"], "string", "{max_memory}");
         assert_eq!(max_memory["pattern"], r"^\d+(G|M|K)?$", "{max_memory}");
+    }
+
+    #[test]
+    fn a_schema_key_is_accepted_and_ignored() {
+        let src = r#"{ "$schema": "./flockfile.schema.json",
+                       "app": [{ "name": "web", "script": "./srv" }] }"#;
+        let flock = Flockfile::parse(src, FlockFormat::Json).unwrap();
+        assert_eq!(flock.apps.len(), 1);
+    }
+
+    /// fails if the new field is implemented by relaxing
+    /// `deny_unknown_fields` instead of naming one more key — which would
+    /// silently accept every typo the document lock exists to catch.
+    #[test]
+    fn one_more_key_is_legal_and_no_others_are() {
+        let src = r#"{ "schema": "x", "app": [{ "name": "w", "script": "./s" }] }"#;
+        assert!(
+            matches!(
+                Flockfile::parse(src, FlockFormat::Json),
+                Err(FlockfileError::Json(_))
+            ),
+            "bare `schema` (no $) must still be an unknown field"
+        );
+    }
+
+    #[test]
+    fn a_toml_flockfile_takes_the_key_too() {
+        let src = "\"$schema\" = \"./flockfile.schema.json\"\n\
+                   [[app]]\nname = \"web\"\nscript = \"./srv\"\n";
+        assert_eq!(
+            Flockfile::parse(src, FlockFormat::Toml).unwrap().apps.len(),
+            1
+        );
     }
 }

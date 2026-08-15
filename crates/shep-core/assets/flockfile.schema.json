@@ -3,6 +3,14 @@
   "title": "Flockfile",
   "type": "object",
   "properties": {
+    "$schema": {
+      "description": "The editor's schema hint, read and discarded.\n\nThis is the \"future schema key\" the comment above anticipated, added\nHERE explicitly rather than by relaxing `deny_unknown_fields`: a\ntypo'd key must still fail loudly, and exactly one more key is now\nlegal. shep does not validate against the named schema and makes no\npromise about it — it is a hint for the operator's editor, which is\nthe only consumer that ever reads it.\n\nTOML Flockfiles do not need it: taplo's `#:schema <url>` directive is\na comment, invisible to serde. JSON and JSON5 have no comment an\neditor agrees to look in, which is why this field exists at all.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
     "app": {
       "type": "array",
       "default": [],
