@@ -316,11 +316,16 @@ pub enum Commands {
     Import(ImportArgs),
     /// Install an init unit so the shepherd starts at boot.
     ///
-    /// Writes a systemd unit (Linux) or a launchd plist (macOS) for the
-    /// target user, carrying this binary's own path, that user's
-    /// $SHEP_HOME, and the PATH of this invocation — which is what makes an
-    /// interpreter installed under ~/.bun or ~/.cargo findable after a
-    /// reboot.
+    /// Writes an init unit for the target user — a systemd unit
+    /// (`Type=notify`), a launchd plist, an openrc script, or a FreeBSD or
+    /// OpenBSD `rc.d` script, picked automatically for the running target
+    /// or named explicitly with `--init` below. Every unit carries this
+    /// binary's own path, that user's $SHEP_HOME, and the PATH of this
+    /// invocation — which is what makes an interpreter installed under
+    /// ~/.bun or ~/.cargo findable after a reboot.
+    ///
+    /// The openrc and BSD scripts are rendered and pinned by exact-string
+    /// tests; nobody on this project has run them on their own init system.
     ///
     /// Needs root, and never asks for it: without it this prints the exact
     /// command to run and exits non-zero, so a script notices. Under sudo
@@ -331,7 +336,8 @@ pub enum Commands {
     /// sudo's own secure_path before shep ever saw it, and shows the exact
     /// PATH about to go into the unit so you can check it yourself.
     Startup(StartupArgs),
-    /// Disable and remove the unit `startup` installed.
+    /// Disable and remove whichever unit `startup` installed — systemd,
+    /// openrc, launchd, or a BSD `rc.d` script.
     ///
     /// Needs root under the same rule: without it, prints the command to
     /// run and exits non-zero. A unit that is not there is reported absent
