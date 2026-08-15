@@ -28,17 +28,19 @@ order:
 2. **The rest of the v1.0 surface** — lookout, serve, dev/runtime,
    `.js` Flockfile, schemars, the daemon-config flags layer, and openrc +
    BSD rc.d.
-3. **The Windows functional tier — last** (Rin, 2026-08-12). It is the one
-   item whose cost estimate is mostly guesswork: the decision brief put it at
-   +30-40% on the daemon's process-control layer, and that number gets much
-   better once nothing else is in flight to confound it.
+3. ~~**The Windows functional tier — last**~~ (Rin, 2026-08-12). **Superseded
+   2026-08-15: Windows is out of v1 entirely** and moved to the v1.1+ section
+   below. The estimate that was "mostly guesswork" has since been made, and it
+   is what changed the decision — see
+   [windows-estimate.md](windows-estimate.md).
 
 **Dogs** (spec §8) was originally queued first and has since shipped, on
 `feat/phase9-dogs`; see "Not deferred" below for what landed. **whistle**
 (spec §8, §13) has since shipped too, on Phase 13; same section.
 
-Ordering is not priority. Windows is last because its estimate is the
-weakest, not because it matters least.
+Ordering is not priority. Windows was last because its estimate was the
+weakest; now that the estimate exists, it is out of v1 rather than at the end
+of it.
 
 ## Committed to v1.1+ by design (spec §2)
 
@@ -48,8 +50,35 @@ Six deliberate scope cuts, not oversights — spec §2 carries the reasoning:
 - cgroup v2 enforcement (`enforce = "kernel"`) — `LimitEnforcer`'s polling
   impl is the v1.0 tier
 - `@shep/io` npm shim (built on demand)
-- Windows polish: service integration, ctrl-event graceful stop, full e2e
-  (the functional tier below is the v1.0 target)
+- **The whole Windows tier** (spec §11) — 0%, not partial, and no longer a
+  v1.0 target. The Windows arm of the CLI's entry point prints "shep does not
+  yet support Windows" and exits `Failure` for every verb; `boot`, `sys`,
+  `server` and `tokio_runner` are all `#[cfg(unix)]`. Named-pipe transport and
+  Job Objects: absent.
+
+  Rin ruled it out of v1 on 2026-08-15, once the estimate existed rather than
+  being guessed. [windows-estimate.md](windows-estimate.md) is that estimate:
+  roughly 36-49 tasks over 4-5 phases, and a redesign rather than a port. The
+  145 `cfg(unix)` sites are the cheap part — four module trees are gated at the
+  crate root despite containing no Unix calls at all. The cost is in the
+  handful of places where behaviour must change, not merely the API:
+
+  - **Graceful stop has no analogue.** `CTRL_BREAK_EVENT` reaches only console
+    apps carrying their own handler, so `shep stop` degrades to `shep kill`
+    for anything that did not opt into the shepherd channel.
+  - **The shepherd channel cannot be fd 3.** `cmd.exe` has no fd-3
+    redirection and `command-fds` is Unix-only, so the channel becomes a named
+    pipe named by an environment variable. The wire format survives;
+    [shepherd-channel.md](../shepherd-channel.md) does not.
+  - **`user`/`group` would refuse permanently.** Dropping privilege needs a
+    logon session or a primary-token privilege, which is a different feature
+    rather than a different call.
+
+  Also on the table and not yet decided: whether permanent non-support is the
+  right answer. A tier is not built once, it is maintained forever on a
+  platform no maintainer here runs — and the cheap Windows checks have already
+  rotted twice (see the windows-gnu entry under known debt). WSL2 covers the
+  common case today.
 - vcs metadata (`vcs` feature, off by default)
 - `shep web` JSON status endpoint. Resolved, 2026-08-13: the metrics dog
   does not cover this — it serves Prometheus exposition text for a
@@ -102,10 +131,6 @@ PID-1 zombie reaping). Neither verb exists, nor the `shep-runtime`/
 `shep-dev` `[[bin]]` aliases spec §3 describes — `shep-cli/Cargo.toml` has
 one `[[bin]]`.
 
-**Windows functional tier** (spec §11) — 0%, not partial. The Windows arm
-of `main.rs::run` prints "shep does not yet support Windows" and exits
-`Failure` for every verb; `boot`, `sys`, `server`, `tokio_runner` are all
-`#[cfg(unix)]`. Named-pipe transport and Job Objects: absent.
 
 ## Known debt, recorded rather than built
 
