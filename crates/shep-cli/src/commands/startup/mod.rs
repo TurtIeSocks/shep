@@ -46,30 +46,14 @@ pub(crate) const fn unit_mode(init: Init) -> u32 {
     }
 }
 
-/// The renderer this init does not have yet, or `None` when it does.
-///
-/// Temporary, by construction: Task 7 removes `Openrc` from it and Task 8
-/// removes the two BSDs, at which point this function and its test are
-/// deleted. It exists so that `--init` can accept all five values in the
-/// tree that adds the flag without any intermediate state of that tree being
-/// able to write a file it cannot render.
-pub(crate) const fn unbuilt_renderer(init: Init) -> Option<&'static str> {
-    match init {
-        Init::Systemd | Init::Launchd | Init::Openrc => None,
-        Init::FreebsdRc => Some("freebsd-rc"),
-        Init::OpenbsdRc => Some("openbsd-rc"),
-    }
-}
-
 /// Where a generated unit for `init` is written, for `user`.
 ///
 /// Systemd and launchd keep calling their own existing formatters —
 /// `unit::systemd_unit_path`/`unit::launchd_plist_path` — rather than
-/// restating their format strings here. The other three are new in Task 6,
-/// ahead of the renderers Tasks 7 and 8 supply: `unstartup` has to be able to
-/// name a unit's path under any init an operator names with `--init`, which
-/// is why this is a function of `Init` alone rather than something `plan`
-/// only ever calls for the detected one.
+/// restating their format strings here. The other three name a file
+/// `unstartup` has to be able to find under any init an operator names with
+/// `--init`, which is why this is a function of `Init` alone rather than
+/// something `plan` only ever calls for the detected one.
 pub(crate) fn unit_path_for(init: Init, user: &str) -> PathBuf {
     match init {
         Init::Systemd => unit::systemd_unit_path(user),
@@ -78,6 +62,25 @@ pub(crate) fn unit_path_for(init: Init, user: &str) -> PathBuf {
         Init::FreebsdRc => PathBuf::from(format!("/usr/local/etc/rc.d/shep_{user}")),
         Init::OpenbsdRc => PathBuf::from(format!("/etc/rc.d/shep_{user}")),
     }
+}
+
+/// Whether `user` can appear in a BSD rc script's variable names.
+///
+/// `rcvar` and `rcctl` turn the service name into **shell variable names**
+/// (`shep_<user>_enable`, `shep_<user>_flags`). A username containing `-` or
+/// `.` — `web-app` and `deploy.svc` are both legal on both systems —
+/// produces `shep_web-app_enable`, which is not a valid `sh` variable, and
+/// the script then fails at `load_rc_config` with a syntax error naming a
+/// line number rather than a user.
+///
+/// systemd and openrc name *files*, not variables, and are unaffected. Do
+/// not add this check there.
+pub(crate) fn is_rc_safe_user(user: &str) -> bool {
+    let mut chars = user.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && user.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// A step that did what it was asked.
@@ -282,11 +285,16 @@ pub(crate) fn install(
             ));
             steps.push(run_step("rc-service", &[&unit_file_name(plan), "start"]));
         }
-        // TASK-8 REPLACES THIS ARM: unreachable — `plan()` refuses these two
-        // inits (via `unbuilt_renderer`) before a `StartupPlan` naming one
-        // can exist, and `install` only ever receives a plan from `plan()`.
-        Init::FreebsdRc | Init::OpenbsdRc => {
-            steps.push(unbuilt_step("ran", plan.init));
+        Init::FreebsdRc => {
+            steps.push(run_step(
+                "sysrc",
+                &[&format!("{}_enable=YES", unit_file_name(plan))],
+            ));
+            steps.push(run_step("service", &[&unit_file_name(plan), "start"]));
+        }
+        Init::OpenbsdRc => {
+            steps.push(run_step("rcctl", &["enable", &unit_file_name(plan)]));
+            steps.push(run_step("rcctl", &["start", &unit_file_name(plan)]));
         }
     }
     report(streams, fmt, "startup", steps)
@@ -382,11 +390,18 @@ pub(crate) fn remove(
             ));
             steps.push(remove_unit(plan));
         }
-        // TASK-8 REPLACES THIS ARM: unreachable — `plan()` refuses these two
-        // inits (via `unbuilt_renderer`) before a `StartupPlan` naming one
-        // can exist, and `remove` only ever receives a plan from `plan()`.
-        Init::FreebsdRc | Init::OpenbsdRc => {
-            steps.push(unbuilt_step("ran", plan.init));
+        Init::FreebsdRc => {
+            steps.push(run_step("service", &[&unit_file_name(plan), "stop"]));
+            steps.push(run_step(
+                "sysrc",
+                &["-x", &format!("{}_enable", unit_file_name(plan))],
+            ));
+            steps.push(remove_unit(plan));
+        }
+        Init::OpenbsdRc => {
+            steps.push(run_step("rcctl", &["stop", &unit_file_name(plan)]));
+            steps.push(run_step("rcctl", &["disable", &unit_file_name(plan)]));
+            steps.push(remove_unit(plan));
         }
     }
     report(streams, fmt, "unstartup", steps)
@@ -407,11 +422,8 @@ fn write_unit(plan: &StartupPlan) -> StartupStep {
         Init::Systemd => unit::systemd_unit(&plan.spec),
         Init::Launchd => unit::launchd_plist(&plan.spec),
         Init::Openrc => unit::openrc_script(&plan.spec),
-        // TASK-8 REPLACES THIS ARM: unreachable — `plan()` refuses these two
-        // inits (via `unbuilt_renderer`) before a `StartupPlan` naming one
-        // can exist, and `write_unit` only ever receives a plan from
-        // `plan()`.
-        Init::FreebsdRc | Init::OpenbsdRc => String::new(),
+        Init::FreebsdRc => unit::freebsd_rc_script(&plan.spec),
+        Init::OpenbsdRc => unit::openbsd_rc_script(&plan.spec),
     };
     let mode = unit_mode(plan.init);
     let written = std::fs::OpenOptions::new()
@@ -438,19 +450,6 @@ fn write_unit(plan: &StartupPlan) -> StartupStep {
             Ok(()) => OK.to_string(),
             Err(err) => err.to_string(),
         },
-    }
-}
-
-/// One failed step naming an init `plan()` never lets past its own gate.
-///
-/// Shared by [`install`]'s and [`remove`]'s unbuilt-renderer arms so the two
-/// unreachable bodies say the same thing rather than drifting.
-fn unbuilt_step(action: &'static str, init: Init) -> StartupStep {
-    let name = unbuilt_renderer(init).unwrap_or("unknown");
-    StartupStep {
-        action,
-        target: name.to_string(),
-        result: format!("shep cannot write a {name} unit yet"),
     }
 }
 
@@ -523,7 +522,13 @@ fn report(
 /// A `$SHEP_HOME` with a space in it is a legal path, and an unquoted one
 /// would become two arguments — the operator would paste a command that
 /// installs a unit carrying half the path they meant.
-fn shell_quote(word: &str) -> String {
+///
+/// `pub(crate)` rather than private: [`unit::freebsd_rc_script`] and
+/// [`unit::openbsd_rc_script`] reuse it as the single-quote former their own
+/// doc comments describe, for a value that will be re-evaluated by a nested
+/// shell — a different job from `unit`'s own double-quote escaper, and the
+/// two compose there.
+pub(crate) fn shell_quote(word: &str) -> String {
     let safe = |b: &u8| b.is_ascii_alphanumeric() || b"_./:@%+=-".contains(b);
     if !word.is_empty() && word.as_bytes().iter().all(safe) {
         return word.to_string();
@@ -647,12 +652,6 @@ fn plan(explicit_home: Option<&Path>, args: &StartupArgs) -> Result<StartupPlan,
                 .to_string(),
         });
     };
-    if let Some(name) = unbuilt_renderer(init) {
-        return Err(Refusal {
-            code: ExitCode::Usage,
-            message: format!("shep cannot write a {name} unit yet"),
-        });
-    }
     let exec = std::env::current_exe().map_err(|err| Refusal {
         code: ExitCode::Failure,
         message: format!("could not resolve this binary's own path: {err}"),
@@ -665,6 +664,16 @@ fn plan(explicit_home: Option<&Path>, args: &StartupArgs) -> Result<StartupPlan,
         sudo_user.as_deref(),
         &invoking_user()?,
     );
+    if matches!(init, Init::FreebsdRc | Init::OpenbsdRc) && !is_rc_safe_user(&user) {
+        return Err(Refusal {
+            code: ExitCode::Usage,
+            message: format!(
+                "a BSD rc.d script turns the user name into a shell variable, so {user} \
+                 cannot be used: it must start with a letter or underscore and contain \
+                 only letters, digits and underscores. Pass --user with a name that does."
+            ),
+        });
+    }
     let passwd_home = passwd_home(&user)?;
     let unit_path = unit_path_for(init, &user);
     Ok(StartupPlan {
@@ -1211,14 +1220,18 @@ mod tests {
         );
     }
 
-    /// fails when Task 7 or 8 lands a renderer and forgets to remove its
-    /// entry here — a `--init openrc` that refuses after openrc exists.
+    /// fails if a username `rcvar`/`rcctl` cannot turn into a shell variable
+    /// stops being refused, or if a safe one is refused by mistake. `web-app`
+    /// and `deploy.svc` are both legal usernames and both illegal shell
+    /// variable fragments; a script built from one fails at
+    /// `load_rc_config` naming a line number rather than the user.
     #[test]
-    fn only_the_unbuilt_renderers_are_refused() {
-        assert_eq!(unbuilt_renderer(Init::Systemd), None);
-        assert_eq!(unbuilt_renderer(Init::Launchd), None);
-        assert_eq!(unbuilt_renderer(Init::Openrc), None);
-        assert!(unbuilt_renderer(Init::FreebsdRc).is_some());
-        assert!(unbuilt_renderer(Init::OpenbsdRc).is_some());
+    fn a_user_name_that_cannot_be_a_shell_variable_is_refused() {
+        for ok in ["deploy", "www", "_shep", "app2"] {
+            assert!(is_rc_safe_user(ok), "{ok} should be accepted");
+        }
+        for bad in ["web-app", "deploy.svc", "2fast", "", "ünicode"] {
+            assert!(!is_rc_safe_user(bad), "{bad} should be refused");
+        }
     }
 }

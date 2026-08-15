@@ -1,6 +1,8 @@
-//! Rendering a systemd unit and a launchd plist for the daemon.
+//! Rendering the five init-system units shep can start at boot: a systemd
+//! unit, a launchd plist, an openrc script, and the FreeBSD and OpenBSD
+//! `rc.d` scripts.
 //!
-//! Both renderers are pure `format!` over a [`UnitSpec`]: no filesystem
+//! Every renderer is pure `format!` over a [`UnitSpec`]: no filesystem
 //! access, no environment reads, nothing that could fail. Resolving a real
 //! `UnitSpec` — reading `$PATH`, this binary's own path, the target user —
 //! and writing the result to disk is the parent module's.
@@ -19,6 +21,8 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+
+use super::shell_quote;
 
 /// Everything a generated init unit carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +225,160 @@ pub(crate) fn openrc_script(spec: &UnitSpec) -> String {
          \teerror \"shep did not answer on its control socket within 60s\"\n\
          \treturn 1\n\
          }}\n"
+    )
+}
+
+/// Renders the FreeBSD `rc.d` script, `/usr/local/etc/rc.d/shep_<user>`.
+///
+/// The standard `rc.subr(8)` skeleton: `daemon(8)` runs the process in the
+/// background under a pidfile, `${name}_user`/`${name}_chdir` hand it off to
+/// the right account and directory, and `start_postcmd` closes the same
+/// readiness gap [`openrc_script`]'s `start_post` does and for the same
+/// reason — `daemon(8)` reports the service started as soon as it has
+/// forked, before the muster restore has run, so this polls the shepherd's
+/// own control socket instead, exactly as `openrc_script`'s doc comment
+/// explains at greater length.
+///
+/// The caller must already have refused any `spec.user`
+/// [`super::is_rc_safe_user`] rejects: `name`, `rcvar`, and every
+/// `shep_<user>_*` name below are shell **identifiers**, not values, so
+/// `spec.user` is interpolated into them raw. Every other interpolated value
+/// goes through [`sh_double_quoted`], same reasoning as [`openrc_script`].
+///
+/// `${name}_env` is the one field that needs more than that:
+/// `rc.subr(8)` documents it as a list of environment variables that gets
+/// word-split into arguments for `env(1)`, so an unescaped space in `home`
+/// or `path` would silently become two environment entries rather than one.
+/// Its two values are single-quoted first with [`shell_quote`] so the
+/// word-split cannot touch them, then escaped a second time for the
+/// double-quoted context the whole line sits in:
+/// `sh_double_quoted(shell_quote(value))`.
+pub(crate) fn freebsd_rc_script(spec: &UnitSpec) -> String {
+    let user = &spec.user;
+    let exec = sh_double_quoted(&spec.exec.display().to_string());
+    let home = sh_double_quoted(&spec.home.display().to_string());
+    let working_dir = sh_double_quoted(&spec.working_dir.display().to_string());
+    let home_env = sh_double_quoted(&shell_quote(&spec.home.display().to_string()));
+    let path_env = sh_double_quoted(&shell_quote(&spec.path.to_string_lossy()));
+    format!(
+        "#!/bin/sh\n\
+         #\n\
+         # PROVIDE: shep_{user}\n\
+         # REQUIRE: LOGIN NETWORKING\n\
+         # KEYWORD: shutdown\n\
+         #\n\
+         # Enable with: sysrc shep_{user}_enable=YES\n\
+         \n\
+         . /etc/rc.subr\n\
+         \n\
+         name=\"shep_{user}\"\n\
+         rcvar=\"shep_{user}_enable\"\n\
+         : ${{shep_{user}_enable:=\"NO\"}}\n\
+         \n\
+         shep_{user}_user=\"{user}\"\n\
+         shep_{user}_chdir=\"{working_dir}\"\n\
+         shep_{user}_env=\"SHEP_HOME={home_env} PATH={path_env}\"\n\
+         \n\
+         pidfile=\"/var/run/shep_{user}.pid\"\n\
+         command=\"/usr/sbin/daemon\"\n\
+         command_args=\"-P ${{pidfile}} -r -f {exec} daemon --foreground\"\n\
+         \n\
+         start_postcmd=\"shep_{user}_poststart\"\n\
+         \n\
+         # rc.subr reports the service started as soon as daemon(8) has forked, which\n\
+         # is before the shepherd has finished restoring the muster roll. This waits\n\
+         # for the shepherd to answer on its own control socket, which is the same\n\
+         # milestone systemd's READY=1 reports.\n\
+         shep_{user}_poststart()\n\
+         {{\n\
+         \t_waited=0\n\
+         \twhile [ ${{_waited}} -lt 60 ]; do\n\
+         \t\tif \"{exec}\" --home \"{home}\" flock >/dev/null 2>&1; then\n\
+         \t\t\treturn 0\n\
+         \t\tfi\n\
+         \t\tsleep 1\n\
+         \t\t_waited=$((_waited + 1))\n\
+         \tdone\n\
+         \techo \"shep did not answer on its control socket within 60s\" >&2\n\
+         \treturn 1\n\
+         }}\n\
+         \n\
+         load_rc_config $name\n\
+         run_rc_command \"$1\"\n"
+    )
+}
+
+/// Renders the OpenBSD `rc.d` script, `/etc/rc.d/shep_<user>`.
+///
+/// Like [`freebsd_rc_script`], the caller must already have refused any
+/// `spec.user` [`super::is_rc_safe_user`] rejects, and `spec.user` is
+/// interpolated raw wherever it names something — the header comment and
+/// `daemon_user`'s value — rather than through [`sh_double_quoted`].
+///
+/// **OpenBSD's `rc.subr(8)` has no post-start hook.** `rc_pre` runs before
+/// `start`; `rc_post` runs after *stop*, not after start — confirmed against
+/// the manual page rather than assumed, and there is nothing in the
+/// framework this script could poll the way [`freebsd_rc_script`] and
+/// [`openrc_script`] do. The header comment says so, and the service is
+/// reported started the instant the shepherd process is spawned, which is
+/// before the muster restore has finished; `shep --home <home> flock` is the
+/// manual check an operator has to run instead. Do not delete this comment
+/// on the assumption that it is hedging — it is not; OpenBSD genuinely has
+/// no equivalent hook.
+///
+/// The environment is passed as literal `VAR=value` prefixes inside the
+/// string handed to `rc_exec`, not exported at the top of the script.
+/// Verified against OpenBSD's own `etc/rc.d/rc.subr` source, not guessed:
+/// `rc_exec` runs the daemon through
+/// `su -fl -c <class> -s /bin/sh <user> -c "..."`, and `su(1)`'s `-l` flag
+/// discards the caller's environment, so an `export` above `rc_start` would
+/// never reach the daemon. Prefixing the assignments inside the string
+/// `rc_exec` evaluates is what survives that — not a hedge against
+/// uncertainty, but the only mechanism that reaches the daemon at all. The
+/// two values are single-quoted for the shell that evaluates the string
+/// ([`shell_quote`]) and then escaped a second time for the double-quoted
+/// context they sit in here ([`sh_double_quoted`]).
+pub(crate) fn openbsd_rc_script(spec: &UnitSpec) -> String {
+    let user = &spec.user;
+    let exec = sh_double_quoted(&spec.exec.display().to_string());
+    let working_dir = sh_double_quoted(&spec.working_dir.display().to_string());
+    let home_display = spec.home.display();
+    let home_env = sh_double_quoted(&shell_quote(&spec.home.display().to_string()));
+    let path_env = sh_double_quoted(&shell_quote(&spec.path.to_string_lossy()));
+    format!(
+        "#!/bin/ksh\n\
+         #\n\
+         # shep process manager for {user}\n\
+         #\n\
+         # Enable with: rcctl enable shep_{user} && rcctl start shep_{user}\n\
+         #\n\
+         # OpenBSD's rc.subr has no post-start hook: rc_pre runs before the daemon\n\
+         # starts and rc_post runs after it stops. So this script reports the service\n\
+         # started as soon as the shepherd process is spawned, which is BEFORE the\n\
+         # muster restore has finished — the flock may still be coming back. There is\n\
+         # no readiness protocol here and this script does not pretend to one. Check\n\
+         # with: shep --home {home_display} flock\n\
+         \n\
+         daemon=\"{exec}\"\n\
+         daemon_flags=\"daemon --foreground\"\n\
+         daemon_user=\"{user}\"\n\
+         daemon_execdir=\"{working_dir}\"\n\
+         \n\
+         . /etc/rc.d/rc.subr\n\
+         \n\
+         rc_bg=YES\n\
+         rc_reload=NO\n\
+         \n\
+         # su(1)'s -l flag, which rc_exec always passes, discards the environment\n\
+         # rc.subr itself ran in — so exporting SHEP_HOME/PATH above would never reach\n\
+         # the daemon. Prefixing them onto the string rc_exec hands to su is the only\n\
+         # way they survive. Single-quoted for the shell that evaluates that string,\n\
+         # then escaped again for the double-quoted context here.\n\
+         rc_start() {{\n\
+         \trc_exec \"SHEP_HOME={home_env} PATH={path_env} ${{daemon}} ${{daemon_flags}}\"\n\
+         }}\n\
+         \n\
+         rc_cmd $1\n"
     )
 }
 
@@ -513,5 +671,167 @@ mod tests {
     fn the_openrc_script_is_the_same_entry_point_as_the_other_two() {
         let rendered = openrc_script(&spec());
         assert!(rendered.contains(r#"command_args="daemon --foreground""#));
+    }
+
+    /// fails if the FreeBSD rcvar stops matching the script name — the two
+    /// have to agree or `sysrc shep_<user>_enable=YES` sets a variable
+    /// nothing reads, and the service silently never starts at boot.
+    #[test]
+    fn the_freebsd_rcvar_matches_the_script_name() {
+        let rendered = freebsd_rc_script(&spec());
+        assert!(rendered.contains(r#"name="shep_deploy""#), "{rendered}");
+        assert!(
+            rendered.contains(r#"rcvar="shep_deploy_enable""#),
+            "{rendered}"
+        );
+        assert!(rendered.contains("PROVIDE: shep_deploy"), "{rendered}");
+        assert_eq!(
+            unit_path_for(Init::FreebsdRc, "deploy"),
+            PathBuf::from("/usr/local/etc/rc.d/shep_deploy")
+        );
+    }
+
+    /// fails if the OpenBSD script grows a readiness claim it cannot back.
+    /// OpenBSD's `rc.subr` has no post-start hook, the script says so
+    /// plainly, and this is what stops that sentence being "tidied away".
+    #[test]
+    fn the_openbsd_script_admits_it_has_no_readiness_gate() {
+        let rendered = openbsd_rc_script(&spec());
+        assert!(rendered.contains("no post-start hook"), "{rendered}");
+        assert!(rendered.contains("BEFORE the"), "{rendered}");
+        assert!(
+            !rendered.contains("start_post"),
+            "OpenBSD has no such hook: {rendered}"
+        );
+        assert!(
+            !rendered.contains("READY=1"),
+            "that is systemd's, not this: {rendered}"
+        );
+    }
+
+    /// fails if either BSD script forgets `SHEP_HOME` — a shepherd started
+    /// without it uses root's `~/.shep` and restores nothing, silently, and
+    /// the operator finds out at the next reboot.
+    #[test]
+    fn both_bsd_scripts_carry_shep_home_and_path() {
+        for rendered in [freebsd_rc_script(&spec()), openbsd_rc_script(&spec())] {
+            assert!(rendered.contains("SHEP_HOME="), "{rendered}");
+            assert!(rendered.contains("PATH="), "{rendered}");
+        }
+    }
+
+    /// fails if a metacharacter in `home` escapes the quoting in the
+    /// FreeBSD script. Same class as the openrc test above; this one is
+    /// worse in the `${name}_env` line, where `rc.subr` word-splits the
+    /// result into arguments for `env(1)`.
+    #[test]
+    fn the_freebsd_script_quotes_shell_metacharacters() {
+        let mut s = spec();
+        s.home = PathBuf::from(r#"/tmp/we"ird/$HOME/`x`/back\slash"#);
+        let rendered = freebsd_rc_script(&s);
+        assert!(
+            rendered.contains(r#"we\"ird"#),
+            "a quote must be escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains(r"\$HOME"),
+            "a dollar must be escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains(r"\`x\`"),
+            "a backtick must be escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains(r"back\\slash"),
+            "a backslash must be escaped: {rendered}"
+        );
+    }
+
+    /// fails if a metacharacter in `home` escapes the quoting in the
+    /// OpenBSD script. Worse than the openrc case: OpenBSD hands its whole
+    /// interpolated string to a shell for evaluation via `su -c`.
+    #[test]
+    fn the_openbsd_script_quotes_shell_metacharacters() {
+        let mut s = spec();
+        s.home = PathBuf::from(r#"/tmp/we"ird/$HOME/`x`/back\slash"#);
+        let rendered = openbsd_rc_script(&s);
+        assert!(
+            rendered.contains(r#"we\"ird"#),
+            "a quote must be escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains(r"\$HOME"),
+            "a dollar must be escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains(r"\`x\`"),
+            "a backtick must be escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains(r"back\\slash"),
+            "a backslash must be escaped: {rendered}"
+        );
+    }
+
+    /// fails if a `PATH` containing a space becomes two environment entries.
+    /// `${name}_env` is a space-separated list rc.subr word-splits into
+    /// arguments for `env(1)`, and capturing a real `PATH` is the whole
+    /// reason that field exists.
+    #[test]
+    fn a_path_with_a_space_stays_one_freebsd_env_entry() {
+        let mut s = spec();
+        s.path = OsString::from("/opt/my tools/bin:/usr/bin");
+        let rendered = freebsd_rc_script(&s);
+        assert!(
+            rendered.contains("PATH='/opt/my tools/bin:/usr/bin'"),
+            "the space must stay inside the single-quoted word: {rendered}"
+        );
+    }
+
+    /// Byte-for-byte, the same tier `the_systemd_unit_matches_the_spec_exactly`
+    /// and `the_launchd_plist_matches_the_spec_exactly` already set. The
+    /// `.contains` tests above each guard one claim; this one guards the
+    /// whole artefact, which is the only kind of test a file nobody can run
+    /// on its own OS can have.
+    #[test]
+    fn the_openbsd_script_matches_the_spec_exactly() {
+        let rendered = openbsd_rc_script(&spec());
+        assert_eq!(
+            rendered,
+            "#!/bin/ksh\n\
+             #\n\
+             # shep process manager for deploy\n\
+             #\n\
+             # Enable with: rcctl enable shep_deploy && rcctl start shep_deploy\n\
+             #\n\
+             # OpenBSD's rc.subr has no post-start hook: rc_pre runs before the daemon\n\
+             # starts and rc_post runs after it stops. So this script reports the service\n\
+             # started as soon as the shepherd process is spawned, which is BEFORE the\n\
+             # muster restore has finished — the flock may still be coming back. There is\n\
+             # no readiness protocol here and this script does not pretend to one. Check\n\
+             # with: shep --home /home/deploy/.shep flock\n\
+             \n\
+             daemon=\"/usr/local/bin/shep\"\n\
+             daemon_flags=\"daemon --foreground\"\n\
+             daemon_user=\"deploy\"\n\
+             daemon_execdir=\"/home/deploy\"\n\
+             \n\
+             . /etc/rc.d/rc.subr\n\
+             \n\
+             rc_bg=YES\n\
+             rc_reload=NO\n\
+             \n\
+             # su(1)'s -l flag, which rc_exec always passes, discards the environment\n\
+             # rc.subr itself ran in — so exporting SHEP_HOME/PATH above would never reach\n\
+             # the daemon. Prefixing them onto the string rc_exec hands to su is the only\n\
+             # way they survive. Single-quoted for the shell that evaluates that string,\n\
+             # then escaped again for the double-quoted context here.\n\
+             rc_start() {\n\
+             \trc_exec \"SHEP_HOME=/home/deploy/.shep PATH=/home/deploy/.bun/bin:/usr/local/bin:/usr/bin:/bin ${daemon} ${daemon_flags}\"\n\
+             }\n\
+             \n\
+             rc_cmd $1\n",
+            "{rendered}"
+        );
     }
 }
