@@ -452,13 +452,13 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         app.update(Msg::Key(KeyPress::SelectDown));
     }
 
-    // Every live scene gets a host sample. The FROZEN one gets it too, and
-    // that is load-bearing: `the_frozen_frame_does_not_move_however_long_the
-    // _link_stays_gone` renders the frozen scene at two clock ages and
-    // compares the frames byte for byte, so a host strip that kept updating
-    // after the link was lost reddens it with no new assertion written. A
-    // frozen scene with no host sample would leave that mutation uncaught —
-    // Task 4's own mutation step says so out loud.
+    // Every live scene gets a host sample, including the FROZEN one — a
+    // strip with no host sample at all would render "host  not read yet"
+    // whether or not the freeze guard existed, so this baseline sample is
+    // what gives that guard something to protect. The regression coverage
+    // itself is the SECOND, age-varying sample sent after `Msg::Frozen`
+    // below, in the `Scene::Frozen` arm: this one only establishes what a
+    // live dashboard would have shown first.
     if which == Scene::HostUnknown {
         app.update(Msg::Host { sample: None });
     } else {
@@ -489,6 +489,26 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         Scene::Frozen => {
             app.update(Msg::Frozen {
                 at_local: "2026-08-14 14:32:07".to_string(),
+            });
+            // The frame-level regression test for the `Msg::Host` freeze
+            // guard: a sample sent AFTER `Msg::Frozen`, with a load average
+            // that varies with `age` so it cannot coincide with the
+            // baseline sample above by accident. With the guard in place
+            // this is refused and changes nothing, so the ten-minute and
+            // sixteen-hour renders in
+            // `the_frozen_frame_does_not_move_however_long_the_link_stays_gone`
+            // stay byte-identical, as they already do. Remove the guard
+            // and this is what makes that test catch it: the two ages
+            // would then paint two different load averages onto a banner
+            // that claims neither should move.
+            app.update(Msg::Host {
+                sample: Some(HostSample {
+                    load: (2.31 + age.as_secs_f64(), 4.10, 3.88),
+                    cores: Some(10),
+                    memory_total_bytes: 32 << 30,
+                    memory_used_bytes: 12 * (1 << 30) + (410 << 20),
+                    uptime_seconds: 6 * 86_400 + 3 * 3_600,
+                }),
             });
         }
         Scene::Refused => {
