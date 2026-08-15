@@ -15,7 +15,11 @@ name = "shep"
 path = "src/main.rs"
 
 [dependencies]
-shep-core.workspace = true
+# `features = ["schema"]`: `shep schema` prints `shep_core::config::
+# flockfile_schema_json()`, which only exists behind that feature. This
+# crate names no `schemars` type of its own for it — it calls a shep-core
+# function that returns a `String`.
+shep-core = { workspace = true, features = ["schema"] }
 # Unconditional even though only its `#[cfg(unix)]` modules (`boot`, `sys`,
 # `tokio_runner`, `server`) are reachable here: the pure tier compiles on
 # every target, so the platform gate belongs on our `use` sites, not on this

@@ -1,0 +1,385 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Flockfile",
+  "type": "object",
+  "properties": {
+    "app": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AppConfig"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "AppConfig": {
+      "description": "Per-app configuration — one sheep's entry in a Flockfile\n\nField names are the Flockfile contract (sheep-native; pm2 spellings are\nrejected — the importer translates them). Unknown fields are errors so\ntypos fail loudly at parse time.\n\n# Example\n```\nuse shep_core::config::AppConfig;\n\nlet app: AppConfig = toml::from_str(\"name = \\\"web\\\"\\nscript = \\\"./srv\\\"\").unwrap();\nassert!(app.autorestart); // spec default\n```",
+      "type": "object",
+      "properties": {
+        "action_timeout": {
+          "description": "How long a triggered action gets to answer on the shepherd channel\nbefore its row becomes `ActionOutcome::TimedOut`.\n\nDefaults to 3s — comfortably under the 5s an RPC caller gets when it\nsends no deadline of its own (`shep-client`'s `DEFAULT_DEADLINE`,\nmirrored daemon-side as `rpc`'s `DEFAULT_DEADLINE_MS`). The margin\nmatters more than the number: push this past that budget and a caller\nusing the plain default gives up with `DeadlineExceeded` before the\ndaemon's own honest `TimedOut` row ever reaches it. A legitimately\nslow action (a cache flush, say) can still ask for longer, but its\ncaller has to ask for a longer deadline in step —\n`Client::request_with_deadline`, the way `shep logs -f` already asks\nfor `LOG_PLANE_DEADLINE` rather than the client's default. `normalize`\nrefuses a value no caller could ever satisfy, however long a deadline\nit asks for; a value merely above the *default* budget is a caller's\nchoice to widen its own deadline, not a config error this crate can\nsee.",
+          "$ref": "#/$defs/UpDuration",
+          "default": "3s"
+        },
+        "args": {
+          "description": "Arguments passed to the script",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "autorestart": {
+          "description": "Restart on unexpected exit",
+          "type": "boolean",
+          "default": true
+        },
+        "autostart": {
+          "description": "Start when the daemon starts / on `shep muster`",
+          "type": "boolean",
+          "default": true
+        },
+        "channel": {
+          "description": "Open the shepherd channel on fd 3 for this app on its own, without\nneeding `wait_ready` or `shutdown_with_message` to imply it.\n\nDefaults to `false`: a socketpair plus two pump tasks per sheep is\nreal cost weighed against spec §14.11's single-digit-MB idle-RSS\ngoal, so a channel is opened only when something asks for one.",
+          "type": "boolean",
+          "default": false
+        },
+        "cron_restart": {
+          "description": "Cron pattern for scheduled restarts (croner dialect)",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "cron_timezone": {
+          "description": "Timezone for `cron_restart` (IANA name)",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "cwd": {
+          "description": "Working directory (default: daemon's cwd at spawn registration)",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "env": {
+          "description": "Environment for the sheep (merged over the daemon's filtered env)",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "err_file": {
+          "description": "Stderr log file (default: `$SHEP_HOME/logs/<name>-<instance>-err.log`; `merge_logs` collapses to `<name>-err.log`)",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "exp_backoff_restart_delay": {
+          "description": "Initial backoff delay; grows ×1.5 capped at 15s (spec §4)",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "fold": {
+          "description": "Fold (group) this sheep belongs to",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "graceful_timeout": {
+          "description": "Drain window for the old instance during reload",
+          "$ref": "#/$defs/UpDuration",
+          "default": "8s"
+        },
+        "group": {
+          "description": "Run as this group (unix)",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "ignore_watch": {
+          "description": "Watch ignore globs (defaults added daemon-side: dot-entries, node_modules)",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "increment_var": {
+          "description": "Env var receiving the instance slot (default `SHEP_INSTANCE`)",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "instances": {
+          "description": "Instance count (\"cluster\" = N fork instances; spec §4)",
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
+        },
+        "interpreter": {
+          "description": "Interpreter override (`\"none\"` = run script directly)",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "kill_signal": {
+          "description": "Stop signal, one of `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGUSR2` (the `SIG`\nprefix and the case are both optional). Unset means `SIGTERM`.\n\nA `String` rather than a [`KillSignal`](crate::config::KillSignal) so\nthe Flockfile schema and this struct's wire form stay plain text;\n`normalize` is what refuses a name outside that set, the same split\n`cron_restart` and the watch globs already use.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "kill_timeout": {
+          "description": "Grace period between stop signal and SIGKILL",
+          "$ref": "#/$defs/UpDuration",
+          "default": "1600"
+        },
+        "listen_timeout": {
+          "description": "Readiness fallback window when no ready signal/probe configured",
+          "$ref": "#/$defs/UpDuration",
+          "default": "3s"
+        },
+        "liveness_probe": {
+          "description": "Liveness probe — failures feed the restart policy (spec §7)",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProbeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "max_memory": {
+          "description": "Memory ceiling — polling enforcer restarts above this",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemSize"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "max_restarts": {
+          "description": "Consecutive unstable exits before `errored`",
+          "type": "integer",
+          "format": "uint32",
+          "default": 16,
+          "minimum": 0
+        },
+        "merge_logs": {
+          "description": "Merge instance logs into one file pair",
+          "type": "boolean",
+          "default": false
+        },
+        "min_uptime": {
+          "description": "Uptime below this marks an exit as unstable",
+          "$ref": "#/$defs/UpDuration",
+          "default": "1s"
+        },
+        "name": {
+          "description": "Unique sheep name (required)",
+          "type": "string",
+          "default": ""
+        },
+        "out_file": {
+          "description": "Stdout log file (default: `$SHEP_HOME/logs/<name>-<instance>-out.log`; `merge_logs` collapses to `<name>-out.log`)",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "readiness_probe": {
+          "description": "Readiness probe — gates reload's AwaitReady (spec §7)",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProbeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "restart_delay": {
+          "description": "Fixed delay before every restart (alternative to backoff)",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "reuse_port": {
+          "description": "Asserts that the app itself sets `SO_REUSEPORT` before it binds —\nshep binds nothing, so it cannot set the option on the app's behalf.\nThe child process owns the mechanism (Node ≥22's `reusePort`, Go's\n`net.ListenConfig.Control`, nginx's `reuseport`); shep's contribution\nis permission for the old and new instance to overlap during reload,\nnot the socket option itself.\n\n**This field is inert today.** shep never reads it: reload overlap\nalready happens unconditionally, so setting it changes nothing and\nleaving it unset costs nothing. It is kept because `shep import`\nwrites it for a cluster-mode pm2 app and `shep flock` displays it, so\ndropping it would silently discard a value out of an imported config.\nIt becomes load-bearing the day shep gains a reload mode that does NOT\noverlap by default, which is when the permission it describes stops\nbeing free — see `docs/specs/deferred.md`.",
+          "type": "boolean",
+          "default": false
+        },
+        "script": {
+          "description": "Executable or script path (required)",
+          "type": "string",
+          "default": ""
+        },
+        "shutdown_with_message": {
+          "description": "Send `{\"kind\":\"shutdown\"}` on the shepherd channel instead of a signal",
+          "type": "boolean",
+          "default": false
+        },
+        "stdin": {
+          "description": "Open a pipe on this sheep's stdin, so `shep whisper` can write to it.\n\nDefaults to `false`, and the default is the decision rather than a\nconvenience. Without it a sheep gets `/dev/null` on fd 0, which is what\nevery sheep has had until now, and three things argue for keeping it\nthat way unless an app asks otherwise:\n\n- Flipping it for the whole flock is a behaviour change to processes\n  nobody asked to change.\n- **Programs detect stdin.** A closed or null fd 0 is how a great many\n  programs decide they are non-interactive — no prompt, no pager, no\n  readline, no colour. Handing them a pipe silently moves them to the\n  other branch.\n- It costs a descriptor and a pump task per sheep for the whole life of\n  the process, against spec §14.11's single-digit-MB idle-RSS goal — the\n  same budget [`Self::channel`]'s own default is protecting.\n\nUnlike `channel`, nothing implies this: `wait_ready` and\n`shutdown_with_message` both need fd 3 and so turn `channel` on for you,\nwhile nothing in shep needs a sheep's stdin except an operator typing\n`shep whisper`. A sheep without it answers a `no_stdin` row and names\nthis field.\n\nThe pipe's write end lives as long as the sheep does, so the app sees\nEOF on stdin when the process is on its way out, never before.",
+          "type": "boolean",
+          "default": false
+        },
+        "stop_exit_codes": {
+          "description": "Exit codes treated as clean stop (no restart)",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "user": {
+          "description": "Run as this user (unix)",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "wait_ready": {
+          "description": "Expect `{\"kind\":\"ready\"}` on the shepherd channel",
+          "type": "boolean",
+          "default": false
+        },
+        "watch": {
+          "description": "Watch files and restart on change",
+          "type": "boolean",
+          "default": false
+        },
+        "watch_delay": {
+          "description": "Watch debounce window (default 500ms, applied daemon-side)",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "watch_options": {
+          "description": "Watch include globs (empty = watch cwd)",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "MemSize": {
+      "description": "A byte quantity: digits, optionally suffixed G, M or K (binary units).",
+      "type": "string",
+      "pattern": "^\\d+(G|M|K)?$"
+    },
+    "ProbeConfig": {
+      "description": "Readiness/liveness probe configuration (spec §7)",
+      "type": "object",
+      "properties": {
+        "failure_threshold": {
+          "description": "Consecutive failures before the probe reports unhealthy (default 3)",
+          "type": "integer",
+          "format": "uint32",
+          "default": 3,
+          "minimum": 0
+        },
+        "interval": {
+          "description": "Time between probes (default 10s)",
+          "$ref": "#/$defs/UpDuration",
+          "default": "10s"
+        },
+        "kind": {
+          "description": "Probe mechanism",
+          "$ref": "#/$defs/ProbeKind"
+        },
+        "target": {
+          "description": "URL (http), `host:port` (tcp), or command line (exec)",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Per-probe timeout (default 5s)",
+          "$ref": "#/$defs/UpDuration",
+          "default": "5s"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "target"
+      ]
+    },
+    "ProbeKind": {
+      "description": "How a health probe checks a sheep",
+      "oneOf": [
+        {
+          "description": "HTTP GET must return 2xx",
+          "type": "string",
+          "const": "http"
+        },
+        {
+          "description": "TCP connect must succeed",
+          "type": "string",
+          "const": "tcp"
+        },
+        {
+          "description": "Command must exit 0",
+          "type": "string",
+          "const": "exec"
+        }
+      ]
+    },
+    "UpDuration": {
+      "description": "A duration: digits, optionally suffixed h, m or s. Plain digits are milliseconds.",
+      "type": "string",
+      "pattern": "^\\d+(h|m|s)?$"
+    }
+  }
+}

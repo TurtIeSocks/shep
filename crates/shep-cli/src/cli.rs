@@ -321,6 +321,11 @@ pub enum Commands {
     /// `<this binary> dog <name>`; not for direct use.
     #[command(hide = true)]
     Dog(DogArgs),
+    /// Print the Flockfile JSON Schema. Hidden: the schema is committed at
+    /// `crates/shep-core/assets/flockfile.schema.json`, and this is how it is
+    /// regenerated.
+    #[command(hide = true)]
+    Schema,
 }
 
 /// Arguments to `shep start`.

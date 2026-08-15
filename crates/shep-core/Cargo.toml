@@ -11,6 +11,18 @@ documentation = "https://docs.rs/shep-core"
 keywords = ["shep", "process-manager", "supervisor", "flockfile", "protocol"]
 categories = ["config", "parsing", "data-structures"]
 
+[features]
+# Off by default. `JsonSchema` derives for the Flockfile document schema
+# (`assets/flockfile.schema.json`), which `shep schema` prints.
+#
+# Inside this workspace the gate is inert: cargo unifies features across the
+# graph, so every `--all-features` gate command and the shipped `shep` binary
+# compile this crate WITH schemars regardless. What it buys is out-of-tree —
+# a consumer of the published shep-core does not compile a proc macro for a
+# JSON Schema they may not want, and neither does a standalone
+# `cargo build -p shep-daemon`.
+schema = ["dep:schemars"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
@@ -23,6 +35,12 @@ bytes.workspace = true
 croner.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
+# Adds no PACKAGE to the tree: `rmcp`'s server feature already resolves
+# schemars 1.2.2 for whistle, workspace-pinned exactly. Verified with
+# `grep -c '^name = "schemars"$' Cargo.lock` == 1 before and after. It does
+# add one dependency EDGE, so the unanchored `grep -c schemars Cargo.lock`
+# goes 5 -> 6; that is expected, not a version conflict.
+schemars = { workspace = true, optional = true }
 # Compiles `watch_options`/`ignore_watch` globs at config time. The same engine
 # spec §4 names for the daemon's own watch filter, so a pattern `normalize`
 # accepts is one the filter can build (spec §4 "globs via globset").

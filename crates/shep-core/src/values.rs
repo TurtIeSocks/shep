@@ -150,6 +150,29 @@ impl fmt::Display for ParseMemSizeError {
 
 impl core::error::Error for ParseMemSizeError {}
 
+/// String-shaped, matching this type's `Serialize`/`Deserialize`, which go
+/// through `Display`/`FromStr` rather than the wrapped `u64`. A derive here
+/// would emit `{"type":"integer"}` and describe a wire form that does not
+/// exist.
+///
+/// The pattern is `FromStr`'s own grammar, lifted from its doc comment
+/// above. If you change one, change the other — the paired test below is
+/// what catches it.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for MemSize {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "MemSize".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "pattern": r"^\d+(G|M|K)?$",
+            "description": "A byte quantity: digits, optionally suffixed G, M or K (binary units).",
+        })
+    }
+}
+
 /// A duration from the Flockfile grammar `^\d+(h|m|s)?$`
 ///
 /// Plain digits are milliseconds; `s`/`m`/`h` are seconds/minutes/hours.
@@ -296,6 +319,24 @@ impl fmt::Display for ParseUpDurationError {
 
 impl core::error::Error for ParseUpDurationError {}
 
+/// String-shaped, matching this type's `Serialize`/`Deserialize` — see
+/// [`MemSize`]'s own `JsonSchema` impl for the full reasoning, which applies
+/// here unchanged.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for UpDuration {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "UpDuration".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "pattern": r"^\d+(h|m|s)?$",
+            "description": "A duration: digits, optionally suffixed h, m or s. Plain digits are milliseconds.",
+        })
+    }
+}
+
 #[cfg(test)]
 mod mem_size_tests {
     use super::*;
@@ -352,6 +393,34 @@ mod mem_size_tests {
         assert_eq!(serde_json::to_string(&size).unwrap(), "\"512M\"");
         assert!(serde_json::from_str::<MemSize>("\"512MB\"").is_err());
     }
+
+    /// fails if the schema pattern and `FromStr` disagree. A pattern that is
+    /// merely self-consistent is worthless; it has to agree with the parser
+    /// the schema claims to describe. The reject list carries `512T` and
+    /// `1P` for a specific reason: a widened suffix set is the way this
+    /// pattern most plausibly goes wrong, and a reject list without a
+    /// would-be-accepted suffix cannot catch it.
+    #[cfg(feature = "schema")]
+    #[test]
+    fn the_schema_pattern_agrees_with_from_str() {
+        let schema = serde_json::to_value(schemars::schema_for!(MemSize)).unwrap();
+        let pattern = schema["pattern"].as_str().unwrap();
+        let re = regex::Regex::new(pattern).unwrap();
+        for accepted in ["512M", "1G", "4096", "7K"] {
+            assert!(re.is_match(accepted), "pattern rejects {accepted}");
+            assert!(
+                accepted.parse::<MemSize>().is_ok(),
+                "FromStr rejects {accepted}"
+            );
+        }
+        for rejected in ["512MB", "512m", "1.5G", "", "M", "512T", "1P", "512g"] {
+            assert!(!re.is_match(rejected), "pattern accepts {rejected}");
+            assert!(
+                rejected.parse::<MemSize>().is_err(),
+                "FromStr accepts {rejected}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -403,5 +472,30 @@ mod up_duration_tests {
         let d: UpDuration = serde_json::from_str("\"30s\"").unwrap();
         assert_eq!(d.as_millis(), 30_000);
         assert_eq!(serde_json::to_string(&d).unwrap(), "\"30s\"");
+    }
+
+    /// fails if the schema pattern and `FromStr` disagree — see the
+    /// `MemSize` version of this same test, above, for the full reasoning
+    /// behind the reject list's shape.
+    #[cfg(feature = "schema")]
+    #[test]
+    fn the_schema_pattern_agrees_with_from_str() {
+        let schema = serde_json::to_value(schemars::schema_for!(UpDuration)).unwrap();
+        let pattern = schema["pattern"].as_str().unwrap();
+        let re = regex::Regex::new(pattern).unwrap();
+        for accepted in ["1600", "30s", "5m", "2h"] {
+            assert!(re.is_match(accepted), "pattern rejects {accepted}");
+            assert!(
+                accepted.parse::<UpDuration>().is_ok(),
+                "FromStr rejects {accepted}"
+            );
+        }
+        for rejected in ["30S", "1.5s", "30 s", "", "s", "30d", "30w"] {
+            assert!(!re.is_match(rejected), "pattern accepts {rejected}");
+            assert!(
+                rejected.parse::<UpDuration>().is_err(),
+                "FromStr accepts {rejected}"
+            );
+        }
     }
 }

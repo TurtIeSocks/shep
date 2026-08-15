@@ -12,6 +12,8 @@ pub mod probe;
 pub use app::{AppConfig, ProbeConfig, ProbeKind};
 pub use cron::{CronParseError, CronSchedule, CronScheduleError};
 pub use daemon::{DaemonConfig, DaemonConfigError, LogLevel};
+#[cfg(feature = "schema")]
+pub use flockfile::flockfile_schema_json;
 pub use flockfile::{FlockFormat, Flockfile, FlockfileError, discover};
 pub use kill_signal::KillSignal;
 pub use normalize::{NormalizeError, ResolvedApp, normalize, normalize_all};

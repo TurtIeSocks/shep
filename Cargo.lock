@@ -2120,6 +2120,7 @@ dependencies = [
  "pest",
  "quote 0.3.15",
  "regex",
+ "schemars",
  "serde",
  "serde-saphyr",
  "serde_json",
