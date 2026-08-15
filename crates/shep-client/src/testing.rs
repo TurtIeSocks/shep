@@ -19,7 +19,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -93,6 +93,47 @@ pub async fn serve_one_request(
         write_reply(&mut frames, envelope.id, response).await;
         envelope
     })
+}
+
+/// Binds `path` and answers EVERY connection — one handshake and one request
+/// each — with `reply`, until the returned handle is aborted.
+///
+/// Every other fake in this module accepts exactly one connection
+/// (`serve_scripted` opens with a bare `accept` and then loops over frames),
+/// which is right for a caller handed an already-connected [`Client`]. `shep
+/// whistle` is the first caller in this workspace that opens a fresh
+/// connection per request — see `shep-cli/src/whistle/shepherd.rs` for why —
+/// so it needs a listener that outlives the first call.
+///
+/// The returned `served` counter is shared, not the task's return value: the
+/// accept loop never ends on its own, so a `JoinHandle<u32>` would carry a
+/// number no caller could ever read (a caller that `abort()`s gets
+/// `JoinError::Cancelled`, and a caller that awaits waits forever). An
+/// `AtomicU32` the test reads WHILE the fake is still running is what lets a
+/// test assert that a request was made exactly once rather than retried.
+///
+/// Panics if `path` cannot be bound — test scaffolding, the same failure mode
+/// [`fake_daemon`] documents.
+pub fn fake_daemon_accepting_repeatedly(
+    path: &Path,
+    reply: Response,
+) -> (JoinHandle<()>, Arc<AtomicU32>) {
+    let listener = UnixListener::bind(path).unwrap();
+    let served = Arc::new(AtomicU32::new(0));
+    let counter = Arc::clone(&served);
+    let handle = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let mut frames = Framed::new(stream, codec());
+            handshake(&mut frames, sample_ack()).await;
+            let envelope = read_envelope(&mut frames).await;
+            // `write_reply` wraps the value in `Ok` itself — its signature is
+            // `(&mut Frames, u64, Response)`, testing.rs:155 — so passing an
+            // `Ok(...)` here is a type error, not a courtesy.
+            write_reply(&mut frames, envelope.id, reply.clone()).await;
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    (handle, served)
 }
 
 /// A `HelloAck` with a distinctive version and pid, so a test that asserts
