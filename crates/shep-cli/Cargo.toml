@@ -75,7 +75,12 @@ clap_complete = { version = "4.6.0", default-features = false }
 # `io-util` is `crate::http`'s: `BufReader`, `AsyncBufReadExt`/`AsyncReadExt`/
 # `AsyncWriteExt`, and `tokio::io::duplex` for its own tests — the same
 # reason shep-daemon's own hand-rolled HTTP probe (`probes/os.rs`) carries it.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "io-util"] }
+# `fs` is `serve::worker`'s: `tokio::fs::File` and `tokio::io::copy` for
+# streaming a served file off disk. It adds zero crates — tokio's `fs`
+# feature is `spawn_blocking` over `std::fs` and pulls in no new dependency
+# (confirmed: `cargo tree -p shep-cli` prints the same line count before and
+# after — see Task 6's report).
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "io-util", "fs"] }
 # `dog::bark::sinks`'s TLS transport for Discord/Slack webhooks. Rin's ruling
 # (2026-08-12): a hand-rolled HTTP/1.1 client over `tokio-rustls`, not
 # `reqwest` — see the root `Cargo.toml` entry for the full accounting,

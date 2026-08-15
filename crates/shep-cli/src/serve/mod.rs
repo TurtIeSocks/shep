@@ -15,6 +15,11 @@
 //! unix-only piece, isolated to a single internal function so the rest —
 //! the creds parse and the constant-time basic-auth comparison — stays
 //! portable like the others.
+//!
+//! `worker` is `#[cfg(unix)]`, same as `fs`: it binds a real listener and
+//! reads real files, and it is where every one of the modules above is
+//! actually called — [`worker::ServeConfig`] and [`worker::run`] are what
+//! the verb (Task 7) builds and starts.
 
 mod path;
 
@@ -26,3 +31,6 @@ mod mime;
 mod listing;
 
 mod auth;
+
+#[cfg(unix)]
+mod worker;
