@@ -4125,18 +4125,21 @@ fn call_tool_request(
     serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params})
 }
 
-/// Parses every non-empty line of `stdout` as JSON-RPC, panicking naming the
+/// Parses every line of `stdout` as JSON-RPC, panicking naming the
 /// offending line if any line fails to parse as JSON or lacks the
 /// `"jsonrpc"` key.
 ///
-/// This is Task 10's load-bearing assertion: a test that only searched
+/// This is this file's load-bearing assertion: a test that only searched
 /// stdout for the reply it wanted would pass even if the verb also printed a
 /// stray `println!`, a `--format json` error envelope, or a tracing record
-/// onto the same wire.
+/// onto the same wire. That includes a BARE `println!()`: `str::lines`
+/// never yields a trailing empty entry for a well-formed final newline, so
+/// any empty line left after splitting is a stray blank line the verb
+/// wrote, not framing artefact, and a blank line is not JSON-RPC either —
+/// this used to filter those out and let one through unnoticed.
 fn assert_every_stdout_line_is_jsonrpc(stdout: &[u8]) -> Vec<serde_json::Value> {
     let text = String::from_utf8(stdout.to_vec()).expect("whistle's stdout is valid UTF-8");
     text.lines()
-        .filter(|line| !line.is_empty())
         .map(|line| {
             let value: serde_json::Value = serde_json::from_str(line)
                 .unwrap_or_else(|err| panic!("stdout line is not JSON: {err}\nline: {line}"));
