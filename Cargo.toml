@@ -231,6 +231,63 @@ ratatui = { version = "0.30", default-features = false, features = ["std", "cros
 # `#[cfg(unix)]` like `commands` and `dog`, and the Windows leg of
 # `main.rs::run` refuses every verb before dispatching to any of them.
 crossterm = { version = "0.29", default-features = false, features = ["events", "event-stream"] }
+# The MCP SDK, for `shep whistle` (spec §8, §9). Rin's ruling (2026-08-14),
+# taken against a hand-rolled stdio JSON-RPC loop: MCP is an evolving
+# protocol, and tracking an SDK beats owning a parser for something whose
+# wire format is still moving. Deliberately the opposite of the `serve`
+# ruling, where axum was overruled in favour of hand-rolling on the HTTP
+# surface the metrics dog already has — a settled protocol with one
+# endpoint is the case for hand-rolling, and this is not that case.
+#
+# MEASURED, not estimated (12a's ratatui bill came in at +48 against an
+# estimate of 18-24, and that is the reason this comment carries numbers):
+#   compiled: +14 crates  — rmcp, rmcp-macros, pastey, schemars,
+#     schemars_derive, serde_derive_internals, dyn-clone, ref-cast,
+#     ref-cast-impl, futures, futures-channel, futures-executor, futures-io,
+#     futures-macro. All fourteen build on macOS and Linux; none builds C or
+#     needs cmake; the highest MSRV among them is rmcp's own 1.88, which is
+#     this workspace's MSRV exactly.
+#   Cargo.lock: 326 -> 340, i.e. the same +14: rmcp's feature table does
+#     name `reqwest?/rustls` and three siblings, but cargo only locks a
+#     weakly-referenced optional dependency when the feature CONTAINING the
+#     reference is enabled, and none of those four features is on here.
+#     Contrast ratatui, where `ratatui-termwiz?/underline-color` sits inside
+#     the `underline-color` feature this workspace DOES enable, which is why
+#     `grep -c '^name = "termwiz"$' Cargo.lock` prints 1 for a backend
+#     nothing builds.
+#
+# `schemars` is what generates each tool's input and output schema. rmcp's
+# `server` feature requires it, so it costs no extra crate — but it is
+# declared separately below because it is a DIRECT dependency of ours:
+# `#[derive(JsonSchema)]` emits absolute `schemars::` paths, and rmcp only
+# re-exports the crate (`pub use schemars;`, rmcp-3.1.2/src/lib.rs:38-39).
+#
+# Version 3.1.2, not "3": CI runs `-Z minimal-versions`, which resolves a
+# bare "3" to 3.0.0, an API nobody here has compiled. 3.1.2 is the newest
+# published version, its rust-version is 1.88 (this workspace's MSRV
+# exactly), and every API this phase uses was read out of its source — see
+# the plan's "Every rmcp API this plan names" table for the file:line list.
+rmcp = { version = "3.1.2", default-features = false, features = ["server", "macros", "transport-io"] }
+# The JSON Schema generator behind every whistle tool's declared input and
+# output shape. Not a transitive we happen to get: `src/whistle/facts.rs` and
+# `src/whistle/read.rs` derive `JsonSchema` on our own types, and that derive
+# expands to `schemars::…` paths, so the crate has to be nameable. rmcp
+# re-exports it, which is not the same thing — a re-export does not put the
+# crate in our extern prelude, and routing the derive through
+# `rmcp::schemars` is not an option because the derive writes the paths.
+#
+# Pinned exactly, same reason as rmcp: `-Z minimal-versions` would take a
+# bare "1" down to 1.0.0. rmcp declares `schemars = "1.0"` with
+# `features = ["chrono04"]`; 1.2.2 satisfies it and the re-resolved lockfile
+# carries exactly ONE schemars package, which is the property that matters —
+# two schemars majors would mean two `JsonSchema` traits and a derive
+# implementing the wrong one. `chrono04` is a renamed optional dep of
+# schemars (`[dependencies.chrono04] package = "chrono"`); chrono is already
+# in this workspace, so it costs nothing.
+#
+# `derive` and `std` ARE schemars' own defaults; they are named per IR-2
+# because a crate that uses a feature says so.
+schemars = { version = "1.2.2", default-features = false, features = ["derive", "std"] }
 
 # Most debuginfo in `target/` is not ours: the default `debug = true` emits
 # full DWARF for every dependency and links a copy into each of the

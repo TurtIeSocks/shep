@@ -139,6 +139,18 @@ nix = { workspace = true, features = ["fs"] }
 # phase gate runs.
 ratatui.workspace = true
 crossterm.workspace = true
+# The MCP server behind `shep whistle`. Unix-only for the same reason
+# `ratatui` and `crossterm` above are: `src/whistle/` is `#[cfg(unix)]`,
+# because it needs a unix socket to reach a shepherd, and the Windows leg of
+# `main.rs::run` refuses every verb before it could reach this module.
+# Declaring it unconditionally would build an MCP stack, a schema generator
+# and the `futures` facade into a binary that cannot use any of it, and would
+# slow the `--target x86_64-pc-windows-gnu` check the phase gate runs.
+rmcp.workspace = true
+# The schema generator, beside it and unix-only for the same reason. Declared
+# rather than reached through `rmcp::schemars`, because `#[derive(JsonSchema)]`
+# in `src/whistle/` expands to absolute `schemars::` paths.
+schemars.workspace = true
 
 # A process-group assertion and a teardown Drop guard both need to signal a
 # real pid; same cfg(unix) dev-only shape shep-daemon uses. The workspace
