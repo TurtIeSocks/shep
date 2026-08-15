@@ -126,6 +126,15 @@ pub enum Msg {
     },
     /// The terminal changed size; nothing to update but the frame is stale.
     Resize,
+    /// One reading of the machine this lookout is running on, off the 1-second
+    /// heartbeat. `None` means `sysinfo` does not support this platform —
+    /// which is a real, expected case, not a failure.
+    ///
+    /// Refused once the link is lost: see this arm in [`App::update`].
+    Host {
+        /// What the sampler saw, or `None` on an unsupported platform.
+        sample: Option<super::source::HostSample>,
+    },
 }
 
 /// What the caller has to do after an update.
@@ -232,6 +241,13 @@ pub struct App {
     /// frozen dashboard's uptime column from counting up for a sheep nothing
     /// can see.
     now: Instant,
+    /// The last host reading, or `None` before the first heartbeat and on a
+    /// platform `sysinfo` does not support. [`Self::host_unsupported`] tells
+    /// the strip which of the two it is looking at.
+    host: Option<super::source::HostSample>,
+    /// True once a sample has come back `None` — the two `None`s mean
+    /// different things and the strip says different sentences for them.
+    host_unsupported: bool,
 }
 
 impl App {
@@ -247,6 +263,8 @@ impl App {
             control,
             home,
             now,
+            host: None,
+            host_unsupported: false,
         }
     }
 
@@ -309,6 +327,19 @@ impl App {
             }
             Msg::Resize => Effect::None,
             Msg::Key(key) => self.on_key(key),
+            Msg::Host { sample } => {
+                // The one line that keeps a frozen dashboard honest, for the
+                // second time. `Msg::Tick` stops advancing `now` once the link
+                // is lost; this stops the strip for the same reason. A single
+                // line ticking over on a screen whose banner says the values
+                // are frozen is a contradiction on one frame.
+                if matches!(self.link, Link::Lost { .. }) {
+                    return Effect::None;
+                }
+                self.host_unsupported = sample.is_none();
+                self.host = sample;
+                Effect::None
+            }
         }
     }
 
@@ -529,6 +560,23 @@ impl App {
     #[must_use]
     pub fn home(&self) -> &str {
         &self.home
+    }
+
+    /// The last host reading, or `None` if there has not been one.
+    #[must_use]
+    pub fn host(&self) -> Option<super::source::HostSample> {
+        self.host
+    }
+
+    /// Whether [`Self::host`] is `None` because the platform cannot be read,
+    /// rather than because no heartbeat has fired yet.
+    ///
+    /// The strip says `usage is not available on this platform` for the first
+    /// and `not read yet` for the second. They are different facts and an
+    /// operator seeing the wrong one waits for numbers that are never coming.
+    #[must_use]
+    pub fn host_unsupported(&self) -> bool {
+        self.host_unsupported
     }
 
     /// One sheep's uptime as of this dashboard's own clock, in milliseconds.
@@ -1042,5 +1090,41 @@ mod tests {
         assert!(app.notice().is_some());
         app.update(Msg::Key(KeyPress::SelectDown));
         assert!(app.notice().is_none());
+    }
+
+    /// fails if a frozen dashboard accepts a host reading. The strip reads
+    /// THIS machine, which lookout can still see after the shepherd dies — so
+    /// this is the one pane that could keep ticking, and one line ticking over
+    /// on a screen whose banner says the values are frozen as of 14:32:07 is a
+    /// contradiction on the same frame.
+    ///
+    /// Asserted in the reducer, which is the single place the rule lives:
+    /// `run_ui`'s heartbeat samples unconditionally and this arm decides
+    /// whether the dashboard is allowed to believe it, exactly as
+    /// `Msg::Tick` and the uptime clock already work.
+    #[test]
+    fn a_frozen_dashboard_ignores_a_host_sample() {
+        let (mut app, _) = started();
+        app.update(Msg::Host {
+            sample: Some(super::super::source::HostSample {
+                load: (2.31, 4.10, 3.88),
+                cores: Some(10),
+                memory_total_bytes: 32 << 30,
+                memory_used_bytes: 12 << 30,
+                uptime_seconds: 600,
+            }),
+        });
+        assert!(app.host().is_some(), "a live dashboard takes the sample");
+
+        app.update(Msg::Frozen {
+            at_local: "2026-08-14 14:32:07".to_string(),
+        });
+        let frozen = app.host();
+        assert_eq!(app.update(Msg::Host { sample: None }), Effect::None);
+        assert_eq!(app.host(), frozen, "the last values stay, unchanged");
+        assert!(
+            !app.host_unsupported(),
+            "and a refused sample changes no flag"
+        );
     }
 }
