@@ -993,7 +993,6 @@ correct kind of red for a rename.
             "a frozen dashboard does not re-read anything"
         );
     }
-```
 
     /// fails if a frozen dashboard reads a log file. The snapshot path
     /// freezes for free — no snapshots arrive after `Msg::Frozen` — but the
@@ -1333,7 +1332,7 @@ grep -c 'RefreshFeed' crates/shep-cli/src/lookout/mod.rs        # was 0; now 1 (
 grep -rn 'ScrollUp\|ScrollDown\|ScrollTop\|ScrollBottom' crates/ | wc -l   # was 24; now 0
 grep -c 'j/k select' crates/shep-cli/src/lookout/view/status.rs # was 0; now 1
 grep -rn 'j/k scroll' crates/ | wc -l                           # was 7; now 6 — the six SNAPSHOTS, until Task 2 re-accepts them
-grep -rn 'app.scroll()' crates/ | wc -l                         # was 5; now 0
+grep -rn 'app.scroll()' crates/ | wc -l                         # was 8; now 0
 ```
 
 ### Step 1.5 — MUTATION
@@ -2091,6 +2090,13 @@ pub fn render_all(lines: &[Line<'static>]) -> String {
 }
 ```
 
+**The two tests that assert on colour use `coloured()` rather than building a
+`Palette` inline.** The RED blocks below are written as
+`let palette = Palette::detect(None, Some(OsStr::new("xterm-256color")), None);`
+because that is how 12a's tests read; use `let palette = coloured();` instead.
+Same value, one import fewer per file, and an unused `std::ffi::OsStr` import
+is a warning the Task 8 gate denies.
+
 ### Landed by Task 6
 
 ```rust
@@ -2296,7 +2302,6 @@ grep -rn 'Msg::Host' crates/ | wc -l                         # 0
         // Both keep the flock half, which lookout can always compute.
         assert!(rendered(&strip_line(&unsupported, 200)).contains("flock cpu"));
     }
-
 ```
 
 **`the_strip_never_exceeds_the_width_it_was_given` is deliberately not here.**
