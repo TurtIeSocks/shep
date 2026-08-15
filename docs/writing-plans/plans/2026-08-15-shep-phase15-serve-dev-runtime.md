@@ -713,6 +713,8 @@ each — every one of them a test in Step 3.2:
 | `GET /.env` | not the resolver's job — it resolves to `[".env"]` and the handler refuses a leading-dot segment unless `--hidden` | 404 |
 | a symlink inside the root pointing outside it | not lexical at all — see below | 404 |
 | a component swapped for a symlink after it was checked | `O_NOFOLLOW` on the open — see below | 404 |
+| any symlink component, default mode | refused by `contain`'s walk, and logged to stderr naming the path and `--follow-symlinks` — see below | 404 |
+| a symlink component, `--follow-symlinks` set | permitted, then checked by canonicalize + `starts_with(root)` — see below | 404 if it still escapes, else served |
 
 A sixth shape, not in the brief and worth as much as any of them:
 **`GET /a%0d%0aSet-Cookie:%20x`**. Decoded, that segment carries CR and LF. A
@@ -757,10 +759,51 @@ of closing the TOCTOU, not a side effect: distinguishing "points inside" from
 the root, which is the per-request `canonicalize` this design exists to avoid,
 and on the timing that matters most — between that canonicalize and the open.
 **Only the docroot itself may be a symlink; nothing under it may be, in either
-direction.** Say so in the module doc, in `--help` for `shep serve`, in Step
-12.3's divergence list, and in `docs/migration.md` beside the listing and
-dotfile flips — an operator who deploys with a `current -> release-N` symlink
-inside the docroot hits a 404 with no explanation otherwise.
+direction — by default.** Say so in the module doc, in `--help` for
+`shep serve`, in Step 12.3's divergence list, and in `docs/migration.md`
+beside the listing and dotfile flips — an operator who deploys with a
+`current -> release-N` symlink inside the docroot hits a 404 with no
+explanation otherwise.
+
+**Rin's ruling: the default does not change, and an operator who wants the
+deploy layout gets an explicit opt-out.** Refusing every symlink component
+stays the default because the two ways this can be wrong are not equally
+survivable. A wrong refusal is a 404 on a deploy layout — loud, immediate, one
+flag away from fixed. A wrong permission is a file disclosure — silent, found
+out from an incident, if it is found out at all. The loud failure is the safe
+default; it is also the fixable one.
+
+**`--follow-symlinks`, off by default, is that opt-out.** When set, `contain`
+(Task 3) stops refusing a symlink component during the walk and instead falls
+back to the design this section spent its whole argument rejecting as the
+default: canonicalize the resolved path once, after the walk, and check the
+result with `starts_with(root)`. That reopens exactly the TOCTOU this decision
+closes — a window between the canonicalize and the open a fast local attacker
+can still win — in exchange for `current -> releases/2026-08-15` and a
+symlinked `assets/` working the way pm2's serve and a bare canonicalize-based
+server both already let them. `--help` says this in one plain sentence, not as
+a footnote: turning the flag on reopens the race, it does not remove it for
+free. Two more things happen when the flag changes anything about how a
+request is answered, both stderr, both aimed at the operator and never at the
+client — the 404 the client sees does not change either way, which is the
+existing and correct posture (decision 6): an unauthenticated client learns
+nothing about the filesystem from either mode.
+
+- **At startup**, if `--follow-symlinks` is set, `shep serve` prints a notice
+  saying so and naming the race it reopens — the same "loud when widening"
+  shape decision 8 already uses for `--bind`, and argued as its own helper
+  rather than folded into `exposure_notice` where Task 7's Step 7.3 lays out
+  why.
+- **Per refusal, in the default (non-`--follow-symlinks`) mode only**, the
+  moment `contain`'s walk refuses a component because it is a symlink, it
+  writes one line to stderr naming the refused path and the flag that would
+  allow it. `serve` runs as a registered sheep, so that line lands in that
+  sheep's bleats — `shep bleats web` — which is where an operator debugging an
+  unexplained 404 on a deploy layout will actually look. Without it, "refused
+  a symlink" and "the file genuinely is not there" are indistinguishable from
+  outside the process, and that is an hour lost to the wrong theory. This does
+  not fire for an ordinary missing file, and it does not fire at all once
+  `--follow-symlinks` is set — the walk it instruments no longer runs.
 
 **That closes the TOCTOU, and it needs no new dependency and no `unsafe`.**
 The earlier draft accepted the race, and both halves of its argument were
@@ -799,6 +842,18 @@ is `O_NOFOLLOW`-protected, so what that buys the attacker is a refusal or a
 path within a directory they controlled anyway. Say this in the module doc and
 in `SECURITY.md`; do not say the race is gone.
 
+**Under `--follow-symlinks` the residue is larger, and the module doc and
+`SECURITY.md` say so as plainly as the paragraph above.** There the window is
+between `contain`'s closing `canonicalize` and `open_regular`'s open of the
+canonical path it returns — the exact per-request canonicalize-then-open gap
+this whole decision exists to avoid by default. `O_NOFOLLOW` on that final open
+is not a no-op by accident: the path `contain` returns in this mode has
+already had every symlink resolved out of it by `canonicalize`, so the flag
+protects only against a component being swapped for a symlink in the instant
+between the two calls, not against anything the walk itself would have caught
+with the flag off. This is the trade the operator is making, and it is the
+one thing the startup notice above exists to say out loud.
+
 ### 6. The refusal taxonomy: 400, 401, 404, 405, 500, and nothing else
 
 - **400** — the target itself is invalid: not starting with `/`, a malformed
@@ -808,9 +863,12 @@ in `SECURITY.md`; do not say the race is gone.
 - **401** — auth is configured and the request did not satisfy it, with
   `WWW-Authenticate: Basic realm="shep"`.
 - **404** — resolved fine, and there is nothing to serve: no such path, a path
-  that leaves the root through a symlink, a non-regular file (fifo, socket,
-  device node), a hidden path without `--hidden`, or a directory with no index
-  and no listing enabled.
+  that leaves the root through a symlink, a symlink component refused because
+  `--follow-symlinks` was not given, a non-regular file (fifo, socket, device
+  node), a hidden path without `--hidden`, or a directory with no index and no
+  listing enabled. The client sees the same 404 whether the reason was a
+  missing file or a refused symlink — decision 5's stderr line is how the
+  operator, not the client, tells the two apart.
 - **405** — a method other than `GET` or `HEAD`, with `Allow: GET, HEAD`.
 - **500** — the file existed and could not be read, or a header value failed the
   control-byte check. Never carries the underlying error text to the client; it
@@ -899,6 +957,19 @@ parsed default `port` is 8080. And the notice is extracted as
 so it can be asserted without a process: `None` for loopback, `Some` naming the
 address for `0.0.0.0`, and the no-auth variant additionally saying the files
 are readable by anything that can reach the port.
+
+**`--follow-symlinks` (decision 5) is loud in the same shape, through its own
+helper, not this one.** `exposure_notice` widens network reach; the flag
+widens filesystem trust, and the two fire independently of each other — a
+fully loopback `shep serve` with `--follow-symlinks` still reopens the TOCTOU
+and still has to say so, and a wide-open `--bind 0.0.0.0` with the flag off
+says nothing about symlinks at all. Folding both into one string would mean
+one `Option<String>` doing double duty for two unrelated risks, and a test
+that wants to assert either half in isolation would have to parse the other
+half back out of the same sentence. `fn follow_symlinks_notice(follow_symlinks:
+bool) -> Option<String>` (Task 7, Step 7.3) keeps the same "compute a pure
+string, let the caller print it" shape `exposure_notice` established, printed
+alongside it rather than merged into it.
 
 ### 9. Directory listing is off by default; the trailing-slash redirect is not optional
 
@@ -2013,10 +2084,29 @@ then 404s on it has still leaked the filename.
 ### Step 3.3 — GREEN: `resolve` in `path.rs`, containment in `fs.rs`
 
 `resolve` and `is_hidden` are the pure half and finish `path.rs`. The
-filesystem half is `serve/fs.rs`, `#[cfg(unix)]`, async, and it is two
-functions:
+filesystem half is `serve/fs.rs`, `#[cfg(unix)]`, async, and it is three
+functions — the two the previous revision of this task had, plus one small
+pure one `contain` calls at the exact moment it refuses a symlink component:
 
 ```rust
+/// The stderr line an operator sees when `contain` refuses a component for
+/// being a symlink in the default (non-`--follow-symlinks`) mode.
+///
+/// Pure and synchronous on purpose, the same reason `commands::serve`'s
+/// `exposure_notice` (decision 8) is: `contain` is async and mid-request, and
+/// the message it writes needs to be assertable without booting a server or
+/// capturing a live process's stderr. `contain` itself does the `eprintln!`;
+/// this function only builds the string, so a test can pin its content
+/// directly.
+fn symlink_refusal_notice(path: &Path) -> String {
+    format!(
+        "shep serve: refused {} — a symlink is not permitted in the docroot; \
+         pass --follow-symlinks to allow it (this reopens the check-then-open \
+         race refusing symlinks closes)",
+        path.display(),
+    )
+}
+
 /// Joins `segments` onto `root`, refusing anything that leaves it.
 ///
 /// `root` must already be canonical — `serve` canonicalizes it once at
@@ -2026,11 +2116,30 @@ functions:
 ///
 /// **Every component is `symlink_metadata`'d as the path is built, and any
 /// component that is a symlink is refused — intermediate directories
-/// included.** A leaf-only check misses the swapped-directory case, which is
-/// the same escape one level up. There is no `canonicalize` here: it is a
-/// blocking syscall on a path this function is about to walk anyway, and
-/// per-request canonicalization is what an earlier draft used to justify
-/// accepting a TOCTOU it did not need to accept.
+/// included, unless `follow_symlinks` is set.** A leaf-only check misses the
+/// swapped-directory case, which is the same escape one level up. There is no
+/// `canonicalize` in this branch: it is a blocking syscall on a path this
+/// function is about to walk anyway, and per-request canonicalization is what
+/// an earlier draft used to justify accepting a TOCTOU it did not need to
+/// accept. When the walk refuses a component for being a symlink, it writes
+/// one line to stderr, via [`symlink_refusal_notice`], naming the refused
+/// path and `--follow-symlinks` — the sheep's own bleats, and the only place
+/// an operator can tell "refused a symlink" apart from "genuinely missing"
+/// (decision 5).
+///
+/// **`follow_symlinks: true` is the opt-out (`--follow-symlinks`, decision
+/// 5), and it changes what this function does after the walk, not during
+/// it.** The per-component refusal above is skipped entirely — a symlink
+/// component is pushed like any other — and once every segment is joined, the
+/// *whole* result is canonicalized once and checked with
+/// [`Path::starts_with`] against `root`. That is the per-request canonicalize
+/// this function exists to avoid by default, reintroduced deliberately: it
+/// reopens the window between the canonicalize and the eventual open, which
+/// is the TOCTOU this decision closes when the flag is off. The path this
+/// mode returns is therefore already fully resolved — no symlink component
+/// remains in it — which is why [`open_regular`]'s `O_NOFOLLOW` is not
+/// fighting this mode so much as covering the one instant after the
+/// canonicalize that it cannot see.
 ///
 /// Each segment is pushed only after `Path::new(segment).components()` yields
 /// exactly one [`Component::Normal`]. `path::resolve`'s rule 5 already refuses
@@ -2038,19 +2147,24 @@ functions:
 /// the one that still holds if rule 5 is ever loosened. On Windows it is what
 /// stops `PathBuf::push` honouring a drive prefix and replacing the base path
 /// outright — this function is `cfg(unix)` today, and the assertion costs one
-/// line against the day it is not.
+/// line against the day it is not. This lock applies in both modes; it is the
+/// per-component symlink refusal that `follow_symlinks` skips, not this one.
 ///
 /// [`Path::starts_with`] compares **components**, not string prefixes: a root
 /// of `/srv/www` does not contain `/srv/www-secret`, and a `to_str()` prefix
-/// test would say it does. It cannot fail given the walk above, which is
-/// exactly why it is cheap to keep.
+/// test would say it does. In the default mode it cannot fail given the walk
+/// above, which is exactly why it is cheap to keep; in `follow_symlinks` mode
+/// it is doing real work — it is the only thing standing between a symlink
+/// that escapes the root and a body sent back over HTTP.
 ///
 /// # Errors
-/// `None` for every refusal — missing, a symlink component, or outside
-/// `root`. The caller answers 404 to all of them without distinguishing: a
-/// server that tells a client which of "missing" and "forbidden" applies is a
-/// server that maps its own filesystem on request.
-pub async fn contain(root: &Path, segments: &[String]) -> Option<PathBuf>
+/// `None` for every refusal — missing, a symlink component (default mode
+/// only), or outside `root` after resolution (either mode). The caller
+/// answers 404 to all of them without distinguishing: a server that tells a
+/// client which of "missing" and "forbidden" applies is a server that maps
+/// its own filesystem on request. The stderr line above is for the operator,
+/// not the response.
+pub async fn contain(root: &Path, segments: &[String], follow_symlinks: bool) -> Option<PathBuf>
 
 /// Opens a leaf for reading without ever following a symlink, and without
 /// ever blocking on a fifo.
@@ -2085,8 +2199,11 @@ The handler asks `contain` first, stats the result once for the file/directory
 fork, and calls `open_regular` on the file branch — and it is `open_regular`'s
 own metadata, not that stat, that decides whether bytes are sent.
 
-Tests for both live in `fs.rs` behind its `#[cfg(unix)]` gate and need a real
-temp tree:
+Tests for all three live in `fs.rs` behind its `#[cfg(unix)]` gate. The five
+below are unchanged from the previous revision except that every `contain`
+call now passes `follow_symlinks` explicitly — `false` in each of these, since
+every one of them is pinning the default-mode refusal — and need a real temp
+tree:
 
 ```rust
     /// fails if a symlinked LEAF inside the root that points outside it is
@@ -2104,8 +2221,8 @@ temp tree:
         let root = std::fs::canonicalize(&root).unwrap();
 
         // positive control, in the same test: the ordinary neighbour works.
-        assert!(contain(&root, &["ok.txt".to_string()]).await.is_some());
-        assert!(contain(&root, &["escape.txt".to_string()]).await.is_none());
+        assert!(contain(&root, &["ok.txt".to_string()], false).await.is_some());
+        assert!(contain(&root, &["escape.txt".to_string()], false).await.is_none());
     }
 
     /// fails if only the leaf is checked. A symlinked INTERMEDIATE directory
@@ -2125,8 +2242,8 @@ temp tree:
             root.join("link"),
         ).unwrap();
 
-        assert!(contain(&root, &["ok.txt".to_string()]).await.is_some());
-        assert!(contain(&root, &["link".to_string(), "x".to_string()]).await.is_none());
+        assert!(contain(&root, &["ok.txt".to_string()], false).await.is_some());
+        assert!(contain(&root, &["link".to_string(), "x".to_string()], false).await.is_none());
     }
 
     /// fails if `O_NOFOLLOW` is not on the open. This is the lock on the race
@@ -2179,9 +2296,66 @@ temp tree:
         // `..` never reaches here from `resolve`; this drives `contain`
         // directly, which is what the second lock is for.
         assert!(
-            contain(&root, &["..".to_string(), "www-secret".to_string(), "x".to_string()])
+            contain(&root, &["..".to_string(), "www-secret".to_string(), "x".to_string()], false)
                 .await
                 .is_none()
+        );
+    }
+
+    /// fails if the pure notice string stops naming the path or the flag. It
+    /// is `contain`'s only side effect on refusal, and it is what an operator
+    /// reads in `shep bleats web` to tell "refused a symlink" apart from
+    /// "genuinely missing" — the two events this decision's stderr line
+    /// exists to distinguish.
+    #[test]
+    fn symlink_refusal_notice_names_the_path_and_the_flag() {
+        let notice = symlink_refusal_notice(Path::new("/srv/www/current"));
+        assert!(notice.contains("/srv/www/current"), "{notice}");
+        assert!(notice.contains("--follow-symlinks"), "{notice}");
+    }
+
+    /// fails if `follow_symlinks` does not actually let an in-docroot deploy
+    /// symlink through. This is the exact shape Rin's ruling names:
+    /// `current -> releases/2026-08-15`, a symlink that stays inside the
+    /// root the whole way. Default mode refuses it (already covered by
+    /// `a_symlinked_intermediate_directory_is_not_contained`'s sibling case);
+    /// this pins that the flag actually flips the outcome for the one layout
+    /// it exists for.
+    #[tokio::test]
+    async fn an_in_docroot_deploy_symlink_is_contained_only_with_follow_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("www");
+        std::fs::create_dir_all(root.join("releases/2026-08-15")).unwrap();
+        std::fs::write(root.join("releases/2026-08-15/index.html"), b"home").unwrap();
+        std::os::unix::fs::symlink(
+            root.join("releases/2026-08-15"),
+            root.join("current"),
+        ).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let target = vec!["current".to_string(), "index.html".to_string()];
+
+        assert!(contain(&root, &target, false).await.is_none(), "default mode still refuses it");
+        assert!(contain(&root, &target, true).await.is_some(), "the flag is what lets it through");
+    }
+
+    /// fails if `follow_symlinks` trusts `canonicalize` without also checking
+    /// `starts_with(root)` afterwards. Without this test the closing
+    /// containment check could be deleted from the `follow_symlinks` branch
+    /// and nothing above would notice, because every other `follow_symlinks`
+    /// case in this file stays inside the root.
+    #[tokio::test]
+    async fn follow_symlinks_still_refuses_a_symlink_that_escapes_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("www");
+        std::fs::create_dir(&root).unwrap();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"not served").unwrap();
+        std::os::unix::fs::symlink(&secret, root.join("escape.txt")).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+
+        assert!(
+            contain(&root, &["escape.txt".to_string()], true).await.is_none(),
+            "the flag permits a symlink component; it does not permit escaping the root"
         );
     }
 ```
@@ -2193,9 +2367,9 @@ assume, by building once.
 
 ### Step 3.4 — MUTATION
 
-Five, run one at a time. Each names the one test that must redden and, where it
-matters, the tests that must **not** — an asymmetry is a finding about coverage
-and not just a pass.
+Eight, run one at a time. Each names the one test that must redden and, where
+it matters, the tests that must **not** — an asymmetry is a finding about
+coverage and not just a pass.
 
 1. In the walk, replace the `AboveRoot` refusal with a clamp (`if stack.is_empty()
    { continue }`). Expected: the `AboveRoot` assertions in
@@ -2227,15 +2401,38 @@ and not just a pass.
    Then, separately, drop `O_NONBLOCK`: `a_fifo_is_refused_without_blocking`
    does not fail, it **hangs to its own five-second deadline and then fails**,
    which is the production symptom rendered as a test failure.
+6. In `contain`, delete the `if follow_symlinks { continue }` short-circuit so
+   the per-component symlink refusal always runs regardless of the argument.
+   Expected: `an_in_docroot_deploy_symlink_is_contained_only_with_follow_symlinks`
+   fails on its second assertion (`follow_symlinks: true` now refuses the
+   deploy symlink same as `false` does) — and every default-mode test still
+   passes, because `false` behaves exactly as before. That asymmetry is the
+   whole reason the test asserts both calls rather than only the `true` one.
+7. In the `follow_symlinks` branch, drop the closing `starts_with(root)` check
+   on the canonicalized result and trust `canonicalize` unconditionally.
+   Expected: `follow_symlinks_still_refuses_a_symlink_that_escapes_the_root`
+   fails — it wants `None` and now gets `Some`, a symlink escape served over
+   HTTP. `an_in_docroot_deploy_symlink_is_contained_only_with_follow_symlinks`
+   still passes, because its symlink never leaves the root; that asymmetry is
+   why the escaping case needs its own test rather than being read off the
+   deploy-layout one.
+8. In `symlink_refusal_notice`, drop the flag name from the formatted string.
+   Expected: `symlink_refusal_notice_names_the_path_and_the_flag` fails on its
+   `--follow-symlinks` assertion, and nothing else in the file so much as
+   notices — this function has exactly one caller and that caller only checks
+   `contain`'s return value, never the string. Without this test the message
+   could degrade to something that names the path and nothing an operator can
+   act on, silently.
 
 ### Step 3.5 — verification
 
 ```bash
 grep -c "fn resolve" crates/shep-cli/src/serve/path.rs        # 1
-sed '/^#\[cfg(test)\]/,$d' crates/shep-cli/src/serve/fs.rs | grep -c 'fs::canonicalize'   # 0
+sed '/^#\[cfg(test)\]/,$d' crates/shep-cli/src/serve/fs.rs | grep -c 'fs::canonicalize'   # 1
+sed '/^#\[cfg(test)\]/,$d' crates/shep-cli/src/serve/fs.rs | grep -c 'if follow_symlinks' # 1
 grep -c "std::fs::" crates/shep-cli/src/serve/path.rs         # 0 (grep exits 1) — the module is pure
 grep -c "custom_flags" crates/shep-cli/src/serve/fs.rs        # 1
-cargo test -p shep-cli --lib --bins --all-features            # baseline +13
+cargo test -p shep-cli --lib --bins --all-features            # baseline +16
 cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu
 ```
 
@@ -2243,16 +2440,25 @@ Both `fs.rs` checks are scoped past the file's own doc comments and test
 module, and past the file itself: `fs.rs` does not exist before this task, so
 there is no today-number for either — only the count once Step 3.3's code and
 Step 3.3's tests both exist. A whole-file `grep -c "canonicalize"` would print
-around five once written: `contain`'s doc comment says "canonicalize" once and
-"canonicalizes" once, and three of the five tests below call
-`std::fs::canonicalize` to build their fixtures — none of that is the
-per-request canonicalize this check exists to forbid, so the grep is narrowed
-to the call form and to the code above the `#[cfg(test)]` line. Likewise a
-whole-file `grep -c "O_NOFOLLOW"` would print three, because `open_regular`'s
-doc comment names the flag twice before the code that sets it; counting
-`custom_flags` instead counts the one call site.
+around nine once written: `contain`'s doc comment now says "canonicalize" and
+"canonicalizes" several times over describing both modes, and five of the
+eight tests below call `std::fs::canonicalize` to build their fixtures — none
+of that is a per-request canonicalize on the default path, so the grep is
+narrowed to the call form and to the code above the `#[cfg(test)]` line.
+**That narrowed count changed meaning this task, not only its number**: before
+this ruling it proved "no per-request canonicalize, full stop" and printed 0;
+now it proves "exactly one call site, and it exists only inside the
+`follow_symlinks` branch" and prints 1 — a regression that moved the call
+outside that branch, or added a second one, would still show as 1 turning into
+something else, but a regression that made the *default* path call it would
+not show up in this count alone, which is why the paired `if follow_symlinks`
+count exists next to it: together they say one call, one guard, and the
+guard's condition is the flag. Likewise a whole-file `grep -c "O_NOFOLLOW"`
+would print three, because `open_regular`'s doc comment names the flag twice
+before the code that sets it; counting `custom_flags` instead counts the one
+call site, unaffected by this task's edits.
 
-The thirteen, by name, since a total is not a check: `path.rs` adds
+The sixteen, by name, since a total is not a check: `path.rs` adds
 `the_traversal_shapes_are_each_refused_for_their_own_reason`,
 `an_absolute_looking_target_resolves_inside_the_root`,
 `the_query_and_fragment_are_cut_before_anything_else`,
@@ -2264,11 +2470,16 @@ The thirteen, by name, since a total is not a check: `path.rs` adds
 `a_symlinked_leaf_pointing_outside_the_root_is_not_contained`,
 `a_symlinked_intermediate_directory_is_not_contained`,
 `open_regular_refuses_a_symlink_the_walk_never_saw`,
-`a_fifo_is_refused_without_blocking` and
-`a_sibling_whose_name_extends_the_roots_name_is_not_contained`. That is
-eight plus five, so **thirteen** on unix and eight under the Windows
-cross-check, which compiles `path.rs` and skips `fs.rs` entirely. Record both
-numbers; the delta on this machine is +13.
+`a_fifo_is_refused_without_blocking`,
+`a_sibling_whose_name_extends_the_roots_name_is_not_contained`,
+`symlink_refusal_notice_names_the_path_and_the_flag`,
+`an_in_docroot_deploy_symlink_is_contained_only_with_follow_symlinks` and
+`follow_symlinks_still_refuses_a_symlink_that_escapes_the_root`. That is
+eight plus eight, so **sixteen** on unix and eight under the Windows
+cross-check, which compiles `path.rs` and skips `fs.rs` entirely — none of
+this task's three new tests touch `path.rs`, so the Windows-visible count is
+unchanged from the previous revision. Record both numbers; the delta on this
+machine is +16.
 
 The Windows check runs here rather than only at the merge: `path.rs` is the
 pure-tier module this phase adds, and the backslash and drive-prefix refusals
@@ -2618,6 +2829,12 @@ pub struct ServeConfig {
     pub hidden: bool,
     /// Credentials every request must satisfy, if any.
     pub auth: Option<Credentials>,
+    /// Permit a symlink anywhere in the resolved path, falling back to a
+    /// canonicalize-then-`starts_with` containment check that reopens the
+    /// TOCTOU the default per-component walk closes. Off by default
+    /// (decision 5); `--follow-symlinks` on `ServeArgs` is the only place
+    /// this is ever set true. Passed straight through to `fs::contain`.
+    pub follow_symlinks: bool,
 }
 ```
 
@@ -2675,7 +2892,12 @@ test:
 6. `path::is_hidden` and not `cfg.hidden` → **404**. A 404 and not a 403, so it
    does not distinguish "hidden" from "missing" (decision 6). Before any
    filesystem access, so it costs nothing and leaks nothing.
-7. `fs::contain` → 404 on `None`.
+7. `fs::contain(&cfg.root, &segments, cfg.follow_symlinks)` → 404 on `None`.
+   In the default case (`cfg.follow_symlinks == false`), a refusal caused by a
+   symlink component also writes one line to stderr, from inside `contain`
+   itself (Task 3) — this handler does not duplicate that logging, it only
+   passes the flag through and answers 404 either way, same as every other
+   refusal reason `contain` folds into `None`.
 8. metadata: a directory → step 9; anything else → step 10.
 9. directory: the request path did not end in `/` → **301** to the same path
    with one, its `Location` built from the resolved segments run back through
@@ -2714,9 +2936,9 @@ metrics dog's `RunningDog` shape: a struct holding the address and the
 Three helpers, shared by every case below and written once: `write_tree(root,
 &[(path, contents)])` creates a docroot **inside** a caller-owned `TempDir`;
 `config(root)` builds a default `ServeConfig` over it; and `config_with_*`
-are one-field overrides of that (`_auth`, `_spa`, `_listing`, `_hidden`).
-Every case owns the outer `TempDir` itself, so nothing this tier writes lands
-outside one guard.
+are one-field overrides of that (`_auth`, `_spa`, `_listing`, `_hidden`,
+`_follow_symlinks`). Every case owns the outer `TempDir` itself, so nothing
+this tier writes lands outside one guard.
 
 Every one of them wraps its request/response exchange in
 `tokio::time::timeout(Duration::from_secs(5), …)` around the **async** call — a
@@ -2779,6 +3001,50 @@ of refuse. Say that in the report rather than presenting it as a live check.
 /// handler's use of `contain`, not the pure function's own test.
 #[tokio::test]
 async fn a_symlink_out_of_the_docroot_is_a_404_and_not_a_body() { … }
+
+/// fails if `cfg.follow_symlinks` does not actually reach `fs::contain`
+/// through the worker — Task 3 already pins `contain`'s own behavior; this
+/// is the wiring between the flag on `ServeConfig` and the function call,
+/// over a real socket, on the exact deploy layout Rin's ruling names.
+#[tokio::test]
+async fn a_symlinked_deploy_layout_is_served_only_with_follow_symlinks() {
+    let outer = tempfile::tempdir().unwrap();
+    let root = outer.path().join("www");
+    write_tree(&root, &[("releases/2026-08-15/index.html", "<h1>home</h1>")]);
+    std::os::unix::fs::symlink(
+        root.join("releases/2026-08-15"),
+        root.join("current"),
+    ).unwrap();
+
+    let refusing = serve_on_free_port(config(&root)).await;
+    assert_eq!(get(refusing.addr(), "/current/index.html").await.status, 404);
+
+    let following = serve_on_free_port(config_with_follow_symlinks(&root)).await;
+    let response = get(following.addr(), "/current/index.html").await;
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("<h1>home</h1>"));
+}
+
+/// fails if `--follow-symlinks` is mistaken for "trust every path" instead
+/// of "permit a symlink component, still enforce containment". A symlink
+/// that leaves the docroot must still 404 with the flag on — the canonicalize
+/// fallback (decision 5) is a different check, not the absence of one.
+#[tokio::test]
+async fn follow_symlinks_does_not_let_a_symlink_escape_the_root() {
+    let outer = tempfile::tempdir().unwrap();
+    let root = outer.path().join("www");
+    write_tree(&root, &[("index.html", "<h1>home</h1>")]);
+    std::fs::write(outer.path().join("secret.txt"), "nope").unwrap();
+    std::os::unix::fs::symlink(
+        outer.path().join("secret.txt"),
+        root.join("escape.txt"),
+    ).unwrap();
+
+    let server = serve_on_free_port(config_with_follow_symlinks(&root)).await;
+    let response = get(server.addr(), "/escape.txt").await;
+    assert_eq!(response.status, 404);
+    assert!(!response.body.contains("nope"), "the escape must not be served");
+}
 
 /// fails if auth is checked after path resolution. An unauthenticated client
 /// must not be able to tell a refused traversal (400) from a missing file
@@ -2894,7 +3160,7 @@ async fn a_connection_that_stops_reading_is_dropped_at_the_deadline() { … }
 
 ### Step 6.4 — MUTATION
 
-Six, one at a time:
+Seven, one at a time:
 
 1. Move the auth check to **after** path resolution. Expected:
    `an_unauthenticated_request_is_401_whatever_the_path_says` fails on
@@ -2921,13 +3187,22 @@ Six, one at a time:
    `connections_beyond_the_cap_are_closed_rather_than_queued_forever` fails.
    Run this one last: it is the mutation most likely to leave sockets behind if
    the test itself is wrong.
+7. Hard-code `false` for `follow_symlinks` at the `fs::contain` call site,
+   ignoring `cfg.follow_symlinks`. Expected:
+   `a_symlinked_deploy_layout_is_served_only_with_follow_symlinks` fails on its
+   second half (still 404 with the flag set) and
+   `follow_symlinks_does_not_let_a_symlink_escape_the_root` still passes,
+   because refusing more than necessary can never make an escape test go
+   green. That asymmetry is why the deploy-layout test is the one that catches
+   this and not the escape test.
 
 ### Step 6.5 — verification and gate
 
 ```bash
 grep -c "fn respond" crates/shep-cli/src/serve/worker.rs   # 1 — one seam, not several
 sed '/^#\[cfg(test)\]/,$d' crates/shep-cli/src/serve/worker.rs | grep -c 'X-Content-Type-Options'   # 1
-cargo test -p shep-cli --lib --bins --all-features         # baseline +16
+grep -c "cfg.follow_symlinks" crates/shep-cli/src/serve/worker.rs   # 1 — one call site, passed through
+cargo test -p shep-cli --lib --bins --all-features         # baseline +18
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
@@ -3006,6 +3281,11 @@ pub struct ServeArgs {
     /// `.well-known/acme-challenge`.
     #[arg(long)]
     pub hidden: bool,
+    /// Follow symlinks under the docroot, reopening the check-then-open race
+    /// refused by default. Needed for deploy layouts like
+    /// `current -> releases/2026-08-15`; off unless you ask for it.
+    #[arg(long)]
+    pub follow_symlinks: bool,
     /// File holding one `user:password` line, mode 0600, required on every
     /// request. Sent over plain HTTP — base64, not encryption.
     #[arg(long)]
@@ -3035,6 +3315,18 @@ pub struct ServeArgs {
   `fn exposure_notice(bind: IpAddr, auth: bool, root: &Path) -> Option<String>`,
   extracted so it can be asserted without a process — it is the whole
   compensating control for allowing the widening and it has no other guard.
+- `--follow-symlinks` set → a second, independent stderr notice, produced by
+  `fn follow_symlinks_notice(follow_symlinks: bool) -> Option<String>` and
+  printed alongside `exposure_notice`'s, not merged into it. Decision 8
+  explains the split: the two knobs widen different things (network reach vs.
+  filesystem trust) and fire independently — a loopback bind with
+  `--follow-symlinks` still needs to say so, and a wide bind without the flag
+  says nothing about symlinks. One `Option<String>` covering both would force
+  either a single sentence doing double duty or a test that has to parse two
+  concerns back out of one string; two small functions with the same "pure
+  string, printed by the caller" shape keep each assertable on its own and
+  keep `exposure_notice`'s existing signature — and its already-passing
+  decision-8 tests — untouched by an orthogonal change.
 
 Then either:
 
@@ -3074,6 +3366,14 @@ Then either:
 /// and mean nothing to the foreground worker that receives this line. The
 /// round-trip test asserts their absence rather than leaving it to be
 /// rediscovered.
+///
+/// **`--follow-symlinks`, by contrast, is a worker-time fact and IS in the
+/// output when set**, the same as `--spa`, `--listing` and `--hidden`: the
+/// foreground process is the one that calls `fs::contain`, so it is the one
+/// that has to know. A sheep registered with the flag on and restarted by the
+/// shepherd must come back up still following symlinks — dropping it here
+/// would be the same silent downgrade `--bind`'s round-trip test already
+/// guards against, on a security-relevant flag instead of a networking one.
 fn sheep_args(root: &Path, auth: Option<&Path>, args: &ServeArgs) -> Vec<String>
 ```
 
@@ -3099,6 +3399,7 @@ Unit, in `commands/serve.rs`:
             spa: true,
             listing: true,
             hidden: true,
+            follow_symlinks: true,
             auth: Some(PathBuf::from("./creds")),
             foreground: false,
         };
@@ -3109,6 +3410,8 @@ Unit, in `commands/serve.rs`:
         assert!(built.contains(&"--spa".to_string()));
         assert!(built.contains(&"--listing".to_string()));
         assert!(built.contains(&"--hidden".to_string()));
+        assert!(built.contains(&"--follow-symlinks".to_string()),
+                "a sheep that quietly drops this on restart silently reopens the safe default");
         assert!(built.windows(2).any(|w| w == ["--port", "9000"]));
         assert!(built.windows(2).any(|w| w == ["--bind", "0.0.0.0"]),
                 "a sheep that quietly binds loopback is a silent downgrade");
@@ -3171,6 +3474,7 @@ the Windows cross-check as well:
         assert_eq!(args.port, 8080);
         assert!(!args.listing, "decision 9");
         assert!(!args.hidden, "decision 4");
+        assert!(!args.follow_symlinks, "decision 5 — the refusal is the safe default");
     }
 ```
 
@@ -3190,6 +3494,18 @@ and the notice itself, in `commands/serve.rs`:
         let with_auth = exposure_notice("0.0.0.0".parse().unwrap(), true, Path::new("/srv/www"))
             .expect("still a wider bind");
         assert!(!with_auth.contains("readable"), "{with_auth}");
+    }
+
+    /// fails if turning symlink-following on stops being loud, or if the
+    /// notice reads as free rather than as a reopened race. Independent of
+    /// `exposure_notice` on purpose (decision 8's addendum): a fully loopback
+    /// serve with the flag on must still get this notice.
+    #[test]
+    fn follow_symlinks_produces_a_notice_that_names_the_race() {
+        assert!(follow_symlinks_notice(false).is_none());
+        let notice = follow_symlinks_notice(true).expect("the flag must say so");
+        assert!(notice.contains("--follow-symlinks"), "{notice}");
+        assert!(notice.contains("race") || notice.contains("TOCTOU"), "{notice}");
     }
 ```
 
@@ -3221,6 +3537,41 @@ fn serve_refuses_a_docroot_that_is_not_a_directory() {
 /// timing assertion would go flaky on a loaded runner while this one cannot.
 #[test]
 fn a_served_sheep_stops_on_sigterm_rather_than_riding_the_ladder_to_sigkill() { … }
+
+/// fails if the per-refusal stderr line (decision 5, Rin's ruling) never
+/// reaches the sheep's own bleats. This is the one claim in the ruling that
+/// Task 3's and Task 6's in-process tests cannot make: they run inside the
+/// test binary's own process, sharing its stderr with every other test in
+/// the suite, so asserting real output there would mean hijacking a
+/// process-global stream under `cargo test`'s default thread-per-test
+/// concurrency — flaky by construction. A registered sheep is a real child
+/// process with its own captured stderr, which is exactly what `shep bleats`
+/// already reads; that is the one place this claim can be checked honestly.
+///
+/// Layout: `<root>/releases/2026-08-15/index.html` and
+/// `<root>/current -> releases/2026-08-15`, the exact shape Rin's ruling
+/// names. Registered WITHOUT `--follow-symlinks`.
+#[test]
+fn a_refused_symlink_writes_the_path_and_the_flag_to_the_sheeps_bleats() {
+    // GET /current/index.html against the registered sheep answers 404;
+    // `shep bleats <name>` (or the sheep's stderr file directly) then
+    // contains both the refused path and the literal string
+    // "--follow-symlinks" — the operator's only way to tell this apart from
+    // a genuinely missing file.
+}
+
+/// fails if `--follow-symlinks` does not actually serve the deploy layout end
+/// to end, through registration and a restart, and fails if setting it stops
+/// being loud at startup. Two assertions in one test because they are one
+/// scenario: the flag that makes the deploy layout work is the same flag
+/// `follow_symlinks_notice` announces.
+#[test]
+fn a_served_sheep_with_follow_symlinks_serves_the_deploy_layout_and_says_so() {
+    // Same layout as above, registered WITH --follow-symlinks. GET
+    // /current/index.html answers 200. The sheep's stderr contains
+    // "--follow-symlinks" and names the reopened race, from
+    // `follow_symlinks_notice` printed at registration.
+}
 ```
 
 The first e2e case needs a free port; take one by binding `127.0.0.1:0`,
@@ -3258,21 +3609,45 @@ pinning, it needs its own case in Step 7.5's e2e tier, over a real relative
 would be invisible until the sheep's first restart, because the registering
 half already validated the file by the operator's cwd.
 
+Fourth: drop `--follow-symlinks` from `sheep_args` while leaving
+`follow_symlinks_notice` in place, the same shape as the `--bind` mutation
+above. Expected: `the_registered_command_line_is_absolute_and_carries_every_flag`
+fails on its new assertion, and
+`a_served_sheep_with_follow_symlinks_serves_the_deploy_layout_and_says_so`
+fails on its 200 (the restarted sheep answers 404 instead) while its notice
+assertion still passes — the operator is told the flag is on, the registered
+sheep quietly drops it, and the deploy layout 404s after a registration that
+reported success. That asymmetry is the same silent-downgrade shape the
+`--bind` mutation exists for, on a flag that trades a security default rather
+than a network one.
+
+Fifth: invert `follow_symlinks_notice`'s condition, so it fires when the flag
+is `false`. Expected: `follow_symlinks_produces_a_notice_that_names_the_race`
+fails on both halves — `false` now returns `Some` and `true` now returns
+`None`, which is a notice that is wrong in exactly the way that matters: silent
+when the race is reopened, noisy when it is not.
+
 ### Step 7.6 — verification and gate
 
 ```bash
 grep -c "Commands::Serve" crates/shep-cli/src/lib.rs   # 0 → 2 (the dispatch arm and the unreachable list)
 grep -c "fn exposure_notice" crates/shep-cli/src/commands/serve.rs   # 1
-cargo test -p shep-cli --lib --bins --all-features     # baseline +4
-cargo test -p shep-cli --test cli_e2e --all-features   # baseline +3
+grep -c "fn follow_symlinks_notice" crates/shep-cli/src/commands/serve.rs   # 1
+grep -c "pub follow_symlinks: bool" crates/shep-cli/src/cli.rs   # 1
+cargo test -p shep-cli --lib --bins --all-features     # baseline +5
+cargo test -p shep-cli --test cli_e2e --all-features   # baseline +5
 ```
 
-The four unit tests: `the_registered_command_line_is_absolute_and_carries_every_flag`,
+The five unit tests: `the_registered_command_line_is_absolute_and_carries_every_flag`,
 `the_registered_command_line_parses_back_to_the_same_arguments`,
 `serve_binds_loopback_on_port_8080_unless_told_otherwise` (in `cli.rs`, so it
-also runs under the Windows cross-check) and
-`a_non_loopback_bind_produces_a_notice_that_names_the_address`. The three e2e:
-the two above plus the SIGTERM case.
+also runs under the Windows cross-check),
+`a_non_loopback_bind_produces_a_notice_that_names_the_address` and
+`follow_symlinks_produces_a_notice_that_names_the_race`. The first two and the
+fourth are edits to existing tests (a fixture field and an assertion added
+each), not new tests on their own; the fifth is wholly new. The five e2e: the
+two original cases plus the SIGTERM case plus the two follow-symlinks cases
+(the refusal-notice one and the deploy-layout one).
 
 ---
 
@@ -4311,10 +4686,11 @@ Two edits, both of which the spec asks for by name:
 
 Also correct §9's **serve** line: it names axum and tower-http, which Rin
 overruled. Replace with the hand-rolled surface and a pointer to the reasoning,
-and add the three flags the spec did not anticipate (`--listing` default-off,
-`--spa`'s `Accept` gate, `--bind`), each in half a line. A spec that still names
-a dependency the implementation deliberately does not have is the exact drift
-`deferred.md` exists to stop hiding.
+and add the four flags the spec did not anticipate (`--listing` default-off,
+`--spa`'s `Accept` gate, `--bind`, `--follow-symlinks` default-off), each in
+half a line. A spec that still names a dependency the implementation
+deliberately does not have is the exact drift `deferred.md` exists to stop
+hiding.
 
 ### Step 12.3 — the ledger
 
@@ -4334,12 +4710,17 @@ the "Not deferred" section, with the divergences named:
 - `serve`'s remaining symlink race, stated as what it is: the leaf open is
   `O_NOFOLLOW`, the component walk is not atomic, and what that leaves an
   attacker is a refusal or a directory they already controlled;
-- **any symlink under the docroot is refused, not only one that leaves it** —
-  only the docroot itself may be a symlink. An in-docroot symlink that points
-  back inside the docroot (`dist/current -> ../releases/2026-08-15`, a
-  symlinked `assets/`) 404s, where pm2's serve and a canonicalize-then-check
-  design both serve it. Decision 5 names this the deliberate cost of closing
-  the TOCTOU without a per-request `canonicalize`.
+- **any symlink under the docroot is refused by default, not only one that
+  leaves it** — only the docroot itself may be a symlink unless the operator
+  says otherwise. An in-docroot symlink that points back inside the docroot
+  (`dist/current -> ../releases/2026-08-15`, a symlinked `assets/`) 404s by
+  default, where pm2's serve and a canonicalize-then-check design both serve
+  it. Decision 5 names this the deliberate cost of closing the TOCTOU without
+  a per-request `canonicalize` — and it is **off by default, one flag away**:
+  `--follow-symlinks` opts back into the canonicalize-then-check behavior,
+  reopening the race, with a startup notice and (in the default mode, on
+  refusal) a per-request stderr line naming the path so the choice and its
+  cost are never silent.
 
 Checks: `grep -c "static file server as a managed sheep" docs/specs/deferred.md`
 goes `1 → 0`; `grep -cF 'one `[[bin]]`'` goes `1 → 0`; and
@@ -4391,7 +4772,9 @@ recording rather than rewriting:
 - `serve.rs` says axum + tower-http and `PM2_SERVE_*` compat. Add a **Drift
   (Phase 15, recorded)** note: shipped as `serve/` with six modules (`path`,
   `fs`, `mime`, `listing`, `auth`, `worker`), hand-rolled on `http.rs` (which
-  moved up out of `dog/`), dotfiles refused by default, no env compat.
+  moved up out of `dog/`), dotfiles refused by default, no env compat, and
+  every symlink under the docroot refused by default with `--follow-symlinks`
+  as the (loud, off-by-default) opt-out — Rin's ruling, 2026-08-15.
 - `runtime.rs` says "auto-exit fail_count 3 / 2s / code 2" and "subreaper +
   WNOHANG loop". The debounce shipped exactly as written; the code is 11 and the
   reaper is a separate init process. Record both, and record **why** the
@@ -4405,9 +4788,13 @@ recording rather than rewriting:
 
 - `docs/migration.md`: a `pm2 serve` → `shep serve` section naming the listing
   default flip, **the dotfile refusal and `--hidden`**, **and in-docroot
-  symlinks being refused (only the docroot itself may be one)**, and the
-  missing `PM2_SERVE_*` variables, and a `pm2-runtime` → `shep runtime`
-  section with a Dockerfile that sets `ENV SHEP_HOME=/shep` and uses
+  symlinks being refused by default (only the docroot itself may be one),
+  with `--follow-symlinks` as the opt-out for a `current -> release-N` deploy
+  layout** — say plainly that turning it on reopens the TOCTOU decision 5
+  closes, so a migrating operator reaches for it deliberately and not out of
+  habit — and the missing `PM2_SERVE_*` variables, and a `pm2-runtime` →
+  `shep runtime` section with a Dockerfile that sets `ENV SHEP_HOME=/shep` and
+  uses
   `ENTRYPOINT ["shep-runtime"]`. All three default changes are things a
   migrating operator will notice as a regression before they notice as a fix,
   so each gets the one-line reason next to it.
@@ -4429,7 +4816,13 @@ recording rather than rewriting:
   component walk is not atomic, so a local attacker who can create files in the
   docroot can still get a directory component swapped between two stats; what
   that buys them is a refusal or a path inside a directory they controlled
-  anyway. State the residue; do not state that the race is gone.
+  anyway. State the residue; do not state that the race is gone. Say the same
+  for `--follow-symlinks`, and say it as a distinct, larger residue rather than
+  a footnote on the paragraph above: with the flag on, the window moves to
+  between `contain`'s closing `canonicalize` and `open_regular`'s open of the
+  path it returns — the per-request canonicalize-then-open gap the default
+  mode exists to avoid — and that is the trade an operator is making by
+  passing it, not an incidental cost.
 
 ### Step 12.7 — verification and the phase gate
 
@@ -4508,3 +4901,12 @@ was at risk, and dismissed the fix as needing `openat2(RESOLVE_BENEATH)` when
 `O_NOFOLLOW` through `OpenOptionsExt::custom_flags` is safe, portable to macOS,
 and needs no dependency this crate does not already have. Decision 5 closes it
 and states the residue.
+
+The one refinement to that closure is also Rin's ruling, not open: refusing
+every symlink component stays the default, and `--follow-symlinks` is the
+explicit, loud, off-by-default opt-out for a deploy layout that needs one
+(`current -> releases/N`). It does not reopen the question of what the
+default is — a wrong refusal is a loud 404 an operator fixes with one flag; a
+wrong permission is a silent disclosure found from an incident, and that
+asymmetry, not a size comparison of the two risks, is why the refusal stays
+the default.
