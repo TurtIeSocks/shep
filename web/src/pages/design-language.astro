@@ -1,0 +1,61 @@
+---
+/*
+ * The design-language page (docs/shep-design/README.md, "Screens > 3.
+ * Design language" — design-files/Shep Design Language.dc.html is the
+ * pixel source, screenshots 01-06 the rendered reference). The house style
+ * reference: a radial-gradient dot grid, the header, the hero, then six
+ * numbered sections. Every color/motion/press-state value on this page
+ * comes from ../styles/tokens.css and ../styles/motion.css rather than
+ * being redeclared — see each section component's own header comment for
+ * specifics.
+ *
+ * theme="auto": this page carries a visible toggle sharing docs' shep-theme
+ * localStorage key (see Base.astro's `theme` prop doc and DlHeader.astro).
+ */
+import Base from "../layouts/Base.astro";
+import DlHeader from "../components/design-language/DlHeader.astro";
+import Hero from "../components/design-language/Hero.astro";
+import MarksSection from "../components/design-language/MarksSection.astro";
+import ColorSection from "../components/design-language/ColorSection.astro";
+import TypeSection from "../components/design-language/TypeSection.astro";
+import ComponentsSection from "../components/design-language/ComponentsSection.astro";
+import ShapeMotionSection from "../components/design-language/ShapeMotionSection.astro";
+import VoiceSection from "../components/design-language/VoiceSection.astro";
+---
+
+<Base
+  title="shep — design language"
+  description="The shep house style reference: marks, color, type, components, shape and motion, and voice."
+>
+  <div class="dot-grid">
+    <DlHeader />
+    <Hero />
+    <div class="rule"><div class="line"></div></div>
+    <MarksSection />
+    <ColorSection />
+    <TypeSection />
+    <ComponentsSection />
+    <ShapeMotionSection />
+    <VoiceSection />
+  </div>
+</Base>
+
+<style>
+  .dot-grid {
+    min-height: 100vh;
+    background-image: radial-gradient(var(--dot) 1.5px, transparent 1.5px);
+    background-size: 24px 24px;
+  }
+
+  .rule {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 0 32px;
+  }
+
+  .rule .line {
+    height: 3px;
+    background: var(--line);
+    border-radius: 2px;
+  }
+</style>

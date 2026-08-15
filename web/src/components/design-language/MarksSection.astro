@@ -1,0 +1,192 @@
+---
+/*
+ * 01 The marks (docs/shep-design/README.md, "Screens > 3. Design
+ * language"). Three cards — sheep, dog, wordmark — each on the exact
+ * background the "Do" rules below prescribe (meadow, butter, ink), using
+ * the real Sheep/Dog mark components rather than redrawing them. Then the
+ * Do/Don't dashed panels.
+ */
+import Sheep from "../marks/Sheep.astro";
+import Dog from "../marks/Dog.astro";
+import { marksDoDont } from "../../data/designLanguage";
+---
+
+<section class="marks-section">
+  <div class="section-head">
+    <span class="n">01</span>
+    <h2>The marks</h2>
+  </div>
+
+  <div class="cards">
+    <div class="mark-card">
+      <div class="stage" style="background:var(--meadow);">
+        <Sheep width={120} />
+      </div>
+      <div>
+        <div class="card-title">A sheep</div>
+        <p>
+          One managed process. Singular only — a set of them is the flock,
+          never "sheeps" and never a bare plural.
+        </p>
+      </div>
+    </div>
+
+    <div class="mark-card">
+      <div class="stage" style="background:var(--butter);">
+        <Dog width={150} />
+      </div>
+      <div>
+        <div class="card-title">A dog</div>
+        <p>
+          A plugin the shepherd supervises for its own sake: metrics, bark.
+          Dogs work for the shepherd. A dog is never the daemon.
+        </p>
+      </div>
+    </div>
+
+    <div class="mark-card">
+      <div class="stage" style="background:var(--ink);">
+        <div class="wordmark">shep<span>.</span></div>
+      </div>
+      <div>
+        <div class="card-title">The wordmark</div>
+        <p>
+          Lowercase always, even at the start of a sentence — it is the
+          binary's name. Bricolage Grotesque 800, tracking −5%.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <div class="do-dont">
+    {
+      marksDoDont.map((list) => (
+        <div class="panel" data-tone={list.tone}>
+          <div class="panel-label">{list.heading}</div>
+          <ul>
+            {list.items.map((item) => (
+              <li>{item}</li>
+            ))}
+          </ul>
+        </div>
+      ))
+    }
+  </div>
+</section>
+
+<style>
+  .marks-section {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 64px 32px;
+  }
+
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    margin-bottom: 36px;
+  }
+
+  .section-head .n {
+    font-family: "Space Mono", monospace;
+    font-size: 13px;
+    color: var(--bark);
+  }
+
+  .section-head h2 {
+    font-size: 38px;
+    letter-spacing: -0.03em;
+  }
+
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 22px;
+  }
+
+  .mark-card {
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 22px;
+    box-shadow: 6px 6px 0 var(--shadow);
+    padding: 28px;
+    display: grid;
+    gap: 18px;
+  }
+
+  .stage {
+    height: 150px;
+    display: grid;
+    place-items: center;
+    border-radius: 14px;
+    border: 2.5px solid var(--line);
+  }
+
+  .wordmark {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 64px;
+    letter-spacing: -0.05em;
+    color: var(--paper);
+    line-height: 1;
+  }
+
+  .wordmark span {
+    color: var(--grass);
+  }
+
+  .card-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 19px;
+    margin-bottom: 6px;
+  }
+
+  .mark-card p {
+    margin: 0;
+    font-size: 14.5px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+
+  .do-dont {
+    margin-top: 22px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 22px;
+  }
+
+  .panel {
+    border-radius: 22px;
+    padding: 24px 26px;
+    border: 3px dashed var(--line);
+  }
+
+  .panel[data-tone="bark"] {
+    border-color: var(--bark);
+  }
+
+  .panel-label {
+    font-family: "Space Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--meadow);
+    margin-bottom: 12px;
+  }
+
+  .panel[data-tone="bark"] .panel-label {
+    color: var(--bark);
+  }
+
+  .panel ul {
+    margin: 0;
+    padding-left: 20px;
+    display: grid;
+    gap: 8px;
+    font-size: 14.5px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+</style>

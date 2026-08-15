@@ -1,0 +1,158 @@
+---
+/*
+ * 03 Type (docs/shep-design/README.md, "Screens > 3. Design language").
+ * Three specimen cards, then the five-row type scale table.
+ */
+import { typeSpecimens, typeScale } from "../../data/designLanguage";
+---
+
+<section class="type-section">
+  <div class="section-head">
+    <span class="n">03</span>
+    <h2>Type</h2>
+  </div>
+
+  <div class="specimens">
+    {
+      typeSpecimens.map((t) => (
+        <div class="specimen">
+          <div class="glyph" style={`font-family:${t.fontFamily};`}>
+            Aa
+          </div>
+          <div class="label">{t.label}</div>
+          <div class="spec">{t.spec}</div>
+        </div>
+      ))
+    }
+  </div>
+
+  <div class="scale">
+    {
+      typeScale.map((row) => (
+        <div class="scale-row">
+          <div class="scale-meta">
+            <div class="role">{row.role}</div>
+            <div class="spec">{row.spec}</div>
+          </div>
+          <div
+            class="sample"
+            style={`font-family:${row.family};font-weight:${row.weight};font-size:${row.px};letter-spacing:${row.tracking};`}
+          >
+            {row.sample}
+          </div>
+        </div>
+      ))
+    }
+  </div>
+</section>
+
+<style>
+  .type-section {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 64px 32px;
+  }
+
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    margin-bottom: 36px;
+  }
+
+  .section-head .n {
+    font-family: "Space Mono", monospace;
+    font-size: 13px;
+    color: var(--bark);
+  }
+
+  .section-head h2 {
+    font-size: 38px;
+    letter-spacing: -0.03em;
+  }
+
+  .specimens {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+    gap: 22px;
+    margin-bottom: 34px;
+  }
+
+  .specimen {
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 22px;
+    padding: 26px;
+    box-shadow: 6px 6px 0 var(--shadow);
+  }
+
+  .glyph {
+    font-weight: 800;
+    font-size: 56px;
+    line-height: 1;
+    letter-spacing: -0.04em;
+    margin-bottom: 16px;
+  }
+
+  .specimen .label {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+  }
+
+  .specimen .spec {
+    font-family: "Space Mono", monospace;
+    font-size: 12px;
+    color: var(--ink-3);
+    margin-top: 6px;
+  }
+
+  .scale {
+    display: grid;
+    border: 3px solid var(--line);
+    border-radius: 22px;
+    overflow: hidden;
+  }
+
+  .scale-row {
+    display: grid;
+    grid-template-columns: 190px minmax(0, 1fr);
+    gap: 24px;
+    align-items: center;
+    padding: 20px 26px;
+    border-bottom: 2px solid var(--hair);
+    background: var(--paper-2);
+  }
+
+  .scale-row:last-child {
+    border-bottom: none;
+  }
+
+  .scale-meta .role {
+    font-family: "Space Mono", monospace;
+    font-size: 12px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  .scale-meta .spec {
+    font-family: "Space Mono", monospace;
+    font-size: 12.5px;
+    color: var(--ink-2);
+    margin-top: 4px;
+  }
+
+  .sample {
+    line-height: 1.15;
+    min-width: 0;
+    overflow-wrap: break-word;
+  }
+
+  @media (max-width: 640px) {
+    .scale-row {
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+  }
+</style>
