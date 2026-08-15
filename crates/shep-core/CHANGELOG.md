@@ -355,6 +355,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is unaffected.
 - `protocol::channel` — the shepherd channel's `ChildMessage`/`ShepherdMessage`
   shapes, moved here from shep-daemon so a bus event can carry one.
+- Add `config::WhistleSection` and `DaemonConfig::whistle` — the `[whistle]`
+  section, one key (`allow_control`, default `false`) gating whether `shep
+  whistle`'s four control tools are offered. Lives in `shep.toml` and
+  nowhere else: no flag, no `SHEP_*` variable, because the config file is
+  what an operator can audit and `shep whistle`'s launcher writes its own
+  argv. `Debug` is derived, not redacted (IR-41) — one boolean, no secret.
 
 ### Fixes
 

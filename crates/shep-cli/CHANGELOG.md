@@ -757,6 +757,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one with `(failed)` appended, so the failure is visible in the table an
   operator is already reading rather than only in `--format json`; a bark
   the shepherd wrote itself, with no sinks at all, renders `-`.
+- Add `shep whistle`, the ninth verb: serves the Model Context Protocol on
+  stdin/stdout for an AI agent host. Five read-only tools — `list_flock`,
+  `describe_sheep`, `get_metrics`, `tail_bleats`, `list_barks` — are always
+  offered; the four that act — `start_sheep`, `stop_sheep`, `restart_sheep`,
+  `reload_sheep` — exist only when `[whistle] allow_control = true` in
+  `$SHEP_HOME/shep.toml`. That gate is a fat-finger catch, not a security
+  boundary — whistle runs as the operator's own uid, so anything it could do
+  the operator could already do with `shep stop` — and it is deliberately a
+  config-file key rather than a flag or environment variable, for the
+  legibility a diffable file gives an auditor. Writes nothing to stdout but
+  the JSON-RPC wire; a `shep.toml` that fails to parse reads as the gate
+  shut, never open, and prints the parse failure to stderr.
 
 ### Fixes
 

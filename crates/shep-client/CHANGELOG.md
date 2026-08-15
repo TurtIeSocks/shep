@@ -83,6 +83,15 @@ change to any of it is a `[Unreleased]` entry of its own, not a silent diff.
   leaving in the tree to avoid one Cargo feature.
 - Re-export `shep_core` at the crate root, so downstream users need a single
   dependency rather than naming both crates themselves.
+- Add `testing::fake_daemon_accepting_repeatedly` — a fake that binds and
+  answers every connection with one reply each, until its handle is
+  aborted, for `shep whistle`: the first caller in this workspace that opens
+  a fresh connection per request rather than reusing one. Every other fake
+  in this module accepts exactly one connection, which is right for a
+  caller handed an already-connected `Client` but not for this one. Returns
+  an `Arc<AtomicU32>` request counter alongside the `JoinHandle`, since the
+  accept loop never ends on its own and a test needs to read the count
+  while the fake is still running.
 
 ### Fixes
 
