@@ -6,6 +6,7 @@ pub mod admin;
 pub mod bleats;
 pub mod daemon;
 pub mod dogs;
+pub(crate) mod empty;
 pub mod import;
 pub mod kv;
 pub mod lifecycle;

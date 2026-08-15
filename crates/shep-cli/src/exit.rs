@@ -59,6 +59,28 @@ pub enum ExitCode {
     /// exist.
     #[cfg_attr(windows, allow(dead_code))]
     DaemonAlreadyRunning = 10,
+    /// The flock emptied and something in it had failed.
+    ///
+    /// `runtime`'s fail-fast status: no sheep is online any more and at least
+    /// one ended `errored` — its restart budget was exhausted, or it never
+    /// spawned. An orchestrator reads this as "restart the container".
+    ///
+    /// **Spec §9 specified code 2 for this and flagged the collision rather
+    /// than resolving it**: 2 is clap's usage code, so a container that exits
+    /// 2 leaves an operator unable to tell a bad flag from a dead app. Codes
+    /// 0-10 were all spoken for, so this is a new row rather than a reused
+    /// one, and the spec's table now carries it.
+    ///
+    /// A flock that emptied *cleanly* — every sheep `stopped`, none `errored`
+    /// — exits `Success` instead. A one-shot job in a container finishing its
+    /// work is not a failure.
+    ///
+    /// Not constructed anywhere yet: only `runtime`'s foreground engine would
+    /// produce it, and that engine is still unwritten (Task 9).
+    /// `#[allow(dead_code)]` says so explicitly rather than inventing a call
+    /// site nothing needs yet.
+    #[allow(dead_code)]
+    FlockEmpty = 11,
 }
 
 impl ExitCode {
@@ -83,6 +105,7 @@ impl ExitCode {
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::Internal => "internal",
             Self::DaemonAlreadyRunning => "daemon_already_running",
+            Self::FlockEmpty => "flock_empty",
         }
     }
 }
@@ -233,6 +256,7 @@ mod tests {
             ExitCode::DeadlineExceeded,
             ExitCode::Internal,
             ExitCode::DaemonAlreadyRunning,
+            ExitCode::FlockEmpty,
         ];
         let strings: Vec<&str> = all.iter().map(|c| c.code_str()).collect();
         assert!(strings.iter().all(|s| !s.is_empty()));
