@@ -212,6 +212,17 @@ pub fn name_width(width: u16, columns: &[Column]) -> u16 {
 ///
 /// A truncated name that looked whole would be a name an operator types into
 /// `shep stop`, so the ellipsis is not cosmetic.
+///
+/// **Known limitation: `char`s, not display columns.** A double-width
+/// character (CJK, many emoji) counts as one `char` here but occupies two
+/// columns in the terminal, so a name or a log line built from them can run
+/// past `width` and lose its `…` truncation marker. Confirmed cosmetic, not
+/// a security issue: ratatui's own `Buffer::set_line` clips at the render
+/// area rather than bleeding into a neighbouring pane, and no ESC or CR byte
+/// ever reaches a buffer cell, so a hostile log line has no escape-injection
+/// path through this function. Fixing it means measuring display width
+/// (`unicode-width` or equivalent) instead of `char` count; not done here —
+/// see `docs/specs/deferred.md`'s "Known debt" section.
 #[must_use]
 pub fn fit(text: &str, width: u16) -> String {
     let width = usize::from(width);

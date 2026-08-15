@@ -315,6 +315,30 @@ one. What would force it: an app class where the sheep is a supervisor that
 does not forward signals to its own workers, which is a real shape and simply
 has not come up here yet.
 
+### `lookout`'s flock table and bleats feed measure `char`s, not display columns
+
+[`crates/shep-cli/src/lookout/view/flock.rs`](../../crates/shep-cli/src/lookout/view/flock.rs)'s
+`fit` — the function every truncated line in `shep lookout` goes through —
+counts `text.chars().count()` to decide where to cut and place its `…`. A
+double-width character (CJK, many emoji) counts as one `char` but draws in
+two terminal columns, so a NAME or a log line built from them can overrun its
+column and lose the ellipsis that marks the cut.
+
+Confirmed cosmetic, not a security issue: ratatui's `Buffer::set_line` clips
+at the render area rather than bleeding into a neighbouring pane, and no ESC
+or CR byte reaches a buffer cell, so there is no escape-injection path from a
+hostile log line through this function — only a truncation marker that can go
+missing.
+
+Not fixed in Phase 12b, deliberately: 12a already carried this limitation for
+sheep names, and 12b is the first phase to feed the same function arbitrary
+log bytes rather than operator-chosen names, which is what makes it worth
+recording rather than what makes it new. Fixing it means measuring display
+width (`unicode-width` or equivalent) instead of `char` count — a new
+dependency this phase's review declined to add for a cosmetic gap. What would
+force it: an operator running `shep lookout` against sheep with CJK names or
+logs, where a missing `…` is confusing rather than theoretical.
+
 ## Not deferred
 
 **Dogs** (spec §8) **shipped**: the dog contract (`shep_daemon::dogs`,
