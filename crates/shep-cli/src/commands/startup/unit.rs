@@ -148,11 +148,110 @@ fn xml_text(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Renders the openrc init script.
+///
+/// `supervise-daemon` (openrc >= 0.21) rather than `start-stop-daemon`,
+/// because it supervises the foreground process the way systemd does rather
+/// than daemonizing and tracking a pidfile — and `shep daemon --foreground`
+/// is the entry point both other renderers already use.
+///
+/// **openrc has no `sd_notify` analogue.** Nothing tells openrc the shepherd
+/// is ready; `supervise-daemon` marks the service started the instant the
+/// process is spawned, which is before the muster restore has finished. The
+/// `start_post` poll below is what closes that gap, and it is not a
+/// consolation prize: it proves exactly what `READY=1` proves. `boot` binds
+/// the control socket at step 2, restores the roll and starts the dogs at
+/// step 4, and `RpcServer` — the thing that *accepts* on that listener — is
+/// constructed afterwards, in `run`. So a connection lands in the backlog
+/// immediately but **no request is answered until after the restore**, and
+/// the first answered `shep flock` is the same milestone, one step later.
+/// `shep flock` also routes through `connect_client`, which never spawns, so
+/// the poll cannot start a shepherd of its own.
+/// Do not "simplify" the poll away on the assumption that it is a guess.
+///
+/// Every interpolated value goes through [`sh_double_quoted`]: these land
+/// inside double-quoted assignments in a script that runs as root at boot.
+pub(crate) fn openrc_script(spec: &UnitSpec) -> String {
+    let user = sh_double_quoted(&spec.user);
+    let exec = sh_double_quoted(&spec.exec.display().to_string());
+    let home = sh_double_quoted(&spec.home.display().to_string());
+    let path = sh_double_quoted(&spec.path.to_string_lossy());
+    let working_dir = sh_double_quoted(&spec.working_dir.display().to_string());
+    format!(
+        "#!/sbin/openrc-run\n\
+         # shep process manager for {user}\n\
+         #\n\
+         # openrc has no sd_notify analogue, so the readiness gap systemd's\n\
+         # Type=notify closes is closed here by start_post asking the shepherd\n\
+         # itself. The first answered request proves the muster restore finished:\n\
+         # shep binds its control socket before the restore but does not accept on\n\
+         # it until after.\n\
+         \n\
+         name=\"shep-{user}\"\n\
+         description=\"shep process manager for {user}\"\n\
+         supervisor=\"supervise-daemon\"\n\
+         command=\"{exec}\"\n\
+         command_args=\"daemon --foreground\"\n\
+         command_user=\"{user}\"\n\
+         directory=\"{working_dir}\"\n\
+         pidfile=\"/run/shep-{user}.pid\"\n\
+         respawn_delay=5\n\
+         output_log=\"{home}/logs/shepd.out.log\"\n\
+         error_log=\"{home}/logs/shepd.err.log\"\n\
+         \n\
+         export SHEP_HOME=\"{home}\"\n\
+         export PATH=\"{path}\"\n\
+         \n\
+         depend() {{\n\
+         \tneed net\n\
+         }}\n\
+         \n\
+         # start_post runs as root, and the control socket lives in a 0700 $SHEP_HOME\n\
+         # owned by {user}. Root bypasses that, so the poll works; it looks like a\n\
+         # permission bug only until you have thought it through.\n\
+         start_post() {{\n\
+         \tlocal waited=0\n\
+         \twhile [ \"${{waited}}\" -lt 60 ]; do\n\
+         \t\tif \"{exec}\" --home \"{home}\" flock >/dev/null 2>&1; then\n\
+         \t\t\treturn 0\n\
+         \t\tfi\n\
+         \t\tsleep 1\n\
+         \t\twaited=$((waited + 1))\n\
+         \tdone\n\
+         \teerror \"shep did not answer on its control socket within 60s\"\n\
+         \treturn 1\n\
+         }}\n"
+    )
+}
+
+/// Escapes a value that lands INSIDE a double-quoted shell assignment:
+/// `"`, `$`, `` ` `` and `\` get a backslash.
+///
+/// Not the same function as [`super::shell_quote`], and the two must not be
+/// folded together: `shell_quote` produces a standalone single-quoted *word*
+/// for a human to paste into a terminal, while this escapes *content* that
+/// is already inside double quotes. Where a value will additionally be
+/// re-evaluated by a shell — OpenBSD's `rc_start` string, FreeBSD's
+/// `${name}_env` — the two compose, innermost first:
+/// `sh_double_quoted(shell_quote(value))`.
+fn sh_double_quoted(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '"' | '$' | '`' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::cli::Init;
+    use crate::commands::startup::unit_path_for;
 
     fn spec() -> UnitSpec {
         UnitSpec {
@@ -346,5 +445,73 @@ mod tests {
             "systemd-analyze verify rejected the unit:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// fails if the readiness poll is ever dropped or unbounded. openrc's
+    /// only honest answer to Type=notify.
+    #[test]
+    fn the_openrc_script_polls_for_readiness_and_bounds_the_wait() {
+        let rendered = openrc_script(&spec());
+        assert!(rendered.contains("start_post()"));
+        assert!(rendered.contains("-lt 60"), "the poll must be bounded");
+        assert!(rendered.contains("flock >/dev/null"));
+        assert!(
+            rendered.contains("return 1"),
+            "a timeout must fail the service"
+        );
+    }
+
+    /// fails if the comment explaining WHY the poll is equivalent to
+    /// READY=1 is deleted. Phase 12a shipped two false captions in a
+    /// generated artefact because only one of them was pinned; generated
+    /// prose that makes a claim gets a test.
+    #[test]
+    fn the_openrc_script_says_why_it_polls() {
+        let rendered = openrc_script(&spec());
+        assert!(rendered.contains("openrc has no sd_notify analogue"));
+        assert!(rendered.contains("binds its control socket before the restore"));
+    }
+
+    /// fails if a metacharacter in a path escapes the double quotes.
+    #[test]
+    fn the_openrc_script_quotes_shell_metacharacters() {
+        let mut s = spec();
+        s.home = PathBuf::from(r#"/tmp/we"ird/$HOME/`x`/back\slash"#);
+        let rendered = openrc_script(&s);
+        assert!(
+            rendered.contains(r#"we\"ird"#),
+            "a quote must be escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains(r"\$HOME"),
+            "a dollar must be escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains(r"\`x\`"),
+            "a backtick must be escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains(r"back\\slash"),
+            "a backslash must be escaped: {rendered}"
+        );
+    }
+
+    /// fails if the service name stops matching the file name — openrc
+    /// derives defaults from `name`/`RC_SVCNAME`, and a constant `name`
+    /// would make two users on one host collide while owning distinct files.
+    #[test]
+    fn the_openrc_name_is_per_user_and_matches_the_file() {
+        let rendered = openrc_script(&spec());
+        assert!(rendered.contains(r#"name="shep-deploy""#), "{rendered}");
+        assert_eq!(
+            unit_path_for(Init::Openrc, "deploy"),
+            PathBuf::from("/etc/init.d/shep-deploy")
+        );
+    }
+
+    #[test]
+    fn the_openrc_script_is_the_same_entry_point_as_the_other_two() {
+        let rendered = openrc_script(&spec());
+        assert!(rendered.contains(r#"command_args="daemon --foreground""#));
     }
 }

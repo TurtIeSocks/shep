@@ -55,8 +55,7 @@ pub(crate) const fn unit_mode(init: Init) -> u32 {
 /// able to write a file it cannot render.
 pub(crate) const fn unbuilt_renderer(init: Init) -> Option<&'static str> {
     match init {
-        Init::Systemd | Init::Launchd => None,
-        Init::Openrc => Some("openrc"),
+        Init::Systemd | Init::Launchd | Init::Openrc => None,
         Init::FreebsdRc => Some("freebsd-rc"),
         Init::OpenbsdRc => Some("openbsd-rc"),
     }
@@ -276,10 +275,17 @@ pub(crate) fn install(
             "launchctl",
             &["bootstrap", "system", &plan.unit_path.display().to_string()],
         )),
-        // TASK-7-8 REPLACES THIS ARM: unreachable — `plan()` refuses these
-        // three inits (via `unbuilt_renderer`) before a `StartupPlan` naming
-        // one can exist, and `install` only ever receives a plan from `plan()`.
-        Init::Openrc | Init::FreebsdRc | Init::OpenbsdRc => {
+        Init::Openrc => {
+            steps.push(run_step(
+                "rc-update",
+                &["add", &unit_file_name(plan), "default"],
+            ));
+            steps.push(run_step("rc-service", &[&unit_file_name(plan), "start"]));
+        }
+        // TASK-8 REPLACES THIS ARM: unreachable — `plan()` refuses these two
+        // inits (via `unbuilt_renderer`) before a `StartupPlan` naming one
+        // can exist, and `install` only ever receives a plan from `plan()`.
+        Init::FreebsdRc | Init::OpenbsdRc => {
             steps.push(unbuilt_step("ran", plan.init));
         }
     }
@@ -368,10 +374,18 @@ pub(crate) fn remove(
             ));
             steps.push(remove_unit(plan));
         }
-        // TASK-7-8 REPLACES THIS ARM: unreachable — `plan()` refuses these
-        // three inits (via `unbuilt_renderer`) before a `StartupPlan` naming
-        // one can exist, and `remove` only ever receives a plan from `plan()`.
-        Init::Openrc | Init::FreebsdRc | Init::OpenbsdRc => {
+        Init::Openrc => {
+            steps.push(run_step("rc-service", &[&unit_file_name(plan), "stop"]));
+            steps.push(run_step(
+                "rc-update",
+                &["del", &unit_file_name(plan), "default"],
+            ));
+            steps.push(remove_unit(plan));
+        }
+        // TASK-8 REPLACES THIS ARM: unreachable — `plan()` refuses these two
+        // inits (via `unbuilt_renderer`) before a `StartupPlan` naming one
+        // can exist, and `remove` only ever receives a plan from `plan()`.
+        Init::FreebsdRc | Init::OpenbsdRc => {
             steps.push(unbuilt_step("ran", plan.init));
         }
     }
@@ -392,11 +406,12 @@ fn write_unit(plan: &StartupPlan) -> StartupStep {
     let rendered = match plan.init {
         Init::Systemd => unit::systemd_unit(&plan.spec),
         Init::Launchd => unit::launchd_plist(&plan.spec),
-        // TASK-7-8 REPLACES THIS ARM: unreachable — `plan()` refuses these
-        // three inits (via `unbuilt_renderer`) before a `StartupPlan` naming
-        // one can exist, and `write_unit` only ever receives a plan from
+        Init::Openrc => unit::openrc_script(&plan.spec),
+        // TASK-8 REPLACES THIS ARM: unreachable — `plan()` refuses these two
+        // inits (via `unbuilt_renderer`) before a `StartupPlan` naming one
+        // can exist, and `write_unit` only ever receives a plan from
         // `plan()`.
-        Init::Openrc | Init::FreebsdRc | Init::OpenbsdRc => String::new(),
+        Init::FreebsdRc | Init::OpenbsdRc => String::new(),
     };
     let mode = unit_mode(plan.init);
     let written = std::fs::OpenOptions::new()
@@ -1202,7 +1217,7 @@ mod tests {
     fn only_the_unbuilt_renderers_are_refused() {
         assert_eq!(unbuilt_renderer(Init::Systemd), None);
         assert_eq!(unbuilt_renderer(Init::Launchd), None);
-        assert!(unbuilt_renderer(Init::Openrc).is_some());
+        assert_eq!(unbuilt_renderer(Init::Openrc), None);
         assert!(unbuilt_renderer(Init::FreebsdRc).is_some());
         assert!(unbuilt_renderer(Init::OpenbsdRc).is_some());
     }
