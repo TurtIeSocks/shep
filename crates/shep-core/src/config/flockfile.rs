@@ -198,10 +198,13 @@ pub fn discover(dir: &Path) -> Option<PathBuf> {
 
 /// Error type returned from [`Flockfile::parse`]
 ///
-/// `#[non_exhaustive]`: a fifth backend is the named next step for this type
-/// — `deferred.md` lists `.js` Flockfiles — and it brings its own rejection
-/// reason with it, which must not be a breaking change for a consumer
-/// matching on this enum (IR-20).
+/// `#[non_exhaustive]`: shep-core is a library crate, so an out-of-tree
+/// consumer can match this exhaustively and a new variant would break them
+/// with no version bump to say so (IR-20). Growth is anticipated per
+/// backend, not per format: `.js` Flockfiles do NOT appear here, because
+/// shep-core never executes anything — the node bridge lives in shep-cli
+/// (`commands::lifecycle`) and feeds its output back through
+/// [`FlockFormat::Json`], which is what this module's own doc promises.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlockfileError {
@@ -332,6 +335,24 @@ args = ["job.py"]
             discover(dir.path()),
             Some(dir.path().join("Flockfile.toml"))
         );
+    }
+
+    /// fails if a `.js` name is ever added to the discovery order. Rin's
+    /// ruling, 2026-08-15: a `.js` Flockfile is read only when named
+    /// explicitly on the command line, because reading one runs node on it,
+    /// and `cd` into a cloned repo followed by `shep start` must not execute
+    /// a stranger's JavaScript. Discovery is the path with no operator in
+    /// the loop, so it is the path that must never reach node.
+    #[test]
+    fn discovery_never_names_a_js_file_and_stays_ten_names() {
+        assert_eq!(DISCOVERY_ORDER.len(), 10);
+        for name in DISCOVERY_ORDER {
+            assert!(
+                !name.ends_with(".js"),
+                "{name} would let `shep start` execute a repo's JavaScript"
+            );
+            assert!(FlockFormat::from_path(Path::new(name)).is_some());
+        }
     }
 
     #[test]

@@ -334,6 +334,15 @@ pub struct StartArgs {
     /// Fold to place this sheep in
     #[arg(long)]
     pub fold: Option<String>,
+    /// Read TARGET as a Flockfile rather than as a script path.
+    ///
+    /// Required for a `.js` Flockfile and the only way to reach one: shep
+    /// reads a `.js` config by running it through node, which is arbitrary
+    /// code execution, so it never happens because a file merely has that
+    /// extension. Without this flag `shep start server.js` starts
+    /// `server.js` as a script, which is what it has always meant.
+    #[arg(long)]
+    pub flockfile: bool,
 }
 
 /// Arguments shared by every verb that targets an existing selection of the
@@ -680,6 +689,20 @@ mod tests {
     fn the_command_tree_parses_and_is_internally_consistent() {
         use clap::CommandFactory;
         Cli::command().debug_assert(); // clap's own structural self-check
+    }
+
+    #[test]
+    fn start_takes_a_flockfile_flag_and_defaults_it_off() {
+        use clap::Parser;
+        let plain = Cli::try_parse_from(["shep", "start", "srv.js"]).unwrap();
+        let flagged = Cli::try_parse_from(["shep", "start", "srv.js", "--flockfile"]).unwrap();
+        match (plain.command, flagged.command) {
+            (Commands::Start(a), Commands::Start(b)) => {
+                assert!(!a.flockfile, "absent means script form");
+                assert!(b.flockfile);
+            }
+            other => panic!("expected two Start commands, got {other:?}"),
+        }
     }
 
     #[test]
