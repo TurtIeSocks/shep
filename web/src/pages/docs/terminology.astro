@@ -1,0 +1,272 @@
+---
+/*
+ * Terminology (docs/shep-design/README.md, "Screens > 2. Docs >
+ * Terminology"). The lexicon table is DATA from web/src/data/docsLexicon.ts
+ * (parsed from README.md's own lexicon table at build time — see that
+ * file's header comment for why README.md rather than docs/terminology.md).
+ * The usage-rule cards are DATA from web/src/data/docsRules.ts.
+ */
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import { lexiconTable, mdInlineToHtml } from "../../data/docsLexicon";
+import { usageRules } from "../../data/docsRules";
+
+const toneFor = (built: "yes" | "partly" | "no") =>
+  built === "yes"
+    ? "var(--meadow)"
+    : built === "partly"
+      ? "var(--butter)"
+      : "var(--bark)";
+---
+
+<DocsLayout
+  title="Terminology"
+  description="The full shep lexicon: what each themed word means, where you meet it, and whether it's built yet."
+  crumb="Concepts / Terminology"
+  activeSlug="terminology"
+>
+  <article>
+    <h1>Terminology</h1>
+    <p class="lede">
+      The vocabulary is not decoration. A process manager gives you a lot of
+      nouns to keep straight, and sheep are a better mnemonic than "target
+      group" or "managed unit".
+    </p>
+    <p class="lede lede-last">
+      Where the joke would cost clarity it gets dropped: <code>kill</code> is
+      called kill, error messages are written in plain technical English,
+      and every themed verb has a straight alias that works forever.
+    </p>
+
+    <h2>The lexicon</h2>
+    <div class="lexicon-table">
+      <div class="row header">
+        <span class="col-term">shep says</span>
+        <span class="col-means">means</span>
+        <span class="col-where">where you meet it</span>
+        <span class="col-built">built</span>
+      </div>
+      {
+        lexiconTable.map((row) => (
+          <div class="row">
+            <span class="col-term term">{row.term}</span>
+            <span class="col-means" set:html={mdInlineToHtml(row.means)} />
+            <span class="col-where" set:html={mdInlineToHtml(row.where)} />
+            <span class="col-built" style={`color:${toneFor(row.built)}`}>
+              {row.built}
+            </span>
+          </div>
+        ))
+      }
+    </div>
+
+    <div class="sheepdogs-card">
+      <h3>Sheepdogs and sheep were separate ideas from the start</h3>
+      <p>
+        So "dog" never means the daemon. The shepherd is the shepherd. Dogs
+        are plugins that work for it — <code>metrics</code> and
+        <code>bark</code> ship inside the binary, and
+        <code>shep adopt</code> runs anyone else's.
+      </p>
+    </div>
+
+    <h2>Usage rules</h2>
+    <p class="rules-lede">Readability beats theme, every time.</p>
+    <div class="rules">
+      {
+        usageRules.map((rule, i) => (
+          <div class="rule">
+            <span class="n">{i + 1}</span>
+            <div>
+              <div class="rule-title">{rule.title}</div>
+              <p>{rule.body}</p>
+            </div>
+          </div>
+        ))
+      }
+    </div>
+  </article>
+</DocsLayout>
+
+<style>
+  h1 {
+    font-size: clamp(36px, 4.6vw, 56px);
+    line-height: 1;
+    letter-spacing: -0.04em;
+    margin: 0 0 18px;
+  }
+
+  h2 {
+    font-size: 29px;
+    letter-spacing: -0.03em;
+    margin: 40px 0 18px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  .lede {
+    font-size: 19px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    margin: 0 0 22px;
+    text-wrap: pretty;
+  }
+
+  .lede-last {
+    margin-bottom: 34px;
+  }
+
+  .lexicon-table {
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    overflow: hidden;
+    margin: 0 0 40px;
+  }
+
+  .row {
+    display: grid;
+    grid-template-columns: 150px minmax(0, 1.1fr) minmax(0, 1.1fr) 74px;
+    gap: 14px;
+    padding: 14px 20px;
+    align-items: start;
+  }
+
+  .row.header {
+    padding: 13px 20px;
+    background: var(--ink);
+  }
+
+  .row:not(.header) {
+    border-bottom: 2px solid var(--hair);
+    background: var(--paper-2);
+  }
+
+  .row:last-child {
+    border-bottom: none;
+  }
+
+  .row.header span {
+    font-family: "Space Mono", monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  .row.header .col-term {
+    color: var(--butter);
+  }
+
+  .row.header .col-built {
+    text-align: right;
+  }
+
+  .term {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 15.5px;
+    color: var(--meadow);
+    line-height: 1.3;
+  }
+
+  .col-means {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink);
+  }
+
+  .col-where {
+    font-family: "Space Mono", monospace;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+
+  .row:not(.header) .col-built {
+    font-family: "Space Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    text-align: right;
+  }
+
+  @media (max-width: 640px) {
+    .row {
+      grid-template-columns: 1fr;
+      gap: 6px;
+    }
+
+    .row.header {
+      display: none;
+    }
+
+    .col-built {
+      text-align: left !important;
+    }
+  }
+
+  .sheepdogs-card {
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    padding: 24px 26px;
+    margin: 0 0 40px;
+  }
+
+  .sheepdogs-card h3 {
+    font-size: 20px;
+    margin: 0 0 10px;
+  }
+
+  .sheepdogs-card p {
+    margin: 0;
+    font-size: 15.5px;
+    line-height: 1.6;
+    color: var(--ink-2);
+  }
+
+  .rules-lede {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 22px;
+  }
+
+  .rules {
+    display: grid;
+    gap: 14px;
+  }
+
+  .rule {
+    display: grid;
+    grid-template-columns: 38px minmax(0, 1fr);
+    gap: 16px;
+    align-items: start;
+    background: var(--paper-2);
+    border: 2.5px solid var(--hair);
+    border-radius: 16px;
+    padding: 20px;
+  }
+
+  .rule .n {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 20px;
+    color: var(--bark);
+  }
+
+  .rule-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 6px;
+  }
+
+  .rule p {
+    margin: 0;
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink-2);
+  }
+</style>

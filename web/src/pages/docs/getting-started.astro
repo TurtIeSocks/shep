@@ -1,0 +1,324 @@
+---
+/*
+ * Getting started (docs/shep-design/README.md, "Screens > 2. Docs >
+ * Getting started"). Copy and command output checked against README.md —
+ * the source of truth for anything that could drift (build steps, the
+ * Flockfile shape, shep ls output, the JSON envelope).
+ */
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import Callout from "../../components/docs/Callout.astro";
+---
+
+<DocsLayout
+  title="Getting started"
+  description="From a clone to a running flock: build shep, write a Flockfile, and start it."
+  crumb="Start here / Getting started"
+  activeSlug="getting-started"
+>
+  <article>
+    <h1>Getting started</h1>
+    <p class="lede">
+      shep is one binary. Running it starts a daemon called the shepherd,
+      which keeps a flock of your long-running processes alive. This page
+      takes you from a clone to a running flock.
+    </p>
+
+    <Callout variant="careful">
+      There is no install script and no crates.io release yet. Building from
+      source is the only path, and only macOS and Linux work. On Windows
+      every command prints <code>shep does not yet support Windows</code>
+      and exits 1.
+    </Callout>
+
+    <h2>1. Build it</h2>
+    <p>Rust 1.88 or newer, edition 2024.</p>
+    <div class="terminal">
+      <div><span class="prompt">$</span> git clone https://github.com/TurtIeSocks/shep.git</div>
+      <div><span class="prompt">$</span> cd shep</div>
+      <div><span class="prompt">$</span> cargo build --release</div>
+      <div><span class="prompt">$</span> ./target/release/shep --help</div>
+    </div>
+    <p class="fine">
+      Put <code>target/release/shep</code> on your PATH, or keep typing the
+      full path — everything below works either way.
+    </p>
+
+    <h2>2. Write a Flockfile</h2>
+    <p>
+      Two fields is a complete one. <code>Flockfile.toml</code>,
+      <code>.yaml</code>, <code>.json</code> and <code>.json5</code> all
+      work, discovered by searching ten filenames in a fixed order.
+    </p>
+    <div class="file-panel">
+      <div class="file-name">Flockfile.toml</div>
+      <div class="file-body">
+        <div class="bark-line">[[app]]</div>
+        <div>name&nbsp;&nbsp;&nbsp;= <span class="str">"web"</span></div>
+        <div>script = <span class="str">"./server"</span></div>
+      </div>
+    </div>
+    <Callout variant="note">
+      Unknown fields are a parse error, not a shrug — a typo tells you at
+      load instead of at 3am. Durations and sizes are strict on purpose:
+      <code>512M</code> and <code>30s</code> parse; <code>512MB</code>,
+      <code>1.5G</code> and <code>30S</code> do not.
+    </Callout>
+
+    <h2>3. Start the flock</h2>
+    <p>
+      You never launch the daemon yourself. <code>shep start</code> notices
+      nothing is listening and re-execs itself in the background.
+    </p>
+    <div class="terminal">
+      <div><span class="prompt">$</span> shep start Flockfile.toml</div>
+      <div><span class="prompt">$</span> shep ls</div>
+      <div class="muted">ID  NAME    STATUS  PID   RESTARTS  CPU    MEM    UPTIME  FOLD</div>
+      <div>1&nbsp;&nbsp;&nbsp;web&nbsp;&nbsp;&nbsp;&nbsp;<span class="ok">online</span>&nbsp;&nbsp;1001&nbsp;&nbsp;1&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;12.5%&nbsp;&nbsp;48.1M&nbsp;&nbsp;1m&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;backend</div>
+      <div>2&nbsp;&nbsp;&nbsp;worker&nbsp;<span class="ok">online</span>&nbsp;&nbsp;1002&nbsp;&nbsp;2&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;12.5%&nbsp;&nbsp;48.1M&nbsp;&nbsp;2m&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;backend</div>
+      <div>3&nbsp;&nbsp;&nbsp;cron&nbsp;&nbsp;&nbsp;&nbsp;<span class="ok">online</span>&nbsp;&nbsp;1003&nbsp;&nbsp;3&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="muted">-</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;48.1M&nbsp;&nbsp;30s&nbsp;&nbsp;&nbsp;&nbsp;backend</div>
+    </div>
+    <p class="fine">
+      The CPU column prints <code>-</code> rather than <code>0.0%</code> when
+      a reading is unavailable, because a confident zero is worse than an
+      obvious blank.
+    </p>
+
+    <h2>4. Watch what it prints</h2>
+    <p>
+      <code>shep bleats</code> follows the logs; <code>--no-follow</code>
+      prints the tail and exits. If you prefer the boring word,
+      <code>shep logs</code> is the same command and always will be.
+    </p>
+    <div class="alias-grid">
+      <div class="alias-card">
+        <div class="themed">shep bleats</div>
+        <div class="plain">same as shep logs</div>
+      </div>
+      <div class="alias-card">
+        <div class="themed">shep flock</div>
+        <div class="plain">same as shep list / ls</div>
+      </div>
+      <div class="alias-card">
+        <div class="themed">shep muster</div>
+        <div class="plain">same as resurrect</div>
+      </div>
+      <div class="alias-card">
+        <div class="themed">shep thatlldo</div>
+        <div class="plain">same as graceful stop</div>
+      </div>
+    </div>
+
+    <h2>5. Pipe it somewhere</h2>
+    <p>
+      Every command renders as <code>--format json</code> too, under a
+      versioned envelope, so nothing has to scrape columns.
+    </p>
+    <div class="terminal json">{"\n"}  <span class="key">"schema_version"</span>: <span class="num">1</span>,{"\n"}  <span class="key">"command"</span>: <span class="s">"flock"</span>,{"\n"}  <span class="key">"data"</span>: [{"\n"}    {"{ "}<span class="key">"id"</span>: <span class="num">1</span>, <span class="key">"name"</span>: <span class="s">"web"</span>, <span class="key">"status"</span>: <span class="s">"online"</span>, <span class="key">"pid"</span>: <span class="num">1001</span>,{"\n"}      <span class="key">"restarts"</span>: <span class="num">1</span>, <span class="key">"uptime_ms"</span>: <span class="num">60000</span>, <span class="key">"fold"</span>: <span class="s">"backend"</span>,{"\n"}      <span class="key">"cpu_percent"</span>: <span class="num">12.5</span>, <span class="key">"memory_bytes"</span>: <span class="num">50462720</span>, <span class="key">"dog"</span>: <span class="nul">null</span> {"}"}{"\n"}  ]{"\n"}{"}"}</div>
+
+    <h2>Where to go next</h2>
+    <div class="next-grid">
+      <a href="/docs/terminology" class="next-card">
+        <div class="next-title">Terminology →</div>
+        <div class="next-body">
+          Fifteen words carry the whole product. Learn them once and the CLI
+          explains itself.
+        </div>
+      </a>
+      <a href="/docs/from-pm2" class="next-card">
+        <div class="next-title">Coming from pm2 →</div>
+        <div class="next-body">
+          Turn a real dump.pm2 into a Flockfile, and see what cluster mode
+          costs on the way.
+        </div>
+      </a>
+      <a href="/docs/dogs" class="next-card">
+        <div class="next-title">Dogs →</div>
+        <div class="next-body">
+          Turn on Prometheus metrics and webhook alerts, or adopt a binary of
+          your own.
+        </div>
+      </a>
+    </div>
+  </article>
+</DocsLayout>
+
+<style>
+  h1 {
+    font-size: clamp(36px, 4.6vw, 56px);
+    line-height: 1;
+    letter-spacing: -0.04em;
+    margin: 0 0 18px;
+  }
+
+  h2 {
+    font-size: 29px;
+    letter-spacing: -0.03em;
+    margin: 40px 0 8px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  .lede {
+    font-size: 19px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  .fine {
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink-3);
+    margin: 0 0 40px;
+  }
+
+  .terminal {
+    background: var(--illus-terminal-bg);
+    border: 3px solid var(--line);
+    border-radius: 16px;
+    padding: 20px 22px;
+    font-family: "Space Mono", monospace;
+    font-size: 13.5px;
+    line-height: 1.9;
+    color: var(--illus-terminal-text);
+    overflow-x: auto;
+    white-space: pre;
+    margin: 0 0 12px;
+  }
+
+  .terminal.json {
+    font-size: 13px;
+    line-height: 1.85;
+    margin: 0 0 40px;
+  }
+
+  .terminal .prompt,
+  .terminal .ok {
+    color: var(--grass);
+  }
+
+  .terminal .muted {
+    color: var(--illus-terminal-muted);
+  }
+
+  .terminal .key {
+    color: var(--sky);
+  }
+
+  .terminal .num,
+  .terminal .s {
+    color: var(--grass);
+  }
+
+  .terminal .nul {
+    color: var(--bark);
+  }
+
+  .file-panel {
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 16px;
+    overflow: hidden;
+    margin: 0 0 18px;
+  }
+
+  .file-name {
+    padding: 12px 18px;
+    border-bottom: 2px solid var(--hair);
+    font-family: "Space Mono", monospace;
+    font-size: 12.5px;
+    font-weight: 700;
+  }
+
+  .file-body {
+    padding: 20px 22px;
+    font-family: "Space Mono", monospace;
+    font-size: 13.5px;
+    line-height: 1.9;
+    color: var(--ink-2);
+    overflow-x: auto;
+  }
+
+  .file-body .bark-line {
+    color: var(--bark);
+  }
+
+  .file-body .str {
+    color: var(--meadow);
+  }
+
+  .alias-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 14px;
+    margin: 0 0 40px;
+  }
+
+  .alias-card {
+    background: var(--paper-2);
+    border: 2.5px solid var(--hair);
+    border-radius: 14px;
+    padding: 14px 16px;
+  }
+
+  .alias-card .themed {
+    font-family: "Space Mono", monospace;
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--meadow);
+  }
+
+  .alias-card .plain {
+    font-family: "Space Mono", monospace;
+    font-size: 12.5px;
+    color: var(--ink-3);
+    margin-top: 5px;
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+</style>

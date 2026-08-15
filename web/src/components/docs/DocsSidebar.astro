@@ -1,0 +1,135 @@
+---
+/*
+ * Docs sidebar (docs/shep-design/README.md, "Screens > 2. Docs > Sidebar").
+ * Three groups from web/src/data/docsNav.ts. Active item: butter fill, ink
+ * text, 700 weight, 2px ink border. Inactive: transparent, --ink-2, 400.
+ * Unbuilt items carry a "soon" tag in bark on the right.
+ */
+import { docsNav } from "../../data/docsNav";
+
+interface Props {
+  activeSlug: string;
+}
+
+const { activeSlug } = Astro.props;
+---
+
+<aside class="docs-sidebar">
+  {
+    docsNav.map((group) => (
+      <div class="group">
+        <div class="group-label">{group.label}</div>
+        <div class="items">
+          {group.items.map((item) => {
+            const active = item.slug === activeSlug;
+            return (
+              <a
+                href={`/docs/${item.slug}`}
+                class:list={["item", active && "active"]}
+              >
+                <span>{item.label}</span>
+                {!item.built && <span class="tag">soon</span>}
+              </a>
+            );
+          })}
+        </div>
+      </div>
+    ))
+  }
+  <div class="footnote">
+    Docs track the repo. Anything marked <span class="mono">soon</span> exists
+    in <span class="mono">/docs</span> but hasn't been brought over yet.
+  </div>
+</aside>
+
+<style>
+  .docs-sidebar {
+    position: sticky;
+    top: 64px;
+    padding: 34px 24px 60px;
+    border-right: 3px solid var(--line);
+    min-height: calc(100vh - 64px);
+  }
+
+  .group {
+    margin-bottom: 28px;
+  }
+
+  .group-label {
+    font-family: "Space Mono", monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin-bottom: 12px;
+  }
+
+  .items {
+    display: grid;
+    gap: 3px;
+  }
+
+  .item {
+    font-family: "Space Grotesk", sans-serif;
+    font-weight: 400;
+    font-size: 14.5px;
+    text-align: left;
+    background: transparent;
+    color: var(--ink-2);
+    border: 2px solid transparent;
+    border-radius: 10px;
+    padding: 8px 11px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    text-decoration: none;
+  }
+
+  .item:hover {
+    border-color: var(--hair);
+    color: var(--ink-2);
+  }
+
+  .item.active {
+    font-weight: 700;
+    background: var(--butter);
+    color: var(--ink);
+    border-color: var(--line);
+  }
+
+  .item.active:hover {
+    color: var(--ink);
+  }
+
+  .tag {
+    font-family: "Space Mono", monospace;
+    font-size: 9.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--bark);
+  }
+
+  .footnote {
+    border-top: 2px solid var(--hair);
+    padding-top: 18px;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--ink-3);
+  }
+
+  .mono {
+    font-family: "Space Mono", monospace;
+  }
+
+  @media (max-width: 860px) {
+    .docs-sidebar {
+      position: static;
+      min-height: 0;
+      border-right: none;
+      border-bottom: 3px solid var(--line);
+      padding: 22px 20px 26px;
+    }
+  }
+</style>

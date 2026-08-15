@@ -1,0 +1,130 @@
+---
+/*
+ * Docs sticky header (docs/shep-design/README.md, "Screens > 2. Docs >
+ * Header"). Logo lockup back to the landing page, a "docs · pre-release"
+ * pill, Home / Design language text links, the icon theme toggle, and an
+ * ink GitHub button with a meadow shadow.
+ */
+import Sheep from "../marks/Sheep.astro";
+import ThemeToggle from "../ThemeToggle.astro";
+---
+
+<header class="docs-header">
+  <div class="bar">
+    <div class="lockup">
+      <a href="/" class="logo">
+        <Sheep width={40} />
+        <span class="wordmark">shep</span>
+      </a>
+      <span class="pill">docs · pre-release</span>
+    </div>
+    <div class="links">
+      <a href="/" class="text-link">Home</a>
+      <a href="/design-language" class="text-link">Design language</a>
+      <ThemeToggle variant="icon" />
+      <a
+        href="https://github.com/TurtIeSocks/shep"
+        class="gh press"
+        style="--shadow-offset:3px; --shadow-color:var(--meadow); --press-offset:1px;"
+      >
+        GitHub
+      </a>
+    </div>
+  </div>
+</header>
+
+<style>
+  .docs-header {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: var(--paper);
+    border-bottom: 3px solid var(--line);
+  }
+
+  .bar {
+    max-width: 1340px;
+    margin: 0 auto;
+    padding: 13px 26px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+  }
+
+  .lockup {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    min-width: 0;
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    text-decoration: none;
+    color: var(--ink);
+    flex: none;
+  }
+
+  .wordmark {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 22px;
+    letter-spacing: -0.04em;
+  }
+
+  .pill {
+    font-family: "Space Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    background: var(--paper-2);
+    border: 2px solid var(--line);
+    border-radius: 999px;
+    padding: 5px 11px;
+    color: var(--ink-2);
+    white-space: nowrap;
+  }
+
+  .links {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    font-size: 14.5px;
+    font-weight: 500;
+  }
+
+  .text-link {
+    color: var(--ink-2);
+    text-decoration: none;
+  }
+
+  .text-link:hover {
+    color: var(--bark);
+  }
+
+  .gh {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 14.5px;
+    background: var(--ink);
+    color: var(--paper);
+    border: 2.5px solid var(--line);
+    border-radius: 11px;
+    padding: 10px 16px;
+    text-decoration: none;
+  }
+
+  .gh:hover {
+    color: var(--paper);
+  }
+
+  @media (max-width: 720px) {
+    .pill,
+    .text-link {
+      display: none;
+    }
+  }
+</style>

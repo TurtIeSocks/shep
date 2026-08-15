@@ -8,11 +8,17 @@
  * remains (handoff rule, also stated in the design-language "Do" panel).
  * Only the lead sheep in a group chews; give any two bobbing sheep different
  * durations and offset delays so they don't read as a loading spinner.
+ *
+ * `sleeping` swaps the pupil for a closed-eye line (docs stub template —
+ * docs/shep-design/README.md, "Screens > 2. Docs > Stub pages"). Mutually
+ * exclusive with `chewing` in practice — a sleeping sheep doesn't chew —
+ * so `sleeping` wins if both are set.
  */
 interface Props {
   width: number;
   legs?: boolean;
   chewing?: boolean;
+  sleeping?: boolean;
   bob?: boolean;
   bobDuration?: string;
   bobDelay?: string;
@@ -23,6 +29,7 @@ const {
   width,
   legs = width >= 32,
   chewing = false,
+  sleeping = false,
   bob = false,
   bobDuration = "5.6s",
   bobDelay = "0s",
@@ -58,7 +65,10 @@ const wrapperStyle = [
       stroke-width="4"
       stroke-linejoin="round"
     />
-    <g class:list={[chewing && "anim-chew"]} style="--chew-origin:34px 40px;">
+    <g
+      class:list={[!sleeping && chewing && "anim-chew"]}
+      style="--chew-origin:34px 40px;"
+    >
       <ellipse
         cx="26"
         cy="34"
@@ -68,8 +78,24 @@ const wrapperStyle = [
         fill="var(--ink)"
       />
       <ellipse cx="27" cy="48" rx="15" ry="14" fill="var(--ink)" />
-      <circle cx="22" cy="45" r="3" fill="var(--fleece)" />
-      <circle cx="21.4" cy="45.6" r="1.4" fill="var(--ink)" />
+      {
+        sleeping ? (
+          <>
+            <circle cx="20" cy="45" r="3" fill="var(--fleece)" />
+            <path
+              d="M17 44h6"
+              stroke="var(--ink)"
+              stroke-width="2"
+              stroke-linecap="round"
+            />
+          </>
+        ) : (
+          <>
+            <circle cx="22" cy="45" r="3" fill="var(--fleece)" />
+            <circle cx="21.4" cy="45.6" r="1.4" fill="var(--ink)" />
+          </>
+        )
+      }
     </g>
   </svg>
 </div>

@@ -1,0 +1,31 @@
+---
+/*
+ * /docs itself. Getting started is the default page (docs/shep-design/
+ * README.md's prototype default `state.page = "start"`), and #terminology
+ * must keep working as a redirect — the handoff calls this out explicitly
+ * since the prototype only had client-side page state, no real routes.
+ * A tiny inline script picks the target before paint; no client JS
+ * framework needed for one redirect.
+ */
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="refresh" content="0; url=/docs/getting-started" />
+    <script is:inline>
+      document.location.replace(
+        location.hash === "#terminology"
+          ? "/docs/terminology"
+          : "/docs/getting-started",
+      );
+    </script>
+    <title>shep docs</title>
+  </head>
+  <body>
+    <p>
+      Redirecting to <a href="/docs/getting-started">the docs</a>…
+    </p>
+  </body>
+</html>
