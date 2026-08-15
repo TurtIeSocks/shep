@@ -4,6 +4,24 @@
  * Three groups from web/src/data/docsNav.ts. Active item: butter fill, ink
  * text, 700 weight, 2px ink border. Inactive: transparent, --ink-2, 400.
  * Unbuilt items carry a "soon" tag in bark on the right.
+ *
+ * Mobile (below 860px, the width DocsLayout.astro collapses the sidebar
+ * column at): the handoff calls a fixed 264px column beside an 860px
+ * article the biggest unsolved gap and asks for "a collapsible docs
+ * sidebar" as one real option. This is that — a native <details>/<summary>
+ * disclosure, collapsed by default so a phone visitor sees the article
+ * almost immediately instead of scrolling past ten nav links first, with a
+ * "Menu" bar that expands the same three groups in place.
+ *
+ * No client JS: <details> is natively keyboard- and screen-reader-operable
+ * as a disclosure widget, so this needs no toggle script and keeps working
+ * with JS disabled. Desktop forces the content permanently open with one
+ * CSS rule (`.sidebar-content { display: block }` at >=861px) rather than
+ * shipping two copies of the nav — that rule wins over the browser's own
+ * `details:not([open]) > *:not(summary){display:none}` default because
+ * author-origin rules beat user-agent-origin rules of equal importance
+ * regardless of selector specificity, so it holds even though the `<details>`
+ * carries no `open` attribute.
  */
 import { docsNav } from "../../data/docsNav";
 
@@ -14,33 +32,42 @@ interface Props {
 const { activeSlug } = Astro.props;
 ---
 
-<aside class="docs-sidebar">
-  {
-    docsNav.map((group) => (
-      <div class="group">
-        <div class="group-label">{group.label}</div>
-        <div class="items">
-          {group.items.map((item) => {
-            const active = item.slug === activeSlug;
-            return (
-              <a
-                href={`/docs/${item.slug}`}
-                class:list={["item", active && "active"]}
-              >
-                <span>{item.label}</span>
-                {!item.built && <span class="tag">soon</span>}
-              </a>
-            );
-          })}
+<details class="docs-sidebar">
+  <summary class="menu-toggle">
+    <span>Menu</span>
+    <svg class="chevron" width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
+      <path d="M2 4.5 7 9.5 12 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+  </summary>
+  <div class="sidebar-content">
+    {
+      docsNav.map((group) => (
+        <div class="group">
+          <div class="group-label">{group.label}</div>
+          <div class="items">
+            {group.items.map((item) => {
+              const active = item.slug === activeSlug;
+              return (
+                <a
+                  href={`/docs/${item.slug}`}
+                  class:list={["item", active && "active"]}
+                >
+                  <span>{item.label}</span>
+                  {!item.built && <span class="tag">soon</span>}
+                </a>
+              );
+            })}
+          </div>
         </div>
-      </div>
-    ))
-  }
-  <div class="footnote">
-    Docs track the repo. Anything marked <span class="mono">soon</span> exists
-    in <span class="mono">/docs</span> but hasn't been brought over yet.
+      ))
+    }
+    <div class="footnote">
+      Docs track the repo. Anything marked <span class="mono">soon</span>{" "}
+      exists in <span class="mono">/docs</span> but hasn't been brought over
+      yet.
+    </div>
   </div>
-</aside>
+</details>
 
 <style>
   .docs-sidebar {
@@ -49,6 +76,10 @@ const { activeSlug } = Astro.props;
     padding: 34px 24px 60px;
     border-right: 3px solid var(--line);
     min-height: calc(100vh - 64px);
+  }
+
+  .menu-toggle {
+    display: none;
   }
 
   .group {
@@ -123,13 +154,58 @@ const { activeSlug } = Astro.props;
     font-family: "Space Mono", monospace;
   }
 
+  /* Desktop: ignore the <details> open/closed state entirely and always
+     show the nav — see the component doc comment for why this plain
+     selector is enough to beat the browser's own hiding rule. */
+  @media (min-width: 861px) {
+    .sidebar-content {
+      display: block;
+    }
+  }
+
   @media (max-width: 860px) {
     .docs-sidebar {
       position: static;
       min-height: 0;
       border-right: none;
       border-bottom: 3px solid var(--line);
-      padding: 22px 20px 26px;
+      padding: 0;
+    }
+
+    /* Kill the default disclosure triangle so .chevron is the only marker. */
+    .docs-sidebar summary {
+      list-style: none;
+    }
+
+    .docs-sidebar summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .menu-toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 16px 20px;
+      font-family: "Bricolage Grotesque", sans-serif;
+      font-weight: 800;
+      font-size: 15px;
+      cursor: pointer;
+    }
+
+    .chevron {
+      color: var(--ink-3);
+      transition: transform 0.15s ease;
+      flex: none;
+    }
+
+    .docs-sidebar[open] .chevron {
+      transform: rotate(180deg);
+    }
+
+    .sidebar-content {
+      padding: 4px 20px 24px;
+      border-top: 2px solid var(--hair);
     }
   }
 </style>
