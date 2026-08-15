@@ -16,13 +16,19 @@
  * confirmed shipped in deferred.md's "Not deferred" section as of the
  * 2026-08-12 audit. Re-check this array against deferred.md whenever a
  * phase ships.
+ *
+ * Phase 12a (merged after that audit) shipped lookout's shell and its
+ * flock table pane, so the flat "the lookout TUI" entry this list used to
+ * carry is now false — deferred.md's own "lookout's other three panes"
+ * section says plainly that the shell and flock table exist. Narrowed to
+ * name only what is still missing, matching that section's own wording.
  */
 // `?raw` (see lexicon.ts's header comment for why, not node:fs +
 // import.meta.url) inlines the file's text content at build time.
 import deferredSource from "../../../docs/specs/deferred.md?raw";
 
 export const notBuiltYet: string[] = [
-  "the lookout TUI",
+  "lookout's bleats feed, sheep pane, host strip",
   "the whistle MCP server",
   "shep serve",
   "shep dev",
