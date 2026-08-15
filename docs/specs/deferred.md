@@ -438,7 +438,7 @@ and there is no `--allow-control` CLI flag on `shep whistle` at all.
 What §8/§13 name beyond this and remain open: HTTP/SSE transport (above,
 under "Committed to v1.1+ by design"), and MCP resources, prompts, sampling,
 completions, subscriptions and tasks — `get_info` advertises tools only.
-Five verbs an operator can run today have deliberately no tool at all:
+Six verbs an operator can run today have deliberately no tool at all:
 `delete_sheep` and `flush` are irreversible in a way the four control tools
 are not; `kill` takes the shepherd itself down, and whistle's own connection
 with it; `signal_sheep` and `whisper` take free-form input whose blast
