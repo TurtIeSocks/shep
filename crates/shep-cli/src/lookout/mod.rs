@@ -347,6 +347,10 @@ where
                 let _ = polls.try_send(());
                 dirty = true;
             }
+            // Task 6 replaces this with the read. Until then the reducer's
+            // request is honoured by redrawing and nothing else — which is
+            // correct, because there is no feed on screen yet to refresh.
+            Effect::RefreshFeed => dirty = true,
             Effect::None => dirty = true,
         }
     }

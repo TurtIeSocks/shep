@@ -15,4 +15,4 @@ ID    NAME      STATUS           CPU     UPTIME
                                                  
                                                  
                                                  
-q quit   j/k scroll   g/G top/bottom  … read-only
+q quit   j/k select   g/G first/last  … read-only

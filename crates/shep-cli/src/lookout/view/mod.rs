@@ -84,7 +84,7 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
         let line = Line::from(Span::styled("the flock is empty", palette.muted()));
         buffer.set_line(area.x, y, &line, width);
     } else {
-        let offset = flock::scroll_offset(app.scroll(), viewport, rows.len());
+        let offset = flock::scroll_offset(app.selected_index().unwrap_or(0), viewport, rows.len());
         for (slot, row) in rows.iter().skip(offset).take(viewport).enumerate() {
             let line = flock::row_line(app, row, columns, width);
             let slot = u16::try_from(slot).unwrap_or(0);

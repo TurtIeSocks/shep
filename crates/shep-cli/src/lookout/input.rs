@@ -38,10 +38,10 @@ pub fn map_key(event: &Event) -> Option<KeyPress> {
     }
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => Some(KeyPress::Quit),
-        KeyCode::Char('j') | KeyCode::Down => Some(KeyPress::ScrollDown),
-        KeyCode::Char('k') | KeyCode::Up => Some(KeyPress::ScrollUp),
-        KeyCode::Char('g') | KeyCode::Home => Some(KeyPress::ScrollTop),
-        KeyCode::Char('G') | KeyCode::End => Some(KeyPress::ScrollBottom),
+        KeyCode::Char('j') | KeyCode::Down => Some(KeyPress::SelectDown),
+        KeyCode::Char('k') | KeyCode::Up => Some(KeyPress::SelectUp),
+        KeyCode::Char('g') | KeyCode::Home => Some(KeyPress::SelectFirst),
+        KeyCode::Char('G') | KeyCode::End => Some(KeyPress::SelectLast),
         KeyCode::Char('r') => Some(KeyPress::Refresh),
         KeyCode::Char('x') => Some(KeyPress::Stop),
         _ => None,
@@ -67,19 +67,48 @@ mod tests {
         assert_eq!(map_key(&key(KeyCode::Esc)), Some(KeyPress::Quit));
         assert_eq!(
             map_key(&key(KeyCode::Char('j'))),
-            Some(KeyPress::ScrollDown)
+            Some(KeyPress::SelectDown)
         );
-        assert_eq!(map_key(&key(KeyCode::Down)), Some(KeyPress::ScrollDown));
-        assert_eq!(map_key(&key(KeyCode::Char('k'))), Some(KeyPress::ScrollUp));
-        assert_eq!(map_key(&key(KeyCode::Up)), Some(KeyPress::ScrollUp));
-        assert_eq!(map_key(&key(KeyCode::Char('g'))), Some(KeyPress::ScrollTop));
+        assert_eq!(map_key(&key(KeyCode::Down)), Some(KeyPress::SelectDown));
+        assert_eq!(map_key(&key(KeyCode::Char('k'))), Some(KeyPress::SelectUp));
+        assert_eq!(map_key(&key(KeyCode::Up)), Some(KeyPress::SelectUp));
+        assert_eq!(
+            map_key(&key(KeyCode::Char('g'))),
+            Some(KeyPress::SelectFirst)
+        );
         assert_eq!(
             map_key(&key(KeyCode::Char('G'))),
-            Some(KeyPress::ScrollBottom)
+            Some(KeyPress::SelectLast)
         );
         assert_eq!(map_key(&key(KeyCode::Char('r'))), Some(KeyPress::Refresh));
         assert_eq!(map_key(&key(KeyCode::Char('x'))), Some(KeyPress::Stop));
         assert_eq!(map_key(&key(KeyCode::Char('z'))), None);
+    }
+
+    /// fails if the four movement keys stop meaning SELECTION. They were
+    /// named for scrolling in 12a and the pane genuinely scrolled; it now
+    /// carries a cursor, and a name that says otherwise is the kind this
+    /// project's reviews keep catching. The KEYS are unchanged — an operator's
+    /// muscle memory is not what this rename touches.
+    #[test]
+    fn the_movement_keys_are_unchanged_and_now_mean_selection() {
+        assert_eq!(
+            map_key(&key(KeyCode::Char('j'))),
+            Some(KeyPress::SelectDown)
+        );
+        assert_eq!(map_key(&key(KeyCode::Down)), Some(KeyPress::SelectDown));
+        assert_eq!(map_key(&key(KeyCode::Char('k'))), Some(KeyPress::SelectUp));
+        assert_eq!(map_key(&key(KeyCode::Up)), Some(KeyPress::SelectUp));
+        assert_eq!(
+            map_key(&key(KeyCode::Char('g'))),
+            Some(KeyPress::SelectFirst)
+        );
+        assert_eq!(map_key(&key(KeyCode::Home)), Some(KeyPress::SelectFirst));
+        assert_eq!(
+            map_key(&key(KeyCode::Char('G'))),
+            Some(KeyPress::SelectLast)
+        );
+        assert_eq!(map_key(&key(KeyCode::End)), Some(KeyPress::SelectLast));
     }
 
     /// fails if Ctrl-C stops quitting. In raw mode crossterm does NOT deliver

@@ -70,7 +70,11 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         // asterisk. The key still works as a refusal, and still exercises
         // the control gate; it is only the advertisement that is gone.
         None => (
-            "q quit   j/k scroll   g/G top/bottom   r refresh".to_string(),
+            // `select`/`first/last`, not `scroll`/`top/bottom`: the pane
+            // carries a cursor now and the viewport is derived from it. Same
+            // 48 characters as the 12a text, so the truncation test at 49
+            // columns still measures what it was written to measure.
+            "q quit   j/k select   g/G first/last   r refresh".to_string(),
             palette.muted(),
         ),
     };
@@ -147,6 +151,36 @@ mod tests {
         assert!(
             !rendered.contains("…read-only"),
             "the ellipsis must not butt straight against the label: {rendered:?}"
+        );
+    }
+
+    /// fails if the key hint keeps saying `scroll` after the keys stopped
+    /// scrolling. This is the only one of the four renamed names an operator
+    /// ever reads — it is on every frame in the gallery — so leaving it would
+    /// be shipping the exact lie this task exists to remove, on the one
+    /// surface where it is visible.
+    ///
+    /// The replacement is the same 48 characters as the original, so
+    /// `a_truncated_hint_still_leaves_a_gap_before_the_control_label` at 49
+    /// columns is measuring the same thing it measured before.
+    #[test]
+    fn the_key_hint_says_what_the_keys_now_do() {
+        let app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/home/rin/.shep".to_string(),
+            Instant::now(),
+        );
+        let hint: String = status_line(&app, 200)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(hint.contains("j/k select"), "got {hint:?}");
+        assert!(hint.contains("g/G first/last"), "got {hint:?}");
+        assert!(
+            !hint.contains("scroll"),
+            "the pane no longer scrolls: {hint:?}"
         );
     }
 
