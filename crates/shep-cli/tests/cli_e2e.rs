@@ -4276,6 +4276,69 @@ fn the_shep_toml_gate_decides_the_tool_list_in_a_real_process() {
     }
 }
 
+/// fails if a `shep.toml` that exists but will not parse ever reaches
+/// stdout, or opens the gate it failed to read. Every other case in this
+/// file uses a `$SHEP_HOME` with either no `shep.toml` at all or one that
+/// parses, so `whistle::whistle`'s one `output::emit_error` call — the
+/// malformed-config stderr notice, the only thing whistle ever writes
+/// outside the JSON-RPC wire — had never run under
+/// [`assert_every_stdout_line_is_jsonrpc`]'s per-line check before this
+/// test existed. That call sits right next to the stdout handle; a mistake
+/// that pointed it at stdout instead of stderr would have gone uncaught.
+///
+/// Pins both halves: stdout stays pure JSON-RPC, and the gate reads SHUT —
+/// a config that fails to parse must not fail OPEN — which is a behaviour
+/// worth pinning on its own, not just a side effect of the stdout check.
+#[test]
+fn a_malformed_shep_toml_stays_off_stdout_and_keeps_the_gate_shut() {
+    let home = TempDir::new().unwrap();
+    write_shep_toml(&home, "[whistle\n");
+
+    let stdin = mcp_session(&[tools_list_request(2)]);
+    let output = shep(home.path())
+        .arg("whistle")
+        .write_stdin(stdin)
+        .output()
+        .unwrap();
+    assert_success(&output);
+
+    let lines = assert_every_stdout_line_is_jsonrpc(&output.stdout);
+    let list_reply = find_reply(&lines, 2);
+    let names: Vec<String> = list_reply["result"]["tools"]
+        .as_array()
+        .expect("tools/list result carries a tools array")
+        .iter()
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .expect("every tool has a name")
+                .to_string()
+        })
+        .collect();
+
+    assert_eq!(
+        names.len(),
+        5,
+        "a broken config must read as the gate SHUT, not open: {names:?}"
+    );
+    for tool in ["start_sheep", "stop_sheep", "restart_sheep", "reload_sheep"] {
+        assert!(
+            !names.contains(&tool.to_string()),
+            "{tool} must be absent when shep.toml fails to parse: {names:?}"
+        );
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid_config"),
+        "the malformed-config notice must reach stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("shep.toml"),
+        "the notice must name the file: {stderr}"
+    );
+}
+
 /// fails if a gated-off control tool becomes callable. With the gate shut,
 /// `tools/call` for `stop_sheep` must answer JSON-RPC error `-32602` with
 /// `"tool not found"` — rmcp's own answer for a name its router does not
