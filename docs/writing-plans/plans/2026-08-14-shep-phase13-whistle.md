@@ -222,20 +222,28 @@ here.
 
 ### Method
 
-Resolved offline against this machine's crates.io index cache
-(`~/.cargo/registry/index/index.crates.io-*/.cache`), which holds the full
-dependency and feature metadata for every version of every crate, `rmcp` 3.1.2
-included. The resolution walks `rmcp = { version = "3.1.2", default-features =
-false, features = ["server", "macros", "transport-io"] }`, applies cargo's own
-feature rules (`dep:`, `pkg/feat`, weak `pkg?/feat`, renamed packages), skips
-`dev` dependencies, and stops at every package already in this workspace's
-`Cargo.lock`. Every package in the closure resolved — nothing was missing from
-the index cache, so this is a complete walk and not a partial one.
+**Measured by cargo, on a copy of this workspace, not walked by hand.** An
+earlier draft of this section resolved the closure offline against the
+crates.io index cache, because rmcp 3.1.2 was not on this machine and could not
+be read. It is now: `cargo fetch` pulled it, and the numbers below come from
+cargo's own resolver rather than from a reimplementation of it.
 
-### The compiled cost: **+14 crates**
+What was actually run, 2026-08-15: the four `Cargo.toml` files plus `Cargo.lock`
+were copied to a scratch directory with stub `src/` targets, the two entries
+Task 1 adds were written into that copy, and `cargo fetch` re-resolved it. The
+compiled figure comes from `cargo tree -e normal --target aarch64-apple-darwin`
+over the same feature set Task 1 names, deduplicated by crate name and
+subtracted from the names already in `Cargo.lock` at `5894273`. No `cargo
+build` and no `cargo test` were run — another workstream holds this
+workspace's target-dir lock, and neither number needs a build.
 
-The closure is 76 packages. 62 of them are already in `Cargo.lock` at
-`5894273`. The fourteen that are not:
+### The compiled cost: **+14 crates** (measured)
+
+`cargo tree -e normal` over `rmcp = { version = "3.1.2", default-features =
+false, features = ["server", "macros", "transport-io"] }` names 53 distinct
+crates for `aarch64-apple-darwin`. 39 of them are already in `Cargo.lock` at
+`5894273`. The fourteen that are not — and this list is `comm -23` output, not
+a reading:
 
 | crate | version | why it is here |
 |---|---|---|
@@ -262,51 +270,91 @@ Phase 9 and reqwest's +93 was not.
 
 Two of the fourteen are worth naming for what they buy elsewhere:
 
-- **`schemars` arrives free.** `deferred.md` lists "schemars JSON-schema
+- **`schemars` is a DIRECT dependency of shep-cli, not a transitive.** An
+  earlier draft of this section said it "arrives free". That is wrong twice
+  over. rmcp only *re-exports* it (`pub use schemars;`, behind `#[cfg(feature =
+  "schemars")]` — rmcp-3.1.2/src/lib.rs:38-39), and `#[derive(JsonSchema)]`
+  emits absolute `schemars::` paths, so a crate whose own types derive
+  `JsonSchema` must name `schemars` in its manifest or nothing compiles. Task 1
+  therefore adds **two** workspace entries, not one, and shep-cli grows a
+  second `[target.'cfg(unix)'.dependencies]` line. It still costs zero extra
+  crates — rmcp's `server` feature pulls the same schemars — but it is a
+  versioned edge we own, with its own `-Z minimal-versions` floor.
+
+  What that DOES buy elsewhere: `deferred.md` lists "schemars JSON-schema
   export" as unbuilt v1.0 scope on the grounds that `AppConfig` has no
   `schemars` derive and no schema ships in `assets/`. After this phase the
-  crate is in the tree at zero marginal cost, and that item becomes a derive
-  and a writer rather than a dependency decision. Task 11 records that in the
-  ledger. It does **not** build it here.
+  crate is a declared dependency of the CLI, so that item is a derive and a
+  writer rather than a dependency decision. Task 11 records that in the ledger.
+  It does **not** build it here.
+
+  Version unification is checked, not assumed: rmcp declares `schemars = "1.0"`
+  with `features = ["chrono04"]` (rmcp-3.1.2/Cargo.toml, `[dependencies.schemars]`),
+  Task 1 pins `1.2.2`, and the re-resolved lockfile carries **exactly one**
+  `schemars` package (`1.2.2`). Two schemars majors in one tree would be its own
+  problem — two `JsonSchema` traits, and a derive that implements the wrong one —
+  and this is the check that says it did not happen. `chrono04` is a *renamed
+  optional dependency* of schemars (`[dependencies.chrono04] package = "chrono"`),
+  which is why it appears as a feature name; chrono is already in this workspace,
+  so it costs nothing.
 - **`futures` is the facade, not `futures-util`.** This workspace already
   carries `futures-util`, `futures-core`, `futures-sink` and `futures-task`;
   `futures` re-exports them and adds `futures-channel`, `futures-executor` and
   `futures-io`. Five of the fourteen crates are that one edge. It is not ours
   to remove — rmcp names `futures` non-optionally.
 
-### The `Cargo.lock` cost will be much larger than 14, and that is expected
+### The `Cargo.lock` cost is also **+14**, and that was worth measuring
 
-`Cargo.lock` is not a list of what compiles. Cargo locks a version for an
-optional dependency it never builds whenever that dependency is named through
-**weak feature syntax** (`pkg?/feat`) somewhere in the package's feature table
-— it has to, because it must know which version `pkg?/feat` would refer to.
-This is verifiable in this repo's own lockfile today, in both directions:
+An earlier draft of this section predicted a lockfile delta "much larger than
+14", with a computed ceiling of +344, on the reasoning that cargo locks a
+version for an optional dependency it never builds whenever that dependency is
+named through **weak feature syntax** (`pkg?/feat`). rmcp 3.1.2's feature table
+does name `reqwest?/rustls`, `reqwest?/native-tls`, `reqwest?/rustls-no-provider`
+and `rmcp-macros?/local`, so the prediction was not unreasonable. It was also
+wrong, and the measurement says so plainly:
 
-```bash
-grep -c '^name = "ron"$' Cargo.lock       # 0 — insta's optional `ron` is pruned (named only as `dep:ron`)
-grep -c '^name = "termwiz"$' Cargo.lock   # 1 — ratatui's optional termwiz backend is locked, never compiled
+```
+grep -c '^\[\[package\]\]' Cargo.lock      # 326 before, 340 after
 ```
 
-`rmcp` 3.1.2's feature table names `reqwest?/rustls`,
-`reqwest?/native-tls`, `reqwest?/rustls-no-provider` and `rmcp-macros?/local`,
-so `reqwest` and its chain will be locked without ever being built — the same
-mechanism that made 12a's lockfile delta +109 against a compiled +48. An
-upper bound computed by taking *every* optional edge transitively is **+344**,
-which is a ceiling and not a prediction: cargo prunes the ones reached only
-through `dep:`.
+The fourteen names added to the lockfile are the same fourteen that compile.
+Nothing else is locked — no `reqwest`, no TLS chain, nothing.
 
-**Task 1 records the real number** with `grep -c '^\[\[package\]\]' Cargo.lock`
-before and after, and writes both numbers — compiled and locked — into the
-dependency comment in the root manifest. If the measured compiled figure is not
-14, that is a finding and goes in the task's report, not a rounding error.
+The mechanism is real; it just does not fire here. Cargo locks a weakly
+referenced optional dependency only when the feature that *contains* the
+reference is itself enabled. rmcp's four `?/` references all sit inside
+features Task 1 does not turn on (`reqwest`, `reqwest-native-tls`,
+`reqwest-tls-no-provider`, `local`), so the resolver never has to know what
+version `reqwest?/rustls` would mean. This workspace already carries the
+matching positive case, which is what makes the rule checkable rather than
+folklore:
+
+```bash
+grep -c '^name = "ron"$' Cargo.lock       # 0 — insta's optional `ron` is pruned (reached only via `dep:`)
+grep -c '^name = "termwiz"$' Cargo.lock   # 1 — locked, never compiled
+```
+
+termwiz is locked because `ratatui-termwiz?/underline-color` sits inside
+ratatui's `underline-color` feature (ratatui-0.30.2/Cargo.toml:125), and this
+workspace **enables** `underline-color`. Same syntax, opposite outcome,
+decided entirely by whether the containing feature is on.
+
+**Task 1 still records the number it measures** with `grep -c
+'^\[\[package\]\]' Cargo.lock` before and after, and writes both figures —
+compiled and locked — into the dependency comment in the root manifest. The
+expectation is now 326 → 340 and +14 compiled. **If either measured figure
+differs, that is a finding** and goes in the task's report with the names that
+differ, exactly as 12a did when +48 landed against +18–24.
 
 ### Features, per IR-2
 
 `default-features = false`, and name what is used:
 
-- **`server`** — `ServerHandler`, `ToolRouter`, the tool traits. Pulls
-  `schemars` (tool schemas), `pastey`, `uuid` (already present) and
-  `transport-async-rw`.
+- **`server`** — `ServerHandler`, `ToolRouter`, the tool traits. Its feature
+  table is `["transport-async-rw", "schemars", "dep:pastey", "uuid"]`
+  (rmcp-3.1.2/Cargo.toml), so it pulls the schema generator, `pastey`, and
+  `uuid` — `uuid` is already in this workspace's lockfile
+  (`grep -c '^name = "uuid"$' Cargo.lock` prints `1`) and costs nothing.
 - **`macros`** — `#[tool_router]` and `#[tool]`. Without it the tools are
   hand-written `ToolBase`/`AsyncTool` impls, three times the code for the same
   router. Costs exactly `rmcp-macros`.
@@ -323,10 +371,104 @@ happens to `default-features`, and turning defaults off costs only `base64`.
 bare `3` to `3.0.0` — an API nobody here has compiled. The floor is the version
 this phase's code was written against and verified against.
 
+**And 3.1.2 is now a version that can be read, which it was not when this plan
+was first written.** A review of the first draft found that rmcp 3.1.2 had
+never been on this machine — `~/.cargo/registry/` held 1.7.0 and 2.2.0 only —
+so every API shape here had been asserted against a source nobody could open,
+and the reviewer had to check the plan against 2.2.0, two majors back. Four
+findings came out of that gap, and at least one of them (the output-schema
+panic) is a real property of 2.2.0 that **3.1.2 deliberately removed**.
+
+So the version was fetched before this revision was written:
+
+```bash
+cargo fetch          # in a scratch crate declaring rmcp 3.1.2
+tar xzf ~/.cargo/registry/cache/*/rmcp-3.1.2.crate
+```
+
+3.1.2 is also the newest published version (the index carries nothing after
+it), and its `rust_version` is `1.88` — this workspace's MSRV exactly, so
+pinning the newest costs no headroom. The alternative, pinning 2.2.0 because it
+was already local, would have bought verifiability at the price of two majors
+of drift and a hard object-root rule on output schemas that 3.1.2 does not
+have. **Pinned: 3.1.2, read from source.** Every API below carries a
+`file:line` into that source, and the next section is the whole list.
+
 **`[target.'cfg(unix)'.dependencies]`,** beside `nix`, `ratatui` and
 `crossterm`. `whistle` is `#[cfg(unix)]` like `commands`, `dog` and `lookout`,
 because it needs a unix socket to reach a shepherd, and the Windows leg of
 `main.rs::run` refuses every verb before dispatching.
+
+---
+
+## Every rmcp API this plan names, checked against 3.1.2's source
+
+Paths are relative to the unpacked crate (`rmcp-3.1.2/src/…`,
+`rmcp-macros-3.1.2/src/…`). Read once, here, so that no task below has to
+guess — and so that a future rmcp bump has a checklist rather than a search.
+
+| what the plan uses | where it is in 3.1.2 | notes |
+|---|---|---|
+| `rmcp::handler::server::wrapper::Json<T>` | `handler/server/wrapper/json.rs:18` | `pub struct Json<T>(pub T)`. **Not `Debug`** — do not put one in a `#[derive(Debug)]` struct |
+| `rmcp::handler::server::wrapper::Parameters<P>` | `handler/server/wrapper/parameters.rs:46` | `#[serde(transparent)]`; its `JsonSchema` delegates to `P` |
+| `rmcp::ErrorData` | `model.rs:565` | re-exported at `lib.rs:6` |
+| `ErrorData::internal_error` / `::invalid_params` | `model.rs:636` / `model.rs:633` | `(impl Into<Cow<'static, str>>, Option<Value>)` |
+| `ToolRouter<S>` | `handler/server/router/tool.rs:325` | `#[non_exhaustive]`; has a **manual** `Debug` needing no `S: Debug` (`:336`), and `ToolRoute<S>` has one too (`:165`) |
+| `ToolRouter::list_all()` | `handler/server/router/tool.rs:581` | returns `Vec<Tool>`, **sorted by name**, disabled routes filtered out |
+| `ToolRouter::get(&str)` | `handler/server/router/tool.rs:596` | `Option<&Tool>`; `Tool: Clone`, so `.cloned()` works |
+| `impl Add for ToolRouter<S>` | `handler/server/router/tool.rs:604` | bound is `S: MaybeSend + 'static` |
+| `-32602 "tool not found"` | `handler/server/router/tool.rs:570-571` | `.get(name).ok_or_else(|| ErrorData::invalid_params("tool not found", None))` — the exact string and code Task 10 asserts |
+| `ServerInfo` | `model.rs:1085` | alias of `InitializeResult` |
+| `ServerInfo::new(caps)` | `model.rs:1056` | |
+| `.with_instructions(...)` / `.with_server_info(...)` | `model.rs:1067` / `model.rs:1073` | |
+| `Implementation::new(name, version)` | `model.rs:1417` | |
+| `ServerCapabilities::builder().enable_tools().build()` | `model/capabilities.rs:272` (macro-generated `builder`), used at `:215` | |
+| `ToolAnnotations` + its four hints | `model/tool.rs:54-91` | `read_only_hint`, `destructive_hint`, `idempotent_hint`, `open_world_hint`, all `Option<bool>` |
+| `Tool::{name, description, annotations}` | `model/tool.rs:17-39` | `name: Cow<'static, str>`, `description: Option<Cow<'static, str>>` |
+| `#[tool_router(router = …, vis = …)]` | `rmcp-macros/tool_router.rs:15-16, 68-74` | see the visibility note below — this is a compile error waiting in the first draft |
+| `#[tool_handler(router = self.router)]` | `rmcp-macros/tool_handler.rs:11, 44-56` | `router` is an `Expr` used inside `&self` methods, so `self.router` is exactly right |
+| `#[tool_handler]` skips a hand-written `get_info` | `rmcp-macros/tool_handler.rs:97-106` | `if !has_method("get_info", …)` — the plan's dynamic `get_info` survives |
+| `transport::stdio()` | `transport/io.rs:4` | `(tokio::io::Stdin, tokio::io::Stdout)` |
+| `ServiceExt::serve(transport)` | `service.rs:330` | |
+| `RunningService::waiting()` | `service.rs:1088` | `Result<QuitReason, tokio::task::JoinError>` |
+| `ProtocolVersion::KNOWN_VERSIONS` | `model.rs:181-187` | **not `SUPPORTED`** — that constant does not exist. `V_2025_06_18` is `model.rs:172`; `LATEST` is `V_2025_11_25` (`:175`) |
+| `CallToolResult::structured(value)` | `model.rs:3963-3971` | fills `content` with `ContentBlock::text(value.to_string())` **and** `structured_content` |
+| `CallToolResult::structured_error(value)` | `model.rs:3990` | same, with `is_error: Some(true)` |
+| `IntoCallToolResult for ErrorData` | `handler/server/tool.rs:119-123` | returns `Err(self)` — a JSON-RPC protocol error, not an in-band tool error. See § "What a control tool meets in flight" |
+| `schema_for_input::<T>()` | `handler/server/common.rs:77-96` | **validates**: root must be `type: "object"` or it is an `Err` |
+| `schema_for_output::<T>()` | `handler/server/common.rs:109-144` | **does not validate.** Its own comment: *"output schemas are not restricted to root type `object` (per SEP-2106)"* |
+
+### Two places where 3.1.2 differs from what a 2.2.0 reading would tell you
+
+**1. Output schemas are no longer required to be object-rooted, and no longer
+panic.** In rmcp 2.2.0, `schema_for_output` ran the same `validate_and_strip`
+as the input side and returned `Err` for an array root, and the `#[tool]` macro
+`unwrap_or_else(|e| panic!(…))`'d it — so a tool returning `Json<Vec<T>>`
+panicked during router construction. In 3.1.2 `schema_for_output` returns
+`Arc<JsonObject>` with no `Result` at all (`common.rs:121`), `strip_output`
+does no validation (`common.rs:112-117`), and the crate's own tests pin the new
+behaviour: `test_schema_for_output_accepts_primitive` (`common.rs:317`),
+`test_schema_for_output_accepts_composition` (`:329`), against
+`test_schema_for_input_rejects_array` (`:348`) on the input side.
+
+This plan still wraps every list payload in an object, and § "The five that
+read" says why — but the reason is a **wire-shape** one, not a panic, and
+stating it as a panic would be stating something 3.1.2 does not do.
+
+**2. `#[tool_router]`'s generated constructor is private unless you say
+otherwise.** The macro emits `#vis fn #router() -> ToolRouter<Self>`
+(`rmcp-macros/tool_router.rs:68-72`) with `vis` defaulting to `None`
+(`:25-27`). This phase puts `#[tool_router(router = read_only_router)]` in
+`whistle/read.rs` and `#[tool_router(router = control_router)]` in
+`whistle/control.rs`, and calls both from `Whistle::new` in `whistle/mod.rs` —
+the **parent** module. A private associated function is visible in its defining
+module and that module's descendants, and a parent is neither. `Self::read_only_router()`
+from `mod.rs` would be `E0624`.
+
+So both attributes carry `vis = "pub(crate)"`, which the macro parses and its
+own test pins (`rmcp-macros/tool_router.rs:103-116`). Tasks 6 and 7 spell it
+out; this is the one API detail in this phase that fails at compile time rather
+than at runtime, and it would have cost an implementer a confusing hour.
 
 ---
 
@@ -339,13 +481,41 @@ mutating tool annotated `readOnlyHint: true` would be a lie told to a machine.
 
 ### The five that read — always present
 
-| tool | argument | reaches | mutates | annotations |
-|---|---|---|---|---|
-| `list_flock` | none | `Request::ListFlock` | **no** | `read_only_hint = true` |
-| `describe_sheep` | `name` | `Request::Describe` | **no** | `read_only_hint = true` |
-| `get_metrics` | none | `Request::ListFlock` + a `sysinfo` host sample | **no** | `read_only_hint = true` |
-| `tail_bleats` | `name`, optional `lines`, optional `stream` | `Request::Describe` for the paths, then reads the files | **no** | `read_only_hint = true` |
-| `list_barks` | optional `tail` | `$SHEP_HOME/barks.jsonl` — no socket at all | **no** | `read_only_hint = true` |
+| tool | argument | reaches | returns | mutates | annotations |
+|---|---|---|---|---|---|
+| `list_flock` | none | `Request::ListFlock` | `Json<FlockListing>` | **no** | `read_only_hint = true` |
+| `describe_sheep` | `name` | `Request::Describe` | `Json<FlockListing>` | **no** | `read_only_hint = true` |
+| `get_metrics` | none | `Request::ListFlock` + a `sysinfo` host sample | `Json<MetricsReading>` | **no** | `read_only_hint = true` |
+| `tail_bleats` | `name`, optional `lines` | `Request::Describe` for the paths, then reads the files | `Json<BleatTail>` | **no** | `read_only_hint = true` |
+| `list_barks` | optional `tail` | `$SHEP_HOME/barks.jsonl` — no socket at all | `Json<BarkListing>` | **no** | `read_only_hint = true` |
+
+**No tool returns a bare `Vec`, and that is a rule rather than a style
+preference.** An earlier draft had the four list-shaped tools return
+`Json<Vec<SheepRow>>` and `Json<Vec<BarkRow>>`. `Json<T>` hands `T` to
+`CallToolResult::structured`, which puts it verbatim into `structured_content`
+(`model.rs:3963-3971`) — and `structured_content` is `structuredContent` on the
+wire, which MCP types as an **object**, as rmcp's own field doc says in as many
+words: *"An optional JSON object that represents the structured result of the
+tool call"* (`model.rs:3802-3803`). A `Vec` puts a JSON array there. rmcp will
+not stop you: `structured_content` is a `serde_json::Value`, and 3.1.2's
+`schema_for_output` deliberately does not validate the root type
+(`common.rs:109-120`, per SEP-2106). It would simply be wrong on the wire, and
+wrong in the way a strict client rejects and a lenient one silently accepts —
+the worst kind.
+
+Two wrapper structs, defined in Task 5, carry every list:
+`FlockListing { flock: Vec<SheepRow> }` and `BarkListing { barks: Vec<BarkRow> }`.
+They also buy something real later: a listing that needs a `total` or a
+`truncated` beside its rows can grow one without changing the tool's output
+shape from array to object, which *is* a breaking change for a consumer.
+
+**The INPUT side does still reject a non-object root, and it panics.**
+`schema_for_input` returns `Err` for anything but `type: "object"`
+(`common.rs:77-96`), and the `#[tool]` macro `unwrap_or_else(|e| panic!(…))`s
+it during router construction (`rmcp-macros/tool.rs:200-208`). Every argument
+type in this phase is a plain struct, so this is satisfied by construction —
+and Task 5 pins it with a test anyway, because "satisfied by construction" is
+how the first draft got the output side wrong.
 
 None of the five writes anything, anywhere. `tail_bleats` and `list_barks`
 open files read-only; the other three send request frames the daemon answers
@@ -362,12 +532,12 @@ description and into `docs/whistle/README.md`, not left as folklore.
 
 ### The four that act — present only when the gate is open
 
-| tool | argument | reaches | mutates | annotations |
-|---|---|---|---|---|
-| `start_sheep` | `name` | `Request::Restart`, after refusing a sheep that is already running | **yes** | `read_only_hint = false`, `destructive_hint = false`, `idempotent_hint = true` |
-| `stop_sheep` | `name` | `Request::Stop` | **yes** | `read_only_hint = false`, `destructive_hint = true`, `idempotent_hint = true` |
-| `restart_sheep` | `name` | `Request::Restart` | **yes** | `read_only_hint = false`, `destructive_hint = true`, `idempotent_hint = false` |
-| `reload_sheep` | `name` | `Request::Reload` | **yes** | `read_only_hint = false`, `destructive_hint = false`, `idempotent_hint = false` |
+| tool | argument | reaches | returns | mutates | annotations |
+|---|---|---|---|---|---|
+| `start_sheep` | `name` | `Request::Restart`, after refusing a sheep that is already running | `Json<FlockListing>` | **yes** | `read_only_hint = false`, `destructive_hint = false`, `idempotent_hint = false` |
+| `stop_sheep` | `name` | `Request::Stop` | `Json<FlockListing>` | **yes** | `read_only_hint = false`, `destructive_hint = true`, `idempotent_hint = true` |
+| `restart_sheep` | `name` | `Request::Restart` | `Json<FlockListing>` | **yes** | `read_only_hint = false`, `destructive_hint = true`, `idempotent_hint = false` |
+| `reload_sheep` | `name` | `Request::Reload` | `Json<FlockListing>` | **yes** | `read_only_hint = false`, `destructive_hint = false`, `idempotent_hint = false` |
 
 The annotation values are decisions, not defaults, and each is defended:
 
@@ -383,8 +553,16 @@ The annotation values are decisions, not defaults, and each is defended:
   precise sense MCP's `destructiveHint` means. Not idempotent: two reloads are
   two swaps, and the second is refused outright while the first is in flight
   (§ "What a control tool meets in flight").
-- **`start_sheep` is not destructive and is idempotent** *because of how it is
-  narrowed* — see immediately below. As specified it would be neither.
+- **`start_sheep` is not destructive, and it is NOT idempotent.** The first
+  draft annotated it `idempotent_hint = true`, on the reading that calling it
+  against a running sheep changes nothing and says so. That reading assumes the
+  pre-check and the `Restart` are one atomic step, and they are not — see the
+  race named immediately below. A second call that lands in the window between
+  another caller's check and its restart *does* restart a running process, and
+  a caller can observe that. `false` is the honest value, and MCP's own doc for
+  the field says the hints are hints and clients should not trust a server's
+  self-description anyway (`model/tool.rs:44-51`) — which is an argument for
+  making ours true, not for shrugging.
 
 ### `start_sheep` is narrowed, deliberately, and this is the phase's sharpest cut
 
@@ -404,9 +582,53 @@ bounded by what a human already registered. It cannot introduce a process that
 was not already in the flock, and it cannot change one's configuration.
 
 The refusal is whistle's own, before anything reaches the wire, and it names
-the other tool: `"api is already running; use restart_sheep"`. That is what
-makes the tool idempotent in the annotation sense — calling it against a
-running sheep changes nothing and says so.
+the other tool: `"api is already running; use restart_sheep"`.
+
+#### The pre-check is advisory, and the plan says so rather than implying otherwise
+
+The narrowing above is about **what** `start_sheep` can reach. It is not, and
+must not be described as, a guarantee about **when**. Two gaps, both named
+here, both surfaced in the tool's own description where a model reads them:
+
+**The check and the call are not atomic (TOCTOU).** whistle sends
+`Request::Describe`, reads the status out of the reply, and then — on a
+*second* request, over a *second* connection, because § "One connection per
+tool call" is the design — sends `Request::Restart`. Between those two, the
+sheep can come online: a cron restart, a watch trigger, an autorestart after a
+crash, or a person at another terminal. `Request::Restart` does not re-check;
+`ManualKind::Restart` calls `respawn` unconditionally (`supervisor.rs:2520-2523`),
+which for an online sheep is a kill and a spawn. So a tool annotated
+`destructive_hint = false` can, in that window, cause an outage.
+
+**This cannot be closed without a wire change, and the plan does not pretend
+otherwise.** Closing it needs the *daemon* to do the check under the same lock
+that performs the restart — a `Request::StartIfStopped`, or a conditional flag
+on `Restart`. That is a new wire variant, `PROTOCOL_VERSION` stays 1 this
+phase, and § "Why the gate is not read over the wire" already argues why this
+phase adds none. **The residual window is one round trip on a local unix
+socket** — the `Describe` reply to the `Restart` send, single-digit
+milliseconds in the ordinary case, and bounded above by the client's deadline
+rather than by anything whistle controls. It is small; it is not zero; and the
+tool's description says "the check is a courtesy" rather than "refuses if it is
+already running" for exactly that reason.
+
+The annotation follows the truth: `idempotent_hint = false`, and
+`destructive_hint = false` stays only because the *intended* operation is
+additive. A reviewer who wants `destructive_hint = true` on the grounds that
+the race makes it destructive has a defensible position; the call made here is
+that the hint should describe the operation, not its worst-case interleaving,
+and that the interleaving belongs in the description where a model can read it.
+
+**Multi-instance apps: refuse the whole call.** `SelectorSpec::Name(name)`
+matches *every* instance of an app, so a four-instance `api` with two online is
+a real case the first draft left unspecified. The rule is the one the daemon
+already uses for reload: **if ANY matched instance is `online` or `starting`,
+the whole call is refused** — never "restart the stopped ones and skip the
+rest". `supervisor.rs:424-432` is explicit that a partly-accepted selector
+leaves the caller unable to tell which half was taken, and a model is exactly
+the caller least able to work it out. The message carries the count:
+`"api: 2 of 4 instances are already running; use restart_sheep"`. Task 7 tests
+this case specifically.
 
 If Rin wants the wider `start` later, it is a new tool with a new name and its
 own argument, not a widening of this one. That belongs in the same
@@ -476,26 +698,69 @@ that can act; with the gate open, a log line can reach `stop_sheep`. That is
 the specific, real thing the default buys, and it is the sentence the README
 leads with.
 
-### Why there is no `--allow-control` flag
+### Why there is no `--allow-control` flag — and what that does NOT buy
 
-lookout has one. whistle does not, and the asymmetry is the point.
+lookout has one. whistle does not, and the asymmetry is the point. But the
+argument has to be the true one, because this is the paragraph a future reader
+will trust.
 
-Spec §14.7 already rules it: *"Whistle control tools gated by daemon config,
-not CLI flag — config is auditable, flags are per-invocation."* lookout's own
-`resolve_control` doc states the other half from the other side: lookout's gate
-is *"the operator's own"* because a person is at the keyboard, while whistle's
-control tools *"act for a client nobody is watching"*.
+**What the first draft claimed, and why it was false.** It argued that a flag
+was refused because "the launcher writes the argv", so a flag would let the
+same edit that adds the MCP server open the gate — and that an environment
+variable was refused for the same reason, leaving `$SHEP_HOME/shep.toml` as a
+second, separate edit an attacker's one-line change could not reach. That
+conclusion does not hold as shipped. `GlobalArgs::home` is
+`#[arg(long, global = true, env = "SHEP_HOME")]` (`crates/shep-cli/src/cli.rs:29-31`),
+and `ShepPaths::resolve` derives `daemon_config = $SHEP_HOME/shep.toml`
+(`crates/shep-core/src/paths.rs:52-57`). So:
 
-The operational argument is sharper than "auditable". **The launcher writes the
-argv.** Whoever edits an agent host's config to add `shep whistle` would, with
-a flag, be editing the gate in the same line — and that config is precisely
-what an attacker who has reached the developer's machine, or a well-meaning
-copy-paste from a blog post, would touch. A file at `$SHEP_HOME/shep.toml` is a
-second, separate edit in a place an operator owns and can diff. Same reasoning
-excludes an environment variable: `SHEP_WHISTLE_ALLOW_CONTROL` would be one
-line in the same launcher config. `resolve_control` therefore calls
-`DaemonConfig::load(source, &|_| None)` — env layering explicitly disabled, in
-code, with a comment saying why.
+```jsonc
+// an agent host's server config — one line, gate open
+{ "command": "shep", "args": ["whistle", "--home", "/tmp/open"] }
+// or, identically:
+{ "command": "shep", "args": ["whistle"], "env": { "SHEP_HOME": "/tmp/open" } }
+```
+
+Both already work today. **argv and the environment reach the gate**, by
+choosing which `shep.toml` is read. A dedicated `--allow-control` flag would be
+one token shorter, not one capability wider.
+
+**The true statement, which the docs, the `--help` and the README all carry
+instead.** whistle reads its gate out of whichever `$SHEP_HOME` the launcher
+selected, so the launcher is the boundary in argv, environment **and** file
+alike — the same one boundary § "The trust boundary" opens with, restated
+rather than contradicted. There is no configuration of shep in which the entity
+that starts the process cannot also decide what it may do. That is not a
+weakness peculiar to whistle; it is what "runs as you, with your uid, from your
+config" means.
+
+**The decision stands anyway, on the reason that survives.** Spec §14.7 rules
+it: *"Whistle control tools gated by daemon config, not CLI flag — config is
+auditable, flags are per-invocation."* That argument is about **legibility, not
+containment**. A boolean in a file has a mtime, a diff, a review, and a place
+an operator can look to answer "is control on?". A flag has none of those — it
+lives in whatever process's argv, is invisible to `shep` itself between runs,
+and is the sort of thing that gets pasted from a README and never revisited.
+lookout's own `resolve_control` doc states the other half from the other side
+(`crates/shep-cli/src/lookout/mod.rs:196-205`): lookout's gate is the
+operator's own because a person is at the keyboard, while whistle's control
+tools act for a client nobody is watching.
+
+**What `allow_control` actually buys, stated in one sentence and no more:** it
+stops an agent acting on text it just read. That is real, it is the whole
+reason the default is `false`, and it is all of it.
+
+**What `resolve_control`'s `&|_| None` is for.** `DaemonConfig::load` layers
+`SHEP_LOG_JSON`, `SHEP_LOG_LEVEL`, `SHEP_SOCKET` and `SHEP_MAX_CRON_SLEEP` over
+the parsed file (`crates/shep-core/src/config/daemon.rs:178-205`). **None of
+those four touches `whistle.allow_control`, in either direction**, so passing
+`&|_| None` is not a security measure and the first draft was wrong to call it
+"load-bearing". It is there for a plainer reason worth keeping: it makes
+`resolve_control` a pure function of the file's text, which is what lets every
+case in Task 3 be tested without a tempdir, without `std::env::set_var` (which
+is `unsafe` in edition 2024 and races the rest of the suite), and without any
+dependence on how the test binary happened to be launched. That is a testability
+argument, and it is stated as one.
 
 **One concept, one enum, two sources — never two concepts.** `Control::ReadOnly`
 / `Control::Allowed` is the same shape lookout shipped in 12a, deliberately
@@ -552,27 +817,47 @@ answers all of these; the work here is surfacing them honestly rather than
 inventing new refusals. Every row was read out of the shipped supervisor, and
 Task 8 pins each mapping with a test.
 
-| situation | what the daemon does | what the model is told |
+| situation | what the daemon does | what the model receives |
 |---|---|---|
-| name matches nothing | `RpcErrorCode::NotFound`, "selector matched no registered sheep" | tool error, message verbatim, plus the name it was given |
-| `reload_sheep` while that app is already reloading | `SupervisorError::ReloadInFlight` → `RpcErrorCode::Internal`, "`<name>` is already being reloaded" | tool error, message verbatim. **The whole command is refused, not the overlapping part** — `supervisor.rs:428` is explicit that a partly-accepted selector leaves the caller unable to tell which half was taken |
-| `stop_sheep` / `restart_sheep` against a reload drainee (`ProcStatus::Stopping`) | **accepted.** `begin_manual_ids` holds a command off a half-committed swap only when `origin == CommandOrigin::Automatic`; an operator-origin command — which every RPC is — goes through | success. The reply lists the matched sheep as they stood |
-| `start_sheep` against an `online` or `starting` sheep | never reaches the daemon | whistle's own refusal: "`<name>` is already running; use restart_sheep" |
-| anything while the shepherd is shutting down | `SupervisorError::EngineStopped` → `RpcErrorCode::Internal`, "the supervisor engine has stopped" | tool error, message verbatim |
+| name matches nothing | `RpcErrorCode::NotFound`, "selector matched no registered sheep" | **`CallToolResult` with `is_error: true`**, `structuredContent = {code, message}`, message verbatim, plus the name it was given |
+| `reload_sheep` while that app is already reloading | `SupervisorError::ReloadInFlight` → `RpcErrorCode::Internal`, "`<name>` is already being reloaded" | same shape, message verbatim. **The whole command is refused, not the overlapping part** — `supervisor.rs:424-432` is explicit that a partly-accepted selector leaves the caller unable to tell which half was taken |
+| `stop_sheep` / `restart_sheep` against a reload drainee (`ProcStatus::Stopping`) | **accepted.** `begin_manual_ids` holds a command off a half-committed swap only when `origin == CommandOrigin::Automatic` (`supervisor.rs:2416-2417`); an operator-origin command — which every RPC is — goes through | success. The reply lists the matched sheep as they stood |
+| `start_sheep` against an `online` or `starting` sheep | never reaches the daemon | whistle's own in-band refusal: "`<name>` is already running; use restart_sheep". Advisory — see the TOCTOU note above |
+| `start_sheep` where SOME instances of a multi-instance app are running | never reaches the daemon | whistle's own in-band refusal, naming the count: "`api`: 2 of 4 instances are already running; use restart_sheep" |
+| anything while the shepherd is shutting down | `SupervisorError::EngineStopped` → `RpcErrorCode::Internal`, "the supervisor engine has stopped" (`rpc.rs:621-623`) | same shape, message verbatim |
 | an operator's `shep stock` is scaling the same app right now | not reachable *from whistle* — there is no scale tool. `restart_sheep` acts on whichever instances exist at that instant; `reload_sheep` is unaffected | success, listing what it matched |
-| no shepherd running | nothing — the connect fails | tool error: "no shepherd is running at `<socket>`". whistle never spawns one |
-| the request outlives its deadline | `RpcErrorCode::DeadlineExceeded` | tool error, message verbatim |
+| no shepherd running | nothing — the connect fails | same shape: "no shepherd is running at `<socket>`". whistle never spawns one |
+| the request outlives its deadline | `RpcErrorCode::DeadlineExceeded` | same shape, message verbatim |
+| the tool name is not registered (gate shut, `stop_sheep` called) | never reaches whistle's own code | **JSON-RPC protocol error `-32602`, "tool not found"** — rmcp's own answer (`handler/server/router/tool.rs:570-571`) |
 
-Two properties hold across the whole table and are worth naming:
+Three properties hold across the whole table and are worth naming:
 
-**Every daemon-side refusal reaches the model as an MCP tool error with the
-daemon's own message unaltered.** shep does not paraphrase the shepherd for the
-benefit of a model. `ReloadInFlight` arrives as `RpcErrorCode::Internal` —
-which `rpc.rs` itself documents as "`Internal` under protest", the right code
-being a conflict code the wire does not have yet — and whistle passes that
-through rather than inventing a nicer one. A model reading "api is already
-being reloaded" can act on it; a model reading a whistle-invented
-"CONFLICT_RELOAD" is reading fiction.
+**A daemon refusal is an in-band tool error, not a JSON-RPC protocol error, and
+that is a decision.** The first draft said "tool error" without saying which,
+and returned `Err(ErrorData)` everywhere. rmcp turns that into a protocol error:
+`impl IntoCallToolResult for ErrorData` returns `Err(self)`
+(`handler/server/tool.rs:119-123`), which becomes `-32603` on the wire. MCP
+draws the line deliberately — protocol errors are for unknown tools and
+malformed params, while tool *execution* failures belong in-band so the model
+sees them and can act. A host is free to surface a `-32603` to the user and not
+to the model, and if it does, this phase's load-bearing promise — *"a model
+reading 'api is already being reloaded' can act on it"* — silently stops
+holding.
+
+So: **daemon-side refusals return `Ok(CallToolResult::structured_error(...))`**
+(`model.rs:3990`), carrying `{"code": "<exit.rs code_str>", "message": "<the
+shepherd's own words>"}`, and `Err(ErrorData)` is reserved for what is genuinely
+protocol-level — an unknown tool (rmcp's own, above) and params that fail to
+deserialize (rmcp's own, again). Task 4 defines both mappings and Task 7 pins
+the in-band one.
+
+**The shepherd's message is passed through unaltered.** shep does not paraphrase
+the shepherd for the benefit of a model. `ReloadInFlight` arrives as
+`RpcErrorCode::Internal` — which `rpc.rs` itself documents as "`Internal` under
+protest", the right code being a conflict code the wire does not have yet — and
+whistle passes that through rather than inventing a nicer one. A model reading
+"api is already being reloaded" can act on it; a model reading a
+whistle-invented "CONFLICT_RELOAD" is reading fiction.
 
 **No control tool is retried automatically.** Not by whistle, not by the
 client. A `Timeout` or a `Closed` from a mutating call is reported as-is, and
@@ -635,9 +920,16 @@ dependency into shep-core for a CLI concern, and the twin plus its equality
 test is the cheaper half of that trade.
 
 `CallToolResult`'s human-readable `content` block carries the same data as
-compact JSON text, because not every MCP client reads `structuredContent` yet.
-One `serde_json::to_string` of the same struct — one source, two renderings,
-the same discipline `output::Render` already imposes on the CLI.
+compact JSON text, because not every MCP client reads `structuredContent` yet —
+and **rmcp's `Json` wrapper already does that for us**, which is part of why the
+wrapper is used rather than a hand-built `CallToolResult`. `Json<T>` calls
+`CallToolResult::structured`, which fills `content` with
+`ContentBlock::text(value.to_string())` alongside `structured_content` from the
+same `Value` (`model.rs:3963-3971`). One source, two renderings, no code of
+ours. An earlier draft described this as work whistle performs ("one
+`serde_json::to_string` of the same struct"); an implementer taking that
+literally would hand-build the result and lose the macro-generated output
+schema along with it.
 
 ### 3. Gated-off tools are absent, not present-and-refusing
 
@@ -683,9 +975,23 @@ process whose stdout is a wire and whose stderr belongs to the launcher's log.
 An agent's context is finite and a flock is not. Two tools take a size:
 
 - `tail_bleats` — `lines` defaults to 50 and is clamped to 200. It reuses
-  `bleats.rs`'s `read_tail`, promoted to `pub(crate)`, so the
-  `TAIL_WINDOW_BYTES` window (256 KiB from the end of the file) is enforced by
-  the same code the CLI uses. One source of truth for "what a tail is".
+  `bleats.rs`'s `read_tail` so the `TAIL_WINDOW_BYTES` window (256 KiB from the
+  end of the file) is enforced by the same code the CLI uses. One source of
+  truth for "what a tail is".
+
+  **This is a real edit to `bleats.rs`, not a visibility change, and the first
+  draft was wrong to say "no logic moves".** As shipped, `read_tail(path:
+  &Path) -> io::Result<Vec<String>>` (`crates/shep-cli/src/commands/bleats.rs:254`)
+  takes no count and hard-caps at `const TAIL_LINES: usize = 50` internally
+  (`:222`, applied at `:279-280`). So a `lines: 200` request could never return
+  more than 50 — and because the surplus is `drain`ed away, `BleatTail::truncated`
+  ("cut short by the cap rather than by the end of the file") is not derivable
+  from the return value at all. Both the headline behaviour and one of the two
+  documented payload fields are unimplementable without touching it. Task 6
+  gives it a `limit` and an overflow signal; `commands::bleats` passes
+  `TAIL_LINES` at its own call site, so CLI behaviour is byte-identical and
+  `bleats.rs:1408-1413`'s "exactly TAIL_LINES lines must reach stdout"
+  regression is the check that says so.
 - `list_barks` — `tail` defaults to 50, clamped to 200, over the ring
   `shep_core::barks::read` returns.
 
@@ -738,8 +1044,11 @@ of each other. Everything else is a chain.
 grep -c '^\[\[package\]\]' Cargo.lock        # 326
 grep -c '^name = "rmcp"$' Cargo.lock         # 0
 grep -c '^name = "schemars"$' Cargo.lock     # 0
+grep -c '^name = "uuid"$' Cargo.lock         # 1  — already here; `server` needs it and costs nothing
 grep -c rmcp crates/shep-cli/Cargo.toml      # 0
+grep -c schemars crates/shep-cli/Cargo.toml  # 0
 grep -c '^rmcp = ' Cargo.toml                # 0
+grep -c '^schemars = ' Cargo.toml            # 0
 ```
 
 The last one is anchored: `grep -c rmcp Cargo.toml` prints **3** today, all
@@ -767,22 +1076,47 @@ In `Cargo.toml`, immediately after the `crossterm` entry:
 #     futures-macro. All fourteen build on macOS and Linux; none builds C or
 #     needs cmake; the highest MSRV among them is rmcp's own 1.88, which is
 #     this workspace's MSRV exactly.
-#   Cargo.lock: 326 -> <FILL IN FROM THE MEASUREMENT BELOW>. Larger than 14
-#     and expected to be: rmcp's feature table names `reqwest?/rustls` and
-#     two siblings, and cargo locks a version for an optional dependency
-#     reached through weak feature syntax even though it never compiles it.
-#     Same mechanism that locked ratatui's termwiz backend (`grep -c '^name =
-#     "termwiz"$' Cargo.lock` prints 1, and nothing in this workspace builds
-#     it).
+#   Cargo.lock: 326 -> <FILL IN FROM THE MEASUREMENT BELOW>. Expected 340,
+#     i.e. the same +14: rmcp's feature table does name `reqwest?/rustls` and
+#     three siblings, but cargo only locks a weakly-referenced optional
+#     dependency when the feature CONTAINING the reference is enabled, and
+#     none of those four features is on here. Contrast ratatui, where
+#     `ratatui-termwiz?/underline-color` sits inside the `underline-color`
+#     feature this workspace DOES enable, which is why `grep -c '^name =
+#     "termwiz"$' Cargo.lock` prints 1 for a backend nothing builds.
 #
-# `schemars` arrives as a hard requirement of rmcp's `server` feature — it is
-# what generates each tool's input and output schema — which incidentally
-# puts deferred.md's "schemars JSON-schema export" item within reach of a
-# derive rather than a dependency decision. Not built here.
+# `schemars` is what generates each tool's input and output schema. rmcp's
+# `server` feature requires it, so it costs no extra crate — but it is
+# declared separately below because it is a DIRECT dependency of ours:
+# `#[derive(JsonSchema)]` emits absolute `schemars::` paths, and rmcp only
+# re-exports the crate (`pub use schemars;`, rmcp-3.1.2/src/lib.rs:38-39).
 #
 # Version 3.1.2, not "3": CI runs `-Z minimal-versions`, which resolves a
-# bare "3" to 3.0.0, an API nobody here has compiled.
+# bare "3" to 3.0.0, an API nobody here has compiled. 3.1.2 is the newest
+# published version, its rust-version is 1.88 (this workspace's MSRV
+# exactly), and every API this phase uses was read out of its source — see
+# the plan's "Every rmcp API this plan names" table for the file:line list.
 rmcp = { version = "3.1.2", default-features = false, features = ["server", "macros", "transport-io"] }
+# The JSON Schema generator behind every whistle tool's declared input and
+# output shape. Not a transitive we happen to get: `src/whistle/facts.rs` and
+# `src/whistle/read.rs` derive `JsonSchema` on our own types, and that derive
+# expands to `schemars::…` paths, so the crate has to be nameable. rmcp
+# re-exports it, which is not the same thing — a re-export does not put the
+# crate in our extern prelude, and routing the derive through
+# `rmcp::schemars` is not an option because the derive writes the paths.
+#
+# Pinned exactly, same reason as rmcp: `-Z minimal-versions` would take a
+# bare "1" down to 1.0.0. rmcp declares `schemars = "1.0"` with
+# `features = ["chrono04"]`; 1.2.2 satisfies it and the re-resolved lockfile
+# carries exactly ONE schemars package, which is the property that matters —
+# two schemars majors would mean two `JsonSchema` traits and a derive
+# implementing the wrong one. `chrono04` is a renamed optional dep of
+# schemars (`[dependencies.chrono04] package = "chrono"`); chrono is already
+# in this workspace, so it costs nothing.
+#
+# `derive` and `std` ARE schemars' own defaults; they are named per IR-2
+# because a crate that uses a feature says so.
+schemars = { version = "1.2.2", default-features = false, features = ["derive", "std"] }
 ```
 
 ### Step 1.2 — the crate entry
@@ -799,50 +1133,85 @@ In `crates/shep-cli/Cargo.toml`, in the existing
 # and the `futures` facade into a binary that cannot use any of it, and would
 # slow the `--target x86_64-pc-windows-gnu` check the phase gate runs.
 rmcp.workspace = true
+# The schema generator, beside it and unix-only for the same reason. Declared
+# rather than reached through `rmcp::schemars`, because `#[derive(JsonSchema)]`
+# in `src/whistle/` expands to absolute `schemars::` paths.
+schemars.workspace = true
 ```
 
 ### Step 1.3 — measure, then write the numbers back
 
 ```bash
 cargo fetch                                                    # populates Cargo.lock
-grep -c '^\[\[package\]\]' Cargo.lock                          # record: was 326
+grep -c '^\[\[package\]\]' Cargo.lock                          # expect 340 (was 326)
 grep -c '^name = "rmcp"$' Cargo.lock                           # expect 1
-grep -c '^name = "schemars"$' Cargo.lock                       # expect 1
-cargo tree -p shep-cli --target aarch64-apple-darwin -e normal --all-features > /tmp/tree-after.txt
-grep -c 'rmcp v3' /tmp/tree-after.txt                          # expect >= 1
+grep -c '^name = "schemars"$' Cargo.lock                       # expect 1 — exactly one, see below
 ```
 
-The compiled delta is confirmed by rooting a tree at the package and
-subtracting names already in `Cargo.lock` at `5894273`:
+**The one-schemars check is not a formality.** A second schemars major in the
+tree means two distinct `JsonSchema` traits, and `#[derive(JsonSchema)]`
+implementing whichever one our own dependency edge resolved rather than the one
+rmcp's bound expects — which fails as an unsatisfied trait bound at the `Json<T>`
+call site, in a message that names neither cause. `grep -c` printing `2` here is
+a stop-and-report, not a warning.
+
+The compiled delta is confirmed by subtracting the names already in
+`Cargo.lock` at `5894273` from the tree the change produces:
 
 ```bash
-cargo tree -p rmcp@3.1.2 --target aarch64-apple-darwin -e normal --prefix none \
-  | awk '{print $1}' | sort -u > /tmp/rmcp-names.txt
-wc -l /tmp/rmcp-names.txt        # this plan's offline walk says 76
+git show 5894273:Cargo.lock | grep '^name = ' | sed 's/name = "//;s/"//' | sort -u > /tmp/before.txt
+cargo tree -p shep-cli --target aarch64-apple-darwin -e normal --all-features --prefix none \
+  | awk '{print $1}' | sort -u > /tmp/after.txt
+comm -13 /tmp/before.txt /tmp/after.txt      # expect exactly the 14 names in the table above
+comm -13 /tmp/before.txt /tmp/after.txt | wc -l   # expect 14
 ```
 
-Write the measured `Cargo.lock` figure into the `<FILL IN>` above. **If the
-compiled figure is not 14, that is a finding** — put it in the task report with
-the names that differ, exactly as 12a did when +48 landed against +18–24.
+`--prefix none` is what makes `awk '{print $1}'` a crate name rather than a box-drawing
+character, and `comm` needs both sides sorted, which `sort -u` above guarantees.
 
-### Step 1.4 — it compiles with nothing using it
+Write the measured `Cargo.lock` figure into the `<FILL IN>` above. **If either
+figure is not 14, that is a finding** — put it in the task report with the names
+that differ, exactly as 12a did when +48 landed against +18–24.
+
+### Step 1.4 — it compiles with nothing using it, and not on Windows
 
 ```bash
 cargo check -p shep-cli --all-features                         # EXIT=0
-cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu
+cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu   # EXIT=0
 ```
 
-The Windows check is the one that proves `cfg(unix)` placement: `grep -c rmcp`
-on that command's output should print `0` — rmcp must not appear in a Windows
-build at all.
+**The `cfg(unix)` placement needs a check that can actually fail, and a `grep`
+over `cargo check`'s output is not one.** The first draft said to run `grep -c
+rmcp` on that command's output and expect `0`. It would print `0` whatever the
+manifest said, because `cargo check` writes its `Checking …` lines to **stderr**
+and a bare pipe carries stdout; and on a warm target dir it prints nothing at
+all, so the mutation below would be unobservable too. The placement claim would
+have been unverified in both directions — the exact shape § "Four shapes a dead
+check takes" exists to catch, shipped in the task that introduces the section.
+
+The build-state-independent, stdout-based check instead:
+
+```bash
+cargo tree -p shep-cli --target x86_64-pc-windows-gnu -e normal --all-features | grep -c rmcp
+```
+
+**Baseline before Step 1.2: `0`** (the package is not a dependency at all).
+**After Step 1.2: still `0`** — declared, but not for this target. The
+`cargo check --target x86_64-pc-windows-gnu` run stays exactly where it is, as
+the `EXIT=0` gate it already is; this is the additional check that says *why*
+it passed. Run the same command for `schemars`, which is the second entry this
+task adds and would otherwise go unchecked.
 
 **Tests:** none. This task adds no code. Count unchanged: **1219 / 0 / 4**.
 
-**Mutation:** move the `rmcp.workspace = true` line out of
-`[target.'cfg(unix)'.dependencies]` into the plain `[dependencies]` table. The
-Windows cross-check must go from `EXIT=0` to building rmcp (visible as rmcp
-compile units in its output). If it does not, the cross-check is not reaching
-this dependency and the placement claim is unverified.
+**Mutation:** move the `rmcp.workspace = true` and `schemars.workspace = true`
+lines out of `[target.'cfg(unix)'.dependencies]` into the plain
+`[dependencies]` table. `cargo tree … --target x86_64-pc-windows-gnu … | grep -c
+rmcp` must go from `0` to `1` or more. If it does not, the tree command is not
+reaching this dependency and the placement claim is unverified. (Do not use the
+`cargo check` exit code as the mutation's signal: the Windows cross-check may
+well still pass, since rmcp itself is portable — the claim under test is that it
+is not *built*, not that it cannot be.)
 
 ---
 
@@ -884,6 +1253,20 @@ fn a_whistle_section_parses_and_defaults_to_refusing_control() {
         !absent.whistle.allow_control,
         "a file with no [whistle] section leaves control off"
     );
+
+    // The third case, and it is a DIFFERENT code path from the second: an
+    // absent `[whistle]` table is filled by `RawDaemonConfig`'s own
+    // container-level `#[serde(default)]` (daemon.rs:146-151), which never
+    // consults the field's serde default at all. A present-but-empty table
+    // is the only input that does. Without this line, a field-level
+    // `#[serde(default = "...")]` on `allow_control` could flip the gate open
+    // and no test in this file would notice — which is exactly what the
+    // first draft's mutation assumed it was proving.
+    let empty_table = DaemonConfig::load(Some("[whistle]\n"), &no_env).unwrap();
+    assert!(
+        !empty_table.whistle.allow_control,
+        "a [whistle] section with no keys leaves control off"
+    );
 }
 
 // fails if the section silently accepts a key it does not implement. A
@@ -896,9 +1279,15 @@ fn a_misspelled_whistle_key_is_a_named_error() {
     let DaemonConfigError::Toml(message) = err else {
         panic!("a misspelled key is a TOML error, got {err:?}")
     };
+    // The full quoted form, not the bare stem: `"allow_control"` also
+    // contains `"allow_contro"`, so an assertion on the stem would pass on a
+    // message that named only what serde EXPECTED and never quoted what the
+    // operator actually wrote. serde's `deny_unknown_fields` message is
+    // "unknown field `allow_contro`, expected `allow_control`", and the
+    // closing backtick is what distinguishes the two.
     assert!(
-        message.contains("allow_contro"),
-        "the message names the key that was not understood: {message}"
+        message.contains("unknown field `allow_contro`"),
+        "the message quotes the key that was not understood: {message}"
     );
 }
 ```
@@ -976,10 +1365,34 @@ cargo test -p shep-core --lib --all-features        # EXIT=0
 
 **Tests:** +2 in shep-core. Expected shape: **1221 / 0 / 4**.
 
-**Mutation:** change `WhistleSection::allow_control`'s default to `true` by
-adding `#[serde(default = "yes")]`. `a_whistle_section_parses_and_defaults_to_
-refusing_control`'s second assertion must redden. If it does not, the default
-is not under test and the gate has no floor.
+**Mutation:** replace the derived `Default` with an open one —
+
+```rust
+impl Default for WhistleSection {
+    fn default() -> Self {
+        Self { allow_control: true }
+    }
+}
+```
+
+— and drop `Default` from the `#[derive(...)]` list.
+`a_whistle_section_parses_and_defaults_to_refusing_control`'s **second and
+third** assertions must both redden, and so must Task 3's
+`the_file_is_the_only_source_and_it_defaults_to_read_only`. If they do not, the
+default is not under test and the gate has no floor.
+
+The first draft named a different mutation — `#[serde(default = "yes")]` on the
+field — and it was wrong twice. It names a function path that does not exist,
+so it fails to compile rather than reddening anything (an implementer would
+report "mutation not applicable" and move on); and even spelled correctly, with
+`fn yes() -> bool { true }` beside the struct, it would **not** redden the
+assertion it names. A field-level serde default only fires when the containing
+table is present and the key is missing. With no `[whistle]` section at all,
+`RawDaemonConfig`'s container-level `#[serde(default)]` (daemon.rs:146-151)
+supplies `WhistleSection::default()` and the field attribute is never consulted.
+Replacing `Default` itself is the mutation that reaches every path — which is
+also why the new third assertion above exists, to keep the narrower path covered
+too.
 
 ---
 
@@ -1035,29 +1448,20 @@ mod tests {
         );
     }
 
-    /// fails if an environment variable becomes a second source. The whole
-    /// argument for a config file over a flag is that a launcher writes the
-    /// argv AND the environment; an env override would hand back exactly
-    /// what the flag was refused for.
-    ///
-    /// `SHEP_LOG_LEVEL` is the control: it is a real, live env key that
-    /// `DaemonConfig::load` DOES honour, so this test proves the env closure
-    /// is genuinely disabled here rather than proving that some made-up key
-    /// is ignored.
-    #[test]
-    fn no_environment_variable_can_open_the_gate() {
-        // SAFETY-free: `resolve_control` passes `&|_| None` for the env
-        // closure, so this process's real environment is not consulted and
-        // nothing needs setting to prove it. The claim under test is a
-        // property of the call, and the assertion below is what would fail
-        // if someone swapped in `&|k| std::env::var(k).ok()`.
-        assert_eq!(
-            resolve_control(Some("[daemon]\nlog_level = \"trace\"\n[whistle]\nallow_control = false\n")),
-            Control::ReadOnly
-        );
-        let source = "[whistle]\nallow_control = true\n";
-        assert_eq!(resolve_control(Some(source)), Control::Allowed);
-    }
+    // DELETED, deliberately, and the deletion is recorded here so it is not
+    // reinstated by a well-meaning later reader:
+    // `no_environment_variable_can_open_the_gate` was a dead check twice
+    // over. It set no environment variable, so swapping `&|_| None` for
+    // `&|k| std::env::var(k).ok()` — the exact regression its doc claimed to
+    // catch — left it green. And the property was vacuous anyway:
+    // `DaemonConfig::load` reads only SHEP_LOG_JSON, SHEP_LOG_LEVEL,
+    // SHEP_SOCKET and SHEP_MAX_CRON_SLEEP (daemon.rs:178-205), none of which
+    // touches `whistle.allow_control` in either direction, so no env closure
+    // could open this gate whatever was passed. Its assertions duplicated the
+    // first test's. The real environment-reaches-the-gate path is
+    // `--home`/`$SHEP_HOME` selecting WHICH shep.toml is read — see the
+    // plan's "Why there is no `--allow-control` flag" — and Task 10 pins that
+    // one end to end, in a real process, where it can actually fail.
 
     /// fails if the refusal text stops naming the exact edit. An operator
     /// told "control is off" and not told the two lines to write will guess,
@@ -1065,6 +1469,8 @@ mod tests {
     #[test]
     fn the_refusal_names_the_file_and_the_key() {
         let notice = Control::ReadOnly.how_to_open();
+        // Method syntax on a value, which is why `how_to_open` takes `self`
+        // rather than being a receiverless associated function.
         assert!(notice.contains("[whistle]"));
         assert!(notice.contains("allow_control = true"));
         assert!(notice.contains("shep.toml"));
@@ -1118,8 +1524,13 @@ impl Control {
     /// Named rather than inlined because three places say it — the tool
     /// catalogue, `get_info`'s instructions, and the stderr notice on a
     /// malformed config — and three copies would drift.
+    ///
+    /// Takes `self` (`Control` is `Copy`) rather than being receiverless: the
+    /// call sites read `control.how_to_open()`, and a receiver leaves room for
+    /// the `Allowed` arm to say something different later without moving any
+    /// of them.
     #[must_use]
-    pub const fn how_to_open() -> &'static str {
+    pub const fn how_to_open(self) -> &'static str {
         "control tools are off; add `[whistle]` with `allow_control = true` to \
          $SHEP_HOME/shep.toml and restart whistle"
     }
@@ -1134,13 +1545,23 @@ impl Control {
 /// ([`super::whistle`]) prints the parse failure to stderr, so a shut gate is
 /// never silent about being shut for the wrong reason.
 ///
-/// **`&|_| None` for the environment closure is load-bearing, not laziness.**
-/// `DaemonConfig::load` layers `SHEP_*` variables over the file, and here that
-/// layer is switched off deliberately: whistle is launched by an agent host
-/// whose config file writes both the argv and the environment, so an env
-/// override would be the `--allow-control` flag spec §14.7 refuses, wearing a
-/// different hat. There is no `SHEP_WHISTLE_ALLOW_CONTROL` and there must not
-/// be one.
+/// **`&|_| None` for the environment closure is about testability, not
+/// security.** `DaemonConfig::load` layers `SHEP_LOG_JSON`, `SHEP_LOG_LEVEL`,
+/// `SHEP_SOCKET` and `SHEP_MAX_CRON_SLEEP` over the parsed file; **none of the
+/// four touches `allow_control` in either direction**, so no env closure could
+/// open this gate and passing `None` defends nothing. What it does buy is that
+/// this function is a pure function of the file's text: every case is testable
+/// without a tempdir, without `std::env::set_var` (`unsafe` in edition 2024,
+/// and it races the rest of the suite), and without depending on how the test
+/// binary happened to be launched.
+///
+/// There is still no `SHEP_WHISTLE_ALLOW_CONTROL`, and there must not be one —
+/// but the reason is spec §14.7's, which is about a config file being
+/// auditable where a per-invocation setting is not. It is **not** that argv and
+/// the environment cannot reach this gate. They can, by choosing which
+/// `$SHEP_HOME` is read: `shep whistle --home <dir>` and `SHEP_HOME=<dir> shep
+/// whistle` both select the `shep.toml` this function is handed. The launcher
+/// is the boundary, in argv, environment and file alike.
 #[must_use]
 pub fn resolve_control(shep_toml: Option<&str>) -> Control {
     match DaemonConfig::load(shep_toml, &|_| None) {
@@ -1160,7 +1581,8 @@ testable without a tempdir.
 cargo test -p shep-cli --bins --all-features        # EXIT=0
 ```
 
-**Tests:** +4 in shep-cli. Expected shape: **1225 / 0 / 4**.
+**Tests:** +3 in shep-cli (the fourth was deleted above, for cause).
+Expected shape: **1224 / 0 / 4**.
 
 **Mutation:** change the `_ =>` arm to `Err(_) => Control::Allowed`.
 `a_file_that_will_not_parse_is_read_as_no` must redden. If it does not, the
@@ -1208,29 +1630,44 @@ feature:
 /// connection per request — see `shep-cli/src/whistle/shepherd.rs` for why —
 /// so it needs a listener that outlives the first call.
 ///
-/// The handle's value is the number of connections served, which is what lets
-/// a test assert that a request was made exactly once rather than retried.
+/// The returned `served` counter is shared, not the task's return value: the
+/// accept loop never ends on its own, so a `JoinHandle<u32>` would carry a
+/// number no caller could ever read (a caller that `abort()`s gets
+/// `JoinError::Cancelled`, and a caller that awaits waits forever). An
+/// `AtomicU32` the test reads WHILE the fake is still running is what lets a
+/// test assert that a request was made exactly once rather than retried.
 ///
 /// Panics if `path` cannot be bound — test scaffolding, the same failure mode
 /// [`fake_daemon`] documents.
-pub fn fake_daemon_accepting_repeatedly(path: &Path, reply: Response) -> JoinHandle<u32> {
+pub fn fake_daemon_accepting_repeatedly(
+    path: &Path,
+    reply: Response,
+) -> (JoinHandle<()>, Arc<AtomicU32>) {
     let listener = UnixListener::bind(path).unwrap();
-    tokio::spawn(async move {
-        let mut served = 0;
+    let served = Arc::new(AtomicU32::new(0));
+    let counter = Arc::clone(&served);
+    let handle = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let mut frames = Framed::new(stream, codec());
             handshake(&mut frames, sample_ack()).await;
             let envelope = read_envelope(&mut frames).await;
-            write_reply(&mut frames, envelope.id, Ok(reply.clone())).await;
-            served += 1;
+            // `write_reply` wraps the value in `Ok` itself — its signature is
+            // `(&mut Frames, u64, Response)`, testing.rs:155 — so passing an
+            // `Ok(...)` here is a type error, not a courtesy.
+            write_reply(&mut frames, envelope.id, reply.clone()).await;
+            counter.fetch_add(1, Ordering::SeqCst);
         }
-        served
-    })
+    });
+    (handle, served)
 }
 ```
 
-`write_reply` and `read_envelope` are the module's own existing private
-helpers; use them rather than re-encoding a frame by hand.
+**Copy `serve_one_request` (testing.rs:82-96) as the shape.** This helper is
+that function with `accept()` moved inside a loop, the returned `Envelope`
+traded for a counter, and `sample_ack()` inlined. `write_reply`, `read_envelope`,
+`handshake`, `codec` and `sample_ack` are the module's own existing helpers —
+use them rather than re-encoding a frame by hand. `Arc`, `AtomicU32` and
+`Ordering` need imports the module does not have yet.
 
 ### Step 4.1 — the tests
 
@@ -1240,37 +1677,66 @@ mod tests {
     use super::*;
     use shep_core::protocol::{RpcError, RpcErrorCode};
 
-    /// fails if a daemon-side refusal stops reaching the model verbatim.
-    /// shep does not paraphrase the shepherd: "api is already being
-    /// reloaded" is actionable and a whistle-invented replacement is not.
+    /// fails if a daemon-side refusal stops reaching the model verbatim, or
+    /// stops being IN-BAND. shep does not paraphrase the shepherd: "api is
+    /// already being reloaded" is actionable and a whistle-invented
+    /// replacement is not — but a message a host routes to the user instead
+    /// of the model is just as lost. `is_error: true` on a `CallToolResult`
+    /// is what keeps it in front of the model; an `Err(ErrorData)` becomes a
+    /// JSON-RPC protocol error (rmcp handler/server/tool.rs:119-123) and the
+    /// host decides.
     #[test]
-    fn a_daemon_refusal_keeps_its_own_message() {
-        let err = to_tool_error(&RequestError::Rpc(RpcError {
+    fn a_daemon_refusal_is_an_in_band_error_keeping_its_own_message() {
+        let result = refusal(&RequestError::Rpc(RpcError {
             code: RpcErrorCode::Internal,
             message: "api is already being reloaded".to_string(),
         }));
-        assert!(err.message.contains("api is already being reloaded"));
-        assert!(
-            err.message.contains("internal"),
-            "and the code, so a model can tell a conflict from a not-found: {}",
-            err.message
+        assert_eq!(result.is_error, Some(true));
+        let structured = result
+            .structured_content
+            .expect("a refusal carries structured content a model can branch on");
+        assert_eq!(structured["message"], "api is already being reloaded");
+        assert_eq!(
+            structured["code"], "internal",
+            "and the code, so a model can tell a conflict from a not-found: {structured}"
         );
     }
 
     /// fails if an unreachable shepherd stops naming the socket. "connection
     /// refused" alone tells a model nothing it can act on; the path is what
     /// an operator greps for.
+    ///
+    /// `ConnectError::Connect` is a STRUCT variant carrying both fields
+    /// (`crates/shep-client/src/connection.rs:44-49`) — constructing it as a
+    /// tuple variant does not compile.
     #[test]
-    fn an_unreachable_shepherd_names_the_socket() {
-        let err = connect_error(
-            std::path::Path::new("/nonexistent/shep/run/shep.sock"),
-            &ConnectError::Connect(std::io::Error::from(std::io::ErrorKind::NotFound)),
+    fn an_unreachable_shepherd_names_the_socket_once() {
+        let socket = std::path::Path::new("/nonexistent/shep/run/shep.sock");
+        let result = connect_refusal(
+            socket,
+            &ConnectError::Connect {
+                path: socket.to_path_buf(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
         );
-        assert!(err.message.contains("/nonexistent/shep/run/shep.sock"));
+        assert_eq!(result.is_error, Some(true));
+        let message = result.structured_content.expect("structured")["message"]
+            .as_str()
+            .expect("a string")
+            .to_string();
+        assert!(message.contains("/nonexistent/shep/run/shep.sock"));
         assert!(
-            err.message.contains("no shepherd"),
-            "and says what is missing, not just what failed: {}",
-            err.message
+            message.contains("no shepherd"),
+            "and says what is missing, not just what failed: {message}"
+        );
+        // ONCE, not twice. `ConnectError`'s own `Display` already prints
+        // ``could not connect to `<path>` `` (connection.rs:78-80), so a
+        // wrapper that prepends the path too says it twice — which reads as
+        // two different sockets to anything skimming.
+        assert_eq!(
+            message.matches("/nonexistent/shep/run/shep.sock").count(),
+            1,
+            "the socket path appears once, not once per layer: {message}"
         );
     }
 
@@ -1285,7 +1751,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("shep.sock");
 
-        let first = shep_client::testing::fake_daemon_accepting_repeatedly(
+        let (first, first_served) = shep_client::testing::fake_daemon_accepting_repeatedly(
             &socket,
             Response::Pong,
         );
@@ -1297,13 +1763,18 @@ mod tests {
         .await
         .expect("the first call finished within ten seconds");
         assert!(one.is_ok());
+        assert_eq!(
+            first_served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one call is one connection — not zero, and not a retry"
+        );
 
         // The shepherd goes away entirely: task aborted, socket file removed.
         // A `Shepherd` holding a connection would be holding a dead one.
         first.abort();
         std::fs::remove_file(&socket).unwrap();
 
-        let second = shep_client::testing::fake_daemon_accepting_repeatedly(
+        let (second, _second_served) = shep_client::testing::fake_daemon_accepting_repeatedly(
             &socket,
             Response::Pong,
         );
@@ -1336,8 +1807,9 @@ mod tests {
 use std::path::{Path, PathBuf};
 
 use rmcp::ErrorData as McpError;
+use rmcp::model::CallToolResult;
 use shep_client::{Client, ConnectError, RequestError};
-use shep_core::protocol::{Request, Response};
+use shep_core::protocol::{HelloAck, Request, Response};
 
 /// The socket, and the one operation anything in `whistle` performs on it.
 #[derive(Debug, Clone)]
@@ -1361,31 +1833,66 @@ impl Shepherd {
     ///
     /// # Errors
     ///
-    /// An [`McpError`] carrying the shepherd's own message: the connect
-    /// failure with the socket path, or the daemon's [`RpcError`] with its
-    /// code and text unaltered.
-    pub async fn call(&self, request: Request) -> Result<Response, McpError> {
+    /// A [`CallToolResult`] with `is_error: true` — never an [`McpError`] —
+    /// carrying the shepherd's own message. See [`refusal`] for why the
+    /// distinction is load-bearing.
+    pub async fn call(&self, request: Request) -> Result<Response, CallToolResult> {
+        self.call_with_ack(request).await.map(|(_ack, response)| response)
+    }
+
+    /// [`Self::call`], plus the handshake the connection was opened with.
+    ///
+    /// `get_metrics` needs `daemon_version` and `daemon_pid` for
+    /// [`super::facts::MetricsReading`], and those live on the [`Client`]
+    /// (`Client::daemon() -> &HelloAck`, shep-client/src/client.rs:175) which
+    /// [`Self::call`] drops before it returns. Rather than making every caller
+    /// deal with a tuple, `call` delegates here and throws the ack away.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::call`].
+    pub async fn call_with_ack(
+        &self,
+        request: Request,
+    ) -> Result<(HelloAck, Response), CallToolResult> {
         let client = Client::connect(&self.socket)
             .await
-            .map_err(|err| connect_error(&self.socket, &err))?;
-        let response = client.request(request).await.map_err(|err| to_tool_error(&err));
+            .map_err(|err| connect_refusal(&self.socket, &err))?;
+        let ack = client.daemon().clone();
+        let response = client.request(request).await.map_err(|err| refusal(&err));
         // Dropping the client ends its actor task and closes the socket. Done
         // explicitly rather than by scope end so the ordering is visible: the
         // reply is already in hand.
         let _ = client.close().await;
-        response
+        response.map(|response| (ack, response))
     }
 }
 
-/// A connect failure, as a tool error naming the socket.
-fn connect_error(socket: &Path, err: &ConnectError) -> McpError {
-    McpError::internal_error(
-        format!("no shepherd is running at {}: {err}", socket.display()),
-        None,
-    )
+/// A connect failure, as an in-band tool error naming the socket ONCE.
+///
+/// `ConnectError`'s own `Display` already prints
+/// ``could not connect to `<path>`: <source>`` (shep-client's
+/// connection.rs:78-80), so this wrapper does not repeat the path — it adds
+/// only the words that say what is missing rather than what failed, which is
+/// what a model can act on.
+fn connect_refusal(socket: &Path, err: &ConnectError) -> CallToolResult {
+    let _ = socket; // named in the signature for call-site readability; the
+                    // path itself comes out of `err`'s own Display.
+    CallToolResult::structured_error(serde_json::json!({
+        "code": "no_shepherd",
+        "message": format!("no shepherd is running: {err}"),
+    }))
 }
 
-/// A request failure, as a tool error carrying the shepherd's own words.
+/// A request failure, as an in-band tool error carrying the shepherd's words.
+///
+/// **`CallToolResult::structured_error`, not `Err(ErrorData)`.** rmcp turns an
+/// `Err(ErrorData)` into a JSON-RPC protocol error — `impl IntoCallToolResult
+/// for ErrorData` returns `Err(self)` (rmcp handler/server/tool.rs:119-123) —
+/// and MCP reserves protocol errors for unknown tools and malformed params. A
+/// host is free to show one to the user and not to the model. A daemon refusal
+/// is an execution failure the model must see and can act on, so it goes
+/// in-band with `is_error: true` (rmcp model.rs:3990).
 ///
 /// The daemon's message is passed through unaltered, including the cases where
 /// its code is imprecise — `rpc.rs` maps `SupervisorError::ReloadInFlight` to
@@ -1393,29 +1900,49 @@ fn connect_error(socket: &Path, err: &ConnectError) -> McpError {
 /// protest", the right answer being a conflict code the wire does not have
 /// yet. A model reading "api is already being reloaded" can act on that. A
 /// model reading a nicer code whistle invented would be reading fiction.
-fn to_tool_error(err: &RequestError) -> McpError {
-    match err {
-        RequestError::Rpc(rpc) => McpError::internal_error(
-            // `ExitCode::from(RpcErrorCode)` then `code_str()`, rather than a
-            // second `match` spelling the codes out here: `exit.rs` is already
-            // the one place this binary decides how a daemon error code is
-            // spelled (`not_found`, `invalid_config`, ...), and a copy would
-            // be a second spelling to drift. The MESSAGE is untouched — no
-            // lowercasing, no rewrapping — because it routinely carries an
-            // app's own name, and `Api` is not `api`.
-            format!(
-                "the shepherd refused this ({}): {}",
-                ExitCode::from(rpc.code).code_str(),
-                rpc.message
-            ),
-            None,
+fn refusal(err: &RequestError) -> CallToolResult {
+    let (code, message) = match err {
+        // `ExitCode::from(RpcErrorCode)` then `code_str()`, rather than a
+        // second `match` spelling the codes out here: `exit.rs` is already the
+        // one place this binary decides how a daemon error code is spelled
+        // (`not_found`, `invalid_config`, ...) — see exit.rs:71 and :95 — and
+        // a copy would be a second spelling to drift. The MESSAGE is untouched
+        // — no lowercasing, no rewrapping — because it routinely carries an
+        // app's own name, and `Api` is not `api`.
+        RequestError::Rpc(rpc) => (
+            ExitCode::from(rpc.code).code_str().to_string(),
+            rpc.message.clone(),
         ),
         // `Timeout`, `Closed` and `Wire` each have a `Display` that already
         // says what happened in one clause; there is nothing to add.
-        other => McpError::internal_error(other.to_string(), None),
-    }
+        other => ("transport".to_string(), other.to_string()),
+    };
+    CallToolResult::structured_error(serde_json::json!({
+        "code": code,
+        "message": message,
+    }))
+}
+
+/// whistle's OWN refusal, before anything reaches the wire.
+///
+/// One shape for both kinds, so a model never has to learn two. `start_sheep`'s
+/// already-running refusal is the only caller today.
+fn own_refusal(code: &str, message: String) -> CallToolResult {
+    CallToolResult::structured_error(serde_json::json!({
+        "code": code,
+        "message": message,
+    }))
 }
 ```
+
+**Every tool signature is therefore `Result<Json<T>, CallToolResult>`, not
+`Result<Json<T>, McpError>`.** rmcp handles that: `IntoCallToolResult` is
+implemented for `Result<T, E>` where **both** sides implement it
+(handler/server/tool.rs:125-131), and `CallToolResult` implements it
+(`:101-105`) — with the `Err` branch setting `is_error = true` for you, which
+is belt-and-braces given `structured_error` already did. `McpError` is still
+reachable and still right for a params-level failure, but no code in this phase
+constructs one: rmcp raises those itself.
 
 ### Step 4.3 — verify
 
@@ -1425,7 +1952,7 @@ cargo test -p shep-cli --bins --all-features        # EXIT=0
 
 **Tests:** +3 in shep-cli. Step 4.0's helper adds no test of its own — it is
 scaffolding, exercised by the third case above. Expected shape:
-**1228 / 0 / 4**.
+**1227 / 0 / 4**.
 
 **Mutation:** make `Shepherd` hold `tokio::sync::Mutex<Option<Client>>` and
 reuse the handle. `two_calls_survive_a_shepherd_that_restarted_in_between` must
@@ -1522,6 +2049,41 @@ mod tests {
         }
     }
 
+    /// fails if a tool's declared shape stops being one MCP will accept.
+    ///
+    /// Two halves, and they are different rules in rmcp 3.1.2:
+    ///
+    /// - **Output.** `structuredContent` is an OBJECT on the wire (rmcp's own
+    ///   field doc, model.rs:3802-3803), and `Json<T>` puts `T` there verbatim
+    ///   via `CallToolResult::structured` (model.rs:3963-3971). rmcp will not
+    ///   stop a `Vec`: 3.1.2's `schema_for_output` deliberately does not
+    ///   validate the root type (common.rs:109-120, per SEP-2106), so the
+    ///   failure would be a wire-shape violation a strict client rejects and a
+    ///   lenient one silently takes — the worst kind. Hence the wrappers, and
+    ///   hence this test rather than a comment.
+    /// - **Input.** `schema_for_input` DOES validate (common.rs:77-96) and the
+    ///   `#[tool]` macro `panic!`s on the `Err` during router construction
+    ///   (rmcp-macros/tool.rs:200-208) — i.e. inside `Whistle::new`, on every
+    ///   startup and in the first line of every test in Tasks 6-10. Every
+    ///   argument type here is a plain struct so this holds by construction,
+    ///   which is exactly what was said about the output side before it turned
+    ///   out to be wrong.
+    #[test]
+    fn every_declared_tool_shape_is_object_rooted() {
+        for (label, schema) in [
+            ("FlockListing", schemars::schema_for!(FlockListing)),
+            ("BarkListing", schemars::schema_for!(BarkListing)),
+            ("MetricsReading", schemars::schema_for!(MetricsReading)),
+            ("BleatTail", schemars::schema_for!(BleatTail)),
+        ] {
+            let value = serde_json::to_value(schema).unwrap();
+            assert_eq!(
+                value["type"], "object",
+                "{label} is a tool's declared output and must be object-rooted"
+            );
+        }
+    }
+
     /// fails if a bark row drifts from `shep barks --format json`.
     #[test]
     fn a_bark_row_serializes_exactly_as_a_bark_does() {
@@ -1582,6 +2144,31 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use shep_core::barks::{Bark, SinkOutcome};
 use shep_core::protocol::{DogSource, Lamb, ProcessInfo};
+
+/// Every list-shaped tool's payload: rows under a named field.
+///
+/// **Not a bare `Vec`.** `Json<T>` hands `T` straight to
+/// `CallToolResult::structured`, which puts it in `structured_content` —
+/// `structuredContent` on the wire, which MCP types as an object. A `Vec`
+/// would put a JSON array there. rmcp 3.1.2 does not stop it (its
+/// `schema_for_output` stopped validating root types per SEP-2106), so this
+/// would be wrong quietly rather than loudly, which is worse.
+///
+/// It also leaves room: a listing that later needs a `total` or a `truncated`
+/// beside its rows can grow one without changing the tool's output shape from
+/// array to object, which IS a breaking change for a consumer.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FlockListing {
+    /// The matched sheep and dogs, in the order the shepherd reported them.
+    pub flock: Vec<SheepRow>,
+}
+
+/// `list_barks`' payload. Same rule, same reason as [`FlockListing`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BarkListing {
+    /// The most recent alerts, oldest first.
+    pub barks: Vec<BarkRow>,
+}
 
 /// One sheep, exactly as `shep flock --format json` renders it.
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1689,8 +2276,13 @@ test:
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct MetricsReading {
     /// The shepherd's crate version, from the handshake.
+    ///
+    /// From [`super::shepherd::Shepherd::call_with_ack`], not from the reply:
+    /// the handshake lives on the `Client` (`Client::daemon() -> &HelloAck`,
+    /// shep-client/src/client.rs:175) and plain `call` drops the client before
+    /// it returns, so `get_metrics` would have no way to fill this field.
     pub daemon_version: String,
-    /// The shepherd's pid, from the same handshake.
+    /// The shepherd's pid, from the same handshake and the same call.
     pub daemon_pid: u32,
     /// Every registered entry, sheep and dogs alike.
     pub flock: Vec<SheepRow>,
@@ -1740,7 +2332,7 @@ convert with `u64::try_from(...).unwrap_or(u64::MAX)` and say so in a comment.
 cargo test -p shep-cli --bins --all-features        # EXIT=0
 ```
 
-**Tests:** +4 in shep-cli. Expected shape: **1232 / 0 / 4**.
+**Tests:** +5 in shep-cli. Expected shape: **1232 / 0 / 4**.
 
 **Mutation:** rename `SheepRow::uptime_ms` to `uptime` with
 `#[serde(rename = "uptime")]`. Both equality tests must redden. If they do not,
@@ -1757,10 +2349,63 @@ the twin is not pinned and the vocabulary claim in the docs is unearned.
 ```bash
 grep -n 'fn read_tail' crates/shep-cli/src/commands/bleats.rs    # 254, and it is private
 grep -n 'fn sample_host' crates/shep-cli/src/dog/metrics/mod.rs  # 120, and it is private
+grep -n 'const TAIL_LINES' crates/shep-cli/src/commands/bleats.rs # 222
 ```
 
-Both get promoted to `pub(crate)` in this task, each with a comment saying who
-the second caller is. No logic moves.
+Both get promoted to `pub(crate)`, each with a comment saying who the second
+caller is.
+
+**`sample_host` is a visibility change and nothing else. `read_tail` is not.**
+The first draft said "no logic moves" of both, and that is wrong about
+`read_tail`: its signature is `fn read_tail(path: &Path) -> io::Result<Vec<String>>`
+(bleats.rs:254) and it hard-caps at `const TAIL_LINES: usize = 50` internally
+(:222, applied at :279-280). It takes no count, so a `lines: 200` request could
+never return more than 50; and the surplus is `drain`ed, so
+`BleatTail::truncated` is not derivable from the return value at all. This
+task's headline test and one of its two documented payload fields are both
+unimplementable without changing it.
+
+**The change, spelled out:**
+
+```rust
+/// The last `limit` lines of one log file, bounded twice over: a
+/// [`TAIL_WINDOW_BYTES`] window from the end of the file, then `limit` once
+/// that window is split into lines.
+///
+/// Returns the lines and whether the LINE cap was what cut them short — the
+/// caller needs to tell "this is all of it" from "this is the last N", and
+/// `whistle`'s `tail_bleats` surfaces that to a model as
+/// `BleatTail::truncated`. A model that cannot tell the two apart concludes a
+/// busy app went quiet.
+///
+/// `limit` is a parameter rather than a constant because there are now two
+/// callers with two answers: `commands::bleats` passes [`TAIL_LINES`], which
+/// is what keeps `shep bleats --no-follow` byte-identical, and `whistle`
+/// passes its own clamped `lines`.
+pub(crate) fn read_tail(path: &Path, limit: usize) -> io::Result<(Vec<String>, bool)> {
+```
+
+The body reads `limit + 1` lines' worth from the window and reports the
+overflow, rather than draining silently:
+
+```rust
+    let keep_from = lines.len().saturating_sub(limit);
+    let truncated = keep_from > 0;
+    lines.drain(..keep_from);
+    Ok((lines, truncated))
+```
+
+`commands::bleats`'s own call site becomes `read_tail(path, TAIL_LINES)?.0`,
+and **`bleats.rs:1408-1413`'s "exactly TAIL_LINES lines must reach stdout"
+regression is this task's verify step**, not an afterthought — it is the check
+that says CLI behaviour did not move. So is `bleats.rs:1424`'s
+long-line-defeats-the-window case, which exercises the `start > 0` branch the
+edit sits next to.
+
+Note the `truncated` this returns is the LINE cap only. A tail cut short by
+`TAIL_WINDOW_BYTES` instead reports `false`, which is honest for the field's
+own doc ("cut short by the line cap rather than by the end of the file") and is
+why that doc says "line cap" rather than "truncated at all".
 
 ### Step 6.1 — the tests first
 
@@ -1812,13 +2457,13 @@ async fn list_barks_reads_the_file_with_no_shepherd_anywhere_in_reach() { /* ...
 //! and two open files read-only.
 
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::{ErrorData as McpError, tool, tool_router};
-use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use super::Whistle;
-use super::facts::{BarkRow, BleatTail, MetricsReading, SheepRow};
+use super::facts::{BarkListing, BleatTail, FlockListing, MetricsReading};
 
 /// The argument every sheep-scoped tool takes.
 ///
@@ -1834,7 +2479,13 @@ pub struct SheepName {
     pub name: String,
 }
 
-#[tool_router(router = read_only_router)]
+// `vis = "pub(crate)"` is REQUIRED, not decoration. The macro emits
+// `#vis fn #router() -> ToolRouter<Self>` with `vis` defaulting to nothing
+// (rmcp-macros/tool_router.rs:25-27, 68-72), i.e. private to THIS module —
+// and `Whistle::new` calls it from `whistle/mod.rs`, the parent. A private
+// associated fn is visible in its defining module and that module's
+// descendants; a parent is neither, so without this the call is `E0624`.
+#[tool_router(router = read_only_router, vis = "pub(crate)")]
 impl Whistle {
     /// Every sheep and dog the shepherd has registered, with status, pid,
     /// restart count, uptime, CPU and memory.
@@ -1843,7 +2494,7 @@ impl Whistle {
         description = "List every process the shepherd is supervising, with its status, pid, restart count, uptime, CPU and memory. Read-only.",
         annotations(read_only_hint = true)
     )]
-    pub async fn list_flock(&self) -> Result<Json<Vec<SheepRow>>, McpError> { /* ListFlock */ }
+    pub async fn list_flock(&self) -> Result<Json<FlockListing>, CallToolResult> { /* ListFlock */ }
 
     /// One sheep in detail, its process-tree members included.
     #[tool(
@@ -1854,7 +2505,7 @@ impl Whistle {
     pub async fn describe_sheep(
         &self,
         Parameters(SheepName { name }): Parameters<SheepName>,
-    ) -> Result<Json<Vec<SheepRow>>, McpError> { /* Describe with SelectorSpec::Name */ }
+    ) -> Result<Json<FlockListing>, CallToolResult> { /* Describe with SelectorSpec::Name */ }
 
     /// The flock's numbers plus the machine's.
     #[tool(
@@ -1862,7 +2513,9 @@ impl Whistle {
         description = "Resource usage for the whole flock plus host totals: per-process CPU and memory, and the machine's memory, process count and uptime. Read-only.",
         annotations(read_only_hint = true)
     )]
-    pub async fn get_metrics(&self) -> Result<Json<MetricsReading>, McpError> { /* ListFlock + sample_host */ }
+    pub async fn get_metrics(&self) -> Result<Json<MetricsReading>, CallToolResult> {
+        /* call_with_ack(ListFlock) for daemon_version/daemon_pid, + sample_host */
+    }
 
     /// The tail of one sheep's logs.
     #[tool(
@@ -1873,7 +2526,7 @@ impl Whistle {
     pub async fn tail_bleats(
         &self,
         Parameters(params): Parameters<TailParams>,
-    ) -> Result<Json<BleatTail>, McpError> { /* Describe for paths, then read_tail */ }
+    ) -> Result<Json<BleatTail>, CallToolResult> { /* Describe for paths, then read_tail(path, lines) */ }
 
     /// The alert history.
     #[tool(
@@ -1884,7 +2537,7 @@ impl Whistle {
     pub async fn list_barks(
         &self,
         Parameters(params): Parameters<BarksParams>,
-    ) -> Result<Json<Vec<BarkRow>>, McpError> { /* barks::read + tail */ }
+    ) -> Result<Json<BarkListing>, CallToolResult> { /* barks::read + tail */ }
 }
 ```
 
@@ -1915,13 +2568,27 @@ pub struct BarksParams {
 
 The clamp is `lines.unwrap_or(50).min(200)` and it is silent — a model asking
 for 5000 gets 200 and `truncated: true`, which is the honest answer rather than
-an error that costs a round trip.
+an error that costs a round trip. The clamped value is what goes to
+`read_tail(path, lines)`, which is the whole reason that function grew a
+parameter: without it the clamp would be decorative above a hard 50.
 
 ### Step 6.3 — verify
 
 ```bash
 cargo test -p shep-cli --bins --all-features        # EXIT=0
 ```
+
+and, because `read_tail` changed shape, name the two existing cases that say
+CLI behaviour did not:
+
+```bash
+cargo test -p shep-cli --bins --all-features -- bleats   # EXIT=0
+```
+
+`bleats.rs:1408-1413` asserts "exactly TAIL_LINES lines must reach stdout" and
+`:1424` drives a line longer than `TAIL_WINDOW_BYTES`. Both must stay green
+without being edited. **If either needed editing, the refactor changed CLI
+behaviour** and that is a finding for the task report, not a test to fix.
 
 **Tests:** +4 in shep-cli. Expected shape: **1236 / 0 / 4**.
 
@@ -1962,6 +2629,20 @@ async fn start_sheep_refuses_a_running_sheep_and_names_restart_sheep() { /* ... 
 #[tokio::test]
 async fn start_sheep_sends_a_restart_for_a_stopped_sheep() { /* ... */ }
 
+/// fails if a partly-running multi-instance app is partly started. A
+/// four-instance `api` with two online must refuse the WHOLE call and say how
+/// many — never "restart the stopped two and skip the rest".
+/// `supervisor.rs:424-432` is explicit that a partly-accepted selector leaves
+/// the caller unable to tell which half was taken, and a model is the caller
+/// least able to work it out.
+///
+/// The fake daemon answers the `Describe` with four rows, two `Online`; the
+/// assertion is that NO second request arrived (the shared counter from Step
+/// 4.0 reads 1, not 2) and that the message carries both the count and
+/// `restart_sheep`.
+#[tokio::test]
+async fn start_sheep_refuses_the_whole_call_when_any_instance_is_running() { /* ... */ }
+
 /// fails if a daemon refusal stops reaching the model intact. The message
 /// asserted here is the shepherd's own, verbatim: `supervisor.rs`'s
 /// `SupervisorError::ReloadInFlight` renders as "<name> is already being
@@ -1996,7 +2677,10 @@ async fn a_timed_out_control_call_is_reported_not_retried() { /* ... */ }
 //! told to a machine. Each value below is argued in the plan's "The nine
 //! tools" section.
 
-#[tool_router(router = control_router)]
+// `vis = "pub(crate)"` for the same reason `read.rs` carries it: the macro's
+// generated constructor is private by default and `Whistle::new` calls it from
+// the parent module. See the plan's "Every rmcp API this plan names" section.
+#[tool_router(router = control_router, vis = "pub(crate)")]
 impl Whistle {
     /// Start a registered sheep that is not currently running.
     ///
@@ -2009,11 +2693,15 @@ impl Whistle {
     /// name and its own approval story, not a widening of this one.
     #[tool(
         name = "start_sheep",
-        description = "Start a registered sheep that is currently stopped. Refuses if it is already running. Cannot register new processes — the sheep must already be in the flock.",
-        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true)
+        description = "Start a registered sheep that is currently stopped. Cannot register new processes — the sheep must already be in the flock. The running check is a courtesy, not a guarantee: a sheep that comes up between the check and the call is restarted. For a multi-instance app, the whole call is refused if any instance is running.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false)
     )]
     pub async fn start_sheep(&self, Parameters(SheepName { name }): Parameters<SheepName>)
-        -> Result<Json<Vec<SheepRow>>, McpError> { /* Describe, refuse if online/starting, then Restart */ }
+        -> Result<Json<FlockListing>, CallToolResult> {
+        /* Describe; if ANY matched row is online/starting, `own_refusal` naming
+           the count and `restart_sheep`; otherwise Restart. The refusal is
+           advisory — see the plan's TOCTOU note. */
+    }
 
     /// Stop a sheep. It stays registered.
     #[tool(
@@ -2022,7 +2710,7 @@ impl Whistle {
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true)
     )]
     pub async fn stop_sheep(&self, Parameters(SheepName { name }): Parameters<SheepName>)
-        -> Result<Json<Vec<SheepRow>>, McpError> { /* Stop */ }
+        -> Result<Json<FlockListing>, CallToolResult> { /* Stop */ }
 
     /// Restart a sheep: kill, then spawn.
     #[tool(
@@ -2031,7 +2719,7 @@ impl Whistle {
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false)
     )]
     pub async fn restart_sheep(&self, Parameters(SheepName { name }): Parameters<SheepName>)
-        -> Result<Json<Vec<SheepRow>>, McpError> { /* Restart */ }
+        -> Result<Json<FlockListing>, CallToolResult> { /* Restart */ }
 
     /// Reload a sheep: spawn the replacement, then drain the old one.
     #[tool(
@@ -2040,7 +2728,7 @@ impl Whistle {
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false)
     )]
     pub async fn reload_sheep(&self, Parameters(SheepName { name }): Parameters<SheepName>)
-        -> Result<Json<Vec<SheepRow>>, McpError> { /* Reload */ }
+        -> Result<Json<FlockListing>, CallToolResult> { /* Reload */ }
 }
 ```
 
@@ -2055,13 +2743,22 @@ themselves on the bus afterwards. A model told otherwise would call
 cargo test -p shep-cli --bins --all-features        # EXIT=0
 ```
 
-**Tests:** +4 in shep-cli. Expected shape: **1240 / 0 / 4**.
+**Tests:** +5 in shep-cli. Expected shape: **1241 / 0 / 4**.
 
-**Mutation:** flip `stop_sheep`'s annotation to `read_only_hint = true`. The
-catalogue test in Task 9 must redden (it asserts the annotation against the
-mutation column). Run that task's tests too when checking this mutation — this
-is the one cross-task mutation in the plan, and it is deliberate: the
-annotation's only enforcement is the catalogue.
+**Mutation:** flip `stop_sheep`'s annotation to `read_only_hint = true`.
+**`the_annotations_match_the_hand_written_table` in Task 9 must redden.** Run
+that task's tests too when checking this mutation — this is the one cross-task
+mutation in the plan, and it is deliberate: the annotation's only enforcement
+is that table.
+
+The first draft named `every_row_matches_the_router` here, which was the wrong
+test twice over: it built its expectation out of the same `list_all()` it then
+asserted against, so flipping the annotation flipped both sides and it stayed
+green. Task 9 replaces it. If the mutation does not redden
+`the_annotations_match_the_hand_written_table`, that table has drifted into
+being generated too, and a mutating tool can ship annotated `readOnlyHint:
+true` — a lie told to a machine, which is the one thing this phase said it
+would not do.
 
 ---
 
@@ -2091,8 +2788,15 @@ fn a_read_only_whistle_says_in_its_instructions_how_to_open_the_gate() {
     let instructions = info.instructions.expect("whistle always sets instructions");
     assert!(instructions.contains("allow_control = true"));
     assert!(instructions.contains("shep.toml"));
+    // Capitalised, matching the drafted prose in Step 8.2 exactly. The draft
+    // is the contract here, not the assertion: if the two ever disagree, edit
+    // the assertion, because the string is operator-facing and was chosen
+    // word by word. The first draft asserted `"read-only"` against a sentence
+    // opening "Read-only mode.", which fails for a reason that has nothing to
+    // do with the behaviour — and an implementer under time pressure fixes
+    // whichever side is easier, which is the string.
     assert!(
-        instructions.contains("read-only"),
+        instructions.contains("Read-only mode"),
         "and says which state it is in: {instructions}"
     );
 }
@@ -2103,7 +2807,8 @@ fn a_read_only_whistle_says_in_its_instructions_how_to_open_the_gate() {
 fn an_open_whistle_says_its_control_tools_are_live() {
     let info = Whistle::for_test(Control::Allowed).get_info();
     let instructions = info.instructions.expect("whistle always sets instructions");
-    assert!(instructions.contains("control tools are enabled"));
+    // Capitalised to match Step 8.2's draft, same rule as above.
+    assert!(instructions.contains("Control tools are enabled"));
     assert!(
         !instructions.contains("allow_control = true"),
         "an already-open gate must not print the instruction for opening it"
@@ -2189,6 +2894,14 @@ The handler:
 
 ```rust
 /// The MCP server. One per process.
+///
+/// `Debug` is derived, not omitted: `[lints] workspace = true` in shep-cli's
+/// manifest (crates/shep-cli/Cargo.toml:150) makes
+/// `missing_debug_implementations` a deny, and it works —
+/// `ToolRouter<S>` carries a MANUAL `Debug` with no `S: Debug` bound
+/// (rmcp handler/server/router/tool.rs:336), as does `ToolRoute<S>` (:165).
+/// The repo's own convention is to carry it (lookout's `App`, app.rs:197).
+#[derive(Debug)]
 pub struct Whistle {
     shepherd: shepherd::Shepherd,
     paths: ShepPaths,
@@ -2197,6 +2910,31 @@ pub struct Whistle {
 }
 
 impl Whistle {
+    /// The assembled router, for the catalogue and for the gate tests.
+    ///
+    /// `#[tool_handler]` generates `call_tool`, `list_tools` and `get_tool` on
+    /// the `ServerHandler` impl (rmcp-macros/tool_handler.rs:44-95); it does
+    /// NOT put an accessor on the type, so tests that want to enumerate tools
+    /// need this.
+    #[must_use]
+    pub fn router(&self) -> &ToolRouter<Self> {
+        &self.router
+    }
+
+    /// A `Whistle` with a given gate and no reachable shepherd.
+    ///
+    /// Every test in Tasks 8 and 9 asks a question about the router or the
+    /// instructions and never dials, so a `ShepPaths` rooted at a path that
+    /// does not exist is enough. Kept `#[cfg(test)]` so it cannot become a
+    /// production shortcut.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_test(control: gate::Control) -> Self {
+        Self::new(
+            ShepPaths::resolve(&|_| None, std::path::Path::new("/nonexistent")),
+            control,
+        )
+    }
     /// Builds the handler and its router.
     ///
     /// The router is assembled here, once, from the gate: read-only always,
@@ -2302,7 +3040,14 @@ cargo test -p shep-cli --bins --all-features        # EXIT=0
 cargo clippy --workspace --all-targets --all-features -- -D warnings   # EXIT=0
 ```
 
-**Tests:** +4 in shep-cli. Expected shape: **1244 / 0 / 4**.
+**Tests:** +4 in shep-cli. Expected shape: **1245 / 0 / 4**.
+
+**Not tested here, deliberately:** that `--home`/`$SHEP_HOME` selects which
+`shep.toml` the gate is read from. That is a property of `resolve_paths` and
+the dispatch arm, not of `Whistle`, and a bin-tier test would have to reach
+around both to prove it. Task 10 pins it end to end in a real process, where it
+can actually fail — see § "Why there is no `--allow-control` flag" for why the
+property is worth pinning at all rather than left as a surprise.
 
 **Mutation:** in `Whistle::new`, use `Self::read_only_router() +
 Self::control_router()` for both arms. `the_gate_decides_which_tools_exist_at_
@@ -2340,6 +3085,27 @@ artefact that rots the same way.
 #[must_use]
 pub fn render() -> String { /* ... */ }
 
+/// One parsed row of [`render`]'s table, so the freshness and shape tests can
+/// speak about columns rather than about substrings.
+///
+/// Defined here rather than left implicit: the first draft's tests called
+/// `row_for(&render(), name)` and read a `.mutates` field off a type nothing
+/// declared.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Row {
+    /// The tool's name, without its backticks.
+    pub name: String,
+    /// The `mutates` column, as rendered.
+    pub mutates: bool,
+    /// The `gate` column: `always` or `allow_control`.
+    pub gate: &'static str,
+}
+
+/// Finds one rendered row by tool name. Panics if there is none — this is
+/// test-only code and a missing row is the failure, not a `None` to handle.
+#[must_use]
+pub fn row_for(rendered: &str, name: &str) -> Row { /* ... */ }
+
 /// Writes `docs/whistle/tools.md`.
 ///
 ///     cargo test -p shep-cli --bins --all-features -- --ignored write_the_catalogue
@@ -2359,17 +3125,88 @@ with each tool's description below it, verbatim from the router.
 ### Step 9.2 — the pins
 
 ```rust
-/// fails if any row's claim stops matching the router it was rendered from.
-/// This is the test 12a did not have for two of its captions.
+/// The one test in this phase that must genuinely bite.
+///
+/// `ToolAnnotations` is a wire-visible field an agent host reads to decide
+/// whether to ask a human first, so a mutating tool annotated
+/// `readOnlyHint: true` is a lie told to a machine. The expected values below
+/// are **hand-written from the plan's "The nine tools" section** and are
+/// deliberately independent of the source they check — flipping an annotation
+/// in `control.rs` reddens exactly one line here.
+///
+/// The first draft's version of this test could not fail. It built the
+/// `mutates` column FROM `list_all()`'s annotations and then asserted the
+/// column matched those annotations — a comparison of a rendering against its
+/// own source, true by construction. Flipping `stop_sheep` to
+/// `read_only_hint = true` flipped both sides together and it stayed green.
+///
+/// A tool added or removed also reddens this, on the length assertion, which
+/// is the intended cost: nine tools is a decision, and changing it should
+/// require editing a table a human reads.
 #[test]
-fn every_row_matches_the_router() {
+fn the_annotations_match_the_hand_written_table() {
+    // (name, read_only, destructive, idempotent) — from the plan, by hand.
+    const EXPECTED: [(&str, bool, Option<bool>, Option<bool>); 9] = [
+        ("describe_sheep", true, None, None),
+        ("get_metrics", true, None, None),
+        ("list_barks", true, None, None),
+        ("list_flock", true, None, None),
+        ("reload_sheep", false, Some(false), Some(false)),
+        ("restart_sheep", false, Some(true), Some(false)),
+        ("start_sheep", false, Some(false), Some(false)),
+        ("stop_sheep", false, Some(true), Some(true)),
+        ("tail_bleats", true, None, None),
+    ];
+
     let open = Whistle::for_test(Control::Allowed);
-    for tool in open.router().list_all() {
-        let annotations = tool.annotations.as_ref().expect("every shep tool is annotated");
-        let read_only = annotations.read_only_hint.unwrap_or(false);
-        let row = row_for(&render(), &tool.name);
+    let tools = open.router().list_all();
+    assert_eq!(
+        tools.len(),
+        EXPECTED.len(),
+        "the router and this table disagree about how many tools exist: {:?}",
+        tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>()
+    );
+
+    // `list_all()` sorts by name (rmcp handler/server/router/tool.rs:581-590),
+    // and EXPECTED is written in that order, so a positional zip is sound and
+    // a rename reddens rather than silently pairing the wrong rows.
+    for (tool, (name, read_only, destructive, idempotent)) in tools.iter().zip(EXPECTED) {
+        assert_eq!(tool.name.as_ref(), name, "sorted order drifted");
+        let annotations = tool
+            .annotations
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} carries no annotations"));
         assert_eq!(
-            row.mutates,
+            annotations.read_only_hint,
+            Some(read_only),
+            "{name}'s readOnlyHint"
+        );
+        assert_eq!(
+            annotations.destructive_hint, destructive,
+            "{name}'s destructiveHint"
+        );
+        assert_eq!(
+            annotations.idempotent_hint, idempotent,
+            "{name}'s idempotentHint"
+        );
+    }
+}
+
+/// fails if a rendered row stops agreeing with the router it was rendered
+/// from. Weaker than the table above by design — this one IS generated on
+/// both sides, so it catches a broken renderer, not a wrong annotation.
+#[test]
+fn every_rendered_row_agrees_with_the_router() {
+    let open = Whistle::for_test(Control::Allowed);
+    let rendered = render();
+    for tool in open.router().list_all() {
+        let read_only = tool
+            .annotations
+            .as_ref()
+            .and_then(|a| a.read_only_hint)
+            .unwrap_or(false);
+        assert_eq!(
+            row_for(&rendered, &tool.name).mutates,
             !read_only,
             "{}'s catalogue row and its annotation disagree",
             tool.name
@@ -2377,10 +3214,19 @@ fn every_row_matches_the_router() {
     }
 }
 
-/// fails if the catalogue and the router disagree about how many tools there
-/// are. A tool added to `control.rs` without a row cannot ship.
+/// fails if the tool COUNT stops being nine.
+///
+/// That is what this test pins, and the doc says only that because the other
+/// two things the first draft claimed for it are structurally impossible
+/// rather than tested: rows are GENERATED from `list_all()`, so "a tool added
+/// without a row cannot ship" is true by construction, and
+/// `rendered.contains(name)` is true for the same reason. Freshness of the
+/// checked-in copy is `the_checked_in_catalogue_is_current`'s job; correctness
+/// of the annotations is `the_annotations_match_the_hand_written_table`'s.
+/// A stale row for a REMOVED tool is the one extra thing the row count below
+/// still catches.
 #[test]
-fn the_catalogue_has_a_row_for_every_tool_and_no_others() {
+fn the_catalogue_has_exactly_nine_rows() {
     let names: Vec<_> = Whistle::for_test(Control::Allowed)
         .router()
         .list_all()
@@ -2389,9 +3235,6 @@ fn the_catalogue_has_a_row_for_every_tool_and_no_others() {
         .collect();
     assert_eq!(names.len(), 9);
     let rendered = render();
-    for name in &names {
-        assert!(rendered.contains(name), "no catalogue row for {name}");
-    }
     assert_eq!(
         rendered.matches("| `").count(),
         9,
@@ -2438,9 +3281,14 @@ fn the_checked_in_catalogue_is_current() {
 Hand-written, and it carries the three things this plan argues, in the same
 plain register `docs/dogs.md` and `docs/kv.md` use:
 
-1. **What the gate is and is not** — the launcher is the boundary; the gate is
-   a fat-finger catch; what it actually buys is that a log line cannot reach a
-   tool that acts.
+1. **What the gate is and is not** — the launcher is the boundary, **in argv,
+   environment and file alike**: `shep whistle --home <dir>` and
+   `SHEP_HOME=<dir> shep whistle` both choose which `shep.toml` the gate is
+   read from, so an agent host's own config can already reach it and no wording
+   here may imply otherwise. The gate is a fat-finger catch; what it actually
+   buys is that a log line cannot reach a tool that acts; `[whistle]
+   allow_control` lives in a file rather than a flag because a file is
+   auditable, not because a flag would be more reachable.
 2. **What the shepherd cannot tell you** — an agent's `restart_sheep` and a
    person's `shep restart` are the same `CommandOrigin::Operator` on the wire,
    so attribution stops at the socket.
@@ -2459,14 +3307,26 @@ grep -c '| `' docs/whistle/tools.md                                             
 grep -c 'not a security boundary' docs/whistle/README.md                        # 1
 ```
 
-**Tests:** +4 in shep-cli, and **`ignored` goes 4 → 5**. Expected shape:
-**1248 / 0 / 5**.
+**Tests:** +5 in shep-cli (the honest-annotation table is a new test beside the
+renderer check, not a replacement for it), and **`ignored` goes 4 → 5**.
+Expected shape: **1250 / 0 / 5**.
 
-**Mutation:** hand-edit one row of `docs/whistle/tools.md` to say a mutating
-tool does not mutate. `the_checked_in_catalogue_is_current` must redden. Then
-revert the file and instead flip the annotation in `control.rs`;
-`every_row_matches_the_router` must redden. Both halves are needed: the first
-proves the file is checked, the second proves the claim is.
+**Mutation, three halves now:**
+
+1. Hand-edit one row of `docs/whistle/tools.md` to say a mutating tool does not
+   mutate. `the_checked_in_catalogue_is_current` must redden. Revert.
+2. Flip `stop_sheep`'s `read_only_hint` to `true` in `control.rs`.
+   **`the_annotations_match_the_hand_written_table` must redden**, and
+   `every_rendered_row_agrees_with_the_router` must stay GREEN — that is the
+   demonstration that the second test cannot substitute for the first, and it
+   is why both exist. Revert.
+3. Break the renderer instead: make `render` emit `no` in the `mutates` column
+   unconditionally. `every_rendered_row_agrees_with_the_router` must redden and
+   `the_annotations_match_the_hand_written_table` must stay green.
+
+Halves 2 and 3 in opposite directions are what pin the division of labour: one
+test guards the claim, the other guards the rendering, and neither can quietly
+become the other.
 
 ---
 
@@ -2501,12 +3361,22 @@ observed, because it is the only one with a real process and a real pipe.
 fn whistle_speaks_mcp_and_writes_nothing_else_to_stdout() { /* ... */ }
 
 /// fails if the gate stops being read from `shep.toml`, end to end, in a real
-/// process. Two runs against two `$SHEP_HOME`s: one with no `[whistle]`
-/// section (five tools) and one with `allow_control = true` (nine).
+/// process. THREE runs against two `$SHEP_HOME`s:
+///
+/// 1. `$SHEP_HOME` with no `[whistle]` section, passed as an env var — five tools.
+/// 2. `$SHEP_HOME` with `allow_control = true`, passed as an env var — nine.
+/// 3. The same open directory, passed as `--home` instead — nine again.
 ///
 /// The five/nine split is the assertion, and the four names are checked
 /// individually — a count alone would pass if the gate accidentally
 /// registered a read tool twice.
+///
+/// **Run 3 is not redundant.** It pins the property § "Why there is no
+/// `--allow-control` flag" now states honestly: the launcher chooses which
+/// `shep.toml` is read, in argv as well as in the environment, so
+/// `--home <dir with allow_control = true>` yields nine tools. That is
+/// documented rather than surprising, and it fails here if `resolve_paths`
+/// ever stops folding the flag (`crates/shep-cli/src/main.rs:105-123`).
 #[test]
 fn the_shep_toml_gate_decides_the_tool_list_in_a_real_process() { /* ... */ }
 
@@ -2535,9 +3405,14 @@ a whistle whose peer never closes runs forever, which is correct behaviour and
 would hang a test that forgot.
 
 The `initialize` request each case sends names `"protocolVersion":
-"2025-06-18"`, one of the versions rmcp's `ProtocolVersion::SUPPORTED` carries,
-rather than the current `LATEST` — hardcoding `LATEST` would turn an rmcp
-version bump into a red suite for no behavioural reason. The assertion is on
+"2025-06-18"`, one of the five versions rmcp's
+`ProtocolVersion::KNOWN_VERSIONS` carries (`model.rs:181-187`; the constant is
+`KNOWN_VERSIONS`, **not** `SUPPORTED`, which does not exist — an implementer
+chasing that name finds nothing), rather than the current `LATEST` (which is
+`V_2025_11_25`, `model.rs:175`) — hardcoding `LATEST` would turn an rmcp
+version bump into a red suite for no behavioural reason. Negotiation is safe
+here: rmcp deprecated its unsupported-version error and falls back to the
+server-configured version. The assertion is on
 `result.serverInfo.name == "shep"` and on `result.capabilities.tools` being
 present, not on the negotiated version string.
 
@@ -2547,7 +3422,7 @@ present, not on the negotiated version string.
 cargo test -p shep-cli --test cli_e2e --all-features        # EXIT=0
 ```
 
-**Tests:** +4 in `cli_e2e`. Expected shape: **1252 / 0 / 5**.
+**Tests:** +4 in `cli_e2e`. Expected shape: **1254 / 0 / 5**.
 
 **Mutation:** add `println!("starting")` to the top of `whistle::whistle`.
 `whistle_speaks_mcp_and_writes_nothing_else_to_stdout` must redden. If it does
@@ -2559,7 +3434,8 @@ is not under test.
 ## Task 11 — the ledger, the docs, and the phase gate
 
 **Files:** `docs/specs/deferred.md`, `README.md`, `CLAUDE.md`,
-`crates/shep-cli/src/cli.rs` (lookout's cross-reference).
+`crates/shep-cli/src/cli.rs` (lookout's cross-reference),
+`crates/shep-cli/src/lookout/mod.rs` (one line — see 11.0).
 
 **Baselines:**
 
@@ -2569,6 +3445,31 @@ grep -ci whistle README.md                 # 2
 grep -c '| the whistle |' README.md        # 1 — the subsystem table's row, whose last column reads `no`
 grep -ci whistle docs/terminology.md       # 1 — already there; §11.3 edits it only if this prints 0
 ```
+
+### Step 11.0 — the two shipped cross-references that will otherwise contradict
+
+Both name the gate in a spelling this phase does not ship, and both are the
+doc-drift class 12a shipped:
+
+```bash
+grep -n 'whistle.allow_control' crates/shep-cli/src/lookout/mod.rs   # 203
+grep -n 'whistle.allow_control' docs/specs/shep-v1.md                # 405
+```
+
+- **`crates/shep-cli/src/lookout/mod.rs:203`** says "`whistle.allow_control` is
+  daemon-side" in dotted-key form. This phase ships a TOML **section**, so
+  after Task 2 the dotted spelling names a key that does not exist. One-line
+  edit: `[whistle] allow_control` in `$SHEP_HOME/shep.toml`. The surrounding
+  sentence — that lookout's gate is the operator's own and whistle's acts for a
+  client nobody is watching — stays exactly as it is; it is the half of the
+  argument the trust-boundary section still leans on.
+- **`docs/specs/shep-v1.md:405-406`** says control tools "require the daemon
+  flag `whistle.allow_control = true`". **Leave it.** It is the spec, this plan
+  is the thing interpreting it, and rewriting a spec to match an implementation
+  is the wrong direction. Note the difference in the ledger instead — "the spec
+  says *flag*; this phase reads that as the `[whistle]` section of the daemon's
+  config file, per §14.7's own 'daemon config, not CLI flag'" — so a later
+  reader treats it as an interpretation rather than a bug.
 
 ### Step 11.1 — `deferred.md`
 
@@ -2582,8 +3483,14 @@ part of whistle that is genuinely not built: no HTTP/SSE transport, no
 resources or prompts, and the five verbs that deliberately have no tool.
 
 Amend the **schemars** entry: it still is not built, but the dependency
-question is now settled, and the entry should say so rather than leaving a
-future reader to rediscover that `schemars` is already in `Cargo.lock`.
+question is now settled in a stronger way than "it is in `Cargo.lock`" —
+`schemars 1.2.2` is a **declared, direct, versioned dependency of shep-cli**
+after Task 1, because whistle's own payload types derive `JsonSchema`. So
+"schemars JSON-schema export" for `AppConfig` is now a derive and a writer, not
+a dependency decision. The entry should say that, and should not repeat the
+first draft's claim that the crate "arrives free" — it arrives at zero extra
+crates, which is not the same thing as arriving without an edge we own and a
+`-Z minimal-versions` floor we have to hold.
 
 ### Step 11.2 — `README.md`
 
@@ -2620,7 +3527,7 @@ cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-
 
 Plus the two `benches/` gates per CLAUDE.md, from their own target dir.
 
-**Final expected shape: 1252 passed / 0 failed / 5 ignored across 17 result
+**Final expected shape: 1254 passed / 0 failed / 5 ignored across 17 result
 lines.** The `ignored` figure is exact (Task 9's catalogue writer is the only
 addition) and so is the line count. The passed figure is a shape.
 
@@ -2643,6 +3550,15 @@ arbitrary code execution behind a gate that is explicitly not a security
 boundary. If Rin reads the spec as promising the wider form, that is a decision
 to take before Task 7, not after — and it should come with an approval flow
 (MCP elicitation), which this phase does not build.
+
+The narrowing is about **what** the tool can reach, and the plan is now explicit
+that it says nothing about **when**: the pre-check and the `Restart` are two
+round trips, so a sheep that comes up in between is restarted, and closing that
+needs a wire variant this phase does not add. The residual window is one local
+round trip, it is named in the tool's own description, and the annotations were
+changed to match (`idempotent_hint = false`). A reviewer who thinks
+`destructive_hint` should also flip to `true` on the strength of that race has a
+defensible position and it is one line to change.
 
 **2. The gate is read from `shep.toml` by whistle itself, not from the
 shepherd.** Spec §14.7 says "daemon config", and this plan satisfies that with
