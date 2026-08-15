@@ -1,21 +1,21 @@
-# `shep lookout` — Phase 12a frames
+# `shep lookout` — frames
 
-`shep lookout` (alias `dash`) is a terminal dashboard over the shepherd.
-Phase 12a builds the whole shell — the dependency, terminal lifecycle,
-palette, event loop, and link supervision — plus exactly **one** pane: the
-flock table. The bleats feed, the sheep detail pane and the host-usage strip
-are Phase 12b, and are not built yet.
+`shep lookout` (alias `dash`) is a terminal dashboard over the shepherd. It
+now draws all four panes spec §9 names: the flock table (the spine, and the
+only pane Phase 12a shipped), a host-usage strip above it, and a sheep
+detail pane plus a bleats feed underneath a selected row — both added in
+Phase 12b, kept as plain as the table that came before them.
 
 This directory is not documentation of a shipped design. It is the thing
 Rin asked for: *"let's start with flock table first. I need to see the
 panels before I can make a full decision."* A TUI cannot be screenshotted
-the way a web page can, so these rendered frames are how she sees it before
-12b's layout gets decided.
+the way a web page can, so these rendered frames are how she looked at each
+phase before deciding what came next.
 
 ## Reading the frames
 
-- `frames.txt` — eight scenes, plain text. Open it in any editor.
-- `frames.ansi` — the same eight scenes, with colour. Read it with
+- `frames.txt` — fourteen scenes, plain text. Open it in any editor.
+- `frames.ansi` — the same fourteen scenes, with colour. Read it with
   `less -R` so the escape codes render instead of printing literally.
 
 Both files are generated, not hand-written, and both come from the same
@@ -44,12 +44,12 @@ cargo test -p shep-cli --bins --all-features -- --ignored write_the_gallery
   that was never there.
 - **Actions are gated off by default, and it says so.** `--allow-control`
   (or `lookout.allow_control = "true"` in the KV store) has to be set before
-  any action key does anything. In 12a exactly one action key exists, `x`
-  (stop), and it never acts — it refuses in both states, with a literal
-  sentence (`read-only: actions need --allow-control`, or `stop is not
-  built yet` once control is allowed but the action isn't). The status bar
-  always says which state is in force. This is a fat-finger catch, not a
-  security boundary: lookout runs as the operator's own process, under the
+  any action key does anything. Exactly one action key exists, `x` (stop),
+  and it never acts — it refuses in both states, with a literal sentence
+  (`read-only: actions need --allow-control`, or `stop is not built yet`
+  once control is allowed but the action isn't). The status bar always says
+  which state is in force. This is a fat-finger catch, not a security
+  boundary: lookout runs as the operator's own process, under the
   operator's own uid, so the shepherd has no way to refuse a keypress it
   cannot tell apart from `shep stop`.
 - **Colour is always redundant with text.** Every coloured cell says the
@@ -63,18 +63,47 @@ cargo test -p shep-cli --bins --all-features -- --ignored write_the_gallery
   refuses outright rather than draw overlapping garbage, with a two-line
   message short enough to survive the narrowest terminal it is warning
   about.
-- **The keyboard scrolls; it does not select.** `j`/`k` move the viewport
-  by a row, `g`/`G` jump to its ends, and the offset is re-clamped whenever
-  a snapshot replaces the flock map. There is no cursor and no selected row
-  in 12a — a selection needs a detail pane to read it, and that pane is
-  12b.
 
-## What is still open for 12b
+## What 12b settled
 
-- Where the other three panes (bleats feed, sheep detail, host-usage strip)
-  sit, and which are focusable.
-- Whether the flock table grows a selected row, and what marks it.
-- Which actions the control gate lets through once it is wired to
-  something, and what confirms them before they run.
-- Whether a filter line takes the CLI's own selector grammar or plain
-  substring matching.
+- **A selected sheep, and the table marks it.** `j`/`k` move the selection
+  by a row now, not just the viewport; `g`/`G` jump to its ends. A `>`
+  gutter to the left of ID marks the selected row, and the offset re-clamps
+  whenever a snapshot replaces the flock map or the selected sheep drops out
+  of it. The two panes below the table both describe whichever sheep is
+  selected.
+- **The bleats feed reads log files, not the bus.** It re-reads the
+  selected sheep's `out`/`err` log files from disk on every refresh, rather
+  than subscribing to the `log.*` bus topic. A busy flock costs one bounded
+  64 KiB read per file per refresh; subscribing would make the dashboard the
+  highest-volume subscriber on the bus for a pane most refreshes don't even
+  draw. What the feed cannot show, it says: lines the
+  reader saw and discarded count exactly, and bytes below its window report
+  as bytes, because nothing counted the lines in those and guessing would be
+  worse than saying so.
+- **The detail pane reads what the table already has.** No second request,
+  no `Request::Describe`, and therefore no lamb list — `ProcessInfo::lambs`
+  is `None` on the `ListFlock` reply the table is built from. It adds the
+  untruncated name, both log paths, and whichever columns the current width
+  tier has dropped.
+- **Short terminals drop panes before they drop columns.** A plain 80×24
+  gets all three: host strip, detail pane, feed. Below 24 rows the detail
+  pane goes first, below 18 the feed goes with it, and below 14 the host
+  strip goes too and only the flock table remains — the same shape 12a
+  shipped alone. The order is least-diagnostic-first, the same principle
+  the column drop already used: the detail pane only restates what the
+  selected row already shows, so it is the cheapest thing to lose, while
+  the feed is the only pane carrying information no other pane has. The
+  `no_detail` scene in `frames.txt` is the 120×20 case — feed present,
+  detail gone.
+
+## What is still open
+
+- **Search/filter.** Rin's v1 ruling for 12b excluded it explicitly, and it
+  still carries an unresolved question from 12a: whether a filter line takes
+  the CLI's own selector grammar or plain substring matching.
+- **Actions behind the gate.** The gate exists and refuses honestly; no
+  action beyond `x`'s refusal has landed behind it yet.
+- **Lambs in the detail pane.** Showing them needs `Describe`'s
+  process-table walk, and polling that per selection on a two-second timer
+  is a cost this phase declined to add.

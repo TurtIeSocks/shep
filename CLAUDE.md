@@ -178,10 +178,15 @@ verbs — `shep stock` (alias `scale`), `shep signal`, `shep whisper` (alias
 the `channel.*` bus topic. Phase 12a merged: `shep lookout`'s shell and its
 flock table pane — dependency, terminal lifecycle, palette, event loop, link
 supervision, and a table that subscribes to the bus and polls every two
-seconds to repair drift. The bleats feed, the sheep detail pane and the
-host-usage strip are Phase 12b; rendered frames for that decision are in
-`docs/lookout/frames.txt`. Phase 13 merged: `shep whistle`, the MCP server
-over stdio (`rmcp`) — nine tools, five read-only and always present, four
+seconds to repair drift. Phase 12b merged too: the table grows a selected
+row, and the three remaining panes go up around it — a host-usage strip, a
+sheep detail pane, and a bleats feed. The feed reads the selected sheep's
+log files from disk on every refresh rather than subscribing to `log.*`,
+deliberately — a busy flock costs one bounded read per pane instead of
+making the dashboard the highest-volume subscriber on the bus. Rendered
+frames for both phases are in `docs/lookout/frames.txt`. Phase 13 merged:
+`shep whistle`, the MCP server over stdio (`rmcp`) — nine tools, five
+read-only and always present, four
 that mutate and present only when `[whistle] allow_control = true` in
 `shep.toml`; `start_sheep` narrowed to already-registered sheep; every
 daemon refusal a control tool can meet reaches the model as an in-band tool

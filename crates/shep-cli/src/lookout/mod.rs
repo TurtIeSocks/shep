@@ -1,8 +1,13 @@
 //! `shep lookout` (alias `dash`): the terminal dashboard.
 //!
-//! Phase 12a builds the shell and one pane, the flock table. The bleats feed,
-//! the sheep detail pane and the host-usage strip are 12b —
-//! `docs/lookout/README.md` says what those frames are for.
+//! Four panes, one screen: the flock table stays the spine, and a selected
+//! row now grows a sheep detail pane ([`view::detail`]) and a bleats feed
+//! ([`view::bleats`]) beneath it, with a host-usage strip
+//! ([`view::host`]) above. A narrow or short terminal drops panes before it
+//! drops columns — [`view::panes_for`] is the tier table. `source::TOPICS`
+//! has the argument for why the feed re-reads the selected sheep's log files
+//! on every refresh instead of subscribing to `log.*`. `docs/lookout/README.md`
+//! says what the rendered frames are for.
 //!
 //! **Two tasks, two channels.** The link task ([`link::run_link`]) owns the
 //! connection: it subscribes, polls, repairs on a drop, climbs a bounded

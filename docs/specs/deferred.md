@@ -68,16 +68,30 @@ for what phase is next.
 Prometheus exposition only; no `otel` cargo feature exists in
 `crates/shep-cli/Cargo.toml`.
 
-**lookout's other three panes** (spec §9, §13) — `shep lookout` ships its
-shell and its flock table (Phase 12a). The bleats feed, the sheep detail pane
-and the host-usage strip are not built, and neither is search/filter. Actions
-have a gate (`--allow-control`, `lookout.allow_control`) and a refusal; there
-are no actions behind it yet. lookout does not subscribe to `log.*` — the feed
-that would read it does not exist, and a dashboard that subscribed anyway would
-be the highest-volume subscriber on the bus for a pane it does not draw.
-Rendered frames of what 12a built are in
-[docs/lookout/frames.txt](../lookout/frames.txt), for Rin to look at before
-12b's layout is decided.
+**lookout's search/filter** (spec §9) — `shep lookout` ships all four panes
+spec §9 names (Phase 12a's shell and flock table, Phase 12b's host-usage
+strip, sheep detail pane and bleats feed), but no filter or search line.
+Rin's v1 ruling for 12b excluded it explicitly ("no filtering UI, no
+elaborate layout"), and it also carries an unresolved design question 12a
+already wrote down: whether the filter takes the CLI's own selector grammar
+or plain substring matching. That choice is Rin's, not this file's, and is
+why the item stays open rather than half-built either way.
+
+**lookout actions** (spec §9) — the control gate (`--allow-control`,
+`lookout.allow_control`) exists and every action key checks it, but there is
+still exactly one action key, `x` (stop), and it refuses honestly in both
+gate states: `read-only: actions need --allow-control` when the gate is
+closed, `stop is not built yet` when it is open. No action has landed behind
+the gate.
+
+**lambs in the detail pane** (spec §9) — the sheep detail pane
+([`crates/shep-cli/src/lookout/view/detail.rs`](../../crates/shep-cli/src/lookout/view/detail.rs))
+reads only the `ProcessInfo` the flock table's own rows already carry, so it
+never shows `lambs`. `ListFlock` deliberately does not populate that field;
+only `Describe` does, with a process-table walk, and calling `Describe` on a
+two-second poll timer for whichever sheep is selected is the cost this phase
+declined to add. Rendered frames of what both 12a and 12b built are in
+[docs/lookout/frames.txt](../lookout/frames.txt).
 
 **serve** (spec §9, §13) — static file server as a managed sheep. `axum`
 and `tower-http` are not dependencies of any crate.
