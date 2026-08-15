@@ -60,7 +60,7 @@ clap = { version = "4", default-features = false, features = ["std", "derive", "
 # `Shell` and `generate` sat at the crate root). `-Z minimal-versions` picks
 # 4.0.0 without this pin and fails with "cannot find `aot` in `clap_complete`".
 clap_complete = { version = "4.6.0", default-features = false }
-# `io-util` is `dog::http`'s: `BufReader`, `AsyncBufReadExt`/`AsyncReadExt`/
+# `io-util` is `crate::http`'s: `BufReader`, `AsyncBufReadExt`/`AsyncReadExt`/
 # `AsyncWriteExt`, and `tokio::io::duplex` for its own tests — the same
 # reason shep-daemon's own hand-rolled HTTP probe (`probes/os.rs`) carries it.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "io-util"] }
@@ -120,7 +120,7 @@ toml_edit = { version = "0.22", default-features = false, features = ["display",
 tempfile.workspace = true
 
 [dev-dependencies]
-# `test-util` for `#[tokio::test(start_paused = true)]` — `dog::http`'s own
+# `test-util` for `#[tokio::test(start_paused = true)]` — `crate::http`'s own
 # "a peer that says nothing is dropped at the timeout" test, matching how
 # shep-client and shep-daemon each add this feature as a dev-only override.
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }

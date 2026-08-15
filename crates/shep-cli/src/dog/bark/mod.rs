@@ -402,7 +402,7 @@ mod tests {
     use tokio::sync::{broadcast, oneshot};
 
     use super::*;
-    use crate::dog::http::{HttpRequest, read_request, write_response};
+    use crate::http::{HttpRequest, read_request, write_response};
 
     /// [`EventSource`] over the real thing bark's local subscription lags
     /// on: a `tokio::sync::broadcast::Receiver`. Only ever built by tests —

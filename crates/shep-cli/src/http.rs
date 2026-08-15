@@ -1,8 +1,11 @@
-//! The little HTTP a dog needs: [`read_request`] and [`write_response`].
+//! The little HTTP this binary needs: [`read_request`], [`write_response`]
+//! and [`write_head`].
 //!
 //! Hand-rolled rather than pulled from a crate, and the reason is the whole
 //! dependency tree: this workspace carries no HTTP server and does not want
-//! one for a loopback endpoint serving one path. What it needs is a request
+//! one for a loopback endpoint serving one path, and — Rin's 2026-08-15
+//! ruling on `serve` — no more of one for a genuinely simple static file
+//! server over code this crate already owns. What it needs is a request
 //! line, a header map and a body — under a hundred lines against
 //! `tokio::io`, with no TLS to get wrong because the metrics endpoint is
 //! loopback by default and binding it wider is the operator's explicit act.
@@ -10,9 +13,9 @@
 //! same call for the same reason; this is that call's server-side twin.
 //!
 //! Generic over [`AsyncRead`]/[`AsyncWrite`] rather than `TcpStream`, so a
-//! test drives [`read_request`]/[`write_response`] over a `tokio::io::duplex`
-//! pair with no socket at all. `dog::metrics` is the one caller that binds a
-//! real [`tokio::net::TcpListener`].
+//! test drives [`read_request`]/[`write_response`]/[`write_head`] over a
+//! `tokio::io::duplex` pair with no socket at all. `dog::metrics` is the one
+//! caller that binds a real [`tokio::net::TcpListener`] today.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -67,6 +70,29 @@ pub enum HttpError {
     },
     /// No request arrived within the caller's `read_timeout`.
     Timeout,
+    /// A header name or value passed to [`write_head`] carried a byte outside
+    /// the printable ASCII range (`0x20..=0x7e`) — a CR, an LF, or anything
+    /// above the range such as DEL. Carries a fixed reason, never the
+    /// offending name or value: unlike this enum's other variants, the value
+    /// that trips this one can be attacker-controlled (a percent-decoded
+    /// request path reflected into a `Location`), so the same rule that keeps
+    /// this type's `Debug` safe to log — never a header value — applies here
+    /// too. `HttpError` is private to this crate — `lib.rs` declares
+    /// `mod http;`, not `pub mod http;` — so IR-20's `#[non_exhaustive]`
+    /// question does not arise.
+    ///
+    /// `write_head`'s only caller is `serve::worker` (Task 6), which does not
+    /// exist yet, so nothing outside this file's own tests constructs this
+    /// variant today — the plain (non-test) build sees no live constructor
+    /// and flags it dead. Silenced on that one axis, same shape as
+    /// `resolve_paths`'s own `#[cfg_attr(windows, allow(dead_code))]`
+    /// (`lib.rs`), and for the same reason: say which axis the code is
+    /// legitimately unreachable on rather than leave an unexplained warning.
+    #[cfg_attr(not(test), allow(dead_code))]
+    BadHeader {
+        /// What was bad: `"a header name"` or `"a header value"`.
+        what: &'static str,
+    },
 }
 
 impl fmt::Display for HttpError {
@@ -78,6 +104,9 @@ impl fmt::Display for HttpError {
                 write!(f, "{what} exceeded the {limit}-byte ceiling")
             }
             Self::Timeout => f.write_str("no request arrived within the read timeout"),
+            Self::BadHeader { what } => {
+                write!(f, "{what} carried a byte outside the printable ASCII range")
+            }
         }
     }
 }
@@ -86,7 +115,9 @@ impl core::error::Error for HttpError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
-            Self::Malformed(_) | Self::TooLarge { .. } | Self::Timeout => None,
+            Self::Malformed(_) | Self::TooLarge { .. } | Self::Timeout | Self::BadHeader { .. } => {
+                None
+            }
         }
     }
 }
@@ -276,6 +307,86 @@ pub async fn write_response<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// One extra response header: a name and a value, both already final.
+///
+/// Unreachable from the plain (non-test) build until `serve::worker` (Task 6)
+/// exists — see [`HttpError::BadHeader`]'s own doc for the full reasoning
+/// behind the `cfg_attr` below.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct Header<'a> {
+    /// The header name, written exactly as given.
+    pub name: &'a str,
+    /// The value, written exactly as given — refused if it carries a control
+    /// byte, see [`write_head`].
+    pub value: &'a str,
+}
+
+/// Writes a response head and stops, leaving the body to the caller.
+///
+/// [`write_response`] is still the right function when the whole body is
+/// already a `&[u8]` — the metrics dog's exposition is exactly that. This one
+/// exists for `serve`, which streams a file it has not read: `content_length`
+/// comes from the file's metadata and the caller copies the bytes afterwards.
+///
+/// Every response carries `Connection: close`, the same as [`write_response`],
+/// so a caller that writes fewer bytes than it declared closes the connection
+/// and the client sees a truncated response rather than a hang.
+///
+/// # Errors
+/// - [`HttpError::Io`] — the write failed.
+/// - [`HttpError::BadHeader`] — a header name or value carries a byte outside
+///   the printable ASCII range. A `Location` built from a request path is the
+///   case this exists for: a percent-encoded CRLF that reached this far would
+///   otherwise split the response and let a client inject headers of its own.
+///   The caller answers 500; nothing is written to the stream first, so the
+///   refusal cannot itself produce a malformed response.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn write_head<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    status: u16,
+    content_type: &str,
+    content_length: u64,
+    headers: &[Header<'_>],
+) -> Result<(), HttpError> {
+    for header in headers {
+        if has_control_byte(header.name) {
+            return Err(HttpError::BadHeader {
+                what: "a header name",
+            });
+        }
+        if has_control_byte(header.value) {
+            return Err(HttpError::BadHeader {
+                what: "a header value",
+            });
+        }
+    }
+
+    let mut head = format!(
+        "HTTP/1.1 {status} \r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\n"
+    );
+    for header in headers {
+        head.push_str(header.name);
+        head.push_str(": ");
+        head.push_str(header.value);
+        head.push_str("\r\n");
+    }
+    head.push_str("Connection: close\r\n\r\n");
+
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .map_err(HttpError::Io)
+}
+
+/// Whether `s` carries a byte outside the printable ASCII range
+/// (`0x20..=0x7e`) — a CR, an LF, or anything above it such as DEL. Any of
+/// these, written unescaped into a response head, splits it: a CRLF pair
+/// starts a new header line, and a lone CR or LF is enough for some clients.
+#[cfg_attr(not(test), allow(dead_code))]
+fn has_control_byte(s: &str) -> bool {
+    s.bytes().any(|b| !(0x20..=0x7e).contains(&b))
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::io::AsyncWriteExt;
@@ -369,5 +480,70 @@ mod tests {
         assert!(response.contains("Connection: close\r\n"), "{response:?}");
         assert!(response.starts_with("HTTP/1.1 200 "), "{response:?}");
         assert!(response.ends_with("ok"), "{response:?}");
+    }
+
+    /// fails if a header value carrying CRLF is written to the stream —
+    /// response splitting, reachable from a percent-encoded path in a
+    /// `Location`.
+    #[tokio::test]
+    async fn a_header_value_with_a_control_byte_is_refused_before_anything_is_written() {
+        for (name, value) in [
+            ("Location", "/a\r\nSet-Cookie: x=1"), // the pair
+            ("Location", "/a\rSet-Cookie: x=1"),   // a lone CR: enough on its own
+            ("Location", "/a\nSet-Cookie: x=1"),   // a lone LF
+            ("Location", "/a\u{7f}b"),             // DEL, above the control range
+            ("X-Bad\r\nInjected", "ok"),           // the NAME is checked too
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let err = write_head(&mut server, 301, "text/html", 0, &[Header { name, value }])
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, HttpError::BadHeader { .. }),
+                "{name}: {err:?}"
+            );
+            drop(server);
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).await.unwrap();
+            assert!(
+                buf.is_empty(),
+                "{name}: nothing may reach the stream: {buf:?}"
+            );
+        }
+    }
+
+    /// fails if the extra headers are dropped, or if the declared length stops
+    /// matching what the caller was told to write.
+    #[tokio::test]
+    async fn a_head_carries_its_extra_headers_and_its_declared_length() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        write_head(
+            &mut server,
+            200,
+            "text/css",
+            42,
+            &[Header {
+                name: "X-Content-Type-Options",
+                value: "nosniff",
+            }],
+        )
+        .await
+        .unwrap();
+        drop(server);
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let head = String::from_utf8(buf).unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head:?}");
+        assert!(head.contains("Content-Length: 42\r\n"), "{head:?}");
+        assert!(head.contains("Content-Type: text/css\r\n"), "{head:?}");
+        assert!(
+            head.contains("X-Content-Type-Options: nosniff\r\n"),
+            "{head:?}"
+        );
+        assert!(head.contains("Connection: close\r\n"), "{head:?}");
+        assert!(
+            head.ends_with("\r\n\r\n"),
+            "a head and nothing else: {head:?}"
+        );
     }
 }

@@ -23,8 +23,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{SignalKind, signal};
 
 use super::DogRuntime;
-use super::http::{self, HttpError};
 use crate::exit::ExitCode;
+use crate::http::{self, HttpError};
 
 /// How long [`http::read_request`] waits for a connected peer to finish
 /// sending its request before giving up on it. Generous for a scraper (an

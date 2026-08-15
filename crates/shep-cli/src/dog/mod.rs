@@ -26,7 +26,6 @@
 //! [`DogRuntime`].
 
 pub mod bark;
-pub mod http;
 pub mod metrics;
 
 use core::fmt;

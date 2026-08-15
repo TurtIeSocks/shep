@@ -10,7 +10,7 @@
 //! under `reqwest`'s own default `rustls` feature). `rustls` does the part
 //! that must not be gotten wrong — the handshake and record layer; what
 //! this module owns is the same HTTP/1.1 request/response framing
-//! `dog::http`'s server side (Task 13) already hand-rolls, aimed the other
+//! `crate::http`'s server side (Task 13) already hand-rolls, aimed the other
 //! way. See `crates/shep-cli/Cargo.toml` and this workspace's root
 //! `Cargo.toml` for the accounting behind the two new dependencies.
 //!
@@ -554,7 +554,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::dog::http::{HttpRequest, read_request, write_response};
+    use crate::http::{HttpRequest, read_request, write_response};
 
     /// A representative fired alert, tagged by `subject` and `message` — the
     /// two fields these tests vary. `at_ms`/`rule` are fixed since no test

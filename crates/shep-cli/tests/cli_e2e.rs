@@ -864,7 +864,7 @@ fn free_port() -> u16 {
 
 /// One attempt at a `GET /metrics` scrape against `addr`, over a plain
 /// `std::net::TcpStream` — no HTTP crate anywhere in this workspace
-/// (`dog::http`'s own module doc gives the reason), so the client side of
+/// (`crate::http`'s own module doc gives the reason), so the client side of
 /// this exchange is exactly as hand-rolled as the server side.
 ///
 /// Reads to EOF rather than to a declared `content-length`: the metrics
