@@ -1,11 +1,15 @@
 [package]
 name = "shep-core"
-description = "Shared types, configuration, and wire protocol for the shep process manager"
+description = "Types, Flockfile parsing, and the wire protocol shared by the shep process manager's daemon, client, and CLI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/shep-core"
+keywords = ["shep", "process-manager", "supervisor", "flockfile", "protocol"]
+categories = ["config", "parsing", "data-structures"]
 
 [dependencies]
 serde.workspace = true

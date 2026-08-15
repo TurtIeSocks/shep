@@ -1,11 +1,14 @@
 [package]
 name = "shep-cli"
-description = "The shep command-line interface: clap surface, output rendering, and the daemon launch/re-exec path"
+description = "The shep binary: a process manager that keeps a flock of long-running processes alive on macOS and Linux, with logs, watch and cron restarts, and webhook alerts"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+readme = "README.md"
+keywords = ["shep", "process-manager", "supervisor", "daemon", "cli"]
+categories = ["command-line-utilities", "os", "development-tools"]
 
 [[bin]]
 name = "shep"

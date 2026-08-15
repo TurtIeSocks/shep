@@ -1,11 +1,15 @@
 [package]
 name = "shep-client"
-description = "Async RPC client and programmatic API for the shep daemon"
+description = "Async client for the shep daemon: typed requests, event subscriptions, and starting a shepherd that is not running yet"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/shep-client"
+keywords = ["shep", "process-manager", "client", "ipc", "async"]
+categories = ["asynchronous", "network-programming", "api-bindings"]
 
 [features]
 # Option: expose `testing` (the hand-rolled daemon fakes) to other crates'

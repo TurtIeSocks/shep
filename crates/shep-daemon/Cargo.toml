@@ -1,11 +1,15 @@
 [package]
 name = "shep-daemon"
-description = "Supervisor engine for shep: spawn, restart, reload, watch, cron-restart, memory-limit polling"
+description = "The supervision engine behind shep: process spawning, restart policy, the log plane, watch and cron restarts, and the RPC server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/shep-daemon"
+keywords = ["shep", "process-manager", "supervisor", "daemon", "restart"]
+categories = ["os", "os::unix-apis", "asynchronous"]
 
 [features]
 # Option: expose the scripted fake runner (`fake::ScriptedRunner`) to other
