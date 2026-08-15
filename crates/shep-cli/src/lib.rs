@@ -71,6 +71,8 @@ use commands::muster;
 #[cfg(unix)]
 use commands::query;
 #[cfg(unix)]
+use commands::runtime;
+#[cfg(unix)]
 use commands::schema;
 // Imports the function directly, not the module: `commands::serve` would
 // collide in this scope with the crate-root `serve` module (the static-file
@@ -387,6 +389,22 @@ async fn run(cli: Cli) -> ExitCode {
         return serve_command(&mut streams, fmt, &paths, args).await;
     }
 
+    // Not in the locked block below, for the same reason as `daemon`,
+    // `bleats`, `lookout` and `serve` above: this runs until the flock
+    // empties or a signal ends the supervisor, and a `StdoutLock` held that
+    // long wedges the first off-thread write — here, the supervisor's own
+    // logging, booted in this same process. `commands::foreground::run`'s
+    // own doc carries the rest of the reasoning.
+    if let Commands::Runtime(ref args) = cli.command {
+        let mut out = std::io::stdout();
+        let mut err = std::io::stderr();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+        };
+        return runtime::runtime(&mut streams, fmt, cli.global.quiet, paths, args).await;
+    }
+
     // Not in the locked block below, and it takes NO `Streams` at all. This
     // verb owns stdout as a wire: everything written there is MCP, and an
     // `output::emit` call on this path would corrupt the peer's parse. It also
@@ -552,6 +570,7 @@ async fn run(cli: Cli) -> ExitCode {
         | Commands::Lookout(_)
         | Commands::Whistle
         | Commands::Serve(_)
+        | Commands::Runtime(_)
         | Commands::Dog(_) => {
             unreachable!("handled above: before the shared $SHEP_HOME gate, or on unlocked handles")
         }
@@ -780,6 +799,21 @@ mod tests {
         );
         let cli = Cli::try_parse_from(argv).expect("the passthrough vector must parse");
         assert!(matches!(cli.command, Commands::Dog(_)));
+    }
+
+    /// The Task 1 sibling for `runtime`: the alias vector [`main_runtime`]
+    /// builds actually reaches `Commands::Runtime`, with `--supervise` set —
+    /// the init's own re-exec, not a person's invocation.
+    #[test]
+    fn the_runtime_alias_vector_parses_to_the_runtime_command() {
+        use clap::Parser;
+        use cli::Commands;
+        let argv = alias_argv("runtime", vec!["shep-runtime".into(), "--supervise".into()]);
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let Commands::Runtime(args) = cli.command else {
+            panic!("expected runtime")
+        };
+        assert!(args.supervise);
     }
 
     /// fails if `propagate_version` is dropped, which leaves the two alias

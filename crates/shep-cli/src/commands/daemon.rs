@@ -33,7 +33,7 @@ use shep_core::config::{DaemonConfig, DaemonConfigError, DaemonOverrides};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::DogSource;
 use shep_core::values::UpDuration;
-use shep_daemon::boot::{BootError, BootOptions, boot};
+use shep_daemon::boot::{BootError, BootOptions, RunningDaemon, boot};
 use shep_daemon::dogs::DogSpec;
 use shep_daemon::notify::NOTIFY_SOCKET_ENV;
 use shep_daemon::tokio_runner::TokioRunner;
@@ -188,7 +188,8 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
     stderr_is_terminal && no_color.is_none_or(OsStr::is_empty)
 }
 
-/// Runs the supervisor in this process until a signal or `KillDaemon`.
+/// Loads config, installs the log subscriber, and boots the supervisor —
+/// everything [`run_daemon`] does except serve.
 ///
 /// Loads `shep.toml` (a missing file is not an error — see
 /// [`read_daemon_config_source`]) layered under `SHEP_*` environment
@@ -197,9 +198,9 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
 /// subscriber those layers configure (see [`install_log_subscriber`]), folds
 /// `args` in via [`boot_options`] — which is also where `[daemon]
 /// enabled_dogs`/`adopted_dogs` become the dogs `boot` starts once the flock
-/// is back — then boots and serves. The re-exec'd child inherits a real
-/// environment on purpose (`launch::launch_command` deliberately does not
-/// `.env_clear()`), so `SHEP_LOG_JSON`, `SHEP_LOG_LEVEL`, `SHEP_SOCKET`, and
+/// is back — then boots. The re-exec'd child inherits a real environment on
+/// purpose (`launch::launch_command` deliberately does not `.env_clear()`),
+/// so `SHEP_LOG_JSON`, `SHEP_LOG_LEVEL`, `SHEP_SOCKET`, and
 /// `SHEP_MAX_CRON_SLEEP` are read straight from `std::env::var` — the
 /// environment is the *middle* layer now, not the top one; `--log-json`,
 /// `--log-level`, `--socket` and `--max-cron-sleep` on the invocation itself
@@ -211,8 +212,17 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
 ///
 /// The subscriber goes in *here* and never in `shep_daemon::boot`: a global
 /// subscriber can be installed once per process, and `boot` is called many
-/// times over by one test binary. This function is called once, by `main`, and
-/// the e2e tier reaches it as a subprocess.
+/// times over by one test binary. This function is called once per process —
+/// by [`run_daemon`] for the hidden `daemon` subcommand, and by
+/// `commands::foreground` for `runtime`/`dev` — and the e2e tier reaches it
+/// as a subprocess.
+///
+/// Split out of what used to be `run_daemon`'s own body for
+/// `commands::foreground`, which needs the booted daemon in hand rather than
+/// a call that blocks until shutdown: it spawns `run()` as a task and then
+/// talks to the same supervisor over its own socket, like any other client.
+/// Nothing about the boot differs between the two callers, and the split is
+/// what keeps that true.
 ///
 /// # Errors
 /// - [`DaemonRunError::Config`] — `shep.toml` failed to parse, or a
@@ -220,9 +230,10 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
 /// - [`DaemonRunError::Boot`] — the config file itself could not be read
 ///   (any IO error other than "does not exist"), or the supervisor failed
 ///   to boot.
-/// - [`DaemonRunError::Run`] — the supervisor came up and served, then
-///   failed during its run loop or teardown.
-pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), DaemonRunError> {
+pub async fn boot_supervisor(
+    paths: ShepPaths,
+    args: &DaemonArgs,
+) -> Result<RunningDaemon, DaemonRunError> {
     let env = |key: &str| std::env::var(key).ok();
     let file_source = read_daemon_config_source(&paths)?;
     let overrides = daemon_overrides(args);
@@ -236,7 +247,26 @@ pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), Daemo
     let options = boot_options(&config, args, notify_socket.as_deref());
     boot(TokioRunner::new(), paths, options)
         .await
-        .map_err(DaemonRunError::Boot)?
+        .map_err(DaemonRunError::Boot)
+}
+
+/// Runs the supervisor in this process until a signal or `KillDaemon`.
+///
+/// [`boot_supervisor`] does everything up to and including the boot; this
+/// adds only `.run()` on top of it. See that function's own doc for the
+/// config-loading and log-subscriber detail this used to carry directly.
+///
+/// # Errors
+/// - [`DaemonRunError::Config`] — `shep.toml` failed to parse, or a
+///   `SHEP_*` override held an unparseable value.
+/// - [`DaemonRunError::Boot`] — the config file itself could not be read
+///   (any IO error other than "does not exist"), or the supervisor failed
+///   to boot.
+/// - [`DaemonRunError::Run`] — the supervisor came up and served, then
+///   failed during its run loop or teardown.
+pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), DaemonRunError> {
+    boot_supervisor(paths, args)
+        .await?
         .run()
         .await
         .map_err(DaemonRunError::Run)

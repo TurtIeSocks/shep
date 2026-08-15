@@ -4720,3 +4720,72 @@ fn a_served_sheep_with_follow_symlinks_serves_the_deploy_layout_and_says_so() {
 
     graceful_kill(dir.path());
 }
+
+/// fails if `shep runtime` does not exit on its own when the flock empties,
+/// or exits with the wrong code for the reason it emptied.
+///
+/// Two runs of the same shape, sharing one test so the harness's own
+/// `Command::cargo_bin` lookup is paid once: one app that exits 0 with
+/// `autorestart = false` (exit 0, a clean batch job), and one that exits 1
+/// with `max_restarts = 1` (exit 11) — `max_restarts = 1` errors on the
+/// FIRST unstable exit (`shep-daemon`'s `entry.rs::exhausted`: N = 1 means
+/// N-1 = 0 restarts performed), so this needs no wait through a restart
+/// delay. The second case is decision 13's whole contract.
+///
+/// Each takes at least 6 seconds (`commands::empty::STRIKES` × `INTERVAL` =
+/// 3 × 2s) — the debounce is not shortened to make this fast, per Step
+/// 9.5's own plan text — so this one test costs a bit over 12 seconds of
+/// the suite's wall clock.
+///
+/// No [`DaemonGuard`] here, unlike almost every other case in this file:
+/// `shep runtime` never leaves a daemon behind on either path (that is the
+/// whole point of the verb — no daemonizing, no re-exec, nothing left
+/// running once the flock empties), so there is nothing for a guard to
+/// adopt. A hang instead of a clean exit is caught by `shep()`'s own
+/// `CMD_TIMEOUT`.
+#[test]
+fn runtime_exits_when_the_flock_empties_with_a_code_that_says_why() {
+    // Clean emptying: one app exits 0 and is told not to restart.
+    let clean_dir = tempfile::tempdir().unwrap();
+    let clean_script = write_script(&clean_dir, "clean.sh", "#!/bin/sh\nexit 0\n");
+    let clean_flockfile = write_flockfile(
+        &clean_dir,
+        &format!(
+            "[[app]]\nname = \"batch\"\nscript = \"{}\"\nautorestart = false\n",
+            clean_script.display(),
+        ),
+    );
+    let clean = shep(clean_dir.path())
+        .arg("runtime")
+        .arg(&clean_flockfile)
+        .output()
+        .unwrap();
+    assert_eq!(
+        clean.status.code(),
+        Some(0),
+        "a clean emptying is not a failure; stderr={}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // Fail-fast emptying: one app exits 1 with no restart budget at all.
+    let failed_dir = tempfile::tempdir().unwrap();
+    let failed_script = write_script(&failed_dir, "fail.sh", "#!/bin/sh\nexit 1\n");
+    let failed_flockfile = write_flockfile(
+        &failed_dir,
+        &format!(
+            "[[app]]\nname = \"batch\"\nscript = \"{}\"\nmax_restarts = 1\n",
+            failed_script.display(),
+        ),
+    );
+    let failed = shep(failed_dir.path())
+        .arg("runtime")
+        .arg(&failed_flockfile)
+        .output()
+        .unwrap();
+    assert_eq!(
+        failed.status.code(),
+        Some(11),
+        "an errored sheep must fail the container; stderr={}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+}

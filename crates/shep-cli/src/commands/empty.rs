@@ -1,17 +1,15 @@
 //! The empty-flock watcher: turns a poll of the flock into a [`Sample`], and
 //! debounces a run of empty samples before `runtime`'s foreground engine
-//! (Task 9) decides the flock is gone rather than mid-recovery.
+//! decides the flock is gone rather than mid-recovery.
 //!
 //! Read decision 13 in this phase's plan before touching this file — the
 //! debounce and the clean/failed split here are what decide between
 //! [`crate::exit::ExitCode::Success`] and [`crate::exit::ExitCode::FlockEmpty`],
 //! which is a resolution of a collision spec §9 named and left open.
 //!
-//! Not called anywhere yet outside this module's own tests: `runtime`'s
-//! foreground engine, the only caller, is still unwritten (Task 9).
-//! `#[allow(dead_code)]` on every item below says so explicitly rather than
-//! inventing a call site nothing needs yet — same shape as
-//! [`crate::exit::ExitCode::FlockEmpty`] itself.
+//! `commands::foreground::run` is the one caller: it races
+//! [`watch_until_empty`] against the supervisor's own task, so the engine
+//! stops as soon as either has something to say.
 
 use std::future::Future;
 use std::time::Duration;
@@ -22,7 +20,6 @@ use shep_core::status::ProcStatus;
 /// What one poll of the flock says about whether the foreground engine should
 /// still be running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Sample {
     /// At least one sheep is online, starting, stopping, or waiting to
     /// restart.
@@ -47,7 +44,6 @@ pub enum Sample {
 /// the OS until it exits, and a reload in progress must not read as the
 /// flock having gone away.
 #[must_use]
-#[allow(dead_code)]
 pub fn sample(flock: &[ProcessInfo]) -> Sample {
     let mut any_errored = false;
     for info in flock {
@@ -74,11 +70,9 @@ pub fn sample(flock: &[ProcessInfo]) -> Sample {
 /// gives up — map.md's recorded contract, and not ceremony: a single sample
 /// catches the gap between a sheep exiting and its backoff restart, and a
 /// container torn down in that gap is a container torn down mid-recovery.
-#[allow(dead_code)]
 pub const STRIKES: u8 = 3;
 
 /// The interval between polls while debouncing an emptying flock.
-#[allow(dead_code)]
 pub const INTERVAL: Duration = Duration::from_secs(2);
 
 /// Polls `source` until [`STRIKES`] consecutive non-[`Sample::Busy`] readings
@@ -94,9 +88,8 @@ pub const INTERVAL: Duration = Duration::from_secs(2);
 ///
 /// The loop takes its readings through a generic `source` rather than a
 /// concrete `Client` so this stays testable against a scripted sequence with
-/// no socket involved; `runtime`'s real caller (Task 9) polls a live `Client`
+/// no socket involved; `commands::foreground::run` polls a live `Client`
 /// behind the same closure shape.
-#[allow(dead_code)]
 pub async fn watch_until_empty<F, Fut>(mut source: F) -> Sample
 where
     F: FnMut() -> Fut,

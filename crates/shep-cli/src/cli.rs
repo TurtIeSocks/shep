@@ -333,6 +333,28 @@ pub enum Commands {
     // defeat the point of keeping it hidden.
     #[command(alias = "resurrect")]
     Muster,
+    /// Boot a shepherd in this process, run one Flockfile's flock in the
+    /// foreground, and exit once nothing is left online.
+    ///
+    /// Meant for a container: no daemonization, no re-exec, no saved muster
+    /// roll — `--no-restore` is always on, because a container starts from
+    /// its Flockfile every time, never from a roll left on the image by a
+    /// previous run.
+    ///
+    /// Bleats stream to this process's own stdout/stderr while it runs, so
+    /// `docker logs` is the flock's log without any extra plumbing. The
+    /// shepherd is still reachable over its own socket the whole time —
+    /// `shep flock` from a second terminal, or `docker exec`, works exactly
+    /// as it would against a daemonized one.
+    ///
+    /// Exits 0 once the flock has been empty and clean (every sheep
+    /// `stopped`, none `errored`) for three consecutive two-second polls —
+    /// a batch job finishing its work. Exits 11 (`flock_empty`) instead when
+    /// the flock emptied with at least one sheep `errored` — a restart
+    /// budget exhausted, or a spawn that never came up — so an orchestrator
+    /// reading the exit status can tell "finished" from "died" and restart
+    /// the container only for the second.
+    Runtime(RuntimeArgs),
     /// Write a Flockfile from a pm2 dump. Starts nothing.
     ///
     /// Reads `--from`, or `~/.pm2/dump.pm2` if it names nothing — whichever
@@ -841,6 +863,20 @@ pub struct DaemonArgs {
     pub max_cron_sleep: Option<shep_core::values::UpDuration>,
 }
 
+/// Arguments to `shep runtime`.
+#[derive(Debug, clap::Args)]
+pub struct RuntimeArgs {
+    /// Flockfile to run (default: discovered in the current directory)
+    pub target: Option<String>,
+    /// Run the supervisor in this process rather than splitting off an init.
+    ///
+    /// Set by the init half of a PID-1 split when it re-execs this binary,
+    /// and never by a person. Also a safety catch: with this set the split
+    /// cannot happen, so a mis-read pid can never produce a fork loop.
+    #[arg(long, hide = true)]
+    pub supervise: bool,
+}
+
 /// clap value parser over shep's own four boolean spellings — NOT clap's
 /// `BoolishValueParser`, which also takes yes/no/y/n/on/off and would widen
 /// the grammar on the flag side only.
@@ -902,6 +938,46 @@ mod tests {
                 "{wider} must not parse"
             );
         }
+    }
+
+    /// fails if `runtime` stops parsing, or if `--supervise` becomes
+    /// visible. It is the init's own re-exec flag; a person typing it
+    /// should not find it in `--help`.
+    #[test]
+    fn runtime_parses_and_its_supervise_flag_is_hidden() {
+        use clap::Parser;
+
+        let bare = Cli::try_parse_from(["shep", "runtime"]).unwrap();
+        let Commands::Runtime(args) = bare.command else {
+            panic!("expected runtime")
+        };
+        assert_eq!(args.target, None, "no target means discover");
+        assert!(!args.supervise, "a person never sets this");
+
+        let with_target = Cli::try_parse_from(["shep", "runtime", "./Flockfile.toml"]).unwrap();
+        let Commands::Runtime(args) = with_target.command else {
+            panic!("expected runtime")
+        };
+        assert_eq!(args.target.as_deref(), Some("./Flockfile.toml"));
+
+        let supervised = Cli::try_parse_from(["shep", "runtime", "--supervise"]).unwrap();
+        let Commands::Runtime(args) = supervised.command else {
+            panic!("expected runtime")
+        };
+        assert!(args.supervise, "the init passes --supervise to its child");
+
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let runtime = cmd.find_subcommand("runtime").unwrap();
+        assert!(!runtime.is_hide_set(), "runtime is a real, documented verb");
+        let supervise_arg = runtime
+            .get_arguments()
+            .find(|a| a.get_id().as_str() == "supervise")
+            .expect("RuntimeArgs must still carry a hidden `supervise` field");
+        assert!(
+            supervise_arg.is_hide_set(),
+            "--supervise must stay hidden from --help"
+        );
     }
 
     #[test]

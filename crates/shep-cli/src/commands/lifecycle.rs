@@ -109,7 +109,11 @@ impl core::error::Error for TargetError {
 
 /// `start`'s mapping from a resolution failure to the exit code that
 /// reports it.
-fn target_exit_code(err: &TargetError) -> ExitCode {
+///
+/// `pub(crate)`, not private: `commands::runtime` shares this mapping for
+/// its own call to [`resolve_target`] rather than inventing a second one —
+/// the same failure ought to mean the same exit code whichever verb hit it.
+pub(crate) fn target_exit_code(err: &TargetError) -> ExitCode {
     match err {
         TargetError::Stdin(_) => ExitCode::Failure,
         TargetError::Read { .. } | TargetError::Unresolvable { .. } => ExitCode::Usage,
