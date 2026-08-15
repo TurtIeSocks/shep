@@ -38,6 +38,7 @@ mod launch;
 #[cfg(unix)]
 mod lookout;
 mod output;
+mod serve;
 #[cfg(unix)]
 mod whistle;
 
