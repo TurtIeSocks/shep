@@ -170,11 +170,14 @@ const JS_BRIDGE_SCRIPT: &str = "try { \
 /// interruptible; adding a bound means a reaper thread in a crate that
 /// forbids unsafe code. Recorded in `docs/specs/deferred.md`.
 ///
-/// **The `node_missing` sentence has no unit test**, for the same reason the
-/// stdin gap a few functions up admits its own: producing it needs a `PATH`
-/// without node, and `std::env::set_var` is `unsafe` in edition 2024 in a
-/// crate that forbids unsafe. It is pinned in `docs/migration.md` instead,
-/// by two greps in Task 9.
+/// **The `node_missing` sentence has no unit test and no automated pin**,
+/// for the same reason the stdin gap a few functions up admits its own:
+/// producing it needs a `PATH` without node, and `std::env::set_var` is
+/// `unsafe` in edition 2024 in a crate that forbids unsafe. `docs/migration.md`
+/// quotes this sentence for an operator without node installed; nothing
+/// re-checks that quote against this `format!` after the fact, so the two
+/// are kept in step by hand. If this sentence changes, update
+/// `docs/migration.md`'s quote in the same commit.
 ///
 /// # Errors
 ///

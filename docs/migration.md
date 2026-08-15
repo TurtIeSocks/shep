@@ -24,6 +24,13 @@ says so and tells you the alternative: *reading a .js Flockfile runs it
 through node, and node was not found on PATH; install node, or convert
 `<path>` to a .toml Flockfile.*
 
+This quote is kept in step with `evaluate_js_flockfile`'s `format!` in
+`crates/shep-cli/src/commands/lifecycle.rs` by hand, not by a test: producing
+the `node`-missing path needs a `PATH` without `node` on it, and
+`std::env::set_var` is `unsafe` in edition 2024 in a crate that forbids
+unsafe, so there is no automated way to exercise it. If that sentence
+changes, update this quote in the same commit.
+
 ## 1. What comes across, and what does not
 
 `shep import` reads pm2's dump — one row per running *instance* — and
