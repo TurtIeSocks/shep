@@ -466,8 +466,12 @@ What each of those does NOT do, recorded so it is not rediscovered as drift:
 **`.js` Flockfile** (spec §5) **shipped**, Phase 14, with a ruling narrower
 than the spec's own phrasing suggests: explicit only, never by directory
 discovery and never by extension alone. `shep start <path> --flockfile` reads
-`<path>` by shelling out to `node -p 'JSON.stringify(require(process.argv[1]))'`
-and feeding the result through the existing JSON parser; without the flag,
+`<path>` by shelling out to `node -e` with a small `try`/`catch` wrapper
+(`JS_BRIDGE_SCRIPT` in `lifecycle.rs`) that requires the module and writes
+its JSON to stdout, or `err.message` to stderr on failure — not `node -p`
+bare, whose crash dump on an uncaught exception ends with a trailing
+`Node.js vX.Y.Z` banner line rather than the actual error — and feeding the
+result through the existing JSON parser; without the flag,
 `shep start server.js` still means exactly what it always has — start
 `server.js` as a script. The ten-name `DISCOVERY_ORDER` is unchanged and still
 has no `.js` entry in it. The document it reads is Flockfile-shaped (an `app`

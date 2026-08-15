@@ -162,8 +162,11 @@ impl lands v1.1).
 
 **Flockfile** (per-app config): TOML preferred, YAML + JSON + JSON5 accepted;
 `.js`
-config via `node -p 'JSON.stringify(require(p))'` (requires node on PATH,
-documented). Discovery order in cwd: `Flockfile.{toml,yaml,yml,json,json5}`
+config via `node -e` with a try/catch bridge script that requires the module
+and writes its JSON to stdout (requires node on PATH, documented) — not
+`node -p` bare, whose crash-dump on failure hides the real error behind a
+trailing `Node.js vX.Y.Z` banner. Discovery order in cwd:
+`Flockfile.{toml,yaml,yml,json,json5}`
 then lowercase `flockfile.*` in the same order. Schema = `AppConfig` in shep-core
 (schemars-exported JSON schema ships in `crates/shep-core/assets/`, generated
 from the parser's own document type and describing the whole document — not

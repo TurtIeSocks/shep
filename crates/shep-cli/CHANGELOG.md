@@ -14,11 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `--flockfile` to `shep start`. With it, `shep start <path> --flockfile`
   reads `<path>` as a Flockfile by extension — including `.js`, evaluated by
-  shelling out to `node -p 'JSON.stringify(require(process.argv[1]))'` and
-  feeding the JSON result through the existing parser — instead of treating
-  it as a script. `shep start server.js` with no flag is unchanged: it still
-  starts `server.js`. The flag is on `start` only, not `restart`, `reload`,
-  or `import`.
+  shelling out to
+  `node -e "try { process.stdout.write(JSON.stringify(require(process.argv[1]))); } catch (err) { process.stderr.write(err && err.message ? String(err.message) : String(err)); process.exitCode = 1; }" <path>`
+  and feeding the JSON result through the existing parser — instead of
+  treating it as a script. Not `node -p` bare: node's own crash dump on an
+  uncaught exception ends with a trailing `Node.js vX.Y.Z` banner line, so
+  scraping the last non-blank line of stderr would quote the banner instead
+  of the actual error; the try/catch writes `err.message` to stderr itself
+  instead. `shep start server.js` with no flag is unchanged: it still starts
+  `server.js`. The flag is on `start` only, not `restart`, `reload`, or
+  `import`.
 - Add the hidden `shep schema` verb — prints the Flockfile JSON Schema to
   stdout. The same rendering is committed at
   `crates/shep-core/assets/flockfile.schema.json`, drift-guarded by an
