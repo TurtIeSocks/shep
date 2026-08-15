@@ -25,6 +25,8 @@ use serde::Serialize;
 use shep_core::barks::{Bark, SinkOutcome};
 use shep_core::protocol::{DogSource, Lamb, ProcessInfo};
 
+use crate::dog::metrics::HostReading;
+
 /// Every list-shaped tool's payload: rows under a named field.
 ///
 /// **Not a bare `Vec`.** `Json<T>` hands `T` straight to
@@ -38,9 +40,6 @@ use shep_core::protocol::{DogSource, Lamb, ProcessInfo};
 /// `truncated` beside its rows can grow one without changing the tool's
 /// output shape from array to object, which IS a breaking change for a
 /// consumer.
-///
-/// Not constructed here yet: `read.rs` (Task 6) is the first caller.
-#[allow(dead_code)]
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct FlockListing {
     /// The matched sheep and dogs, in the order the shepherd reported them.
@@ -48,9 +47,6 @@ pub struct FlockListing {
 }
 
 /// `list_barks`' payload. Same rule, same reason as [`FlockListing`].
-///
-/// Not constructed here yet: `read.rs` (Task 6) is the first caller.
-#[allow(dead_code)]
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct BarkListing {
     /// The most recent alerts, oldest first.
@@ -211,9 +207,6 @@ impl From<&SinkOutcome> for SinkOutcomeRow {
 }
 
 /// What `get_metrics` returns: the flock's own numbers plus the machine's.
-///
-/// Not constructed here yet: `read.rs` (Task 6) is the first caller.
-#[allow(dead_code)]
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct MetricsReading {
     /// The shepherd's crate version, from the handshake.
@@ -233,9 +226,6 @@ pub struct MetricsReading {
 }
 
 /// The machine the flock runs on.
-///
-/// Not constructed here yet: `read.rs` (Task 6) is the first caller.
-#[allow(dead_code)]
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct HostRow {
     /// Total physical memory in bytes.
@@ -248,10 +238,23 @@ pub struct HostRow {
     pub uptime_seconds: u64,
 }
 
+impl From<&HostReading> for HostRow {
+    fn from(host: &HostReading) -> Self {
+        Self {
+            memory_total_bytes: host.memory_total_bytes,
+            memory_used_bytes: host.memory_used_bytes,
+            // `usize -> u64`: infallible on every target this workspace
+            // ships (macOS/Linux/Windows, all 64-bit) — a live process
+            // count is nowhere near either width's ceiling, so a
+            // `try_from` here would exist to handle a case that cannot
+            // occur on any target in `docs/idiomatic-rust.md`'s matrix.
+            processes: host.processes as u64,
+            uptime_seconds: host.uptime_seconds,
+        }
+    }
+}
+
 /// What `tail_bleats` returns.
-///
-/// Not constructed here yet: `read.rs` (Task 6) is the first caller.
-#[allow(dead_code)]
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct BleatTail {
     /// The sheep this came from.

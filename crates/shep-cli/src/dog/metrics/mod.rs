@@ -117,7 +117,12 @@ pub struct HostReading {
 /// `None` on a target `sysinfo` does not support — [`Reading::host`]'s own
 /// doc is explicit that this is a real, expected case, not an error a
 /// scrape should fail over.
-fn sample_host() -> Option<HostReading> {
+///
+/// `pub(crate)`, not private: `whistle::read`'s `get_metrics` tool is a
+/// second caller, wanting the same host sample this dog's `/metrics`
+/// scrape does — a visibility change only, the sampling itself is
+/// untouched.
+pub(crate) fn sample_host() -> Option<HostReading> {
     if !sysinfo::IS_SUPPORTED_SYSTEM {
         return None;
     }

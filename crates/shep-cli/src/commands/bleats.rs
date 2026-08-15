@@ -230,9 +230,22 @@ const TAIL_LINES: usize = 50;
 /// would defeat it — hence both bounds.
 const TAIL_WINDOW_BYTES: u64 = 256 * 1024;
 
-/// The last [`TAIL_LINES`] lines of one log file, bounded twice over: a
-/// [`TAIL_WINDOW_BYTES`] window from the end of the file, then a
-/// [`TAIL_LINES`] cap once that window is split into lines.
+/// The last `limit` lines of one log file, bounded twice over: a
+/// [`TAIL_WINDOW_BYTES`] window from the end of the file, then `limit` once
+/// that window is split into lines.
+///
+/// Returns the lines and whether the LINE cap was what cut them short — the
+/// caller needs to tell "this is all of it" from "this is the last N", and
+/// `whistle`'s `tail_bleats` (`crate::whistle::read`) surfaces that to a
+/// model as `BleatTail::truncated`. A model that cannot tell the two apart
+/// concludes a busy app went quiet. A tail cut short by
+/// [`TAIL_WINDOW_BYTES`] instead reports `false` here: that is a byte cap,
+/// not a line cap, and honest for what this return value promises.
+///
+/// `limit` is a parameter rather than a constant because there are now two
+/// callers with two answers: [`tail_log_files`] passes [`TAIL_LINES`], which
+/// is what keeps `shep bleats --no-follow` byte-identical, and `whistle`
+/// passes its own clamped `lines`.
 ///
 /// `std::fs`, not `tokio::fs`: shep-cli's tokio does not carry the `fs`
 /// feature, and this is a bounded read on a one-shot command with nothing
@@ -251,7 +264,7 @@ const TAIL_WINDOW_BYTES: u64 = 256 * 1024;
 /// includes [`io::ErrorKind::NotFound`] (the sheep has never run in this
 /// `$SHEP_HOME`) and `EISDIR` (`out_file`/`err_file` named a directory) —
 /// [`tail_log_files`] gives the two different treatment.
-fn read_tail(path: &Path) -> io::Result<Vec<String>> {
+pub(crate) fn read_tail(path: &Path, limit: usize) -> io::Result<(Vec<String>, bool)> {
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let start = len.saturating_sub(TAIL_WINDOW_BYTES);
@@ -276,9 +289,10 @@ fn read_tail(path: &Path) -> io::Result<Vec<String>> {
     if lines.last().is_some_and(String::is_empty) {
         lines.pop();
     }
-    let keep_from = lines.len().saturating_sub(TAIL_LINES);
+    let keep_from = lines.len().saturating_sub(limit);
+    let truncated = keep_from > 0;
     lines.drain(..keep_from);
-    Ok(lines)
+    Ok((lines, truncated))
 }
 
 /// Renders the selected files of every sheep the selector admits, in id
@@ -333,8 +347,8 @@ fn tail_log_files(
                     "log_path_unknown",
                     &format!("{name}: the daemon did not report a {stream_name} log path"),
                 ),
-                Some(path) => match read_tail(Path::new(path)) {
-                    Ok(lines) => {
+                Some(path) => match read_tail(Path::new(path), TAIL_LINES) {
+                    Ok((lines, _truncated)) => {
                         for line in lines {
                             if let Err(write_err) =
                                 write_line(streams.out, fmt, info.id, name, stream_name, &line)

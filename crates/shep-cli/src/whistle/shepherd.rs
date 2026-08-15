@@ -22,18 +22,24 @@ use crate::exit::ExitCode;
 /// Not an error enum, so IR-20's `#[non_exhaustive]` rule does not apply; and
 /// shep-cli is `[[bin]]`-only, so nothing here is in a library crate at all.
 ///
-/// Not constructed outside this module's own tests yet: the `Whistle`
-/// handler that owns one is Task 8. `#[allow(dead_code)]` on this type and
-/// its inherent impl says so explicitly, same pattern as `gate::Control`.
-#[allow(dead_code)]
+/// `super::read`'s five tools (Task 6) are the first real callers of
+/// [`Self::call`]/[`Self::call_with_ack`], each holding one as
+/// `Whistle::shepherd` — reached transitively through `read`'s own
+/// `#[allow(dead_code)]` router, so those two methods need no allow of
+/// their own. [`Self::new`] is different: nothing in `main` constructs a
+/// `Whistle` (and so a `Shepherd`) yet — that's Task 8's job, building one
+/// from `ShepPaths::socket` — so it alone still carries the allow.
 #[derive(Debug, Clone)]
 pub struct Shepherd {
     socket: PathBuf,
 }
 
-#[allow(dead_code)]
 impl Shepherd {
     /// Wraps a socket path. Connects to nothing until [`Self::call`].
+    ///
+    /// Not called outside this module's and `super::read`'s own tests yet:
+    /// see the struct's own doc for why.
+    #[allow(dead_code)]
     #[must_use]
     pub fn new(socket: PathBuf) -> Self {
         Self { socket }
@@ -93,9 +99,10 @@ impl Shepherd {
 /// only the words that say what is missing rather than what failed, which is
 /// what a model can act on.
 ///
-/// Not called outside this module's own tests yet: [`Shepherd::call_with_ack`]
-/// is its only call site, and `Shepherd` itself has no caller until Task 8.
-#[allow(dead_code)]
+/// [`Shepherd::call_with_ack`] is its only call site — reached from every
+/// tool in `super::read` (Task 6) once `super::read`'s router is itself
+/// reachable, which is Task 8's job; that router's own `#[allow(dead_code)]`
+/// covers this transitively until then.
 fn connect_refusal(socket: &Path, err: &ConnectError) -> CallToolResult {
     let _ = socket; // named in the signature for call-site readability; the
     // path itself comes out of `err`'s own Display.
@@ -122,9 +129,9 @@ fn connect_refusal(socket: &Path, err: &ConnectError) -> CallToolResult {
 /// yet. A model reading "api is already being reloaded" can act on that. A
 /// model reading a nicer code whistle invented would be reading fiction.
 ///
-/// Not called outside this module's own tests yet, same reason as
-/// [`connect_refusal`].
-#[allow(dead_code)]
+/// Reached the same way [`connect_refusal`] is: through `super::read`'s
+/// tools, transitively covered by that router's `#[allow(dead_code)]` until
+/// Task 8 wires it into `main`.
 fn refusal(err: &RequestError) -> CallToolResult {
     let (code, message) = match err {
         // `ExitCode::from(RpcErrorCode)` then `code_str()`, rather than a
@@ -150,13 +157,14 @@ fn refusal(err: &RequestError) -> CallToolResult {
 
 /// whistle's OWN refusal, before anything reaches the wire.
 ///
-/// One shape for both kinds, so a model never has to learn two. `start_sheep`'s
-/// already-running refusal will be its only caller, in `whistle/control.rs`
-/// (Task 7) — not yet written, so nothing in this task calls it.
+/// One shape for both kinds, so a model never has to learn two. `super::read`
+/// (Task 6) is the first caller — an unreadable log file (`tail_bleats`) and
+/// an unreadable `barks.jsonl` (`list_barks`) both go through this, rather
+/// than each tool inventing its own error shape. `start_sheep`'s
+/// already-running refusal (`whistle/control.rs`, Task 7) will be a third.
 ///
 /// Not an error enum, so IR-20's `#[non_exhaustive]` rule does not apply; and
 /// shep-cli is `[[bin]]`-only, so nothing here is in a library crate at all.
-#[allow(dead_code)]
 pub fn own_refusal(code: &str, message: String) -> CallToolResult {
     CallToolResult::structured_error(serde_json::json!({
         "code": code,
