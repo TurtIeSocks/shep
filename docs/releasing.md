@@ -175,7 +175,7 @@ stay true, not work left to do.
 
 - The task gate is green: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, and `cargo test --workspace
-  --all-features` at 1219 passed / 0 failed / 4 ignored.
+  --all-features` at 1298 passed / 0 failed / 5 ignored.
 - Every crate has `description`, `readme`, `keywords` and `categories`, and
   every category is a real crates.io slug. A category the registry does not
   recognise is rejected at upload, after earlier crates in the chain have
@@ -201,10 +201,27 @@ cross-compiles for the target, and the README, the crate descriptions and the
 is allowed to have an unsupported platform. A `1.0.0` is not.
 
 **Several v1.0 spec items are unbuilt.** `shep serve`, `shep dev` and
-`shep runtime`, `.js` Flockfiles, the schemars schema, the CLI-flag config
-layer, openrc and BSD `rc.d` units, and three of lookout's four panes. All of
-them are named in [specs/deferred.md](specs/deferred.md), and none of them
-change the behaviour of what does exist. They are why the version is an alpha.
+`shep runtime`, and three of lookout's four panes. All of them are named in
+[specs/deferred.md](specs/deferred.md), and none of them change the
+behaviour of what does exist. They are why the version is an alpha. `.js`
+Flockfiles, the schemars schema, the CLI-flag config layer, and openrc/BSD
+`rc.d` units shipped in Phase 14 — see the two paragraphs below for what
+that means for this release, specifically.
+
+**The three new init scripts are rendered and pinned by exact-string tests,
+and have not been executed on FreeBSD, OpenBSD, or an openrc host.** No such
+host exists in this project. Nothing claims support for those platforms
+until somebody reports back from one; `shep startup` will happily render a
+script for an init system nobody here has ever booted it under.
+
+**`crates/shep-core/assets/flockfile.schema.json` is a committed, generated
+artefact that ships in shep-core's tarball**, because
+`crates/shep-core/src/config/flockfile.rs` `include_str!`s it — that is why
+it lives inside the package directory rather than at the repository root.
+Regenerate it with `cargo run -p shep-cli -- schema >
+crates/shep-core/assets/flockfile.schema.json` before a release if
+`AppConfig` changed, though the drift test in `flockfile.rs` will have told
+you already: `cargo test -p shep-core` fails first.
 
 **Docs.rs has never built these crates.** It cannot until they are published,
 so this is unknowable in advance rather than skippable. `RUSTDOCFLAGS="-D

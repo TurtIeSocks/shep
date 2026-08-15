@@ -186,7 +186,16 @@ that mutate and present only when `[whistle] allow_control = true` in
 `shep.toml`; `start_sheep` narrowed to already-registered sheep; every
 daemon refusal a control tool can meet reaches the model as an in-band tool
 result, not a protocol error. `docs/whistle/README.md` and the generated
-`docs/whistle/tools.md` are the operator contract.
+`docs/whistle/tools.md` are the operator contract. Phase 14 merged: config
+and packaging — `.js` Flockfiles behind `shep start --flockfile` (never by
+discovery, never by extension alone: `shep start server.js` still starts
+`server.js`), a schemars-exported Flockfile JSON Schema
+(`crates/shep-core/assets/flockfile.schema.json`, generated from the parser's
+own document type, printed by the hidden `shep schema`), a `file < env <
+flags` daemon-config layer (`shep daemon --log-json/--log-level/--socket/
+--max-cron-sleep`), and openrc plus FreeBSD/OpenBSD `rc.d` renderers for
+`shep startup`/`unstartup` — the last two rendered and pinned by
+exact-string tests only, never executed on their own operating systems.
 
 What's built vs. deferred to v1.1+: [docs/specs/deferred.md](docs/specs/deferred.md).
 Windows is 0%, not partial — every verb prints "not yet supported" and exits.
