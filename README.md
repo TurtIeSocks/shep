@@ -177,10 +177,11 @@ Not started: `shep serve`, `shep dev` and `shep runtime`, `.js` Flockfiles, a
 `schemars`-exported config JSON schema, a CLI-flag config layer, and openrc
 and BSD `rc.d` units.
 
-The lookout has its shell and its flock table pane; the bleats feed, the
-sheep detail pane and the host-usage strip are still to come, and so is
-search/filter and the actions the control gate refuses today. Rendered
-frames of what exists so far are in
+The lookout ships all four panes — the flock table, the bleats feed, the
+sheep detail pane, and the host-usage strip. Search/filter is still to come,
+and so are the actions: the control gate exists, but `x` (stop) is the only
+key bound to one and it refuses either way, honestly, with a message saying
+why. Rendered frames of what exists so far are in
 [docs/lookout/frames.txt](docs/lookout/frames.txt) (`frames.ansi` for the
 coloured version, read with `less -R`).
 
