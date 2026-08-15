@@ -213,6 +213,22 @@ pub enum Commands {
     /// escape sequences into a file.
     #[command(visible_alias = "dash")]
     Lookout(LookoutArgs),
+    /// Serve the MCP interface on stdin/stdout for an AI agent.
+    ///
+    /// Speaks the Model Context Protocol over stdio: an agent host launches
+    /// this process and talks JSON-RPC to it on the pipe. It writes nothing
+    /// else to stdout, because stdout is the wire.
+    ///
+    /// Five read-only tools are always offered. The four that act —
+    /// start_sheep, stop_sheep, restart_sheep, reload_sheep — exist only when
+    /// `[whistle] allow_control = true` in `$SHEP_HOME/shep.toml`.
+    ///
+    /// That gate is a guard against an agent acting on its own reading of
+    /// your flock, not a security boundary: whistle runs as you, so anything
+    /// it could do you can already do with `shep stop`. There is deliberately
+    /// no flag for it — an agent host writes its own launch command, and a
+    /// flag would let the same edit that adds this server open the gate.
+    Whistle,
     /// Reopen log files after an external rotator has renamed them.
     Reopen(ReopenArgs),
     /// Empty the log files of one or more sheep, or the shepherd's own.
@@ -1142,5 +1158,22 @@ mod tests {
             panic!("lookout parses to its own variant")
         };
         assert!(flagged.allow_control);
+    }
+
+    /// fails if `shep whistle` stops parsing, or grows an argument. The
+    /// absence of `--allow-control` is a decision (spec §14.7), so it is
+    /// asserted rather than left to be noticed.
+    #[test]
+    fn whistle_takes_no_arguments_and_has_no_control_flag() {
+        use clap::Parser;
+        assert!(matches!(
+            Cli::try_parse_from(["shep", "whistle"]).unwrap().command,
+            Commands::Whistle
+        ));
+        assert!(
+            Cli::try_parse_from(["shep", "whistle", "--allow-control"]).is_err(),
+            "whistle's gate is `[whistle] allow_control` in shep.toml, and a flag would \
+             let an agent host's own config open it in the same line that adds the server"
+        );
     }
 }

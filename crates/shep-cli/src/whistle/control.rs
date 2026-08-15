@@ -212,8 +212,10 @@ mod tests {
     use tokio::net::{UnixListener, UnixStream};
     use tokio::task::JoinHandle;
 
+    use shep_core::paths::ShepPaths;
+
     use super::*;
-    use crate::whistle::shepherd::Shepherd;
+    use crate::whistle::gate;
 
     /// How long a test waits before deciding a tool call hung rather than
     /// failed — IR-46: every await in a test needs a forcing mechanism.
@@ -221,11 +223,21 @@ mod tests {
 
     fn whistle_at(socket: std::path::PathBuf) -> Whistle {
         // None of these four tools ever reads `barks.jsonl` — that path is
-        // `read::list_barks`' alone — so a nonexistent one is fine here.
-        Whistle::new(
-            Shepherd::new(socket),
-            std::path::PathBuf::from("/nonexistent/barks.jsonl"),
-        )
+        // `read::list_barks`' alone — so a nonexistent one is fine here, and
+        // every other `ShepPaths` field beside `socket` is likewise unread
+        // by anything a control tool does.
+        let paths = ShepPaths {
+            home: std::path::PathBuf::new(),
+            daemon_config: std::path::PathBuf::new(),
+            snapshot: std::path::PathBuf::new(),
+            logs: std::path::PathBuf::new(),
+            pids: std::path::PathBuf::new(),
+            run: std::path::PathBuf::new(),
+            socket,
+            barks: std::path::PathBuf::from("/nonexistent/barks.jsonl"),
+            kv: std::path::PathBuf::new(),
+        };
+        Whistle::new(paths, gate::Control::Allowed)
     }
 
     async fn read_frame(stream: &mut UnixStream) -> Vec<u8> {

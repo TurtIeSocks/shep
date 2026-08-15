@@ -277,6 +277,17 @@ async fn run(cli: Cli) -> ExitCode {
         return lookout::lookout(&mut streams, fmt, &paths, args).await;
     }
 
+    // Not in the locked block below, and it takes NO `Streams` at all. This
+    // verb owns stdout as a wire: everything written there is MCP, and an
+    // `output::emit` call on this path would corrupt the peer's parse. It also
+    // runs until the peer closes the pipe, which is the same reason `bleats`
+    // and `lookout` are up here — a `StdoutLock` held for a process lifetime
+    // wedges the first off-thread write.
+    if let Commands::Whistle = cli.command {
+        let mut err = std::io::stderr();
+        return whistle::whistle(&mut err, fmt, &paths).await;
+    }
+
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
     let mut streams = Streams {
@@ -428,6 +439,7 @@ async fn run(cli: Cli) -> ExitCode {
         | Commands::Unstartup(_)
         | Commands::Bleats(_)
         | Commands::Lookout(_)
+        | Commands::Whistle
         | Commands::Dog(_) => {
             unreachable!("handled above: before the shared $SHEP_HOME gate, or on unlocked handles")
         }

@@ -183,7 +183,7 @@ impl Whistle {
         Parameters(params): Parameters<BarksParams>,
     ) -> Result<Json<BarkListing>, CallToolResult> {
         let limit = (params.tail.unwrap_or(DEFAULT_TAIL).min(MAX_TAIL)) as usize;
-        let mut history = barks::read(&self.barks_path)
+        let mut history = barks::read(&self.paths.barks)
             .map_err(|err| shepherd::own_refusal("failure", err.to_string()))?;
         let keep_from = history.len().saturating_sub(limit);
         history.drain(..keep_from);
@@ -232,18 +232,39 @@ fn unexpected_response() -> CallToolResult {
 mod tests {
     use std::time::Duration;
 
+    use shep_core::paths::ShepPaths;
     use shep_core::protocol::{DogSource, ProcessInfo};
     use shep_core::status::ProcStatus;
 
     use super::*;
-    use crate::whistle::shepherd::Shepherd;
+    use crate::whistle::gate;
 
     /// How long a test waits before deciding a tool call hung rather than
     /// failed — IR-46: every await in a test needs a forcing mechanism.
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// A `ShepPaths` naming only the two fields any test here reads — the
+    /// socket `Shepherd::call` dials and the file `list_barks` opens
+    /// directly. The rest are never touched (`Whistle::new` reaches
+    /// `paths.socket` alone to build its `Shepherd`), so they carry an
+    /// empty placeholder rather than a plausible-looking value nothing
+    /// checks.
+    fn test_paths(socket: std::path::PathBuf, barks: std::path::PathBuf) -> ShepPaths {
+        ShepPaths {
+            home: std::path::PathBuf::new(),
+            daemon_config: std::path::PathBuf::new(),
+            snapshot: std::path::PathBuf::new(),
+            logs: std::path::PathBuf::new(),
+            pids: std::path::PathBuf::new(),
+            run: std::path::PathBuf::new(),
+            socket,
+            barks,
+            kv: std::path::PathBuf::new(),
+        }
+    }
+
     fn whistle_at(socket: std::path::PathBuf, barks_path: std::path::PathBuf) -> Whistle {
-        Whistle::new(Shepherd::new(socket), barks_path)
+        Whistle::new(test_paths(socket, barks_path), gate::Control::ReadOnly)
     }
 
     /// fails if `list_flock` stops returning every registered entry, or
