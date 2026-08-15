@@ -12,12 +12,20 @@ use super::super::app::{App, Control, Link};
 use super::flock::fit;
 
 /// The title: what this is, where it points, and how big the flock is.
+///
+/// `right` carries a leading space so the two halves never touch: `fit`
+/// pads a short `left` with trailing spaces, which already keeps them apart
+/// at ordinary widths, but a `left` too long to fit gets truncated to
+/// EXACTLY the budget `right`'s own length reserves — with no leading space
+/// on `right`, the `…` and the flock count would land in adjacent columns
+/// with nothing between them. The leading space shrinks that budget by one,
+/// which is all a truncated `left` needs.
 #[must_use]
 pub fn title_line(app: &App, home: &str, width: u16) -> Line<'static> {
     let palette = app.palette();
     let left = format!("shep lookout   {home}");
     let count = app.rows().len();
-    let right = format!("{count} in the flock");
+    let right = format!(" {count} in the flock");
     Line::from(vec![
         Span::raw(fit(
             &left,

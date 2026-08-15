@@ -298,7 +298,7 @@ shep lookout   /home/rin/.shep                                                  
 q quit   j/k select   g/G first/last   r refresh                                                               read-only
 
 === feed_gap  (120x30) ===
-The feed under a burst: four megabytes were never read and some hundreds of lines were read and dropped. The pane counts both, and counts them separately, because it knows the second exactly and cannot know how many lines are in the first.
+The feed under a burst: 3.8 megabytes were never read and some hundreds of lines were read and dropped. The pane counts both, and counts them separately, because it knows the second exactly and cannot know how many lines are in the first.
 
 shep lookout   /home/rin/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
@@ -366,9 +366,9 @@ this sheep has not written a log in this $SHEP_HOME
 q quit   j/k select   g/G first/last   r refresh                                                               read-only
 
 === cramped  (33x26) ===
-33 columns, 26 rows: the narrowest terminal that draws, with all three panes up. Everything truncates with an ellipsis; nothing overlaps.
+33 columns: the narrowest terminal that draws. 26 rows — a couple more than the 24-row floor for all three panes being up, so this frame has a little breathing room rather than sitting exactly on the edge. Everything truncates with an ellipsis; nothing overlaps.
 
-shep lookout   /ho…6 in the flock
+shep lookout   /h… 6 in the flock
 host  load 2.31 4.10 3.88 / 10 c…
   ID    NAME      STATUS         
 ─────────────────────────────────

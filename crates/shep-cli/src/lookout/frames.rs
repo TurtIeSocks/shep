@@ -235,13 +235,13 @@ impl Scene {
                 "12 rows: no optional panes at all. This is 12a's frame, and the only thing that changed is the two-column gutter the marker sits in."
             }
             Self::FeedGap => {
-                "The feed under a burst: four megabytes were never read and some hundreds of lines were read and dropped. The pane counts both, and counts them separately, because it knows the second exactly and cannot know how many lines are in the first."
+                "The feed under a burst: 3.8 megabytes were never read and some hundreds of lines were read and dropped. The pane counts both, and counts them separately, because it knows the second exactly and cannot know how many lines are in the first."
             }
             Self::FeedMissing => {
                 "The selected sheep has never written a log in this $SHEP_HOME. The feed names that cause rather than sitting blank."
             }
             Self::Cramped => {
-                "33 columns, 26 rows: the narrowest terminal that draws, with all three panes up. Everything truncates with an ellipsis; nothing overlaps."
+                "33 columns: the narrowest terminal that draws. 26 rows — a couple more than the 24-row floor for all three panes being up, so this frame has a little breathing room rather than sitting exactly on the edge. Everything truncates with an ellipsis; nothing overlaps."
             }
             Self::HostUnknown => {
                 "`sysinfo` reports this platform unsupported. The strip says so and keeps the flock's own totals, which lookout can always compute."
@@ -777,7 +777,7 @@ mod tests {
         assert_eq!(lines.next().unwrap().trim_end(), "too small");
         assert_eq!(lines.next().unwrap().trim_end(), "need 33x6");
 
-        // "The feed under a burst: four megabytes were never read and some
+        // "The feed under a burst: 3.8 megabytes were never read and some
         //  hundreds of lines were read and dropped. The pane counts both, and
         //  counts them separately, because it knows the second exactly and
         //  cannot know how many lines are in the first."
@@ -824,8 +824,10 @@ mod tests {
         assert!(!table_only.contains("bleats  "));
         assert!(table_only.contains("STATUS"), "the table is still there");
 
-        // "33 columns, 26 rows: the narrowest terminal that draws, with all
-        //  three panes up. Everything truncates with an ellipsis; nothing
+        // "33 columns: the narrowest terminal that draws. 26 rows — a couple
+        //  more than the 24-row floor for all three panes being up, so this
+        //  frame has a little breathing room rather than sitting exactly on
+        //  the edge. Everything truncates with an ellipsis; nothing
         //  overlaps."
         let cramped = render_text(&scene(Scene::Cramped).1);
         assert!(cramped.contains('…'), "something truncated, visibly");
