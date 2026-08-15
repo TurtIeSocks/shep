@@ -178,7 +178,7 @@ impl Scene {
                 "No sheep registered. The header row still prints, and a plain sentence says the pane is empty rather than leaving it blank."
             }
             Self::Narrow => {
-                "49 columns: FOLD, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY."
+                "51 columns: FOLD, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY."
             }
             Self::TooNarrow => {
                 "28 columns: below the floor, the pane refuses rather than drawing overlapping garbage. The refusal is two short lines so it still fits."
@@ -200,12 +200,15 @@ impl Scene {
     pub const fn size(self) -> (u16, u16) {
         match self {
             Self::Empty => (100, 12),
-            // 49, not 46. `columns_for` picks the first tier whose threshold
-            // is <= the width, and 46 lands on the `41` tier — which has
-            // already dropped CPU, so a scene rendered there would
-            // contradict its own caption in the gallery Rin reads. 49 is the
-            // `NO_MEM` tier: four columns gone, CPU and UPTIME still there.
-            Self::Narrow => (49, 14),
+            // 51, not 46 and not 49. `columns_for` runs on `width - GUTTER`
+            // (Task 2: the selection marker's two-column gutter, phase plan
+            // design decision 6), so the table only sees `width - 2` — a
+            // scene asked for the raw `NO_MEM` threshold (49) would land two
+            // columns short of it and drop into the `41` tier, which has
+            // already dropped CPU, contradicting this scene's own caption.
+            // 51 - GUTTER == 49, the `NO_MEM` tier: four columns gone, CPU
+            // and UPTIME still there.
+            Self::Narrow => (51, 14),
             Self::TooNarrow => (28, 8),
             _ => (120, 20),
         }
@@ -494,7 +497,7 @@ mod tests {
     #[test]
     fn every_scene_shows_the_thing_it_is_named_for() {
         assert!(render_text(&scene(Scene::Empty).1).contains("the flock is empty"));
-        assert!(render_text(&scene(Scene::TooNarrow).1).contains("need 31x6"));
+        assert!(render_text(&scene(Scene::TooNarrow).1).contains("need 33x6"));
         assert!(render_text(&scene(Scene::Frozen).1).contains("the shepherd has died"));
         assert!(render_text(&scene(Scene::Retrying).1).contains("reconnecting"));
         assert!(render_text(&scene(Scene::Refused).1).contains("--allow-control"));

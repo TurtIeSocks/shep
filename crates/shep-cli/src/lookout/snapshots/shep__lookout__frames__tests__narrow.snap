@@ -2,17 +2,17 @@
 source: crates/shep-cli/src/lookout/frames.rs
 expression: render_text(&buffer)
 ---
-shep lookout   /home/rin/.shep     6 in the flock
-ID    NAME      STATUS           CPU     UPTIME  
-─────────────────────────────────────────────────
-0     web       online           3.4%    1h 25m  
-1     web       online           2.9%    1h 26m  
-2     api       online           7.1%    1h 28m  
-3     billing…  online           0.8%    1h 29m  
-4     cron      online           0.1%    1h 31m  
-5     metrics   online           0.4%    1h 32m  
-                                                 
-                                                 
-                                                 
-                                                 
-q quit   j/k select   g/G first/last  … read-only
+shep lookout   /home/rin/.shep       6 in the flock
+  ID    NAME      STATUS           CPU     UPTIME  
+───────────────────────────────────────────────────
+> 0     web       online           3.4%    1h 25m  
+  1     web       online           2.9%    1h 26m  
+  2     api       online           7.1%    1h 28m  
+  3     billing…  online           0.8%    1h 29m  
+  4     cron      online           0.1%    1h 31m  
+  5     metrics   online           0.4%    1h 32m  
+                                                   
+                                                   
+                                                   
+                                                   
+q quit   j/k select   g/G first/last   r… read-only

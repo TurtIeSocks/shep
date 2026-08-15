@@ -12,8 +12,15 @@ pub mod status;
 use ratatui::Frame;
 use ratatui::text::{Line, Span};
 
-use self::flock::{MIN_HEIGHT, MIN_WIDTH};
+use self::flock::MIN_HEIGHT;
 use super::app::App;
+
+/// The narrowest terminal the dashboard draws into.
+///
+/// The table's own floor ([`flock::MIN_WIDTH`], 31) plus the selection
+/// marker's gutter ([`flock::GUTTER`], 2). Below this the whole draw becomes
+/// two short lines saying so.
+pub const MIN_TERM_WIDTH: u16 = flock::MIN_WIDTH + flock::GUTTER;
 
 /// Renders the whole dashboard.
 ///
@@ -29,20 +36,21 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
     let (width, height) = (area.width, area.height);
     let palette = app.palette();
 
-    if width < MIN_WIDTH || height < MIN_HEIGHT {
+    if width < MIN_TERM_WIDTH || height < MIN_HEIGHT {
         // Two nine-character lines, not one 39-character sentence.
         // `Buffer::set_line` truncates at `max_width` in silence, and this
-        // branch exists for terminals narrower than `MIN_WIDTH` — so a
-        // refusal that does not fit inside `MIN_WIDTH` loses its own numbers
-        // at exactly the widths that need them. Nine columns is the floor at
-        // which both lines are still whole, and below that nothing helps.
+        // branch exists for terminals narrower than `MIN_TERM_WIDTH` — so a
+        // refusal that does not fit inside `MIN_TERM_WIDTH` loses its own
+        // numbers at exactly the widths that need them. Nine columns is the
+        // floor at which both lines are still whole, and below that nothing
+        // helps.
         if width == 0 || height == 0 {
             return;
         }
         let first = Line::from(Span::raw("too small"));
         frame.buffer_mut().set_line(area.x, area.y, &first, width);
         if height >= 2 {
-            let second = Line::from(Span::raw(format!("need {MIN_WIDTH}x{MIN_HEIGHT}")));
+            let second = Line::from(Span::raw(format!("need {MIN_TERM_WIDTH}x{MIN_HEIGHT}")));
             frame
                 .buffer_mut()
                 .set_line(area.x, area.y + 1, &second, width);
@@ -66,14 +74,18 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
         y += 1;
     }
 
-    let columns = flock::columns_for(width);
+    // width >= MIN_TERM_WIDTH, checked above, so this never underflows.
+    let table_width = width - flock::GUTTER;
+    let columns = flock::columns_for(table_width);
     buffer.set_line(
-        area.x,
+        area.x + flock::GUTTER,
         y,
-        &flock::header_line(columns, width, palette.muted()),
-        width,
+        &flock::header_line(columns, table_width, palette.muted()),
+        table_width,
     );
     y += 1;
+    // The rule stays full width — it is chrome, and a rule that stopped two
+    // columns short of the left edge would look like a rendering bug.
     buffer.set_line(area.x, y, &status::rule_line(palette.muted(), width), width);
     y += 1;
 
@@ -86,9 +98,20 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
     } else {
         let offset = flock::scroll_offset(app.selected_index().unwrap_or(0), viewport, rows.len());
         for (slot, row) in rows.iter().skip(offset).take(viewport).enumerate() {
-            let line = flock::row_line(app, row, columns, width);
             let slot = u16::try_from(slot).unwrap_or(0);
-            buffer.set_line(area.x, y + slot, &line, width);
+            let selected = app.selected() == Some(row.info.id);
+            buffer.set_line(
+                area.x,
+                y + slot,
+                &Line::from(Span::raw(flock::mark(selected))),
+                1,
+            );
+            buffer.set_line(
+                area.x + flock::GUTTER,
+                y + slot,
+                &flock::row_line(app, row, columns, table_width),
+                table_width,
+            );
         }
     }
 
@@ -110,7 +133,7 @@ mod tests {
     use shep_core::status::ProcStatus;
 
     use super::*;
-    use crate::lookout::app::{App, Control, Msg};
+    use crate::lookout::app::{App, Control, KeyPress, Msg};
     use crate::lookout::theme::Palette;
 
     fn draw_to(app: &App, width: u16, height: u16) -> String {
@@ -127,8 +150,8 @@ mod tests {
     ///
     /// The second half is the one that regresses silently. `Buffer::set_line`
     /// truncates at `max_width` without complaint, and this branch exists
-    /// for terminals narrower than 31 columns — so a refusal written as one
-    /// 39-character sentence loses `31x6` off the right-hand edge at exactly
+    /// for terminals narrower than 33 columns — so a refusal written as one
+    /// 39-character sentence loses `33x6` off the right-hand edge at exactly
     /// the widths that need to read it. Both assertions below are on the
     /// WHOLE line, trimmed, rather than on `contains`, because `contains`
     /// passes on a truncated line as happily as on a whole one.
@@ -143,7 +166,7 @@ mod tests {
         let frame = draw_to(&app, 28, 8);
         let mut lines = frame.lines();
         assert_eq!(lines.next().unwrap().trim_end(), "too small");
-        assert_eq!(lines.next().unwrap().trim_end(), "need 31x6");
+        assert_eq!(lines.next().unwrap().trim_end(), "need 33x6");
         assert!(!frame.contains("STATUS"), "no header was drawn");
 
         // Narrower still, and taller than the floor in rows: the numbers
@@ -151,7 +174,7 @@ mod tests {
         // the case this message exists for.
         let cramped = draw_to(&app, 12, 8);
         assert!(
-            cramped.lines().nth(1).unwrap().trim_end() == "need 31x6",
+            cramped.lines().nth(1).unwrap().trim_end() == "need 33x6",
             "the dimensions were cut off in the terminal that needed them"
         );
 
@@ -178,6 +201,52 @@ mod tests {
         let frame = draw_to(&app, 100, 12);
         assert!(frame.contains("STATUS"));
         assert!(frame.contains("the flock is empty"));
+    }
+
+    /// fails if the table stops leaving room for the marker, or if the marker
+    /// stops landing on the selected row. Asserted on the WHOLE line rather
+    /// than with `contains`, because a `>` somewhere in a log path would
+    /// satisfy `contains` and prove nothing.
+    #[test]
+    fn the_marker_sits_in_the_gutter_of_the_selected_row_and_nowhere_else() {
+        let mut app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/home/rin/.shep".to_string(),
+            Instant::now(),
+        );
+        app.update(Msg::Snapshot {
+            rows: (0..4)
+                .map(|id| {
+                    ProcessInfo::builder(id, format!("sheep-{id}"), ProcStatus::Online).build()
+                })
+                .collect(),
+            at: Instant::now(),
+        });
+        app.update(Msg::Key(KeyPress::SelectDown));
+
+        let frame = draw_to(&app, 100, 12);
+        let rows: Vec<&str> = frame.lines().skip(3).take(4).collect();
+        assert!(
+            rows[0].starts_with("  0 "),
+            "unselected rows keep a blank gutter: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[1].starts_with("> 1 "),
+            "the marker is on row 1: {:?}",
+            rows[1]
+        );
+        assert!(
+            rows[2].starts_with("  2 "),
+            "and on no other row: {:?}",
+            rows[2]
+        );
+        assert_eq!(
+            frame.lines().filter(|line| line.starts_with('>')).count(),
+            1,
+            "exactly one marker on the frame"
+        );
     }
 
     /// fails if a frozen dashboard does not say so where it cannot be

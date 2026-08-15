@@ -19,11 +19,12 @@ use ratatui::text::{Line, Span};
 use super::super::app::{App, Row};
 use crate::output::{human_bytes, human_duration};
 
-/// The narrowest terminal the pane will draw into.
+/// The narrowest terminal the TABLE will draw into.
 ///
 /// `ID` + `NAME` (floor 8) + `STATUS` (15, the width of `waiting-restart`)
-/// plus two separators. Below this the whole draw becomes one line saying
-/// so — see [`super::draw`].
+/// plus two separators. This is the table's own floor, not the terminal's —
+/// the terminal also needs room for [`GUTTER`], the selection marker's
+/// column; see [`super::MIN_TERM_WIDTH`] and [`super::draw`].
 pub const MIN_WIDTH: u16 = 31;
 
 /// The shortest terminal the pane will draw into: title, banner, header,
@@ -33,6 +34,26 @@ pub const MIN_HEIGHT: u16 = 6;
 /// The floor on the NAME column, which takes whatever the fixed columns
 /// leave.
 pub const NAME_MIN: u16 = 8;
+
+/// The columns the selection marker takes, to the left of the table.
+///
+/// One for the marker, one for the gap. The table itself is rendered into
+/// `width - GUTTER` starting at `x + GUTTER`, which is why every threshold in
+/// [`TIERS`] and every arithmetic in [`name_width`] is untouched by the
+/// marker's arrival — see the phase plan's design decision 6.
+pub const GUTTER: u16 = 2;
+
+/// The marker for the selected row, or a blank for every other row.
+///
+/// A plain ASCII `>`, not a colour and not a `REVERSED` modifier: every
+/// signal on this screen survives `NO_COLOR` and a 16-colour terminal, and a
+/// decoration-only cursor does not. `▸` is East-Asian *Ambiguous* width, and a
+/// terminal that renders it double-wide would shift every column of that one
+/// row by a cell.
+#[must_use]
+pub const fn mark(selected: bool) -> &'static str {
+    if selected { ">" } else { " " }
+}
 
 /// One column of the flock table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,25 +310,20 @@ fn cell(app: &App, row: &Row, column: Column) -> String {
     }
 }
 
-/// Which slice of the flock is on screen: the first row to draw, given what
-/// `App` was asked for and how many rows there is room for.
+/// Which slice of the flock is on screen, given where the cursor is.
 ///
-/// `requested` is [`super::super::app::App::scroll`] — the reducer's own
-/// offset, which it clamps to the flock's length but cannot clamp to the
-/// terminal's height, because it does not know it. This is the second
-/// clamp, and it is the one that stops a scrolled pane leaving blank rows
-/// above the status bar: once the flock is taller than the viewport, the
-/// furthest down it can go is the page that ends on the last row.
-///
-/// Derived every frame rather than stored: the flock map is replaced
-/// wholesale every two seconds, and a stored *result* would have to be
-/// reconciled against a list that changed underneath it.
+/// Derived every frame from [`super::super::app::App::selected_index`] rather
+/// than stored beside it: a stored offset and a stored cursor can disagree,
+/// and this way they cannot. The selection is centred where the flock is long
+/// enough to allow it and pinned at both ends where it is not, so the last row
+/// of the flock is always the last row of the pane.
 #[must_use]
-pub fn scroll_offset(requested: usize, viewport: usize, total: usize) -> usize {
+pub fn scroll_offset(selected: usize, viewport: usize, total: usize) -> usize {
     if viewport == 0 || total <= viewport {
         return 0;
     }
-    requested.min(total - viewport)
+    let last = total - viewport;
+    selected.saturating_sub(viewport / 2).min(last)
 }
 
 #[cfg(test)]
@@ -395,22 +411,57 @@ mod tests {
         assert_eq!(fit("日本語アプリ", 5), "日本語ア…");
     }
 
-    /// fails if the viewport stops being clamped to the rows that exist. An
-    /// offset past the last row draws an empty pane, which reads as a crash
-    /// rather than as a short flock; an offset inside a flock that fits on
-    /// screen would scroll rows off the top for no reason.
+    /// fails if the selection marker stops being a plain character. Colour
+    /// and a `REVERSED` modifier are both rejected here: every signal on this
+    /// screen has to survive `NO_COLOR` and a 16-colour terminal, and a
+    /// decoration-only cursor does not. `>` rather than `▸` because `▸` is
+    /// East-Asian *Ambiguous* width — a terminal rendering it double-wide
+    /// shifts every column of that one row by a cell, which is worse than
+    /// plain.
     #[test]
-    fn the_scroll_offset_never_leaves_a_gap_at_the_bottom() {
-        // Everything fits: no scrolling, whatever was asked for.
+    fn the_marker_is_one_ascii_column_wide_in_both_states() {
+        // The two literals ARE the test. `chars().count() == 1` and
+        // `is_ascii()` were in the first draft and cannot fail once these two
+        // have passed — `">"` is one ASCII char by inspection — so they were
+        // three assertions dressed as five.
+        assert_eq!(
+            mark(true),
+            ">",
+            "not `▸`: East-Asian Ambiguous width would shift the row"
+        );
+        assert_eq!(mark(false), " ");
+    }
+
+    /// fails if the viewport stops keeping the selection on screen, or stops
+    /// clamping at either end. A pane whose cursor has walked off the bottom
+    /// draws a page the operator is not pointing at, and a detail pane
+    /// describing a sheep no row on screen shows is worse than either.
+    #[test]
+    fn the_offset_keeps_the_selection_visible_and_centred_where_it_can() {
+        // Everything fits: no scrolling, wherever the cursor is.
         assert_eq!(scroll_offset(0, 10, 6), 0);
-        assert_eq!(scroll_offset(4, 10, 6), 0);
-        // Taller than the viewport: the last page is the ceiling, so the
-        // bottom row is always the flock's own last row.
+        assert_eq!(scroll_offset(5, 10, 6), 0);
+        // Taller than the viewport: centred in the middle, pinned at the ends.
         assert_eq!(scroll_offset(0, 5, 20), 0);
-        assert_eq!(scroll_offset(7, 5, 20), 7);
-        assert_eq!(scroll_offset(19, 5, 20), 15);
+        assert_eq!(scroll_offset(2, 5, 20), 0);
+        assert_eq!(scroll_offset(3, 5, 20), 1);
+        assert_eq!(scroll_offset(10, 5, 20), 8);
+        assert_eq!(scroll_offset(19, 5, 20), 15, "the last page, not past it");
         assert_eq!(scroll_offset(usize::MAX, 5, 20), 15);
         // Degenerate: a viewport of zero rows scrolls nowhere.
         assert_eq!(scroll_offset(3, 0, 20), 0);
+        // And the selection is always inside the window it returns.
+        for total in [1usize, 2, 7, 40, 200] {
+            for viewport in [1usize, 3, 8, 25] {
+                for selected in 0..total {
+                    let offset = scroll_offset(selected, viewport, total);
+                    assert!(
+                        selected >= offset && selected < offset + viewport,
+                        "selected {selected} fell outside [{offset}, {}) for total {total}",
+                        offset + viewport
+                    );
+                }
+            }
+        }
     }
 }

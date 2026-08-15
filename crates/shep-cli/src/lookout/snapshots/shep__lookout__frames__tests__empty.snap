@@ -3,7 +3,7 @@ source: crates/shep-cli/src/lookout/frames.rs
 expression: render_text(&buffer)
 ---
 shep lookout   /home/rin/.shep                                                        0 in the flock
-ID    NAME                STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+  ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 the flock is empty                                                                                  
                                                                                                     
