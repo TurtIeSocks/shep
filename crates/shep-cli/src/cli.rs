@@ -675,6 +675,15 @@ pub struct CompletionArgs {
 }
 
 /// Arguments to the hidden `shep daemon` subcommand.
+///
+/// The last four are the CLI-flag layer of spec §5's `file < env < flags`,
+/// one per `SHEP_*` variable `DaemonConfig::load` already reads. They live
+/// here rather than on `GlobalArgs` because they configure **the shepherd**,
+/// and this is the only invocation that runs one — `--log-level` on
+/// `shep flock` would configure nothing.
+///
+/// Their real audience is an init unit's `ExecStart`, which can now say
+/// `shep daemon --foreground --log-level info` without a config file.
 #[derive(Debug, clap::Args)]
 pub struct DaemonArgs {
     /// Boot without restoring the saved muster roll
@@ -684,6 +693,48 @@ pub struct DaemonArgs {
     /// daemonized, and report readiness once the flock is back
     #[arg(long)]
     pub foreground: bool,
+    /// Emit the shepherd's own logs as JSON lines (overrides shep.toml and
+    /// SHEP_LOG_JSON). Accepts 1, 0, true, false; bare means true.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = bool_flag
+    )]
+    pub log_json: Option<bool>,
+    /// Lowest severity of the shepherd's own records that reaches its log
+    #[arg(long, value_name = "LEVEL", value_parser = log_level_flag)]
+    pub log_level: Option<shep_core::config::LogLevel>,
+    /// Control-socket path override
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+    /// Longest a cron worker sleeps before re-deriving its next occurrence
+    #[arg(long, value_name = "DURATION", value_parser = duration_flag)]
+    pub max_cron_sleep: Option<shep_core::values::UpDuration>,
+}
+
+/// clap value parser over shep's own four boolean spellings — NOT clap's
+/// `BoolishValueParser`, which also takes yes/no/y/n/on/off and would widen
+/// the grammar on the flag side only.
+fn bool_flag(value: &str) -> Result<bool, String> {
+    shep_core::config::parse_daemon_bool(value)
+        .ok_or_else(|| format!("expected one of 1, 0, true, false; got `{value}`"))
+}
+
+/// clap value parser over [`shep_core::config::LogLevel::from_name`] — the
+/// same lowercase-only grammar `SHEP_LOG_LEVEL` accepts.
+fn log_level_flag(value: &str) -> Result<shep_core::config::LogLevel, String> {
+    shep_core::config::LogLevel::from_name(value).ok_or_else(|| {
+        format!("expected one of off, error, warn, info, debug, trace; got `{value}`")
+    })
+}
+
+/// clap value parser over `UpDuration`'s `FromStr`.
+fn duration_flag(value: &str) -> Result<shep_core::values::UpDuration, String> {
+    value
+        .parse::<shep_core::values::UpDuration>()
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -694,6 +745,36 @@ mod tests {
     fn the_command_tree_parses_and_is_internally_consistent() {
         use clap::CommandFactory;
         Cli::command().debug_assert(); // clap's own structural self-check
+    }
+
+    #[test]
+    fn log_json_has_three_states() {
+        use clap::Parser;
+        let cases = [
+            (vec!["shep", "daemon"], None),
+            (vec!["shep", "daemon", "--log-json"], Some(true)),
+            (vec!["shep", "daemon", "--log-json=false"], Some(false)),
+            (vec!["shep", "daemon", "--log-json=1"], Some(true)),
+        ];
+        for (argv, expected) in cases {
+            match Cli::try_parse_from(&argv).unwrap().command {
+                Commands::Daemon(args) => assert_eq!(args.log_json, expected, "{argv:?}"),
+                other => panic!("expected Daemon, got {other:?}"),
+            }
+        }
+    }
+
+    /// fails if the flag grammar widens past the env grammar — the exact
+    /// drift `parse_daemon_bool` exists to prevent.
+    #[test]
+    fn the_flag_bool_grammar_matches_the_env_grammar() {
+        use clap::Parser;
+        for wider in ["--log-json=yes", "--log-json=on", "--log-json=TRUE"] {
+            assert!(
+                Cli::try_parse_from(["shep", "daemon", wider]).is_err(),
+                "{wider} must not parse"
+            );
+        }
     }
 
     #[test]
