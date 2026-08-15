@@ -13,9 +13,10 @@
 //! uid and can already run `shep stop`. See [`gate`] for what the control
 //! gate is and, more importantly, what it is not.
 //!
-//! [`catalogue`] (`#[cfg(test)]` only) renders `docs/whistle/tools.md` off
-//! [`Whistle::router`], and pins every claim in it against the two live
-//! routers below — nothing outside its own tests calls into it.
+//! `catalogue` (`#[cfg(test)]` only, so not linkable from a non-test doc
+//! build) renders `docs/whistle/tools.md` off [`Whistle::router`], and pins
+//! every claim in it against the two live routers below — nothing outside
+//! its own tests calls into it.
 
 pub mod control;
 pub mod facts;
