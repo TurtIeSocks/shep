@@ -5,8 +5,10 @@ Written overnight. Delete it whenever; it is a status note, not a doc.
 ## The short version
 
 The **website is finished and ready to deploy**. The **workspace is ready to
-publish**, and publishing is one command. **Phase 13 (whistle) is about half
-built.** Phases 12b and 14 have finished, reviewed plans and have not started.
+publish**, and publishing is one command. **Phase 13 (whistle) is built, green
+and reviewed** — the whistle MCP server works. **Phase 12b (lookout's last
+three panes) is building as you sleep.** Phase 14 has a finished plan and has
+not started, and Phase 15 — the last unplanned phase — now has one too.
 
 Nothing is pushed. Nothing is published. Nothing is tagged. All of that is
 yours.
@@ -55,16 +57,47 @@ first-come. Worth claiming `shep` either way.
 
 ## Where the code got to
 
-Phase 13 (whistle, the MCP server) has its dependency, its config section, its
-control gate, its shepherd bridge and its payload twins. The nine tools, the
-verb, the catalogue and the e2e tier are not built yet.
+**Phase 13 (whistle) is done.** Eleven tasks, all nine MCP tools, the verb, the
+catalogue and an e2e tier. `cargo test --workspace --all-features` is EXIT=0 at
+1256 passed / 0 failed / 5 ignored. Its review returned six findings and all six
+are fixed; I re-ran the suite myself afterwards, because the agent that fixed
+them was cut off before it could.
 
-Phases 12b (lookout's other three panes) and 14 (`.js` Flockfiles, the schema
-export, the daemon flags layer, openrc and BSD units) have plans that have been
-through an adversarial read and a revision. Neither has started.
+One of those findings is worth thirty seconds of your time, because it was a
+claim rather than a bug. `shep whistle --help` used to tell you the control gate
+deliberately has no flag, since "a flag would let the same edit that adds this
+server open the gate". That was false: `--home` is a global flag reading
+`$SHEP_HOME`, so `shep whistle --home /tmp/open` is exactly that one line and it
+opens the gate. The phase's own test proves it. Nothing about the gate changed —
+it was never a security boundary, and whistle runs as you — but the help text
+now says the true reason, which is that a config file is auditable where a
+per-invocation setting is not.
 
-Phase 15 (`serve`, `dev`, `runtime`) has not been planned. Windows is last, by
-your earlier call.
+**Phase 12b is running right now** — the bleats feed, the sheep detail pane and
+the host-usage strip, ten tasks. Check `.superpowers/sdd/progress.md` for where
+it got to.
+
+**Phase 14** (`.js` Flockfiles, the schema export, the daemon flags layer,
+openrc and BSD units) has a plan through an adversarial read and a revision, and
+has not started.
+
+**Phase 15** (`serve`, `dev`, `runtime`) is now planned — written, reviewed
+against 27 findings, revised, re-swept, tightened. It is last because it
+extracts shep-cli into a library with three thin binaries, which nothing else
+needs. Windows is after that, by your earlier call.
+
+### One Phase 15 decision I would like you to look at
+
+Closing a real race in `shep serve` costs something an operator will notice.
+To refuse a symlink attack without re-checking the path on every request, the
+resolver refuses **any** symlink component — not only ones that escape the
+docroot. So `dist/current -> ../releases/2026-08-15`, and a symlinked
+`assets/`, now 404 where pm2's serve would serve them, and the operator gets no
+explanation with the 404.
+
+It is written down as a deliberate cost in the plan, the ledger and
+`migration.md`. But if you would rather keep the layout working and accept the
+race, that is your call and it is cheaper to make now than after Phase 15 runs.
 
 ## Things worth your eye, none urgent
 
