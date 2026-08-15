@@ -1,15 +1,27 @@
-//! The `shep` binary: clap command surface, output rendering, and the
-//! daemon launch/re-exec path. Module-by-module design:
+//! `shep-cli`: clap command surface, output rendering, and the daemon
+//! launch/re-exec path behind the `shep` binary. Module-by-module design:
 //! `docs/systematic-refactor/refactor-workspace/map.md`.
+//!
+//! The crate's whole public API is three entry points — [`main`],
+//! [`main_runtime`], [`main_dev`] — each returning
+//! [`std::process::ExitCode`] for the binary that calls it. Every other item
+//! is private. Embedding shep in another program is `shep-client`'s job, not
+//! this crate's: that crate is the published embedding API, re-exports
+//! shep-core, and carries none of the process-ownership assumptions (a clap
+//! tree that is `#[cfg(unix)]` in half its dispatch, an exit code it expects
+//! to own) this one does.
 //!
 //! A static file server (`serve`) and the container (`shep runtime`) and dev
 //! (`shep dev`) execution modes are spec'd (`docs/specs/shep-v1.md` §9) but
-//! not built — this crate depends on neither `axum` nor `tower-http`, and
-//! there is no `[[bin]]` beyond `shep` itself. The ratatui `lookout` dashboard
-//! has its shell and its flock table (Phase 12a); its other three panes — the
-//! bleats feed, the sheep detail and the host-usage strip — are 12b. Recorded
-//! here as deliberately absent or deliberately partial rather than letting
-//! either read as shipped; full inventory: `docs/specs/deferred.md`.
+//! not built — this crate depends on neither `axum` nor `tower-http`. Three
+//! `[[bin]]` targets sit over this library: `shep` itself, plus
+//! `shep-runtime` and `shep-dev`, the two container-entrypoint aliases that
+//! prepend their verb before parsing (see `main_runtime`/`main_dev`). The
+//! ratatui `lookout` dashboard has its shell and its flock table (Phase
+//! 12a); its other three panes — the bleats feed, the sheep detail and the
+//! host-usage strip — are 12b. Recorded here as deliberately absent or
+//! deliberately partial rather than letting either read as shipped; full
+//! inventory: `docs/specs/deferred.md`.
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +40,7 @@ mod output;
 #[cfg(unix)]
 mod whistle;
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -75,8 +88,60 @@ use shep_client::Client;
 use shep_client::spawn::{SpawnOutcome, connect_or_spawn};
 use shep_core::paths::ShepPaths;
 
-#[tokio::main]
-async fn main() {
+/// The `shep` entry point. Parses this process's arguments and runs one verb.
+///
+/// Returns rather than exiting, so the caller's `main` owns the process exit —
+/// which is also what lets the integration tier call this without taking the
+/// test harness down with it.
+#[must_use]
+pub fn main() -> std::process::ExitCode {
+    run_argv(std::env::args_os().collect())
+}
+
+/// The `shep-runtime` entry point: `shep runtime`, with the verb supplied.
+#[must_use]
+pub fn main_runtime() -> std::process::ExitCode {
+    run_argv(alias_argv("runtime", std::env::args_os().collect()))
+}
+
+/// The `shep-dev` entry point: `shep dev`, with the verb supplied.
+#[must_use]
+pub fn main_dev() -> std::process::ExitCode {
+    run_argv(alias_argv("dev", std::env::args_os().collect()))
+}
+
+/// Builds the argument vector an alias binary should be parsed as: `verb`
+/// inserted after argv[0].
+///
+/// **Except for `daemon` and `dog`.** Both are hidden re-exec targets that the
+/// supervisor spawns as `std::env::current_exe()` plus the verb —
+/// `shep_daemon::dogs` for a built-in dog, `crate::launch::launch_command` for
+/// the shepherd itself. Under an alias binary, `current_exe()` is
+/// `shep-runtime`, so inserting a verb here would turn `shep-runtime dog
+/// metrics` into `shep runtime dog metrics` and every dog in a container would
+/// die at its first exec. Those two argument vectors are never typed by a
+/// human; they are constructed in exactly three places in this workspace —
+/// the two named above, plus `crate::commands::startup::unit`, which renders
+/// `{exec} daemon --foreground` into a systemd unit and a launchd plist. That
+/// third one never reaches here: `shep startup` is not a verb an alias binary
+/// can spell.
+fn alias_argv(verb: &str, mut argv: Vec<OsString>) -> Vec<OsString> {
+    let passthrough = matches!(
+        argv.get(1).and_then(|arg| arg.to_str()),
+        Some("daemon" | "dog")
+    );
+    if !passthrough {
+        argv.insert(1, OsString::from(verb));
+    }
+    argv
+}
+
+/// Parses `argv` and runs it on a fresh multi-threaded runtime.
+///
+/// The runtime is built here rather than by `#[tokio::main]` on each entry
+/// point, so the three of them share one construction and the `argv` seam
+/// above stays testable without one.
+fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
     // A hidden, env-gated hook for `tests/term_panic_order.rs` — not a
     // clap variant, so it carries no `--help` entry and no command-surface
     // footprint. See `lookout::term::probe_panic_for_test`'s doc for why
@@ -85,9 +150,18 @@ async fn main() {
     if std::env::var_os("SHEP_TERM_PANIC_PROBE").is_some() {
         lookout::term::probe_panic_for_test();
     }
-    let cli = Cli::parse();
-    let code = run(cli).await;
-    std::process::exit(code as i32);
+    let cli = Cli::parse_from(argv);
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("shep: could not start an async runtime: {err}");
+            return std::process::ExitCode::from(ExitCode::Failure as u8);
+        }
+    };
+    std::process::ExitCode::from(runtime.block_on(run(cli)) as u8)
 }
 
 /// Turns `--home`/`$SHEP_HOME`/`$HOME` into a resolved [`ShepPaths`].
@@ -604,6 +678,97 @@ async fn run(cli: Cli) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fails if an alias binary stops supplying its own verb.
+    #[test]
+    fn an_alias_supplies_its_verb() {
+        let argv = alias_argv(
+            "runtime",
+            vec!["shep-runtime".into(), "./Flockfile.toml".into()],
+        );
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("shep-runtime"),
+                OsString::from("runtime"),
+                OsString::from("./Flockfile.toml"),
+            ]
+        );
+    }
+
+    /// fails if the alias with no arguments at all stops naming its verb —
+    /// `shep-dev` on its own must be `shep dev`, not `shep`.
+    #[test]
+    fn an_alias_with_no_arguments_still_supplies_its_verb() {
+        let argv = alias_argv("dev", vec!["shep-dev".into()]);
+        assert_eq!(
+            argv,
+            vec![OsString::from("shep-dev"), OsString::from("dev")]
+        );
+    }
+
+    /// fails if an alias binary rewrites the two hidden re-exec verbs.
+    ///
+    /// This is the container-killer: `shep_daemon::dogs` spawns a built-in dog
+    /// as `current_exe() dog <name>`, and under `shep-runtime` that is this
+    /// argument vector. A prepend here makes every dog exit with a clap usage
+    /// error the moment `shep runtime` enables one.
+    #[test]
+    fn an_alias_passes_the_two_re_exec_verbs_through_untouched() {
+        for verb in ["daemon", "dog"] {
+            let argv = alias_argv(
+                "runtime",
+                vec!["shep-runtime".into(), verb.into(), "metrics".into()],
+            );
+            assert_eq!(
+                argv[1],
+                OsString::from(verb),
+                "{verb} must not be rewritten"
+            );
+            assert_eq!(argv.len(), 3, "{verb}: nothing may be inserted");
+        }
+    }
+
+    /// fails if the pass-through is written as a prefix or contains test
+    /// rather than an exact match — a sheep legitimately named `dogfood`
+    /// must still reach `runtime`, not be mistaken for the `dog` re-exec.
+    #[test]
+    fn the_pass_through_matches_the_whole_argument_and_not_a_prefix() {
+        let argv = alias_argv("runtime", vec!["shep-runtime".into(), "dogfood".into()]);
+        assert_eq!(argv[1], OsString::from("runtime"));
+        assert_eq!(argv[2], OsString::from("dogfood"));
+    }
+
+    /// fails if the alias vector is well-formed and still does not reach the
+    /// verb — a `runtime` subcommand that took a required positional, say.
+    #[test]
+    fn the_alias_vector_parses_to_the_expected_command() {
+        use clap::Parser;
+        // `Commands` is imported here and not via `super::*`: the top-level
+        // `use cli::Commands` is `#[cfg(unix)]`-gated alongside every verb
+        // module, and this test — like every other one in this file — must
+        // still compile under the Windows cross-check. Matches
+        // `save_parses_to_its_own_command`'s existing shape.
+        use cli::Commands;
+        let argv = alias_argv(
+            "dog",
+            vec!["shep-runtime".into(), "dog".into(), "metrics".into()],
+        );
+        let cli = Cli::try_parse_from(argv).expect("the passthrough vector must parse");
+        assert!(matches!(cli.command, Commands::Dog(_)));
+    }
+
+    /// fails if `propagate_version` is dropped, which leaves the two alias
+    /// binaries with no working `--version` at all: `shep-runtime --version`
+    /// is parsed as `shep runtime --version`, and without propagation that is
+    /// a clap usage error. `--version` is the one alias invocation a
+    /// packager's smoke test actually runs.
+    #[test]
+    fn a_subcommand_answers_version() {
+        use clap::Parser;
+        let err = Cli::try_parse_from(["shep", "dogs", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
 
     /// fails if `Commands::Save` is wired to another verb's function. The
     /// dispatch arms carried no unit coverage at all until recently, and a

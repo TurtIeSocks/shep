@@ -13,7 +13,12 @@ use std::path::PathBuf;
 
 /// The `shep` command line.
 #[derive(Debug, clap::Parser)]
-#[command(name = "shep", version, about = "A process manager for your flock")]
+#[command(
+    name = "shep",
+    version,
+    about = "A process manager for your flock",
+    propagate_version = true
+)]
 pub struct Cli {
     /// Flags valid on every subcommand.
     #[command(flatten)]

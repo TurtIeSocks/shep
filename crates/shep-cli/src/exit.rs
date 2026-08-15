@@ -6,9 +6,11 @@ use shep_core::protocol::RpcErrorCode;
 
 /// A `shep` process exit status.
 ///
-/// No `#[non_exhaustive]`: this is a binary crate, so there is no downstream
-/// matcher for it to protect, and IR-20's growth argument does not apply
-/// (contrast shep-client's three error enums, which do carry it).
+/// No `#[non_exhaustive]`: `ExitCode` is not exported from `lib.rs` — the
+/// crate's whole public API is three functions returning
+/// `std::process::ExitCode` from `std`, not this type — so there is no
+/// downstream matcher for it to protect, and IR-20's growth argument does
+/// not apply (contrast shep-client's three error enums, which do carry it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ExitCode {

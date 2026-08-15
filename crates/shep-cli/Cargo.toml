@@ -10,9 +10,24 @@ readme = "README.md"
 keywords = ["shep", "process-manager", "supervisor", "daemon", "cli"]
 categories = ["command-line-utilities", "os", "development-tools"]
 
+[lib]
+name = "shep_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "shep"
-path = "src/main.rs"
+path = "src/bin/shep.rs"
+
+# Container entrypoint aliases (spec §3). Each is three lines over the library
+# above; the verb is supplied by the entry point it calls, so nothing here
+# reads argv[0].
+[[bin]]
+name = "shep-runtime"
+path = "src/bin/shep-runtime.rs"
+
+[[bin]]
+name = "shep-dev"
+path = "src/bin/shep-dev.rs"
 
 [dependencies]
 # `features = ["schema"]`: `shep schema` prints `shep_core::config::
