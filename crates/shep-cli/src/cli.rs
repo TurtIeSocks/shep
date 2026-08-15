@@ -50,6 +50,37 @@ pub enum Format {
     Json,
 }
 
+/// Which init system a unit is written for.
+///
+/// Five variants, all constructible on every target: `--init` lets an
+/// operator name one directly, which is also what lets a macOS machine
+/// exercise the systemd, openrc and rc.d renderers at all. Selection without
+/// the flag is `commands::startup::current_init` — a runtime probe on Linux,
+/// where systemd and openrc share one target triple, and a compile-time fact
+/// everywhere else, where nothing else the target could be exists.
+///
+/// It lives in `cli.rs` rather than beside the renderers because `cli.rs`
+/// compiles on **every** target while `mod commands` is `#[cfg(unix)]`. A
+/// field on `StartupArgs` naming a type from a unix-only module breaks
+/// `cargo check --workspace --all-targets --all-features --target
+/// x86_64-pc-windows-gnu`, which is a phase-gate command. `Format` above is
+/// the precedent: a `clap::ValueEnum` the parse surface owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum Init {
+    /// Linux + systemd: a unit file, `Type=notify`.
+    Systemd,
+    /// Linux + openrc: an `openrc-run` script. No readiness protocol — see
+    /// the renderer's own doc.
+    Openrc,
+    /// macOS: a `LaunchDaemon` plist.
+    Launchd,
+    /// FreeBSD: an `/etc/rc.subr` script under `/usr/local/etc/rc.d`.
+    FreebsdRc,
+    /// OpenBSD: an `/etc/rc.d/rc.subr` script under `/etc/rc.d`.
+    OpenbsdRc,
+}
+
 /// Every verb the binary understands.
 #[derive(Debug, clap::Subcommand)]
 pub enum Commands {
@@ -655,15 +686,21 @@ pub struct ImportArgs {
 
 /// Arguments shared by `shep startup` and `shep unstartup`.
 ///
-/// One struct for both verbs, and one field: the unit is named after the
-/// user it runs the shepherd as, so that user is the only thing either verb
-/// needs to be told. `--home` is read from [`GlobalArgs`] by `startup` and
-/// ignored by `unstartup`, which removes a unit rather than writing one.
+/// One struct for both verbs: the unit is named after the user it runs the
+/// shepherd as, and, since Task 6, after which init system it targets.
+/// `--home` is read from [`GlobalArgs`] by `startup` and ignored by
+/// `unstartup`, which removes a unit rather than writing one.
 #[derive(Debug, clap::Args)]
 pub struct StartupArgs {
     /// The user the unit runs the shepherd as (default: $SUDO_USER, else the invoking user)
     #[arg(long)]
     pub user: Option<String>,
+    /// Write a unit for this init system instead of the detected one.
+    ///
+    /// `unstartup` takes it too: a unit installed under one init has to be
+    /// removable after the host has changed to another.
+    #[arg(long, value_enum)]
+    pub init: Option<Init>,
 }
 
 /// Arguments to `shep completions`.

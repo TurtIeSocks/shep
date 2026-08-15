@@ -37,29 +37,6 @@ pub(crate) struct UnitSpec {
     pub working_dir: PathBuf,
 }
 
-/// Which init system this build targets. Linux is systemd, macOS is
-/// launchd; there is no runtime detection because there is nothing else
-/// either target could be, and openrc/rc.d are named as deferred in
-/// `docs/specs/deferred.md`. The parent module's `current_init` is what
-/// picks the variant, with `#[cfg(target_os = ...)]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Init {
-    /// Linux: a systemd unit, `Type=notify`.
-    ///
-    /// Constructed only on Linux. Both variants exist on every target so
-    /// both renderers, and the exact-match tests that pin them, compile and
-    /// run everywhere — which is the only way a macOS machine checks the
-    /// systemd unit at all. `dead_code` sees only the target it is
-    /// compiling, so the variant the other target constructs is narrowed
-    /// rather than blanket-allowed.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    Systemd,
-    /// macOS: a `LaunchDaemon` plist. Constructed only on macOS; see
-    /// [`Init::Systemd`] for why the other variant still exists here.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    Launchd,
-}
-
 /// Renders the systemd unit, `Type=notify`.
 pub(crate) fn systemd_unit(spec: &UnitSpec) -> String {
     let home = systemd_environment_value(&spec.home.display().to_string());

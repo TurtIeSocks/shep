@@ -18,9 +18,9 @@ pub(crate) mod unit;
 
 use std::path::{Path, PathBuf};
 
-use unit::{Init, UnitSpec};
+use unit::UnitSpec;
 
-use crate::cli::{Format, StartupArgs};
+use crate::cli::{Format, Init, StartupArgs};
 use crate::exit::ExitCode;
 use crate::output::{
     StartupStep, StartupSteps, Streams, emit, emit_error, emit_notice, write_outcome,
@@ -33,10 +33,53 @@ use crate::output::{
 /// surface for one call site.
 const DEFAULT_HOME_DIR: &str = ".shep";
 
-/// The mode a generated unit is created with: readable by everyone (the init
-/// system reads it as whatever user it runs as), writable only by the root
-/// that wrote it.
-const UNIT_MODE: u32 = 0o644;
+/// The mode a generated unit is created with.
+///
+/// A systemd unit and a launchd plist are **read** by their init system:
+/// 0644. An openrc script and a BSD rc.d script are **executed**: 0755.
+/// Shipping an openrc script at 0644 fails at the next reboot, which is the
+/// worst possible time to find out.
+pub(crate) const fn unit_mode(init: Init) -> u32 {
+    match init {
+        Init::Systemd | Init::Launchd => 0o644,
+        Init::Openrc | Init::FreebsdRc | Init::OpenbsdRc => 0o755,
+    }
+}
+
+/// The renderer this init does not have yet, or `None` when it does.
+///
+/// Temporary, by construction: Task 7 removes `Openrc` from it and Task 8
+/// removes the two BSDs, at which point this function and its test are
+/// deleted. It exists so that `--init` can accept all five values in the
+/// tree that adds the flag without any intermediate state of that tree being
+/// able to write a file it cannot render.
+pub(crate) const fn unbuilt_renderer(init: Init) -> Option<&'static str> {
+    match init {
+        Init::Systemd | Init::Launchd => None,
+        Init::Openrc => Some("openrc"),
+        Init::FreebsdRc => Some("freebsd-rc"),
+        Init::OpenbsdRc => Some("openbsd-rc"),
+    }
+}
+
+/// Where a generated unit for `init` is written, for `user`.
+///
+/// Systemd and launchd keep calling their own existing formatters —
+/// `unit::systemd_unit_path`/`unit::launchd_plist_path` — rather than
+/// restating their format strings here. The other three are new in Task 6,
+/// ahead of the renderers Tasks 7 and 8 supply: `unstartup` has to be able to
+/// name a unit's path under any init an operator names with `--init`, which
+/// is why this is a function of `Init` alone rather than something `plan`
+/// only ever calls for the detected one.
+pub(crate) fn unit_path_for(init: Init, user: &str) -> PathBuf {
+    match init {
+        Init::Systemd => unit::systemd_unit_path(user),
+        Init::Launchd => unit::launchd_plist_path(user),
+        Init::Openrc => PathBuf::from(format!("/etc/init.d/shep-{user}")),
+        Init::FreebsdRc => PathBuf::from(format!("/usr/local/etc/rc.d/shep_{user}")),
+        Init::OpenbsdRc => PathBuf::from(format!("/etc/rc.d/shep_{user}")),
+    }
+}
 
 /// A step that did what it was asked.
 const OK: &str = "ok";
@@ -233,6 +276,12 @@ pub(crate) fn install(
             "launchctl",
             &["bootstrap", "system", &plan.unit_path.display().to_string()],
         )),
+        // TASK-7-8 REPLACES THIS ARM: unreachable — `plan()` refuses these
+        // three inits (via `unbuilt_renderer`) before a `StartupPlan` naming
+        // one can exist, and `install` only ever receives a plan from `plan()`.
+        Init::Openrc | Init::FreebsdRc | Init::OpenbsdRc => {
+            steps.push(unbuilt_step("ran", plan.init));
+        }
     }
     report(streams, fmt, "startup", steps)
 }
@@ -319,11 +368,17 @@ pub(crate) fn remove(
             ));
             steps.push(remove_unit(plan));
         }
+        // TASK-7-8 REPLACES THIS ARM: unreachable — `plan()` refuses these
+        // three inits (via `unbuilt_renderer`) before a `StartupPlan` naming
+        // one can exist, and `remove` only ever receives a plan from `plan()`.
+        Init::Openrc | Init::FreebsdRc | Init::OpenbsdRc => {
+            steps.push(unbuilt_step("ran", plan.init));
+        }
     }
     report(streams, fmt, "unstartup", steps)
 }
 
-/// Renders the unit and writes it at [`UNIT_MODE`], as one step.
+/// Renders the unit and writes it at [`unit_mode`], as one step.
 ///
 /// The mode is requested at `open` time rather than set afterwards, matching
 /// `launch::launch_command`'s own discipline: a create-then-chmod sequence
@@ -337,12 +392,18 @@ fn write_unit(plan: &StartupPlan) -> StartupStep {
     let rendered = match plan.init {
         Init::Systemd => unit::systemd_unit(&plan.spec),
         Init::Launchd => unit::launchd_plist(&plan.spec),
+        // TASK-7-8 REPLACES THIS ARM: unreachable — `plan()` refuses these
+        // three inits (via `unbuilt_renderer`) before a `StartupPlan` naming
+        // one can exist, and `write_unit` only ever receives a plan from
+        // `plan()`.
+        Init::Openrc | Init::FreebsdRc | Init::OpenbsdRc => String::new(),
     };
+    let mode = unit_mode(plan.init);
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(UNIT_MODE)
+        .mode(mode)
         .open(&plan.unit_path)
         .and_then(|mut file| {
             file.write_all(rendered.as_bytes())?;
@@ -353,7 +414,7 @@ fn write_unit(plan: &StartupPlan) -> StartupStep {
             // shipped mode deterministic; it acts on the open descriptor,
             // so there is no path to race, and it only ever widens from a
             // mode that was already no wider than this one.
-            file.set_permissions(std::fs::Permissions::from_mode(UNIT_MODE))
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
         });
     StartupStep {
         action: "wrote",
@@ -362,6 +423,19 @@ fn write_unit(plan: &StartupPlan) -> StartupStep {
             Ok(()) => OK.to_string(),
             Err(err) => err.to_string(),
         },
+    }
+}
+
+/// One failed step naming an init `plan()` never lets past its own gate.
+///
+/// Shared by [`install`]'s and [`remove`]'s unbuilt-renderer arms so the two
+/// unreachable bodies say the same thing rather than drifting.
+fn unbuilt_step(action: &'static str, init: Init) -> StartupStep {
+    let name = unbuilt_renderer(init).unwrap_or("unknown");
+    StartupStep {
+        action,
+        target: name.to_string(),
+        result: format!("shep cannot write a {name} unit yet"),
     }
 }
 
@@ -471,19 +545,73 @@ fn refuse(streams: &mut Streams<'_>, fmt: Format, code: ExitCode, message: &str)
     code
 }
 
-/// systemd on Linux, launchd on macOS. No runtime detection: there is
-/// nothing else either target could be, and openrc and the BSD rc.d scripts
-/// are named as deferred in `docs/specs/deferred.md`.
-const fn current_init() -> Option<Init> {
+/// Which init a Linux host running these two probes is on.
+///
+/// A pure function so the ORDER is testable on a machine that is not Linux.
+/// systemd wins a tie: `/run/systemd/system` is exactly what `sd_booted(3)`
+/// checks and is the only probe here with an upstream contract behind it,
+/// and a host with both present is a host running systemd with openrc
+/// leftovers rather than the other way round.
+///
+/// [`current_init`]'s Linux arm is the only non-test caller, and that arm is
+/// `#[cfg]`-ed away on every other target — narrowed the same way the old
+/// `Init` variants were before this task moved them, rather than
+/// blanket-allowed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const fn linux_init(systemd: bool, openrc: bool) -> Option<Init> {
+    if systemd {
+        Some(Init::Systemd)
+    } else if openrc {
+        Some(Init::Openrc)
+    } else {
+        None
+    }
+}
+
+/// The init system this host is actually running, or `None` when it is one
+/// shep has no renderer for.
+///
+/// Linux is a **runtime** probe: systemd and openrc share one target triple,
+/// so `target_os` cannot tell them apart, and until this existed a Linux host
+/// running openrc was silently written a systemd unit whose failure surfaced
+/// only when `systemctl` turned out not to exist. The ordering lives in
+/// [`linux_init`], which is compiled and tested everywhere; this function is
+/// the two filesystem reads that feed it.
+///
+/// Every other target is a compile-time fact: there is nothing else macOS,
+/// FreeBSD or OpenBSD could be.
+///
+/// **This is stricter than what it replaces.** A Linux container with no
+/// `/run/systemd/system` used to get a systemd unit written into it and now
+/// gets a refusal. That is the right answer — a unit with no init to read it
+/// does nothing — but it is a case that worked before, so `--init` exists to
+/// override this entirely.
+fn current_init() -> Option<Init> {
     #[cfg(target_os = "linux")]
     {
-        Some(Init::Systemd)
+        linux_init(
+            Path::new("/run/systemd/system").is_dir(),
+            Path::new("/run/openrc/softlevel").exists() || Path::new("/run/openrc").is_dir(),
+        )
     }
     #[cfg(target_os = "macos")]
     {
         Some(Init::Launchd)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "freebsd")]
+    {
+        Some(Init::FreebsdRc)
+    }
+    #[cfg(target_os = "openbsd")]
+    {
+        Some(Init::OpenbsdRc)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd"
+    )))]
     {
         None
     }
@@ -495,13 +623,21 @@ const fn current_init() -> Option<Init> {
 /// a function three cases can be stated about; an empty one is treated as
 /// unset, since that is what a shell that exported it without a value means.
 fn plan(explicit_home: Option<&Path>, args: &StartupArgs) -> Result<StartupPlan, Refusal> {
-    let Some(init) = current_init() else {
+    let Some(init) = args.init.or_else(current_init) else {
         return Err(Refusal {
             code: ExitCode::Failure,
-            message: "shep writes a systemd unit or a launchd plist; this platform has neither"
+            message: "could not tell which init system is running: neither \
+                      /run/systemd/system nor /run/openrc is present. Name one \
+                      with --init (systemd, openrc, launchd, freebsd-rc, openbsd-rc)"
                 .to_string(),
         });
     };
+    if let Some(name) = unbuilt_renderer(init) {
+        return Err(Refusal {
+            code: ExitCode::Usage,
+            message: format!("shep cannot write a {name} unit yet"),
+        });
+    }
     let exec = std::env::current_exe().map_err(|err| Refusal {
         code: ExitCode::Failure,
         message: format!("could not resolve this binary's own path: {err}"),
@@ -515,10 +651,7 @@ fn plan(explicit_home: Option<&Path>, args: &StartupArgs) -> Result<StartupPlan,
         &invoking_user()?,
     );
     let passwd_home = passwd_home(&user)?;
-    let unit_path = match init {
-        Init::Systemd => unit::systemd_unit_path(&user),
-        Init::Launchd => unit::launchd_plist_path(&user),
-    };
+    let unit_path = unit_path_for(init, &user);
     Ok(StartupPlan {
         init,
         label: unit::launchd_label(&user),
@@ -887,10 +1020,10 @@ mod tests {
             .unwrap()
             .permissions()
             .mode();
-        // A literal, deliberately, not `UNIT_MODE`: a test comparing the
-        // constant against itself passes for whatever the constant is
-        // changed to, and a mutation to 0o666 went uncaught by exactly that
-        // until this line stopped naming it.
+        // A literal, deliberately, not `unit_mode(Init::Systemd)`: a test
+        // comparing the function's own return value against itself passes
+        // for whatever that value is changed to, and a mutation to 0o666
+        // went uncaught by exactly that until this line stopped naming it.
         assert_eq!(mode & 0o777, 0o644, "mode was {:o}", mode & 0o777);
 
         assert_eq!(remove_unit(&plan).result, OK);
@@ -987,5 +1120,90 @@ mod tests {
             !failure_line(&output("")).is_empty(),
             "a command that failed silently still has to say so"
         );
+    }
+
+    /// fails if a systemd unit or launchd plist stops being read-only, or an
+    /// openrc/rc.d script stops being executable. A unit an init system
+    /// cannot read is a boot that restores nothing; a script that is not
+    /// executable fails at the next reboot, the worst possible time to
+    /// find out.
+    #[test]
+    fn the_mode_is_read_only_for_units_and_executable_for_scripts() {
+        assert_eq!(unit_mode(Init::Systemd), 0o644);
+        assert_eq!(unit_mode(Init::Launchd), 0o644);
+        assert_eq!(unit_mode(Init::Openrc), 0o755);
+        assert_eq!(unit_mode(Init::FreebsdRc), 0o755);
+        assert_eq!(unit_mode(Init::OpenbsdRc), 0o755);
+    }
+
+    /// fails if the probe order ever flips. systemd wins a tie because
+    /// `/run/systemd/system` is the check `sd_booted(3)` makes; a host with
+    /// both is a systemd host with openrc leftovers. Untestable as a
+    /// filesystem probe on this machine — which is the whole reason the
+    /// ordering is a pure function.
+    #[test]
+    fn systemd_wins_when_both_linux_probes_are_true() {
+        assert_eq!(linux_init(true, true), Some(Init::Systemd));
+        assert_eq!(linux_init(true, false), Some(Init::Systemd));
+        assert_eq!(linux_init(false, true), Some(Init::Openrc));
+        assert_eq!(linux_init(false, false), None);
+    }
+
+    /// fails if `--init` stops overriding detection — the escape hatch for a
+    /// container with no /run/systemd/system, and the only way a macOS
+    /// machine renders a systemd unit at all.
+    #[test]
+    fn an_explicit_init_beats_detection() {
+        use clap::Parser as _;
+
+        use crate::cli::{Cli, Commands};
+
+        let cli = Cli::try_parse_from(["shep", "startup", "--init", "openrc"]).unwrap();
+        match cli.command {
+            Commands::Startup(args) => assert_eq!(args.init, Some(Init::Openrc)),
+            other => panic!("expected Startup, got {other:?}"),
+        }
+    }
+
+    /// fails if `--init` stops choosing the unit PATH — which is the half
+    /// that matters for `unstartup`. A unit installed under one init has to
+    /// be removable after the host has changed to another, and that is a
+    /// claim about which file gets removed, not about which struct the two
+    /// verbs share. (`Startup` and `Unstartup` both take `StartupArgs`, so a
+    /// test that only checked that both parse `--init` could barely fail.)
+    #[test]
+    fn each_init_names_its_own_unit_path() {
+        assert_eq!(
+            unit_path_for(Init::Openrc, "deploy"),
+            PathBuf::from("/etc/init.d/shep-deploy")
+        );
+        assert_eq!(
+            unit_path_for(Init::FreebsdRc, "deploy"),
+            PathBuf::from("/usr/local/etc/rc.d/shep_deploy")
+        );
+        assert_eq!(
+            unit_path_for(Init::OpenbsdRc, "deploy"),
+            PathBuf::from("/etc/rc.d/shep_deploy")
+        );
+        // systemd and launchd keep the paths they already had
+        assert_eq!(
+            unit_path_for(Init::Systemd, "deploy"),
+            unit::systemd_unit_path("deploy")
+        );
+        assert_eq!(
+            unit_path_for(Init::Launchd, "deploy"),
+            unit::launchd_plist_path("deploy")
+        );
+    }
+
+    /// fails when Task 7 or 8 lands a renderer and forgets to remove its
+    /// entry here — a `--init openrc` that refuses after openrc exists.
+    #[test]
+    fn only_the_unbuilt_renderers_are_refused() {
+        assert_eq!(unbuilt_renderer(Init::Systemd), None);
+        assert_eq!(unbuilt_renderer(Init::Launchd), None);
+        assert!(unbuilt_renderer(Init::Openrc).is_some());
+        assert!(unbuilt_renderer(Init::FreebsdRc).is_some());
+        assert!(unbuilt_renderer(Init::OpenbsdRc).is_some());
     }
 }
