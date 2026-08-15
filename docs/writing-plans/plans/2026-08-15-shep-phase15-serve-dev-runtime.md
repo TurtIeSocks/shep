@@ -22,21 +22,39 @@ and packaging 14 — edits that file or adds a `mod` line to it. Starting Task 1
 while any of them is unmerged converts a clean rebase into a manual one, on the
 one file that dispatches every verb in the binary.
 
-Confirm before Task 1, and do not start on a `no` (each prints a path if that
-phase has landed, nothing if it has not):
+**A `git log` hit on a phase's artefact proves a commit landed. It does not
+prove the phase merged**, and on this project that distinction is the whole
+point of the gate: phases commit task by task onto `main`, so
+`git log --oneline -1 -- crates/shep-cli/src/whistle/mod.rs` prints
+`1d652ec feat(whistle): add control.rs…` **today**, while Phase 13 is
+mid-execution against shep-cli. An artefact probe reads that as "Phase 13
+landed" and hands Task 1 a green light in exactly the window the gate exists
+to guard. Do not use one.
+
+The signal that measures completion here is the **ledger**: every phase on
+this project signs off by deleting its own `docs/specs/deferred.md` entry, in
+a Task-12-shaped final task. So:
 
 ```bash
-git log --oneline -1 -- crates/shep-cli/src/whistle/mod.rs      # Phase 13
-git log --oneline -1 -- crates/shep-cli/src/lookout/bleats.rs   # Phase 12b
-git log --oneline -1 -- crates/shep-core/assets                 # Phase 14
+grep -c 'whistle' docs/specs/deferred.md                    # Phase 13 done when 0 (3 today)
+grep -c "lookout's other three panes" docs/specs/deferred.md # Phase 12b done when 0 (1 today)
 ```
 
-Those three paths are this plan's guesses at each phase's most distinctive
-artefact, taken from their own plans. If a path is empty and you believe the
-phase landed anyway, check the phase's plan for what it actually shipped rather
-than assuming. Phase 14 in particular is severable task by task, so its
-artefact may differ; what matters is that no branch with unmerged shep-cli
-edits exists, not that these exact three files do.
+Phase 14 is severable task by task and has no single ledger line; read its own
+plan's final task and check what it says it deletes.
+
+Then confirm nothing is in flight anywhere else — these print nothing on a
+clean tree, which is the answer you want, and any row at all is a stop:
+
+```bash
+git branch -a --no-merged HEAD
+git worktree list                                    # one row, the main checkout
+gh pr list --state open --json headRefName,files     # none touching crates/shep-cli/
+```
+
+They are a second line rather than the first because this project's phases
+land on `main` directly, so an empty branch list is consistent with a phase
+being half-shipped. The ledger greps are what actually answer the question.
 
 ---
 
@@ -88,6 +106,8 @@ grep -c "request.method" crates/shep-cli/src/dog/metrics/mod.rs    # 0 (grep exi
 grep -c "not built" crates/shep-cli/src/main.rs                    # 2
 grep -c "resolves that" docs/specs/shep-v1.md                      # 1
 grep -cF 'one `[[bin]]`' docs/specs/deferred.md                    # 1
+grep -c "static file server as a managed sheep" docs/specs/deferred.md   # 1
+grep -c "propagate_version" crates/shep-cli/src/cli.rs             # 0 (grep exits 1)
 grep -rn "set_child_subreaper" crates | wc -l                      # 0
 grep -c "#\[test\]\|#\[tokio::test\]" crates/shep-cli/src/main.rs  # 13
 ```
@@ -113,9 +133,13 @@ counts `cpu_percent` is a check that never moves.
 
 `grep -c "not built" crates/shep-cli/src/main.rs` prints **2** and only one of
 the two is this phase's: line 7 is the module doc claiming serve/dev/runtime do
-not exist (Task 12 deletes it), line 548 is a Windows named-pipe note that must
-survive. A post-task expectation of `0` here would be wrong; the expectation is
-`1`.
+not exist, line 548 is a Windows named-pipe note that must survive. Task 1
+leaves the count at **2** — it rewrites only the `[[bin]]` clause of that same
+paragraph, because at Task 1 the three verbs genuinely do not exist yet — and
+**Task 12** takes it to `1`. A post-task expectation of `0` would be wrong in
+either task. This is why Task 1's check on that paragraph is
+`grep -cF 'no [[bin]] beyond'` and not this one: a count that does not move
+cannot see the edit that was made.
 
 Several of these exit `1` while printing `0`. That is fine at a prompt and
 **fatal under `set -e`**, which is how a dead check got into an earlier phase.
@@ -123,8 +147,9 @@ Append `|| true` if you script them.
 
 ### The dead-check shapes this project has actually shipped
 
-Five, all found in real plans here. Before writing any check below, state what
-it prints **today**:
+Six. The first five were found in real plans on this project; the sixth is this
+phase's, and it is numbered rather than described because three tasks cite it.
+Before writing any check below, state what it prints **today**:
 
 1. **The pattern that cannot match the real text** — backticks, or a phrase
    wrapped across a line break. `grep -n` the surrounding words and read what is
@@ -139,12 +164,20 @@ it prints **today**:
 5. **`grep -rc … | wc -l`** — counts files searched, not matches. Use
    `grep -rn … | wc -l`.
 
-A sixth, specific to this phase: **a security test that passes for the wrong
-reason.** A traversal test that asserts "not 200" passes when the server is
-simply broken and answers 500 to everything. Every refusal test in Tasks 3 and
-6 asserts the **exact status and the exact refusal reason**, and each is paired
-with a positive control in the same test that proves the server serves the
-legitimate neighbour of the refused path.
+6. **A security test that passes for the wrong reason** — specific to this
+   phase, and numbered so the tasks below can cite it by number rather than by
+   description.   A traversal test that asserts "not 200" passes when the server is simply
+   broken and answers 500 to everything. Every refusal test in Tasks 3 and 6
+   asserts the **exact status and the exact refusal reason**, and each is
+   paired with a positive control in the same test that proves the server
+   serves the legitimate neighbour of the refused path.
+
+   A second form of the same shape, and the one this plan's own review caught
+   twice: **a test whose assertion is satisfied by something other than the
+   thing it names.** `shep-dev --help` containing the string `dev` is true of
+   the root help too, so it proves nothing about the alias reaching its verb;
+   `Usage: shep dev` is printed only by the subcommand's own help. Assert the
+   string only that code path can produce.
 
 ---
 
@@ -164,6 +197,20 @@ omissions. Each is argued in the decision it belongs to.
   Decision 15.
 - **`serve --foreground` as a visible flag** — the spec says serve runs as a
   managed sheep and does not say how the sheep is spelled. Decision 11.
+- **`serve --hidden`, and dotfiles refused without it** — spec §9 says nothing
+  about hidden files and pm2's serve publishes them. A `shep serve .` in a
+  repo checkout would otherwise publish `.env` and `.git/`. Decision 4.
+- **A connection cap and a per-connection deadline on `serve`** — not named in
+  the spec. Without them a handful of idle sockets exhaust the process's
+  descriptors on a `--bind 0.0.0.0` server. Decision 4.
+- **`propagate_version = true` on the clap tree** — one attribute. Without it
+  `shep-runtime --version` becomes `shep runtime --version`, which is a clap
+  usage error, and the alias binaries ship with no working `--version` at all.
+  Decision 2.
+- **`$SHEP_FORCE_INIT`** — a test-only switch that lets the PID-1 split be
+  reached from a test harness, following `$SHEP_TERM_PANIC_PROBE`'s existing
+  shape in this crate. Without it the init's signal forwarding has no test
+  that can fail. Decision 14.
 - **An access log line per request** — not named in spec §9. **Severable**:
   cutting it costs debuggability and nothing else. Decision 16.
 - **`X-Content-Type-Options: nosniff` on every `serve` response** — not named in
@@ -199,18 +246,30 @@ omissions. Each is argued in the decision it belongs to.
 - **The fast loop is `cargo test -p shep-daemon --lib --all-features -- --skip
   ::slow::`**, unchanged; nothing here touches the daemon's own crate.
 - **shep-cli's own loop changes in Task 1, and this is the trap that will
-  actually bite.** Today `cargo test -p shep-cli --lib` runs *nothing* and
-  reports success, so the project's rule is `--bins`. After Task 1 every unit
-  test in the crate lives in the library and `--bins` is what runs nothing.
-  From Task 1 onward use:
+  actually bite.** shep-cli has exactly one target of kind `bin` and **no
+  `lib` target** today, so `cargo test -p shep-cli --lib` is not a run of zero
+  tests — it is a hard cargo error, `error: no library targets found in
+  package 'shep-cli'`, exiting non-zero. Anyone scripting a baseline under
+  `set -e` halts on it. Today's command is therefore `--bins` alone. After
+  Task 1 every unit test in the crate lives in the library and `--bins` is
+  what runs almost nothing. **From Task 1 onward, and not before**, use:
 
   ```bash
   cargo test -p shep-cli --lib --bins --all-features
   ```
 
-  Both, so the command is correct on either side of the rename and correct
-  afterwards. Task 12 corrects `CLAUDE.md`, which states the `--bins` rule as a
-  fact about this repo.
+  The combined form is correct from Task 1 on. It is not correct on both sides
+  of the rename — before Task 1 the `--lib` half fails outright — so every
+  baseline command in Task 1 uses `--bins` alone and every task after it uses
+  the pair.
+- **`CLAUDE.md` does not state a `--bins` rule for shep-cli, and Task 12 must
+  not "correct" one into it.** Its only two `--bins` mentions (lines 97 and
+  100) sit inside the *"Doctests are not the cost here — do not split them
+  out"* section and argue the opposite: that the global `--lib --bins`
+  preference does **not** transfer to this workspace, because the cost here is
+  the integration tier. That paragraph is measured and correct and stays
+  untouched. Task 12 **adds** a sentence saying shep-cli carries a library from
+  Phase 15 on, so a shep-cli-scoped run needs both halves.
 - The task gate is fmt, clippy `-D warnings`, `cargo test --workspace
   --all-features`, `RUSTDOCFLAGS="-D warnings" cargo doc`; **one cargo command
   at a time**, `$?` read directly and never through a pipe (in zsh a pipeline's
@@ -231,10 +290,11 @@ cargo test -p shep-cli    --test cli_e2e --all-features
 cargo test -p shep-daemon --test daemon_e2e --all-features
 ```
 
-Task 10 adds one target that only exists on Linux:
+Task 10 adds one integration target, `cfg(unix)` with one Linux-only case
+inside it:
 
 ```bash
-cargo test -p shep-cli --test reaper --all-features
+cargo test -p shep-cli --test init --all-features
 ```
 
 Task gate, each from its own command:
@@ -368,11 +428,31 @@ paid to avoid a `lib.rs` whose public surface we are choosing anyway.
 
 **Each alias entry point prepends its verb to the argument vector**, so
 `shep-runtime ./Flockfile.toml --format json` is parsed as
-`["shep", "runtime", "./Flockfile.toml", "--format", "json"]`. Consequence to
-document rather than fix: `shep-runtime --help` prints usage lines that say
-`shep runtime`. Renaming the clap command per binary would fix the cosmetics
-and put a second name into every error message; the prepend is honest about
-what it does.
+`["shep", "runtime", "./Flockfile.toml", "--format", "json"]`.
+
+**Consequence to document rather than fix:** `shep-runtime --help` prints usage
+lines that say `shep runtime`. Renaming the clap command per binary would fix
+the cosmetics and put a second name into every error message; the prepend is
+honest about what it does.
+
+**Consequence to fix, in one attribute:** `shep-runtime --version` becomes
+`shep runtime --version`, and `cli.rs`'s `#[command(name = "shep", version, …)]`
+carries no `propagate_version`, so `--version` exists on the root command only
+— which means the alias binaries as specified have **no working `--version` at
+all**, and `--version` is the one invocation a packager's smoke test actually
+runs. Task 1 sets `propagate_version = true` on the `Cli` derive. That is
+independently right (a subcommand that answers `--version` is what everyone
+expects) and it costs one line. The `--version` case joins Step 1.5's table.
+
+**Consequence that stays, and is written into `--help` rather than worked
+around:** the root-level verbs are not reachable through an alias binary.
+`shep-dev completions` is parsed as `shep dev completions`, and since `DevArgs`
+takes one optional positional, that is a `dev` run whose target is a script
+named `completions` (`shep-dev completions bash` is simply a clap error — one
+positional too many). This is inherent to a container entrypoint that supplies
+its own verb, it costs nothing anyone wants, and the two alias binaries' own
+`--help` says which verb they are in its first line. Use `shep` for anything
+that is not `dev` or `runtime`.
 
 **The trap.** `shep_daemon::dogs` spawns a built-in dog as
 `std::env::current_exe() dog <name>` (`crates/shep-daemon/src/dogs.rs:140`),
@@ -388,8 +468,20 @@ no test runs a dog through an alias binary.
 re-exec verbs, the two the supervisor spawns by path. Written once, in one
 function, with the reason in its doc comment, and pinned by four tests (Step
 1.5). It is not a guess about what the user meant: those two argument vectors
-are never typed by a human and are constructed in exactly two places in this
-workspace, both of which this plan cites by path.
+are never typed by a human and are constructed in exactly **three** places in
+this workspace, all of which this plan cites by path.
+
+The three are `shep_daemon::dogs` (`crates/shep-daemon/src/dogs.rs:140`, the
+`dog <name>` vector), `crate::launch::launch_command`
+(`crates/shep-cli/src/launch.rs:76`, the `daemon` vector), and
+`crate::commands::startup::unit` (`unit.rs:79-81` and `:112`), which renders
+`ExecStart={exec} daemon --foreground`, `ExecReload={exec} reload all` and
+`ExecStop={exec} kill` into a systemd unit and `<string>daemon</string>` into a
+launchd plist. The third never passes through `alias_argv`: `shep startup` is
+not reachable from an alias binary (`shep-runtime startup` is `shep runtime
+startup`, a clap error), so the unit renderer only ever writes the path of the
+`shep` binary. It is named here anyway, because the doc comment below makes a
+completeness claim and a future `grep -rn current_exe crates` will find it.
 
 ### 3. `serve` is hand-rolled on the metrics dog's HTTP surface. Rin's ruling, and what that surface actually is
 
@@ -472,32 +564,84 @@ a lookup that is a `match`.
   `If-Modified-Since`. Every request re-reads the file.
 - **Compression, TLS, HTTP/2, keep-alive.** `Connection: close` on every
   response, as the existing writer already does.
-- **Hidden-file filtering.** A dotfile in the docroot is served like any other
-  file, so a `.env` or a `.git/config` sitting in a directory the operator chose
-  to publish is published. This is the no-code option and it is what pm2's serve
-  does; it is written into `--help` in as many words rather than left for
-  somebody to discover. Ledger entry.
 - **`PM2_SERVE_*` environment compatibility** (map.md names it). shep's own
   rule is that every knob it owns is `SHEP_`-prefixed; reading another tool's
   variables would be shep configuring itself from a namespace it does not own.
 
-**One header is added that the spec does not name:
-`X-Content-Type-Options: nosniff`, on every response.** Without it a browser may
-sniff a served file's bytes and decide a `.txt` is HTML, which turns any docroot
-containing user-supplied files into a stored-XSS surface. It is one constant
-header on a path that already writes three.
+**Three things the spec does not name are built anyway, because leaving each of
+them out would be a security decision rather than a scope decision.**
+
+**Dotfiles are refused, and `--hidden` opts back in.** Any resolved segment
+whose first byte is `.` is a **404**, and hidden entries are omitted from a
+directory listing. pm2's serve publishes them and the earlier draft of this
+plan followed it, with "it is what pm2's serve does" as the whole argument —
+which does not survive being placed next to this phase's other two exposure
+decisions. Listing is off by default because *filenames* on an internal
+service are information; the bind is loopback for the same reason. `shep serve .` in
+a repo checkout publishes `.env`, `.npmrc`, and the whole `.git` object store,
+from which the entire source history is reconstructible and whose `config`
+commonly carries a credential in a remote URL. Writing it into `--help` does not help, because the
+operator who reads that line is not the one who types `shep serve .` in a
+checkout. What a dotfile leaks is not the filename but the file.
+
+`--hidden` exists rather than a hard ban because there is one real use case:
+`.well-known/acme-challenge/…`, which is how an ACME client proves control of a
+host. That is a flag, and a test asserts it serves. The refusal is a 404 and
+not a 403, so it does not distinguish "hidden" from "missing" — decision 6's
+rule. The divergence from pm2 goes into `docs/migration.md` beside the listing
+flip.
+
+**A connection cap and a per-connection deadline.** `http::read_request`
+bounds the *read* phase at five seconds and nothing bounds the response phase:
+`tokio::io::copy` waits on a full send buffer forever, so a client that
+requests a large file and then stops reading holds a task, an open file and a
+socket indefinitely, and nothing caps how many of those exist at once. The
+metrics dog gets away with the identical shape because it is loopback-only and
+writes one small in-memory body; decision 8 explicitly invites `--bind
+0.0.0.0`, which moves this into a real threat model. So `serve` — and only
+`serve`, the dog is left alone — holds a `tokio::sync::Semaphore` permit for
+the life of each connection task, and wraps the whole handler in one
+`CONNECTION_DEADLINE`. Both are named constants with the reasoning on them.
+A few hundred idle sockets exhausting the descriptor table, with no error
+anywhere, is not a failure mode worth two lines of savings.
+
+**`X-Content-Type-Options: nosniff`, on every response.** Without it a browser
+may sniff a served file's bytes and decide a `.txt` is HTML, which turns any
+docroot containing user-supplied files into a stored-XSS surface. It is one
+constant header on a path that already writes three.
+
+**"Every response" is a claim about a seam, not about a list of branches.**
+Attaching it per-branch means the 400/401/404/405/500 replies and the directory
+listing do not get it — and the listing is the one response that renders
+attacker-influenced filenames into HTML, so it is the one that needs it most.
+So every reply `serve` writes goes through **one** `respond` helper that
+appends the header itself, and the tests assert it on a refusal and on a
+listing as well as on a file.
 
 ### 5. Path resolution: split first, decode second, and six refusals
 
 This is the whole verb. A static file server resolves an attacker-controlled
 string against a directory, and path traversal is the oldest bug in the
-category. The resolver is a **pure function in the pure tier** —
-`crates/shep-cli/src/serve/path.rs`, no `cfg`, no I/O, `&str` in and a
-`Result<RelPath, Refusal>` out — so it compiles on Windows, is covered by the
-cross-check, and its tests need no filesystem.
+category. It splits into **two** modules, and the split is the decision:
+
+- `crates/shep-cli/src/serve/path.rs` is the **pure tier** — no `cfg`, no I/O,
+  `&str` in and a `Result<Vec<String>, Refusal>` out. It compiles on Windows,
+  it is covered by the cross-check, and its tests need no filesystem.
+- `crates/shep-cli/src/serve/fs.rs` is `#[cfg(unix)]` and `async` over
+  `tokio::fs`. Everything that touches the filesystem lives there: the
+  containment walk and the open. It is excluded from the Windows cross-check,
+  which is correct — it is unix code — and it keeps `path.rs` honestly pure.
+
+An earlier draft put the containment check in `path.rs` and then opened the
+task with "nothing here touches the filesystem". It called `std::fs::canonicalize`,
+a blocking syscall, from inside a tokio task — so on a slow or network-mounted
+docroot every request would block a runtime worker for the length of a stat,
+in the same phase that adds tokio's `fs` feature specifically so file reads go
+through `spawn_blocking`.
 
 ```rust
-/// Resolves a request target to a root-relative path, or refuses it.
+/// Resolves a request target to a root-relative sequence of segments, or
+/// refuses it. Pure: `serve/path.rs`.
 pub fn resolve(target: &str) -> Result<Vec<String>, Refusal>;
 ```
 
@@ -516,7 +660,42 @@ one implemented:
 4. **Then percent-decode each segment**, byte by byte, refusing a malformed
    escape (`%`, `%z`, `%4`).
 5. Refuse a decoded segment containing any of: a NUL byte; any other control
-   byte (`< 0x20` or `0x7f`); `/`; `\`; or bytes that are not valid UTF-8.
+   byte (`< 0x20` or `0x7f`); `/`; `\`; `:`; or bytes that are not valid UTF-8.
+
+   **`:` is in that set on every target, not under `cfg(windows)`.** This
+   module is compiled on Windows and this decision claims it is correct there,
+   and on Windows a path component carrying a drive prefix is not a component:
+   `PathBuf::push("C:")` **replaces the entire base path**, documented std
+   behaviour. So a `contain` written as `for segment in segments {
+   joined.push(segment) }` turns `GET /C:/Windows/System32/config/SAM` into
+   `C:/Windows/…` — outside the root, before any containment check ever sees a
+   path derived from the docroot. The same byte covers NTFS alternate data
+   streams (`x.txt:$DATA`, which reads the file's raw contents past an
+   extension check) and the drive-relative form (`C:foo`). A colon in a served
+   filename is worth less than the class of bug, and refusing it uniformly
+   means the pure tier's tests are the ones that pin it.
+
+   The refusal is a lexical one, and lexical refusals are only as good as the
+   next reader's memory, so **`contain` is defensive independently**: before
+   pushing a segment it asserts `Path::new(segment).components()` yields
+   exactly one `Component::Normal`, and refuses anything else. Two locks,
+   because rule 5 is the one a future feature is most likely to route around.
+
+   **Three Windows-specific hazards this resolver deliberately does NOT
+   handle**, recorded here so the Windows tier finds them rather than
+   rediscovering them: reserved device names (`CON`, `NUL`, `PRN`, `AUX`,
+   `COM1`-`COM9`, `LPT1`-`LPT9`, with or without an extension — opening one
+   opens a device, not a file); trailing dots and spaces, which Windows strips
+   during path resolution, so `secret.txt.` and `secret.txt ` both name
+   `secret.txt`; and the `\\?\` and `\\.\` prefixes, which the `\` refusal
+   already covers today. Refusing device names on unix would break a
+   legitimate file named `con`, so the right place for those is the Windows
+   worker, and `resolve`'s doc comment says so.
+
+   **`+` is not decoded as a space.** That substitution belongs to
+   `application/x-www-form-urlencoded` query strings and not to path segments;
+   a file named `a+b.txt` is served as `a+b.txt`. One sentence in the doc so
+   nobody "fixes" it into a second way to spell a space.
 6. Walk: `""` and `"."` are skipped, `".."` pops, and **a `".."` with nothing
    left to pop is a refusal**, not a clamp to root. Everything else is pushed.
 
@@ -530,7 +709,10 @@ each — every one of them a test in Step 3.2:
 | `GET /..%2f..%2fetc/passwd` | rule 5 — the decoded segment contains `/` | 400 |
 | `GET /etc/passwd` (absolute path) | not refused — there is nothing to refuse. Every segment is pushed onto a stack that starts empty and is joined onto the root, so a leading `/` is an empty first segment and `etc/passwd` is looked for **inside the docroot**. The refusal is structural: no code path exists that produces a path outside the root from a lexical walk. | 404, if the docroot has no `etc/passwd` |
 | `GET /x%00.png` | rule 5, the NUL | 400 |
+| `GET /C:/Windows/System32/config/SAM` | rule 5, the `:` — a drive-absolute path is an absolute path, and it is the one form `PathBuf::push` would honour | 400 |
+| `GET /.env` | not the resolver's job — it resolves to `[".env"]` and the handler refuses a leading-dot segment unless `--hidden` | 404 |
 | a symlink inside the root pointing outside it | not lexical at all — see below | 404 |
+| a component swapped for a symlink after it was checked | `O_NOFOLLOW` on the open — see below | 404 |
 
 A sixth shape, not in the brief and worth as much as any of them:
 **`GET /a%0d%0aSet-Cookie:%20x`**. Decoded, that segment carries CR and LF. A
@@ -544,31 +726,63 @@ of them is on the code path a future feature is most likely to route around.
 
 **The symlink case is not lexical and cannot be.** The lexical walk guarantees
 the *requested* path is under the root; it says nothing about where the
-filesystem sends it. After the walk, `serve`:
+filesystem sends it. `serve/fs.rs` is where that half lives.
 
-- canonicalizes the docroot **once, at startup** (so a docroot that is itself a
-  symlink — `dist -> releases/2026-08-15`, the normal deploy shape — works);
-- joins the walked segments onto that canonical root;
-- `std::fs::canonicalize`s the result, which resolves every symlink in it;
-- requires the canonical result to `starts_with` the canonical root, and answers
-  **404** when it does not;
-- then requires the metadata to be a regular file or a directory — a fifo,
-  socket or device node in the docroot is a 404, because opening a fifo blocks
-  the task forever and that is a denial of service with no error message.
+`serve` canonicalizes the docroot **once, at startup** — so a docroot that is
+itself a symlink (`dist -> releases/2026-08-15`, the normal deploy shape)
+works, and every comparison below is against the place the operator actually
+chose. Per request there is **no `canonicalize` at all**. Instead:
 
-**The TOCTOU is real and is accepted, in writing.** Between `canonicalize` and
-`File::open`, a local attacker who can create files in the docroot can swap a
-path for a symlink. Closing it properly needs `openat2(RESOLVE_BENEATH)`, which
-is Linux-only, `unsafe`, and unavailable on macOS — a tier-1 platform. The
-accepted argument: an attacker who can write a symlink into the docroot can
-already write an `index.html` into it, so the confidentiality boundary this
-would defend was already gone. That argument holds for the docroot and **not**
-for a docroot on a shared tmpdir; the `--help` text says so.
+- walk the segments, accumulating the path one component at a time, and
+  `tokio::fs::symlink_metadata` each prefix. **Any component that is a symlink
+  is a refusal**, intermediate directories included — the swapped-directory
+  case is the one a leaf-only check misses;
+- keep `joined.starts_with(root)` as a closing assertion. It cannot fail given
+  the walk above, which is exactly why it is cheap to keep: it is the lock that
+  still holds the day someone loosens rule 6. `starts_with` on `Path` compares
+  **components**, not string prefixes, so `/srv/www-secret` does not match a
+  root of `/srv/www`. Never write it as a `to_str` prefix test;
+- open the leaf with
+  `tokio::fs::OpenOptions::new().read(true).custom_flags(O_NOFOLLOW | O_NONBLOCK)`,
+  and take the file type from **`File::metadata` on the open handle**, never
+  from a second stat of the path.
 
-`starts_with` on `Path` compares **components**, not string prefixes, so
-`/srv/www-secret` does not match a root of `/srv/www`. Write it as
-`canonical.starts_with(&root)` on `Path` values and never as a `to_str` prefix
-test; a test in Step 3.3 pins exactly that case.
+**That closes the TOCTOU, and it needs no new dependency and no `unsafe`.**
+The earlier draft accepted the race, and both halves of its argument were
+wrong. It claimed the only fix was `openat2(RESOLVE_BENEATH)` — Linux-only,
+`unsafe`, unavailable on macOS. `std::os::unix::fs::OpenOptionsExt::custom_flags`
+is safe, is implemented for `tokio::fs::OpenOptions`, works identically on
+macOS and Linux, and `nix::fcntl::OFlag::O_NOFOLLOW` is already reachable:
+`crates/shep-cli/Cargo.toml:131-132` carries `nix = { workspace = true,
+features = ["fs"] }` under `[target.'cfg(unix)'.dependencies]`, and nix 0.29's
+`fcntl` module is not feature-gated. Zero crates, zero `unsafe`.
+
+And it claimed the boundary was already gone — "an attacker who can write a
+symlink into the docroot can already write an `index.html` into it". Those are
+two different boundaries. Planting an `index.html` lets an attacker control
+**what the docroot serves**, which is a docroot the operator chose to publish.
+Winning the race between a check and an open lets an attacker make **the
+serving process read a file the attacker cannot** — `/etc/shadow`, another
+tenant's home, `$SHEP_HOME/kv.json` — and stream it back over HTTP. The second
+is a confidentiality boundary that the docroot's own contents say nothing
+about.
+
+**`O_NONBLOCK` is not decoration either.** A fifo in the docroot opened
+read-only **blocks until a writer appears** — the task is gone for the life of
+the process, which is a denial of service with no error message. `O_NOFOLLOW`
+does not help there; `O_NONBLOCK` makes the open return immediately, and the
+`fstat` on the handle then says "fifo" and the answer is 404. On a regular
+file `O_NONBLOCK` is a no-op. A socket or device node is refused by the same
+type check. This is the same refusal the earlier draft made from a pre-open
+stat, which was itself a race.
+
+**What remains, stated so it is not read as more than it is:** the walk's
+per-component `symlink_metadata` calls are not atomic with each other, so a
+sufficiently fast local attacker can still get a *directory* component
+swapped between two stats. The leaf open is the one that returns bytes and it
+is `O_NOFOLLOW`-protected, so what that buys the attacker is a refusal or a
+path within a directory they controlled anyway. Say this in the module doc and
+in `SECURITY.md`; do not say the race is gone.
 
 ### 6. The refusal taxonomy: 400, 401, 404, 405, 500, and nothing else
 
@@ -579,8 +793,9 @@ test; a test in Step 3.3 pins exactly that case.
 - **401** — auth is configured and the request did not satisfy it, with
   `WWW-Authenticate: Basic realm="shep"`.
 - **404** — resolved fine, and there is nothing to serve: no such path, a path
-  that canonicalizes outside the root, a non-regular file, or a directory with
-  no index and no listing enabled.
+  that leaves the root through a symlink, a non-regular file (fifo, socket,
+  device node), a hidden path without `--hidden`, or a directory with no index
+  and no listing enabled.
 - **405** — a method other than `GET` or `HEAD`, with `Allow: GET, HEAD`.
 - **500** — the file existed and could not be read, or a header value failed the
   control-byte check. Never carries the underlying error text to the client; it
@@ -657,6 +872,19 @@ not a refusal: serving a directory to a LAN is a legitimate thing to want, and a
 tool that refuses it teaches people to reach for `python -m http.server`, which
 has no auth at all.
 
+**Both halves are tested, because the notice is the entire compensating
+control for allowing the widening and neither half has any other guard.**
+Deleting `default_value = "127.0.0.1"` reddens nothing on its own — clap would
+then require the flag, and an `Option<IpAddr>` written in its place would
+default to unspecified and silently bind `0.0.0.0`. So Task 7 adds two pure
+assertions in `cli.rs`'s existing `mod tests` (which puts them under the
+Windows cross-check too): the parsed default `bind` is `127.0.0.1` and the
+parsed default `port` is 8080. And the notice is extracted as
+`fn exposure_notice(bind: IpAddr, auth: bool, root: &Path) -> Option<String>`
+so it can be asserted without a process: `None` for loopback, `Some` naming the
+address for `0.0.0.0`, and the no-auth variant additionally saying the files
+are readable by anything that can reach the port.
+
 ### 9. Directory listing is off by default; the trailing-slash redirect is not optional
 
 `--listing` enables it. Off by default, on the same reasoning as every other
@@ -666,7 +894,7 @@ information. With no index and no `--listing`, a directory is a 404. This is a
 deliberate divergence from pm2's serve, which lists by default, and it is named
 in the migration doc.
 
-Three details that are easy to get wrong and are each a test:
+Four details that are easy to get wrong and are each a test:
 
 - **A directory requested without a trailing slash gets a 301 to the same path
   with one.** Without it, every relative link in the served `index.html`
@@ -679,7 +907,15 @@ Three details that are easy to get wrong and are each a test:
   otherwise, and creating such a file is something a build tool can do by
   accident. The test creates exactly that filename.
 - **The listing links are percent-encoded**, so a filename with a space or a `#`
-  produces a link that works.
+  produces a link that works. This is the same encoder the trailing-slash
+  redirect's `Location` uses, and it is not optional there either: a directory
+  named with any non-ASCII byte would otherwise produce a `Location` that
+  `write_head`'s control-byte check refuses, and the operator would get a 500
+  on a directory that exists.
+- **The listing omits hidden entries unless `--hidden`.** A listing that names
+  `.env` and then 404s on it has still leaked the filename, which is the exact
+  thing decision 9 turns listing off by default to avoid. The filter is the
+  same predicate the handler uses, called in one more place.
 
 ### 10. SPA fallback is gated on `Accept: text/html`
 
@@ -826,7 +1062,12 @@ PID 1  shep runtime               (init: forwards signals, reaps everything)
   `docker stop` on a PID 1 with no handler is ignored until the 10-second SIGKILL.
 - On SIGCHLD, and on a 1-second backstop tick, `waitpid(-1, WNOHANG)` in a loop
   until it reports `StillAlive` or `ECHILD`. Orphaned lambs reparented to PID 1
-  are reaped here and nowhere else.
+  are reaped here and nowhere else. **`ECHILD` is an `Err`, not a status** —
+  `nix::sys::wait::WaitStatus` has no "no children" variant (nix 0.29:
+  `Exited`, `Signaled`, `Stopped`, `PtraceEvent`, `PtraceSyscall`, `Continued`,
+  `StillAlive`), so the shim that feeds the classifier takes a
+  `Result<WaitStatus, Errno>` and not a `WaitStatus`. Task 10 spells that out;
+  it matters because `ECHILD` is one of the loop's two exits.
 - When the reaped pid is the child's, the init exits with the child's code, or
   `128 + signal` if it died by one. It does **not** wait for remaining orphans:
   the container is going away and a stuck orphan must not hold the exit.
@@ -835,8 +1076,84 @@ PID 1  shep runtime               (init: forwards signals, reaps everything)
 
 When `std::process::id() != 1` — a developer running `shep runtime` on a laptop,
 and every test in CI — there is no split at all and the supervisor runs inline.
-Same code, one branch, and the branch is the one thing the Linux-only test in
-Task 10 exercises for real.
+Same code, one branch.
+
+#### The init exits through `std::process::exit`, and that is the only site in the crate that does
+
+**The status the init reports cannot be an `ExitCode`, as a matter of types.**
+`crate::exit::ExitCode` is a closed `#[repr(u8)]` enum with eleven named
+variants, 0 through 10, plus Task 8's 11 — `crates/shep-cli/src/exit.rs:14-58`.
+Every path out of the process funnels through it: `run(cli) -> ExitCode`, and
+Task 1's `run_argv` does `std::process::ExitCode::from(… as u8)`. There is no
+way to construct an `ExitCode` of 3 (a child's own exit code) or 137
+(`128 + SIGKILL`). So an earlier draft's `run_init() -> ExitCode` could not
+honour the container contract stated three bullets above — "a supervisor killed
+by SIGKILL reports 137 exactly as `docker inspect` expects" — while its one
+test, over the pure classifier, passed regardless. That is precisely the defect
+class decision 13 spends a page avoiding for code 11, reappearing one decision
+later.
+
+**`run_init` therefore never returns. It calls `std::process::exit(status)`
+directly**, and its signature says so: `async fn run_init() -> std::convert::Infallible`.
+The two candidates and why this one:
+
+- **A raw carrier through the funnel** — `run` returning something like
+  `Result<u8, ExitCode>`, or a `RawExit(u8)` variant at the `run_argv` seam —
+  touches every dispatch arm in the crate, and buys an open `u8` channel out of
+  the process for one call site. Decision 13 argues at length that a status an
+  orchestrator reads must come from a closed table; widening the funnel to an
+  arbitrary byte to serve the init inverts that argument the same week it is
+  written.
+- **`std::process::exit` at this one site** costs what Task 1 deliberately
+  bought when it moved `main` off `std::process::exit`: destructors and buffer
+  flushes. Here that cost is zero, and it is zero for reasons specific to this
+  process. The init is PID 1. It booted no shepherd, holds no socket, owns no
+  flock, installed no log subscriber, and deliberately never calls
+  `child.wait()`. Its live state is a `std::process::Command` handle, four
+  signal streams, and a tokio runtime it is about to abandon. Rust's stderr is
+  unbuffered and its stdout is line-buffered, so the diagnostics it wrote are
+  already out.
+
+And the deciding argument is not about cost at all: **the status is not
+shep's.** It is the child's status, relayed. `ExitCode` is the taxonomy of
+shep's own outcomes, and forcing a relayed foreign status into it is the
+category error, not bypassing it. A relay is exactly the case where the funnel
+should be stepped around, once, loudly, with the reason in the code.
+
+Write the reason in `run_init`'s doc comment, name it in the task report, and
+**test the process, not the classifier**. `classify` returning
+`Reaped::Supervisor(137)` is a fact about a pure function; what the contract
+promises is a fact about `$?`.
+
+#### Reaching PID 1 from a test: `$SHEP_FORCE_INIT`
+
+Signal forwarding is, in this decision's own words, "the reason an init is
+needed at all" — and no test in an earlier draft of this plan could fail if the
+whole `SIGTERM`/`SIGINT`/`SIGHUP`/`SIGQUIT` arm were deleted. The visible
+failure is silent and slow: every `docker stop` on a shep container takes the
+full grace period and then SIGKILLs the flock mid-stop-ladder, which is the
+exact behaviour the init exists to prevent.
+
+The split is unreachable from a test harness because a harness is never PID 1.
+So it gets a hidden switch, following the shape this crate already uses:
+`crates/shep-cli/src/main.rs:83` reads `$SHEP_TERM_PANIC_PROBE` to reach a
+panic path a test could not otherwise drive, and
+`crates/shep-cli/tests/term_panic_order.rs:65` sets it. (After Task 1 that call
+site lives in `lib.rs`'s `run_argv`.) `$SHEP_FORCE_INIT` is the same idea:
+
+```rust
+should_split(pid: u32, supervise: bool, forced: bool) -> bool
+```
+
+with `forced` read from `std::env::var_os("SHEP_FORCE_INIT").is_some()` at the
+one call site, exactly as the panic probe is.
+
+**The `--supervise` guard must win over `forced`, and that is a test, not a
+comment.** The init passes `--supervise` to its child, but the child inherits
+the environment — so if `forced` could override `supervise`, every child would
+split again and `shep runtime` under that variable would be a fork bomb.
+`should_split` returns `false` whenever `supervise` is set, whatever `pid` and
+`forced` say, and Step 10.4 asserts that case by name.
 
 ### 15. `dev` ignores `--home`, and says so
 
@@ -876,13 +1193,13 @@ it.
 Twelve tasks. The survey that preceded this plan estimated 8 for `serve` and 13
 for `dev`/`runtime`; re-derived from the spec and the code, the work buckets
 into fewer, fatter tasks — the two verbs share one engine (decision 12), and
-serve's five modules are five steps of one design rather than five independent
+serve's six modules are six steps of one design rather than six independent
 pieces.
 
 ```
 1  library extraction + three bins        (blocks everything; land it first and fast)
 2  http.rs moves up, gains write_head     (blocks 6)
-3  serve::path — resolution and refusals  (pure; can run parallel to 2)
+3  serve::path + serve::fs — resolve, contain, open (pure + cfg(unix); ‖ to 2)
 4  serve::mime + serve::listing           (pure; parallel to 3)
 5  serve::auth — creds file, ring         (pure-ish; parallel to 3)
 6  serve::worker — bind, accept, respond  (needs 2,3,4,5)
@@ -894,8 +1211,10 @@ pieces.
 12 docs, ledger, changelogs, CLAUDE.md    (last)
 ```
 
-Tasks 3, 4, 5 and 8 are pure and independent of each other and of 1; if this
-phase is run with parallel agents, that is the fan-out that exists. Task 1 is
+Tasks 4, 5 and 8 are pure and independent of each other and of 1, and Task 3 is
+pure in its `path.rs` half and `cfg(unix)` in its `fs.rs` half but depends on
+nothing else either; if this phase is run with parallel agents, those four are
+the fan-out that exists. Task 1 is
 not parallelisable with anything, because it moves the file they all land in.
 
 ---
@@ -905,7 +1224,7 @@ not parallelisable with anything, because it moves the file they all land in.
 **Files:** `crates/shep-cli/src/main.rs` → `crates/shep-cli/src/lib.rs`,
 `crates/shep-cli/src/bin/shep.rs`, `crates/shep-cli/src/bin/shep-runtime.rs`,
 `crates/shep-cli/src/bin/shep-dev.rs`, `crates/shep-cli/Cargo.toml`,
-`crates/shep-cli/src/exit.rs`.
+`crates/shep-cli/src/exit.rs`, `crates/shep-cli/src/cli.rs`.
 
 This task adds no behaviour. `shep <anything>` must do exactly what it did
 before, and the e2e suite is the proof.
@@ -917,12 +1236,17 @@ grep -cF '[[bin]]' crates/shep-cli/Cargo.toml                     # 1
 ls crates/shep-cli/src/lib.rs                                     # No such file or directory
 grep -c "#\[test\]\|#\[tokio::test\]" crates/shep-cli/src/main.rs # 13
 cargo test -p shep-cli --bins --all-features                      # record every line
-cargo test -p shep-cli --lib  --all-features                      # runs NOTHING today, exits 0
 ```
 
-Run both of those last two and read them. The `--lib` one printing `0 passed`
-while exiting `0` is the trap this task inverts, and seeing it once now is what
-makes the inversion obvious later.
+**`--bins` alone, and only in this task.** shep-cli has no `lib` target today,
+so `cargo test -p shep-cli --lib` is not a run of zero tests — it is
+`error: no library targets found in package 'shep-cli'`, exiting non-zero. Do
+not put it in a baseline script. From Task 2 onward the command is
+`--lib --bins`, and by then both halves exist: after this task the library
+holds every unit test in the crate and `--bins` alone runs the three
+three-line entry points and nothing else. That inversion is the trap; it is
+described here rather than demonstrated, because demonstrating it costs a
+failing command.
 
 ### Step 1.2 — the move
 
@@ -932,19 +1256,41 @@ mkdir -p crates/shep-cli/src/bin
 ```
 
 In `lib.rs`: keep every `mod` line, every `use`, every function and the whole
-`#[cfg(test)] mod tests` exactly as they are. Four edits and no others:
+`#[cfg(test)] mod tests` exactly as they are. Six edits and no others:
 
 1. `#![forbid(unsafe_code)]` stays at the top.
 2. Delete `#[tokio::main] async fn main() { … }` and replace it with the three
    public entry points and the private helper below.
-3. Add a crate-level `//!` doc that is written for **docs.rs**, because that is
+3. **Carry the `$SHEP_TERM_PANIC_PROBE` hook across with it.** It lives inside
+   the deleted `main` at `crates/shep-cli/src/main.rs:83`, it is what
+   `crates/shep-cli/tests/term_panic_order.rs:65` drives, and dropping it turns
+   that test into a hang-then-timeout with no obvious cause. It goes into
+   `run_argv` below, **before** `Cli::parse_from` — the probe panics, and it
+   must panic before clap can reject an argument vector that has no verb in it.
+   Its `#[cfg(unix)]` comes with it. The binary is still called `shep`, so
+   `Command::cargo_bin("shep")` in that test still resolves and the file needs
+   no edit at all; Step 1.6 runs it to prove that.
+4. Add a crate-level `//!` doc that is written for **docs.rs**, because that is
    now where it renders. Three sentences: what the crate is, that the binary is
    `shep`, and that the API is three entry points because embedding shep is
    `shep-client`'s job.
-4. Delete the paragraph in the old module doc claiming serve/dev/runtime are not
-   built (`grep -c "not built"` goes `2 → 1`; Task 12 handles the rest of the
-   staleness, but this sentence is falsified by this very phase and must not
-   survive it).
+5. **Rewrite the `[[bin]]` clause of the old module doc, and leave the rest of
+   that paragraph standing.** The paragraph at `main.rs:5-12` carries three
+   separate claims: (a) serve/dev/runtime are spec'd but not built, (b) "this
+   crate depends on neither `axum` nor `tower-http`, and there is no `[[bin]]`
+   beyond `shep` itself", and (c) lookout's three 12b panes are deferred. This
+   task falsifies exactly one of them — the `[[bin]]` half of (b) — by adding
+   two. Rewrite that clause to name the three targets, and leave (a) and (c)
+   alone: serve, dev and runtime genuinely are not built until Tasks 7, 9 and
+   11, and (c) is 12b's to delete. **Task 12 deletes (a).** Deleting the whole
+   paragraph here would take (c) with it and would claim two verbs exist that
+   do not; deleting only its first sentence would ship a false `[[bin]]` claim
+   in the crate's own docs. `grep -c "not built"` stays **2 → 2** in this task.
+6. Set `propagate_version = true` on `cli.rs`'s `#[command(name = "shep",
+   version, …)]` (decision 2). Without it the two alias binaries have no
+   working `--version`, because `shep-runtime --version` is parsed as
+   `shep runtime --version` and `--version` exists on the root command only.
+   `cli.rs` carries no help snapshots, so nothing else moves.
 
 ```rust
 /// The `shep` entry point. Parses this process's arguments and runs one verb.
@@ -979,7 +1325,11 @@ pub fn main_dev() -> std::process::ExitCode {
 /// `shep-runtime`, so inserting a verb here would turn `shep-runtime dog
 /// metrics` into `shep runtime dog metrics` and every dog in a container would
 /// die at its first exec. Those two argument vectors are never typed by a
-/// human; they are constructed in exactly the two places named above.
+/// human; they are constructed in exactly three places in this workspace —
+/// the two named above, plus `crate::commands::startup::unit`, which renders
+/// `{exec} daemon --foreground` into a systemd unit and a launchd plist. That
+/// third one never reaches here: `shep startup` is not a verb an alias binary
+/// can spell.
 fn alias_argv(verb: &str, mut argv: Vec<OsString>) -> Vec<OsString> {
     let passthrough = matches!(
         argv.get(1).and_then(|arg| arg.to_str()),
@@ -1131,13 +1481,43 @@ not:
     #[test]
     fn the_alias_vector_parses_to_the_expected_command() {
         use clap::Parser;
+        // `Commands` is imported here and not via `super::*`: the top-level
+        // `use cli::Commands` is `#[cfg(unix)]`-gated alongside every verb
+        // module, and this test — like every other one in this file — must
+        // still compile under the Windows cross-check. Matches
+        // `save_parses_to_its_own_command`'s existing shape.
+        use cli::Commands;
         let argv = alias_argv("dog", vec!["shep-runtime".into(), "dog".into(), "metrics".into()]);
         let cli = Cli::try_parse_from(argv).expect("the passthrough vector must parse");
         assert!(matches!(cli.command, Commands::Dog(_)));
     }
 ```
 
-That last one is written **now**, against `dog`, because `runtime` and `dev` do
+**That local `use cli::Commands;` is load-bearing, and omitting it fails the
+Windows cross-check rather than this machine.** `main.rs:36` is `#[cfg(unix)]
+use cli::{AdoptArgs, Commands, DaemonArgs, Format};`, and the existing
+`save_parses_to_its_own_command` in this same module carries a doc comment
+saying exactly why it imports `Commands` locally. Follow it. Tasks 9 and 11
+write their siblings inside `commands/`, which is `#[cfg(unix)]` wholesale, so
+**those** do not need the local import — do not cargo-cult it there.
+
+And a sixth, for the attribute Task 1 adds:
+
+```rust
+    /// fails if `propagate_version` is dropped, which leaves the two alias
+    /// binaries with no working `--version` at all: `shep-runtime --version`
+    /// is parsed as `shep runtime --version`, and without propagation that is
+    /// a clap usage error. `--version` is the one alias invocation a
+    /// packager's smoke test actually runs.
+    #[test]
+    fn a_subcommand_answers_version() {
+        use clap::Parser;
+        let err = Cli::try_parse_from(["shep", "dogs", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+```
+
+The `dog` test is written **now**, against `dog`, because `runtime` and `dev` do
 not exist until Tasks 9 and 11. Task 9 adds its sibling for `runtime` and Task
 11 for `dev`; both are named in those tasks' verification blocks.
 
@@ -1145,7 +1525,10 @@ not exist until Tasks 9 and 11. Task 9 adds its sibling for `runtime` and Task
 
 `tests/cli_e2e.rs` and `tests/term_panic_order.rs` both use
 `Command::cargo_bin("shep")`, which still resolves — the binary name did not
-change. Run them unchanged:
+change, and neither test file needs an edit. `term_panic_order` is the one that
+can be broken silently by this task: it drives the `$SHEP_TERM_PANIC_PROBE`
+hook that lives inside the `main` this task deletes (edit 3). If it fails or
+hangs here, the hook did not make it into `run_argv`. Run them unchanged:
 
 ```bash
 cargo test -p shep-cli --test cli_e2e --all-features
@@ -1154,31 +1537,18 @@ cargo test -p shep-cli --test term_panic_order --all-features
 
 Any failure here is this task's, not a pre-existing one; the baseline was green.
 
-Add one e2e case, because the two alias binaries are otherwise untested as
-binaries:
-
-```rust
-/// fails if `shep-dev` is not built, is not installed under that name, or does
-/// not reach the `dev` verb. `--help` is used rather than a real run so the
-/// test starts no shepherd and writes to no home.
-#[test]
-fn the_alias_binaries_exist_and_reach_their_own_verbs() {
-    for (bin, verb) in [("shep-dev", "dev"), ("shep-runtime", "runtime")] {
-        let output = Command::cargo_bin(bin)
-            .unwrap_or_else(|err| panic!("{bin} must be a [[bin]] target: {err}"))
-            .arg("--help")
-            .output()
-            .unwrap();
-        let text = String::from_utf8_lossy(&output.stdout);
-        assert!(text.contains(verb), "{bin} --help must be {verb}'s help:\n{text}");
-    }
-}
-```
-
-Written in Task 1 and **expected to fail until Tasks 9 and 11 land the verbs**.
-Guard it in Task 1 with `#[ignore = "the dev and runtime verbs land in Tasks 9
-and 11"]` and delete the attribute in Task 11 — an ignored test with a stated
-reason is honest; a deleted one is a hole.
+**The e2e case that covers the two alias binaries as binaries is written in
+Task 11, not here.** It cannot pass until both verbs exist, and an earlier
+draft wrote it now behind `#[ignore = "the dev and runtime verbs land in Tasks
+9 and 11"]`. `tests/cli_e2e.rs` argues against that practice twice in its own
+text — its module doc at line 22 spends the cost of two slow cases "rather than
+marking them `#[ignore]`", and `CRON_DEADLINE`'s doc at line 183 says an
+ignored test closes no gap. The abstract argument for an honest `#[ignore]` is
+fine and it loses to a convention this specific file states twice, especially
+when the alternative is free: Task 11 is where the second verb lands, so the
+test lands there whole. Task 1's proof that the targets exist is
+`ls crates/shep-cli/src/bin | wc -l # 3` in Step 1.9, and Step 11.5 no longer
+needs a round trip through an `#[ignore]` grep.
 
 ### Step 1.7 — the IR-20 comment that this task falsifies
 
@@ -1219,15 +1589,36 @@ Second mutation, cheap and worth it: change `argv.insert(1, …)` to
 `the_alias_vector_parses_to_the_expected_command` still passes — which is the
 point of having both, since a vector can parse and still be wrong.
 
+Third: delete `propagate_version = true`. Expected:
+`a_subcommand_answers_version` fails with `ErrorKind::UnknownArgument`.
+
+Fourth, and the one this task can lose silently: delete the
+`$SHEP_TERM_PANIC_PROBE` block from `run_argv`. Expected:
+`the_restore_escape_lands_before_the_panic_backtrace` in
+`tests/term_panic_order.rs` fails — the probe binary no longer panics, so the
+test's `assert!(!status.success())` is the first thing to go. If that test
+passes with the block deleted, the hook was already unreachable and the task
+report says so.
+
 ### Step 1.9 — verification
 
 ```bash
-grep -cF '[[bin]]' crates/shep-cli/Cargo.toml       # 1 → 3
-grep -c '^pub ' crates/shep-cli/src/lib.rs          # 3, exactly
-grep -c '^pub mod' crates/shep-cli/src/lib.rs       # 0 (grep exits 1)
-ls crates/shep-cli/src/bin | wc -l                  # 3
-cargo test -p shep-cli --lib --bins --all-features  # every test from the --bins baseline, +5
+grep -cF '[[bin]]' crates/shep-cli/Cargo.toml            # 1 → 3
+grep -c '^pub ' crates/shep-cli/src/lib.rs               # 3, exactly
+grep -c '^pub mod' crates/shep-cli/src/lib.rs            # 0 (grep exits 1)
+ls crates/shep-cli/src/bin | wc -l                       # 3
+grep -cF 'no [[bin]] beyond' crates/shep-cli/src/lib.rs  # 1 → 0
+grep -c "not built" crates/shep-cli/src/lib.rs           # 2 → 2 (Task 12 moves it)
+grep -c "SHEP_TERM_PANIC_PROBE" crates/shep-cli/src/lib.rs  # 1, still
+grep -c "propagate_version" crates/shep-cli/src/cli.rs   # 0 → 1
+cargo test -p shep-cli --lib --bins --all-features       # every test from the --bins baseline, +6
 ```
+
+`grep -cF 'no [[bin]] beyond'` is the check that can actually see edit 5 — the
+`not built` count deliberately does **not** move in this task, so it gives no
+signal here and would read as a passing check that verified nothing (dead-check
+shape 3). `-F` for the same reason it is on every `[[bin]]` check in this
+document. The six new tests are Step 1.5's five plus `a_subcommand_answers_version`.
 
 `grep -c '^pub '` printing exactly `3` is decision 1's whole guard, and its
 limit is stated there: it counts declarations at column 0 and would not catch a
@@ -1330,21 +1721,23 @@ Tests, over `tokio::io::duplex` like every existing test in this file:
     /// `Location`.
     #[tokio::test]
     async fn a_header_value_with_a_control_byte_is_refused_before_anything_is_written() {
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        let err = write_head(
-            &mut server,
-            301,
-            "text/html",
-            0,
-            &[Header { name: "Location", value: "/a\r\nSet-Cookie: x=1" }],
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, HttpError::BadHeader { .. }), "{err:?}");
-        drop(server);
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        assert!(buf.is_empty(), "nothing may reach the stream: {buf:?}");
+        for (name, value) in [
+            ("Location", "/a\r\nSet-Cookie: x=1"),  // the pair
+            ("Location", "/a\rSet-Cookie: x=1"),     // a lone CR: enough on its own
+            ("Location", "/a\nSet-Cookie: x=1"),     // a lone LF
+            ("Location", "/a\u{7f}b"),               // DEL, above the control range
+            ("X-Bad\r\nInjected", "ok"),             // the NAME is checked too
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let err = write_head(&mut server, 301, "text/html", 0, &[Header { name, value }])
+                .await
+                .unwrap_err();
+            assert!(matches!(err, HttpError::BadHeader { .. }), "{name}: {err:?}");
+            drop(server);
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).await.unwrap();
+            assert!(buf.is_empty(), "{name}: nothing may reach the stream: {buf:?}");
+        }
     }
 
     /// fails if the extra headers are dropped, or if the declared length stops
@@ -1383,11 +1776,17 @@ the error and still have split the response.
 Change the control-byte check from `!(0x20..=0x7e).contains(&b)` to a check for
 `b == b'\n'` only. Expected:
 `a_header_value_with_a_control_byte_is_refused_before_anything_is_written`
-**still passes**, because the injected value contains a `\n` — so also add the
-bare-CR case to that test's table before mutating, and confirm the mutation
-reddens it. This is dead-check shape 5 (the mutation that changes nothing) and
-it was caught while writing this plan: a lone `\r` is enough to split a response
-for some clients, and a `\n`-only check would have shipped.
+**fails, on its bare-CR row and its DEL row**.
+
+It fails only because Step 2.3's table already carries those rows. Written the
+obvious way — one `\r\n` value — the same test passes under this mutation,
+because the injected value contains a `\n`. That is the plan's **sixth**
+dead-check shape (a test that passes for the wrong reason), not the fifth; an
+earlier draft cited the fifth, which is the `grep -rc … | wc -l` one, and a
+document that builds a numbered vocabulary and then miscites it teaches the
+number wrong. The finding itself is real and was caught while writing this
+plan: a lone `\r` is enough to split a response for some clients, and a
+`\n`-only check would have shipped.
 
 ### Step 2.5 — verification
 
@@ -1401,28 +1800,47 @@ cargo test -p shep-cli --lib --bins --all-features  # baseline +2
 
 ---
 
-## Task 3 — `serve::path`: resolution, and the six refusals
+## Task 3 — `serve::path` and `serve::fs`: resolution, containment, and the refusals
 
-**Files:** `crates/shep-cli/src/serve/mod.rs` (new, `mod path;` and nothing
-else yet), `crates/shep-cli/src/serve/path.rs` (new),
-`crates/shep-cli/src/lib.rs` (`mod serve;`).
+**Files:** `crates/shep-cli/src/serve/mod.rs` (new, `mod path;` and
+`#[cfg(unix)] mod fs;`), `crates/shep-cli/src/serve/path.rs` (new),
+`crates/shep-cli/src/serve/fs.rs` (new), `crates/shep-cli/src/lib.rs`
+(`mod serve;`).
 
 **This is the security core of the whole phase.** Read decision 5 before
-starting. Nothing here touches the filesystem or the network; it is a pure
-function and a table of tests.
+starting, all of it.
 
-`mod serve;` in `lib.rs` is **not** `#[cfg(unix)]` at this task — `path.rs` is
-pure tier and belongs under the Windows cross-check, which is where the `\`
-refusal earns its keep. Task 6 adds `#[cfg(unix)]` on the *worker* submodule
-only.
+**Two modules, and the split is the point.** `path.rs` is the pure tier: no
+`cfg`, no I/O, `&str` in and segments out, tested with a table and nothing
+else. `fs.rs` is `#[cfg(unix)]` and `async` over `tokio::fs`: it is where the
+containment walk and the file open live, because both are syscalls and a
+syscall inside a tokio task must not be the blocking `std::fs` kind. Do not put
+a `std::fs` call in `path.rs` and then describe the module as pure — an earlier
+draft did, and it would have put a blocking `canonicalize` on every request in
+the same phase that adds tokio's `fs` feature to avoid exactly that.
+
+`mod serve;` in `lib.rs` is **not** `#[cfg(unix)]` — `path.rs` is pure tier and
+belongs under the Windows cross-check, which is where the `\` and `:` refusals
+earn their keep. The `fs` and (in Task 6) `worker` submodules carry their own
+`#[cfg(unix)]`.
 
 ### Step 3.1 — baseline
 
 ```bash
 ls crates/shep-cli/src/serve                                    # No such file or directory
 grep -rni "percent_decode\|percent-decode" crates | wc -l       # 0
+grep -n 'nix = { workspace = true' crates/shep-cli/Cargo.toml   # the cfg(unix) entry, "fs" on
+grep -rn "O_NOFOLLOW" crates | wc -l                            # 0
 cargo test -p shep-cli --lib --bins --all-features              # record
 ```
+
+`fs.rs` needs `nix::fcntl::OFlag::O_NOFOLLOW`, `nix::unistd::mkfifo` and
+`nix::sys::stat::Mode`. All three are reachable today:
+`crates/shep-cli/Cargo.toml:131-132` is
+`nix = { workspace = true, features = ["fs"] }` under
+`[target.'cfg(unix)'.dependencies]`, and nix 0.29's `fcntl` module is not
+feature-gated at all. **No manifest edit in this task** — confirm that by
+building rather than by reading this sentence, and record what happened.
 
 ### Step 3.2 — RED first: the refusal table
 
@@ -1439,7 +1857,12 @@ pub enum Refusal {
     /// A `%` escape that is not two hex digits.
     BadEscape,
     /// A decoded segment carries a byte a path segment may not: NUL, any
-    /// other control byte, `/`, or `\`.
+    /// other control byte, `/`, `\`, or `:`.
+    ///
+    /// `:` is refused on every target, not only Windows: a segment carrying a
+    /// drive prefix makes `PathBuf::push` replace the base path outright, and
+    /// `x.txt:$DATA` names an NTFS alternate data stream. A colon in a served
+    /// filename is worth less than that class of bug.
     ForbiddenByte,
     /// A decoded segment is not valid UTF-8.
     NotUtf8,
@@ -1504,58 +1927,151 @@ pub enum Refusal {
 
     /// A backslash is a separator on Windows and this module compiles there.
     /// Refusing it costs a filename nobody has and closes a resolver that
-    /// would be wrong the day someone builds the Windows tier.
+    /// would be wrong the day someone builds the Windows tier. Both forms:
+    /// the percent-encoded one, and the raw one a client can simply type.
     #[test]
     fn a_backslash_segment_is_refused_on_every_target() {
         assert_eq!(resolve("/a%5c..%5cetc"), Err(Refusal::ForbiddenByte));
+        assert_eq!(resolve("/\\..\\..\\etc"), Err(Refusal::ForbiddenByte));
+    }
+
+    /// fails if a drive prefix reaches `PathBuf::push`. On Windows a segment
+    /// carrying `:` REPLACES the base path rather than extending it, so
+    /// `GET /C:/Windows/System32/config/SAM` would resolve entirely outside
+    /// the docroot before any containment check saw a path derived from it.
+    /// Same byte covers the NTFS alternate-data-stream form and the
+    /// drive-relative one. This module compiles on Windows and this test is
+    /// what the cross-check exercises.
+    #[test]
+    fn a_windows_drive_prefix_or_a_data_stream_is_refused() {
+        assert_eq!(resolve("/C:/Windows/System32/config/SAM"), Err(Refusal::ForbiddenByte));
+        assert_eq!(resolve("/C:foo"), Err(Refusal::ForbiddenByte));
+        assert_eq!(resolve("/x.txt:$DATA"), Err(Refusal::ForbiddenByte));
+        assert_eq!(resolve("/a%3ab"), Err(Refusal::ForbiddenByte));
+    }
+
+    /// fails on the decoder's own edges: hex is case-insensitive, an overlong
+    /// UTF-8 encoding of `.` is not a `.`, and the two target forms that are
+    /// not paths at all are refused before anything else runs.
+    #[test]
+    fn the_decoder_and_the_target_form_have_no_soft_edges() {
+        // Uppercase hex decodes the same as lowercase — a resolver that only
+        // handles one case refuses `%2E%2E` as a filename and serves it.
+        assert_eq!(resolve("/%2E%2E/x"), Err(Refusal::AboveRoot));
+        assert_eq!(resolve("/%2e%2E/x"), Err(Refusal::AboveRoot));
+        // Overlong UTF-8 for `.` (`%c0%ae`): invalid UTF-8, never a dot.
+        assert_eq!(resolve("/%c0%ae%c0%ae/x"), Err(Refusal::NotUtf8));
+        // Neither of these is a path. `*` is the asterisk-form target; the
+        // empty string is what a malformed request line leaves behind.
+        assert_eq!(resolve(""), Err(Refusal::NotAbsolute));
+        assert_eq!(resolve("*"), Err(Refusal::NotAbsolute));
+    }
+
+    /// fails if the hidden-path predicate misses a dot anywhere but the first
+    /// segment. `.env` at the root and `.git/config` two levels down are the
+    /// same leak, and `--hidden` is the only thing that serves either.
+    /// The refusal itself is the handler's (a 404, decision 4); this pins the
+    /// predicate the handler asks.
+    #[test]
+    fn a_dot_leading_segment_anywhere_reads_as_hidden() {
+        assert!(is_hidden(&resolve("/.env").unwrap()));
+        assert!(is_hidden(&resolve("/.git/config").unwrap()));
+        assert!(is_hidden(&resolve("/a/.b/c").unwrap()));
+        assert!(!is_hidden(&resolve("/index.html").unwrap()));
+        assert!(!is_hidden(&resolve("/a.b/c").unwrap()));
     }
 ```
 
-### Step 3.3 — GREEN: `resolve`, plus the root containment check
+`is_hidden(segments: &[String]) -> bool` is one line and lives in `path.rs`
+beside `resolve`, so it is pure, tested in the table, and covered by the
+Windows cross-check like everything else here. The handler calls it (Task 6),
+and so does the listing renderer (Task 4) — a listing that names `.env` and
+then 404s on it has still leaked the filename.
 
-`resolve` is the walk from decision 5. The containment half is a second function
-in the same module, because it is the same decision and its failure mode is the
-same one:
+### Step 3.3 — GREEN: `resolve` in `path.rs`, containment in `fs.rs`
+
+`resolve` and `is_hidden` are the pure half and finish `path.rs`. The
+filesystem half is `serve/fs.rs`, `#[cfg(unix)]`, async, and it is two
+functions:
 
 ```rust
-/// Joins `segments` onto `root` and returns the path only if it is really
-/// inside it.
+/// Joins `segments` onto `root`, refusing anything that leaves it.
 ///
-/// `root` must already be canonical — `serve` canonicalizes it once at startup,
-/// so a docroot that is itself a symlink (`dist -> releases/2026-08-15`, the
-/// ordinary deploy shape) works, and the comparison below is against the place
-/// the operator actually chose.
+/// `root` must already be canonical — `serve` canonicalizes it once at
+/// startup, so a docroot that is itself a symlink (`dist ->
+/// releases/2026-08-15`, the ordinary deploy shape) works, and every
+/// comparison here is against the place the operator actually chose.
+///
+/// **Every component is `symlink_metadata`'d as the path is built, and any
+/// component that is a symlink is refused — intermediate directories
+/// included.** A leaf-only check misses the swapped-directory case, which is
+/// the same escape one level up. There is no `canonicalize` here: it is a
+/// blocking syscall on a path this function is about to walk anyway, and
+/// per-request canonicalization is what an earlier draft used to justify
+/// accepting a TOCTOU it did not need to accept.
+///
+/// Each segment is pushed only after `Path::new(segment).components()` yields
+/// exactly one [`Component::Normal`]. `path::resolve`'s rule 5 already refuses
+/// every byte that could make that false; this is the second lock, and it is
+/// the one that still holds if rule 5 is ever loosened. On Windows it is what
+/// stops `PathBuf::push` honouring a drive prefix and replacing the base path
+/// outright — this function is `cfg(unix)` today, and the assertion costs one
+/// line against the day it is not.
 ///
 /// [`Path::starts_with`] compares **components**, not string prefixes: a root
 /// of `/srv/www` does not contain `/srv/www-secret`, and a `to_str()` prefix
-/// test would say it does.
+/// test would say it does. It cannot fail given the walk above, which is
+/// exactly why it is cheap to keep.
 ///
 /// # Errors
-/// `None` when the path does not exist, cannot be canonicalized, or resolves —
-/// through a symlink, which is the case this exists for — outside `root`. The
-/// caller answers 404 to all three without distinguishing them: a server that
-/// tells a client which of "missing" and "forbidden" applies is a server that
-/// maps its own filesystem on request.
-pub fn contain(root: &Path, segments: &[String]) -> Option<PathBuf> {
-    let mut joined = root.to_path_buf();
-    for segment in segments {
-        joined.push(segment);
-    }
-    let canonical = std::fs::canonicalize(joined).ok()?;
-    canonical.starts_with(root).then_some(canonical)
-}
+/// `None` for every refusal — missing, a symlink component, or outside
+/// `root`. The caller answers 404 to all of them without distinguishing: a
+/// server that tells a client which of "missing" and "forbidden" applies is a
+/// server that maps its own filesystem on request.
+pub async fn contain(root: &Path, segments: &[String]) -> Option<PathBuf>
+
+/// Opens a leaf for reading without ever following a symlink, and without
+/// ever blocking on a fifo.
+///
+/// `O_NOFOLLOW` is the lock on the race the walk in [`contain`] cannot close
+/// on its own: a leaf swapped for a symlink after it was checked fails the
+/// open with `ELOOP` instead of being followed into somebody else's file.
+/// It is safe, it needs no new dependency (`nix::fcntl::OFlag::O_NOFOLLOW`,
+/// and nix is already a `cfg(unix)` dependency of this crate), and unlike
+/// `openat2(RESOLVE_BENEATH)` it works on macOS.
+///
+/// `O_NONBLOCK` is the second flag and it is not decoration. Opening a fifo
+/// read-only **blocks until a writer appears** — the task is gone for the life
+/// of the process, a denial of service with no error message. With it the open
+/// returns immediately and the type check below answers 404. On a regular file
+/// it is a no-op.
+///
+/// **The metadata comes from the open handle, never from a second stat of the
+/// path.** `File::metadata` is an `fstat` on the descriptor already held, so
+/// the "regular file" answer is about the bytes that are actually going to be
+/// streamed, not about whatever the path named a moment ago.
+///
+/// # Errors
+/// `None` if the open failed for any reason, or if the thing opened is not a
+/// regular file. Every one of them is the caller's 404.
+pub async fn open_regular(path: &Path) -> Option<(tokio::fs::File, u64)>
 ```
 
-Tests for `contain` need a real temp tree, so they are `#[cfg(unix)]` (they
-create a symlink) and live in the same file behind that gate:
+`contain` returns a path rather than a handle because a directory is a legitimate
+answer (index, listing, redirect) and a directory is not opened for reading.
+The handler asks `contain` first, stats the result once for the file/directory
+fork, and calls `open_regular` on the file branch — and it is `open_regular`'s
+own metadata, not that stat, that decides whether bytes are sent.
+
+Tests for both live in `fs.rs` behind its `#[cfg(unix)]` gate and need a real
+temp tree:
 
 ```rust
-    /// fails if a symlink inside the root that points outside it is served.
-    /// The lexical walk cannot catch this one — the target has no `..` in it
-    /// at all.
-    #[cfg(unix)]
-    #[test]
-    fn a_symlink_pointing_outside_the_root_is_not_contained() {
+    /// fails if a symlinked LEAF inside the root that points outside it is
+    /// served. The lexical walk cannot catch this one — the target has no
+    /// `..` in it at all.
+    #[tokio::test]
+    async fn a_symlinked_leaf_pointing_outside_the_root_is_not_contained() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("www");
         std::fs::create_dir(&root).unwrap();
@@ -1566,31 +2082,98 @@ create a symlink) and live in the same file behind that gate:
         let root = std::fs::canonicalize(&root).unwrap();
 
         // positive control, in the same test: the ordinary neighbour works.
-        assert!(contain(&root, &["ok.txt".to_string()]).is_some());
-        assert!(contain(&root, &["escape.txt".to_string()]).is_none());
+        assert!(contain(&root, &["ok.txt".to_string()]).await.is_some());
+        assert!(contain(&root, &["escape.txt".to_string()]).await.is_none());
+    }
+
+    /// fails if only the leaf is checked. A symlinked INTERMEDIATE directory
+    /// is the same escape one level up, and it is the case a leaf-only walk
+    /// misses — `www/link` is a symlink and `www/link/x` is an ordinary file
+    /// on the far side of it.
+    #[tokio::test]
+    async fn a_symlinked_intermediate_directory_is_not_contained() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("www")).unwrap();
+        std::fs::create_dir(dir.path().join("elsewhere")).unwrap();
+        std::fs::write(dir.path().join("elsewhere/x"), b"not served").unwrap();
+        std::fs::write(dir.path().join("www/ok.txt"), b"served").unwrap();
+        let root = std::fs::canonicalize(dir.path().join("www")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("elsewhere"),
+            root.join("link"),
+        ).unwrap();
+
+        assert!(contain(&root, &["ok.txt".to_string()]).await.is_some());
+        assert!(contain(&root, &["link".to_string(), "x".to_string()]).await.is_none());
+    }
+
+    /// fails if `O_NOFOLLOW` is not on the open. This is the lock on the race
+    /// `contain`'s walk cannot close: it drives `open_regular` directly on a
+    /// symlink the walk never saw, which is what a leaf swapped between the
+    /// check and the open looks like from the open's side. Deterministic —
+    /// there is no race to win here, only a flag to assert.
+    #[tokio::test]
+    async fn open_regular_refuses_a_symlink_the_walk_never_saw() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"not served").unwrap();
+        let ordinary = dir.path().join("ok.txt");
+        std::fs::write(&ordinary, b"served").unwrap();
+        let link = dir.path().join("escape.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        assert!(open_regular(&ordinary).await.is_some(), "positive control");
+        assert!(open_regular(&link).await.is_none());
+    }
+
+    /// fails if a fifo in the docroot can hang the task that opens it. Without
+    /// `O_NONBLOCK` this test does not fail — it never finishes, which is the
+    /// production failure exactly: one request and that task is gone for the
+    /// life of the process. The deadline is the forcing mechanism (IR-46) and
+    /// it wraps the async call, not a synchronous one.
+    #[tokio::test]
+    async fn a_fifo_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR)
+            .unwrap();
+        let opened = tokio::time::timeout(Duration::from_secs(5), open_regular(&fifo))
+            .await
+            .expect("opening a fifo must not block");
+        assert!(opened.is_none(), "a fifo is not a regular file");
     }
 
     /// fails if containment is written as a string prefix. `/srv/www-secret`
     /// starts with the characters of `/srv/www` and is a different directory.
-    #[cfg(unix)]
-    #[test]
-    fn a_sibling_whose_name_extends_the_roots_name_is_not_contained() {
+    /// No symlink in this one, deliberately: the symlink refusal would answer
+    /// it for the wrong reason and the `starts_with` lock would go untested.
+    #[tokio::test]
+    async fn a_sibling_whose_name_extends_the_roots_name_is_not_contained() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("www")).unwrap();
         std::fs::create_dir(dir.path().join("www-secret")).unwrap();
         std::fs::write(dir.path().join("www-secret/x"), b"x").unwrap();
         let root = std::fs::canonicalize(dir.path().join("www")).unwrap();
-        std::os::unix::fs::symlink(
-            dir.path().join("www-secret"),
-            dir.path().join("www/link"),
-        ).unwrap();
-        assert!(contain(&root, &["link".to_string(), "x".to_string()]).is_none());
+        // `..` never reaches here from `resolve`; this drives `contain`
+        // directly, which is what the second lock is for.
+        assert!(
+            contain(&root, &["..".to_string(), "www-secret".to_string(), "x".to_string()])
+                .await
+                .is_none()
+        );
     }
 ```
 
+`nix::unistd::mkfifo` and `nix::sys::stat::Mode` are both behind nix's `fs`
+feature, which `crates/shep-cli/Cargo.toml:131-132` already enables under
+`[target.'cfg(unix)'.dependencies]`. No manifest edit; confirm it rather than
+assume, by building once.
+
 ### Step 3.4 — MUTATION
 
-Two, run one at a time:
+Five, run one at a time. Each names the one test that must redden and, where it
+matters, the tests that must **not** — an asymmetry is a finding about coverage
+and not just a pass.
 
 1. In the walk, replace the `AboveRoot` refusal with a clamp (`if stack.is_empty()
    { continue }`). Expected: the `AboveRoot` assertions in
@@ -1600,21 +2183,61 @@ Two, run one at a time:
    turns `/../secret` into `/secret`, serving a file the client did not ask for.
    If the test still passes, the refusal is not being asserted, only the
    non-200-ness.
-2. Change `canonical.starts_with(root)` to
-   `canonical.to_string_lossy().starts_with(&*root.to_string_lossy())`. Expected:
-   `a_sibling_whose_name_extends_the_roots_name_is_not_contained` fails and the
-   symlink test still passes — which is why both exist.
+2. Drop `:` from rule 5's forbidden set. Expected:
+   `a_windows_drive_prefix_or_a_data_stream_is_refused` fails on all four rows.
+   Every other test in the file passes, on this machine and under the Windows
+   cross-check — which is why that test exists as its own case rather than as
+   four more rows in the big table.
+3. Delete the `Component::Normal` assertion from `contain`, leaving rule 5 as
+   the only lock. Expected: **nothing reddens**, because rule 5 already refuses
+   every byte that could reach it. Note that in the report and keep the
+   assertion: it is a second lock on a lexical refusal, and the mutation that
+   would redden it is one nobody would write today (loosening rule 5) rather
+   than one nobody would notice.
+4. In `contain`, check `symlink_metadata` on the final component only.
+   Expected: `a_symlinked_intermediate_directory_is_not_contained` fails and
+   `a_symlinked_leaf_pointing_outside_the_root_is_not_contained` still passes.
+   That asymmetry is why both tests exist.
+5. Drop `O_NOFOLLOW` from `open_regular`. Expected:
+   `open_regular_refuses_a_symlink_the_walk_never_saw` fails, and every
+   `contain` test still passes — the walk refuses the symlink before the open
+   is ever reached, so without this test the flag could be deleted silently.
+   Then, separately, drop `O_NONBLOCK`: `a_fifo_is_refused_without_blocking`
+   does not fail, it **hangs to its own five-second deadline and then fails**,
+   which is the production symptom rendered as a test failure.
 
 ### Step 3.5 — verification
 
 ```bash
-grep -c "fn resolve" crates/shep-cli/src/serve/path.rs   # 1
-cargo test -p shep-cli --lib --bins --all-features       # baseline +7
+grep -c "fn resolve" crates/shep-cli/src/serve/path.rs        # 1
+grep -c "canonicalize" crates/shep-cli/src/serve/fs.rs        # 0 (grep exits 1) — per request
+grep -c "std::fs::" crates/shep-cli/src/serve/path.rs         # 0 (grep exits 1) — the module is pure
+grep -c "O_NOFOLLOW" crates/shep-cli/src/serve/fs.rs          # 1
+cargo test -p shep-cli --lib --bins --all-features            # baseline +13
 cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu
 ```
 
+The thirteen, by name, since a total is not a check: `path.rs` adds
+`the_traversal_shapes_are_each_refused_for_their_own_reason`,
+`an_absolute_looking_target_resolves_inside_the_root`,
+`the_query_and_fragment_are_cut_before_anything_else`,
+`decoding_happens_after_splitting_and_never_creates_a_separator`,
+`a_backslash_segment_is_refused_on_every_target`,
+`a_windows_drive_prefix_or_a_data_stream_is_refused`,
+`the_decoder_and_the_target_form_have_no_soft_edges` and
+`a_dot_leading_segment_anywhere_reads_as_hidden`; `fs.rs` adds
+`a_symlinked_leaf_pointing_outside_the_root_is_not_contained`,
+`a_symlinked_intermediate_directory_is_not_contained`,
+`open_regular_refuses_a_symlink_the_walk_never_saw`,
+`a_fifo_is_refused_without_blocking` and
+`a_sibling_whose_name_extends_the_roots_name_is_not_contained`. That is
+eight plus five, so **thirteen** on unix and eight under the Windows
+cross-check, which compiles `path.rs` and skips `fs.rs` entirely. Record both
+numbers; the delta on this machine is +13.
+
 The Windows check runs here rather than only at the merge: `path.rs` is the
-pure-tier module this phase adds and the backslash refusal is a Windows claim.
+pure-tier module this phase adds, and the backslash and drive-prefix refusals
+are both Windows claims that nothing else in the suite exercises.
 
 ### Step 3.6 — gate
 
@@ -1695,7 +2318,21 @@ are both `application/octet-stream`; `.HTML` and `.Html` resolve like `.html`;
 /// named `<script>alert(1)</script>` is a thing a build tool produces by
 /// accident and a stored-XSS otherwise. The href is percent-encoded, because a
 /// name with a space, a `#` or a `?` produces a link that goes somewhere else.
+///
+/// `entries` reaches here already filtered: the caller drops any name starting
+/// with `.` unless `--hidden` (decision 4). A listing that names `.env` and
+/// then 404s on it has still leaked the filename, which is the whole reason
+/// listing is off by default.
 pub fn render(prefix: &str, entries: &[Entry]) -> String
+
+/// Percent-encodes one path segment for a URL.
+///
+/// Public within `serve` because there are **two** sinks, not one: this
+/// module's `href`s, and the trailing-slash redirect's `Location` in the
+/// worker. A directory named with any non-ASCII byte would otherwise produce a
+/// `Location` that `http::write_head`'s control-byte check refuses, and the
+/// operator would get a 500 on a directory that exists.
+pub fn encode_segment(name: &str) -> String
 ```
 
 Tests:
@@ -1720,6 +2357,19 @@ Tests:
     }
 ```
 
+```rust
+    /// fails if a non-ASCII name produces bytes a header cannot carry. The
+    /// same encoder feeds the worker's redirect `Location`, where an
+    /// unencoded byte is a 500 on a directory that exists rather than a
+    /// cosmetic problem.
+    #[test]
+    fn a_non_ascii_name_encodes_to_printable_ascii() {
+        let encoded = encode_segment("документы");
+        assert!(encoded.bytes().all(|b| (0x20..=0x7e).contains(&b)), "{encoded}");
+        assert!(encoded.starts_with('%'), "{encoded}");
+    }
+```
+
 ### Step 4.4 — MUTATION
 
 Escape the href with the HTML escaper instead of the percent encoder (one
@@ -1727,10 +2377,15 @@ plausible copy-paste). Expected:
 `a_filename_with_a_space_or_a_hash_produces_a_link_that_resolves` fails while
 the XSS test still passes — the reason both exist rather than one combined test.
 
+Second: leave `encode_segment` as the identity for bytes above `0x7e`.
+Expected: `a_non_ascii_name_encodes_to_printable_ascii` fails. Without that
+test the same bug reaches the redirect and shows up as a 500 nobody can
+attribute.
+
 ### Step 4.5 — verification and gate
 
 ```bash
-cargo test -p shep-cli --lib --bins --all-features   # baseline +7
+cargo test -p shep-cli --lib --bins --all-features   # baseline +8
 ```
 
 ---
@@ -1868,9 +2523,19 @@ the `alicf` case.
 
 ```bash
 grep -c "verify_slices_are_equal" crates/shep-cli/src/serve/auth.rs   # 1
-grep -c "derive(Debug" crates/shep-cli/src/serve/auth.rs              # 0 for Credentials
+grep -B2 'pub struct Credentials' crates/shep-cli/src/serve/auth.rs | grep -c 'derive'  # 0
 cargo test -p shep-cli --lib --bins --all-features                    # baseline +6
 ```
+
+**The `derive` check is scoped to the type on purpose, and it is still a human
+read.** A whole-file `grep -c "derive(Debug"` cannot print 0 here: `AuthError`
+is returned from `load` and implements `core::error::Error`, whose supertrait
+is `Debug`, so it must derive it. An implementer handed the unscoped check
+either records a mismatch and moves on or "fixes" the error type. There is no
+way to assert the absence of a trait impl from inside the crate — that needs
+`trybuild`, a dev-dependency for one check — so this grep plus one human read
+is the guard, exactly as decision 1's module-privacy grep is. Say so in the
+report rather than letting the grep read as stronger than it is.
 
 ---
 
@@ -1881,8 +2546,8 @@ cargo test -p shep-cli --lib --bins --all-features                    # baseline
 
 `worker.rs` is `#[cfg(unix)]` — it binds a listener and reads files, and the
 Windows leg of `run` refuses every verb before it could be reached, exactly as
-`lookout` and `whistle` already are. `path`, `mime`, `listing` and `auth` stay
-pure.
+`lookout` and `whistle` already are. `serve::fs` was already gated by Task 3
+for the same reason. `path`, `mime`, `listing` and `auth` stay pure.
 
 ### Step 6.1 — baseline and the manifest
 
@@ -1912,16 +2577,52 @@ pub struct ServeConfig {
     pub spa: bool,
     /// Render a listing for a directory with no index.
     pub listing: bool,
+    /// Serve paths with a leading-dot segment, and list them. Off by default:
+    /// `shep serve .` in a repo checkout would otherwise publish `.env` and
+    /// the whole `.git` object store (decision 4).
+    pub hidden: bool,
     /// Credentials every request must satisfy, if any.
     pub auth: Option<Credentials>,
 }
+```
+
+Two constants beside it, both decision 4's:
+
+```rust
+/// How many connections may be in flight at once.
+///
+/// A permit is held for the whole life of a connection task, so this is a
+/// hard ceiling on tasks, open files and sockets together. Without it a client
+/// that requests a large file and then stops reading holds all three
+/// indefinitely — `tokio::io::copy` waits on a full send buffer forever — and
+/// a few hundred of those exhaust the process's descriptor table with no error
+/// anywhere. 512 is comfortably above what a static site serving a page's
+/// worth of assets needs and comfortably below a default `RLIMIT_NOFILE`.
+const MAX_CONNECTIONS: usize = 512;
+
+/// The whole-connection deadline: read, resolve, respond and copy together.
+///
+/// `http::read_request`'s own timeout bounds the read phase only. A static
+/// file server has no legitimate minute-long request, and the alternative to a
+/// deadline is a slow-read client holding a permit until the process exits.
+const CONNECTION_DEADLINE: Duration = Duration::from_secs(60);
 ```
 
 The loop is the metrics dog's, deliberately — bind, `SIGINT`/`SIGTERM` select,
 one task per connection, `Connection: close`, no keep-alive. Copy its shape
 rather than inventing a second one, including the SIGTERM handler and the reason
 for it (a worker that only handles SIGINT rides the whole kill ladder to SIGKILL
-on every `shep stop`, which is slow and looks like a hang).
+on every `shep stop`, which is slow and looks like a hang). **That handler gets
+a test in Task 7's e2e tier**, which is the only place a real stop ladder
+exists; nothing in this task can exercise it.
+
+**Two things the dog's loop does not have, and this one must** (decision 4): a
+`tokio::sync::Semaphore` permit acquired before the task is spawned and held
+for its whole life, and the entire per-connection handler wrapped in one
+`tokio::time::timeout(CONNECTION_DEADLINE, …)`. The dog is loopback-only and
+writes one small in-memory body; `serve` is invited to bind `0.0.0.0` and
+streams files. Write the divergence into the comment that says the loop was
+copied, or the next reader will "restore" the shape.
 
 Per connection, in this exact order — the order is decision 6 and is pinned by a
 test:
@@ -1936,17 +2637,31 @@ test:
    This server never reads a body, and a request that carries one would leave
    bytes in the socket.
 5. `path::resolve` → 400 on `Err`, with the refusal's own one-line reason.
-6. `path::contain` → 404 on `None`.
-7. metadata: a directory → step 8; a regular file → step 9; anything else → 404.
-8. directory: the request path did not end in `/` → **301** to the same path
-   with one. Otherwise `index.html` inside it → step 9; else `listing` → render;
+6. `path::is_hidden` and not `cfg.hidden` → **404**. A 404 and not a 403, so it
+   does not distinguish "hidden" from "missing" (decision 6). Before any
+   filesystem access, so it costs nothing and leaks nothing.
+7. `fs::contain` → 404 on `None`.
+8. metadata: a directory → step 9; anything else → step 10.
+9. directory: the request path did not end in `/` → **301** to the same path
+   with one, its `Location` built from the resolved segments run back through
+   `listing::encode_segment` — never from the raw target, and never unencoded
+   (decision 5's response-splitting note, and a non-ASCII directory name is a
+   500 otherwise). Otherwise `index.html` inside it → step 10; else `listing`
+   → render the entries, hidden ones filtered by the same predicate as step 6;
    else 404.
-9. file: `write_head` with the MIME type, the metadata length, and
-   `X-Content-Type-Options: nosniff`; then, for `GET` only,
-   `tokio::io::copy(&mut file.take(len), &mut stream)`.
-10. any 404 with `spa` set, `GET`/`HEAD`, and an `Accept` containing
+10. file: `fs::open_regular` → 404 on `None`, which covers a fifo, a socket, a
+    device node and a leaf swapped for a symlink since step 7. `write_head`
+    with the MIME type and the length **from the open handle's own metadata**;
+    then, for `GET` only,
+    `tokio::io::copy(&mut file.take(len), &mut stream)`.
+11. any 404 with `spa` set, `GET`/`HEAD`, and an `Accept` containing
     `text/html` → serve `<root>/index.html` with **200**.
-11. one access-log line to stdout (decision 16).
+12. one access-log line to stdout (decision 16).
+
+**Every reply above is written by one `respond` helper**, which appends
+`X-Content-Type-Options: nosniff` itself (decision 4). Attaching the header on
+the file branch alone leaves the refusals and the listing without it, and the
+listing is the response that renders attacker-influenced filenames into HTML.
 
 `file.take(len)` rather than a bare copy: `content-length` was taken from the
 metadata, and a file that grows between the two would otherwise desync the
@@ -1961,6 +2676,13 @@ dog's own test helper says why) and speak HTTP over a `TcpStream`. Reuse the
 metrics dog's `RunningDog` shape: a struct holding the address and the
 `JoinHandle`, aborting on drop.
 
+Three helpers, shared by every case below and written once: `write_tree(root,
+&[(path, contents)])` creates a docroot **inside** a caller-owned `TempDir`;
+`config(root)` builds a default `ServeConfig` over it; and `config_with_*`
+are one-field overrides of that (`_auth`, `_spa`, `_listing`, `_hidden`).
+Every case owns the outer `TempDir` itself, so nothing this tier writes lands
+outside one guard.
+
 Every one of them wraps its request/response exchange in
 `tokio::time::timeout(Duration::from_secs(5), …)` around the **async** call — a
 timeout around a synchronous call bounds nothing (dead-check shape 4).
@@ -1974,9 +2696,16 @@ timeout around a synchronous call bounds nothing (dead-check shape 4).
 /// test fails in.
 #[tokio::test]
 async fn every_traversal_shape_is_refused_over_a_real_socket() {
-    let tree = tempdir_with(&[("index.html", "<h1>home</h1>"), ("assets/app.css", "body{}")]);
-    std::fs::write(tree.path().parent().unwrap().join("secret.txt"), "nope").unwrap();
-    let server = serve_on_free_port(config(&tree)).await;
+    // One guard over everything: the docroot is a CHILD of the tempdir, and
+    // the negative control is its sibling. `tree.path().parent()` would be
+    // `/tmp` or `/var/folders/…/T` — shared, world-writable, never cleaned up
+    // by the `TempDir` guard, and a predictable name two concurrent runs of
+    // this suite would race on.
+    let outer = tempfile::tempdir().unwrap();
+    let root = outer.path().join("www");
+    write_tree(&root, &[("index.html", "<h1>home</h1>"), ("assets/app.css", "body{}")]);
+    std::fs::write(outer.path().join("secret.txt"), "nope").unwrap();
+    let server = serve_on_free_port(config(&root)).await;
 
     // positive control first: the server serves.
     assert_eq!(get(server.addr(), "/index.html").await.status, 200);
@@ -1989,15 +2718,26 @@ async fn every_traversal_shape_is_refused_over_a_real_socket() {
         ("/..%2fsecret.txt", 400),
         ("/x%00.png", 400),
         ("/a%0d%0aSet-Cookie:%20x", 400),
+        ("/C:/Windows/System32/config/SAM", 400),
         ("/etc/passwd", 404),
         ("/nope.txt", 404),
+        ("/.env", 404),
     ] {
         let response = get(server.addr(), target).await;
         assert_eq!(response.status, want, "{target} answered {response:?}");
         assert!(!response.body.contains("nope"), "{target} leaked the file");
+        assert_eq!(
+            response.headers["x-content-type-options"], "nosniff",
+            "{target}: every response carries it, refusals included"
+        );
     }
 }
 ```
+
+The `!body.contains("nope")` control never actually fires — every traversal
+case above is refused lexically, before any filesystem access — and it stays
+anyway as the assertion that would catch a resolver rewritten to clamp instead
+of refuse. Say that in the report rather than presenting it as a live check.
 
 ```rust
 /// fails if a symlink out of the docroot is served over the socket — the
@@ -2067,6 +2807,54 @@ async fn a_css_file_is_served_as_css_with_nosniff() { … }
 /// enough to write in a test.
 #[tokio::test]
 async fn a_file_larger_than_the_buffers_is_served_whole() { … }
+
+/// fails if a dotfile is served, or if `--hidden` stops serving one. Both
+/// halves in one test: `shep serve .` in a repo checkout publishing `.env` is
+/// the failure this refusal exists for, and `.well-known/acme-challenge/x` is
+/// the one real reason the flag exists rather than a hard ban.
+#[tokio::test]
+async fn a_dotfile_is_404_unless_hidden_is_set() {
+    let plain = serve_on_free_port(config(&root)).await;
+    assert_eq!(get(plain.addr(), "/.env").await.status, 404);
+    assert_eq!(get(plain.addr(), "/.git/config").await.status, 404);
+    assert_eq!(get(plain.addr(), "/index.html").await.status, 200, "positive control");
+
+    let hidden = serve_on_free_port(config_with_hidden(&root)).await;
+    assert_eq!(get(hidden.addr(), "/.well-known/acme-challenge/x").await.status, 200);
+}
+
+/// fails if a listing names a file the server will not serve. A listing that
+/// prints `.env` and then 404s on it has leaked the filename, which is the
+/// whole reason listing is off by default. Also the one response that renders
+/// attacker-influenced text into HTML, so `nosniff` is asserted here too.
+#[tokio::test]
+async fn a_listing_omits_hidden_entries_and_carries_nosniff() { … }
+
+/// fails if a directory whose name is not ASCII answers 500. The redirect's
+/// `Location` is built from the resolved segments and must be percent-encoded
+/// through the same function the listing hrefs use — unencoded, the header
+/// value carries bytes `write_head` refuses, and the operator gets a 500 on a
+/// directory that exists.
+#[tokio::test]
+async fn a_directory_with_a_non_ascii_name_redirects_rather_than_500ing() {
+    let response = get(server.addr(), "/документы").await;
+    assert_eq!(response.status, 301);
+    assert_eq!(response.headers["location"], "/%D0%B4%D0%BE%D0%BA%D1%83%D0%BC%D0%B5%D0%BD%D1%82%D1%8B/");
+}
+
+/// fails if there is no ceiling on concurrent connections. Opens
+/// `MAX_CONNECTIONS + 1` sockets that complete a request and then never read
+/// the response, and asserts the last one is closed rather than held forever.
+/// Without the semaphore this test does not fail — it exhausts the harness's
+/// descriptors, which is the production symptom.
+#[tokio::test]
+async fn connections_beyond_the_cap_are_closed_rather_than_queued_forever() { … }
+
+/// fails if a connection that stops reading mid-body is held for the life of
+/// the process. On a paused clock, so the forcing mechanism is the test's own
+/// `advance` past `CONNECTION_DEADLINE` and not sixty real seconds (IR-46).
+#[tokio::test(start_paused = true)]
+async fn a_connection_that_stops_reading_is_dropped_at_the_deadline() { … }
 ```
 
 ### Step 6.4 — MUTATION
@@ -2077,7 +2865,7 @@ Three, one at a time:
    `an_unauthenticated_request_is_401_whatever_the_path_says` fails on
    `/../secret.txt` (400 instead of 401). If it passes, the ordering is not
    actually being asserted.
-2. Delete `path::contain`'s call from the handler and join the segments onto the
+2. Delete `fs::contain`'s call from the handler and join the segments onto the
    root directly. Expected:
    `a_symlink_out_of_the_docroot_is_a_404_and_not_a_body` fails **and the whole
    traversal table still passes**, because the lexical walk already refused
@@ -2086,11 +2874,25 @@ Three, one at a time:
 3. Make the SPA fallback unconditional (drop the `Accept` gate). Expected:
    `the_spa_fallback_serves_index_for_navigations_and_404s_for_assets` fails on
    the asset half.
+4. Attach `nosniff` in the file branch instead of in `respond`. Expected: the
+   refusal rows of `every_traversal_shape_is_refused_over_a_real_socket` fail,
+   and `a_listing_omits_hidden_entries_and_carries_nosniff` fails, while
+   `a_css_file_is_served_as_css_with_nosniff` still passes. That asymmetry is
+   the whole argument for the `respond` seam.
+5. Drop the `hidden` check from step 6 of the handler. Expected:
+   `a_dotfile_is_404_unless_hidden_is_set` fails on both dotfile rows and its
+   `--hidden` half still passes — a flag that only ever says yes is not a flag.
+6. Remove the semaphore permit. Expected:
+   `connections_beyond_the_cap_are_closed_rather_than_queued_forever` fails.
+   Run this one last: it is the mutation most likely to leave sockets behind if
+   the test itself is wrong.
 
 ### Step 6.5 — verification and gate
 
 ```bash
-cargo test -p shep-cli --lib --bins --all-features   # baseline +11
+grep -c "fn respond" crates/shep-cli/src/serve/worker.rs   # 1 — one seam, not several
+grep -c "nosniff" crates/shep-cli/src/serve/worker.rs      # 1 — written once, in respond
+cargo test -p shep-cli --lib --bins --all-features         # baseline +16
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
@@ -2122,7 +2924,12 @@ knobs and neither has to parse the other's half.
 
 ```rust
 /// Arguments to `shep serve`.
-#[derive(Debug, clap::Args)]
+///
+/// `PartialEq` is derived for one reason and it is a test: Step 7.4's
+/// round-trip asserts the whole struct, so a field added without teaching
+/// `sheep_args` about it fails by construction rather than by somebody
+/// remembering to extend a list of `assert!`s.
+#[derive(Debug, PartialEq, Eq, clap::Args)]
 pub struct ServeArgs {
     /// Directory to serve
     pub root: PathBuf,
@@ -2148,6 +2955,12 @@ pub struct ServeArgs {
     /// publishes every filename under it.
     #[arg(long)]
     pub listing: bool,
+    /// Serve files and directories whose names begin with a dot. Off by
+    /// default: serving a project directory would otherwise publish `.env`
+    /// and the whole `.git` history. The one real use is
+    /// `.well-known/acme-challenge`.
+    #[arg(long)]
+    pub hidden: bool,
     /// File holding one `user:password` line, mode 0600, required on every
     /// request. Sent over plain HTTP — base64, not encryption.
     #[arg(long)]
@@ -2173,7 +2986,10 @@ pub struct ServeArgs {
 - `--spa` with no `<root>/index.html` → `InvalidConfig` (4).
 - bind not loopback → a stderr notice naming the address and the docroot, and,
   without `--auth`, saying the files will be readable by anything that can reach
-  the port. Notice, not refusal (decision 8).
+  the port. Notice, not refusal (decision 8). Produced by
+  `fn exposure_notice(bind: IpAddr, auth: bool, root: &Path) -> Option<String>`,
+  extracted so it can be asserted without a process — it is the whole
+  compensating control for allowing the widening and it has no other guard.
 
 Then either:
 
@@ -2197,7 +3013,21 @@ Then either:
 /// from its own. The canonical root goes in, and every flag is written in one
 /// canonical order, so `shep describe` shows the same line for the same
 /// server however it was typed.
-fn sheep_args(root: &Path, args: &ServeArgs) -> Vec<String>
+///
+/// **`--auth`'s path is canonicalized here too, for exactly the same reason
+/// and with a worse failure mode.** `shep serve ./dist --auth ./creds`
+/// validates the file successfully in the registering half — so the operator
+/// sees no error at all — and then registers a sheep that resolves `./creds`
+/// against the shepherd's cwd, does not find it, and crash-loops. A relative
+/// docroot produces a 404; a relative creds path produces a server that never
+/// starts, after a green registration.
+///
+/// **`--name` and `--fold` are deliberately NOT in the output.** They are
+/// registration-time facts — which sheep this is and which fold it joins —
+/// and mean nothing to the foreground worker that receives this line. The
+/// round-trip test asserts their absence rather than leaving it to be
+/// rediscovered.
+fn sheep_args(root: &Path, auth: Option<&Path>, args: &ServeArgs) -> Vec<String>
 ```
 
 ### Step 7.4 — tests
@@ -2207,39 +3037,114 @@ Unit, in `commands/serve.rs`:
 ```rust
     /// fails if the registered command line loses a flag, or carries the
     /// operator's relative path instead of the canonical one.
+    ///
+    /// Every field of `ServeArgs` is set to a non-default value here, so a
+    /// flag `sheep_args` forgets shows up as an absence rather than as a
+    /// default that happens to match.
     #[test]
     fn the_registered_command_line_is_absolute_and_carries_every_flag() {
-        let args = ServeArgs { spa: true, listing: true, port: 9000, .. };
-        let built = sheep_args(Path::new("/srv/www"), &args);
+        let args = ServeArgs {
+            root: PathBuf::from("./dist"),
+            port: 9000,
+            bind: "0.0.0.0".parse().unwrap(),
+            name: Some("web".into()),
+            fold: Some("prod".into()),
+            spa: true,
+            listing: true,
+            hidden: true,
+            auth: Some(PathBuf::from("./creds")),
+            foreground: false,
+        };
+        let built = sheep_args(Path::new("/srv/www"), Some(Path::new("/srv/creds")), &args);
         assert_eq!(built[0], "serve");
         assert_eq!(built[1], "/srv/www");
         assert!(built.contains(&"--foreground".to_string()));
         assert!(built.contains(&"--spa".to_string()));
         assert!(built.contains(&"--listing".to_string()));
+        assert!(built.contains(&"--hidden".to_string()));
         assert!(built.windows(2).any(|w| w == ["--port", "9000"]));
+        assert!(built.windows(2).any(|w| w == ["--bind", "0.0.0.0"]),
+                "a sheep that quietly binds loopback is a silent downgrade");
+        assert!(built.windows(2).any(|w| w == ["--auth", "/srv/creds"]),
+                "absolute, or the sheep crash-loops after a green registration");
+        assert!(!built.contains(&"--name".to_string()), "registration-time only");
+        assert!(!built.contains(&"--fold".to_string()), "registration-time only");
     }
 
     /// fails if the rebuilt line does not parse back to the same flags — the
     /// half a string-equality test cannot see.
+    ///
+    /// Whole-struct equality, not field by field: a field added to
+    /// `ServeArgs` without a matching arm in `sheep_args` fails this test by
+    /// construction, which is the property the earlier field-by-field version
+    /// claimed and did not have — it asserted four of ten fields and let
+    /// `--bind` and `--auth` through silently.
     #[test]
     fn the_registered_command_line_parses_back_to_the_same_arguments() {
         use clap::Parser;
-        let built = sheep_args(Path::new("/srv/www"), &args);
+        let original = /* the struct above */;
+        let built = sheep_args(Path::new("/srv/www"), Some(Path::new("/srv/creds")), &original);
         let mut argv = vec!["shep".to_string()];
         argv.extend(built);
         let cli = Cli::try_parse_from(argv).expect("the line shep registers must parse");
         let Commands::Serve(parsed) = cli.command else { panic!("expected serve") };
-        assert!(parsed.foreground);
-        assert!(parsed.spa);
-        assert_eq!(parsed.port, 9000);
-        assert_eq!(parsed.root, PathBuf::from("/srv/www"));
+        assert_eq!(parsed, ServeArgs {
+            root: PathBuf::from("/srv/www"),
+            auth: Some(PathBuf::from("/srv/creds")),
+            foreground: true,
+            // registration-time only, and absent from the line by design
+            name: None,
+            fold: None,
+            ..original
+        });
     }
 ```
 
 That second test is the one that matters. The first pins a vector; this one
 pins the **round trip**, which is where a flag rename or a positional reorder
-actually breaks — and it fails loudly the day someone adds a required argument
-to `ServeArgs` without updating the builder.
+actually breaks — and, because it compares the whole struct, it fails the day
+someone adds a field to `ServeArgs` without updating the builder, which is what
+the plan says it wants from it.
+
+And decision 8's two defaults, in `cli.rs`'s own `mod tests` so they run under
+the Windows cross-check as well:
+
+```rust
+    /// fails if serve stops binding loopback by default. Spec §10 fixes it and
+    /// nothing else in the phase asserts it: delete `default_value` and clap
+    /// requires the flag, write `Option<IpAddr>` instead and an unspecified
+    /// default silently binds 0.0.0.0.
+    #[test]
+    fn serve_binds_loopback_on_port_8080_unless_told_otherwise() {
+        use clap::Parser;
+        use cli::Commands;
+        let cli = Cli::try_parse_from(["shep", "serve", "./x"]).unwrap();
+        let Commands::Serve(args) = cli.command else { panic!("expected serve") };
+        assert_eq!(args.bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(args.port, 8080);
+        assert!(!args.listing, "decision 9");
+        assert!(!args.hidden, "decision 4");
+    }
+```
+
+and the notice itself, in `commands/serve.rs`:
+
+```rust
+    /// fails if widening the bind stops being loud. The notice is the entire
+    /// compensating control for allowing `--bind 0.0.0.0` (decision 8).
+    #[test]
+    fn a_non_loopback_bind_produces_a_notice_that_names_the_address() {
+        assert!(exposure_notice(IpAddr::V4(Ipv4Addr::LOCALHOST), false, Path::new("/srv/www")).is_none());
+        let notice = exposure_notice("0.0.0.0".parse().unwrap(), false, Path::new("/srv/www"))
+            .expect("a wider bind must say so");
+        assert!(notice.contains("0.0.0.0"), "{notice}");
+        assert!(notice.contains("/srv/www"), "{notice}");
+        assert!(notice.contains("readable"), "no auth: say what that means: {notice}");
+        let with_auth = exposure_notice("0.0.0.0".parse().unwrap(), true, Path::new("/srv/www"))
+            .expect("still a wider bind");
+        assert!(!with_auth.contains("readable"), "{with_auth}");
+    }
+```
 
 e2e, in `tests/cli_e2e.rs`, against a fresh `$SHEP_HOME`:
 
@@ -2256,6 +3161,19 @@ fn serve_registers_a_sheep_that_answers_on_its_port() { … }
 fn serve_refuses_a_docroot_that_is_not_a_directory() {
     // exit code 2, stderr names the path, and `shep flock` is still empty.
 }
+
+/// fails if the worker ignores SIGTERM. Step 6.2 copies the metrics dog's
+/// signal handling and states the failure mode — a worker that only handles
+/// SIGINT rides the whole kill ladder to SIGKILL on every `shep stop` — and
+/// nothing in Task 6 can exercise it, because a stop ladder needs a real
+/// shepherd.
+///
+/// The assertion is the recorded signal, not a stopwatch: spec §4 promises
+/// exit code and signal are recorded exactly, so `shep describe` after the
+/// stop must say SIGTERM. A worker that had to be SIGKILLed says 9, and a
+/// timing assertion would go flaky on a loaded runner while this one cannot.
+#[test]
+fn a_served_sheep_stops_on_sigterm_rather_than_riding_the_ladder_to_sigkill() { … }
 ```
 
 The first e2e case needs a free port; take one by binding `127.0.0.1:0`,
@@ -2273,13 +3191,33 @@ more slowly — the sheep starts, registers a second sheep, and crash-loops. Bot
 failures are informative; note in the report which one you would rather have
 found first.
 
+Second: drop `--bind` from `sheep_args` while leaving the notice in place.
+Expected: both unit tests fail. This is the silent downgrade the round trip
+exists for — the operator is told the server is exposed, the registered sheep
+binds loopback, and every request from the LAN is refused by a server that
+reported success.
+
+Third: pass `--auth`'s path through unchanged instead of canonicalized.
+Expected: `the_registered_command_line_is_absolute_and_carries_every_flag`
+fails on the `/srv/creds` row. In production this one is invisible until the
+sheep's first restart, because the registering half already validated the file
+by the operator's cwd.
+
 ### Step 7.6 — verification and gate
 
 ```bash
 grep -c "Commands::Serve" crates/shep-cli/src/lib.rs   # 0 → 2 (the dispatch arm and the unreachable list)
-cargo test -p shep-cli --lib --bins --all-features     # baseline +2
-cargo test -p shep-cli --test cli_e2e --all-features   # baseline +2
+grep -c "fn exposure_notice" crates/shep-cli/src/commands/serve.rs   # 1
+cargo test -p shep-cli --lib --bins --all-features     # baseline +4
+cargo test -p shep-cli --test cli_e2e --all-features   # baseline +3
 ```
+
+The four unit tests: `the_registered_command_line_is_absolute_and_carries_every_flag`,
+`the_registered_command_line_parses_back_to_the_same_arguments`,
+`serve_binds_loopback_on_port_8080_unless_told_otherwise` (in `cli.rs`, so it
+also runs under the Windows cross-check) and
+`a_non_loopback_bind_produces_a_notice_that_names_the_address`. The three e2e:
+the two above plus the SIGTERM case.
 
 ---
 
@@ -2636,7 +3574,12 @@ cargo test -p shep-daemon --test daemon_e2e --all-features # unchanged from base
 
 **Files:** `crates/shep-cli/src/commands/runtime.rs`,
 `crates/shep-cli/src/commands/reap.rs` (new),
-`crates/shep-cli/tests/reaper.rs` (new, Linux-only body).
+`crates/shep-cli/tests/init.rs` (new, `cfg(unix)`, with one Linux-only case
+inside it).
+
+The file is `init.rs` and not `reaper.rs` because reaping is one of the two
+things it covers and the smaller one. The other is signal forwarding, which is
+what the init exists for.
 
 Read decision 14 before writing a line. The reason this is its own task, after
 `runtime` already works, is that the split is the piece most likely to be got
@@ -2653,10 +3596,26 @@ grep -n 'nix = { workspace = true' crates/shep-cli/Cargo.toml    # the cfg(unix)
 cargo test -p shep-cli --lib --bins --all-features                # record
 ```
 
+```bash
+grep -rn "SHEP_FORCE_INIT" crates | wc -l                        # 0
+grep -c "SHEP_TERM_PANIC_PROBE" crates/shep-cli/src/lib.rs       # 1 — the pattern to follow
+grep -rn "std::process::exit" crates/shep-cli/src | wc -l        # 0 after Task 1
+grep -c "= 11" crates/shep-cli/src/exit.rs                       # 1 — Task 8's FlockEmpty, and
+                                                                 # the last variant there will
+                                                                 # ever be for this phase
+```
+
 `nix::sys::wait::waitpid` lives behind nix's `process` feature, which the
 workspace entry already enables (`features = ["signal", "process", "user"]`), so
 this task adds no feature. Confirm rather than assume — build once and read the
 error if there is one.
+
+**Read `crates/shep-cli/src/exit.rs` before writing a line of this task.**
+`ExitCode` is a closed `#[repr(u8)]` enum, variants 0 through 10 plus Task 8's
+11, with no raw carrier — which is why decision 14 has `run_init` exit through
+`std::process::exit` and why Step 10.5 tests the process's status rather than
+`classify`'s return value. The `std::process::exit` baseline printing 0 is what
+makes Step 10.8's "exactly one in the crate" check meaningful.
 
 ### Step 10.2 — the pure half
 
@@ -2693,9 +3652,30 @@ pub fn classify(status: WaitOutcome, supervisor: i32) -> Reaped;
 ```
 
 `WaitOutcome` is this module's own small enum (`Exited { pid, code }`,
-`Signaled { pid, signal }`, `StillAlive`, `NoChildren`), constructed by the thin
-`cfg(unix)` shim from `nix::sys::wait::WaitStatus`. That shim is the only
-platform code in the file, and it is a `match` with no logic in it.
+`Signaled { pid, signal }`, `StillAlive`, `NoChildren`), constructed by a thin
+`cfg(unix)` shim. That shim is the only platform code in the file, and it is a
+`match` with no logic in it — but its input is **not** a `WaitStatus`:
+
+```rust
+/// Maps one `waitpid` return into the classifier's own vocabulary.
+///
+/// `Result`, not `WaitStatus`, because "there are no children" is not a status
+/// — nix 0.29's `WaitStatus` has `Exited`, `Signaled`, `Stopped`,
+/// `PtraceEvent`, `PtraceSyscall`, `Continued` and `StillAlive`, and nothing
+/// else. `ECHILD` arrives as `Err(Errno::ECHILD)`, and it is one of the
+/// drain loop's two exits, so a shim that could not represent it would not
+/// compile against the loop it exists for.
+///
+/// Every other `Err` — `EINTR` above all — maps to `Nothing` and is logged.
+/// **PID 1 must not exit on a transient errno.**
+///
+/// `Stopped` and `Continued` cannot arrive: they need `WUNTRACED` and
+/// `WCONTINUED`, and this loop passes `WNOHANG` alone. They map to `Nothing`,
+/// and this sentence is what stops a future reader adding the flags and
+/// finding the init treats a stopped child as a dead one.
+#[cfg(unix)]
+fn outcome(result: Result<WaitStatus, nix::errno::Errno>) -> WaitOutcome
+```
 
 Tests over `classify` are exhaustive and need no processes:
 
@@ -2713,7 +3693,20 @@ Tests over `classify` are exhaustive and need no processes:
     fn a_signalled_supervisor_exits_128_plus_the_signal() {
         assert_eq!(classify(WaitOutcome::Signaled { pid: 7, signal: 9 }, 7), Reaped::Supervisor(137));
     }
+
+    /// fails if the loop's other exit is not classified. `ECHILD` is how
+    /// "nothing left to reap" arrives, and it arrives as an `Err`.
+    #[test]
+    fn no_children_and_nothing_ready_are_told_apart() {
+        assert_eq!(classify(WaitOutcome::NoChildren, 7), Reaped::NoChildren);
+        assert_eq!(classify(WaitOutcome::StillAlive, 7), Reaped::Nothing);
+    }
 ```
+
+**`classify` is a pure function and its return value is not an exit status.**
+Every assertion above is about a `Reaped`, and a `Reaped::Supervisor(137)` that
+never reaches `$?` is worth nothing. Step 10.5 is where the process's own
+status is asserted; do not let this table stand in for it.
 
 ### Step 10.3 — the init loop
 
@@ -2740,8 +3733,27 @@ Tests over `classify` are exhaustive and need no processes:
 ///
 /// It does not wait for orphans once the supervisor is gone. The container is
 /// being torn down; a wedged orphan must not hold the exit open.
-async fn run_init() -> ExitCode
+///
+/// **This function never returns, and it is the one place in this crate that
+/// calls `std::process::exit`.** The status it reports is the child's — its
+/// own code, or `128 + signal` — and `crate::exit::ExitCode` is a closed
+/// eleven-variant enum that cannot represent either 3 or 137. Widening that
+/// funnel to an arbitrary `u8` for one call site would undo decision 13's
+/// whole argument, and the status is not shep's to classify anyway: it is a
+/// foreign status being relayed. The cost of stepping around the funnel is
+/// destructors and buffer flushes, and here that cost is zero — this process
+/// booted no shepherd, holds no socket, owns no flock, installed no log
+/// subscriber, and deliberately never calls `child.wait()`. Rust's stderr is
+/// unbuffered and its stdout line-buffered, so its diagnostics are already
+/// out. See decision 14.
+async fn run_init() -> std::convert::Infallible
 ```
+
+**One stderr line at startup, and it is not decoration:**
+`shep runtime: init supervising pid {pid}`. An operator reading container logs
+gets the pid the signals are going to, and Step 10.5's test reads it to find
+the child it needs to signal — which is what keeps that test off `pgrep` and
+off a process-table walk, and makes it deterministic on macOS and Linux both.
 
 The loop: a `tokio::select!` over `signal(SIGCHLD)`, the four forwarded signals,
 and a 1-second `interval` as a backstop — signal delivery coalesces, and a tick
@@ -2754,48 +3766,132 @@ down with no diagnostic. No `unwrap`, no `expect`, no indexing; every error is
 logged to stderr and the loop continues, except a failure to spawn the child at
 all, which exits non-zero immediately.
 
-### Step 10.4 — the branch, and the test that reaches it
+### Step 10.4 — the branch, and the tests that reach it
 
 ```rust
-if args.supervise || std::process::id() != 1 {
+/// Whether this process should become the PID-1 init and re-exec itself as
+/// the supervisor.
+///
+/// `const` and pure over three scalars, so every case can be asserted — a
+/// test harness is never PID 1, and the branch whose wrong answer is a fork
+/// bomb is exactly the one that cannot be reached by running the code.
+///
+/// `forced` is `$SHEP_FORCE_INIT`, read at the call site and never here. It
+/// exists so Step 10.5 can drive a real init from a test at all, following
+/// `$SHEP_TERM_PANIC_PROBE`'s shape in this crate — without it the signal
+/// forwarding, which is the reason an init exists, has no test that can fail.
+///
+/// **`supervise` wins over everything.** The init passes `--supervise` to its
+/// child and the child inherits the environment, so a `forced` that could
+/// override it would make every child split again: `shep runtime` under that
+/// variable would be a fork bomb rather than a test.
+const fn should_split(pid: u32, supervise: bool, forced: bool) -> bool {
+    !supervise && (pid == 1 || forced)
+}
+```
+
+```rust
+if !should_split(std::process::id(), args.supervise, forced) {
     return foreground::run(options).await;
 }
 run_init().await
 ```
 
 ```rust
-    /// fails if the split fires anywhere but PID 1, which would mean every
-    /// developer running `shep runtime` on a laptop gets two processes and a
-    /// re-exec.
-    ///
-    /// The test process is never PID 1, so this asserts the branch it actually
-    /// takes rather than mocking the pid.
+    /// fails if the split fires anywhere but PID 1 (or under the test switch),
+    /// which would mean every developer running `shep runtime` on a laptop
+    /// gets two processes and a re-exec. The real call site passes
+    /// `std::process::id()`, and that value is asserted here rather than
+    /// mocked.
     #[test]
     fn the_init_split_does_not_fire_outside_pid_one() {
         assert_ne!(std::process::id(), 1, "a test harness is never PID 1");
-        assert!(!should_split(&RuntimeArgs { supervise: false, .. }));
-        assert!(!should_split(&RuntimeArgs { supervise: true, .. }));
+        assert!(!should_split(std::process::id(), false, false));
+    }
+
+    /// fails if `--supervise` stops disabling the split, which is a fork bomb
+    /// in two different ways — a mis-read pid, and a child that inherited
+    /// `$SHEP_FORCE_INIT` from the init that spawned it.
+    #[test]
+    fn supervise_disables_the_split_whatever_the_pid_and_the_switch_say() {
+        assert!(should_split(1, false, false));
+        assert!(!should_split(1, true, false));
+        assert!(!should_split(4242, false, false));
+        assert!(should_split(4242, false, true), "the test switch reaches the init");
+        assert!(!should_split(4242, true, true), "and --supervise still wins");
+        assert!(!should_split(1, true, true), "and it still wins at PID 1");
     }
 ```
 
-`should_split` is extracted precisely so this test can exist: it takes the pid
-as a parameter, so the case that cannot be reached in a test can still be
-asserted.
+### Step 10.5 — the test the init exists for: signal forwarding and the real exit status
+
+`crates/shep-cli/tests/init.rs`, `cfg(unix)`, and this is the only test in the
+phase that would catch a forwarding regression. Delete the whole
+SIGTERM/SIGINT/SIGHUP/SIGQUIT arm from `run_init` and nothing else in this plan
+reddens. What it costs in production is silent and slow: every `docker stop` on
+a shep container takes the full grace period and then SIGKILLs the flock in the
+middle of its stop ladder, which is the exact behaviour the init was added to
+prevent.
+
+It also asserts the **process's** exit status. `classify`'s table in Step 10.2
+is a fact about a pure function; the container contract decision 14 states —
+"137 exactly as `docker inspect` expects" — is a fact about `$?`, and nothing
+else in this plan reads one.
 
 ```rust
-    #[test]
-    fn a_pid_of_one_splits_unless_supervise_says_otherwise() {
-        assert!(should_split(1, false));
-        assert!(!should_split(1, true));
-        assert!(!should_split(4242, false));
-    }
+/// fails if the init ignores SIGTERM, or exits with its own status instead of
+/// the child's.
+///
+/// `SHEP_FORCE_INIT` is what makes the split reachable at all — a test harness
+/// is never PID 1 — and it is the same shape `SHEP_TERM_PANIC_PROBE` already
+/// uses in this crate for a path a test cannot otherwise drive. The `Flockfile`
+/// runs one long-lived app, so nothing exits on its own and the only thing that
+/// can end this process is the signal.
+///
+/// Three assertions, and the deadline is the point of the first: an init that
+/// does not forward exits when the harness gives up, not when it is told to.
+#[test]
+#[cfg(unix)]
+fn a_sigterm_to_the_init_reaches_the_flock_and_the_status_is_the_childs() {
+    // spawn `shep runtime <flockfile>` with SHEP_FORCE_INIT=1 and a temp
+    // $SHEP_HOME; read the `init supervising pid N` line off stderr; wait for
+    // the flock's sheep to appear.
+    kill(init_pid, Signal::SIGTERM);
+    let status = wait_bounded(child, INIT_DEADLINE);   // (a) well inside the deadline
+    assert_eq!(status.code(), Some(0), "a clean stop is the child's own 0");  // (b)
+    assert!(flock_pids_are_gone(), "the sheep must not outlive the container"); // (c)
+}
+
+/// fails if a signalled child does not report `128 + signal`. This is the one
+/// assertion in the phase that reads the PROCESS's status rather than
+/// `classify`'s return value, and it is what proves `run_init` steps around
+/// the `ExitCode` funnel rather than being clamped by it — `ExitCode` has no
+/// variant for 137 and never will.
+#[test]
+#[cfg(unix)]
+fn a_supervisor_killed_by_sigkill_makes_the_init_exit_137() {
+    // same setup; SIGKILL the CHILD (the pid the init printed), not the init.
+    kill(supervised_pid, Signal::SIGKILL);
+    let status = wait_bounded(child, INIT_DEADLINE);
+    assert_eq!(status.code(), Some(137), "128 + SIGKILL, what docker inspect reads");
+}
 ```
 
-### Step 10.5 — the Linux-only reaper test
+`INIT_DEADLINE` is a named constant with its reasoning on it, like
+`CRON_DEADLINE` in `cli_e2e.rs`: a few seconds, because the whole claim is that
+the init answers a signal promptly rather than riding a grace period.
 
-`crates/shep-cli/tests/reaper.rs`. The whole point is to exercise the drain loop
-against a **real orphan**, and getting one without being PID 1 needs Linux's
-child-subreaper bit:
+**One thing to get right in the harness:** `$SHEP_FORCE_INIT` is inherited by
+the child, and `--supervise` is what stops the child splitting again.
+`supervise_disables_the_split_whatever_the_pid_and_the_switch_say` asserts that
+in the pure tier; if this e2e ever spawns processes without bound, that
+assertion is what to look at first.
+
+### Step 10.6 — the Linux-only reaper test
+
+In the same file, behind `#[cfg(target_os = "linux")]`. The whole point is to
+exercise the drain loop against a **real orphan**, and getting one without
+being PID 1 needs Linux's child-subreaper bit:
 
 ```rust
 /// fails if the drain loop leaves a reparented orphan as a zombie — the
@@ -2829,30 +3925,72 @@ printed reason and say so in the report — **not** to write a version that pass
 without observing a real reparent. This machine is macOS, so this test is CI's
 to run; note in the report that you could not execute it locally.
 
-### Step 10.6 — MUTATION
+### Step 10.7 — MUTATION
 
-Change the drain to `waitpid(child_pid, WNOHANG)` — reap only our own child,
-which is what a reader who has not read decision 14 would write. Expected:
-`a_reparented_orphan_is_reaped` fails **on Linux only**, and every other test in
-this phase still passes, on both platforms. That asymmetry is the finding:
-without the Linux test, the mutation is invisible, and the plan would be
-claiming coverage it does not have.
+Four, one at a time.
 
-Second: delete the `--supervise` guard from `should_split`. Expected:
-`a_pid_of_one_splits_unless_supervise_says_otherwise` fails. If it did not, PID
-1 would re-exec itself forever.
+1. Change the drain to `waitpid(child_pid, WNOHANG)` — reap only our own child,
+   which is what a reader who has not read decision 14 would write. Expected:
+   `a_reparented_orphan_is_reaped` fails **on Linux only**, and every other
+   test in this phase still passes, on both platforms. That asymmetry is the
+   finding: without the Linux test, the mutation is invisible, and the plan
+   would be claiming coverage it does not have.
+2. Delete the `--supervise` guard from `should_split`. Expected:
+   `supervise_disables_the_split_whatever_the_pid_and_the_switch_say` fails on
+   three of its six rows. If it did not, PID 1 would re-exec itself forever —
+   and so would every process that inherited `$SHEP_FORCE_INIT`.
+3. **Delete the four forwarded signals' arm from `run_init`'s select.**
+   Expected: `a_sigterm_to_the_init_reaches_the_flock_and_the_status_is_the_childs`
+   fails at its deadline, and nothing else in the phase moves. This is the
+   mutation the whole of Step 10.5 exists for; before that step, this deletion
+   was green.
+4. Change `run_init` to `std::process::exit(1)` on any child death rather than
+   relaying the status. Expected:
+   `a_supervisor_killed_by_sigkill_makes_the_init_exit_137` fails while every
+   `classify` assertion in Step 10.2 still passes — which is the gap that
+   review found, rendered as a mutation.
 
-### Step 10.7 — verification and gate
+### Step 10.8 — verification and gate
 
 ```bash
 grep -c "tokio::process" crates/shep-cli/src/commands/reap.rs   # 0 (grep exits 1) — load-bearing
-grep -c "unwrap()\|expect(" crates/shep-cli/src/commands/reap.rs # 0 outside `mod tests`
-cargo test -p shep-cli --lib --bins --all-features                # baseline +5
+sed '/^#\[cfg(test)\]/,$d' crates/shep-cli/src/commands/reap.rs | grep -c 'unwrap()\|expect('   # 0
+sed '/^#\[cfg(test)\]/,$d' crates/shep-cli/src/commands/reap.rs | grep -c 'panic!\|\[0\]'      # 0
+grep -c "std::process::exit" crates/shep-cli/src/commands/reap.rs  # 1, and exactly one
+grep -rn "std::process::exit" crates/shep-cli/src | wc -l          # 1 — the whole crate
+grep -c "SHEP_FORCE_INIT" crates/shep-cli/src/commands/runtime.rs  # 1
+cargo test -p shep-cli --lib --bins --all-features                 # baseline +5
+cargo test -p shep-cli --test init --all-features                  # 2 on macOS, 3 on Linux
 cargo check -p shep-daemon --all-targets --all-features --target x86_64-unknown-linux-gnu
 ```
 
+The five unit tests: `the_supervisor_is_told_apart_from_every_orphan`,
+`a_signalled_supervisor_exits_128_plus_the_signal`,
+`no_children_and_nothing_ready_are_told_apart`,
+`the_init_split_does_not_fire_outside_pid_one` and
+`supervise_disables_the_split_whatever_the_pid_and_the_switch_say`. The
+integration target adds
+`a_sigterm_to_the_init_reaches_the_flock_and_the_status_is_the_childs` and
+`a_supervisor_killed_by_sigkill_makes_the_init_exit_137` on every unix, plus
+`a_reparented_orphan_is_reaped` on Linux — and **only that last one cannot run
+on this machine**. The other two are the phase's answer to "the init's own
+reason for existing had no test", and they run here. Say in the report that you
+ran them.
+
 The `tokio::process` grep is the mechanical form of decision 14's whole
 argument, which is why it is a check and not a comment.
+
+**The `unwrap` check is scoped with `sed`, not run over the whole file.** The
+file will contain a `mod tests` and those tests will `unwrap` — a whole-file
+count cannot print 0 once the task is done, which would make the mechanical
+guard on "nothing in this function may panic, it is PID 1" the one check in the
+task that is wrong by construction. The second `sed` line catches the two forms
+the first misses, indexing and a bare `panic!`.
+
+The two `std::process::exit` greps are decision 14's exception written as a
+check: exactly one in `reap.rs`, and exactly one in the crate. If the second
+prints 2, either Task 1 left the old `main`'s call behind or somebody else
+decided the funnel was optional.
 
 ---
 
@@ -2973,10 +4111,56 @@ e2e:
 /// the variable existing.
 #[test]
 fn dev_tidies_up_after_itself() { … }
+
+/// fails if Ctrl-C out of `shep dev` leaves a shepherd or a flock behind.
+///
+/// The auto-exit path above never sends a signal, and the signal path is the
+/// one people actually use — "a dev mode that leaks a supervisor is a dev mode
+/// people stop trusting" is Step 11.2's claim and nothing else checks it.
+/// Runs a long-lived script so nothing exits on its own, sends SIGTERM to the
+/// `shep dev` process, and asserts the same two things the auto-exit case
+/// does: no live socket under `$SHEP_DEV_HOME`, and no sheep pid alive.
+#[test]
+fn dev_tidies_up_when_it_is_signalled_rather_than_when_the_flock_empties() { … }
 ```
 
-And delete the `#[ignore]` from Task 1's
-`the_alias_binaries_exist_and_reach_their_own_verbs`: both verbs exist now.
+And the case that covers the two alias binaries **as binaries**, which lands
+here rather than in Task 1 because this is the task where the second verb
+exists (Task 1's Step 1.6 says why, and it is `cli_e2e.rs`'s own stated
+convention against `#[ignore]`):
+
+```rust
+/// fails if `shep-dev` or `shep-runtime` is not built, is not installed under
+/// that name, or does not reach its own verb. `--help` rather than a real run,
+/// so the test starts no shepherd and writes to no home.
+///
+/// **The assertion is the usage line, not the verb's name.** Once Tasks 9 and
+/// 11 add the verbs, the ROOT `shep --help` lists `dev` and `runtime` among
+/// its subcommands — so `text.contains("dev")` passes even if `alias_argv` is
+/// deleted entirely and the binary prints root help. `Usage: shep dev` is
+/// printed only by that subcommand's own help. This is the plan's sixth
+/// dead-check shape, in the one test that covers the alias binaries at all.
+#[test]
+fn the_alias_binaries_exist_and_reach_their_own_verbs() {
+    for (bin, verb) in [("shep-dev", "dev"), ("shep-runtime", "runtime")] {
+        let output = Command::cargo_bin(bin)
+            .unwrap_or_else(|err| panic!("{bin} must be a [[bin]] target: {err}"))
+            .arg("--help")
+            .timeout(CMD_TIMEOUT)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains(&format!("Usage: shep {verb}")),
+            "{bin} --help must be {verb}'s own help, not the root's:\n{text}"
+        );
+        assert!(
+            !text.contains("lookout"),
+            "{bin} printed the root verb list, so the alias supplied no verb:\n{text}"
+        );
+    }
+}
+```
 
 ### Step 11.4 — MUTATION
 
@@ -2990,11 +4174,17 @@ half — the half that protects a production flock.
 
 ```bash
 grep -c "Commands::Dev" crates/shep-cli/src/lib.rs        # 0 → 2
-grep -c "ignore = " crates/shep-cli/tests/cli_e2e.rs      # 1 → 0 (0 before Task 1)
+grep -c "ignore = " crates/shep-cli/tests/cli_e2e.rs      # 0 → 0, and it stays 0
 cargo test -p shep-cli --lib --bins --all-features         # baseline +2
-cargo test -p shep-cli --test cli_e2e --all-features       # baseline +2 (dev's, plus the
-                                                           # un-ignored alias case)
+cargo test -p shep-cli --test cli_e2e --all-features       # baseline +3
 ```
+
+The `ignore` check is 0 on both sides now that Task 1 no longer writes one, so
+it verifies nothing about this task — it is kept as a standing guard on the
+file's own convention (`cli_e2e.rs:22` and `:183`), and the report should say
+which of those two things it is. The three e2e cases: `dev_tidies_up_after_itself`,
+`dev_tidies_up_when_it_is_signalled_rather_than_when_the_flock_empties`, and
+`the_alias_binaries_exist_and_reach_their_own_verbs`.
 
 ---
 
@@ -3008,13 +4198,40 @@ cargo test -p shep-cli --test cli_e2e --all-features       # baseline +2 (dev's,
 ### Step 12.1 — baselines, all four of them checkable
 
 ```bash
-grep -c "resolves that" docs/specs/shep-v1.md                    # 1
-grep -cF 'one `[[bin]]`' docs/specs/deferred.md                  # 1
-grep -c "axum" docs/specs/deferred.md                            # 1
-grep -c "not built" crates/shep-cli/src/lib.rs                   # 1 (Task 1 removed the other)
-grep -rn "shep-cli is \[\[bin\]\]-only\|--bins" CLAUDE.md | wc -l # 2
-grep -c "Windows is 0%" CLAUDE.md                                 # 1
+grep -c "resolves that" docs/specs/shep-v1.md                             # 1
+grep -cF 'one `[[bin]]`' docs/specs/deferred.md                           # 1
+grep -c "static file server as a managed sheep" docs/specs/deferred.md    # 1
+grep -c "not built" crates/shep-cli/src/lib.rs                            # 2 (Task 1 rewrote
+                                                                          # the [[bin]] clause
+                                                                          # and left both)
+grep -c 'shep-cli --lib --bins' CLAUDE.md                                 # 0
+grep -c "Windows is 0%" CLAUDE.md                                         # 1
+grep -rn "axum\|tower-http" Cargo.lock | wc -l                            # 0, before and after
 ```
+
+**Two of these are deliberately not the checks an earlier draft carried.**
+
+`grep -c "axum" docs/specs/deferred.md` is replaced because Step 12.3 both
+requires the word `axum` to stay in the file (the divergence note records that
+serve is hand-rolled and not axum, which is Rin's ruling and the thing worth
+recording) and required that count to reach 0. Satisfying one breaks the other,
+and an implementer would silently pick a side. The replacement targets the
+**deferral claim** — the sentence that says serve is not built — which is what
+this phase actually falsifies.
+
+`grep -rn "shep-cli is [[bin]]-only\|--bins" CLAUDE.md | wc -l` is replaced
+because it prints 2 for text that has nothing to do with the claim it was
+meant to check: `CLAUDE.md:97` and `:100` are inside the *"Doctests are not the
+cost here"* section, arguing that the global `--lib --bins` preference does not
+transfer to this workspace. It prints 2 before the edit and 2 after, so it gave
+no signal in either direction (dead-check shape 3 wearing shape 1's clothes),
+and following it would have meant editing a measured, correct paragraph into
+something false. `grep -c 'shep-cli --lib --bins' CLAUDE.md` goes 0 → 1 and can
+actually fail.
+
+The `Cargo.lock` check prints 0 today and must still print 0 afterwards; it is
+the standing guard that decision 3's ruling has not quietly been undone, and
+the closing section promises it without ever listing it.
 
 ### Step 12.2 — spec §9
 
@@ -3043,25 +4260,58 @@ the "Not deferred" section, with the divergences named:
 
 - serve is hand-rolled, not axum/tower-http (Rin's ruling, 2026-08-15);
 - directory listing is **off** by default, where pm2's is on;
-- no range requests, no conditional requests, no hidden-file filtering, no
-  `PM2_SERVE_*` compatibility — each a v1.1 candidate with one line of reason;
+- **dotfiles are refused by default**, where pm2's serve publishes them, with
+  `--hidden` to opt in — the reverse of the listing flip and the same argument;
+- no range requests, no conditional requests, no `PM2_SERVE_*` compatibility —
+  each a v1.1 candidate with one line of reason;
 - exit code 11 exists and code 2 is clap's alone;
 - `runtime` splits into an init process when it is PID 1, rather than reaping in
-  the supervisor's own process.
+  the supervisor's own process;
+- `serve`'s remaining symlink race, stated as what it is: the leaf open is
+  `O_NOFOLLOW`, the component walk is not atomic, and what that leaves an
+  attacker is a refusal or a directory they already controlled.
 
-Checks: `grep -c "axum" docs/specs/deferred.md` goes `1 → 0`;
-`grep -cF 'one `[[bin]]`'` goes `1 → 0`.
+Checks: `grep -c "static file server as a managed sheep" docs/specs/deferred.md`
+goes `1 → 0`; `grep -cF 'one `[[bin]]`'` goes `1 → 0`; and
+`grep -rn "axum\|tower-http" Cargo.lock | wc -l` stays `0`. The word `axum`
+**remains** in `deferred.md` — in the "Not deferred" note recording that serve
+was built without it — which is why the deferral sentence, and not the word, is
+what the check targets.
 
-### Step 12.4 — CLAUDE.md, and the rule this phase inverts
+### Step 12.4 — CLAUDE.md: ADD a sentence, do not correct one
 
-`CLAUDE.md` states the shep-cli test command as a fact about this repo, and
-after Task 1 that fact is false: the crate has a library and `--bins` runs
-almost nothing. Correct it to `cargo test -p shep-cli --lib --bins
---all-features`, and add one sentence saying the crate became a library in Phase
-15 and why, so the next reader does not "fix" it back.
+**`CLAUDE.md` does not state a shep-cli test command, and there is nothing here
+to correct.** Its only two `--bins` mentions are lines 97 and 100, inside
+*"Doctests are not the cost here — do not split them out"*, and they argue that
+the global `--lib --bins` preference does **not** transfer to this workspace
+because the cost here is the integration tier. That paragraph is measured, it
+is correct, and editing it into a per-crate command note would destroy a real
+finding. Leave it alone.
+
+What this phase changes is that shep-cli now has a library, so a
+**shep-cli-scoped** run needs both halves. Add that as a new sentence under the
+inner-loop section: from Phase 15 the crate is a library with three thin
+binaries, so `cargo test -p shep-cli --lib --bins --all-features` is the
+scoped form, and `--bins` alone now runs three three-line entry points. Say why
+the library exists (the two `[[bin]]` aliases spec §3 asks for cannot share a
+module tree without one), so the next reader does not "fix" it back.
+
+Check: `grep -c 'shep-cli --lib --bins' CLAUDE.md` goes `0 → 1`.
 
 Also update the status paragraph: Phase 15 merged, the v1.0 CLI surface closed,
 Windows still 0%.
+
+### Step 12.4b — the module-doc claim Task 1 deliberately left standing
+
+`crates/shep-cli/src/lib.rs`'s crate doc still says serve, dev and runtime are
+spec'd but not built. Task 1 rewrote only the `[[bin]]` clause of that
+paragraph, because at Task 1 the three verbs genuinely did not exist. They do
+now. Delete that claim and leave the lookout-12b sentence alone unless 12b has
+merged, in which case it is 12b's ledger entry that removes it, not this one.
+
+Check: `grep -c "not built" crates/shep-cli/src/lib.rs` goes `2 → 1` — the
+survivor is the Windows named-pipe note, which the Baseline section flags by
+line number and which must not be touched.
 
 ### Step 12.5 — map.md drift entries
 
@@ -3069,8 +4319,9 @@ map.md is the design record and three of its entries are now wrong in ways worth
 recording rather than rewriting:
 
 - `serve.rs` says axum + tower-http and `PM2_SERVE_*` compat. Add a **Drift
-  (Phase 15, recorded)** note: shipped as `serve/` with five modules, hand-rolled
-  on `http.rs` (which moved up out of `dog/`), no env compat.
+  (Phase 15, recorded)** note: shipped as `serve/` with six modules (`path`,
+  `fs`, `mime`, `listing`, `auth`, `worker`), hand-rolled on `http.rs` (which
+  moved up out of `dog/`), dotfiles refused by default, no env compat.
 - `runtime.rs` says "auto-exit fail_count 3 / 2s / code 2" and "subreaper +
   WNOHANG loop". The debounce shipped exactly as written; the code is 11 and the
   reaper is a separate init process. Record both, and record **why** the
@@ -3083,9 +4334,12 @@ recording rather than rewriting:
 ### Step 12.6 — the rest
 
 - `docs/migration.md`: a `pm2 serve` → `shep serve` section naming the listing
-  default flip and the missing `PM2_SERVE_*` variables, and a `pm2-runtime` →
-  `shep runtime` section with a Dockerfile that sets `ENV SHEP_HOME=/shep` and
-  uses `ENTRYPOINT ["shep-runtime"]`.
+  default flip, **the dotfile refusal and `--hidden`**, and the missing
+  `PM2_SERVE_*` variables, and a `pm2-runtime` → `shep runtime` section with a
+  Dockerfile that sets `ENV SHEP_HOME=/shep` and uses
+  `ENTRYPOINT ["shep-runtime"]`. Both default changes are things a migrating
+  operator will notice as a regression before they notice as a fix, so each
+  gets the one-line reason next to it.
 - `docs/releasing.md`: the artefact list now has **three** binaries, not one.
   Whatever that file says about what `cargo install shep-cli` produces needs the
   other two named. Read it before editing — it was written the night before this
@@ -3097,9 +4351,14 @@ recording rather than rewriting:
   crates.io front page): the three binaries, and the one-line "embedding shep is
   `shep-client`, not this crate".
 - **`SECURITY.md`**, if the repo has one by the time this runs (spec §10 names
-  it, and Phase 14 may have added it): `serve`'s traversal posture, the accepted
-  TOCTOU, the loopback default and the plain-HTTP basic auth all belong there in
-  a paragraph.
+  it, and Phase 14 may have added it): `serve`'s traversal posture, the
+  loopback default, the dotfile refusal and the plain-HTTP basic auth all
+  belong there in a paragraph — and so does **what the symlink defences do and
+  do not cover**. Say that the leaf open is `O_NOFOLLOW` and that the
+  component walk is not atomic, so a local attacker who can create files in the
+  docroot can still get a directory component swapped between two stats; what
+  that buys them is a refusal or a path inside a directory they controlled
+  anyway. State the residue; do not state that the race is gone.
 
 ### Step 12.7 — verification and the phase gate
 
@@ -3126,9 +4385,13 @@ is argued:
   neither after this phase, and that is a check in Task 12.
 - **Range requests, conditional requests, ETags, compression, keep-alive, TLS,
   HTTP/2.** Not in spec §9's sentence about serve; decision 4. The visible cost
-  is video seeking and a full re-read per request.
-- **Hidden-file filtering.** A `.env` in a docroot the operator chose to publish
-  is published; `--help` says so. Decision 4.
+  is video seeking and a full re-read per request, and the first two are the
+  ones a static file server is most often assumed to have. Both are v1.1
+  candidates in the ledger.
+- **Hidden-file filtering is NOT on this list any more.** It is built, and
+  `--hidden` opts back in (decision 4). An earlier draft of this plan had it
+  here on the strength of "it is what pm2's serve does", which is the one
+  argument this phase rejects everywhere else it appears.
 - **`PM2_SERVE_*` environment compatibility.** shep reads `SHEP_`-prefixed
   variables and nobody else's. Decision 4, and named in `docs/migration.md` so a
   migrating operator finds it.
@@ -3159,8 +4422,18 @@ blocks the phase:
    divergence from pm2, argued from shep's own posture on every other exposure
    knob. If Rin would rather match pm2 for migration reasons, it is one default
    and one test.
-3. **`serve`'s TOCTOU** (decision 5). Accepted in writing, with the argument
-   that anyone who can plant a symlink in the docroot can plant an
-   `index.html`. Closing it properly needs `openat2(RESOLVE_BENEATH)`, which is
-   Linux-only and `unsafe`, in a crate that forbids `unsafe`. If she wants it
-   closed on Linux anyway, that is a v1.1 item with a real cost.
+3. **Dotfiles refused by default** (decision 4). New in this revision, and the
+   second deliberate divergence from pm2's serve in the same verb. The argument
+   is that it is inconsistent to turn listing off because filenames are
+   information and then serve `.env` and `.git/` by default, and that
+   `shep serve .` in a repo checkout is a thing people type. `--hidden` opts
+   back in and `.well-known/acme-challenge` is the use case it exists for. If
+   Rin would rather match pm2, it is one default and one test — but she should
+   see the flip rather than find it.
+
+`serve`'s TOCTOU **is no longer an open question and is no longer accepted**.
+The earlier draft accepted it on an argument that misidentified which boundary
+was at risk, and dismissed the fix as needing `openat2(RESOLVE_BENEATH)` when
+`O_NOFOLLOW` through `OpenOptionsExt::custom_flags` is safe, portable to macOS,
+and needs no dependency this crate does not already have. Decision 5 closes it
+and states the residue.
