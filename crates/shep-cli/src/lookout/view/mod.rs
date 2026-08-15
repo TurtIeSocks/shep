@@ -590,6 +590,46 @@ mod tests {
                 let lines: Vec<&str> = frame.lines().collect();
                 let panes = panes_for(height);
 
+                // The table's own row band, recomputed independently of
+                // `draw` rather than trusted from it — this is what makes
+                // the test's name true. Title (1) + banner (1, always: this
+                // fixture is frozen, so `banner_line` is always `Some`) +
+                // the host strip if it is up + the table's own header and
+                // rule (2) is where the table's rows START; `floor`, walked
+                // up from the status row exactly as `draw` walks it, is
+                // where they STOP. A bottom-stack pane drawn downward from
+                // the table instead of upward from the status bar — the
+                // exact regression a snapshot test caught here before this
+                // check existed — would put its content inside
+                // `table_body_start..table_body_end` and this loop would
+                // catch it on the next line.
+                let table_body_start =
+                    2 + if panes.host { HOST_ROWS } else { 0 } + 2;
+                let mut floor = height - 1;
+                if panes.feed {
+                    floor -= FEED_ROWS;
+                }
+                if panes.detail {
+                    floor -= DETAIL_ROWS;
+                }
+                let table_body_end = floor;
+                for (i, line) in lines.iter().enumerate() {
+                    let i = u16::try_from(i).unwrap_or(u16::MAX);
+                    if i < table_body_start || i >= table_body_end {
+                        continue;
+                    }
+                    assert!(
+                        !line.starts_with("bleats  "),
+                        "the feed header sits inside the table's own rows at \
+                         {width}x{height}, row {i}"
+                    );
+                    assert!(
+                        !line.starts_with("out  /home/rin/.shep/logs/"),
+                        "the detail pane's out path sits inside the table's \
+                         own rows at {width}x{height}, row {i}"
+                    );
+                }
+
                 // NOT `lines.len() == height`: `frames::render_text` maps
                 // `(0..area.height)` over `(0..area.width)` by construction,
                 // so that holds for any `draw` whatsoever — including one that
@@ -612,20 +652,36 @@ mod tests {
                         "a blank row above the status bar at {width}x{height}"
                     );
                 }
-                // And every pane that is up appears exactly once, so nothing
-                // overlapped anything else.
+                // And every pane that is up appears exactly once, AND sits in
+                // its own band, so nothing overlapped anything else and
+                // nothing landed in the wrong place while still appearing
+                // once.
                 if panes.host {
-                    assert_eq!(
-                        lines.iter().filter(|l| l.starts_with("host  ")).count(),
-                        1,
-                        "the strip at {width}x{height}"
+                    let positions: Vec<usize> = lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| l.starts_with("host  "))
+                        .map(|(i, _)| i)
+                        .collect();
+                    assert_eq!(positions.len(), 1, "the strip at {width}x{height}");
+                    assert!(
+                        u16::try_from(positions[0]).unwrap_or(u16::MAX) < table_body_start,
+                        "the strip at {width}x{height} sits at row {}, at or below the table",
+                        positions[0]
                     );
                 }
                 if panes.feed {
-                    assert_eq!(
-                        lines.iter().filter(|l| l.starts_with("bleats  ")).count(),
-                        1,
-                        "the feed header at {width}x{height}"
+                    let positions: Vec<usize> = lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| l.starts_with("bleats  "))
+                        .map(|(i, _)| i)
+                        .collect();
+                    assert_eq!(positions.len(), 1, "the feed header at {width}x{height}");
+                    assert!(
+                        u16::try_from(positions[0]).unwrap_or(0) >= table_body_end,
+                        "the feed header at {width}x{height} sits at row {}, inside or above the table",
+                        positions[0]
                     );
                 }
                 if panes.detail {
@@ -633,13 +689,21 @@ mod tests {
                     // body lines are tagged `out  ` too, and counting those
                     // would make this assertion depend on how many log lines
                     // the fixture happens to carry.
+                    let positions: Vec<usize> = lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| l.starts_with("out  /home/rin/.shep/logs/"))
+                        .map(|(i, _)| i)
+                        .collect();
                     assert_eq!(
-                        lines
-                            .iter()
-                            .filter(|l| l.starts_with("out  /home/rin/.shep/logs/"))
-                            .count(),
+                        positions.len(),
                         1,
                         "the detail pane's out path at {width}x{height}"
+                    );
+                    assert!(
+                        u16::try_from(positions[0]).unwrap_or(0) >= table_body_end,
+                        "the detail pane's out path at {width}x{height} sits at row {}, inside or above the table",
+                        positions[0]
                     );
                 }
             }
