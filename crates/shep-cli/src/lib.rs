@@ -72,6 +72,11 @@ use commands::muster;
 use commands::query;
 #[cfg(unix)]
 use commands::schema;
+// Imports the function directly, not the module: `commands::serve` would
+// collide in this scope with the crate-root `serve` module (the static-file
+// implementation `commands::serve::serve` itself calls into).
+#[cfg(unix)]
+use commands::serve::serve as serve_command;
 #[cfg(unix)]
 use commands::signal;
 #[cfg(unix)]
@@ -366,6 +371,22 @@ async fn run(cli: Cli) -> ExitCode {
         return lookout::lookout(&mut streams, fmt, &paths, args).await;
     }
 
+    // Not in the locked block below, for the reason `lookout`'s own comment
+    // above gives: `--foreground` runs until signalled, and a `StdoutLock`
+    // held that long wedges the first off-thread write. The registering half
+    // is quick, but it shares this one function with the foreground half —
+    // `commands::serve::serve`'s own doc — so the two flags cannot validate
+    // differently by running through two different dispatch spots.
+    if let Commands::Serve(ref args) = cli.command {
+        let mut out = std::io::stdout();
+        let mut err = std::io::stderr();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+        };
+        return serve_command(&mut streams, fmt, &paths, args).await;
+    }
+
     // Not in the locked block below, and it takes NO `Streams` at all. This
     // verb owns stdout as a wire: everything written there is MCP, and an
     // `output::emit` call on this path would corrupt the peer's parse. It also
@@ -530,6 +551,7 @@ async fn run(cli: Cli) -> ExitCode {
         | Commands::Bleats(_)
         | Commands::Lookout(_)
         | Commands::Whistle
+        | Commands::Serve(_)
         | Commands::Dog(_) => {
             unreachable!("handled above: before the shared $SHEP_HOME gate, or on unlocked handles")
         }

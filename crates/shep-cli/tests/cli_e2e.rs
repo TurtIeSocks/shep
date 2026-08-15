@@ -169,6 +169,37 @@ const METRICS_SCRAPE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// stall the loop past its own deadline.
 const METRICS_SCRAPE_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long [`poll_http_get`] keeps retrying a `shep serve` worker before
+/// giving up. Same reasoning as [`METRICS_SCRAPE_DEADLINE`]: `shep serve`
+/// returning success means the RPC registering the sheep landed, not that
+/// the worker has bound its listener yet.
+const SERVE_HTTP_DEADLINE: Duration = FLOCK_DEADLINE;
+
+/// Gap between [`poll_http_get`]'s retries.
+const SERVE_HTTP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Bound on a single `shep serve` request's own I/O, inside
+/// [`poll_http_get`]'s outer retry loop — the same belt
+/// [`METRICS_SCRAPE_READ_TIMEOUT`] buckles for the metrics dog.
+const SERVE_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bound [`a_served_sheep_stops_on_sigterm_rather_than_riding_the_ladder_to_sigkill`]
+/// asserts `shep stop`'s own wall-clock against.
+///
+/// Not a race against anything asynchronous: `Command::Stop`'s daemon-side
+/// handler (`shep-daemon/src/supervisor.rs`'s `begin_manual`) defers its
+/// reply until the matched sheep has actually exited, so `shep stop`'s own
+/// elapsed time is a deterministic report of which rung of the kill ladder
+/// answered — never a value this test could observe mid-flight. A worker
+/// that rides the ladder to `SIGKILL` takes AT LEAST `kill_timeout`
+/// (`AppConfig::default`'s 1600ms) by the ladder's own construction
+/// (`shep-daemon/src/kill.rs`); a worker that handles `SIGTERM` the way
+/// `serve::worker::run` is supposed to (copied from the metrics dog's own
+/// handler, Task 6's doc) returns in low tens of milliseconds. This bound
+/// sits well inside that 1600ms floor with wide margin on both sides, so it
+/// distinguishes the two rather than merely hoping load doesn't intervene.
+const SERVE_STOP_DEADLINE: Duration = Duration::from_millis(1000);
+
 /// How long [`a_cron_occurrence_restarts_a_sheep_on_the_real_clock`] waits
 /// for its occurrence.
 ///
@@ -901,6 +932,69 @@ fn poll_metrics(addr: std::net::SocketAddr) -> String {
             return String::new();
         }
         std::thread::sleep(METRICS_SCRAPE_POLL_INTERVAL);
+    }
+}
+
+/// One attempt at a request against a `shep serve` worker, over a plain
+/// `std::net::TcpStream` — the same reasoning [`scrape_metrics`] gives, and
+/// safe for the same structural reason: `serve::worker`'s own handler
+/// answers `Connection: close` on every reply, so reading to EOF is reading
+/// the whole response.
+///
+/// Returns the status code off the response's first line, and everything
+/// after the blank line as the body. Not a real HTTP parser — this file has
+/// no HTTP crate in it any more than `serve::worker` does — but every
+/// response this tier's own fixtures produce is small enough to fit in one
+/// read, sent with no chunking.
+///
+/// # Errors
+/// Connection refused (nothing bound yet), or no full response within
+/// [`SERVE_HTTP_READ_TIMEOUT`].
+fn http_get(
+    addr: std::net::SocketAddr,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> std::io::Result<(u16, String)> {
+    use std::io::{Read as _, Write as _};
+    let mut stream = std::net::TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(SERVE_HTTP_READ_TIMEOUT))?;
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes())?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw)?;
+    let status = raw
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map_or("", |(_, body)| body)
+        .to_string();
+    Ok((status, body))
+}
+
+/// [`http_get`], retried until it answers or [`SERVE_HTTP_DEADLINE`]
+/// expires, returning the last attempt's status and body either way
+/// (`(0, "")` if every attempt failed to connect at all).
+fn poll_http_get(
+    addr: std::net::SocketAddr,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (u16, String) {
+    let start = Instant::now();
+    loop {
+        if let Ok(answer) = http_get(addr, path, headers) {
+            return answer;
+        }
+        if start.elapsed() >= SERVE_HTTP_DEADLINE {
+            return (0, String::new());
+        }
+        std::thread::sleep(SERVE_HTTP_POLL_INTERVAL);
     }
 }
 
@@ -4410,4 +4504,219 @@ fn whistle_starts_with_no_shepherd_and_reports_it_per_call() {
         message.contains("no shepherd is running"),
         "message: {message}"
     );
+}
+
+// --- `shep serve` --------------------------------------------------------
+
+/// fails if `shep serve` does not register a sheep, or registers one that
+/// cannot actually serve. The assertion is an HTTP GET against the port, not
+/// a `shep flock` row — a row says the process is up, and up is not serving.
+#[test]
+fn serve_registers_a_sheep_that_answers_on_its_port() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("site");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("index.html"), "hello from shep serve").unwrap();
+    let mut guard = DaemonGuard::default();
+    let port = free_port();
+
+    let output = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("serve")
+        .arg(&root)
+        .arg("--port")
+        .arg(port.to_string())
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&output);
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (status, body) = poll_http_get(addr, "/", &[]);
+    assert_eq!(status, 200, "body={body}");
+    assert!(body.contains("hello from shep serve"), "{body}");
+
+    graceful_kill(dir.path());
+}
+
+/// fails if a missing docroot registers a crash-looping sheep instead of
+/// failing immediately.
+#[test]
+fn serve_refuses_a_docroot_that_is_not_a_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope");
+    let mut guard = DaemonGuard::default();
+
+    let output = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("serve")
+        .arg(&missing)
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+
+    assert_json_error(&output, 2, "usage");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&missing.display().to_string()), "{stderr}");
+
+    // No daemon was ever spawned to register anything against — the
+    // strongest available proof that the refusal happened before any
+    // `Request::Start`, not that a registered sheep crash-looped after one.
+    assert!(
+        daemon_pid(dir.path()).is_none(),
+        "a refused root must not even bring a shepherd up"
+    );
+}
+
+/// fails if the worker ignores SIGTERM. Step 6.2 copies the metrics dog's
+/// signal handling and states the failure mode — a worker that only handles
+/// SIGINT rides the whole kill ladder to SIGKILL on every `shep stop`, which
+/// is slow and looks like a hang.
+///
+/// See [`SERVE_STOP_DEADLINE`]'s own doc for why this is a deterministic
+/// assertion on `shep stop`'s own wall-clock rather than a flaky one.
+#[test]
+fn a_served_sheep_stops_on_sigterm_rather_than_riding_the_ladder_to_sigkill() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("site");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("index.html"), "ok").unwrap();
+    let mut guard = DaemonGuard::default();
+    let port = free_port();
+    let name = "sigterm-check";
+
+    let output = shep(dir.path())
+        .arg("serve")
+        .arg(&root)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--name")
+        .arg(name)
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&output);
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (status, body) = poll_http_get(addr, "/", &[]);
+    assert_eq!(status, 200, "body={body}");
+
+    let started = Instant::now();
+    let stop_output = shep(dir.path()).arg("stop").arg(name).output().unwrap();
+    let elapsed = started.elapsed();
+    assert_success(&stop_output);
+    assert!(
+        elapsed < SERVE_STOP_DEADLINE,
+        "shep stop took {elapsed:?}, at or past SERVE_STOP_DEADLINE ({SERVE_STOP_DEADLINE:?}); \
+         a worker riding the ladder to SIGKILL takes at least the 1600ms kill_timeout default"
+    );
+
+    graceful_kill(dir.path());
+}
+
+/// Layout shared by the two `--follow-symlinks` cases below:
+/// `<root>/releases/2026-08-15/index.html` and
+/// `<root>/current -> releases/2026-08-15` — the exact deploy shape Rin's
+/// ruling names.
+fn write_deploy_layout(root: &Path) {
+    let release = root.join("releases/2026-08-15");
+    std::fs::create_dir_all(&release).unwrap();
+    std::fs::write(release.join("index.html"), "the deploy layout").unwrap();
+    std::os::unix::fs::symlink(&release, root.join("current")).unwrap();
+}
+
+/// fails if the per-refusal stderr line (decision 5, Rin's ruling) never
+/// reaches the sheep's own bleats. This is the one claim in the ruling that
+/// Task 3's and Task 6's in-process tests cannot make: they run inside the
+/// test binary's own process, sharing its stderr with every other test in
+/// the suite, so asserting real output there would mean hijacking a
+/// process-global stream under `cargo test`'s default thread-per-test
+/// concurrency — flaky by construction. A registered sheep is a real child
+/// process with its own captured stderr, which is exactly what `shep
+/// bleats` already reads; that is the one place this claim can be checked
+/// honestly.
+///
+/// Registered WITHOUT `--follow-symlinks`.
+#[test]
+fn a_refused_symlink_writes_the_path_and_the_flag_to_the_sheeps_bleats() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("site");
+    std::fs::create_dir(&root).unwrap();
+    write_deploy_layout(&root);
+    let canonical_root = root.canonicalize().unwrap();
+    let mut guard = DaemonGuard::default();
+    let port = free_port();
+    let name = "symlink-refused";
+
+    let output = shep(dir.path())
+        .arg("serve")
+        .arg(&root)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--name")
+        .arg(name)
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&output);
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (status, body) = poll_http_get(addr, "/current/index.html", &[]);
+    assert_eq!(status, 404, "body={body}");
+
+    let bleats_output = bleats_no_follow_until_written(dir.path(), &[name, "--err"]);
+    let bleats = String::from_utf8_lossy(&bleats_output.stdout);
+    assert!(
+        bleats.contains(&canonical_root.join("current").display().to_string()),
+        "{bleats}"
+    );
+    assert!(bleats.contains("--follow-symlinks"), "{bleats}");
+
+    graceful_kill(dir.path());
+}
+
+/// fails if `--follow-symlinks` does not actually serve the deploy layout
+/// end to end, through registration and a restart, and fails if setting it
+/// stops being loud at startup. Two assertions in one test because they are
+/// one scenario: the flag that makes the deploy layout work is the same
+/// flag `follow_symlinks_notice` announces.
+#[test]
+fn a_served_sheep_with_follow_symlinks_serves_the_deploy_layout_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("site");
+    std::fs::create_dir(&root).unwrap();
+    write_deploy_layout(&root);
+    let mut guard = DaemonGuard::default();
+    let port = free_port();
+    let name = "symlink-followed";
+
+    let output = shep(dir.path())
+        .arg("serve")
+        .arg(&root)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--name")
+        .arg(name)
+        .arg("--follow-symlinks")
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&output);
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (status, body) = poll_http_get(addr, "/current/index.html", &[]);
+    assert_eq!(status, 200, "body={body}");
+    assert!(body.contains("the deploy layout"), "{body}");
+
+    let bleats_output = bleats_no_follow_until_written(dir.path(), &[name, "--err"]);
+    let bleats = String::from_utf8_lossy(&bleats_output.stdout);
+    assert!(bleats.contains("--follow-symlinks"), "{bleats}");
+    assert!(
+        bleats.contains("race") || bleats.contains("TOCTOU"),
+        "{bleats}"
+    );
+
+    graceful_kill(dir.path());
 }

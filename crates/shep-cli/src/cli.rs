@@ -9,6 +9,7 @@
 //! command is not wired up yet — the whole parse surface lives in one
 //! portable file rather than accreting piecemeal as each verb lands.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 /// The `shep` command line.
@@ -91,6 +92,29 @@ pub enum Init {
 pub enum Commands {
     /// Start a sheep from a script, a Flockfile, or stdin.
     Start(StartArgs),
+    /// Serve a directory over plain HTTP, as a managed sheep.
+    ///
+    /// Registers a sheep whose command line is this invocation, canonicalized
+    /// and with `--foreground` appended — the same worker that answers every
+    /// request also IS the registered sheep, so `shep describe` shows exactly
+    /// what will run again on a restart.
+    ///
+    /// Binds loopback (`127.0.0.1:8080`) by default. A wider `--bind` is
+    /// allowed, not refused, and gets a stderr notice naming what it exposes
+    /// — the docroot is published to anything that can reach the port, and
+    /// unencrypted unless the operator puts a proxy in front. `--auth`
+    /// narrows that to anyone who also has the password, still sent as plain
+    /// HTTP basic auth.
+    ///
+    /// Dotfiles, directory listings, and any symlink under the docroot are
+    /// all refused by default — `--hidden`, `--listing`, and
+    /// `--follow-symlinks` opt back in, each with its own reason a repo
+    /// checkout or a deploy layout might need it.
+    ///
+    /// `--foreground` runs the worker directly in this terminal instead of
+    /// registering a sheep — also how the registered sheep runs; the flag on
+    /// the end of its own command line is the only difference.
+    Serve(ServeArgs),
     /// Stop one or more sheep.
     Stop(SelectorArgs),
     /// Restart one or more sheep.
@@ -390,6 +414,61 @@ pub struct StartArgs {
     /// `server.js` as a script, which is what it has always meant.
     #[arg(long)]
     pub flockfile: bool,
+}
+
+/// Arguments to `shep serve`.
+///
+/// `PartialEq` is derived for one reason and it is a test: Step 7.4's
+/// round-trip asserts the whole struct, so a field added without teaching
+/// `sheep_args` about it fails by construction rather than by somebody
+/// remembering to extend a list of `assert!`s.
+#[derive(Debug, PartialEq, Eq, clap::Args)]
+pub struct ServeArgs {
+    /// Directory to serve
+    pub root: PathBuf,
+    /// Port to listen on
+    #[arg(long, default_value_t = 8080)]
+    pub port: u16,
+    /// Address to bind. Loopback unless you say otherwise — a wider bind
+    /// publishes every file under the directory to anything that can reach
+    /// the port.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub bind: IpAddr,
+    /// Name for this sheep (default: the directory's own name)
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Fold to place this sheep in
+    #[arg(long)]
+    pub fold: Option<String>,
+    /// Serve index.html for paths that do not exist, for a single-page app.
+    /// Only for requests that accept HTML, so a missing script still 404s.
+    #[arg(long)]
+    pub spa: bool,
+    /// List a directory that has no index.html. Off by default: a listing
+    /// publishes every filename under it.
+    #[arg(long)]
+    pub listing: bool,
+    /// Serve files and directories whose names begin with a dot. Off by
+    /// default: serving a project directory would otherwise publish `.env`
+    /// and the whole `.git` history. The one real use is
+    /// `.well-known/acme-challenge`.
+    #[arg(long)]
+    pub hidden: bool,
+    /// Follow symlinks under the docroot, reopening the check-then-open race
+    /// refused by default. Needed for deploy layouts like
+    /// `current -> releases/2026-08-15`; off unless you ask for it.
+    #[arg(long)]
+    pub follow_symlinks: bool,
+    /// File holding one `user:password` line, mode 0600, required on every
+    /// request. Sent over plain HTTP — base64, not encryption.
+    #[arg(long)]
+    pub auth: Option<PathBuf>,
+    /// Serve in this terminal instead of registering a sheep.
+    ///
+    /// This is also how the registered sheep runs: the command line in
+    /// `shep describe` is this one with the flag on the end.
+    #[arg(long)]
+    pub foreground: bool,
 }
 
 /// Arguments shared by every verb that targets an existing selection of the
@@ -837,6 +916,28 @@ mod tests {
             }
             other => panic!("expected two Start commands, got {other:?}"),
         }
+    }
+
+    /// fails if serve stops binding loopback by default. Spec §10 fixes it and
+    /// nothing else in the phase asserts it: delete `default_value` and clap
+    /// requires the flag, write `Option<IpAddr>` instead and an unspecified
+    /// default silently binds 0.0.0.0.
+    #[test]
+    fn serve_binds_loopback_on_port_8080_unless_told_otherwise() {
+        use clap::Parser;
+        use std::net::{IpAddr, Ipv4Addr};
+        let cli = Cli::try_parse_from(["shep", "serve", "./x"]).unwrap();
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve")
+        };
+        assert_eq!(args.bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(args.port, 8080);
+        assert!(!args.listing, "decision 9");
+        assert!(!args.hidden, "decision 4");
+        assert!(
+            !args.follow_symlinks,
+            "decision 5 — the refusal is the safe default"
+        );
     }
 
     #[test]

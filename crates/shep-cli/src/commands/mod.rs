@@ -14,6 +14,7 @@ pub mod muster;
 pub mod query;
 pub mod schema;
 pub(crate) mod selector;
+pub mod serve;
 pub(crate) mod shep_toml;
 pub mod signal;
 pub(crate) mod startup;

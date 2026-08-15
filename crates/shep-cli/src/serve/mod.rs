@@ -30,7 +30,12 @@ mod mime;
 
 mod listing;
 
-mod auth;
+// `pub(crate)`: `commands::serve` (Task 7) is the verb that builds
+// `auth::load`'s `Credentials` and `worker::ServeConfig` and calls
+// `worker::run` — a sibling module tree under `commands/`, not a descendant
+// of this one, so its items need to reach past `serve`'s own privacy
+// boundary rather than merely being `pub` inside it.
+pub(crate) mod auth;
 
 #[cfg(unix)]
-mod worker;
+pub(crate) mod worker;
