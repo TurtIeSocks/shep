@@ -104,6 +104,25 @@ impl FlockRegistry {
         }
     }
 
+    /// Drops every recorded app, so the next [`Self::roll`] describes an
+    /// empty flock regardless of what is still live in the supervisor's own
+    /// listing.
+    ///
+    /// The one caller is [`crate::boot::RunningDaemon::run`]'s teardown,
+    /// and only when that boot asked for it
+    /// (`BootOptions::delete_flock_on_shutdown`) — `shep dev`'s isolated
+    /// session, where nothing should survive for a later `shep muster` to
+    /// restore, even when the session ends by signal rather than through
+    /// the CLI's own `Stop`/`Delete` requests. A production `runtime`/
+    /// `daemon` shutdown never calls this: the roll surviving with the
+    /// flock's true running state is the entire point of muster.
+    pub(crate) fn clear(&self) {
+        self.apps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
     /// Builds the roll from the live listing, pruning names the flock no
     /// longer has (a deleted sheep must not resurrect).
     #[must_use]

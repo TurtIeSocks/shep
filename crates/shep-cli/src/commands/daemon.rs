@@ -224,6 +224,13 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
 /// Nothing about the boot differs between the two callers, and the split is
 /// what keeps that true.
 ///
+/// `delete_flock_on_shutdown` becomes [`BootOptions::delete_flock_on_shutdown`]
+/// verbatim — see that field's own doc. `run_daemon` below always passes
+/// `false`; `commands::foreground::run` is the one caller that passes its
+/// own `tidy_up`, so `shep dev`'s isolated session gets an empty roll on
+/// the way out even when it ends by signal rather than through its own
+/// `Stop`/`Delete` requests.
+///
 /// # Errors
 /// - [`DaemonRunError::Config`] — `shep.toml` failed to parse, or a
 ///   `SHEP_*` override held an unparseable value.
@@ -233,6 +240,7 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
 pub async fn boot_supervisor(
     paths: ShepPaths,
     args: &DaemonArgs,
+    delete_flock_on_shutdown: bool,
 ) -> Result<RunningDaemon, DaemonRunError> {
     let env = |key: &str| std::env::var(key).ok();
     let file_source = read_daemon_config_source(&paths)?;
@@ -244,7 +252,8 @@ pub async fn boot_supervisor(
     // `SHEP_*` override rather than inside shep-daemon — see
     // `shep_daemon::notify::NOTIFY_SOCKET_ENV`'s own doc.
     let notify_socket = std::env::var_os(NOTIFY_SOCKET_ENV);
-    let options = boot_options(&config, args, notify_socket.as_deref());
+    let mut options = boot_options(&config, args, notify_socket.as_deref());
+    options.delete_flock_on_shutdown = delete_flock_on_shutdown;
     boot(TokioRunner::new(), paths, options)
         .await
         .map_err(DaemonRunError::Boot)
@@ -265,7 +274,9 @@ pub async fn boot_supervisor(
 /// - [`DaemonRunError::Run`] — the supervisor came up and served, then
 ///   failed during its run loop or teardown.
 pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), DaemonRunError> {
-    boot_supervisor(paths, args)
+    // A production daemon always keeps its final roll — `shep muster` after
+    // a reboot is the entire reason it exists.
+    boot_supervisor(paths, args, false)
         .await?
         .run()
         .await
@@ -347,6 +358,10 @@ pub fn boot_options(
                 }
             })
             .collect(),
+        // Overwritten by `boot_supervisor`, the only caller that ever wants
+        // `true` — this function has no `tidy_up`/`dev` concept of its own
+        // to read it from.
+        delete_flock_on_shutdown: false,
     }
 }
 

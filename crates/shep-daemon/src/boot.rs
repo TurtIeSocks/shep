@@ -518,6 +518,19 @@ pub struct BootOptions {
     /// itself — the same division [`Self::socket`] and
     /// [`Self::max_cron_sleep`] already follow.
     pub dogs: Vec<DogSpec>,
+    /// Wipe the in-memory flock registry before [`RunningDaemon::run`]'s
+    /// teardown writes the final muster roll, so that roll always describes
+    /// an empty flock — regardless of whether the session ended through an
+    /// explicit `Stop`/`Delete`/`KillDaemon` sequence or by a signal caught
+    /// inside `run` itself, which no caller-level request can precede.
+    ///
+    /// `false` for every real `runtime`/`daemon` boot: the roll surviving
+    /// with the flock's true running state is what lets `shep muster`
+    /// restore it after a reboot. `true` only for `shep dev`'s isolated
+    /// session, where nothing here should ever be worth mustering — see
+    /// `crate::snapshot::FlockRegistry::clear`'s own doc for the shutdown
+    /// gap this closes.
+    pub delete_flock_on_shutdown: bool,
 }
 
 /// Brings the daemon up: signal handlers, layout, roll restore, bus,
@@ -579,6 +592,10 @@ pub async fn boot<R: ProcessRunner>(
     paths: ShepPaths,
     mut options: BootOptions,
 ) -> Result<RunningDaemon, BootError> {
+    // Copied out up front, purely a `bool`, so nothing later in this fn has
+    // to remember to read it off `options` before that struct is consumed.
+    let delete_flock_on_shutdown = options.delete_flock_on_shutdown;
+
     // 1. Install signal handlers before the socket (or anything else
     //    observable) exists — see this fn's own doc.
     let (shutdown, shutdown_rx) = watch::channel(false);
@@ -738,6 +755,7 @@ pub async fn boot<R: ProcessRunner>(
         // THIS function) is the only thing that releases the `flock`. See
         // `PidfileLock`'s own doc.
         pidfile_lock,
+        delete_flock_on_shutdown,
     })
 }
 
@@ -820,6 +838,9 @@ pub struct RunningDaemon {
     // teardown finishes — releasing this `flock` is what lets a NEXT
     // daemon's own `PidfileLock::acquire` succeed. See that type's own doc.
     pidfile_lock: PidfileLock,
+    // Copied from `BootOptions::delete_flock_on_shutdown` at boot time; see
+    // that field's own doc. Consulted only in `run`'s teardown step 2.
+    delete_flock_on_shutdown: bool,
 }
 
 impl RunningDaemon {
@@ -848,7 +869,10 @@ impl RunningDaemon {
     /// 1. stop the snapshot writer, and the dog watch alongside it — nothing
     ///    may rewrite the roll from here on, and no bus subscriber has a
     ///    reason left to watch once serving ends;
-    /// 2. write the final muster roll — records the flock AS IT WAS, still running;
+    /// 2. write the final muster roll — records the flock AS IT WAS, still
+    ///    running, unless [`BootOptions::delete_flock_on_shutdown`] asked
+    ///    for the registry to be wiped first, in which case it records
+    ///    nothing;
     /// 3. broadcast [`BusEvent::DaemonShutdown`] — subscribers learn before their sockets close;
     /// 4. [`SupervisorHandle::shutdown`] — the kill ladder on every online sheep;
     /// 5. unlink the socket, remove the pidfile (best-effort on both: a
@@ -894,6 +918,7 @@ impl RunningDaemon {
             // its `Drop` at the end of this scope — that release is what
             // lets a future daemon's own boot succeed.
             pidfile_lock: _pidfile_lock,
+            delete_flock_on_shutdown,
         } = self;
 
         // `shutdown_rx` is the receiver `boot` has kept alive since the
@@ -911,7 +936,19 @@ impl RunningDaemon {
         writer.stop().await;
         dog_watch.abort();
 
-        // 2. Write the final roll while every sheep is still online.
+        // 2. Write the final roll while every sheep is still online — UNLESS
+        //    this boot asked for nothing to survive here at all
+        //    (`delete_flock_on_shutdown`, `shep dev`'s own case): then the
+        //    registry is wiped first, so this write already agrees with
+        //    step 4's kill ladder that nothing here should come back. This
+        //    runs regardless of how serving just ended — a signal caught
+        //    inside `install_signals` ends things exactly the same way a
+        //    `KillDaemon` request does, and no caller-level `Stop`/`Delete`
+        //    pair can run ahead of that path (see
+        //    `crate::snapshot::FlockRegistry::clear`'s own doc).
+        if delete_flock_on_shutdown {
+            ctx.registry.clear();
+        }
         if let Err(err) = ctx.snapshot_now().await {
             tracing::warn!(%err, "final muster roll write failed");
         }
@@ -1712,6 +1749,59 @@ mod tests {
             "the socket is unlinked on a clean exit"
         );
         assert_eq!(read_pidfile(&paths).unwrap(), None);
+    }
+
+    /// fails if `delete_flock_on_shutdown` leaves anything in the final
+    /// roll — `shep dev`'s own bug (Phase 15 review, Important 2). The
+    /// signal path is what this pins: `ctx.shutdown()` ends `run` the exact
+    /// way a caught `SIGTERM` does, WITHOUT going through any caller-level
+    /// `Stop`/`Delete` request first, which is precisely the gap a CLI-side
+    /// `tidy_up` flag alone cannot close. If `delete_flock_on_shutdown` is
+    /// ever ignored — or is threaded through as `false` by mistake — this
+    /// app survives into the roll exactly as
+    /// `boot_restores_a_saved_flock_and_tears_down_in_order` above expects
+    /// for the ordinary (non-`dev`) case, and this assertion catches it.
+    #[tokio::test]
+    async fn delete_flock_on_shutdown_clears_the_roll_even_on_a_signalled_exit() {
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+
+        let daemon = boot(
+            ScriptedRunner::new(vec![ProcScript::never_exits()]),
+            paths.clone(),
+            BootOptions {
+                delete_flock_on_shutdown: true,
+                ..BootOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ctx = daemon.context();
+        let held = shep_core::config::normalize(AppConfig::minimal("held", "./held")).unwrap();
+        ctx.registry.record(&[held.clone()]);
+        ctx.supervisor.start(vec![held]).await.unwrap();
+        let flock = ctx.supervisor.list_checked().await.unwrap();
+        assert_eq!(flock.len(), 1, "the held app must actually be up");
+
+        let run = tokio::spawn(daemon.run());
+        // The signal path, not a caller-level `Stop`/`Delete` pair: `run`'s
+        // own `install_signals` handler flips this same watch on a real
+        // `SIGTERM`, and never runs anything this test hasn't run either.
+        ctx.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let final_roll = crate::snapshot::read(&paths.snapshot).unwrap();
+        assert!(
+            final_roll.apps.is_empty(),
+            "delete_flock_on_shutdown must leave the roll empty, not {:?}",
+            final_roll.apps
+        );
     }
 
     /// fails if the dogs come up before the muster restore, or not at all.

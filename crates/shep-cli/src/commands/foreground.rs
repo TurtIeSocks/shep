@@ -98,7 +98,12 @@ pub async fn run(
         max_cron_sleep: None,
     };
 
-    let daemon = match boot_supervisor(paths.clone(), &daemon_args).await {
+    // `tidy_up` doubles as `BootOptions::delete_flock_on_shutdown` — a
+    // session that promises to stop-and-delete its own flock on the way out
+    // must keep that promise even when it ends by signal, which reaches
+    // `RunningDaemon::run`'s own teardown directly and never runs the
+    // `Stop`/`Delete` pair below at all (see that field's own doc).
+    let daemon = match boot_supervisor(paths.clone(), &daemon_args, tidy_up).await {
         Ok(daemon) => daemon,
         Err(err) => {
             // `daemon_exit_code` already maps `BootError::AlreadyRunning` to

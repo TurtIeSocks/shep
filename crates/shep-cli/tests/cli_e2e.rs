@@ -4927,7 +4927,8 @@ fn dev_tidies_up_after_itself() {
     );
 }
 
-/// fails if Ctrl-C out of `shep dev` leaves a shepherd or a flock behind.
+/// fails if Ctrl-C out of `shep dev` leaves a shepherd or a flock behind —
+/// on disk as well as in the process table.
 ///
 /// The auto-exit path above never sends a signal, and the signal path is
 /// the one people actually use — "a dev mode that leaks a supervisor is a
@@ -4937,8 +4938,13 @@ fn dev_tidies_up_after_itself() {
 /// shepherd is up and the sheep is running, not merely that the process
 /// exists) and records the sheep's own pid, sends `SIGTERM` to the `shep
 /// dev` process itself, and asserts the same two things the auto-exit case
-/// does — no live socket, no shepherd left running — plus the one this
-/// case alone can make: the held sheep did not outlive its supervisor.
+/// does — no live socket, no shepherd left running — plus two only this
+/// case can make: the held sheep did not outlive its supervisor, and
+/// `flock.json` does not still list it as running (Phase 15 review,
+/// Important 2 — a signal reaches `commands::foreground::run`'s own
+/// `RunningDaemon::run` teardown directly, never through the `Stop`/
+/// `Delete` pair `tidy_up` sends over the wire, so only
+/// `BootOptions::delete_flock_on_shutdown` closes this half of the gap).
 #[test]
 fn dev_tidies_up_when_it_is_signalled_rather_than_when_the_flock_empties() {
     let dir = tempfile::tempdir().unwrap();
@@ -4984,6 +4990,17 @@ fn dev_tidies_up_when_it_is_signalled_rather_than_when_the_flock_empties() {
     assert!(
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(sheep_pid), None).is_err(),
         "the held sheep (pid {sheep_pid}) must not outlive the dev session"
+    );
+
+    let roll_text = std::fs::read_to_string(dev_home.path().join("flock.json"))
+        .expect("teardown must still write a final flock.json, even an empty one");
+    let roll: serde_json::Value =
+        serde_json::from_str(&roll_text).expect("flock.json must still be valid JSON");
+    assert_eq!(
+        roll["apps"].as_array().map(Vec::len),
+        Some(0),
+        "a signalled dev session must not leave `held` in the roll for `shep muster` to \
+         resurrect: {roll}"
     );
 }
 
