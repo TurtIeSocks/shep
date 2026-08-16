@@ -7,15 +7,21 @@
  *   0  fixed sky gradient spanning the whole stage (night -> dawn -> noon)
  *   1  stars / moon / sun / sheep-clouds, positioned in vh down the stage
  *   2  a STICKY pasture (position:sticky; top:0; height:100vh;
- *      margin-bottom:-100vh) so the scenery pins while content scrolls
+ *      margin-bottom:-100vh) so the scenery pins while content scrolls —
+ *      since build 4 it also carries a band of dawn fog over the far hill
  *   3  a night wash that multiplies over the top and fades out
  *   4  a barn glow, second sticky layer
  *   5+ <slot /> — the five content scenes and the lexicon section, which
  *      must live INSIDE this same wrapper: the stage's total height (driven
  *      by that slotted content) is what the sticky pasture pins against.
  *
- * Nothing here animates on scroll — the only scroll effect is this fixed
- * gradient being revealed behind the sticky scenery as the page moves.
+ * Scroll is the passage of time here (night -> dawn -> noon), and the sky
+ * plays it out: stars, moon, sun and clouds each scroll at their own
+ * fraction of content speed, the night sky dissolves as the dawn comes up,
+ * and time-based ambients (cloud sway, shooting stars, sun/moon glow) keep
+ * the scene breathing even when the page is still. See THE SPEED MODEL
+ * comment above the parallax rules at the bottom of this file for the whole
+ * choreography and how to tune it.
  */
 import Sheep from "../marks/Sheep.astro";
 import Dog from "../marks/Dog.astro";
@@ -40,14 +46,83 @@ const posts = [30, 180, 330, 480, 630, 780, 930, 1080, 1230, 1350];
  * same max-width/columnWidth math SceneSection.astro uses. So these
  * percentages are of the safe zone to the right of every scene's text, and
  * a cloud can never land under copy at any width.
+ *
+ * `speed` is the fraction of content speed the cloud scrolls at while on
+ * screen (THE SPEED MODEL, in the stylesheet below): near, big clouds run
+ * fast (0.75), far, small ones slow (0.4) — depth comes from the SPREAD of
+ * those rates, not from any one of them. `wind` is the time-based sideways
+ * sway of the puff itself; amplitude and period also scale with depth
+ * (near = bigger and faster), and the negative delays start each cloud
+ * mid-cycle so no two ever sway in sync (motion.css's lockstep rule).
+ *
+ * The first cloud is on screen before any scrolling happens, so it can't
+ * run on a view() timeline (`atTop`, see `.cloud.at-top` below). Its
+ * `spanVh` is its document top-to-bottom-edge extent — top 52vh plus its
+ * own ~11vh height — the figure its scroll(root) range is derived from.
  */
-const clouds = [
-  { left: "6%", top: "52vh", width: "150px" },
-  { right: "18%", top: "128vh", width: "112px" },
-  { left: "38%", top: "262vh", width: "184px" },
-  { right: "10%", top: "332vh", width: "132px" },
-  { left: "20%", top: "392vh", width: "96px" },
+interface CloudSpec {
+  left?: string;
+  right?: string;
+  top: string;
+  width: string;
+  speed: number;
+  atTop?: { spanVh: number };
+  wind: { amp: string; duration: string; delay: string };
+}
+
+const clouds: CloudSpec[] = [
+  {
+    left: "6%",
+    top: "52vh",
+    width: "150px",
+    speed: 0.6,
+    atTop: { spanVh: 63 },
+    wind: { amp: "10px", duration: "23s", delay: "-7s" },
+  },
+  {
+    right: "18%",
+    top: "128vh",
+    width: "112px",
+    speed: 0.5,
+    wind: { amp: "9px", duration: "26s", delay: "-3s" },
+  },
+  {
+    left: "38%",
+    top: "262vh",
+    width: "184px",
+    speed: 0.75,
+    wind: { amp: "16px", duration: "17s", delay: "-11s" },
+  },
+  {
+    right: "10%",
+    top: "332vh",
+    width: "132px",
+    speed: 0.6,
+    wind: { amp: "12px", duration: "21s", delay: "-15s" },
+  },
+  {
+    left: "20%",
+    top: "392vh",
+    width: "96px",
+    speed: 0.4,
+    wind: { amp: "7px", duration: "31s", delay: "-5s" },
+  },
 ];
+
+/*
+ * Turn a cloud's authored `speed` into the custom properties the drift
+ * animations consume — the two formulas from THE SPEED MODEL, computed here
+ * so the tuning knob stays the single speed number above.
+ */
+const cloudMotion = (c: CloudSpec) => {
+  const wind = `--wind-amp:${c.wind.amp};--wind-duration:${c.wind.duration};--wind-delay:${c.wind.delay};`;
+  if (c.atTop) {
+    const range = c.atTop.spanVh / c.speed;
+    return `--parallax-drift:${(range - c.atTop.spanVh).toFixed(1)}vh;--parallax-range:${range.toFixed(1)}vh;${wind}`;
+  }
+  const drift = (100 * (1 - c.speed)) / c.speed;
+  return `--parallax-drift:${drift.toFixed(1)}vh;--parallax-range-end:${(100 / c.speed).toFixed(1)}%;${wind}`;
+};
 
 /*
  * Depth for the grazing sheep: far/mid/near controls width (a clamp() in
@@ -120,6 +195,14 @@ const grazing = [
         style={`left:${s.x}%;top:${s.y}%;width:${s.d}px;height:${s.d}px;--twinkle-duration:${s.dur}s;`}
       />
     ))}
+    <span
+      class="shooting-star"
+      style="left:64%;top:18%;--shoot-duration:9.5s;--shoot-delay:2.8s;"
+    />
+    <span
+      class="shooting-star"
+      style="left:28%;top:44%;--shoot-duration:14s;--shoot-delay:8.4s;"
+    />
   </div>
 
   <div class="moon">
@@ -133,8 +216,8 @@ const grazing = [
   <div class="clouds">
     {clouds.map((c) => (
       <div
-        class="cloud"
-        style={`${c.left ? `left:${c.left};` : `right:${c.right};`}top:${c.top};width:${c.width};`}
+        class={`cloud${c.atTop ? " at-top" : ""}`}
+        style={`${c.left ? `left:${c.left};` : `right:${c.right};`}top:${c.top};width:${c.width};${cloudMotion(c)}`}
       >
         <svg viewBox="0 0 104 78" width="100%" aria-hidden="true">
           <path
@@ -164,6 +247,8 @@ const grazing = [
     <div class="barn">
       <Barn width={300} />
     </div>
+
+    <div class="mist"></div>
 
     <div class="near-hill">
       <svg viewBox="0 0 1200 260" preserveAspectRatio="none" width="100%" height="100%">
@@ -218,6 +303,14 @@ const grazing = [
 <style>
   .stage {
     position: relative;
+    /* Belt-and-braces against horizontal scroll from decorative overhang
+       (first offender: the sun's ::before halo past the right edge at
+       narrow widths). `clip`, never `hidden`: hidden would make the stage
+       a scroll container and silently kill the sticky pasture — the bug
+       that flattened the whole scroll effect once already — while clip
+       only clips paint and creates no scroll container, leaving sticky
+       and the scroll-driven timelines alone. */
+    overflow-x: clip;
     /*
      * Mirrors SceneSection.astro's own layout math (.inner's max-width and
      * padding, and the widest columnWidth of the five scenes — Scene2's
@@ -284,6 +377,25 @@ const grazing = [
     background: var(--fleece);
   }
 
+  /*
+   * Meteors. Base opacity 0: the streak only ever appears through its
+   * time-based keyframes, so reduced-motion visitors (and anyone with
+   * animations off) simply never see one — no static streak parked in the
+   * sky. They live inside .stars, so they inherit its slow drift and fade,
+   * and die with the night the way the stars do. The gradient runs bright
+   * head (left) to transparent tail; rotate(-33deg) matches the keyframes'
+   * travel vector (-190px, +123px), down-and-left toward the horizon.
+   */
+  .shooting-star {
+    position: absolute;
+    width: 110px;
+    height: 3px;
+    border-radius: 3px;
+    background: linear-gradient(90deg, var(--fleece), rgba(255, 255, 255, 0));
+    opacity: 0;
+    transform: rotate(-33deg);
+  }
+
   .moon {
     position: absolute;
     left: 17%;
@@ -307,7 +419,12 @@ const grazing = [
   .sun {
     position: absolute;
     left: 60%;
-    top: 224vh;
+    /* 190vh, not the original 224vh: the disc now rises at ~0.2x (THE
+       SPEED MODEL below), so it visually crests the hills about 1.5
+       viewports of scroll later than a 1x sun from the same spot would.
+       Placing it a third of a viewport earlier puts the crest back inside
+       the orange dawn band instead of into an already-blue morning. */
+    top: 190vh;
     width: 124px;
     height: 124px;
     border-radius: 50%;
@@ -315,6 +432,44 @@ const grazing = [
     border: 4px solid var(--line);
     box-shadow: 6px 6px 0 rgba(23, 37, 28, 0.16);
     z-index: 1;
+  }
+
+  /*
+   * Soft halos behind the two discs, following the barn-glow precedent for
+   * radial gradients in an otherwise hard-outlined scene. Each is a child
+   * pseudo-element rather than a sibling so it rides the disc's own drift
+   * transform for free; z-index -1 tucks it behind the disc's fill (both
+   * discs are positioned with z-index 1, so each is its own stacking
+   * context and -1 cannot escape below the sky). The glows are static for
+   * reduced-motion visitors — light, not movement — and only the gentle
+   * breathing (glow-breathe, in the motion block below) is gated.
+   */
+  .moon::before,
+  .sun::before {
+    content: "";
+    position: absolute;
+    border-radius: 50%;
+    z-index: -1;
+  }
+
+  .moon::before {
+    inset: -34px;
+    background: radial-gradient(
+      circle,
+      rgba(244, 240, 226, 0.4) 0%,
+      rgba(244, 240, 226, 0.14) 45%,
+      rgba(244, 240, 226, 0) 70%
+    );
+  }
+
+  .sun::before {
+    inset: -46px;
+    background: radial-gradient(
+      circle,
+      rgba(247, 228, 176, 0.8) 0%,
+      rgba(243, 196, 76, 0.32) 42%,
+      rgba(243, 196, 76, 0) 70%
+    );
   }
 
   .clouds {
@@ -326,12 +481,21 @@ const grazing = [
        pixel width, so at narrow widths one can reach past the lane's right
        edge and give the document real horizontal scroll. Clip here rather
        than on `.stage`: `.stage` also contains `.pasture`, and any overflow
-       value other than `visible` makes an ancestor a scroll container, which
-       silently disables `position: sticky` for its descendants. That is the
-       exact bug that flattened the whole scroll effect once already.
-       `.clouds` and `.pasture` are siblings, so clipping stops here. A cloud
-       cut off at the edge reads as one drifting out of the sky. */
-    overflow: hidden;
+       value other than `visible` or `clip` makes an ancestor a scroll
+       container, which silently disables `position: sticky` for its
+       descendants. That is the exact bug that flattened the whole scroll
+       effect once already. `.clouds` and `.pasture` are siblings, so
+       clipping stops here. A cloud cut off at the edge reads as one
+       drifting out of the sky.
+
+       `clip`, NOT `hidden`: hidden also makes this lane a scroll container,
+       and view() timelines bind to their nearest scroll-container ancestor
+       — with hidden here, every cloud's animation silently tracked this
+       never-scrolling lane instead of the page and sat frozen at progress
+       0 (which is why build 3's cloud parallax never actually moved).
+       clip clips identically but creates no scroll container, so the
+       timelines fall through to the root scroller. */
+    overflow: clip;
   }
 
   .cloud {
@@ -399,6 +563,43 @@ const grazing = [
      already-responsive min(300px,26vw) container. */
   .barn :global(.barn-mark) {
     width: 100% !important;
+  }
+
+  /*
+   * Dawn fog over the far hill and the barn's feet. It sits in the sticky
+   * pasture between the barn and the near hill (paint order is DOM order
+   * here), so the near meadow, fence and animals all stay crisp in front
+   * of it while the far scenery goes hazy. Base opacity 0: it only exists
+   * through its scroll-driven keyframes (mist-cycle below) — thin before
+   * first light, thickest at dawn, burned off by mid-morning — so browsers
+   * without scroll-driven animations, and reduced-motion visitors, never
+   * see a stuck noon fog. The night wash multiplies over it (z-index 3 vs
+   * the pasture's 2), which keeps it a dim grey bank before first light
+   * rather than a bright cream one.
+   */
+  .mist {
+    position: absolute;
+    left: -3%;
+    right: -3%;
+    bottom: 22%;
+    height: 24vh;
+    opacity: 0;
+    background:
+      radial-gradient(
+        58% 60% at 22% 62%,
+        rgba(251, 246, 231, 0.75),
+        rgba(251, 246, 231, 0) 70%
+      ),
+      radial-gradient(
+        46% 64% at 58% 38%,
+        rgba(251, 246, 231, 0.6),
+        rgba(251, 246, 231, 0) 72%
+      ),
+      radial-gradient(
+        50% 55% at 88% 60%,
+        rgba(251, 246, 231, 0.7),
+        rgba(251, 246, 231, 0) 70%
+      );
   }
 
   .grazing-sheep {
@@ -518,109 +719,285 @@ const grazing = [
   }
 
   /*
-   * Parallax (build 3): the sky layer scrolls at 1x today because it's an
-   * absolutely-positioned child of the tall .stage, same as the copy below
-   * it. animation-timeline: scroll(root) drives a small, growing translateY
-   * off of overall page scroll progress with no JS — it partially cancels
-   * the sky's normal upward scroll, so it visibly lags the text. Gated
-   * behind @supports so unsupported browsers (no scroll-driven animation
-   * support yet in Firefox/older Safari) get zero transform applied, i.e.
-   * today's plain 1x scroll — never a stuck offset from an animation that
-   * ran once at time 0. Also gated behind reduced-motion, same as every
-   * other animation on this page.
+   * Parallax (build 4) — THE SPEED MODEL.
    *
-   * Build 2 gave every layer the same 10vh of drift across the whole page,
-   * which reads as a slightly slower background, not depth — depth needs
-   * layers to move at DIFFERENT rates. All four share one keyframe (still
-   * longhand only, see the note below on why) and each layer sets its own
-   * --parallax-drift: stars and moon are the farthest things in the scene
-   * and barely move; clouds sit lower and nearer and drift noticeably; the
-   * sun is the nearest, lowest object of the four (it rises across the
-   * pasture's own scenery band rather than sitting fixed in a far sky) and
-   * gets the most drift of the group.
-   */
-  /*
-   * TUNING THE PARALLAX. Two timelines, because the layers differ in kind.
+   * Scroll on this page is the passage of time, so the sky is choreographed
+   * as a time-lapse rather than as generic lag: the stars linger and
+   * dissolve into first light, the moon hangs pale into the morning before
+   * fading, the sun climbs slowly off the hills and hangs through the day
+   * scenes, and every cloud runs at its own depth-scaled speed. Depth comes
+   * from the SPREAD of those speeds — build 2's mistake was giving every
+   * layer the same drift, which reads as one slightly-slow background.
    *
-   * `scroll(root)` spreads an animation across the WHOLE page scroll, so the
-   * drift you perceive per screenful is only
+   * Every drifting element moves at a UNIFORM fraction r of content speed
+   * for as long as it is on screen. Builds 2-3 proved the two naive routes
+   * both fail: scroll(root) drift diluted over the whole ~7-viewport page
+   * is invisible (18vh of drift = ~25px per screenful), and a plain view()
+   * drift is spent inside one viewport-crossing, so the element crawls and
+   * then snaps back to full speed partway up the screen. The fix is to
+   * stretch each animation's window to exactly the element's SLOWED time on
+   * screen, so the drift rate is constant and the animation completes just
+   * as the element leaves — no kink, no dilution:
    *
-   *     drift / (page height in viewports)
+   *     on-screen span at 1x = S  (in vh of scroll)
+   *     window = S / r            drift = S * (1 - r) / r
    *
-   * This page is about 7.3 viewports tall, so a 18vh drift showed as roughly
-   * 25px of movement per screen: real, measurable, and invisible. That is why
-   * the first two attempts at this looked like nothing was happening. To read
-   * as parallax on a global timeline the numbers have to be large.
+   * Two timelines, split by where the element starts:
    *
-   * Stars, moon and sun are single elements with nothing anchored to them, so
-   * large global drift is fine and reads as the sky wheeling slowly overhead.
+   * - Starts below the fold (sun, clouds 2-5): animation-timeline: view()
+   *   with animation-range `cover 0% cover (100/r)%`. S is one viewport
+   *   plus the element's own height; the height term is deliberately
+   *   dropped (S = 100vh) so the drift errs a few percent SMALL — the
+   *   animation then finishes just after the element exits (invisible)
+   *   instead of just before (a visible speed-up at the top edge).
    *
-   * Clouds cannot use the same trick: each is placed against a particular
-   * scene (top: 128vh, 262vh, 332vh), and drift big enough to notice would
-   * carry them into a neighbouring scene. They get `view()` instead, which
-   * runs each cloud's animation over its own pass across the viewport rather
-   * than over the whole document. That gives a strong local effect and zero
-   * cumulative displacement, so the composition stays where it was placed.
+   * - Visible at scroll 0 (stars, moon, first cloud): a view() timeline
+   *   would already be partially elapsed at load, and fill:both would
+   *   displace them from their authored positions before any scrolling
+   *   happens. They run on animation-timeline: scroll(root) with an
+   *   explicit `0% <S/r>` range instead — S is the element's document
+   *   bottom edge in vh, and at scroll 0 the range's progress is exactly
+   *   0, so the load composition holds.
    *
-   * To tune: change the --parallax-drift values below. For the `scroll(root)`
-   * layers, divide by ~7.3 to predict what a reader sees per screenful. For
-   * the `view()` clouds the number is close to what you get, since the whole
-   * animation plays out over roughly one viewport of scrolling.
+   * Numbers in play (r, S -> range, drift):
+   *
+   *     stars   r 0.30, S 36vh -> range 120vh,       drift  84vh, fades
+   *     moon    r 0.10, S 17vh -> range 170vh,       drift 153vh, fades
+   *     sun     r 0.45         -> range cover 222%,  drift 122vh, eased
+   *     clouds  r per instance -> cloudMotion() in the frontmatter
+   *
+   * The stars and moon also FADE (the sky-drift-fade* keyframes — stars
+   * across the back 45% of their range, the moon over 25%-65%, timed to
+   * its own slower departure) — that is what turns "slow parallax" into
+   * "swallowed by the dawn", and it forgives the S estimates above: a star
+   * field that lingers a touch long is invisible before it could clash
+   * with the day sky. The sun instead gets an ease-out timing function:
+   * the drift is spent fastest at the start, where it cancels the most
+   * scroll, so the sun sits nearly still at the hilltop at first light and
+   * accelerates away toward noon. (The curve's initial slope times
+   * drift/window must stay below 1 or the sun would visibly move DOWN
+   * while the page scrolls; the pair below has it rising at ~0.2x off the
+   * horizon: slope 0.5/0.3 = 1.67, drift/window = 122/249 = 0.49.)
+   *
+   * Gates: every scroll-driven rule sits behind @supports
+   * (animation-timeline: ...) so browsers without scroll-driven animations
+   * (Firefox at this build) get the static 1x sky — never a stuck offset —
+   * while still getting every time-based ambient (twinkle, wind sway,
+   * shooting stars, glow breathing). Everything, ambient included, sits
+   * behind reduced-motion, same as motion.css.
    */
   @media (prefers-reduced-motion: no-preference) {
+    .cloud svg {
+      animation: wind-sway var(--wind-duration, 24s) ease-in-out infinite;
+      animation-delay: var(--wind-delay, 0s);
+    }
+
+    .shooting-star {
+      animation: shoot var(--shoot-duration, 12s) linear infinite;
+      animation-delay: var(--shoot-delay, 0s);
+    }
+
+    .sun::before {
+      animation: glow-breathe 7s ease-in-out infinite;
+    }
+
+    .moon::before {
+      animation: glow-breathe 9s ease-in-out infinite;
+      animation-delay: -3.5s;
+    }
+
     @supports (animation-timeline: scroll()) {
+      /*
+       * Deliberately longhand, not the `animation` shorthand: Astro's CSS
+       * minifier (Lightning CSS) folds a shorthand `animation` declaration
+       * plus a separate `animation-timeline` into one shorthand value, and
+       * as of this build it produces `animation:linear both sky-parallax
+       * scroll(root)`, a value the browser itself then rejects as invalid,
+       * silently dropping the whole declaration (confirmed via the CSSOM:
+       * the compiled rule's selector survives, its body is empty). The
+       * longhand properties do not hit that merge path. animation-range is
+       * kept out of any shorthand for the same reason. (The time-based
+       * ambients above may use the shorthand: they set no timeline, so
+       * there is nothing for the minifier to fold in.)
+       *
+       * Shared base for every scroll-driven element. view() support always
+       * ships alongside scroll() support, so the .sun/.cloud members of
+       * this list getting their animation-name in the view() block below
+       * is not a real split — and either way, a base with no name is a
+       * no-op.
+       */
       .stars,
       .moon,
-      .sun {
-        /*
-         * Deliberately longhand, not the `animation` shorthand: Astro's CSS
-         * minifier (Lightning CSS) folds a shorthand `animation` declaration
-         * plus a separate `animation-timeline` into one shorthand value, and
-         * as of this build it produces `animation:linear both sky-parallax
-         * scroll(root)`, a value the browser itself then rejects as invalid,
-         * silently dropping the whole declaration (confirmed via the CSSOM:
-         * the compiled rule's selector survives, its body is empty). The
-         * longhand properties do not hit that merge path.
-         */
-        animation-name: sky-parallax;
+      .sun,
+      .cloud,
+      .mist {
         animation-duration: auto;
         animation-timing-function: linear;
         animation-fill-mode: both;
-        animation-timeline: scroll(root);
       }
 
       .stars {
-        --parallax-drift: 40vh;
+        animation-name: sky-drift-fade;
+        animation-timeline: scroll(root);
+        animation-range: 0% 120vh;
+        --parallax-drift: 84vh;
       }
 
       .moon {
-        --parallax-drift: 70vh;
+        /* The early-fade profile, not sky-drift-fade: at 0.1x the moon has
+           crawled fully above the viewport by ~55% of its range, so the
+           stars' back-45% fade would play out offscreen. 25%-65% dissolves
+           the disc exactly across its visible departure into the dawn. */
+        animation-name: sky-drift-fade-early;
+        animation-timeline: scroll(root);
+        animation-range: 0% 170vh;
+        --parallax-drift: 153vh;
       }
 
-      .sun {
-        --parallax-drift: 190vh;
+      .cloud.at-top {
+        animation-name: sky-drift;
+        animation-timeline: scroll(root);
+        animation-range: 0% var(--parallax-range, 100vh);
+      }
+
+      /* The fog reads overall page progress: its subject (the sticky
+         pasture) is always on screen, so view() would be meaningless — the
+         whole scroll range IS its dawn-and-burn-off day. */
+      .mist {
+        animation-name: mist-cycle;
+        animation-timeline: scroll(root);
       }
     }
 
     @supports (animation-timeline: view()) {
-      .cloud {
-        /* Longhand for the same Lightning CSS reason as above. */
-        animation-name: sky-parallax;
-        animation-duration: auto;
-        animation-timing-function: linear;
-        animation-fill-mode: both;
+      .sun {
+        animation-name: sky-drift;
         animation-timeline: view();
-        --parallax-drift: 30vh;
+        animation-range: cover 0% cover 222%;
+        animation-timing-function: cubic-bezier(0.3, 0.5, 0.6, 1);
+        --parallax-drift: 122vh;
+      }
+
+      .cloud:not(.at-top) {
+        animation-name: sky-drift;
+        animation-timeline: view();
+        animation-range: cover 0% cover var(--parallax-range-end, 150%);
       }
     }
   }
 
-  @keyframes sky-parallax {
+  @keyframes sky-drift {
     from {
       transform: translateY(0);
     }
     to {
-      transform: translateY(var(--parallax-drift, 10vh));
+      transform: translateY(var(--parallax-drift, 0vh));
+    }
+  }
+
+  /*
+   * Drift plus a fade across the back 45%. The 55% keyframe must pin the
+   * transform to 0.55 * drift by hand — an intermediate keyframe that only
+   * declared opacity would still restart the transform's interpolation
+   * there, and with any non-linear timing the drift rate would visibly
+   * change at the seam. Linear timing only, for the same reason.
+   */
+  @keyframes sky-drift-fade {
+    from {
+      transform: translateY(0);
+      opacity: 1;
+    }
+    55% {
+      transform: translateY(calc(var(--parallax-drift, 0vh) * 0.55));
+      opacity: 1;
+    }
+    to {
+      transform: translateY(var(--parallax-drift, 0vh));
+      opacity: 0;
+    }
+  }
+
+  /* Same construction, tuned for the moon (see its rule above): hold to
+     25%, gone by 65%, transform hand-pinned at both seams. */
+  @keyframes sky-drift-fade-early {
+    from {
+      transform: translateY(0);
+      opacity: 1;
+    }
+    25% {
+      transform: translateY(calc(var(--parallax-drift, 0vh) * 0.25));
+      opacity: 1;
+    }
+    65% {
+      transform: translateY(calc(var(--parallax-drift, 0vh) * 0.65));
+      opacity: 0;
+    }
+    to {
+      transform: translateY(var(--parallax-drift, 0vh));
+      opacity: 0;
+    }
+  }
+
+  @keyframes wind-sway {
+    from,
+    to {
+      transform: translateX(calc(var(--wind-amp, 10px) * -1));
+    }
+    50% {
+      transform: translateX(var(--wind-amp, 10px));
+    }
+  }
+
+  @keyframes shoot {
+    0% {
+      transform: translate3d(0, 0, 0) rotate(-33deg);
+      opacity: 0;
+    }
+    3% {
+      opacity: 0.9;
+    }
+    10% {
+      transform: translate3d(-190px, 123px, 0) rotate(-33deg);
+      opacity: 0;
+    }
+    100% {
+      transform: translate3d(-190px, 123px, 0) rotate(-33deg);
+      opacity: 0;
+    }
+  }
+
+  /*
+   * Opacity only — deliberately NO transform. A time-based scale on these
+   * ::before glows, whose parents carry a scroll-driven transform of their
+   * own, hit a Chromium compositing bug during verification: with the sun
+   * on screen the page rendered blank in the capture path. Pulsing opacity
+   * reads the same and composites cleanly.
+   */
+  @keyframes glow-breathe {
+    from,
+    to {
+      opacity: 0.7;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+
+  /* Percentages are of the whole scroll: fog on the pasture from before
+     first light, thickest as the dawn band crosses, burned off by the time
+     the sky turns full blue. */
+  @keyframes mist-cycle {
+    0% {
+      opacity: 0.55;
+    }
+    20% {
+      opacity: 0.75;
+    }
+    38% {
+      opacity: 0;
+    }
+    100% {
+      opacity: 0;
     }
   }
 </style>
