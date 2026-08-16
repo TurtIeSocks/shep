@@ -8,6 +8,7 @@
  * at crates/shep-core/assets/flockfile.schema.json.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 
@@ -115,6 +116,7 @@ const fieldGroups: FieldGroup[] = [
 >
   <article>
     <h1>Your first Flockfile</h1>
+    <ReferencePills slug="first-flockfile" />
     <p class="lede">
       <a href="/docs/getting-started">Getting started</a> showed a two-field
       Flockfile and moved on. This page is what's underneath: every field
@@ -139,9 +141,13 @@ script = "./server"`}</CodeBlock>
     <p>
       TOML, YAML, JSON, and JSON5 all parse the same document shape — a list
       of app tables under one <code>app</code> key (<code>[[app]]</code> in
-      TOML). Run <code>shep start</code> with no argument and it searches
-      the current directory for these ten names, in order, and stops at the
-      first one it finds:
+      TOML). <code>shep start</code> always takes an explicit
+      <code>&lt;TARGET&gt;</code> — clap refuses with "the following required
+      arguments were not provided" if you leave it off. Discovery belongs to
+      <code>shep runtime</code> and <code>shep dev</code>, whose
+      <code>[TARGET]</code> is optional: run either with no argument and it
+      searches the current directory for these ten names, in order, and
+      stops at the first one it finds:
     </p>
     <CodeBlock>{`Flockfile.toml
 Flockfile.yaml
@@ -160,15 +166,22 @@ flockfile.json5`}</CodeBlock>
       matter what's sitting in the directory. It's read only when you name
       it explicitly with <code>--flockfile</code>:
     </p>
-    <CodeBlock>{`$ shep start ecosystem.config.js --flockfile`}</CodeBlock>
+    <CodeBlock>{`$ shep start flock.config.js --flockfile`}</CodeBlock>
+    <p class="fine">
+      A pm2 <code>ecosystem.config.js</code> is not a Flockfile shep can read
+      this way — shep never parses pm2's config format at all. That's what
+      <code>shep import</code> is for: it reads a real <code>dump.pm2</code>
+      and writes a Flockfile, once, rather than teaching <code>start</code>
+      a second config dialect. See <a href="/docs/from-pm2">Coming from pm2</a>.
+    </p>
     <Callout variant="careful">
       Without <code>--flockfile</code>, <code>shep start server.js</code>
       still means exactly what it always has: run <code>server.js</code> as
       a script, not as config. <code>cd</code>-ing into a cloned repository
-      and running <code>shep start</code> must never execute a stranger's
-      JavaScript on your machine as a side effect of looking for config —
-      that's the whole reasoning behind the ten-name list above stopping at
-      JSON5.
+      and running <code>shep runtime</code> or <code>shep dev</code> with no
+      argument must never execute a stranger's JavaScript on your machine as
+      a side effect of looking for config — that's the whole reasoning
+      behind the ten-name list above stopping at JSON5.
     </Callout>
 
     <h2>Strict grammars</h2>
@@ -289,21 +302,29 @@ unknown field \`max_memory_restart\`, expected one of \`name\`, \`script\`, \`ar
   "type": "object",
   "properties": {
     "$schema": {
-      "description": "The editor's schema hint, read and discarded.",
-      "type": ["string", "null"],
+      "description": "The editor's schema hint, read and discarded.\\n\\nThis is the \\"future schema key\\" the comment above anticipated, added\\nHERE explicitly rather than by relaxing \`deny_unknown_fields\`: a\\ntypo'd key must still fail loudly, and exactly one more key is now\\nlegal. shep does not validate against the named schema and makes no\\npromise about it — it is a hint for the operator's editor, which is\\nthe only consumer that ever reads it.\\n\\nTOML Flockfiles do not need it: taplo's \`#:schema <url>\` directive is\\na comment, invisible to serde. JSON and JSON5 have no comment an\\neditor agrees to look in, which is why this field exists at all.",
+      "type": [
+        "string",
+        "null"
+      ],
       "default": null
     },
     "app": {
       "type": "array",
       "default": [],
-      "items": { "$ref": "#/$defs/AppConfig" }
-    }
-  },
-  "additionalProperties": false,
-  "$defs": {
-    "AppConfig": { "...": "one entry per field above" }
-  }
-}`}</CodeBlock>
+      "items": {
+        "$ref": "#/$defs/AppConfig"
+      }
+    }`}</CodeBlock>
+    <p class="fine">
+      That's the real first twenty lines, unedited — <code>head -20</code>
+      cuts off mid-<code>"app"</code> block, and the <code>"$schema"</code>
+      key's own description is one long escaped line explaining itself,
+      not the tidied multi-line prose above. The full document closes
+      <code>"app"</code>, adds <code>"additionalProperties": false</code>,
+      and a <code>"$defs"</code> section with one entry per Flockfile field —
+      run the command yourself to see the rest.
+    </p>
     <p>
       That <code>"$schema"</code> key is real and accepted — a JSON or
       JSON5 Flockfile can set it to a path and get editor completion, since
