@@ -128,12 +128,40 @@ Nothing in this phase touches `serve`.
 
 ---
 
-## Shapes the design named, and the three places this plan makes one concrete
+## What in this plan was put through a compiler
 
-The design is behaviour. Three of its shapes do not compile as written, and
-this plan fixes each in the smallest way that keeps the stated behaviour.
-None of these is a design change; each is named here so a reviewer sees it
-declared rather than discovers it in a diff.
+An earlier revision of this plan shipped a GREEN block that does not compile,
+because nobody ran it. Every non-trivial Rust block below has now been
+scaffolded on edition 2024 and built with the real borrow checker: `reseat`,
+`select_at`, `rows`, `selected_index`, `set_filter` and the `SelectLast` call
+(Task 1); `arm`, `confirm`, `forget_missing_target`, `disarm_on_link_change`,
+the routing rule and the `try_send` or-pattern (Task 7); `on_action_reply` and
+`outcome` (Task 8); `on_lambs`, `lambs_for` and `lamb_line`'s match with its
+`if lambs.is_empty()` guard (Tasks 4 and 6); and `status_line`'s six-arm chain
+including `app.action().filter(|a| !a.sent)` (Task 9).
+
+One block failed and is fixed: `self.selected = self.visible_ids().nth(index);`
+in `reseat` is **E0506**, because `visible_ids` returns
+`impl Iterator<Item = u32> + '_` and that temporary holds a shared borrow of
+all of `self` to the end of the statement. It is written two lines now. The
+line it replaced borrowed one field, `self.flock.keys()`, which is why the
+shipped version was fine. **Anything a later revision adds that assigns to a
+field of `self` in the same statement as a call taking `&self` has the same
+bug**; the whole plan was swept for the shape and this was the only instance.
+
+Two of Task 1's mutations were also run against the scaffold rather than
+reasoned about, and both stated reasons turned out to be wrong. See Steps 1.5
+and 1.6.
+
+## Shapes the design named, and the five places this plan makes one concrete
+
+The design is behaviour. Five of its shapes do not survive contact with the
+code as written: three do not compile or leave a state unanswered, and two
+would ship a defect if implemented literally. This plan fixes each in the
+smallest way that keeps the stated behaviour. **Three of the five are
+deviations from an assumption Rin approved** and are collected again in a table
+at the end of this plan so she can reject any one of them on its own; each is
+named here so a reviewer sees it declared rather than discovers it in a diff.
 
 **1. `Armed` becomes `Action` plus a `Stage`.** The design writes
 `struct Armed { verb, id, name, at }` and separately describes an in-flight
@@ -145,14 +173,51 @@ carries `stage: Stage` where `Stage` is `Armed` or `Sent`. The design's doc
 comment about the target being captured at arm time and never re-read moves
 onto `Action` verbatim.
 
-**2. The status bar's full priority is confirm, notice, in flight, filter,
-hint.** A18 lists four of those five; the in-flight line is not in A18's list,
-and the design says of it only that it "outranks the hint and the filter line".
-Five slots, in that order, is the only arrangement that satisfies both
-sentences. Consequence, stated so it can be rejected: a transient notice can
-briefly cover the in-flight line, exactly as A4 already accepts for the filter
-line. A keypress clears the notice and the in-flight line comes back, which is
-the property `an_in_flight_line_survives_a_keypress` pins.
+**2. The status bar has SIX slots, because the filter box being typed into is
+not the same thing as the filter line.** A18 says "confirm, then notice, then
+filter, then hint", and the design says of the in-flight line only that it
+"outranks the hint and the filter line". Both sentences use "the filter" for
+two states the design never separates: a box the operator's fingers are on
+right now, and a persistent applied-filter line the title also signals. Keeping
+them together is what produced the two worst defects in this plan's first
+draft, so they are separated here:
+
+| # | slot | why it sits there |
+|---|---|---|
+| 1 | an armed confirm | A18. A question awaiting an answer outranks everything. |
+| 2 | the filter box, while editing | A live interaction outranks a report of a past event. See the paragraph below: A4's stated reason for putting the filter in the bar at all rests on a premise that is false. |
+| 3 | a notice | A18. |
+| 4 | an in-flight action | The design's own words: it outranks the hint and the filter line, and A18 puts the notice above the filter line. |
+| 5 | the applied filter line | A18. |
+| 6 | the key hint | A18. |
+
+**This is a deviation from A4 and needs Rin's nod.** A4 accepts, as the whole
+cost of putting the filter in the status bar, that "a transient notice can
+briefly cover the filter line", and justifies it with "while editing, every
+keypress is text, so nothing can raise a notice". **That premise is false.**
+Three notices in the shipped reducer are raised by messages that are not
+keypresses at all and keep arriving while the box is open:
+`Msg::BusLagged` (`app.rs:313`), `BusEvent::Dropped` (`:415`) and
+`BusEvent::DaemonShutdown` (`:427`). Worse than A4 admits: `on_text_key` does
+not clear the notice, so nothing an operator types takes it back off, and a
+notice landing mid-word would cover the query until they pressed Enter or Esc.
+Slot 2 closes that. What A4 accepts still holds for slot 5, which is the state
+A4's own sketch (`filter_active`) shows.
+
+The alternative fix, clearing `self.notice` at the top of `on_text_key`, is
+rejected: it destroys the notice rather than deferring it, so an operator who
+happened to be typing when the shepherd announced it was shutting down would
+never learn. Slot 2 defers. The notice is still there when the box closes, and
+the next ordinary keypress clears it as notices are cleared.
+
+Consequence of slot 4 sitting below slot 3, stated so it can be rejected: a
+transient notice can briefly cover the in-flight line. That is deliberate and
+it is what makes a refusal visible: `arm`'s "one action is already in flight"
+IS a notice, so a bar that put the in-flight line above notices would swallow
+the answer to the operator's own keypress. A keypress clears the notice and the
+in-flight line comes back, which is the property
+`an_in_flight_line_survives_a_keypress` pins in the reducer and
+`a_refusal_while_an_action_is_in_flight_reaches_the_bar` pins in the view.
 
 **3. A `try_send` that fails needs an answer, and the design does not give
 one.** The reducer enters the in-flight state and hands `run_ui` a request to
@@ -163,6 +228,45 @@ there is a `Msg::Unsent { sent }`, fed by `run_ui` when `try_send` returns
 `Err`, which clears the action and says plainly that it was not sent. For a
 lamb fetch it does nothing, because a dropped lamb fetch already reads as "not
 read yet", which is the design's own rule for a request the channel dropped.
+
+The sentence is `{verb} {name} (id {id}): it was not sent`, and it stops
+there. It does **not** say the shepherd is unreachable, because the reducer
+does not know that: the channel has capacity 2, it is shared with lamb
+fetches, and `run_connected` awaits each request inline, so
+`TrySendError::Full` is reachable while the shepherd is perfectly reachable
+and merely slow. `Full` and `Closed` get one sentence rather than two because
+the operator's next move is the same either way, and because a sentence naming
+a cause the code did not observe is the exact failure the `-` CPU cell exists
+to prevent.
+
+**4. `q` and `Ctrl-C` are not consumed by the routing rule.** The design says
+"every other key cancels", and the routing rule as written consumes every
+non-Enter key, `KeyPress::Quit` included, so `q` and Ctrl-C would stop quitting
+while a prompt is up. That contradicts `input.rs`'s own shipped doctrine, which
+is stated in `map_key`'s doc comment: dropping the Ctrl-C mapping "would leave
+the most reflexive way out of a terminal program doing nothing, and the
+operator's next move" is `kill -9` from another window, "past every restore
+path `super::term` has". So `KeyPress::Quit` returns `Effect::Quit` from inside
+the routing rule, above the cancel. The safety property the rule exists for is
+untouched, because that property is about a cancelling key ALSO doing its
+ordinary job on a target the operator has lost track of, and quitting discards
+the confirm rather than acting on it. **This is a narrow carve-out of A10 and
+it is named here so Rin can reject it**; text mode already makes the same
+carve-out and the design writes it into its own key table there.
+
+**5. An armed confirm is cleared when the link leaves `Live`.** A9 refuses
+arming unless the link is `Live`, but an already-armed prompt would survive the
+link going away and `confirm` does not re-check. Worse, the expiry rides the
+`Msg::Tick` arm's non-`Lost` branch and `now` stops advancing once the link is
+lost (`app.rs:337-342`), so an armed prompt on a frozen dashboard would never
+expire and Enter would still try to send. Refusals in this design happen at arm
+time so an operator never answers a question that was never going to be
+honoured, and leaving the prompt up to refuse at Enter is exactly what that
+rule forbids. So the `Msg::Retrying` and `Msg::Frozen` arms clear an **armed**
+action, which makes "armed implies `Link::Live`" an invariant and leaves
+`confirm` unchanged. An action already **sent** keeps its line: it is a real
+request, and `run_connected` hands back a `Msg::Replied` carrying the `Err`
+before its loop ends, so the in-flight line always resolves.
 
 One more, smaller: the design's walked-lamb sentence is
 `{n} parent-pid descendants`, which reads `1 parent-pid descendants` for a
@@ -321,7 +425,7 @@ wired.
 | 6 | The lamb line, `DETAIL_ROWS` 4 to 5, two frames, docs | `view/detail.rs`, `view/mod.rs`, `frames.rs`, docs | **full** |
 | 7 | The action keys and the confirm state machine | `input.rs`, `app.rs` | inner |
 | 8 | The send path and the reply | `app.rs`, `mod.rs` | inner |
-| 9 | The actions on screen, three frames, docs | `view/status.rs`, `frames.rs`, docs | **full** |
+| 9 | The actions on screen, five frames, docs | `view/status.rs`, `frames.rs`, docs | **full** |
 | 10 | The docs sweep and the phase gate | docs, `cli.rs`, `web/` | **full + phase** |
 
 The order is the design's: filter, then lambs, then actions (A20). The filter
@@ -369,6 +473,12 @@ Add to `app.rs`'s `mod tests`. Every one of these fails to compile first
 ```rust
     /// A dashboard whose filter is set without any keymap involved. Task 2
     /// wires `/` to this; this task proves the sequence underneath it.
+    ///
+    /// Four sheep, two of which contain `web`: `web` at id 1 and `web-worker`
+    /// at id 3, with `api` at id 2 sitting BETWEEN them in the map. The gap is
+    /// deliberate. It is what makes `j` stepping over a hidden row a
+    /// falsifiable claim rather than one a contiguous fixture would pass by
+    /// accident.
     fn filtered(query: &str) -> App {
         let t0 = Instant::now();
         let mut app = App::new(
@@ -487,6 +597,31 @@ Add to `app.rs`'s `mod tests`. Every one of these fails to compile first
         assert_eq!(app.flock_len(), 4, "the flock is still four sheep");
     }
 
+    /// fails if a snapshot clears the filter, or rebuilds the table from the
+    /// unfiltered map. The two-second `ListFlock` reply REPLACES `self.flock`
+    /// wholesale and is by far the most frequent message this reducer sees, so
+    /// a regression here would make the filter appear to work for two seconds
+    /// and then silently widen the table under an operator who is still
+    /// reading it, with the title's `2 of 4` the only thing left saying a
+    /// filter is on.
+    #[test]
+    fn a_filter_survives_the_two_second_snapshot() {
+        let mut app = filtered("web");
+        let t1 = Instant::now();
+        app.update(Msg::Snapshot {
+            rows: vec![
+                sheep(1, "web", ProcStatus::Online),
+                sheep(2, "api", ProcStatus::Online),
+                sheep(3, "web-worker", ProcStatus::Online),
+                sheep(4, "cron", ProcStatus::Online),
+            ],
+            at: t1,
+        });
+        assert_eq!(app.filter(), "web", "the snapshot did not clear it");
+        assert_eq!(app.rows().len(), 2, "and did not widen the table");
+        assert_eq!(app.flock_len(), 4);
+    }
+
     /// fails if clearing the filter does not bring the whole flock back, or
     /// leaves the selection unseated. An empty query is the same as no filter,
     /// which is also what `Enter` on an empty box has to mean.
@@ -499,7 +634,8 @@ Add to `app.rs`'s `mod tests`. Every one of these fails to compile first
     }
 ```
 
-Run them: they do not compile. That is the red.
+Run them: they do not compile. That is the red. **Nine tests, not eight** (the
+verify step below counts them).
 
 ### Step 1.3 - GREEN
 
@@ -563,21 +699,38 @@ Then, in order:
 
 ```rust
     fn reseat(&mut self, previous_index: Option<usize>) -> bool {
+        // `selected_index`, NOT `flock.contains_key`: a selection the filter
+        // is hiding is not seated, however present its id still is in the map.
+        // This one line is the difference between a cursor that follows the
+        // filter and one that wanders behind it.
+        //
+        // It comes FIRST, where the shipped `flock.is_empty()` check used to.
+        // The order is behaviour-preserving (a seated selection implies at
+        // least one visible row), and it is what makes Step 1.6's mutation
+        // able to reach the nothing-matches case: with the emptiness test
+        // above it, reverting this line changes nothing when the query
+        // matches no sheep, because the early return has already fired.
+        if self.selected_index().is_some() {
+            return false;
+        }
         let before = self.selected;
         let visible = self.visible_len();
         if visible == 0 {
             self.selected = None;
             return before != self.selected;
         }
-        // `selected_index`, NOT `flock.contains_key`: a selection the filter
-        // is hiding is not seated, however present its id still is in the map.
-        // This one line is the difference between a cursor that follows the
-        // filter and one that wanders behind it.
-        if self.selected_index().is_some() {
-            return false;
-        }
         let index = previous_index.unwrap_or(0).min(visible - 1);
-        self.selected = self.visible_ids().nth(index);
+        // Bound first, then assigned. `self.selected = self.visible_ids()
+        // .nth(index);` does NOT compile: `visible_ids` returns
+        // `impl Iterator<Item = u32> + '_`, whose temporary holds a shared
+        // borrow of ALL of `self` to the end of the statement, so the
+        // assignment overlaps it and rustc raises E0506. The line this
+        // replaces borrowed one FIELD (`self.flock.keys()`), which is why it
+        // was fine. `select_at` below takes the same two-line shape for the
+        // same reason. Verified with rustc on an edition-2024 scaffold, both
+        // ways round.
+        let next = self.visible_ids().nth(index);
+        self.selected = next;
         before != self.selected
     }
 ```
@@ -671,10 +824,12 @@ cargo fmt --all --check
 cargo test -p shep --lib --bins --all-features
 ```
 
-Expect roughly `566 passed; 0 failed; 3 ignored` (558 plus the eight above).
+Expect roughly `567 passed; 0 failed; 3 ignored` (558 plus the nine above).
 Every pre-existing `app.rs` test must still pass untouched. `grep -c
-'self\.flock\.keys()' crates/shep-cli/src/lookout/app.rs` now prints **0**;
-that, and not the test count, is the check that the refactor is complete.
+'self\.flock\.keys()' crates/shep-cli/src/lookout/app.rs` now prints **0** and
+`grep -c 'self\.flock\.len()'` prints **1** (`flock_len`, which is the one
+read of the real size that is supposed to survive); those two, and not the test
+count, are the check that the refactor is complete.
 
 Clippy will warn `dead_code` on `set_filter`, `filter` and `flock_len` in the
 non-test build. That is expected and Task 2 and Task 3 clear it. Do not run the
@@ -686,9 +841,20 @@ Point `select_by`'s sequence back at the whole flock, exactly as the design
 names it: in `selected_index`, swap `self.visible_ids()` for
 `self.flock.keys().copied()`.
 
-**Must redden `j_and_k_step_only_over_visible_rows`** (the first `SelectDown`
-lands on `api` at id 2, which the filter is hiding) and
-`a_filter_that_hides_the_selection_clamps_to_the_nearest_visible_row`. Revert.
+**Must redden `j_and_k_step_only_over_visible_rows` on its final `SelectUp`**,
+and `a_filter_that_hides_the_selection_clamps_to_the_nearest_visible_row`, and
+`nothing_visible_means_nothing_selected`.
+
+Name the assertion, because the obvious guess is wrong and a mutation whose
+stated reason does not match what happens is a check nobody can audit. The
+first `SelectDown` still lands on `web-worker` at id 3, not on the hidden `api`
+at id 2, because `select_at` walks `visible_ids()` and only the index LOOKUP is
+mutated. What breaks is the round trip: `selected_index` reports id 3's
+position in the whole flock (2), `select_by(-1)` asks for position 1, and
+`select_at` reads position 1 of the VISIBLE set, which is id 3 again, so the
+cursor never comes back up. Measured on the scaffold: `left: Some(3), right:
+Some(1)`. It reddens the other two because `reseat`'s guard reads
+`selected_index` as well.
 
 ### Step 1.6 - second MUTATION
 
@@ -697,9 +863,16 @@ back in place of `self.selected_index().is_some()`.
 
 **Must redden `a_filter_that_hides_the_selection_clamps_to_the_nearest_visible_row`**
 (the selection stays on `cron`, which is hidden) **and
-`nothing_visible_means_nothing_selected`**. This is the subtlest line in the
-task: the mutated version passes every test that does not set a filter, which
-is every test that existed before today. Revert.
+`nothing_visible_means_nothing_selected`** (it stays on `web` at id 1, which
+`zzz` hides). Both, and both only because Step 1.3 put the guard ABOVE the
+`visible == 0` test: with the emptiness test first, the nothing-matches case
+returns before the guard is ever read and the second half of this mutation is
+a dead check. Measured both orders on a scaffold. `j_and_k_step_only_over_
+visible_rows` stays green here, correctly, because it never exercises `reseat`.
+
+This is the subtlest line in the task: the mutated version passes every test
+that does not set a filter, which is every test that existed before today.
+Revert.
 
 ---
 
@@ -842,7 +1015,7 @@ In `app.rs`'s `mod tests`:
         app.update(Msg::Key(KeyPress::FilterChar('z')));
         assert_eq!(app.rows().len(), 0);
         app.update(Msg::Key(KeyPress::FilterBackspace));
-        assert_eq!(app.rows().len(), 1, "wz became w");
+        assert_eq!(app.rows().len(), 2, "wz became w, which matches web and worker");
     }
 
     /// fails if abandoning the box leaves the filter behind. `Esc` while
@@ -858,10 +1031,16 @@ In `app.rs`'s `mod tests`:
         assert_eq!(app.rows().len(), 3);
     }
 
-    /// fails if a notice survives into the filter box. The bar's priority puts
-    /// a notice above the filter line, so a notice left standing would cover
-    /// the query the operator is typing. Opening the box takes it down; while
-    /// the box is open nothing can raise a new one, because every key is text.
+    /// fails if a notice survives into the filter box. Two things keep the
+    /// query visible and this is one of them: opening the box takes any
+    /// standing notice down (the `self.notice = None` at the top of `on_key`'s
+    /// normal branch, which `FilterStart` goes through), and slot 2 of the bar
+    /// keeps a notice raised LATER, while the box is open, from covering it.
+    /// The second is what actually matters, because `Msg::BusLagged`,
+    /// `BusEvent::Dropped` and `BusEvent::DaemonShutdown` all raise notices
+    /// with no keypress involved and keep arriving while somebody types; see
+    /// "Shapes the design named" #2. This test pins the first, which is what
+    /// stops a stale notice reappearing the instant the box closes.
     #[test]
     fn opening_the_filter_takes_a_notice_off_the_bar() {
         let (mut app, _t0) = started();
@@ -872,10 +1051,33 @@ In `app.rs`'s `mod tests`:
     }
 ```
 
-`started()` builds three sheep named `web`, `api` and `worker`, so `w` matches
-`web` and `worker` while `web` matches one. Check that against the fixture at
-the top of `app.rs`'s `mod tests` before trusting the numbers above and adjust
-the literals, not the assertions, if it has drifted.
+```rust
+    /// fails if a notice raised WHILE the box is open is destroyed rather than
+    /// deferred. The rejected fix for the same problem was to clear
+    /// `self.notice` at the top of `on_text_key`; it would lose a
+    /// `DaemonShutdown` because the operator happened to be mid-word. The bar
+    /// hides the notice under the box (slot 2) and this pins that the notice
+    /// itself is still there to be shown when the box closes.
+    #[test]
+    fn a_notice_raised_while_typing_is_deferred_and_not_destroyed() {
+        let (mut app, _t0) = started();
+        app.update(Msg::Key(KeyPress::FilterStart));
+        app.update(Msg::Key(KeyPress::FilterChar('w')));
+        app.update(Msg::Event(BusEvent::DaemonShutdown));
+        app.update(Msg::Key(KeyPress::FilterChar('e')));
+        assert!(
+            app.notice().is_some(),
+            "typing did not wipe the shepherd's announcement"
+        );
+        assert_eq!(app.filter(), "we", "and the box kept the query");
+    }
+```
+
+`started()` builds three sheep named `web`, `api` and `worker`, at ids 1, 2
+and 3. So `w` matches `web` AND `worker` (two rows), `we` matches `web` alone,
+and `wz` matches nothing. Check that against the fixture at the top of
+`app.rs`'s `mod tests` before trusting the numbers above and adjust the
+literals, not the assertions, if it has drifted.
 
 ### Step 2.3 - GREEN: `app.rs`
 
@@ -924,9 +1126,10 @@ accessor. Then `on_key`:
 
 ```rust
     fn on_key(&mut self, key: KeyPress) -> Effect {
-        // While the box is open every key is text. Nothing below this line can
-        // raise a notice, which is what makes the bar's filter line safe from
-        // being covered mid-word.
+        // While the box is open every KEY is text. That is not the same as
+        // nothing being able to raise a notice: three of them arrive on
+        // messages that are not keys at all, and the status bar rather than
+        // this branch is what keeps them off the query. See `on_text_key`.
         if self.mode == InputMode::Text {
             return self.on_text_key(key);
         }
@@ -966,6 +1169,14 @@ accessor. Then `on_key`:
     /// a text box that swallowed it would leave the operator reaching for
     /// `kill -9` from another window, past every restore path
     /// [`super::term`] has.
+    ///
+    /// Deliberately does NOT clear [`Self::notice`], unlike the normal-mode
+    /// branch above it. A notice can be raised while this box is open, by
+    /// `Msg::BusLagged`, `BusEvent::Dropped` or `BusEvent::DaemonShutdown`,
+    /// none of which is a keypress; clearing here would destroy it because
+    /// somebody was mid-word. The status bar hides it under the box instead
+    /// and shows it when the box closes. See the phase plan's
+    /// "Shapes the design named" #2.
     fn on_text_key(&mut self, key: KeyPress) -> Effect {
         match key {
             KeyPress::Quit => Effect::Quit,
@@ -1047,7 +1258,7 @@ cargo fmt --all --check
 cargo test -p shep --lib --bins --all-features
 ```
 
-Roughly `577 passed` (566 plus eleven). `failed` stays 0.
+Roughly `579 passed` (567 plus twelve). `failed` stays 0.
 
 ### Step 2.6 - MUTATION
 
@@ -1136,6 +1347,31 @@ twice in `frames.rs`. This task fixes all four.
         assert!(bar.contains("ctrl-c quits"), "got {bar:?}");
     }
 
+    /// fails if a notice covers the box. A `Dropped` event arrives with no
+    /// keypress and `on_text_key` does not clear notices, so a bar that
+    /// ranked the notice higher would take the operator's half-typed query
+    /// off the screen and leave it off until they pressed Enter or Esc.
+    #[test]
+    fn a_notice_raised_while_typing_does_not_cover_the_box() {
+        let mut app = editing_app("we");
+        app.update(Msg::Event(BusEvent::Dropped { count: 3 }));
+        let bar = rendered(&status_line(&app, 120));
+        assert!(bar.contains("filter  we\u{258f}"), "the box is still there: {bar:?}");
+        assert!(!bar.contains("dropped 3 events"), "got {bar:?}");
+    }
+
+    /// fails if the deferred notice never gets its turn. The mirror of the
+    /// test above: hiding a notice under the box is only honest if closing the
+    /// box shows it.
+    #[test]
+    fn closing_the_box_shows_the_notice_that_was_waiting() {
+        let mut app = editing_app("we");
+        app.update(Msg::Event(BusEvent::Dropped { count: 3 }));
+        app.update(Msg::Key(KeyPress::FilterApply));
+        let bar = rendered(&status_line(&app, 120));
+        assert!(bar.contains("dropped 3 events"), "got {bar:?}");
+    }
+
     /// fails if `/` stops being advertised. It is the only way into the box
     /// and nothing else on the screen hints at it.
     #[test]
@@ -1187,9 +1423,67 @@ twice in `frames.rs`. This task fixes all four.
     }
 ```
 
-The three new fixtures (`filtered_app`, `filtered_app_of`, `editing_app`) go in
+The three new fixtures, plus one private helper they share, go in
 `view/fixtures.rs` beside the shipped ones, each building an `App` through
-`Msg::Key` presses rather than by touching a private field.
+`Msg::Key` presses rather than by touching a private field. Written out, because an implementer guessing at `filtered_app_of`'s
+argument order is an implementer writing a different test:
+
+```rust
+/// Four sheep at ids 1..=4 named `web`, `api`, `web-worker`, `cron`, with
+/// `query` typed into the filter box and applied. An empty `query` leaves the
+/// dashboard unfiltered, which is what the "nothing changed" assertions need.
+///
+/// Two of the four contain `web`, with `api` between them, so a fixture that
+/// stepped over hidden rows would show up as a wrong count rather than as a
+/// passing test.
+pub fn filtered_app(query: &str) -> App {
+    filtered_app_of(named_flock(), query)
+}
+
+/// [`filtered_app`] over an explicit flock, for the empty-flock mirror.
+pub fn filtered_app_of(flock: Vec<ProcessInfo>, query: &str) -> App {
+    let mut app = app_with(flock, plain());
+    if !query.is_empty() {
+        app.update(Msg::Key(KeyPress::FilterStart));
+        for typed in query.chars() {
+            app.update(Msg::Key(KeyPress::FilterChar(typed)));
+        }
+        app.update(Msg::Key(KeyPress::FilterApply));
+    }
+    app
+}
+
+/// The same four sheep with `query` half-typed and the box still OPEN: no
+/// `FilterApply`, which is the whole difference between this and
+/// [`filtered_app`].
+pub fn editing_app(query: &str) -> App {
+    let mut app = app_with(named_flock(), plain());
+    app.update(Msg::Key(KeyPress::FilterStart));
+    for typed in query.chars() {
+        app.update(Msg::Key(KeyPress::FilterChar(typed)));
+    }
+    app
+}
+
+/// The four named sheep the filter fixtures share. `flock_of` names its sheep
+/// `sheep-0`..`sheep-N`, which every query would match or miss together.
+fn named_flock() -> Vec<ProcessInfo> {
+    [(1, "web"), (2, "api"), (3, "web-worker"), (4, "cron")]
+        .into_iter()
+        .map(|(id, name)| {
+            ProcessInfo::builder(id, name, ProcStatus::Online)
+                .pid(Some(48_000 + id))
+                .uptime_ms(4_512_000)
+                .build()
+        })
+        .collect()
+}
+```
+
+`view/status.rs`'s test module builds its `App`s inline today and imports no
+fixtures. Add `use super::super::fixtures::{editing_app, filtered_app, rendered};`
+to it in this task; `view/mod.rs`'s test module already imports from
+`fixtures` and gains `filtered_app` and `filtered_app_of`.
 
 ### Step 3.3 - GREEN
 
@@ -1205,21 +1499,27 @@ The three new fixtures (`filtered_app`, `filtered_app_of`, `editing_app`) go in
     };
 ```
 
-**`view/status.rs`, `status_line`'s left slot.** Five slots, highest first.
-The two action states are Task 9's; leave the `if let` shape ready for them
-rather than restructuring twice, but do not write the arms yet.
+**`view/status.rs`, `status_line`'s left slot.** Six slots, highest first (see
+"Shapes the design named" #2 for why the box and the applied filter line are
+two of them and not one). Slots 1 and 4 are Task 9's; leave the `if let` chain
+ready for them rather than restructuring twice, but do not write the arms yet.
+
+The box sits **above** the notice. That is the ordering this task must get
+right and the one a reader will be tempted to swap back, so the comment says
+why in the code rather than only here.
 
 ```rust
-    let (left, left_style) = if let Some(notice) = app.notice() {
-        (
-            notice.to_string(),
-            if notice.is_grave() {
-                palette.refusal()
-            } else {
-                palette.attention()
-            },
-        )
-    } else if app.mode() == InputMode::Text {
+    let (left, left_style) = if app.mode() == InputMode::Text {
+        // ABOVE the notice, not below it. `Msg::BusLagged`,
+        // `BusEvent::Dropped` and `BusEvent::DaemonShutdown` all raise notices
+        // with no keypress involved, and they keep arriving while somebody is
+        // typing a sheep name; a notice that covered the box would take the
+        // query off the screen mid-word, and `on_text_key` does not clear
+        // notices, so nothing the operator typed would bring it back. The
+        // notice is not lost: it is what this slot shows the moment the box
+        // closes. A report of a past event does not outrank an interaction in
+        // progress.
+        //
         // The cursor is a character, not a style: the ANSI gallery renders
         // foregrounds only, and a reversed cell would come out unstyled there.
         // Same call the selection marker already makes.
@@ -1230,6 +1530,15 @@ rather than restructuring twice, but do not write the arms yet.
             ),
             palette.attention(),
         )
+    } else if let Some(notice) = app.notice() {
+        (
+            notice.to_string(),
+            if notice.is_grave() {
+                palette.refusal()
+            } else {
+                palette.attention()
+            },
+        )
     } else if !app.filter().is_empty() {
         (
             format!("filter \"{}\"   / edit   esc clear", app.filter()),
@@ -1239,6 +1548,8 @@ rather than restructuring twice, but do not write the arms yet.
         (hint_for(app.control()), palette.muted())
     };
 ```
+
+`status.rs` gains `InputMode` on its `use super::super::app::{...}` line.
 
 with
 
@@ -1253,10 +1564,12 @@ with
 /// nothing, which is the asterisk-instead-of-a-hint failure the rule is about,
 /// shipped by the plan rather than by the code.
 ///
-/// The text is 59 characters, comfortably longer than the 39 the 49-column
-/// truncation test needs, so
-/// `a_truncated_hint_still_leaves_a_gap_before_the_control_label` still
-/// measures what it was written to measure.
+/// The text is 59 characters, up from the 48 that shipped. It still truncates
+/// at the 39 columns the 49-column gap test leaves for it, and the first 40
+/// characters are byte-identical to the old hint, so
+/// `a_truncated_hint_still_leaves_a_gap_before_the_control_label` measures
+/// exactly what it was written to measure and the `narrow` and `cramped`
+/// frames do not move.
 fn hint_for(_control: Control) -> String {
     "q quit   j/k select   g/G first/last   r refresh   / filter".to_string()
 }
@@ -1265,6 +1578,23 @@ fn hint_for(_control: Control) -> String {
 The parameter is taken and ignored on purpose: Task 9 fills it in, and a
 signature that grew an argument later would touch the call site twice. Name it
 `_control` so the ordinary build is quiet.
+
+**Two shipped doc comments in the same file say 48 and become false here.**
+Fix them in this task, not in Task 9, because this is the task that changes the
+number:
+
+- `a_truncated_hint_still_leaves_a_gap_before_the_control_label`: "the default
+  hint is 48 characters, the label 9" becomes 59 and 9. The rest of that
+  comment, including the paragraph about why 49 is not tied to the `narrow`
+  scene, stays exactly as it is.
+- `the_key_hint_says_what_the_keys_now_do`: "The replacement is the same 48
+  characters as the original" is now two revisions stale. Say that the hint is
+  59 characters and that its first 40 are unchanged, which is the property that
+  keeps the 49-column test measuring the same thing.
+
+Neither test's assertions change. Both still pass; it is only their stated
+reasons that would otherwise be wrong, which is the class this project keeps
+catching in review.
 
 **`view/mod.rs`, the empty-table branch:**
 
@@ -1410,18 +1740,30 @@ Assertions, one per caption clause:
 
 ### Step 3.5 - the shipped snapshots, and the one caption that just became false
 
-Every pinned frame's status bar gains `/ filter`, so all fourteen `.snap` files
-change. Re-accept them deliberately, then read the diff:
+**Ten of the fourteen `.snap` files change, not all fourteen.** The four that
+do not are worth naming, because "all fourteen changed" as an acceptance check
+would pass a diff in which four frames moved for a reason nobody looked at:
+
+| frame | why it does not move |
+|---|---|
+| `too_narrow` | 28 columns, below `MIN_TERM_WIDTH` (33). `draw` returns two short lines and never reaches the status bar. |
+| `refused` | Its bar carries the read-only notice, so the hint is not what is drawn. |
+| `narrow` | 51 columns. The bar truncates the hint at 41 characters and the old and new hints share their first 40, so it renders `...   r…` either way. |
+| `cramped` | 33 columns. Same, truncated at 23. |
+
+The other ten gain `   / filter`. Re-accept them deliberately, then read the
+diff:
 
 ```bash
-cargo test -p shep --lib --all-features -- lookout::frames    # red: 14 changed, 3 new
+cargo test -p shep --lib --all-features -- lookout::frames    # red: 10 changed, 3 new
 cargo insta review                                            # or: INSTA_FORCE_UPDATE=1 cargo test ...
-git diff --stat crates/shep-cli/src/lookout/snapshots/
+git diff --stat crates/shep-cli/src/lookout/snapshots/        # 10 changed files
 ```
 
-The only change in the fourteen existing files must be the status-bar row. If a
-table row, a title or a pane line moved, something else moved with it and the
-task is not done.
+The diff must be exactly ten files, and the only change in each must be the
+status-bar row. If a table row, a title or a pane line moved, something else
+moved with it and the task is not done; if one of the four above appears in the
+diff, work out why before accepting it.
 
 **One shipped caption becomes false in this phase and must be fixed here rather
 than in Task 9.** `Scene::Refused`'s caption reads:
@@ -1458,16 +1800,39 @@ files, which the run above rewrites from the preamble):
 
 In the same preamble, `Phase 12b frames` becomes `Phase 16 frames` and
 `the same fourteen frames with colour` becomes `the same seventeen frames with
-colour`; by the end of Task 9 both numbers are twenty-two, so treat this as two
-edits, not one. Leave the rest of the preamble byte-identical.
+colour`. Leave the rest of the preamble byte-identical.
+
+**Two more copies of the count live outside the preamble** and this project's
+seam rule is that a number stops counting the moment something is added beside
+it. Both are in `frames.rs`:
+
+- `Scene::caption`'s doc, "so Rin does not have to hold fourteen of them in her
+  head" (around `frames.rs:199`).
+- `every_scene_shows_the_thing_it_is_named_for`'s
+  `#[allow(clippy::too_many_lines)] // fourteen captions, each pinned clause by
+  clause` (around `frames.rs:714`).
+
+Four numbers in total, then: two in the preamble and these two. By the end of
+Task 9 all four read twenty-four, so each is edited three times across this
+phase. Grep for the spelled-out word at the end of Tasks 3, 6 and 9 rather than
+trusting memory:
+
+```bash
+grep -rn 'fourteen\|seventeen\|nineteen\|twenty-two\|twenty-four' \
+  crates/shep-cli/src/lookout/frames.rs docs/lookout/frames.txt
+```
 
 ### Step 3.7 - the two prose documents
 
 - `docs/specs/deferred.md`: delete the **lookout's search/filter** entry
   outright. It is built.
 - `docs/lookout/README.md`: delete the **Search/filter** bullet under "What is
-  still open", and add the filter to whatever section describes the keymap,
-  including the sentence that `esc` clears a filter before it quits.
+  still open", and add the filter to the keymap, which is the
+  "**A selected sheep, and the table marks it.**" bullet under "What 12b
+  settled" (`README.md:69`). Include the sentence that `esc` clears a filter
+  before it quits, and the one saying the title carries `2 of 6` for as long as
+  one is on. Do NOT delete the "What is still open" heading yet: two bullets
+  remain under it until Task 9.
 
 Both edits land in this task's commit, not in Task 10's, so the document and
 the feature it describes move together.
@@ -1700,6 +2065,22 @@ the reasons `source.rs`'s doc gives. Do not touch it.
 `RecordingFlock` is a hand-rolled `FlockSource` beside `CountingFlock` (IR-33,
 no mock crate): `flock()` returns one sheep, `send()` records the `Request` and
 answers `Response::Described` with one row.
+
+**Two things break the moment `send` becomes a required trait method, and
+neither is a design question. Both are compiler errors; naming them here saves
+an implementer working out mid-task whether they are in scope.**
+
+1. `CountingFlock`, the existing hand-rolled source in `link.rs`'s test module
+   (`link.rs:303`), stops implementing `FlockSource`. Give it a `send` that
+   answers `Ok(Response::Described(vec![]))` and ignores its argument: the
+   tests that use it are about poll counting and know nothing about requests.
+2. `run_ui` gains a parameter, so its call sites stop compiling. There are
+   **six**: one production (`mod.rs:197`) and **five in `mod.rs`'s own test
+   module** (around `:510`, `:551`, `:626`, `:693`, `:790`). Each test site
+   gains a throwaway sender. Keep the receiver alive in the test that asserts
+   on it (Task 5) and let it drop in the rest; a dropped receiver makes
+   `try_send` return `Closed`, which is a case the reducer already answers with
+   `Msg::Unsent`.
 
 ### Step 4.3 - GREEN: `source.rs`
 
@@ -1935,9 +2316,9 @@ In `mod.rs`'s `lookout`:
     ));
 ```
 
-and `run_ui` gains `requests: mpsc::Sender<Sent>` beside `polls`. It has no
-send site until Task 5, so **expect exactly one `unused_variables` warning
-between here and there.** That is why the gate does not run after this task. Do
+and `run_ui` gains `requests: mpsc::Sender<Sent>` beside `polls`, at all six
+call sites listed under Step 4.2. It has no send site until Task 5, so
+**expect exactly one `unused_variables` warning between here and there.** That is why the gate does not run after this task. Do
 not add an `allow` and do not add a placeholder send.
 
 ### Step 4.6 - verify
@@ -1947,7 +2328,7 @@ cargo fmt --all --check
 cargo test -p shep --lib --bins --all-features
 ```
 
-Roughly `583 passed; 0 failed; 3 ignored`.
+Roughly `585 passed; 0 failed; 3 ignored`.
 
 ### Step 4.7 - MUTATION
 
@@ -1982,12 +2363,30 @@ two-second timer the daemon's own docs argue against.
 
 ```bash
 grep -rn 'RefreshSelected' crates/ | wc -l                              # 0
-grep -c 'Effect::RefreshFeed' crates/shep-cli/src/lookout/app.rs        # 4
 grep -c 'feed_dirty' crates/shep-cli/src/lookout/mod.rs                 # 6
-cargo test -p shep --lib --all-features -- lookout::                    # 100 passed, 1 ignored
+grep -n 'Effect::RefreshFeed' crates/shep-cli/src/lookout/app.rs        # see below
+cargo test -p shep --lib --all-features -- lookout::                    # 94 at HEAD, plus Tasks 1-4
 ```
 
 ### Step 5.2 - RED
+
+Two of those need a word, because the first draft of this plan got both wrong
+and a baseline that does not print what it claims is worthless downstream.
+
+- **`Effect::RefreshFeed` is a `grep -n`, not a `grep -c`.** The count at HEAD
+  is 12, not 4: it appears in five doc comments as well as in the code, which
+  is the "a whole-file grep whose word also appears in a doc comment" shape
+  from the baselines section above. What this task needs is the list of call
+  sites, which is the four `Effect::RefreshFeed` expressions at `app.rs:309`
+  (the `Snapshot` arm), `:389` and `:404` (the two `on_event` arms) and `:541`
+  (`select_at`), plus the three test assertions at `:807`, `:811` and `:820`.
+  Count the call, not the word.
+- **The `lookout::` total is a moving target by construction** and this task
+  runs in the middle of the phase. It prints `94 passed; 0 failed; 1 ignored`
+  at HEAD, measured; Tasks 1 to 4 add roughly thirty more, so expect about 125
+  here. Use it as a shape and check `failed` is 0. The number that matters in
+  this task is the `RefreshSelected` grep, which is 0 before and non-zero
+  after.
 
 `app.rs`:
 
@@ -2096,6 +2495,31 @@ Then: `select_at` returns `RefreshSelected` instead of `RefreshFeed`;
 `was_empty` upsert arm in `on_event` return `RefreshSelected`; **the `Snapshot`
 arm keeps `RefreshFeed`, unconditionally, exactly as it is.**
 
+### Step 5.3a - the four assertions this reddens, and why they are updated
+
+Changing what `select_at` returns changes what four existing tests observe.
+Three of them shipped; one this plan wrote in Task 2. **Updating a shipped
+test's expectation is exactly the thing a review should stop, so it is written
+down here as an intended consequence rather than discovered in a diff, and the
+commit message says so.**
+
+- `a_selection_that_moves_refreshes_the_feed_and_one_that_cannot_does_not`
+  (`app.rs`, shipped): its three `assert_eq!(..., Effect::RefreshFeed)` on
+  `SelectDown`, `SelectFirst` and `SelectLast` become `Effect::RefreshSelected`.
+  Its two `Effect::None` assertions do not move, and they are the half of the
+  test that carries its real claim: a selection that could not move asks for
+  nothing. Its doc comment gains one sentence saying the effect now covers the
+  lambs as well as the feed.
+- `esc_clears_the_filter_instead_of_quitting_while_one_is_set` (Task 2): its
+  one `Effect::RefreshFeed` becomes `Effect::RefreshSelected`, because clearing
+  a filter moves the cursor and therefore changes which sheep every pane below
+  the table is describing.
+
+`a_snapshot_refreshes_the_feed_unless_the_link_is_frozen` (`app.rs`, shipped)
+must NOT change. It asserts `Effect::RefreshFeed` from the `Snapshot` arm, and
+that is the whole cost decision this task exists to preserve. A diff that
+touched it has inverted the feature.
+
 ### Step 5.4 - GREEN: `mod.rs`
 
 Beside `feed_dirty`, mirroring it exactly:
@@ -2164,7 +2588,7 @@ cargo fmt --all --check
 cargo test -p shep --lib --bins --all-features
 ```
 
-Roughly `588 passed; 0 failed; 3 ignored`. The `unused_variables` warning from
+Roughly `590 passed; 0 failed; 3 ignored`. The `unused_variables` warning from
 Task 4 is gone.
 
 ### Step 5.6 - MUTATION
@@ -2293,6 +2717,110 @@ fixture for the pane's walked state.
         let app = with_lamb_reading_for(11, LambWalk::Walked(vec![Lamb::new(48_220, "node")]));
         assert!(render_all(&detail_lines(&app, 200)).contains("lambs  not read yet"));
     }
+
+    /// fails if the stamp reads a live clock instead of `App::now`, and fails
+    /// again if a frozen dashboard's stamp creeps. Two halves, and BOTH are
+    /// needed: the first proves the stamp moves at all, the second proves it
+    /// stops when the banner says the values did.
+    ///
+    /// This is a unit test rather than a two-age frame comparison, and that is
+    /// the point. Rendering the frozen scene at two ages cannot fail for this
+    /// mutation: both renders happen at the same wall-clock instant, so a live
+    /// clock produces the same string in both and the frames stay identical.
+    /// Here the two ages differ by construction, because they are `Msg::Tick`
+    /// arithmetic rather than elapsed time. No sleep (IR-33).
+    #[test]
+    fn the_stamp_ages_on_a_live_dashboard_and_stops_on_a_frozen_one() {
+        let (mut app, t0) = app_with_lamb_reading_at(LambWalk::Walked(vec![Lamb::new(
+            48_220, "node",
+        )]));
+        app.update(Msg::Tick {
+            now: t0 + Duration::from_secs(120),
+        });
+        let live = lamb_line_of(&app);
+        assert!(live.contains("read 2m ago"), "the stamp aged: {live:?}");
+
+        app.update(Msg::Frozen {
+            at_local: "2026-08-16 09:00:00".to_string(),
+        });
+        app.update(Msg::Tick {
+            now: t0 + Duration::from_secs(3_600),
+        });
+        assert_eq!(
+            lamb_line_of(&app),
+            live,
+            "a frozen dashboard's reading must not age"
+        );
+    }
+```
+
+Two helpers in `view/fixtures.rs`, and the two `with_lamb_reading*` fixtures
+the tests above use. Written out, because the `LambWalk`-to-`Msg::Replied`
+mapping is not mechanical: the reducer never takes a `LambWalk` directly, it
+derives one from a reply, so each variant needs the reply that produces it.
+
+```rust
+/// [`with_selection`] over [`sheep_with_lambs`] (id 9), with one lamb reading
+/// applied for that sheep.
+pub fn with_lamb_reading(walk: LambWalk) -> App {
+    with_lamb_reading_for(9, walk)
+}
+
+/// The same, with the reading pinned to `id` instead, so a test can hand the
+/// pane a reading that belongs to a different sheep.
+pub fn with_lamb_reading_for(id: u32, walk: LambWalk) -> App {
+    let mut app = with_selection(sheep_with_lambs());
+    app.update(Msg::Replied {
+        sent: Sent::Lambs { id },
+        result: reply_for(id, &walk),
+    });
+    app
+}
+
+/// [`with_lamb_reading`] plus the `Instant` the dashboard started at, for the
+/// one test that needs to tick the clock forward itself.
+pub fn app_with_lamb_reading_at(walk: LambWalk) -> (App, Instant) {
+    let t0 = Instant::now();
+    let mut app = with_selection(sheep_with_lambs());
+    app.update(Msg::Tick { now: t0 });
+    app.update(Msg::Replied {
+        sent: Sent::Lambs { id: 9 },
+        result: reply_for(9, &walk),
+    });
+    (app, t0)
+}
+
+/// The reply that makes the reducer record `walk`. There is no way to set a
+/// `LambWalk` directly and there should not be: a fixture that reached past
+/// `on_lambs` would stop testing the mapping this pane depends on.
+///
+/// `Failed` is produced by an `Err` rather than by an unrecognised `Ok`,
+/// because the two are the same state and `Err` is the one an operator
+/// actually meets.
+fn reply_for(id: u32, walk: &LambWalk) -> Result<Response, RequestError> {
+    let lambs = match walk {
+        LambWalk::Failed => return Err(RequestError::Closed),
+        LambWalk::NotWalked => None,
+        LambWalk::Walked(lambs) => Some(lambs.clone()),
+    };
+    Ok(Response::Described(vec![
+        ProcessInfo::builder(id, "gateway", ProcStatus::Online)
+            .pid(Some(48_301))
+            .lambs(lambs)
+            .build(),
+    ]))
+}
+
+/// The pane's lamb line alone, for the tests that compare two renderings of
+/// it. Panics if the pane has none, so a regression that dropped the line
+/// entirely cannot pass by comparing two absences.
+pub fn lamb_line_of(app: &App) -> String {
+    render_all(&super::detail::detail_lines(app, 200))
+        .lines()
+        .find(|line| line.starts_with("lambs  "))
+        .map(str::to_string)
+        .expect("the pane has a lamb line")
+}
 ```
 
 `view/mod.rs`:
@@ -2320,11 +2848,19 @@ fixture for the pane's walked state.
 `view/mod.rs`: `const DETAIL_ROWS: u16 = 5;` with its doc becoming "one rule
 and four lines". Nothing else in the tier table moves.
 
-`view/detail.rs`: the module doc's opening claim ("no second request, no
-`Request::Describe`, and therefore no lamb list") is now false and is replaced
-by what is true: the pane's other lines come from the `ProcessInfo` the flock
-table's own rows carry, and the lamb line alone comes from a `Describe` fetched
-on selection change and on `r`, never on the poll.
+`view/detail.rs`: **three claims in this file count or describe the pane and
+all three become false.** They are one edit each and the third is the one a
+sweep forgets:
+
+1. The module doc's opening claim, "no second request, no `Request::Describe`,
+   and therefore no lamb list", is replaced by what is true: the pane's other
+   lines come from the `ProcessInfo` the flock table's own rows carry, and the
+   lamb line alone comes from a `Describe` fetched on selection change and on
+   `r`, never on the poll.
+2. The module doc's first line, "The sheep detail pane: three lines about the
+   selected sheep", becomes four.
+3. `detail_lines`'s own doc, "The pane's three content lines. Its rule is
+   [`super::draw`]'s", becomes four.
 
 The no-selection branch returns four lines (its `why` sentence plus three
 blanks). The selected branch inserts the lamb line second, between the sheep
@@ -2395,9 +2931,23 @@ changes twice this phase.
 
 `Lambs` takes the default six-sheep flock with the selection already on `api`
 (id 2, the third row, which the shipped selection block puts it on) and one
-`Msg::Replied` carrying a walk of three. `LambsUnknown` takes the `Errored`
-flock, moves the selection onto `cron` (id 4, stopped, no pid) and applies a
-`Described` reply whose row carries `lambs: None`.
+`Msg::Replied` carrying a walk of three.
+
+`LambsUnknown` needs two edits that are easy to miss and that the compiler will
+only catch one of:
+
+1. **The flock match arm.** The `Errored` flock is the only one whose `cron` at
+   id 4 is `ProcStatus::Stopped` with no pid, which is the state this scene
+   exists to show. That flock lives in the `Scene::Errored | Scene::Frozen`
+   arm, so the arm becomes
+   `Scene::Errored | Scene::Frozen | Scene::LambsUnknown`. Miss this and the
+   scene silently draws the default flock, whose `cron` is `Online` with a pid,
+   and the frame shows the wrong sentence rather than failing to build.
+2. **Two more `SelectDown`s.** The shipped selection block applies exactly two
+   to every scene outside its four-scene exclusion list, which lands the cursor
+   on `api` at id 2. `cron` is id 4, two rows further down, so the scene block
+   applies two more of its own. This one is not a compiler error either: the
+   frame would render `sheep 2  api` under a caption about a stopped sheep.
 
 In `scene_with`, after the feed and before the `Retrying` / `Frozen` block, so
 that the frozen scene's reading is applied while the link is still live:
@@ -2420,11 +2970,22 @@ that the frozen scene's reading is applied while the link is still live:
         }
 ```
 
-**Give `Scene::Frozen` a reading too**, applied the same way and before
-`Msg::Frozen`, so the two-age comparison has something to catch. Without it,
-`a_frozen_dashboard_does_not_age_its_lamb_reading` would pass on a frame with
-no lamb line at all, which is the "passes for the wrong reason" shape the
-frozen test's own doc already warns about for the uptime column.
+**`Scene::Frozen` gets a reading too**, applied the same way and before
+`Msg::Frozen`, so the gallery carries one frame of a lamb line on a frozen
+dashboard. It is applied while the link is still `Live` because `on_lambs`
+refuses once it is `Lost`, which is the same guard `Msg::Bleats` carries.
+
+**It is not there to support a test.** The first draft of this plan pinned the
+freeze property with a two-age frame comparison, modelled on the uptime
+column's. That check cannot fail: both renders happen at the same wall-clock
+instant, so an implementation reading a live clock produces the same string in
+both and the frames stay identical. Worse, `App::now` stops at `t0 + 7s` for
+the frozen scene and the reading is taken at the same instant, so the stamp is
+`read 0s ago` in both renders whatever the implementation does. The property
+lives in `the_stamp_ages_on_a_live_dashboard_and_stops_on_a_frozen_one` in
+`detail.rs` (Step 6.3), where the two ages differ by construction. The frozen
+frame is a picture, and pictures are what Rin reads; this one is not also a
+test.
 
 Captions, each clause pinned:
 
@@ -2458,38 +3019,38 @@ Assertions:
         assert!(unknown.contains("sheep 4  cron"), "on the stopped sheep");
 ```
 
-and one more in `frames.rs`, the design's own:
+and one line added to the shipped
+`the_frozen_frame_does_not_move_however_long_the_link_stays_gone`, which
+already renders `Scene::Frozen` at two ages and compares whole frames. Now that
+the frozen scene has a lamb line, that comparison covers it for free, and one
+assertion makes the coverage deliberate rather than incidental:
 
 ```rust
-    /// fails if the lamb line reads a live clock instead of `App::now`. A
-    /// frozen dashboard's stamp must not creep, for the same reason its uptime
-    /// column must not: the banner says these values stopped.
-    #[test]
-    fn a_frozen_dashboard_does_not_age_its_lamb_reading() {
-        let ten_minutes = render_text(&scene_with(Scene::Frozen, Duration::from_secs(600)));
-        let sixteen_hours = render_text(&scene_with(Scene::Frozen, Duration::from_secs(60_000)));
-        let pick = |frame: &str| {
-            frame
-                .lines()
-                .find(|line| line.starts_with("lambs  "))
-                .map(str::to_string)
-                .expect("the frozen frame has a lamb line to compare")
-        };
-        assert_eq!(pick(&ten_minutes), pick(&sixteen_hours));
-    }
+        assert!(
+            ten_minutes.lines().any(|line| line.starts_with("lambs  ")),
+            "the frozen frame has a lamb line for the comparison above to cover"
+        );
 ```
 
-`.expect(...)` rather than an `Option` compare: two `None`s are equal, so
-without it this test passes on a frame that lost its lamb line entirely.
+Without it the whole-frame compare would keep passing on a frame that lost its
+lamb line entirely, which is the "passes for the wrong reason" shape that
+test's own doc already warns about for the uptime column. It does not make the
+compare able to catch a live clock; nothing rendered at one instant can. That
+is `the_stamp_ages_on_a_live_dashboard_and_stops_on_a_frozen_one`'s job.
 
 `assert_eq!(Scene::ALL.len(), 17)` becomes `19`.
 
 ### Step 6.6 - snapshots, gallery, docs
 
 Every frame that draws the detail pane gains a row and loses a table row, so
-most of the seventeen `.snap` files change. Re-accept, then read the diff: the
-only changes must be one added `lambs  ` line per detail-drawing frame and one
-fewer table row.
+**ten of the seventeen `.snap` files change**, plus the two new ones. The ten
+are exactly the frames tall enough for `panes_for(height).detail` to be true:
+`cramped`, `empty`, `errored`, `feed_gap`, `feed_missing`, `frozen`,
+`healthy_wide`, `host_unknown`, `refused` and `retrying`. The seven that do not
+are `narrow`, `no_detail`, `table_only` and `too_narrow`, which are too short
+for a detail pane, and Task 3's three filter frames, which are 100x14 and
+therefore also too short. Re-accept, then read the diff: the only changes must
+be one added `lambs  ` line per detail-drawing frame and one fewer table row.
 
 ```bash
 cargo test -p shep --lib --all-features -- lookout::frames
@@ -2498,13 +3059,20 @@ cargo test -p shep --lib --all-features -- --ignored write_the_gallery; echo "EX
 grep -c '^=== ' docs/lookout/frames.txt    # 19
 ```
 
-Update the preamble's frame count to nineteen (twenty-two after Task 9). Then:
+Update the frame count to nineteen in all four places Step 3.6 lists, and run
+that step's grep to check none was missed. It becomes twenty-four in Task 9.
+Then:
 
 - `docs/specs/deferred.md`: delete the **lambs in the detail pane** entry.
-- `docs/lookout/README.md`: delete the **Lambs in the detail pane** bullet, and
-  say in the pane's own description that the list is fetched on selection
-  change and on `r`, never on the poll, and that the line carries its age
-  because of it.
+- `docs/lookout/README.md`: delete the **Lambs in the detail pane** bullet
+  under "What is still open", and rewrite the bullet that describes the pane
+  under "What 12b settled" (`README.md:84`), which today opens
+  "**The detail pane reads what the table already has.** No second request..."
+  and is now flatly false. Say that every line but one still reads what the
+  table already has, that the lamb line is fetched with `Describe` on selection
+  change and on `r` and never on the poll, and that it carries its age because
+  of that. Leave the "What is still open" heading in place: one bullet, the
+  actions, is still under it until Task 9.
 
 ### Step 6.7 - verify: the full task gate
 
@@ -2556,17 +3124,41 @@ becoming an action they did not intend.
 ### Step 7.1 - baseline
 
 ```bash
-grep -c "KeyPress::Stop" crates/shep-cli/src/lookout/app.rs      # 2: the variant and its arm
-grep -rn "KeyPress::Stop" crates/ | wc -l                        # 5
+grep -c "KeyPress::Stop" crates/shep-cli/src/lookout/app.rs      # 4
+grep -rn "KeyPress::Stop" crates/ | wc -l                        # 7
 grep -rn 'stop is not built yet' crates/ | wc -l                 # 2
 grep -c "KeyCode::Char('R')" crates/shep-cli/src/lookout/input.rs # 0, the key is free
 grep -c "KeyCode::Char('L')" crates/shep-cli/src/lookout/input.rs # 0, the key is free
 ```
 
-`KeyPress::Stop` becomes `KeyPress::Action(ActionVerb::Stop)`, so those five
-sites are the mechanical part of this task: the variant, its arm, the input
-test, the `Refused` scene's key press, and `view/status.rs`'s comment about the
-hint.
+`KeyPress::Stop` becomes `KeyPress::Action(ActionVerb::Stop)`. **Seven sites,
+measured, not five**, and one of them is a test that has to be rewritten rather
+than renamed:
+
+| site | what happens to it |
+|---|---|
+| `app.rs:463` | the `KeyPress::Stop` match arm, replaced by `arm(verb)` |
+| `app.rs:994` | `the_stop_key_refuses_in_both_control_states`, read-only half |
+| `app.rs:1010` | the same test, control-enabled half. **Rewritten, see below** |
+| `app.rs:1131` | a press inside another test, renamed |
+| `input.rs:46` | `KeyCode::Char('x') => Some(KeyPress::Stop)`, renamed |
+| `input.rs:85` | `every_bound_key_resolves_to_its_press`, renamed |
+| `frames.rs:518` | the `Refused` scene's key press, renamed |
+
+The variant declaration itself is an eighth site the grep does not match,
+because it is spelled `Stop,` inside `enum KeyPress`.
+
+**`the_stop_key_refuses_in_both_control_states` becomes a read-only-only
+refusal test.** Its whole subject is that `x` refuses in BOTH gate states, and
+half of that stops being true in this task: behind an open gate `x` now arms.
+Renaming the variant inside it would leave a test asserting a refusal that no
+longer happens, so the control-enabled half moves out and becomes
+`an_action_key_arms_a_confirm_and_sends_nothing` below. Rename the test to
+`the_action_keys_refuse_while_the_gate_is_closed` or fold it into
+`every_action_key_refuses_while_the_gate_is_closed`, which is strictly
+stronger because it covers all three verbs. **Say in the commit message that a
+shipped test lost half its subject and why**, the same way Task 6 says it about
+the deleted one.
 
 ### Step 7.2 - RED
 
@@ -2574,6 +3166,39 @@ The four that matter most are the four about the confirm. `allowed()` is a new
 fixture beside `started()`: the same three sheep at `Control::Allowed`, with
 the selection moved off both the first and the last row, so a selection
 assertion can fail in either direction.
+
+```rust
+    /// `started()`'s three sheep with the gate open and the cursor parked in
+    /// the middle, on `api` at id 2.
+    ///
+    /// Mid-list on purpose. Half the tests below assert that a stray `j` did
+    /// NOT move the cursor, and a cursor already clamped at either end would
+    /// pass those tests whether the routing rule consumed the key or not.
+    fn allowed() -> App {
+        let t0 = Instant::now();
+        let mut app = App::new(
+            Palette::detect(None, None, None),
+            Control::Allowed,
+            "/home/rin/.shep".to_string(),
+            t0,
+        );
+        app.update(Msg::Snapshot {
+            rows: vec![
+                sheep(1, "web", ProcStatus::Online),
+                sheep(2, "api", ProcStatus::Online),
+                sheep(3, "worker", ProcStatus::Online),
+            ],
+            at: t0,
+        });
+        app.update(Msg::Tick { now: t0 });
+        app.update(Msg::Key(KeyPress::SelectDown));
+        app
+    }
+```
+
+The `Msg::Tick` is not decoration: it sets `App::now`, which is the clock
+`arm` stamps onto the armed action and which
+`a_confirm_expires_after_ten_seconds_of_ticks` then advances.
 
 ```rust
     /// fails if an action key acts. It arms, and nothing has been sent: the
@@ -2774,6 +3399,39 @@ assertion can fail in either direction.
         );
     }
 
+    /// fails if `q` or Ctrl-C stops quitting while a prompt is up. The routing
+    /// rule consumes every other key; this is the one carve-out, and
+    /// `input.rs`'s own doc says why: an operator whose most reflexive way out
+    /// of a terminal program stops working reaches for `kill -9` from another
+    /// window, past every restore path `term` has. Quitting discards the
+    /// confirm rather than acting on it, so nothing this rule protects is
+    /// weakened. See the phase plan's "Shapes the design named" #4.
+    #[test]
+    fn quit_still_quits_while_a_confirm_is_armed() {
+        let mut app = allowed();
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        assert_eq!(app.update(Msg::Key(KeyPress::Quit)), Effect::Quit);
+    }
+
+    /// fails if Enter does something when nothing is armed. It reaches the
+    /// ordinary match in two states an operator can be in: nothing armed at
+    /// all, and one action already in flight. Neither may send.
+    #[test]
+    fn enter_outside_an_armed_confirm_does_nothing() {
+        let mut app = allowed();
+        assert_eq!(app.update(Msg::Key(KeyPress::Confirm)), Effect::None);
+        assert!(app.action().is_none());
+
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        app.update(Msg::Key(KeyPress::Confirm));
+        assert!(app.action().is_some_and(|action| action.sent), "in flight");
+        assert_eq!(
+            app.update(Msg::Key(KeyPress::Confirm)),
+            Effect::None,
+            "a second Enter does not re-send"
+        );
+    }
+
     /// fails if a request the channel could not take leaves the dashboard
     /// claiming an action is in flight forever, which would also refuse every
     /// later action for the life of the process.
@@ -2938,6 +3596,19 @@ before everything else:
             if key == KeyPress::Confirm {
                 return self.confirm();
             }
+            // The one key the cancel does not consume. `input.rs`'s own doc
+            // says why: dropping Ctrl-C would leave the most reflexive way out
+            // of a terminal program doing nothing, and the operator's next
+            // move is `kill -9` from another window, past every restore path
+            // `super::term` has. Quitting DISCARDS the confirm rather than
+            // acting on it, so the property this rule exists for is untouched;
+            // that property is about a cancelling key also doing its ordinary
+            // job on a target the operator has lost track of. Text mode makes
+            // the same carve-out. See the phase plan's "Shapes the design
+            // named" #4.
+            if key == KeyPress::Quit {
+                return Effect::Quit;
+            }
             self.action = None;
             return Effect::None;
         }
@@ -2946,6 +3617,21 @@ before everything else:
 `KeyPress` gains `Confirm` (`Enter` in normal mode) and
 `Action(ActionVerb)` replaces `Stop`. `map_key`'s normal-mode arm gains
 `KeyCode::Enter => Some(KeyPress::Confirm)` and the three action keys.
+
+`on_key`'s ordinary match, which is exhaustive, therefore needs an arm for
+`Confirm` as well. **Say what it does rather than leaving it to be guessed:**
+
+```rust
+            // Enter means nothing outside an armed confirm. It reaches this
+            // match whenever nothing is armed, which includes while an action
+            // is IN FLIGHT, because the routing rule above only fires on
+            // `Stage::Armed`. Named rather than swept into a wildcard: on the
+            // one key whose job is to confirm a stop, an unspecified arm is
+            // one edit away from being the wrong arm.
+            KeyPress::Confirm => Effect::None,
+```
+
+and the new `Action` arm is `KeyPress::Action(verb) => self.arm(verb)`.
 
 **Arming:**
 
@@ -2956,6 +3642,11 @@ before everything else:
     /// never answers a question that was never going to be honoured. Every
     /// sentence is literal: the standing rule is that nothing about damage
     /// gets charming, and a stop is damage.
+    ///
+    /// The ladder's order is the design's error table, read top to bottom:
+    /// gate, link, nothing selected, one already in flight. It only shows when
+    /// two conditions hold at once, and there is no reason to reorder an
+    /// approved table.
     fn arm(&mut self, verb: ActionVerb) -> Effect {
         let refusal = if self.control == Control::ReadOnly {
             Some("read-only: actions need --allow-control".to_string())
@@ -2964,10 +3655,10 @@ before everything else:
             // moved into `LINK_GONE` by this task and reused rather than
             // retyped.
             Some(LINK_GONE.to_string())
-        } else if self.action.is_some() {
-            Some("one action is already in flight".to_string())
         } else if self.selected_row().is_none() {
             Some("no sheep is selected".to_string())
+        } else if self.action.is_some() {
+            Some("one action is already in flight".to_string())
         } else {
             None
         };
@@ -3058,6 +3749,68 @@ byte for byte, and have both arms read the constant.
                     }
 ```
 
+**And the invariant that makes putting it there safe.** `now` stops advancing
+once the link is `Lost`, so this check never runs again after a freeze; on its
+own that would leave an armed prompt on a frozen dashboard forever, with Enter
+still willing to send. A9 refuses arming unless the link is `Live` and this
+design's whole refusal doctrine is that an operator never answers a question
+that was never going to be honoured, so the answer is not a second check in
+`confirm` but keeping the invariant true:
+
+```rust
+    /// Takes an armed prompt off the screen when the link stops being live.
+    ///
+    /// Called from the `Msg::Retrying` and `Msg::Frozen` arms. A9 refuses to
+    /// ARM unless the link is `Live`; without this, a prompt armed a moment
+    /// earlier would outlive the connection it was going to be sent over, and
+    /// on a frozen dashboard it would never expire either, because `now` stops
+    /// advancing and the expiry check rides it. Silent, like every other
+    /// cancel: nothing happened, and the banner appearing on the same frame
+    /// already says why.
+    ///
+    /// An action already SENT keeps its line. It is a real request, and
+    /// `run_connected` answers it with an `Err` before its loop ends, so the
+    /// in-flight line always resolves rather than hanging.
+    fn disarm_on_link_change(&mut self) {
+        if self.action.as_ref().is_some_and(|action| action.stage == Stage::Armed) {
+            self.action = None;
+        }
+    }
+```
+
+With that, "armed implies `Link::Live`" holds everywhere and `confirm` needs no
+link check at all.
+
+Add the test:
+
+```rust
+    /// fails if an armed prompt outlives the connection it was going to be
+    /// sent over. Both halves matter: `Retrying` because A9 says an action
+    /// typed during the reconnect ladder is refused rather than queued, and
+    /// `Frozen` because a frozen dashboard's `now` stops advancing, so an
+    /// armed prompt there would never expire either.
+    #[test]
+    fn a_link_that_stops_being_live_takes_an_armed_prompt_down() {
+        for link in [
+            Msg::Retrying { attempt: 2 },
+            Msg::Frozen {
+                at_local: "2026-08-16 09:00:00".to_string(),
+            },
+        ] {
+            let mut app = allowed();
+            app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+            assert!(app.action().is_some(), "armed while live");
+            app.update(link);
+            assert!(app.action().is_none(), "and gone once the link is not");
+            assert_eq!(
+                app.update(Msg::Key(KeyPress::Confirm)),
+                Effect::None,
+                "so Enter has nothing to send"
+            );
+        }
+    }
+```
+
 **`Sent` and `Effect` grow:**
 
 ```rust
@@ -3109,10 +3862,14 @@ byte for byte, and have both arms read the constant.
                 Sent::Action { verb, id, name } => {
                     self.action = None;
                     self.notice = Some(Notice {
-                        text: format!(
-                            "{} {name} (id {id}): it was not sent, the shepherd is not reachable",
-                            verb.label()
-                        ),
+                        // "it was not sent", and no cause. The reducer does
+                        // not know one: the channel holds 2, it is shared with
+                        // lamb fetches, and `run_connected` awaits each
+                        // request inline, so `Full` is reachable while the
+                        // shepherd is perfectly reachable and merely slow.
+                        // Naming a cause nothing observed is the failure the
+                        // `-` CPU cell exists to prevent.
+                        text: format!("{} {name} (id {id}): it was not sent", verb.label()),
                         grave: true,
                     });
                     Effect::None
@@ -3156,7 +3913,7 @@ cargo fmt --all --check
 cargo test -p shep --lib --bins --all-features
 ```
 
-Roughly `600 passed; 0 failed; 3 ignored`. `grep -rn 'stop is not built yet'
+Roughly `605 passed; 0 failed; 3 ignored`. `grep -rn 'stop is not built yet'
 crates/ | wc -l` now prints **1**: the literal is gone from `app.rs` and only
 `cli.rs`'s flag doc still carries it, which Step 10.3 fixes.
 
@@ -3210,9 +3967,15 @@ updates from the shepherd's words rather than from a guess.
 ### Step 8.1 - baseline
 
 ```bash
-grep -c 'Msg::Replied' crates/shep-cli/src/lookout/app.rs   # 1: the Lambs arm from Task 4
-cargo test -p shep --lib --all-features -- lookout::app     # note the number
+grep -c 'Msg::Replied { sent, result }' crates/shep-cli/src/lookout/app.rs   # 1: the arm
+grep -c 'Sent::Action' crates/shep-cli/src/lookout/app.rs                    # 0
+cargo test -p shep --lib --all-features -- lookout::app                      # note the number
 ```
+
+Not a bare `grep -c 'Msg::Replied'`: Task 4's tests construct one eight times
+over, so that grep prints nine after Task 4 and counting it would be the
+"count the call, not the word" failure the baselines section names. The arm is
+what this task extends, so the arm is what the baseline pins.
 
 ### Step 8.2 - RED
 
@@ -3458,7 +4221,7 @@ cargo fmt --all --check
 cargo test -p shep --lib --bins --all-features
 ```
 
-Roughly `606 passed; 0 failed; 3 ignored`.
+Roughly `611 passed; 0 failed; 3 ignored`.
 
 ### Step 8.5 - MUTATION
 
@@ -3485,7 +4248,7 @@ iteration passes either way, which is why the loop has two. Revert.
 
 ---
 
-# Task 9 - the actions on screen, three frames, and the docs
+# Task 9 - the actions on screen, five frames, and the docs
 
 `view/status.rs` and `frames.rs`, plus the two prose documents. **Full task
 gate at the end.**
@@ -3538,6 +4301,49 @@ grep -c 'Scene::ALL.len(), 19' crates/shep-cli/src/lookout/frames.rs  # 1
         assert!(!bar.contains("filter \""), "the filter line is below it: {bar:?}");
     }
 
+    /// fails if a refusal made while an action is in flight never reaches the
+    /// screen. THIS is the test the four-slot ordering would have failed, and
+    /// no reducer test can catch it: `arm`'s "one action is already in flight"
+    /// is a `Notice`, so a bar that ranked the in-flight line above notices
+    /// would set it, assert it in the reducer, and never draw it. The operator
+    /// presses `R` while a stop is out, nothing on screen changes, and the
+    /// dashboard has silently swallowed the answer to their own keypress.
+    ///
+    /// The second half is the same defect arriving from the bus rather than
+    /// from a key: `Dropped`, `BusLagged` and `DaemonShutdown` would all be
+    /// invisible for as long as an action was in flight.
+    #[test]
+    fn a_refusal_while_an_action_is_in_flight_reaches_the_bar() {
+        let mut app = acting_app(ActionVerb::Stop);
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Restart)));
+        let bar = rendered(&status_line(&app, 120));
+        assert!(
+            bar.contains("one action is already in flight"),
+            "the refusal is on the bar, not only in the reducer: {bar:?}"
+        );
+
+        let mut app = acting_app(ActionVerb::Stop);
+        app.update(Msg::Event(BusEvent::DaemonShutdown));
+        let bar = rendered(&status_line(&app, 120));
+        assert!(bar.contains("the shepherd is shutting down"), "got {bar:?}");
+    }
+
+    /// fails if the in-flight line does not come back once the notice is
+    /// cleared. The mirror of the test above, and what makes ranking the
+    /// notice higher honest rather than lossy: the covering is transient, and
+    /// the next keypress ends it.
+    #[test]
+    fn the_in_flight_line_comes_back_when_the_notice_clears() {
+        let mut app = acting_app(ActionVerb::Stop);
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Restart)));
+        app.update(Msg::Key(KeyPress::SelectDown));
+        let bar = rendered(&status_line(&app, 120));
+        assert!(
+            bar.contains("stop api (id 2): sent, waiting for the shepherd"),
+            "got {bar:?}"
+        );
+    }
+
     /// fails if the action keys are advertised behind a closed gate. This
     /// file's standing rule: a hint that needs a footnote to be true is an
     /// asterisk, not a hint.
@@ -3557,8 +4363,59 @@ grep -c 'Scene::ALL.len(), 19' crates/shep-cli/src/lookout/frames.rs  # 1
 
 The shipped `a_truncated_hint_still_leaves_a_gap_before_the_control_label` at
 49 columns stays exactly as it is and must stay green: the read-only hint is 59
-characters, the label is 9, and the hint still truncates at that width, which
-is the combination the test was written to measure.
+characters (Task 3 updated its doc comment to say so), the label is 9, and the
+hint still truncates at that width, which is the combination the test was
+written to measure. `a_wide_status_line_still_pads_out_to_the_full_width` uses
+`Control::Allowed` at 120 columns and also stays green: the control hint is 62
+characters against 103 of room.
+
+The four fixtures these tests use, in `view/fixtures.rs`:
+
+```rust
+/// [`filtered_app`]'s four sheep with the gate open and the cursor on `api`
+/// at id 2, which is the sheep every action assertion in this file names.
+pub fn allowed_app() -> App {
+    let mut app = app_with(named_flock(), plain());
+    app.set_control_for_tests(Control::Allowed);
+    app.update(Msg::Key(KeyPress::SelectDown));
+    app
+}
+
+/// [`allowed_app`] with `verb` armed and nothing sent.
+pub fn armed_app(verb: ActionVerb) -> App {
+    let mut app = allowed_app();
+    app.update(Msg::Key(KeyPress::Action(verb)));
+    app
+}
+
+/// [`armed_app`] confirmed: the request is out and the reply has not landed.
+pub fn acting_app(verb: ActionVerb) -> App {
+    let mut app = armed_app(verb);
+    app.update(Msg::Key(KeyPress::Confirm));
+    app
+}
+
+/// An armed confirm with a filter applied AND a notice standing, so the bar
+/// has something in three slots at once and the ordering assertion has
+/// something to fail on.
+///
+/// Order matters: the filter is applied first, then the notice is raised, then
+/// the action is armed. Arming after the notice is what leaves the notice
+/// standing, because `on_key`'s normal branch clears it on the way past.
+pub fn armed_app_with_a_filter_and_a_notice() -> App {
+    let mut app = filtered_app("api");
+    app.set_control_for_tests(Control::Allowed);
+    app.update(Msg::Event(BusEvent::Dropped { count: 3 }));
+    app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+    app
+}
+```
+
+`App::new` takes `Control` and the shipped `app_with` hard-codes
+`Control::ReadOnly`, so `set_control_for_tests` is a `#[cfg(test)] pub(crate)`
+setter on `App` rather than a second copy of `app_with`. One line, and it keeps
+the four fixtures above reading as a chain instead of as four near-duplicates
+of the same eight-line builder.
 
 ### Step 9.3 - GREEN
 
@@ -3576,41 +4433,82 @@ fn hint_for(control: Control) -> String {
 }
 ```
 
-and `status_line`'s left slot gains its two top entries, above the notice:
+and `status_line`'s left slot gains its two remaining entries. **They are not
+adjacent.** The armed confirm is slot 1, above the filter box; the in-flight
+line is slot 4, BELOW the notice. Task 3 built the chain with both gaps in it,
+so this is two insertions, not one:
 
 ```rust
-    let (left, left_style) = if let Some(action) = app.action() {
-        let text = if action.sent {
-            format!(
-                "{} {} (id {}): sent, waiting for the shepherd",
-                action.verb.label(),
-                action.name,
-                action.id
-            )
-        } else {
+    let (left, left_style) = if let Some(action) = app.action().filter(|a| !a.sent) {
+        // Slot 1. A18: a question awaiting an answer outranks everything,
+        // including the filter box, which it cannot coexist with anyway
+        // because `/` cancels a confirm before it opens the box.
+        (
             format!(
                 "{} {} (id {})? enter confirms, any other key cancels",
                 action.verb.label(),
                 action.name,
                 action.id
-            )
-        };
+            ),
+            palette.attention(),
+        )
+    } else if app.mode() == InputMode::Text {
+        // Slot 2, from Task 3, unchanged.
+        ...
+    } else if let Some(notice) = app.notice() {
+        // Slot 3, from Task 3, unchanged.
+        ...
+    } else if let Some(action) = app.action() {
+        // Slot 4. BELOW the notice, and that is load-bearing rather than a
+        // concession. `arm`'s "one action is already in flight" IS a notice,
+        // so a bar that put this line above notices would swallow the answer
+        // to the operator's own keypress: they press `R` while a stop is out,
+        // the screen does not change, and the dashboard has hidden a refusal
+        // it made. Every bus-raised notice (`Dropped`, `BusLagged`,
+        // `DaemonShutdown`) would be equally invisible for as long as an
+        // action was in flight. A18 puts the notice above the filter line and
+        // the design puts this line above the filter line; the notice above
+        // this is what satisfies both.
+        //
+        // What the design DOES require of this state is that a keypress
+        // cannot wipe it, and that is a property of the reducer, not of this
+        // order: the next keypress clears the notice and this line comes back.
+        // `an_in_flight_line_survives_a_keypress` pins the first half and
+        // `a_refusal_while_an_action_is_in_flight_reaches_the_bar` the second.
+        let text = format!(
+            "{} {} (id {}): sent, waiting for the shepherd",
+            action.verb.label(),
+            action.name,
+            action.id
+        );
         // `attention`, the same butter the non-grave notice uses. Not a modal,
         // not a box, not a `ratatui::widgets::Clear`: there is no overlay
         // anywhere in this module, and one rule under the header beats a full
         // border for a pane somebody reads at 3am.
         (text, palette.attention())
-    } else if let Some(notice) = app.notice() {
-        // ... unchanged ...
+    } else if !app.filter().is_empty() {
+        // Slot 5, from Task 3, unchanged.
+        ...
+    } else {
+        // Slot 6, from Task 3, unchanged.
+        ...
+    };
 ```
 
-**The armed prompt and the in-flight line share the top slot** because they are
-the same field, and the design's own priority list separates them from the
-notice below only. An in-flight line therefore also survives a notice, which is
-one step stronger than A18 requires and is the property
-`an_in_flight_line_survives_a_keypress` already pins in the reducer.
+The `.filter(|a| !a.sent)` on the first arm is what splits one field across two
+slots. `ActionState` is `Copy`, so this costs nothing and reads better than
+matching on `sent` inside a single arm and then having to place that arm at one
+priority or the other.
 
-### Step 9.4 - GREEN: three frames
+The full order, and the reason each slot sits where it does, is in
+"Shapes the design named" #2 at the top of this plan. It is six slots, not
+five, and the in-flight line is fourth.
+
+### Step 9.4 - GREEN: five frames
+
+**Five scenes, not three.** The three the design sketched, plus two states an
+operator will meet that nothing else in the gallery shows. Both were missing
+from this plan's first draft and one of them it explicitly promised:
 
 ```rust
     /// An action key pressed with the gate open. Nothing has been sent.
@@ -3619,9 +4517,27 @@ one step stronger than A18 requires and is the property
     Acting,
     /// The shepherd refused, in its own words.
     ActionRefused,
+    /// The shepherd did it, and the bar says so in the non-grave style.
+    ActionAccepted,
+    /// An action key pressed while the link is coming back.
+    ActionRefusedOffline,
 ```
 
-`(100, 14)` for all three, and a per-scene control state, which the four
+- **`ActionAccepted`** is the only frame in the gallery that shows an action
+  SUCCEEDING. Without it, all three action frames are a question, a wait and a
+  refusal, and the one styling decision in feature 2 that is not `refusal()`
+  (the outcome sentence is `attention()`, per the design's error table) is
+  never rendered. It also pins the reply's rows reaching the table: the frame
+  shows `api` as `stopped`, which is the shepherd's own row and not a guess.
+- **`ActionRefusedOffline`** is the frame the closing section of this plan
+  promises Rin will judge from. That section says arming while `Retrying`
+  refuses with the sentence `r` gives when the link is GONE, one row under a
+  banner saying the shepherd is being reconnected to, and that "if it reads
+  wrong in the gallery, the fix is one new sentence". It cannot read wrong in a
+  gallery that does not contain it. This is the frame that puts the two
+  disagreeing rows on one screen so the question can actually be answered.
+
+`(100, 14)` for all five, and a per-scene control state, which the six
 action-carrying scenes need and the other eighteen do not:
 
 ```rust
@@ -3633,20 +4549,48 @@ action-carrying scenes need and the other eighteen do not:
     #[must_use]
     pub const fn control(self) -> Control {
         match self {
-            Self::Confirm | Self::Acting | Self::ActionRefused | Self::Lambs => Control::Allowed,
+            Self::Confirm
+            | Self::Acting
+            | Self::ActionRefused
+            | Self::ActionAccepted
+            | Self::ActionRefusedOffline
+            | Self::Lambs => Control::Allowed,
             _ => Control::ReadOnly,
         }
     }
 ```
 
 `scene_with` reads `which.control()` where it currently passes
-`Control::ReadOnly`. In the same match block that applies the filter keys:
+`Control::ReadOnly`. Two more arms in the same match block that applies the
+filter keys.
+
+`ActionRefusedOffline` raises its own `Msg::Retrying` rather than going in the
+shipped `Retrying`/`Frozen` block, because the order is the whole state it
+shows: the link has to stop being live BEFORE the key is pressed, or `arm`
+would accept it.
 
 ```rust
-        Scene::Confirm | Scene::Acting | Scene::ActionRefused => {
+        Scene::ActionRefusedOffline => {
+            app.update(Msg::Retrying { attempt: 3 });
+            app.update(Msg::Key(KeyPress::Action(ActionVerb::Restart)));
+        }
+```
+
+```rust
+        Scene::Confirm | Scene::Acting | Scene::ActionRefused | Scene::ActionAccepted => {
             app.update(Msg::Key(KeyPress::Action(ActionVerb::Restart)));
             if which != Scene::Confirm {
                 app.update(Msg::Key(KeyPress::Confirm));
+            }
+            if which == Scene::ActionAccepted {
+                app.update(Msg::Replied {
+                    sent: Sent::Action {
+                        verb: ActionVerb::Restart,
+                        id: 2,
+                        name: "api".to_string(),
+                    },
+                    result: Ok(Response::Restarted(vec![restarted_api()])),
+                });
             }
             if which == Scene::ActionRefused {
                 // The sheep leaves the flock while the request is out, which
@@ -3674,40 +4618,98 @@ Captions, each clause pinned:
 
 ```rust
             Self::Confirm => {
-                "`R` pressed with the gate open. Nothing has been sent: the bar asks a question naming the verb and the exact sheep, Enter is the only key that answers it, and every other key takes the question away and moves nothing."
+                "`R` pressed with the gate open. Nothing has been sent: the bar asks a question naming the verb and the exact sheep, and `api` is still online in the table behind it."
             }
             Self::Acting => {
-                "Enter pressed. The request is out and nothing on the table has changed, because nothing the shepherd has said has changed. This line is not a notice, so a stray keypress cannot wipe it."
+                "Enter pressed. The request is out and nothing on the table has changed, because nothing the shepherd has said has changed: `api` is still online and the cursor has not moved."
+            }
+            Self::ActionAccepted => {
+                "The shepherd answered. The bar says what it did, in the non-grave style a refusal does not get, and the table shows the row the reply carried rather than waiting for the next poll."
             }
             Self::ActionRefused => {
-                "The shepherd refused while the request was out, and its own sentence is forwarded rather than rewritten. The sheep has left the flock in the listing behind it, so the table is one row shorter and the selection has moved on."
+                "The shepherd refused while the request was out, and its own sentence is forwarded rather than rewritten. The sheep has left the flock in the listing behind it, so the table is one row shorter and the cursor has moved to the row below."
+            }
+            Self::ActionRefusedOffline => {
+                "An action key pressed while the link is coming back. The refusal is the same sentence `r` gives, one row under a banner saying the shepherd is being reconnected to."
             }
 ```
 
+**Three clauses came off the first draft's captions rather than being pinned**,
+which is this file's own rule ("every clause of every caption is one assertion,
+or it is deleted from the caption") and the rule 12a and 12b each shipped a
+violation of:
+
+- Confirm's "Enter is the only key that answers it, and every other key takes
+  the question away and moves nothing" is a claim about behaviour across eight
+  keypresses. A frame is one render; it cannot show it. It is
+  `only_enter_confirms_and_every_other_key_cancels`'s claim and it stays in the
+  reducer, with a `// see:` comment beside the caption pointing at it.
+- Acting's "This line is not a notice, so a stray keypress cannot wipe it" is
+  the same shape, pinned by `an_in_flight_line_survives_a_keypress`. Same
+  treatment.
+- Confirm's replacement clause, "`api` is still online in the table behind it",
+  IS pinnable and is worth more than the sentence it replaces: it is the frame
+  proving that arming did not act.
+
+`ActionRefusedOffline`'s caption deliberately does not say whether the two rows
+reading differently is right. That is the question the frame exists to put in
+front of Rin, and a caption that answered it would be this plan deciding A9 on
+her behalf. See the closing section.
+
 Assertions:
+
+A small helper, because four of these assertions name a specific row of the
+table and `contains` over the whole frame cannot tell one row from another:
+
+```rust
+    /// The table row for `name`, or `None` if the table does not draw one.
+    fn row_for<'a>(frame: &'a str, name: &str) -> Option<&'a str> {
+        frame
+            .lines()
+            .find(|line| line.split_whitespace().nth(1) == Some(name))
+    }
+```
 
 ```rust
         let confirm = render_text(&scene(Scene::Confirm).1);
         assert!(confirm.contains("restart api (id 2)? enter confirms, any other key cancels"));
         assert!(confirm.contains("control enabled"), "the gate is open");
         assert!(
-            confirm.contains("  online  ") ,
-            "nothing was sent, so api is still online"
+            row_for(&confirm, "api").is_some_and(|row| row.contains("online")),
+            "nothing was sent, so api is still online: {confirm:?}"
         );
 
         let acting = render_text(&scene(Scene::Acting).1);
         assert!(acting.contains("restart api (id 2): sent, waiting for the shepherd"));
-        assert_eq!(
-            acting.lines().filter(|line| line.starts_with('>')).count(),
-            1,
-            "the table is untouched: one marker, where it was"
+        assert!(
+            row_for(&acting, "api").is_some_and(|row| row.starts_with('>')),
+            "the table is untouched: the marker is still on api"
+        );
+        assert!(
+            row_for(&acting, "api").is_some_and(|row| row.contains("online")),
+            "and the row still says what the shepherd last said"
+        );
+
+        let accepted = render_text(&scene(Scene::ActionAccepted).1);
+        assert!(accepted.contains("restart api (id 2): the shepherd restarted it"));
+        assert!(
+            row_for(&accepted, "api").is_some_and(|row| row.contains("48299")),
+            "the reply's own row reached the table without waiting for a poll"
         );
 
         let refused = render_text(&scene(Scene::ActionRefused).1);
         assert!(refused.contains("restart api (id 2): selector matched no registered sheep"));
         assert!(!refused.contains("NotFound"), "no Rust identifiers on the bar");
         assert!(refused.contains("5 in the flock"), "one row shorter");
-        assert!(!refused.contains("  api  "), "and api is the row that went");
+        assert!(row_for(&refused, "api").is_none(), "api is the row that went");
+        assert!(
+            row_for(&refused, "billing-reconciliation…").is_some_and(|row| row.starts_with('>')),
+            "and the cursor has moved to the row below"
+        );
+
+        let offline = render_text(&scene(Scene::ActionRefusedOffline).1);
+        assert!(offline.contains("reconnecting (attempt 3)"), "the banner");
+        assert!(offline.contains("nothing left to ask"), "and the refusal under it");
 
         // The one frame in the gallery whose left slot is empty while the gate
         // is open, which makes it the only one that shows the control hint.
@@ -3717,33 +4719,48 @@ Assertions:
         }
 ```
 
-`assert_eq!(Scene::ALL.len(), 19)` becomes `22`.
+`restarted_api()` is the row `ActionAccepted`'s reply carries: `api` at id 2,
+`ProcStatus::Online`, **pid 48299**, restarts 2, uptime near zero. A different
+pid from the listing's 48219 is what makes "the reply's own row reached the
+table" falsifiable; the same pid would pass whether the rows were upserted or
+ignored.
+
+`assert_eq!(Scene::ALL.len(), 19)` becomes `24`.
 
 ### Step 9.5 - snapshots, gallery, docs
 
 The `lambs` snapshot changes (its control state and therefore its hint), the
-three new ones appear, and nothing else should move. Read the diff and check
-that.
+five new ones appear, and nothing else should move: exactly one changed file
+and five new ones. Read the diff and check that.
 
 ```bash
 cargo test -p shep --lib --all-features -- lookout::frames
 cargo insta review
-git diff --stat crates/shep-cli/src/lookout/snapshots/
+git diff --stat crates/shep-cli/src/lookout/snapshots/   # 1 changed, 5 new
 cargo test -p shep --lib --all-features -- --ignored write_the_gallery; echo "EXIT=$?"   # 0
-grep -c '^=== ' docs/lookout/frames.txt   # 22
+grep -c '^=== ' docs/lookout/frames.txt   # 24
 ```
 
-Preamble: the frame count becomes twenty-two, in both sentences that carry it.
+The frame count becomes twenty-four in all four places Step 3.6 lists: twice in
+`GALLERY_PREAMBLE` and twice more in `frames.rs` (`Scene::caption`'s doc and
+the `too_many_lines` allow). Run that step's grep to check none was missed.
 
 - `docs/specs/deferred.md`: delete the **lookout actions** entry. That is the
-  third and last of this phase's three, so check the section for a heading or a
-  count that is now stale.
-- `docs/lookout/README.md`: delete the **Actions behind the gate** bullet, and
-  rewrite the gate bullet, which today says exactly one action key exists and
-  that it never acts. Keep the sentence saying the gate is a fat-finger catch
-  and not a security boundary. Add the confirmation model in one line: an
-  action key arms, Enter confirms, any other key cancels, and an armed prompt
-  expires after ten seconds.
+  third and last of this phase's three, and deleting it makes one more line in
+  that file false: the build-queue item at `deferred.md:28`, "**The rest of the
+  v1.0 surface** - lookout, serve, dev/runtime, ...", which lists lookout as
+  unbuilt surface. Take lookout off that list. Nothing else in the queue moves.
+- `docs/lookout/README.md`: delete the **Actions behind the gate** bullet.
+  That empties "What is still open" of all three bullets, so **the heading goes
+  too** rather than standing over nothing; replace the section with one
+  sentence saying lookout ships complete and pointing at
+  `docs/specs/deferred.md` for the workspace's remaining debt. Then rewrite the
+  gate bullet under "What 12a settled" (`README.md:45`), which today says
+  exactly one action key exists and that it never acts. Keep the sentence
+  saying the gate is a fat-finger catch and not a security boundary. Add the
+  confirmation model in one line: an action key arms, Enter confirms, any other
+  key cancels, `q` and Ctrl-C still quit, and an armed prompt expires after ten
+  seconds.
 
 ### Step 9.6 - verify: the full task gate
 
@@ -3782,10 +4799,18 @@ longer exists.
 ### Step 10.1 - the sweep
 
 ```bash
-grep -rn 'stop is not built yet' crates/ web/ docs/specs/ docs/lookout/ | wc -l   # 1 before, 0 after
+grep -rn 'stop is not built yet' crates/ web/ docs/specs/ docs/lookout/ | wc -l   # 2 before, 0 after
 grep -rn 'search/filter' docs/specs/deferred.md docs/lookout/README.md | wc -l    # 0 by now
 grep -c 'cargo test -p shep-cli --bins' docs/lookout/frames.txt                   # 0 by now
 ```
+
+**Two, not one.** Measured at HEAD, that phrase is in five files: `cli.rs`,
+`app.rs`, `docs/lookout/README.md`, `docs/specs/deferred.md`, and
+`web/src/data/cli-reference.generated.txt`. Tasks 7 and 9 delete three of them
+(the `app.rs` literal, the README bullet, the deferred entry), leaving `cli.rs`
+and the generated file. Both are Step 10.3's, and they are one edit rather than
+two: the generated file is `cli.rs`'s own `--help` rendered, so fixing the doc
+and regenerating clears both. Do not go looking for a fifth site.
 
 The three feature tasks each deleted their own `deferred.md` entry and their own
 README bullet, so those two greps should already be zero. If they are not, the
@@ -3814,15 +4839,34 @@ What is left:
 
 ### Step 10.2 - the check that no wire changed
 
+This needs a `BASE_SHA`, captured **before Task 1 touches anything** and
+carried through the phase:
+
 ```bash
-git diff --stat main -- crates/shep-core/ crates/shep-client/src/ | wc -l   # 0
-grep -rn 'PROTOCOL_VERSION' crates/shep-core/src/protocol/ | head -3        # unchanged
-find crates/shep-core -name '*.snap' | wc -l                               # unchanged from the baseline
+BASE_SHA=$(git rev-parse HEAD)   # run this once, before Task 1
 ```
 
-The first is the real one and it can fail: any edit under `shep-core` or the
-client's `src/` prints a line. This phase's whole claim is that it needed no
-wire change, and this is the only check that tests it rather than repeating it.
+```bash
+git diff --stat "$BASE_SHA" -- crates/shep-core/ crates/shep-client/src/ | wc -l   # 0
+git diff --stat "$BASE_SHA" -- crates/shep-core/tests/ | wc -l                     # 0
+grep -rn 'PROTOCOL_VERSION' crates/shep-core/src/protocol/ | head -3               # unchanged
+```
+
+Not `git diff main`: the phase branch is cut from `main`, so if the work is
+merged locally before this runs, or if it is run on `main` itself, that diff is
+trivially empty and proves nothing. It is the "expectation already true at
+HEAD" shape from the baselines section, arriving inside the check meant to
+catch exactly that class. `$BASE_SHA` is a real fixed point and the diff
+against it can genuinely fail.
+
+The second line is not redundant with the first: `crates/shep-core/tests/` is
+where the stability fixtures live, and a new or changed one is precisely what a
+wire change would produce. The first line does not cover it.
+
+The first two are the real ones and both can fail: any edit under `shep-core`,
+`shep-core/tests/` or the client's `src/` prints a line. This phase's whole
+claim is that it needed no wire change, and these are the only checks that test
+it rather than repeating it.
 
 ### Step 10.3 - the generated CLI reference
 
@@ -3866,7 +4910,7 @@ tree still compile for a target nobody has implemented yet.
 less -R docs/lookout/frames.ansi
 ```
 
-Twenty-two frames. **Read every caption against the frame beneath it.** A
+Twenty-four frames. **Read every caption against the frame beneath it.** A
 caption clause that cannot be pointed at in the frame is a bug in the caption,
 and this project has shipped that twice: 12a shipped two false captions and
 needed a fix commit, and 12b shipped a caption describing a state its frame did
@@ -3876,8 +4920,22 @@ not show.
 
 ## The frames, and what each one proves
 
-Eight new, fourteen changed. Rin decides what this looks like from these, not
+Ten new, thirteen changed. Rin decides what this looks like from these, not
 from a spec sentence.
+
+Twelve and not fourteen. **`too_narrow` and `narrow` do not change at all in
+this phase**, and knowing which two is what makes a wrong-sized diff visible at
+each of the three gate points:
+
+- `too_narrow` is 28 columns, below `MIN_TERM_WIDTH`, so `draw` returns two
+  short lines: no status bar to gain `/ filter`, no detail pane to gain a row.
+- `narrow` is 51x14. Its bar truncates the hint at 41 characters and the old
+  and new hints share their first 40, so Task 3 does not move it; 14 rows is
+  the host-only tier, so Task 6 does not either.
+
+The other twelve split into Task 3's ten (the hint), Task 6's ten (the detail
+row) and an overlap of eight. `refused` and `cramped` are in Task 6's ten but
+not Task 3's; `no_detail` and `table_only` are in Task 3's but not Task 6's.
 
 | Frame | Size | What it proves |
 |---|---|---|
@@ -3886,11 +4944,13 @@ from a spec sentence.
 | `filter_no_match` | 100x14 | Zero matches names the query instead of claiming the flock is empty, and the title keeps the flock's real size on screen. |
 | `lambs` | 120x30 | The detail pane's fifth line: the count, the age stamp before the list, and each lamb's pid and name. Also the only frame whose bar shows the control-enabled key hint. |
 | `lambs_unknown` | 120x30 | A sheep with no pid. "not walked" and "walked and found none" are different sentences, which is the distinction the wire type was built to keep. |
-| `confirm` | 100x14 | An action key armed and nothing sent. The question names the verb and the exact sheep, and the table is untouched. |
-| `acting` | 100x14 | Enter pressed. The request is out, the table has not moved, and the line is not a notice. |
+| `confirm` | 100x14 | An action key armed and nothing sent. The question names the verb and the exact sheep, and `api` is still online in the table behind it. |
+| `acting` | 100x14 | Enter pressed. The request is out and the table has not moved: same marker, same row, same status. |
+| `action_accepted` | 100x14 | The shepherd did it. The outcome sentence in the non-grave style, and the reply's own row in the table, with a pid the listing never carried. |
 | `action_refused` | 100x14 | The shepherd's own sentence forwarded, with no Rust identifier in it, over a listing that has lost the sheep. |
+| `action_refused_offline` | 100x14 | An action key while the link is coming back. The banner and the refusal on one frame, which is what makes the question in the next section answerable. |
 | `refused` (changed) | 120x30 | The read-only refusal, with a caption that no longer claims there are two refusals. |
-| the other thirteen (changed) | as before | One extra detail-pane row and the filter key in the hint, and nothing else. |
+| the other twelve (changed) | as before | One extra detail-pane row and the filter key in the hint, and nothing else. |
 
 ## One thing worth looking at in the frames, and why it is not being changed here
 
@@ -3898,9 +4958,15 @@ Arming an action while the link is `Retrying` refuses with the sentence `r`
 gives when the link is **gone**, while the banner one row above says the
 shepherd is being reconnected to. Two rows of the same frame then describe the
 connection differently. That is A9's literal wording and Rin accepted it, so
-this plan implements it as written rather than relitigating it. If it reads
-wrong in the gallery, the fix is one new sentence for the `Retrying` case and
-nothing else moves.
+this plan implements it as written rather than relitigating it.
+
+**`action_refused_offline` is that frame**, added in Task 9 for this paragraph
+and no other reason. The first draft of this plan said "if it reads wrong in
+the gallery, the fix is one new sentence" while rendering no such frame, which
+made the sentence unanswerable. It is answerable now: open `frames.ansi`, find
+`action_refused_offline`, and read the banner against the line under it. If it
+reads wrong, the fix is one new sentence for the `Retrying` case in `arm`'s
+refusal ladder and nothing else moves.
 
 ## Commits
 
@@ -3908,11 +4974,42 @@ One commit per item, conventional style, as the punch-list rule requires. The
 ten tasks map cleanly onto ten commits; three of them carry a doc edit for the
 feature they finish, which is the point.
 
-Two commit messages have to say something in particular:
+Four commit messages have to say something in particular. Three of them are
+about a shipped test losing or changing its subject, which is the one thing in
+this phase a reviewer should stop on if it arrives unannounced:
 
-- **Task 6** deletes `the_detail_pane_never_mentions_lambs`. Say so in the
-  message, with A19's reason: the feature is the thing that test was written to
-  prevent, and its replacement proves the pane says the right one of five
-  things rather than proving it says nothing.
-- **Task 3** fixes a documented command that silently did nothing. Say that
-  too, because anyone who ran it believed they had regenerated the gallery.
+- **Task 3** fixes a documented command that silently did nothing. Say that,
+  because anyone who ran it believed they had regenerated the gallery.
+- **Task 5** changes three assertions in the shipped
+  `a_selection_that_moves_refreshes_the_feed_and_one_that_cannot_does_not` from
+  `Effect::RefreshFeed` to `Effect::RefreshSelected`, and one in Task 2's `esc`
+  test. Say that a shipped test's expectation was updated and why: the effect
+  now covers the lamb fetch as well as the feed read, and the assertions that
+  carry the test's real claim, the two `Effect::None`s, did not move.
+- **Task 6** deletes `the_detail_pane_never_mentions_lambs`. Say so, with A19's
+  reason: the feature is the thing that test was written to prevent, and its
+  replacement proves the pane says the right one of five things rather than
+  proving it says nothing.
+- **Task 7** takes half the subject away from
+  `the_stop_key_refuses_in_both_control_states`: behind an open gate, `x` now
+  arms instead of refusing. Say that the control-enabled half moved into
+  `an_action_key_arms_a_confirm_and_sends_nothing` rather than being deleted.
+
+## Three deviations from the approved design, in one place
+
+Rin approved twenty numbered assumptions and this plan implements them. Three
+places depart, each because implementing the assumption literally would ship a
+defect. They are named in "Shapes the design named" at the top with their
+reasoning; they are collected here so a reviewer does not have to find them.
+**Each can be rejected on its own, and rejecting one costs one task, not the
+phase.**
+
+| # | assumption | what this plan does instead | why |
+|---|---|---|---|
+| 1 | **A4** | The filter box being typed into gets its own bar slot, above notices. A4's accepted cost, that a notice can cover the filter, applies to the applied-filter line only. | A4's stated reason ("while editing, every keypress is text, so nothing can raise a notice") is false: `BusLagged`, `Dropped` and `DaemonShutdown` raise notices with no keypress, and `on_text_key` never clears them, so the query would go off screen mid-word and stay off. |
+| 2 | **A10** | `q` and `Ctrl-C` are not consumed by the confirm's cancel; they quit. | `input.rs`'s shipped doctrine is that the most reflexive way out of a terminal program must keep working, and quitting discards the confirm rather than acting on it. Text mode already carves out the same key. |
+| 3 | **A9** | An armed confirm is cleared when the link stops being `Live`, rather than surviving to be refused at Enter. | A9 refuses at ARM time so an operator never answers a question that was never going to be honoured. Leaving the prompt up inverts that, and on a frozen dashboard it would never expire, because the expiry rides a clock that has stopped. |
+
+None of the three changes the action set, the keys, the sentences or the wire.
+If Rin rejects one, the plan reverts to the design's literal reading for that
+one item and the corresponding test comes out with it.
