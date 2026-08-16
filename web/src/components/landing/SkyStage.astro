@@ -499,7 +499,7 @@ const grazing = [
   }
 
   /*
-   * Parallax (build 2): the sky layer scrolls at 1x today because it's an
+   * Parallax (build 3): the sky layer scrolls at 1x today because it's an
    * absolutely-positioned child of the tall .stage, same as the copy below
    * it. animation-timeline: scroll(root) drives a small, growing translateY
    * off of overall page scroll progress with no JS — it partially cancels
@@ -509,6 +509,16 @@ const grazing = [
    * today's plain 1x scroll — never a stuck offset from an animation that
    * ran once at time 0. Also gated behind reduced-motion, same as every
    * other animation on this page.
+   *
+   * Build 2 gave every layer the same 10vh of drift across the whole page,
+   * which reads as a slightly slower background, not depth — depth needs
+   * layers to move at DIFFERENT rates. All four share one keyframe (still
+   * longhand only, see the note below on why) and each layer sets its own
+   * --parallax-drift: stars and moon are the farthest things in the scene
+   * and barely move; clouds sit lower and nearer and drift noticeably; the
+   * sun is the nearest, lowest object of the four (it rises across the
+   * pasture's own scenery band rather than sitting fixed in a far sky) and
+   * gets the most drift of the group.
    */
   @media (prefers-reduced-motion: no-preference) {
     @supports (animation-timeline: scroll()) {
@@ -532,6 +542,22 @@ const grazing = [
         animation-fill-mode: both;
         animation-timeline: scroll(root);
       }
+
+      .stars {
+        --parallax-drift: 4vh;
+      }
+
+      .moon {
+        --parallax-drift: 7vh;
+      }
+
+      .clouds {
+        --parallax-drift: 18vh;
+      }
+
+      .sun {
+        --parallax-drift: 26vh;
+      }
     }
   }
 
@@ -540,7 +566,7 @@ const grazing = [
       transform: translateY(0);
     }
     to {
-      transform: translateY(10vh);
+      transform: translateY(var(--parallax-drift, 10vh));
     }
   }
 </style>
