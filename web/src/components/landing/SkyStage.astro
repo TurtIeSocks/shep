@@ -145,20 +145,27 @@ const clouds: CloudSpec[] = [
  * so the tuning knob stays the single speed number above.
  */
 /*
- * Roaming animals cross the entire pasture and walk off screen while others
- * walk on (the `roam` keyframes in motion.css — negative delays start each
- * one mid-journey so the pasture is never suddenly empty at load). Fleece
- * colors are illustration literals like the marks' own: a moorit-brown ewe
- * trailing a white lamb up front, a black sheep and a white ewe with a
- * brown lamb far back. Lambs gambol instead of bobbing. The far groups take
- * the same desaturate/brighten treatment and behind-the-fence z-index as
- * the far grazer; widths are clamp()ed in the styles below, per depth and
- * per adult/lamb, for the same footprint-shrinks-with-viewport reason.
+ * Roaming animals visit the pasture and leave the way they came (the
+ * `roam` keyframes in motion.css: enter from --roam-from, graze at
+ * --roam-visit, one small --roam-shift step, graze, exit — negative
+ * delays start each one mid-visit so the pasture is never suddenly empty
+ * at load). Visit spots are chosen OFF the resident grazers' lanes so no
+ * sheep ever walks through another — the fix for the old edge-to-edge
+ * crossings reading as z-order bugs. Each visit spot has a grass tuft
+ * planted at it (the tufts config below) so the stops read as eating.
+ * Fleece colors are illustration literals like the marks' own: a
+ * moorit-brown ewe trailing a white lamb up front, a black sheep and a
+ * white ewe with a brown lamb far back. Lambs gambol instead of bobbing.
+ * The far groups take the same desaturate/brighten treatment and
+ * behind-the-fence z-index as the far grazer; widths are clamp()ed in
+ * the styles below, per depth and per adult/lamb, for the same
+ * footprint-shrinks-with-viewport reason.
  */
 interface RoamerSpec {
   depth: "mid" | "far";
   from: string;
-  to: string;
+  visit: string;
+  shift: string;
   facingRight: boolean;
   duration: string;
   delay: string;
@@ -175,9 +182,10 @@ const roaming: RoamerSpec[] = [
   {
     depth: "mid",
     from: "-28vw",
-    to: "108vw",
+    visit: "14vw",
+    shift: "4vw",
     facingRight: true,
-    duration: "95s",
+    duration: "88s",
     delay: "-34s",
     bottom: "4.5vh",
     width: 64,
@@ -190,9 +198,10 @@ const roaming: RoamerSpec[] = [
   {
     depth: "far",
     from: "108vw",
-    to: "-28vw",
+    visit: "58vw",
+    shift: "-4vw",
     facingRight: false,
-    duration: "128s",
+    duration: "120s",
     delay: "-58s",
     bottom: "17vh",
     width: 48,
@@ -204,11 +213,15 @@ const roaming: RoamerSpec[] = [
   {
     depth: "far",
     from: "-28vw",
-    to: "108vw",
+    visit: "27vw",
+    shift: "3vw",
     facingRight: true,
-    duration: "152s",
+    duration: "140s",
     delay: "-118s",
-    bottom: "20vh",
+    /* 14.5vh, in front of the resident far grazer's 16vh lane: its entry
+       crosses that sheep's x, and lower-on-screen must paint nearer for
+       the pass to read as depth instead of a glitch. */
+    bottom: "14.5vh",
     width: 44,
     bobDuration: "6.9s",
     bobDelay: ".9s",
@@ -228,6 +241,37 @@ const cloudMotion = (c: CloudSpec) => {
   const drift = (100 * (1 - c.speed)) / c.speed;
   return `--parallax-drift:${drift.toFixed(1)}vh;--parallax-range-end:${(100 / c.speed).toFixed(1)}%;${wind}`;
 };
+
+/*
+ * Grass tufts. Positions land on the spots where an animal actually
+ * stands still — each grazer's walk plateau (home + ~55% of its walk
+ * amplitude) and each roamer's visit spot — so a stopped, bobbing sheep
+ * reads as eating, plus a few decorative extras. `far` tufts render in a
+ * layer just after the far hill (behind the fog, fence and every animal)
+ * and take the far-depth filter; near ones sit on the near hill under
+ * the fence. Retune these alongside the grazing/roaming configs above —
+ * a tuft nobody stops at is scenery, a stop with no tuft is a sheep
+ * staring at nothing.
+ */
+interface TuftSpec {
+  left: string;
+  bottom: string;
+  width: number;
+  far?: boolean;
+  flip?: boolean;
+}
+
+const tufts: TuftSpec[] = [
+  { left: "11.5%", bottom: "15.8vh", width: 22, far: true },
+  { left: "56%", bottom: "16.8vh", width: 24, far: true, flip: true },
+  { left: "28.5%", bottom: "14.2vh", width: 22, far: true },
+  { left: "42%", bottom: "19vh", width: 18, far: true, flip: true },
+  { left: "84%", bottom: "16.2vh", width: 20, far: true },
+  { left: "31%", bottom: "2.6vh", width: 30 },
+  { left: "53.5%", bottom: "1.6vh", width: 32, flip: true },
+  { left: "16%", bottom: "4.3vh", width: 28 },
+  { left: "70%", bottom: "3vh", width: 26, flip: true },
+];
 
 /*
  * Depth for the grazing sheep: far/mid/near controls width (a clamp() in
@@ -360,6 +404,29 @@ const grazing = [
       </svg>
     </div>
 
+    <div class="tuft-layer far" aria-hidden="true">
+      {tufts.filter((t) => t.far).map((t) => (
+        <span
+          class="tuft"
+          style={`left:${t.left};bottom:${t.bottom};width:${t.width}px;${t.flip ? "transform:scaleX(-1);" : ""}`}
+        >
+          <svg viewBox="0 0 32 18" width="100%" aria-hidden="true">
+            <g
+              fill="none"
+              stroke="var(--grass-deep)"
+              stroke-width="3"
+              stroke-linecap="round"
+            >
+              <path d="M6 17C5 11 3 8 2 3" />
+              <path d="M12 17C12 9 11 6 12 1" />
+              <path d="M18 17C19 10 21 7 23 3" />
+              <path d="M25 17C26 12 28 10 30 7" />
+            </g>
+          </svg>
+        </span>
+      ))}
+    </div>
+
     <div class="barn">
       <Barn width={300} />
     </div>
@@ -375,6 +442,29 @@ const grazing = [
           stroke-width="4"
         />
       </svg>
+    </div>
+
+    <div class="tuft-layer" aria-hidden="true">
+      {tufts.filter((t) => !t.far).map((t) => (
+        <span
+          class="tuft"
+          style={`left:${t.left};bottom:${t.bottom};width:${t.width}px;${t.flip ? "transform:scaleX(-1);" : ""}`}
+        >
+          <svg viewBox="0 0 32 18" width="100%" aria-hidden="true">
+            <g
+              fill="none"
+              stroke="var(--grass-deep)"
+              stroke-width="3"
+              stroke-linecap="round"
+            >
+              <path d="M6 17C5 11 3 8 2 3" />
+              <path d="M12 17C12 9 11 6 12 1" />
+              <path d="M18 17C19 10 21 7 23 3" />
+              <path d="M25 17C26 12 28 10 30 7" />
+            </g>
+          </svg>
+        </span>
+      ))}
     </div>
 
     <div class="fence">
@@ -411,9 +501,9 @@ const grazing = [
     {roaming.map((r) => (
       <div
         class={`roamer roamer-${r.depth} anim-roam`}
-        style={`bottom:${r.bottom};--roam-from:${r.from};--roam-to:${r.to};--roam-duration:${r.duration};--roam-delay:${r.delay};`}
+        style={`bottom:${r.bottom};--roam-from:${r.from};--roam-visit:${r.visit};--roam-shift:${r.shift};--face-in:${r.facingRight ? -1 : 1};--roam-duration:${r.duration};--roam-delay:${r.delay};`}
       >
-        <div class="trek" style={r.facingRight ? "transform:scaleX(-1);" : undefined}>
+        <div class="trek">
           <Sheep
             width={r.width}
             fleece={r.fleece}
@@ -780,6 +870,20 @@ const grazing = [
       #000 76%,
       transparent 100%
     );
+  }
+
+  .tuft-layer {
+    position: absolute;
+    inset: 0;
+  }
+
+  .tuft-layer.far {
+    filter: saturate(0.58) brightness(1.07);
+  }
+
+  .tuft {
+    position: absolute;
+    line-height: 0;
   }
 
   .grazing-sheep {

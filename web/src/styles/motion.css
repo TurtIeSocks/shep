@@ -94,54 +94,60 @@
 }
 
 /*
- * Roaming animals cross the whole pasture and walk off screen (--roam-from
- * and --roam-to are set inline, one of them offscreen on each side; swap
- * them to reverse direction). Same amble-graze-amble rhythm as `walk`: two
- * standing plateaus partway across, placed asymmetrically so the two graze
- * stops don't mirror. The element's own non-animated transform should also
- * be translateX(var(--roam-from)) so that without this animation — reduced
- * motion — the roamer simply stays parked offscreen instead of standing in
- * the middle of the scene.
+ * Roaming animals VISIT rather than cross: enter from one offscreen side
+ * (--roam-from), amble to a home spot (--roam-visit), graze, take one
+ * small step further (--roam-shift, signed), graze again, then turn and
+ * leave the way they came. Ending where it started makes the loop
+ * seamless — no offscreen teleport — and choosing visit spots away from
+ * the resident grazers means no two sheep ever walk through each other,
+ * which is what made the old edge-to-edge crossings read as z-order
+ * bugs. The element's own non-animated transform should also be
+ * translateX(var(--roam-from)) so that without this animation — reduced
+ * motion — the roamer stays parked offscreen instead of standing in the
+ * middle of the scene.
+ *
+ * The companion visit-face keyframes flip the mark's facing on the .trek
+ * child (never on the roamer itself, whose transform belongs to `roam`):
+ * --face-in is the scaleX that faces the sheep INTO the pasture on entry
+ * (-1 entering from the left, since the mark faces left at rest), and
+ * the two keyframes 0.2% apart make the 80% turn read as a turn, not a
+ * squish — same trick as `walk`'s endpoint flips.
  */
 @keyframes roam {
   0% {
     transform: translateX(var(--roam-from, -30vw));
   }
-  26% {
+  14% {
+    transform: translateX(var(--roam-visit, 20vw));
+  }
+  46% {
+    transform: translateX(var(--roam-visit, 20vw));
+  }
+  52% {
     transform: translateX(
-      calc(
-        var(--roam-from, -30vw) +
-          (var(--roam-to, 110vw) - var(--roam-from, -30vw)) * 0.32
-      )
+      calc(var(--roam-visit, 20vw) + var(--roam-shift, 3vw))
     );
   }
-  34% {
+  80% {
     transform: translateX(
-      calc(
-        var(--roam-from, -30vw) +
-          (var(--roam-to, 110vw) - var(--roam-from, -30vw)) * 0.32
-      )
-    );
-  }
-  62% {
-    transform: translateX(
-      calc(
-        var(--roam-from, -30vw) +
-          (var(--roam-to, 110vw) - var(--roam-from, -30vw)) * 0.68
-      )
-    );
-  }
-  70% {
-    transform: translateX(
-      calc(
-        var(--roam-from, -30vw) +
-          (var(--roam-to, 110vw) - var(--roam-from, -30vw)) * 0.68
-      )
+      calc(var(--roam-visit, 20vw) + var(--roam-shift, 3vw))
     );
   }
   100% {
-    transform: translateX(var(--roam-to, 110vw));
+    transform: translateX(var(--roam-from, -30vw));
   }
+}
+
+@keyframes visit-face {
+  0%,
+  80% {
+    transform: scaleX(var(--face-in, 1));
+  }
+  80.2%,
+  100% {
+    transform: scaleX(calc(-1 * var(--face-in, 1)));
+  }
+}
 }
 
 /*
@@ -211,6 +217,13 @@
 
   .anim-roam {
     animation: roam var(--roam-duration, 110s) ease-in-out infinite;
+    animation-delay: var(--roam-delay, 0s);
+  }
+
+  /* linear, not eased: the flip is two adjacent keyframes, and easing
+     would only distort the long held segments around them. */
+  .anim-roam .trek {
+    animation: visit-face var(--roam-duration, 110s) linear infinite;
     animation-delay: var(--roam-delay, 0s);
   }
 
