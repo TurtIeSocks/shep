@@ -5,6 +5,7 @@
  * this page's PR for the transcript.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 
@@ -47,6 +48,7 @@ KEY  VALUE`;
 >
   <article>
     <h1>The KV store</h1>
+    <ReferencePills slug="kv" />
     <p class="lede">
       Two files already configure everything shep runs: a Flockfile
       configures a sheep, <code>shep.toml</code> configures the shepherd and
@@ -128,6 +130,7 @@ KEY  VALUE`;
       <code>git add</code> and diff like any other small config file. Mode is
       <code>0600</code>.
     </p>
+    <h2>Where to go next</h2>
 
     <div class="next-grid">
       <a href="/docs/lookout" class="next-card">
