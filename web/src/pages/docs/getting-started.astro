@@ -6,6 +6,7 @@
  * Flockfile shape, shep ls output, the JSON envelope).
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 ---
 
@@ -17,6 +18,7 @@ import Callout from "../../components/docs/Callout.astro";
 >
   <article>
     <h1>Getting started</h1>
+    <ReferencePills slug="getting-started" />
     <p class="lede">
       shep is one binary. Running it starts a daemon called the shepherd,
       which keeps a flock of your long-running processes alive. This page
@@ -47,7 +49,10 @@ import Callout from "../../components/docs/Callout.astro";
     <p>
       Two fields is a complete one. <code>Flockfile.toml</code>,
       <code>.yaml</code>, <code>.json</code> and <code>.json5</code> all
-      work, discovered by searching ten filenames in a fixed order.
+      work. <code>shep start</code> below takes the path explicitly;
+      <code>shep runtime</code> and <code>shep dev</code> can find one on
+      their own instead, by searching ten filenames in a fixed order — see
+      <a href="/docs/first-flockfile">Your first Flockfile</a>.
     </p>
     <div class="file-panel">
       <div class="file-name">Flockfile.toml</div>
@@ -120,8 +125,8 @@ import Callout from "../../components/docs/Callout.astro";
       <a href="/docs/terminology" class="next-card">
         <div class="next-title">Terminology →</div>
         <div class="next-body">
-          Fifteen words carry the whole product. Learn them once and the CLI
-          explains itself.
+          A short lexicon carries the whole product. Learn it once and the
+          CLI explains itself.
         </div>
       </a>
       <a href="/docs/from-pm2" class="next-card">
