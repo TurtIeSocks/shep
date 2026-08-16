@@ -127,20 +127,24 @@ const features: Feature[] = [
     box-shadow: 7px 7px 0 var(--shadow);
     padding: 26px;
     transition: none;
-    /* Whitewashed fence boards — same plank layers as the lexicon's
-       SignpostCard (see the recipe note there), over cream instead of
-       paint. */
+    /* Whitewashed fence boards — same plank recipe as the lexicon's
+       SignpostCard (see the note there) over cream, with a 48px period
+       (two measured 24.2px body lines) and an 8px y offset solved against
+       real line boxes so seams fall in the leading between paragraph
+       lines; a faint seam may cross the bold title, where it disappears
+       into the stroke weight. */
     background-image:
       repeating-linear-gradient(
         180deg,
-        rgba(23, 37, 28, 0) 0 35px,
-        rgba(23, 37, 28, 0.18) 35px 38px
+        rgba(23, 37, 28, 0) 0 45px,
+        rgba(23, 37, 28, 0.12) 45px 48px
       ),
       repeating-linear-gradient(
         180deg,
-        rgba(255, 255, 255, 0.16) 0 4px,
-        rgba(255, 255, 255, 0) 8px 38px
+        rgba(255, 255, 255, 0.12) 0 4px,
+        rgba(255, 255, 255, 0) 8px 48px
       );
+    background-position-y: 8px;
   }
 
   /* A nail in each top corner, echoing the signposts' screws. */

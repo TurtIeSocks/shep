@@ -40,24 +40,30 @@ const { term, meaning, cli, bg, fg, tilt } = Astro.props;
     /*
      * Painted wooden sign: the data-driven background color stays as the
      * paint, and two low-alpha layers draw the boards over it — a dark
-     * seam every 38px, and a soft highlight right under each seam so the
+     * seam every 54px, and a soft highlight right under each seam so the
      * boards read bevelled. (A third vertical saw-mark layer was tried
      * and cut: crossing lines read as graph paper, not wood.) The seam and
-     * highlight layers share the 38px period so they can't drift apart
-     * down a tall card. (Features.astro's cards use the same recipe over
-     * cream — change one, change the other.)
+     * highlight layers share the 54px period so they can't drift apart
+     * down a tall card. 54px is two MEASURED meaning lines (27px rendered
+     * pitch — trust the browser, not the 15px x 1.5 arithmetic), and the
+     * 4px y offset was solved against real line boxes so seams land in the
+     * leading between meaning lines instead of striking through glyphs; a
+     * faint seam may still cross the bold term, where the heavy strokes
+     * shrug it off. (Features.astro's
+     * cards use the same recipe over cream — change one, change the other.)
      */
     background-image:
       repeating-linear-gradient(
         180deg,
-        rgba(23, 37, 28, 0) 0 35px,
-        rgba(23, 37, 28, 0.18) 35px 38px
+        rgba(23, 37, 28, 0) 0 51px,
+        rgba(23, 37, 28, 0.12) 51px 54px
       ),
       repeating-linear-gradient(
         180deg,
-        rgba(255, 255, 255, 0.16) 0 4px,
-        rgba(255, 255, 255, 0) 8px 38px
+        rgba(255, 255, 255, 0.12) 0 4px,
+        rgba(255, 255, 255, 0) 8px 54px
       );
+    background-position-y: 4px;
   }
 
   .screws {
