@@ -9,8 +9,8 @@ No tag was created and nothing was uploaded.
 
 ## Publish order
 
-The four crates form a chain, so they go up in dependency order. Read off the
-manifests:
+Four of the five crates form a chain, so they go up in dependency order. Read
+off the manifests:
 
 | Crate | Depends on |
 |---|---|
@@ -18,12 +18,15 @@ manifests:
 | `shep-client` | `shep-core` |
 | `shep-daemon` | `shep-core` |
 | `shep` | `shep-core`, `shep-daemon`, `shep-client` |
+| `shep-cli` | nothing — the redirect placeholder, no code, no deps |
 
 So: **shep-core, then shep-client and shep-daemon in either order, then
 shep.** `shep-client` and `shep-daemon` do not know about each other.
+`shep-cli` has no workspace dependency in either direction, so it can go up
+whenever — first, last, or wherever `cargo publish --workspace` schedules it.
 
 You do not have to drive that by hand. `cargo publish --workspace` computes
-the order itself and, unlike four separate `-p` runs, resolves the
+the order itself and, unlike five separate `-p` runs, resolves the
 inter-member dependencies against the local workspace instead of demanding
 they already be on the index. That is the one-command form, and it is what
 the sequence below uses.
@@ -87,10 +90,10 @@ If this drifts again on the next bump, `cargo-release` mechanises it.
 
 ## Tag: one tag, `v0.1.0-alpha.1`
 
-The four crates share a single workspace version and are released together, so
-one annotated tag on the release commit is the honest shape. Per-crate tags
-(`shep-core-v0.1.0-alpha.1`) are for workspaces whose members version
-independently, and adopting that scheme here would create four tags that can
+All five crates share a single workspace version and are released together,
+so one annotated tag on the release commit is the honest shape. Per-crate
+tags (`shep-core-v0.1.0-alpha.1`) are for workspaces whose members version
+independently, and adopting that scheme here would create five tags that can
 only ever hold the same number.
 
 Keep the `v` prefix. It is what GitHub's release UI and most changelog tooling
@@ -107,7 +110,8 @@ $EDITOR Cargo.toml
 cargo check --workspace --all-features
 
 # 2. Move each crate's [Unreleased] section to [0.1.0-alpha.1] with today's
-#    date, in all four CHANGELOG.md files.
+#    date, in all four real crates' CHANGELOG.md files. shep-cli (the
+#    redirect) ships no code and keeps no CHANGELOG — nothing to log.
 $EDITOR crates/*/CHANGELOG.md
 
 # 3. The task gate, one command at a time, $? read directly and never
@@ -118,7 +122,7 @@ cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 
 # 4. Rehearse the whole publish. Resolves inter-member deps locally, so it
-#    exercises all four rather than stopping at the first unpublished one.
+#    exercises all five rather than stopping at the first unpublished one.
 cargo publish --workspace --dry-run
 
 # 5. Commit and tag.
@@ -140,16 +144,19 @@ If you would rather go crate by crate and watch each land, the same thing
 spelled out:
 
 ```bash
+cargo publish -p shep-cli
 cargo publish -p shep-core
 cargo publish -p shep-client
 cargo publish -p shep-daemon
 cargo publish -p shep
 ```
 
-Each of the last three waits for the previous crate to appear in the index.
-Recent cargo polls for that on its own; if a run fails with `no matching
-package named 'shep-core' found` immediately after `shep-core` went up, wait a
-minute and rerun the one that failed.
+`shep-cli` has no dependency ordering to respect — it is listed first only so
+it is out of the way early, not because it must go before anything else. Each
+of the last three real crates waits for the previous one to appear in the
+index. Recent cargo polls for that on its own; if a run fails with `no
+matching package named 'shep-core' found` immediately after `shep-core` went
+up, wait a minute and rerun the one that failed.
 
 Afterwards, the install line becomes:
 

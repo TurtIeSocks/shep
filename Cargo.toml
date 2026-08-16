@@ -5,6 +5,7 @@ members = [
     "crates/shep-daemon",
     "crates/shep-client",
     "crates/shep-cli",
+    "crates/shep-cli-redirect",
 ]
 
 [workspace.package]

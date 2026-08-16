@@ -1,0 +1,23 @@
+[package]
+name = "shep-cli"
+description = "Renamed to shep. This crate is an empty placeholder published only to keep the shep-cli name from being squatted; install shep instead."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+readme = "README.md"
+keywords = ["shep", "renamed", "redirect"]
+categories = ["command-line-utilities"]
+# No [lib] or [[bin]] TABLE here — deliberately. Cargo does still require at
+# least one target to exist (a package with truly zero targets fails
+# `no targets specified in the manifest`), so `src/lib.rs` is present and
+# autodiscovered the ordinary way, but it declares nothing: no public items,
+# no re-exports. That keeps the manifest itself free of [lib]/[[bin]]
+# sections and means there is nothing to `cargo install` (no [[bin]] means
+# `cargo install shep-cli` fails outright, which is the point) and nothing
+# meaningful to `cargo build` beyond an empty crate. See README.md for why
+# this crate is published at all.
+
+[lints]
+workspace = true
