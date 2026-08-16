@@ -209,7 +209,9 @@ const roaming: RoamerSpec[] = [
     width: 44,
     bobDuration: "6.9s",
     bobDelay: ".9s",
-    lamb: { width: 28, fleece: "#b5895f", gambolDuration: "0.95s" },
+    /* width >= 32 so Sheep.astro's build-time legs rule keeps the lamb's
+       legs — 28 produced a legless blob bouncing across the far hill. */
+    lamb: { width: 34, fleece: "#b5895f", gambolDuration: "0.95s" },
   },
 ];
 
@@ -842,7 +844,7 @@ const grazing = [
   }
 
   .roamer-far .lamb :global(.sheep-mark) {
-    width: clamp(18px, 2.4vw, 32px) !important;
+    width: clamp(22px, 2.6vw, 34px) !important;
   }
 
   .night-wash {
