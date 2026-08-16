@@ -364,6 +364,19 @@ closed, refusing with the sentence it already refuses with. It remains a
 fat-finger catch and not a security boundary, and the README already says
 so.
 
+**On `start`, raised and settled 2026-08-16.** Whistle has four control tools,
+not three: `start_sheep`, narrowed to already-registered sheep. So lookout's
+surface is a subset of whistle's rather than identical to it, and the case for
+adding `start` is the strongest of the four left out. It needs no parameter, it
+is not destructive, and it is already considered safe enough for an agent to
+invoke unattended. The cost of leaving it out is that an operator watching a
+stopped sheep has to drop to a shell for the one verb that would fix it.
+
+Rin's call: ship the three. Recorded here because the next reader will ask the
+same question, and because the answer is a scope decision rather than a
+technical obstacle. Adding `start` later is additive: one key, one arm-time
+refusal for a sheep that is already running, and no new shape anywhere.
+
 ## Keys
 
 | key | verb | note |
