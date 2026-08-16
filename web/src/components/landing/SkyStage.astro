@@ -114,6 +114,75 @@ const clouds: CloudSpec[] = [
  * animations consume — the two formulas from THE SPEED MODEL, computed here
  * so the tuning knob stays the single speed number above.
  */
+/*
+ * Roaming animals cross the entire pasture and walk off screen while others
+ * walk on (the `roam` keyframes in motion.css — negative delays start each
+ * one mid-journey so the pasture is never suddenly empty at load). Fleece
+ * colors are illustration literals like the marks' own: a moorit-brown ewe
+ * trailing a white lamb up front, a black sheep and a white ewe with a
+ * brown lamb far back. Lambs gambol instead of bobbing. The far groups take
+ * the same desaturate/brighten treatment and behind-the-fence z-index as
+ * the far grazer; widths are clamp()ed in the styles below, per depth and
+ * per adult/lamb, for the same footprint-shrinks-with-viewport reason.
+ */
+interface RoamerSpec {
+  depth: "mid" | "far";
+  from: string;
+  to: string;
+  facingRight: boolean;
+  duration: string;
+  delay: string;
+  bottom: string;
+  width: number;
+  fleece?: string;
+  bobDuration: string;
+  bobDelay: string;
+  lamb?: { width: number; fleece?: string; gambolDuration: string };
+}
+
+const roaming: RoamerSpec[] = [
+  {
+    depth: "mid",
+    from: "-28vw",
+    to: "108vw",
+    facingRight: true,
+    duration: "95s",
+    delay: "-34s",
+    bottom: "4.5vh",
+    width: 64,
+    fleece: "#b5895f",
+    bobDuration: "5.1s",
+    bobDelay: ".6s",
+    lamb: { width: 36, gambolDuration: "1.15s" },
+  },
+  {
+    depth: "far",
+    from: "108vw",
+    to: "-28vw",
+    facingRight: false,
+    duration: "128s",
+    delay: "-58s",
+    bottom: "17vh",
+    width: 48,
+    fleece: "#4b463d",
+    bobDuration: "6.2s",
+    bobDelay: ".2s",
+  },
+  {
+    depth: "far",
+    from: "-28vw",
+    to: "108vw",
+    facingRight: true,
+    duration: "152s",
+    delay: "-118s",
+    bottom: "20vh",
+    width: 44,
+    bobDuration: "6.9s",
+    bobDelay: ".9s",
+    lamb: { width: 28, fleece: "#b5895f", gambolDuration: "0.95s" },
+  },
+];
+
 const cloudMotion = (c: CloudSpec) => {
   const wind = `--wind-amp:${c.wind.amp};--wind-duration:${c.wind.duration};--wind-delay:${c.wind.delay};`;
   if (c.atTop) {
@@ -289,6 +358,28 @@ const grazing = [
     <div class="watch-dog">
       <Dog width={126} wag />
     </div>
+
+    {roaming.map((r) => (
+      <div
+        class={`roamer roamer-${r.depth} anim-roam`}
+        style={`bottom:${r.bottom};--roam-from:${r.from};--roam-to:${r.to};--roam-duration:${r.duration};--roam-delay:${r.delay};`}
+      >
+        <div class="trek" style={r.facingRight ? "transform:scaleX(-1);" : undefined}>
+          <Sheep
+            width={r.width}
+            fleece={r.fleece}
+            bob
+            bobDuration={r.bobDuration}
+            bobDelay={r.bobDelay}
+          />
+          {r.lamb && (
+            <div class="lamb" style={`--gambol-duration:${r.lamb.gambolDuration};`}>
+              <Sheep width={r.lamb.width} fleece={r.lamb.fleece} class="anim-gambol" />
+            </div>
+          )}
+        </div>
+      </div>
+    ))}
   </div>
 
   <div class="night-wash"></div>
@@ -658,6 +749,53 @@ const grazing = [
 
   .watch-dog :global(.dog-mark) {
     width: clamp(56px, 9.4vw, 126px) !important;
+  }
+
+  /*
+   * Roamers sit at left:0 and are carried across by the roam keyframes'
+   * translateX; the same var(--roam-from) as a static transform keeps them
+   * parked offscreen for reduced-motion visitors, who would otherwise find
+   * a stranger standing in the middle of the pasture. `.trek` carries the
+   * facing flip on its own element so it can't fight the roam transform,
+   * and the lamb always trails its ewe: it is the second flex child, and
+   * the flip mirrors the whole group, so the adult leads in both
+   * directions.
+   */
+  .roamer {
+    position: absolute;
+    left: 0;
+    transform: translateX(var(--roam-from, -30vw));
+  }
+
+  .trek {
+    display: flex;
+    align-items: flex-end;
+    gap: 7px;
+  }
+
+  .roamer-mid {
+    z-index: 3;
+  }
+
+  .roamer-far {
+    z-index: 1;
+    filter: saturate(0.58) brightness(1.07) opacity(0.85);
+  }
+
+  .roamer-mid :global(.sheep-mark) {
+    width: clamp(44px, 5.6vw, 78px) !important;
+  }
+
+  .roamer-far :global(.sheep-mark) {
+    width: clamp(30px, 4vw, 56px) !important;
+  }
+
+  .roamer-mid .lamb :global(.sheep-mark) {
+    width: clamp(26px, 3.2vw, 42px) !important;
+  }
+
+  .roamer-far .lamb :global(.sheep-mark) {
+    width: clamp(18px, 2.4vw, 32px) !important;
   }
 
   .night-wash {

@@ -94,6 +94,72 @@
 }
 
 /*
+ * Roaming animals cross the whole pasture and walk off screen (--roam-from
+ * and --roam-to are set inline, one of them offscreen on each side; swap
+ * them to reverse direction). Same amble-graze-amble rhythm as `walk`: two
+ * standing plateaus partway across, placed asymmetrically so the two graze
+ * stops don't mirror. The element's own non-animated transform should also
+ * be translateX(var(--roam-from)) so that without this animation — reduced
+ * motion — the roamer simply stays parked offscreen instead of standing in
+ * the middle of the scene.
+ */
+@keyframes roam {
+  0% {
+    transform: translateX(var(--roam-from, -30vw));
+  }
+  26% {
+    transform: translateX(
+      calc(
+        var(--roam-from, -30vw) +
+          (var(--roam-to, 110vw) - var(--roam-from, -30vw)) * 0.32
+      )
+    );
+  }
+  34% {
+    transform: translateX(
+      calc(
+        var(--roam-from, -30vw) +
+          (var(--roam-to, 110vw) - var(--roam-from, -30vw)) * 0.32
+      )
+    );
+  }
+  62% {
+    transform: translateX(
+      calc(
+        var(--roam-from, -30vw) +
+          (var(--roam-to, 110vw) - var(--roam-from, -30vw)) * 0.68
+      )
+    );
+  }
+  70% {
+    transform: translateX(
+      calc(
+        var(--roam-from, -30vw) +
+          (var(--roam-to, 110vw) - var(--roam-from, -30vw)) * 0.68
+      )
+    );
+  }
+  100% {
+    transform: translateX(var(--roam-to, 110vw));
+  }
+}
+
+/*
+ * A lamb's bounce — takes the place of `bob` on the mark wrapper (a lamb
+ * gambols rather than sways), so it composes with the roam/walk transform
+ * on the wrapper above it the same way bob does.
+ */
+@keyframes gambol {
+  0%,
+  100% {
+    transform: translateY(0) rotate(-2.5deg);
+  }
+  50% {
+    transform: translateY(-9px) rotate(3deg);
+  }
+}
+
+/*
  * Utility classes for the four animations. Each reads its duration/delay from
  * a custom property set inline on the element (falls back to the handoff's
  * default), and is a no-op unless the visitor has no reduced-motion preference.
@@ -122,6 +188,16 @@
   .anim-walk {
     animation: walk var(--walk-duration, 22s) ease-in-out infinite;
     animation-delay: var(--walk-delay, 0s);
+  }
+
+  .anim-roam {
+    animation: roam var(--roam-duration, 110s) ease-in-out infinite;
+    animation-delay: var(--roam-delay, 0s);
+  }
+
+  .anim-gambol {
+    animation: gambol var(--gambol-duration, 1.1s) ease-in-out infinite;
+    animation-delay: var(--gambol-delay, 0s);
   }
 }
 
