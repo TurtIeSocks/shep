@@ -372,6 +372,32 @@ substring in `docs/migration.md`, which drifts from the code the moment
 either one is edited without the other, `grep`-checked but not
 `cargo test`-checked.
 
+### Two `# Panics` sections without `#[track_caller]`
+
+`crates/shep-daemon/src/fake.rs` has seven `spawn_index` accessors that
+document a `# Panics` section and carry no `#[track_caller]`, and
+`CronSchedule::next_after` in `crates/shep-core/src/config/cron.rs` is the
+same shape. IR-21 wants the two to travel together or not at all, and this
+crate's own `limits/mod.rs` says so in a comment.
+
+Not urgent, and deliberately not done before the first publish. Adding the
+attribute is purely additive, so it can ship in any later version without a
+breaking change, and `fake.rs` sits behind the non-default `test-fakes`
+feature so it never reaches docs.rs. What would force it: a panic from one of
+those accessors pointing at the accessor rather than at the caller that passed
+the bad index, which is exactly the debugging cost IR-21 exists to avoid.
+
+### The license files are not inside the published tarballs
+
+`cargo package` does not include `LICENSE-MIT` or `LICENSE-APACHE`, so the
+crates ship with a `license = "MIT OR Apache-2.0"` field and no license text.
+Tooling reads the field, so nothing is broken, and `docs/releasing.md` already
+records it as cosmetic.
+
+Worth knowing that tarball contents are permanent per version, so this cannot
+be corrected for `0.1.0-alpha.1` after the fact. It would be fixed by adding
+the two files to each crate's `include`, in a later version.
+
 ## Not deferred
 
 **Dogs** (spec §8) **shipped**: the dog contract (`shep_daemon::dogs`,
