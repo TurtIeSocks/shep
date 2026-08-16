@@ -150,11 +150,16 @@ so 19 jobs, of which the two macOS legs dominate the bill at ten times their
 wall-clock. A `push`+`pull_request` trigger runs the whole file on every commit
 to a branch with a PR open; a `schedule` row adds one run a week regardless.
 
-**The decision is Rin's and has been made for now: leave it manual until the
-base phases ship.** Recorded here so the next person to read the workflow does
-not "fix" the missing trigger, and so that every "all gates green" claim in
-this project's history is understood for what it is — self-reported by the
-agent that wrote the code, never independently re-run.
+**Superseded 2026-08-16: Rin turned it on.** `push` to `main` and
+`pull_request` now trigger the file. The weekly `schedule` row is still off,
+because a full 19-job run against an unchanged tree spends the expensive part
+of this file to learn nothing; it is worth adding once the repository is public
+and the runs are free.
+
+The reason this entry still matters: every "all gates green" claim in this
+project's history predates the first automatic run, and each was self-reported
+by the agent that wrote the code rather than independently re-run. The first
+real CI run is the first outside check this project has ever had.
 
 The job count here and the one in `.github/workflows/test.yml`'s header
 comment are one fact written in two places. Change a matrix and both move.
