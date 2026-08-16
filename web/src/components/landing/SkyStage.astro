@@ -487,4 +487,50 @@ const grazing = [
       bottom: 4vh;
     }
   }
+
+  /*
+   * Parallax (build 2): the sky layer scrolls at 1x today because it's an
+   * absolutely-positioned child of the tall .stage, same as the copy below
+   * it. animation-timeline: scroll(root) drives a small, growing translateY
+   * off of overall page scroll progress with no JS — it partially cancels
+   * the sky's normal upward scroll, so it visibly lags the text. Gated
+   * behind @supports so unsupported browsers (no scroll-driven animation
+   * support yet in Firefox/older Safari) get zero transform applied, i.e.
+   * today's plain 1x scroll — never a stuck offset from an animation that
+   * ran once at time 0. Also gated behind reduced-motion, same as every
+   * other animation on this page.
+   */
+  @media (prefers-reduced-motion: no-preference) {
+    @supports (animation-timeline: scroll()) {
+      .stars,
+      .moon,
+      .sun,
+      .clouds {
+        /*
+         * Deliberately longhand, not the `animation` shorthand: Astro's CSS
+         * minifier (Lightning CSS) folds a shorthand `animation` declaration
+         * plus a separate `animation-timeline` into one shorthand value, and
+         * as of this build it produces `animation:linear both sky-parallax
+         * scroll(root)` — a value the browser itself then rejects as
+         * invalid, silently dropping the whole declaration (confirmed via
+         * the CSSOM: the compiled rule's selector survives, its body is
+         * empty). Longhand properties don't hit that merge path.
+         */
+        animation-name: sky-parallax;
+        animation-duration: auto;
+        animation-timing-function: linear;
+        animation-fill-mode: both;
+        animation-timeline: scroll(root);
+      }
+    }
+  }
+
+  @keyframes sky-parallax {
+    from {
+      transform: translateY(0);
+    }
+    to {
+      transform: translateY(10vh);
+    }
+  }
 </style>
