@@ -1,6 +1,9 @@
 # Changelog
 
-All notable changes to `shep-cli` are documented in this file.
+All notable changes to `shep` (the CLI binary crate, published under the
+package name `shep`; the redirect placeholder formerly reserved as
+`shep-cli` has its own history, or lack of one — see its README) are
+documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -29,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add the hidden `shep schema` verb — prints the Flockfile JSON Schema to
   stdout. The same rendering is committed at
   `crates/shep-core/assets/flockfile.schema.json`, drift-guarded by an
-  `include_str!` test in shep-core; regenerate with `cargo run -p shep-cli --
+  `include_str!` test in shep-core; regenerate with `cargo run -p shep --
   schema > crates/shep-core/assets/flockfile.schema.json`.
 - Add `--log-json[=BOOL]`, `--log-level <LEVEL>`, `--socket <PATH>` and
   `--max-cron-sleep <DUR>` to the hidden `shep daemon` verb — a third
@@ -818,7 +821,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because the two container-entrypoint aliases spec §3 asks for cannot share
   a module tree between `[[bin]]` targets without a library crate
   underneath, and it is deliberately not a second embedding API — that is
-  `shep-client`'s job. `cargo test -p shep-cli --lib --bins --all-features`
+  `shep-client`'s job. `cargo test -p shep --lib --bins --all-features`
   is the scoped test run from here on; `--bins` alone now runs almost
   nothing.
 - Add `shep serve <dir>`, a static file server run as a managed sheep by
@@ -858,6 +861,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alias that supplies the `dev` verb.
 
 ### Changes
+
+- **The CLI binary crate is renamed from `shep-cli` to `shep`.** The
+  package name now matches the `[[bin]]` it has always produced, so
+  `cargo install shep` installs it — the mismatch where the package was
+  `shep-cli` but the binary was `shep`, forcing `cargo install shep-cli`,
+  is gone. Nothing was ever published under either name before this
+  release, so there is no migration for an existing install: this is the
+  name the crate ships under from its first `cargo publish`. `shep-cli`
+  itself is not freed up for someone else to squat — it is published
+  separately, once, as an empty placeholder with no `[[bin]]` (so
+  `cargo install shep-cli` fails outright) whose README and doc comment
+  point at `shep`. See that crate's own listing for the full reasoning.
 
 - **A Linux host with no `/run/systemd/system` is now refused instead of
   being written a systemd unit.** `shep startup` used to write and enable a
@@ -920,10 +935,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   harmlessly since this crate's first day, because nothing wrote to stderr off
   the main thread until the daemon grew a subscriber for its own records.
 - Give the workspace's path dependencies a version alongside their `path`,
-  which `cargo publish` requires. The package here is `shep-cli`, but the
-  `[[bin]]` it produces is named `shep`, so once published the install
-  command is `cargo install shep-cli` — `cargo install shep` looks up an
-  unrelated crate.
+  which `cargo publish` requires.
 - Read `[daemon] enabled_dogs` and `[daemon] adopted_dogs` at daemon boot:
   each enabled name becomes a dog `shep_daemon::boot` starts once the flock
   is back, and a name present in `adopted_dogs` is that dog's own binary
