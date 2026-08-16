@@ -111,11 +111,16 @@ impl fmt::Display for AuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            // `mode` is the raw `st_mode` — `S_IFREG` (0o100000) or'd onto
+            // the permission bits — so printing it bare shows an operator
+            // "100644" next to advice ("chmod 600") they cannot connect to
+            // that number. `& 0o7777` keeps only the bits `chmod` accepts.
             Self::Mode { path, mode } => write!(
                 f,
-                "{}: mode {mode:03o} is readable by the group or the world; \
+                "{}: mode {:03o} is readable by the group or the world; \
                  chmod 600 it",
-                path.display()
+                path.display(),
+                mode & 0o7777
             ),
             Self::Malformed { path } => write!(
                 f,
@@ -347,6 +352,23 @@ mod tests {
         // positive control: the same file at 0600 loads.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(load(&path).is_ok());
+    }
+
+    /// fails if `AuthError::Mode`'s `Display` prints the raw `st_mode`
+    /// (`S_IFREG | 0o644` = `0o100644`) instead of the permission bits alone
+    /// — the message an operator locked out of `shep serve --auth` reads
+    /// first, and "mode 100644" next to "chmod 600 it" names a number the
+    /// operator cannot connect to the advice.
+    #[test]
+    fn a_mode_error_prints_the_permission_bits_not_the_raw_st_mode() {
+        let err = AuthError::Mode {
+            path: PathBuf::from("/srv/creds"),
+            mode: 0o100_644,
+        };
+        assert_eq!(
+            err.to_string(),
+            "/srv/creds: mode 644 is readable by the group or the world; chmod 600 it"
+        );
     }
 
     /// fails if a failure message ever carries the file's contents.
