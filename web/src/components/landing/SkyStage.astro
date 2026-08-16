@@ -55,10 +55,19 @@ const posts = [30, 180, 330, 480, 630, 780, 930, 1080, 1230, 1350];
  * (near = bigger and faster), and the negative delays start each cloud
  * mid-cycle so no two ever sway in sync (motion.css's lockstep rule).
  *
- * The first cloud is on screen before any scrolling happens, so it can't
- * run on a view() timeline (`atTop`, see `.cloud.at-top` below). Its
- * `spanVh` is its document top-to-bottom-edge extent — top 52vh plus its
- * own ~11vh height — the figure its scroll(root) range is derived from.
+ * Clouds visible before any scrolling happens can't run on a view()
+ * timeline (`atTop`, see `.cloud.at-top` below). Their `spanVh` is the
+ * document top-to-bottom-edge extent — top position plus own height —
+ * the figure the scroll(root) range is derived from.
+ *
+ * Variety comes from three knobs so every puff stays the one handoff
+ * silhouette rather than new artwork: `squash` scales the height only
+ * (the svg renders with preserveAspectRatio="none", so a 0.8 is a long
+ * flat drifter and a 1.12 a taller cumulus — at 3.4px the stroke's
+ * non-uniform scaling is imperceptible), `mirror` flips the path inside
+ * the svg (an attribute transform, because CSS transforms on the svg
+ * element belong to the wind sway), and the two farthest clouds drop a
+ * little opacity to lose contrast the way the far sheep do.
  */
 interface CloudSpec {
   left?: string;
@@ -67,6 +76,9 @@ interface CloudSpec {
   width: string;
   speed: number;
   atTop?: { spanVh: number };
+  squash?: number;
+  mirror?: boolean;
+  opacity?: number;
   wind: { amp: string; duration: string; delay: string };
 }
 
@@ -80,31 +92,47 @@ const clouds: CloudSpec[] = [
     wind: { amp: "10px", duration: "23s", delay: "-7s" },
   },
   {
+    right: "24%",
+    top: "30vh",
+    width: "88px",
+    speed: 0.45,
+    atTop: { spanVh: 36 },
+    squash: 0.82,
+    mirror: true,
+    opacity: 0.9,
+    wind: { amp: "7px", duration: "29s", delay: "-13s" },
+  },
+  {
     right: "18%",
     top: "128vh",
     width: "112px",
     speed: 0.5,
+    squash: 0.85,
     wind: { amp: "9px", duration: "26s", delay: "-3s" },
   },
   {
     left: "38%",
     top: "262vh",
-    width: "184px",
-    speed: 0.75,
-    wind: { amp: "16px", duration: "17s", delay: "-11s" },
+    width: "205px",
+    speed: 0.78,
+    mirror: true,
+    wind: { amp: "17px", duration: "16s", delay: "-11s" },
   },
   {
     right: "10%",
     top: "332vh",
     width: "132px",
     speed: 0.6,
+    squash: 1.12,
     wind: { amp: "12px", duration: "21s", delay: "-15s" },
   },
   {
     left: "20%",
     top: "392vh",
-    width: "96px",
+    width: "84px",
     speed: 0.4,
+    squash: 0.8,
+    opacity: 0.88,
     wind: { amp: "7px", duration: "31s", delay: "-5s" },
   },
 ];
@@ -286,16 +314,24 @@ const grazing = [
     {clouds.map((c) => (
       <div
         class={`cloud${c.atTop ? " at-top" : ""}`}
-        style={`${c.left ? `left:${c.left};` : `right:${c.right};`}top:${c.top};width:${c.width};${cloudMotion(c)}`}
+        style={`${c.left ? `left:${c.left};` : `right:${c.right};`}top:${c.top};width:${c.width};aspect-ratio:${(104 / 78 / (c.squash ?? 1)).toFixed(3)};${c.opacity ? `opacity:${c.opacity};` : ""}${cloudMotion(c)}`}
       >
-        <svg viewBox="0 0 104 78" width="100%" aria-hidden="true">
-          <path
-            d="M40 20c6-9 22-10 28-2 10-3 19 4 18 13 7 4 7 15-1 19-2 8-12 11-19 8-8 5-21 4-26-3-10 1-17-7-15-16-4-8 4-18 15-19Z"
-            fill="var(--fleece)"
-            stroke="var(--ink)"
-            stroke-width="3.4"
-            stroke-linejoin="round"
-          />
+        <svg
+          viewBox="0 0 104 78"
+          width="100%"
+          height="100%"
+          preserveAspectRatio="none"
+          aria-hidden="true"
+        >
+          <g transform={c.mirror ? "translate(104 0) scale(-1 1)" : undefined}>
+            <path
+              d="M40 20c6-9 22-10 28-2 10-3 19 4 18 13 7 4 7 15-1 19-2 8-12 11-19 8-8 5-21 4-26-3-10 1-17-7-15-16-4-8 4-18 15-19Z"
+              fill="var(--fleece)"
+              stroke="var(--ink)"
+              stroke-width="3.4"
+              stroke-linejoin="round"
+            />
+          </g>
         </svg>
       </div>
     ))}
