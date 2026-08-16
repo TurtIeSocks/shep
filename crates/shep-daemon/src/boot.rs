@@ -1780,7 +1780,7 @@ mod tests {
         .unwrap();
         let ctx = daemon.context();
         let held = shep_core::config::normalize(AppConfig::minimal("held", "./held")).unwrap();
-        ctx.registry.record(&[held.clone()]);
+        ctx.registry.record(std::slice::from_ref(&held));
         ctx.supervisor.start(vec![held]).await.unwrap();
         let flock = ctx.supervisor.list_checked().await.unwrap();
         assert_eq!(flock.len(), 1, "the held app must actually be up");
