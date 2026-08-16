@@ -3,15 +3,43 @@
  * Sidebar"). This is the shape of the docs shell itself — which pages exist,
  * which route they live at, which group they're under — not a claim about
  * product state, so unlike docsLexicon.ts / docsRules.ts it isn't sourced
- * from a doc that drifts. `built` just means "has a real page", i.e. isn't
- * rendered with StubPanel; flip it here the day a stub gets written.
+ * from a doc that drifts. `built` just means "has a real page" — every item
+ * below is one today, but the field stays live rather than getting deleted:
+ * a page can still be added to the sidebar (and linked from elsewhere) the
+ * day it's planned, before it's written, the same way the fourteen below
+ * were. Flip it false for a genuinely unwritten page and the sidebar's
+ * "soon" tag picks it back up on its own.
+ *
+ * `source`/`spec`/`api` back the reference pills under each page's title
+ * (see ReferencePills.astro) — one shared component driven by this data so
+ * a new page can't ship without at least a Source pill.
  */
+
+/** A docs/specs/shep-v1.md section this page is drawn from. */
+export interface SpecRef {
+  /** GitHub's own heading-slug algorithm, e.g. "5-configuration" for "## 5. Configuration". */
+  anchor: string;
+  /** Short label, e.g. "§5 Configuration". */
+  label: string;
+}
+
+/** A docs.rs type this page is genuinely about — only where shep-core's own API is the subject. */
+export interface ApiRef {
+  /** Path under docs.rs/shep-core/latest/shep_core/, e.g. "config/struct.Flockfile.html". */
+  path: string;
+  /** Short label, e.g. "shep_core::config::Flockfile". */
+  label: string;
+}
 
 export interface DocsNavItem {
   slug: string;
   /** Route is always `/docs/${slug}`. */
   label: string;
   built: boolean;
+  /** Repo-relative path this page's material is drawn from — the Source pill. */
+  source: string;
+  spec?: SpecRef;
+  api?: ApiRef;
 }
 
 export interface DocsNavGroup {
@@ -23,19 +51,68 @@ export const docsNav: DocsNavGroup[] = [
   {
     label: "Start here",
     items: [
-      { slug: "getting-started", label: "Getting started", built: true },
-      { slug: "first-flockfile", label: "Your first Flockfile", built: false },
-      { slug: "from-pm2", label: "Coming from pm2", built: false },
+      {
+        slug: "getting-started",
+        label: "Getting started",
+        built: true,
+        source: "README.md",
+      },
+      {
+        slug: "first-flockfile",
+        label: "Your first Flockfile",
+        built: true,
+        source: "crates/shep-core/src/config/flockfile.rs",
+        spec: { anchor: "5-configuration", label: "§5 Configuration" },
+        api: {
+          path: "config/struct.Flockfile.html",
+          label: "shep_core::config::Flockfile",
+        },
+      },
+      {
+        slug: "from-pm2",
+        label: "Coming from pm2",
+        built: true,
+        source: "docs/migration.md",
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
+      },
     ],
   },
   {
     label: "Concepts",
     items: [
-      { slug: "terminology", label: "Terminology", built: true },
-      { slug: "folds", label: "Folds", built: false },
-      { slug: "shepherd-channel", label: "The shepherd channel", built: false },
-      { slug: "dogs", label: "Dogs", built: false },
-      { slug: "kv", label: "The KV store", built: false },
+      { slug: "terminology", label: "Terminology", built: true, source: "README.md" },
+      {
+        slug: "folds",
+        label: "Folds",
+        built: true,
+        source: "crates/shep-core/src/config/app.rs",
+        spec: { anchor: "5-configuration", label: "§5 Configuration" },
+      },
+      {
+        slug: "shepherd-channel",
+        label: "The shepherd channel",
+        built: true,
+        source: "docs/shepherd-channel.md",
+        spec: { anchor: "7-readiness--health", label: "§7 Readiness & health" },
+        api: {
+          path: "protocol/channel/index.html",
+          label: "shep_core::protocol::channel",
+        },
+      },
+      {
+        slug: "dogs",
+        label: "Dogs",
+        built: true,
+        source: "docs/dogs.md",
+        spec: { anchor: "8-dogs-plugins", label: "§8 Dogs" },
+      },
+      {
+        slug: "kv",
+        label: "The KV store",
+        built: true,
+        source: "docs/kv.md",
+        spec: { anchor: "5-configuration", label: "§5 Configuration" },
+      },
     ],
   },
   {
@@ -43,143 +120,94 @@ export const docsNav: DocsNavGroup[] = [
     // AI agent's tool call and an operator's terminal dashboard.
     label: "Interfaces",
     items: [
-      { slug: "whistle", label: "Whistle (MCP)", built: false },
-      { slug: "lookout", label: "Lookout", built: false },
+      {
+        slug: "whistle",
+        label: "Whistle (MCP)",
+        built: true,
+        source: "docs/whistle/README.md",
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
+      },
+      {
+        slug: "lookout",
+        label: "Lookout",
+        built: true,
+        source: "docs/lookout/README.md",
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
+      },
     ],
   },
   {
     // Where the flock runs, once it's not just a laptop anymore.
     label: "Deploying",
     items: [
-      { slug: "serve", label: "Serve", built: false },
-      { slug: "containers", label: "Containers", built: false },
-      { slug: "startup", label: "Surviving reboots", built: false },
+      {
+        slug: "serve",
+        label: "Serve",
+        built: true,
+        source: "crates/shep-cli/src/commands/serve.rs",
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
+      },
+      {
+        slug: "containers",
+        label: "Containers",
+        built: true,
+        source: "crates/shep-cli/src/commands/runtime.rs",
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
+      },
+      {
+        slug: "startup",
+        label: "Surviving reboots",
+        built: true,
+        source: "docs/migration.md",
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
+      },
     ],
   },
   {
     label: "Reference",
     items: [
-      { slug: "cli", label: "CLI", built: false },
-      { slug: "json-output", label: "JSON output", built: false },
-      { slug: "not-built", label: "What's not built", built: false },
+      {
+        slug: "cli",
+        label: "CLI",
+        built: true,
+        source: "crates/shep-cli/src/cli.rs",
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
+      },
+      {
+        slug: "json-output",
+        label: "JSON output",
+        built: true,
+        source: "crates/shep-cli/src/output/mod.rs",
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
+        api: {
+          path: "protocol/request/struct.ProcessInfo.html",
+          label: "shep_core::protocol::request::ProcessInfo",
+        },
+      },
+      {
+        slug: "not-built",
+        label: "What's not built",
+        built: true,
+        source: "docs/specs/deferred.md",
+        spec: { anchor: "2-versioned-scope", label: "§2 Versioned scope" },
+      },
     ],
   },
 ];
 
-export interface StubMeta {
-  crumb: string;
-  title: string;
-  blurb: string;
-  /** Repo-relative path shown in the stub panel and linked on GitHub. */
-  source: string;
-}
-
 /**
- * Copy for every stub page — the original eight plus the six added when the
- * site was brought up to date with everything shep can do (whistle, lookout,
- * kv, serve, containers, startup). Blurbs are short and mostly evergreen
- * (what the page will cover, not shep's current build state) — the one
- * exception, "not-built", is checked against docs/specs/deferred.md's own
- * scope-cut and build-queue sections as of 2026-08-16; re-check it whenever
- * that file changes.
+ * Whether each pill *kind* has anywhere real to send a reader yet. Both
+ * start false: the repo is private (a GitHub link 404s for anyone without
+ * access) and no crate has published (docs.rs has nothing to show). The
+ * pills still render — with the real, final URL already in their href —
+ * dimmed and inert instead of clickable, rather than either shipping a
+ * confident-looking link that 404s or hiding the sourcing entirely.
+ *
+ * Flip one flag the day it stops being true and every pill of that kind
+ * goes live with no other code change: the repo going public is one
+ * boolean, shep-core's first docs.rs publish is the other.
  */
-export const stubMeta: Record<string, StubMeta> = {
-  "first-flockfile": {
-    crumb: "Start here / Your first Flockfile",
-    title: "Your first Flockfile",
-    blurb:
-      "Every field a Flockfile understands, the ten filenames config discovery searches, and the strict grammar for durations and sizes.",
-    source: "docs/specs/shep-v1.md",
-  },
-  "from-pm2": {
-    crumb: "Start here / Coming from pm2",
-    title: "Coming from pm2",
-    blurb:
-      "shep import reads a real dump.pm2 and writes a Flockfile. It starts nothing, and names on stderr everything that could not survive the trip unchanged.",
-    source: "docs/migration.md",
-  },
-  folds: {
-    crumb: "Concepts / Folds",
-    title: "Folds",
-    blurb:
-      "A fold is a namespace: shep fold backend lists one, and fold = in a Flockfile puts a sheep in it.",
-    source: "docs/specs/shep-v1.md",
-  },
-  "shepherd-channel": {
-    crumb: "Concepts / The shepherd channel",
-    title: "The shepherd channel",
-    blurb:
-      "Set channel = true and your app gets a private pipe on fd 3, speaking newline JSON. shep trigger sends a named action down it and prints what each instance answered.",
-    source: "docs/shepherd-channel.md",
-  },
-  dogs: {
-    crumb: "Concepts / Dogs",
-    title: "Dogs",
-    blurb:
-      "A dog is a plugin the shepherd supervises for its own sake: it watches the flock rather than being part of it. metrics and bark ship inside the binary; adopt runs anyone else's.",
-    source: "docs/dogs.md",
-  },
-  kv: {
-    crumb: "Concepts / The KV store",
-    title: "The KV store",
-    blurb:
-      "Three verbs — set, get, unset — for the small stuff that has nowhere else to live: a file-locked JSON store, capped at 4 KiB a value, safe to keep in a dotfiles repo.",
-    source: "docs/kv.md",
-  },
-  whistle: {
-    crumb: "Interfaces / Whistle",
-    title: "Whistle",
-    blurb:
-      "An MCP server over stdio. It hands an AI agent the same flock a person reaches with shep flock — five read-only tools always on, four control tools gated behind a config flag that defaults to off.",
-    source: "docs/whistle/README.md",
-  },
-  lookout: {
-    crumb: "Interfaces / Lookout",
-    title: "Lookout",
-    blurb:
-      "A terminal dashboard over the shepherd: the flock table, a host-usage strip, and — once you select a row — that sheep's detail pane and its bleats feed.",
-    source: "docs/lookout/README.md",
-  },
-  serve: {
-    crumb: "Deploying / Serve",
-    title: "Serve",
-    blurb:
-      "A static file server, hand-rolled rather than framework-built, run as a managed sheep. Directory listing, dotfiles, and following symlinks are all off until you ask for them.",
-    source: "docs/specs/shep-v1.md",
-  },
-  containers: {
-    crumb: "Deploying / Containers",
-    title: "Containers",
-    blurb:
-      "shep runtime is the PID-1 entrypoint for a container: it reaps zombies, forwards signals, and exits when the flock empties. shep dev is the same idea for a laptop — an isolated $SHEP_HOME with watch forced on.",
-    source: "docs/specs/shep-v1.md",
-  },
-  startup: {
-    crumb: "Deploying / Surviving reboots",
-    title: "Surviving reboots",
-    blurb:
-      "shep startup installs the unit that brings the shepherd, and the flock it last saved, back after a reboot — systemd, launchd, openrc, or BSD rc.d. shep unstartup takes it back out.",
-    source: "docs/migration.md",
-  },
-  cli: {
-    crumb: "Reference / CLI",
-    title: "CLI reference",
-    blurb:
-      "Every verb, its aliases, its flags, and its exit codes — generated from the same clap tree the binary parses with.",
-    source: "crates/shep-cli/src/cli.rs",
-  },
-  "json-output": {
-    crumb: "Reference / JSON output",
-    title: "JSON output",
-    blurb:
-      "The versioned envelope every command answers in under --format json, and what a schema_version bump does and does not promise.",
-    source: "docs/specs/shep-v1.md",
-  },
-  "not-built": {
-    crumb: "Reference / What's not built",
-    title: "What's not built yet",
-    blurb:
-      "Windows, entirely — no functional tier exists yet. Past that the list is short: OTLP export for the metrics dog, lookout's search/filter and everything behind its action gate but stop, lambs in lookout's detail pane, HTTP/SSE transport for whistle, cgroup v2 enforcement, and the @shep/io npm shim.",
-    source: "docs/specs/deferred.md",
-  },
+export const pillTargetsLive = {
+  github: false,
+  docsRs: false,
 };

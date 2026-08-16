@@ -2,10 +2,9 @@
 /*
  * Inline "not built yet" marker, for a single feature mentioned in passing
  * on an otherwise-real page (e.g. "lookout ships all four panes; search
- * and filter <NotBuilt /> don't exist yet"). This is the sentence-level
- * cousin of StubPanel.astro, which marks a whole page as unwritten rather
- * than one claim inside a finished one — reach for whichever one matches
- * what's actually missing, a page or a sentence.
+ * and filter <NotBuilt /> don't exist yet") — a claim inside a finished
+ * page, not a whole unwritten one; every /docs/* page is written today, so
+ * there's no page-level stub component to compare it against.
  *
  * Usage: <NotBuilt /> for the bare pill, or <NotBuilt note="v1.1+" /> to
  * append a short reason inline.
@@ -25,6 +24,7 @@ const { note } = Astro.props;
 <style>
   .not-built {
     display: inline-flex;
+    flex-wrap: wrap;
     align-items: baseline;
     font-family: "Space Mono", monospace;
     font-size: 0.82em;
@@ -42,5 +42,6 @@ const { note } = Astro.props;
     font-weight: 400;
     text-transform: none;
     letter-spacing: normal;
+    white-space: normal;
   }
 </style>

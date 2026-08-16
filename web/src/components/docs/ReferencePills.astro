@@ -1,0 +1,146 @@
+---
+/*
+ * Reference pills — Source / API / Spec links under a docs page's <h1>
+ * (Rin's ask, 2026-08-16). One shared component reading web/src/data/
+ * docsNav.ts's per-item source/spec/api fields, so a page's pills can't
+ * drift from its own metadata and a new page can't ship without at least
+ * a Source pill — that field has no `?`, so leaving it off is a type error,
+ * not a silent gap.
+ *
+ * Source and Spec both point into the (currently private) GitHub repo; API
+ * points at docs.rs, which has nothing until shep-core's first publish.
+ * Both targets are real, final URLs today — a private repo and an
+ * unpublished crate, not wrong paths — so nothing about the link itself
+ * needs to change later. `pillTargetsLive` in docsNav.ts is the single
+ * switch: while a kind is `false` the pill renders dimmed, non-interactive,
+ * and marked `aria-disabled`, with a tooltip saying why, instead of either
+ * a confident-looking link that 404s or hiding the sourcing until launch
+ * day. Flip the flag once true and every pill of that kind becomes a plain
+ * clickable `<a>` — no other code changes.
+ */
+import { docsNav, pillTargetsLive } from "../../data/docsNav";
+
+interface Props {
+  slug: string;
+}
+
+const { slug } = Astro.props;
+
+const item = docsNav.flatMap((group) => group.items).find((i) => i.slug === slug);
+
+if (!item) {
+  throw new Error(`ReferencePills: no docsNav item for slug "${slug}"`);
+}
+
+const REPO = "https://github.com/TurtIeSocks/shep";
+const SPEC_FILE = "docs/specs/shep-v1.md";
+
+const pills = [
+  {
+    kind: "Source" as const,
+    label: item.source,
+    href: `${REPO}/blob/main/${item.source}`,
+    live: pillTargetsLive.github,
+    disabledReason: "Not public yet — the repo is private until launch.",
+  },
+  item.spec && {
+    kind: "Spec" as const,
+    label: item.spec.label,
+    href: `${REPO}/blob/main/${SPEC_FILE}#${item.spec.anchor}`,
+    live: pillTargetsLive.github,
+    disabledReason: "Not public yet — the repo is private until launch.",
+  },
+  item.api && {
+    kind: "API" as const,
+    label: item.api.label,
+    href: `https://docs.rs/shep-core/latest/shep_core/${item.api.path}`,
+    live: pillTargetsLive.docsRs,
+    disabledReason: "Not published yet — shep-core hasn't shipped to crates.io.",
+  },
+].filter(Boolean) as {
+  kind: "Source" | "Spec" | "API";
+  label: string;
+  href: string;
+  live: boolean;
+  disabledReason: string;
+}[];
+---
+
+<div class="ref-pills" data-pagefind-ignore>
+  {
+    pills.map((pill) =>
+      pill.live ? (
+        <a class="pill" href={pill.href} target="_blank" rel="noopener noreferrer">
+          <span class="kind">{pill.kind}</span>
+          <span class="label">{pill.label}</span>
+        </a>
+      ) : (
+        <span
+          class="pill disabled"
+          aria-disabled="true"
+          tabindex="-1"
+          title={pill.disabledReason}
+        >
+          <span class="kind">{pill.kind}</span>
+          <span class="label">{pill.label}</span>
+        </span>
+      ),
+    )
+  }
+</div>
+
+<style>
+  .ref-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 0 0 26px;
+  }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-family: "Space Mono", monospace;
+    font-size: 12px;
+    line-height: 1.4;
+    background: var(--paper-2);
+    border: 2px solid var(--line);
+    border-radius: 20px;
+    padding: 4px 12px 4px 6px;
+    text-decoration: none;
+    color: var(--ink);
+    max-width: 100%;
+  }
+
+  a.pill:hover {
+    border-color: var(--sky);
+    color: var(--ink);
+  }
+
+  .pill.disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+    border-style: dashed;
+  }
+
+  .kind {
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--paper);
+    background: var(--ink);
+    border-radius: 12px;
+    padding: 2px 8px;
+    flex: none;
+  }
+
+  .pill.disabled .kind {
+    background: var(--ink-3);
+  }
+
+  .label {
+    overflow-wrap: anywhere;
+    color: var(--ink-2);
+  }
+</style>
