@@ -27,6 +27,14 @@ import CtaFooter from "../components/landing/CtaFooter.astro";
   theme="light"
 >
   <Nav />
+  {/*
+    Features, Chalkboard and CtaFooter live INSIDE the stage since the
+    section backgrounds went transparent: the stage's height is what the
+    sticky pasture pins against, so the sky keeps running behind every
+    section all the way to the footer instead of being swapped for flat
+    fills at the lexicon. SkyStage's gradient stops are calibrated to this
+    full-page stage height — see the note on .sky-gradient there.
+  */}
   <SkyStage>
     <Scene1Hero />
     <Scene2Flock />
@@ -34,10 +42,10 @@ import CtaFooter from "../components/landing/CtaFooter.astro";
     <Scene4Dogs />
     <Scene5PreRelease />
     <Lexicon />
+    <Features />
+    <Chalkboard />
+    <CtaFooter />
   </SkyStage>
-  <Features />
-  <Chalkboard />
-  <CtaFooter />
 </Base>
 
 <style is:global>

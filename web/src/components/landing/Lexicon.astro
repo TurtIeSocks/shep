@@ -32,10 +32,11 @@ import { lexiconSignposts } from "../../data/lexicon";
   .lexicon {
     position: relative;
     z-index: 6;
-    background: var(--grass);
-    border-top: 4px solid var(--line);
+    /* No background: the section rides the sky stage now, so the pasture
+       scenery keeps running behind the signposts. clip, not hidden, for
+       the same never-make-a-scroll-container reason as the stage. */
     padding: 76px 0 90px;
-    overflow-x: hidden;
+    overflow-x: clip;
   }
 
   .inner {

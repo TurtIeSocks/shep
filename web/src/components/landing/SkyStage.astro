@@ -11,9 +11,11 @@
  *      since build 4 it also carries a band of dawn fog over the far hill
  *   3  a night wash that multiplies over the top and fades out
  *   4  a barn glow, second sticky layer
- *   5+ <slot /> — the five content scenes and the lexicon section, which
- *      must live INSIDE this same wrapper: the stage's total height (driven
- *      by that slotted content) is what the sticky pasture pins against.
+ *   5+ <slot /> — the five content scenes, the lexicon, features,
+ *      chalkboard and CTA footer: everything below the nav lives INSIDE
+ *      this wrapper, because the stage's total height (driven by slotted
+ *      content) is what the sticky pasture pins against, and the sections
+ *      are transparent so the scene runs behind them to the footer.
  *
  * Scroll is the passage of time here (night -> dawn -> noon), and the sky
  * plays it out: stars, moon, sun and clouds each scroll at their own
@@ -470,21 +472,30 @@ const grazing = [
     position: absolute;
     inset: 0;
     z-index: 0;
+    /*
+     * Stops rescaled x0.743 from the original five-scene calibration when
+     * the lexicon/features/chalkboard/CTA sections moved inside the stage
+     * (stage 5484px -> 7380px at the 1440x900 tuning baseline): the same
+     * multiplier on every stop keeps night and dawn at the same absolute
+     * scroll positions as before, and the added page tail simply extends
+     * the noon hold. If more sections ever join the stage, rescale again
+     * by old-stage-height / new-stage-height.
+     */
     background: linear-gradient(
       180deg,
       #0e1730 0%,
-      #152342 4.8%,
-      #26386a 10.2%,
-      #4c4a83 15%,
-      #8c5f84 19.1%,
-      #c97a5a 23.2%,
-      #e7a468 27.3%,
-      #f1c98d 31.4%,
-      #dde6e0 36.8%,
-      #bfe2f2 43.6%,
-      #9bd8f1 51.8%,
-      #b9e5f7 60%,
-      #cfebf8 68.2%,
+      #152342 3.6%,
+      #26386a 7.6%,
+      #4c4a83 11.1%,
+      #8c5f84 14.2%,
+      #c97a5a 17.2%,
+      #e7a468 20.3%,
+      #f1c98d 23.3%,
+      #dde6e0 27.3%,
+      #bfe2f2 32.4%,
+      #9bd8f1 38.5%,
+      #b9e5f7 44.6%,
+      #cfebf8 50.7%,
       #cfebf8 100%
     );
   }
@@ -840,14 +851,15 @@ const grazing = [
     z-index: 3;
     pointer-events: none;
     mix-blend-mode: multiply;
+    /* Stops rescaled x0.743 with the sky gradient's — see that note. */
     background: linear-gradient(
       180deg,
       rgba(16, 26, 52, 0.72) 0%,
-      rgba(16, 26, 52, 0.66) 8.2%,
-      rgba(22, 34, 64, 0.5) 15%,
-      rgba(40, 40, 72, 0.3) 20.5%,
-      rgba(90, 70, 60, 0.12) 25.9%,
-      rgba(255, 255, 255, 0) 32.7%,
+      rgba(16, 26, 52, 0.66) 6.1%,
+      rgba(22, 34, 64, 0.5) 11.1%,
+      rgba(40, 40, 72, 0.3) 15.2%,
+      rgba(90, 70, 60, 0.12) 19.2%,
+      rgba(255, 255, 255, 0) 24.3%,
       rgba(255, 255, 255, 0) 100%
     );
   }

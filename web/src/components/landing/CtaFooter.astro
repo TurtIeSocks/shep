@@ -58,10 +58,13 @@ const flock = [
   .cta {
     position: relative;
     z-index: 7;
-    background: var(--grass-deep);
-    border-top: 4px solid var(--line);
+    /* No background — rides the sky stage (see Lexicon.astro), which is
+       why the copy below is ink-on-sky now instead of the cream-on-green
+       it wore over the old --grass-deep band. The closing .bar stays
+       solid ink: it's the page's baseboard, not a swapped-out backdrop.
+       clip, not hidden, as everywhere inside the stage. */
     padding: 70px 0 0;
-    overflow-x: hidden;
+    overflow-x: clip;
   }
 
   .inner {
@@ -84,14 +87,14 @@ const flock = [
     line-height: 0.95;
     letter-spacing: -0.045em;
     margin: 0 0 14px;
-    color: var(--fleece);
+    color: var(--ink);
   }
 
   .copy p {
     margin: 0;
     font-size: 18px;
     line-height: 1.5;
-    color: #d6eadb;
+    color: var(--ink-2);
     max-width: 46ch;
   }
 
