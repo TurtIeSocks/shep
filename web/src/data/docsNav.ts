@@ -208,6 +208,10 @@ export const docsNav: DocsNavGroup[] = [
  * boolean, shep-core's first docs.rs publish is the other.
  */
 export const pillTargetsLive = {
-  github: false,
+  // The repository went public on 2026-08-16, so every Source and Spec pill
+  // resolves. docs.rs stays gated until the first `cargo publish`: the crate
+  // has no page there yet, and a pill that looks authoritative and 404s is
+  // worse than one that says why it is waiting.
+  github: true,
   docsRs: false,
 };

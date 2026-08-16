@@ -4,6 +4,7 @@
 [![docs.rs](https://img.shields.io/docsrs/shep)](https://docs.rs/shep)
 [![License](https://img.shields.io/crates/l/shep.svg)](https://github.com/TurtIeSocks/shep#license)
 [![MSRV](https://img.shields.io/crates/msrv/shep.svg)](https://crates.io/crates/shep)
+[![CI](https://github.com/TurtIeSocks/shep/actions/workflows/test.yml/badge.svg)](https://github.com/TurtIeSocks/shep/actions/workflows/test.yml)
 
 A process manager written in Rust. One binary runs a daemon called **the
 shepherd**, which keeps a **flock** of your long-running processes alive.
