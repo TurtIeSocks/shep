@@ -10,9 +10,11 @@
  * Quality bar: getting-started.astro.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 import NotBuilt from "../../components/docs/NotBuilt.astro";
+import { pillTargetsLive } from "../../data/docsNav";
 ---
 
 <DocsLayout
@@ -23,6 +25,7 @@ import NotBuilt from "../../components/docs/NotBuilt.astro";
 >
   <article>
     <h1>whistle</h1>
+    <ReferencePills slug="whistle" />
     <p class="lede">
       <code>shep whistle</code> is an MCP server, spoken over stdio, that
       hands a model the same flock a person reaches with{" "}
@@ -52,23 +55,30 @@ import NotBuilt from "../../components/docs/NotBuilt.astro";
       Generated straight from the two live routers <code>whistle/read.rs</code>{" "}
       and <code>whistle/control.rs</code> build, not a second hand-typed
       copy beside them —{" "}
-      <a href="https://github.com/TurtIeSocks/shep/blob/main/docs/whistle/tools.md">
-        the full generated reference is on GitHub
-      </a>.
+      {pillTargetsLive.github ? (
+        <a href="https://github.com/TurtIeSocks/shep/blob/main/docs/whistle/tools.md">
+          the full generated reference is on GitHub
+        </a>
+      ) : (
+        <span title="Not public yet — the repo is private until launch.">
+          the full generated reference is <code>docs/whistle/tools.md</code>{" "}
+          in the repo
+        </span>
+      )}.
     </p>
     <div class="tool-table">
       <div class="row header">
-        <span>tool</span><span>mutates</span><span>destructive</span><span>idempotent</span><span>gate</span>
+        <span>tool</span> <span>mutates</span> <span>destructive</span> <span>idempotent</span> <span>gate</span>
       </div>
-      <div class="row"><span><code>describe_sheep</code></span><span>no</span><span>-</span><span>-</span><span>always</span></div>
-      <div class="row"><span><code>get_metrics</code></span><span>no</span><span>-</span><span>-</span><span>always</span></div>
-      <div class="row"><span><code>list_barks</code></span><span>no</span><span>-</span><span>-</span><span>always</span></div>
-      <div class="row"><span><code>list_flock</code></span><span>no</span><span>-</span><span>-</span><span>always</span></div>
-      <div class="row"><span><code>tail_bleats</code></span><span>no</span><span>-</span><span>-</span><span>always</span></div>
-      <div class="row"><span><code>reload_sheep</code></span><span>yes</span><span>no</span><span>no</span><span>allow_control</span></div>
-      <div class="row"><span><code>start_sheep</code></span><span>yes</span><span>no</span><span>no</span><span>allow_control</span></div>
-      <div class="row"><span><code>restart_sheep</code></span><span>yes</span><span>yes</span><span>no</span><span>allow_control</span></div>
-      <div class="row"><span><code>stop_sheep</code></span><span>yes</span><span>yes</span><span>yes</span><span>allow_control</span></div>
+      <div class="row"><span><code>describe_sheep</code></span> <span>no</span> <span>-</span> <span>-</span> <span>always</span></div>
+      <div class="row"><span><code>get_metrics</code></span> <span>no</span> <span>-</span> <span>-</span> <span>always</span></div>
+      <div class="row"><span><code>list_barks</code></span> <span>no</span> <span>-</span> <span>-</span> <span>always</span></div>
+      <div class="row"><span><code>list_flock</code></span> <span>no</span> <span>-</span> <span>-</span> <span>always</span></div>
+      <div class="row"><span><code>tail_bleats</code></span> <span>no</span> <span>-</span> <span>-</span> <span>always</span></div>
+      <div class="row"><span><code>reload_sheep</code></span> <span>yes</span> <span>no</span> <span>no</span> <span>allow_control</span></div>
+      <div class="row"><span><code>start_sheep</code></span> <span>yes</span> <span>no</span> <span>no</span> <span>allow_control</span></div>
+      <div class="row"><span><code>restart_sheep</code></span> <span>yes</span> <span>yes</span> <span>no</span> <span>allow_control</span></div>
+      <div class="row"><span><code>stop_sheep</code></span> <span>yes</span> <span>yes</span> <span>yes</span> <span>allow_control</span></div>
     </div>
     <p class="fine">
       <code>tail_bleats</code> returns text a sheep wrote to its own logs,
@@ -164,6 +174,7 @@ tools: describe_sheep, get_metrics, list_barks, list_flock, reload_sheep,
       whistle runs as a local subprocess of whatever host launches it, not
       as a service other machines connect to.
     </p>
+    <h2>Where to go next</h2>
 
     <div class="next-grid">
       <a href="/docs/shepherd-channel" class="next-card">
