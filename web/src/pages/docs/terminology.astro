@@ -7,6 +7,7 @@
  * The usage-rule cards are DATA from web/src/data/docsRules.ts.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
 import { lexiconTable, mdInlineToHtml } from "../../data/docsLexicon";
 import { usageRules } from "../../data/docsRules";
 
@@ -26,6 +27,7 @@ const toneFor = (built: "yes" | "partly" | "no") =>
 >
   <article>
     <h1>Terminology</h1>
+    <ReferencePills slug="terminology" />
     <p class="lede">
       The vocabulary is not decoration. A process manager gives you a lot of
       nouns to keep straight, and sheep are a better mnemonic than "target
@@ -40,18 +42,22 @@ const toneFor = (built: "yes" | "partly" | "no") =>
     <h2>The lexicon</h2>
     <div class="lexicon-table">
       <div class="row header">
-        <span class="col-term">shep says</span>
-        <span class="col-means">means</span>
-        <span class="col-where">where you meet it</span>
-        <span class="col-built">built</span>
+        <span class="col-term">shep says</span>{" "}
+        <span class="col-means">means</span>{" "}
+        <span class="col-where">where you meet it</span>{" "}
+        <span class="col-built" data-pagefind-ignore>built</span>
       </div>
       {
         lexiconTable.map((row) => (
           <div class="row">
-            <span class="col-term term">{row.term}</span>
-            <span class="col-means" set:html={mdInlineToHtml(row.means)} />
-            <span class="col-where" set:html={mdInlineToHtml(row.where)} />
-            <span class="col-built" style={`color:${toneFor(row.built)}`}>
+            <span class="col-term term">{row.term}</span>{" "}
+            <span class="col-means" set:html={mdInlineToHtml(row.means)} />{" "}
+            <span class="col-where" set:html={mdInlineToHtml(row.where)} />{" "}
+            <span
+              class="col-built"
+              data-pagefind-ignore
+              style={`color:${toneFor(row.built)}`}
+            >
               {row.built}
             </span>
           </div>
@@ -83,6 +89,24 @@ const toneFor = (built: "yes" | "partly" | "no") =>
           </div>
         ))
       }
+    </div>
+
+    <h2>Where to go next</h2>
+    <div class="next-grid">
+      <a href="/docs/first-flockfile" class="next-card">
+        <div class="next-title">Your first Flockfile →</div>
+        <div class="next-body">
+          Put the vocabulary to work — every field, in the config that
+          actually uses these words.
+        </div>
+      </a>
+      <a href="/docs/folds" class="next-card">
+        <div class="next-title">Folds →</div>
+        <div class="next-body">
+          One of the words above, worked through on its own: what a fold is,
+          and what it deliberately isn't.
+        </div>
+      </a>
     </div>
   </article>
 </DocsLayout>
@@ -267,6 +291,44 @@ const toneFor = (built: "yes" | "partly" | "no") =>
     margin: 0;
     font-size: 15px;
     line-height: 1.6;
+    color: var(--ink-2);
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 36px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
     color: var(--ink-2);
   }
 </style>
