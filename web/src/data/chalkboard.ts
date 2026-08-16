@@ -18,7 +18,13 @@
  * `scale` (now `shep stock`), `signal`, `sendline` (now `shep whisper`), the
  * key-value store, and lambs in `describe`. Phase 12b shipped three more —
  * lookout's bleats feed, sheep detail pane, and host-usage strip, plus
- * whistle, the MCP server — so this list is down to the eleven items
+ * whistle, the MCP server. Phase 14/15 and the Windows scope call shipped or
+ * moved seven more — serve, dev/runtime, openrc and BSD rc.d units, the
+ * Windows functional tier (moved to deferred.md's "Committed to v1.1+ by
+ * design" section rather than shipping — see Chalkboard.astro's own prose
+ * for that one, since it is a permanent cut, not a build-queue item this
+ * list tracks), `.js` Flockfile, schemars JSON-schema export, and the
+ * daemon-config flags layer — so this list is down to the four items
  * deferred.md's section currently names.
  */
 // `?raw` (see lexicon.ts's header comment for why, not node:fs +
@@ -40,19 +46,6 @@ const notBuiltYetItems: ChalkboardItem[] = [
     anchor: "lambs in the detail pane",
     display: "lambs in lookout's detail pane",
   },
-  { anchor: "serve", display: "shep serve" },
-  { anchor: "dev / runtime", display: "shep dev and shep runtime" },
-  {
-    anchor: "openrc and BSD rc.d units",
-    display: "openrc and BSD rc.d units",
-  },
-  { anchor: "Windows functional tier", display: "Windows, entirely" },
-  { anchor: "`.js` Flockfile", display: ".js Flockfiles" },
-  {
-    anchor: "schemars JSON-schema export",
-    display: "a schemars config JSON schema",
-  },
-  { anchor: "Daemon-config flags layer", display: "a CLI-flag config layer" },
 ];
 
 export const notBuiltYet: string[] = notBuiltYetItems.map((item) => item.display);
