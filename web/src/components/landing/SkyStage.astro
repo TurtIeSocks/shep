@@ -539,21 +539,48 @@ const grazing = [
    * pasture's own scenery band rather than sitting fixed in a far sky) and
    * gets the most drift of the group.
    */
+  /*
+   * TUNING THE PARALLAX. Two timelines, because the layers differ in kind.
+   *
+   * `scroll(root)` spreads an animation across the WHOLE page scroll, so the
+   * drift you perceive per screenful is only
+   *
+   *     drift / (page height in viewports)
+   *
+   * This page is about 7.3 viewports tall, so a 18vh drift showed as roughly
+   * 25px of movement per screen: real, measurable, and invisible. That is why
+   * the first two attempts at this looked like nothing was happening. To read
+   * as parallax on a global timeline the numbers have to be large.
+   *
+   * Stars, moon and sun are single elements with nothing anchored to them, so
+   * large global drift is fine and reads as the sky wheeling slowly overhead.
+   *
+   * Clouds cannot use the same trick: each is placed against a particular
+   * scene (top: 128vh, 262vh, 332vh), and drift big enough to notice would
+   * carry them into a neighbouring scene. They get `view()` instead, which
+   * runs each cloud's animation over its own pass across the viewport rather
+   * than over the whole document. That gives a strong local effect and zero
+   * cumulative displacement, so the composition stays where it was placed.
+   *
+   * To tune: change the --parallax-drift values below. For the `scroll(root)`
+   * layers, divide by ~7.3 to predict what a reader sees per screenful. For
+   * the `view()` clouds the number is close to what you get, since the whole
+   * animation plays out over roughly one viewport of scrolling.
+   */
   @media (prefers-reduced-motion: no-preference) {
     @supports (animation-timeline: scroll()) {
       .stars,
       .moon,
-      .sun,
-      .clouds {
+      .sun {
         /*
          * Deliberately longhand, not the `animation` shorthand: Astro's CSS
          * minifier (Lightning CSS) folds a shorthand `animation` declaration
          * plus a separate `animation-timeline` into one shorthand value, and
          * as of this build it produces `animation:linear both sky-parallax
-         * scroll(root)` — a value the browser itself then rejects as
-         * invalid, silently dropping the whole declaration (confirmed via
-         * the CSSOM: the compiled rule's selector survives, its body is
-         * empty). Longhand properties don't hit that merge path.
+         * scroll(root)`, a value the browser itself then rejects as invalid,
+         * silently dropping the whole declaration (confirmed via the CSSOM:
+         * the compiled rule's selector survives, its body is empty). The
+         * longhand properties do not hit that merge path.
          */
         animation-name: sky-parallax;
         animation-duration: auto;
@@ -563,19 +590,27 @@ const grazing = [
       }
 
       .stars {
-        --parallax-drift: 4vh;
+        --parallax-drift: 40vh;
       }
 
       .moon {
-        --parallax-drift: 7vh;
-      }
-
-      .clouds {
-        --parallax-drift: 18vh;
+        --parallax-drift: 70vh;
       }
 
       .sun {
-        --parallax-drift: 26vh;
+        --parallax-drift: 190vh;
+      }
+    }
+
+    @supports (animation-timeline: view()) {
+      .cloud {
+        /* Longhand for the same Lightning CSS reason as above. */
+        animation-name: sky-parallax;
+        animation-duration: auto;
+        animation-timing-function: linear;
+        animation-fill-mode: both;
+        animation-timeline: view();
+        --parallax-drift: 30vh;
       }
     }
   }
