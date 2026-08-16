@@ -11,6 +11,10 @@ documentation = "https://docs.rs/shep-daemon"
 keywords = ["shep", "process-manager", "supervisor", "daemon", "restart"]
 categories = ["os", "os::unix-apis", "asynchronous"]
 
+# No `[package.metadata.docs.rs]` here, deliberately: `test-fakes` is this
+# crate's only feature, and its own comment below says what it is — test
+# scaffolding for other crates' tests, not public API. There is nothing else
+# behind it worth unlocking for docs.rs, unlike shep-core's `schema`.
 [features]
 # Option: expose the scripted fake runner (`fake::ScriptedRunner`) to other
 # crates' tests. Off by default — it is test scaffolding, not public API.

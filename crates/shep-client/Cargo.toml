@@ -11,6 +11,10 @@ documentation = "https://docs.rs/shep-client"
 keywords = ["shep", "process-manager", "client", "ipc", "async"]
 categories = ["asynchronous", "network-programming", "api-bindings"]
 
+# No `[package.metadata.docs.rs]` here, deliberately: `test-support` is this
+# crate's only feature, and its own comment below says what it is — test
+# scaffolding for other crates' tests, not public API. There is nothing else
+# behind it worth unlocking for docs.rs, unlike shep-core's `schema`.
 [features]
 # Option: expose `testing` (the hand-rolled daemon fakes) to other crates'
 # tests. Off by default — it is test scaffolding, not public API. Mirrors

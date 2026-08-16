@@ -11,6 +11,14 @@ documentation = "https://docs.rs/shep-core"
 keywords = ["shep", "process-manager", "supervisor", "flockfile", "protocol"]
 categories = ["config", "parsing", "data-structures"]
 
+# No `default` feature exists, so docs.rs's own default build would compile
+# this crate without `schema` — `flockfile_schema_json` and every `JsonSchema`
+# impl it gates would render as though they don't exist. `all-features` is
+# baked into the docs.rs build per published version and cannot be changed
+# after the fact, so this has to be right before the first `cargo publish`.
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 # Off by default. `JsonSchema` derives for the Flockfile document schema
 # (`assets/flockfile.schema.json`), which `shep schema` prints.
