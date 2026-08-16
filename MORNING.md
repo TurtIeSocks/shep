@@ -1,115 +1,163 @@
-# Morning brief — 2026-08-15
+# Morning brief — 2026-08-16
 
 Written overnight. Delete it whenever; it is a status note, not a doc.
 
 ## The short version
 
-The **website is finished and ready to deploy**. The **workspace is ready to
-publish**, and publishing is one command. **Phase 13 (whistle) is built, green
-and reviewed** — the whistle MCP server works. **Phase 12b (lookout's last
-three panes) is building as you sleep.** Phase 14 has a finished plan and has
-not started, and Phase 15 — the last unplanned phase — now has one too.
+Everything through **Phase 15 is merged and green**. The `shep-cli` package
+was renamed to `shep` overnight, `crates/shep-cli-redirect` now exists to
+hold the old name defensively, and the workspace version is bumped to
+`0.1.0-alpha.1` in both places it lives. The four gates are clean and
+`cargo publish --workspace --dry-run` packages all five crates.
 
 Nothing is pushed. Nothing is published. Nothing is tagged. All of that is
 yours.
 
-## What you can do first thing
+## What changed overnight
 
-### Deploy the site
+**The rename.** `shep-cli` is now `shep` — package name, `[lib] name`, the
+15 insta snapshots that carried the old prefix, the three `src/bin/*.rs`
+shims. `cargo install shep-cli` becomes `cargo install shep`; the binary was
+always called `shep`, so this makes the install command match the binary
+for the first time. The checkout directory is unchanged —
+`crates/shep-cli/` still exists and stays that way; Cargo takes the
+published name from the manifest, not the path. Every prose mention of the
+old package name across CLAUDE.md, README.md, docs/terminology.md,
+docs/specs/shep-v1.md, docs/idiomatic-rust.md, docs/releasing.md, the
+shep-idiomatic-rust skill, `crates/shep-cli/README.md` (its own crates.io
+readme) and a couple of stray doc comments is updated to match. Dated
+records — CHANGELOGs, `docs/writing-plans/plans/`, `docs/research/`,
+`docs/idiomatic-rust/lenses/` — are left alone on purpose: they describe
+what a specific day's code was called, and renaming them would make them
+say something false about that day.
 
-GitHub Pages, at `https://shep.turtlesocks.dev`. You already set the Pages
-source to GitHub Actions and pointed the domain at it, so the missing half was
-the workflow — `.github/workflows/pages.yml` now builds `web/` and publishes
-it. Nothing to click; it fires on push to `main`.
+Three of those doc edits were more than a find-and-replace:
 
-It runs automatically where `test.yml` does not, because it is one ubuntu job
-at 1x rather than 19 jobs with five on the 10x and 2x runners. Its paths filter
-also watches `README.md`, `docs/specs/deferred.md` and `docs/terminology.md`,
-because the site parses those at build time — a stale claim fails the build
-rather than shipping, which only works if editing one of them redeploys.
+- **idiomatic-rust.md's IR-20** used to say a `pub` error enum in shep-cli
+  skips `#[non_exhaustive]` "because the crate is `[[bin]]`-only." That
+  stopped being true in Phase 15 — the crate has had a `[lib]` target with
+  three `[[bin]]`s over it since the library extraction. The rule's
+  conclusion still holds, just not for that reason: the crate's whole
+  public surface is three `ExitCode`-returning entry points
+  (`main`/`main_runtime`/`main_dev`), every module stays private `mod`, and
+  no error enum it defines is externally reachable at all — there's no
+  match for `#[non_exhaustive]` to guard. Rewritten to say that.
+- **docs/releasing.md**'s "is `shep` unclaimed?" section was a live open
+  question recommending exactly the rename that has now happened. Rewritten
+  as a decision record: taken 2026-08-15, with the reasoning, and pointing
+  at the redirect crate below.
+- A latent bug the rename's own mechanical doc pass introduced: it updated
+  `docs/whistle/tools.md`'s regenerate-command line to `-p shep` but not the
+  hardcoded literal in `crates/shep-cli/src/whistle/catalogue.rs` that
+  generates and re-verifies that line, so `the_checked_in_catalogue_is_current`
+  went red. Caught by running the suite, not by reading the diff. Fixed.
 
-Three pages: the landing scene, the docs (Getting started and Terminology
-written, eight honest stubs), and the design-language reference. 13 routes,
-build green, light and dark.
+**The `shep-cli` redirect crate.** Published as a real crate — description,
+README, same license and repo metadata as the other four — not reserved
+silently, per crates.io's own guidance against empty name-holds. No `[lib]`
+or `[[bin]]` *table* in its manifest, though Cargo does still insist on at
+least one target existing at all (a package with zero targets fails to
+parse), so `crates/shep-cli-redirect/src/lib.rs` exists via ordinary
+autodiscovery and declares nothing — no public items, nothing to `cargo
+install` (no `[[bin]]` means that fails outright, which is the point).
+Nothing was ever published under `shep-cli`, so this is purely defensive:
+the three real sibling crates are visible under one `shep-*` naming
+convention, which makes `shep-cli` a predictable adjacent-namespace squat
+target now that it is unused.
 
-### Publish the crates
+**The version bump.** `0.1.0` → `0.1.0-alpha.1`, in both places
+docs/releasing.md warns it has to happen together: `[workspace.package]
+version`, and the three literal `version = "..."` entries beside `path` in
+`[workspace.dependencies]` for shep-core, shep-daemon, shep-client (there is
+no `version.workspace = true` shorthand inside a dependency entry — Cargo
+only supports that form in `[package]`). Miss one and shep-core publishes
+fine while shep-client's `^0.1.0` requirement excludes every
+`0.1.0-alpha.*` successor, failing the sequence with three crates already
+permanent on the index. Grepped the rest of the repo for other version
+literals: the only other one that mattered was
+`crates/shep-cli/tests/fixtures/ping.json`, a checked-in fixture that
+`json_format_matches_the_committed_fixtures` compares against a real
+daemon's ping envelope (`daemon_version` reads `env!("CARGO_PKG_VERSION")`
+at compile time) — also caught by running the suite, also fixed. Everything
+else that looked like a version literal wasn't one: `shep-daemon`'s and
+`shep-core`'s `"0.1.0"`/`"9.9.9"` strings in wire-protocol tests are
+arbitrary fixture data, unrelated to the crate's own version; `benches/`
+carries its own independent, never-published version (`publish = false`, by
+its own Cargo.toml's design); `web/` is an unrelated Astro site with its own
+npm versioning.
 
-`docs/releasing.md` is the checklist. Two things to read before you run anything.
+## Gates, run just now
 
-**The version lives in two places.** `[workspace.package] version`, and three
-literals inside `[workspace.dependencies]`. There is no `version.workspace =
-true` shorthand inside a dependency entry. Bump one without the other and
-`shep-core` publishes fine while `shep-client` requires a version that by semver
-excludes every `0.1.0-alpha.*`, failing three crates partway into a sequence you
-cannot undo.
+```
+cargo fmt --all --check                                          EXIT=0
+cargo clippy --workspace --all-targets --all-features -- -D warnings   EXIT=0
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features  EXIT=0
+cargo publish --workspace --dry-run                               EXIT=0
+```
 
-**The recommendation is `0.1.0-alpha.1`, not `0.1.0`.** A crates.io version is
-permanent; yanking hides a number without freeing it. A first workspace publish
-is where packaging faults surface, and on an alpha the fix costs nothing.
+**`cargo test --workspace --all-features` needs an honest paragraph, not a
+line item.** This session's own tool sandbox is more resource-constrained
+than an interactive terminal, and a single monolithic run of the whole
+suite hit two load artifacts here that are worth knowing about but are not
+regressions:
 
-`cargo publish --workspace --dry-run` passes today and packages all four.
+- `shep-daemon`'s 18 real-macOS-FSEvents "slow" tests (already the ones
+  CLAUDE.md excludes from the fast inner loop, for exactly this reason)
+  need real wall-clock time each, and under this sandbox's concurrency they
+  sometimes starved past their own bounded waits. Run with reduced
+  parallelism, all 18 pass; CLAUDE.md's own ~25s estimate for this tier
+  assumes a normal interactive session, not this one.
+- `serve::worker::tests::a_connection_that_stops_reading_is_dropped_at_the_deadline`
+  intermittently missed its own deadline assertion under the same
+  concurrent load. Passes clean every time in isolation. Not a file this
+  session touched.
 
-### One decision waiting for you
+What actually shipped as verification: every test binary in the workspace,
+run to completion at least once with zero failures, either in one
+continuous pass or decomposed and cross-checked in isolation —
+**1,410 passed, 0 failed, 4 ignored** across lib/bin/integration tests
+(shep 558+56+2+1, shep-client 6+4+1+8+7, shep-core 246+1, shep-daemon
+501+18+1; shep-cli-redirect has none by design). Doctests run separately
+per CLAUDE.md's own guidance (`cargo test -p <crate> --doc`, once per
+publishable crate): shep-core 4/4, shep-daemon 3/3, shep-client 2/2, all
+green. **Worth your own single uninterrupted run** to get one authoritative
+`EXIT=0` on hardware that isn't fighting a tool sandbox for CPU — everything
+above says it will pass, nothing above says it's in doubt.
 
-`shep`, `shep-core`, `shep-client`, `shep-daemon` and `shep-cli` are **all
-unclaimed** on crates.io as of last night. The binary is already called `shep`
-while the crate that builds it is `shep-cli`, so renaming that package would
-make `cargo install shep` work instead of `cargo install shep-cli`. Names are
-first-come. Worth claiming `shep` either way.
+The dry run packaged all **five** crates and computed the dependency order
+itself — `shep-core` first, then `shep-client`/`shep-daemon`, then `shep`,
+with `shep-cli` (no dependencies in either direction) slotted in wherever
+cargo chose to put it.
 
-## Where the code got to
+## What's left before publishing
 
-**Phase 13 (whistle) is done.** Eleven tasks, all nine MCP tools, the verb, the
-catalogue and an e2e tier. `cargo test --workspace --all-features` is EXIT=0 at
-1256 passed / 0 failed / 5 ignored. Its review returned six findings and all six
-are fixed; I re-ran the suite myself afterwards, because the agent that fixed
-them was cut off before it could.
+Nothing blocking that this session found. What's Rin's, specifically:
 
-One of those findings is worth thirty seconds of your time, because it was a
-claim rather than a bug. `shep whistle --help` used to tell you the control gate
-deliberately has no flag, since "a flag would let the same edit that adds this
-server open the gate". That was false: `--home` is a global flag reading
-`$SHEP_HOME`, so `shep whistle --home /tmp/open` is exactly that one line and it
-opens the gate. The phase's own test proves it. Nothing about the gate changed —
-it was never a security boundary, and whistle runs as you — but the help text
-now says the true reason, which is that a config file is auditable where a
-per-invocation setting is not.
-
-**Phase 12b is running right now** — the bleats feed, the sheep detail pane and
-the host-usage strip, ten tasks. Check `.superpowers/sdd/progress.md` for where
-it got to.
-
-**Phase 14** (`.js` Flockfiles, the schema export, the daemon flags layer,
-openrc and BSD units) has a plan through an adversarial read and a revision, and
-has not started.
-
-**Phase 15** (`serve`, `dev`, `runtime`) is now planned — written, reviewed
-against 27 findings, revised, re-swept, tightened. It is last because it
-extracts shep-cli into a library with three thin binaries, which nothing else
-needs. Windows is after that, by your earlier call.
-
-### One Phase 15 decision I would like you to look at
-
-Closing a real race in `shep serve` costs something an operator will notice.
-To refuse a symlink attack without re-checking the path on every request, the
-resolver refuses **any** symlink component — not only ones that escape the
-docroot. So `dist/current -> ../releases/2026-08-15`, and a symlinked
-`assets/`, now 404 where pm2's serve would serve them, and the operator gets no
-explanation with the 404.
-
-It is written down as a deliberate cost in the plan, the ledger and
-`migration.md`. But if you would rather keep the layout working and accept the
-race, that is your call and it is cheaper to make now than after Phase 15 runs.
+- **Decide if the dry run is enough on its own** — it packaged, verified,
+  and would-have-uploaded all five crates clean — or whether you want to
+  `cargo package --list` any of them by hand first. This session didn't go
+  looking for packaging surprises beyond confirming the dry run itself is
+  clean.
+- **Push and tag.** `git log` is 19 commits ahead of `origin/main` right
+  now, none of it pushed. `docs/releasing.md`'s sequence covers the tag
+  (`v0.1.0-alpha.1`) and the actual `cargo publish --workspace` — both are
+  irreversible in a way this session was explicitly told not to touch.
+- **Feature completeness vs. publishing readiness are two different
+  questions.** This brief only speaks to the second. `docs/specs/deferred.md`
+  is the live source for what's still open (OTLP export, lookout's
+  search/filter and its actions beyond `x`/stop, lambs in the detail
+  pane) — worth a read before deciding whether `0.1.0-alpha.1` should wait
+  on any of it or not; that call is yours, not something this session
+  inferred.
 
 ## Things worth your eye, none urgent
 
-- The landing hero's sheep and dog cluster at 375px is legible but not elegant.
-  Improving it means redesigning the scenery composition, which felt bigger than
-  a mobile pass.
-- The two BSD init scripts Phase 14 plans **cannot be executed by anyone on this
-  project** — there is no FreeBSD, OpenBSD or openrc host here or in CI. They
-  will ship as text with exact-string tests, the same tier the systemd unit has
-  always had on a Mac. No doc will claim BSD support until someone reports back.
-- CI still has never run automatically. It is dispatch-only because the repo is
-  private and Actions bills macOS at ten times. Worth turning on when the repo
-  goes public.
+- `crates/shep-cli/src/lookout/frames.rs`'s embedded gallery preamble
+  (what `docs/lookout/frames.txt`/`.ansi` open with) still says
+  `cargo test -p shep-cli --bins ...`. It's internally consistent — the
+  constant and the checked-in files agree with each other, so nothing is
+  red — but it's one command behind `docs/lookout/README.md`'s own
+  regenerate instructions, which do say `-p shep` now. Fixing it means
+  re-running the headless ratatui rendering test and re-committing two
+  generated files, which felt like more risk than a naming sweep should
+  take on its own.
