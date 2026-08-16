@@ -68,7 +68,6 @@ const CONNECTION_DEADLINE: Duration = Duration::from_secs(60);
 /// `Option<Credentials>` inherits that same answer rather than working
 /// around it with a hand-written impl that has to remember not to print the
 /// one field that matters.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct ServeConfig {
     /// The docroot, already canonical and already known to be a directory.
     pub root: PathBuf,
@@ -103,15 +102,11 @@ pub struct ServeConfig {
 /// registered sheep `shep flock` reports as errored, because the first
 /// looks fine from the outside.
 ///
-/// `run`'s only caller is the verb (Task 7), which does not exist yet — see
-/// `path::resolve`'s doc comment for the general shape of that reasoning.
-/// Unlike `resolve`, nothing in this module's own tests calls `run` either:
-/// they drive [`accept_forever`] directly, because `run`'s SIGTERM handling
-/// needs a real stop ladder to exercise and the plan's own Step 6.2 is
-/// explicit that only Task 7's e2e tier can provide one. The `allow` below
-/// is therefore unconditional rather than `cfg_attr(not(test), …)` — `run`
-/// is genuinely unreached in a test build too, not only a plain one.
-#[allow(dead_code)]
+/// `run`'s only caller is `commands::serve`, which the `--foreground` flag
+/// dispatches straight to this function. This module's own tests never call
+/// `run` itself: they drive [`accept_forever`] directly, because `run`'s
+/// `SIGTERM` handling needs a real stop ladder to exercise, which only the
+/// e2e tier can provide.
 pub async fn run(cfg: ServeConfig) -> ExitCode {
     let listener = match TcpListener::bind(cfg.bind).await {
         Ok(listener) => listener,
@@ -149,7 +144,6 @@ pub async fn run(cfg: ServeConfig) -> ExitCode {
 /// free — queuing would still hold the accepted socket, just without a task
 /// attached to it yet, which is the same descriptor exhaustion under a
 /// different name.
-#[cfg_attr(not(test), allow(dead_code))]
 async fn accept_forever(listener: TcpListener, cfg: Arc<ServeConfig>, semaphore: Arc<Semaphore>) {
     loop {
         match listener.accept().await {
@@ -177,7 +171,6 @@ async fn accept_forever(listener: TcpListener, cfg: Arc<ServeConfig>, semaphore:
 /// read, auth, method, body, resolve, hidden, contain, then a directory or
 /// a file. Every reply — refusal, redirect, listing or file — is logged as
 /// one access-log line (decision 16) before this returns.
-#[cfg_attr(not(test), allow(dead_code))]
 async fn handle_connection(mut stream: TcpStream, cfg: Arc<ServeConfig>) {
     let peer = stream.peer_addr().ok();
 
@@ -397,7 +390,6 @@ async fn handle_connection(mut stream: TcpStream, cfg: Arc<ServeConfig>) {
 ///
 /// Returns the status actually answered and the number of body bytes, for
 /// the caller's access-log line.
-#[cfg_attr(not(test), allow(dead_code))]
 async fn send_not_found(
     stream: &mut TcpStream,
     cfg: &ServeConfig,
@@ -435,7 +427,6 @@ async fn send_not_found(
 /// than a hang.
 ///
 /// `HEAD` never copies the body, only its length.
-#[cfg_attr(not(test), allow(dead_code))]
 async fn serve_file(
     stream: &mut TcpStream,
     request: &HttpRequest,
@@ -462,7 +453,6 @@ async fn serve_file(
 /// ordering is built here, by which `Vec` a name lands in and in what order
 /// they are appended, rather than by inspecting a rendered entry's kind
 /// after the fact.
-#[cfg_attr(not(test), allow(dead_code))]
 async fn read_listing(dir: &std::path::Path, hidden: bool) -> std::io::Result<Vec<listing::Entry>> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
@@ -500,7 +490,6 @@ async fn read_listing(dir: &std::path::Path, hidden: bool) -> std::io::Result<Ve
 /// carried a control byte (`write_head`'s response-splitting lock, decision
 /// 5's response-splitting note) — the caller answers with nothing further,
 /// since nothing has reached the stream yet.
-#[cfg_attr(not(test), allow(dead_code))]
 async fn respond(
     stream: &mut TcpStream,
     status: u16,
@@ -519,7 +508,6 @@ async fn respond(
 /// [`respond`] plus the in-memory body every reply except a streamed file
 /// or an empty redirect carries. Writes nothing further if the head itself
 /// was refused.
-#[cfg_attr(not(test), allow(dead_code))]
 async fn send(
     stream: &mut TcpStream,
     status: u16,
@@ -542,7 +530,6 @@ async fn send(
 /// `path` is already the resolved path where resolution succeeded, or the
 /// raw target where it did not — [`escape_for_log`] has already run on it
 /// either way by the time this is called.
-#[cfg_attr(not(test), allow(dead_code))]
 fn log_access(peer: Option<SocketAddr>, method: &str, path: &str, status: u16, bytes: u64) {
     let peer = peer.map_or_else(|| "-".to_string(), |addr| addr.to_string());
     println!("{peer} \"{method} {path}\" {status} {bytes}");
@@ -553,7 +540,6 @@ fn log_access(peer: Option<SocketAddr>, method: &str, path: &str, status: u16, b
 /// Not decoration: the raw request target can carry any byte a client
 /// sends, and an operator reading `shep bleats` in a terminal would
 /// otherwise be handed a stranger's ANSI escape sequences.
-#[cfg_attr(not(test), allow(dead_code))]
 fn escape_for_log(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {

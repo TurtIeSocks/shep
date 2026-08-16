@@ -27,7 +27,6 @@ use core::fmt;
 
 /// Why a request target cannot be resolved. Every variant is a 400.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum Refusal {
     /// The target does not begin with `/` — an absolute-form target
     /// (`GET http://host/x`), the asterisk form (`OPTIONS *`), a bare
@@ -94,11 +93,8 @@ impl core::error::Error for Refusal {}
 /// # Errors
 /// See [`Refusal`] for the precise condition behind each variant.
 ///
-/// `resolve`'s only caller is `serve::fs`/`serve::worker` (Tasks 3 and 6),
-/// which do not call into it outside this module's own tests yet — see
-/// `http::HttpError::BadHeader`'s doc comment for the full reasoning behind
-/// the `cfg_attr` below, the same shape used there for the same reason.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `resolve`'s caller is `serve::worker`, which walks these segments against
+/// the docroot on every request.
 pub fn resolve(target: &str) -> Result<Vec<String>, Refusal> {
     if !target.starts_with('/') {
         return Err(Refusal::NotAbsolute);
@@ -134,7 +130,6 @@ pub fn resolve(target: &str) -> Result<Vec<String>, Refusal> {
 /// path is a 404 unless `--hidden` was given (decision 4). This is the pure
 /// predicate both the handler and the listing renderer (`serve::listing`)
 /// ask, so the two cannot drift.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_hidden(segments: &[String]) -> bool {
     segments.iter().any(|segment| segment.starts_with('.'))
 }
@@ -150,7 +145,6 @@ pub fn is_hidden(segments: &[String]) -> bool {
 /// # Errors
 /// [`Refusal::BadEscape`] if a `%` is not followed by exactly two hex
 /// digits (case-insensitive).
-#[cfg_attr(not(test), allow(dead_code))]
 fn decode_segment(segment: &str) -> Result<Vec<u8>, Refusal> {
     let bytes = segment.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -174,7 +168,6 @@ fn decode_segment(segment: &str) -> Result<Vec<u8>, Refusal> {
 }
 
 /// The numeric value of one ASCII hex digit, either case.
-#[cfg_attr(not(test), allow(dead_code))]
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -186,7 +179,6 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 /// Whether a decoded byte is one rule 5 forbids in a path segment: a control
 /// byte (`< 0x20` or `0x7f`, which covers NUL), `/`, `\`, or `:`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn is_forbidden_byte(byte: u8) -> bool {
     byte < 0x20 || byte == 0x7f || matches!(byte, b'/' | b'\\' | b':')
 }

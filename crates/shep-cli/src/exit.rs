@@ -75,11 +75,9 @@ pub enum ExitCode {
     /// — exits `Success` instead. A one-shot job in a container finishing its
     /// work is not a failure.
     ///
-    /// Not constructed anywhere yet: only `runtime`'s foreground engine would
-    /// produce it, and that engine is still unwritten (Task 9).
-    /// `#[allow(dead_code)]` says so explicitly rather than inventing a call
-    /// site nothing needs yet.
-    #[allow(dead_code)]
+    /// Constructed by `commands::foreground::run`, the engine `runtime` and
+    /// `dev` both share, once the empty-flock watcher settles on
+    /// [`crate::commands::empty::Sample::EmptyFailed`].
     FlockEmpty = 11,
 }
 

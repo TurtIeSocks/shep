@@ -24,7 +24,6 @@ enum Kind {
 /// anything — the caller already read the directory and knows which
 /// constructor applies to each name.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct Entry {
     name: String,
     kind: Kind,
@@ -33,7 +32,6 @@ pub struct Entry {
 impl Entry {
     /// An entry naming a regular file.
     #[must_use]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn file(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -43,7 +41,6 @@ impl Entry {
 
     /// An entry naming a directory.
     #[must_use]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn dir(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -71,7 +68,6 @@ impl Entry {
 /// `.env` and then 404s on it has still leaked the filename, which is the
 /// whole reason listing is off by default.
 #[must_use]
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn render(prefix: &str, entries: &[Entry]) -> String {
     let mut out = String::new();
     out.push_str("<!doctype html>\n<html><head><meta charset=\"utf-8\">");
@@ -110,7 +106,6 @@ pub fn render(prefix: &str, entries: &[Entry]) -> String {
 /// including every byte of a multi-byte UTF-8 sequence, so a non-ASCII name
 /// still produces a header value that is entirely printable ASCII.
 #[must_use]
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_segment(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for byte in name.bytes() {
@@ -125,7 +120,6 @@ pub fn encode_segment(name: &str) -> String {
 }
 
 /// Whether `byte` may appear unescaped in a percent-encoded path segment.
-#[cfg_attr(not(test), allow(dead_code))]
 fn is_safe_segment_byte(byte: u8) -> bool {
     matches!(byte,
         b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' |
@@ -135,7 +129,6 @@ fn is_safe_segment_byte(byte: u8) -> bool {
 }
 
 /// HTML-escapes `s` for use in a text node.
-#[cfg_attr(not(test), allow(dead_code))]
 fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

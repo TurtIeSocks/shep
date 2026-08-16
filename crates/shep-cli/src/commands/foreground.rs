@@ -1,6 +1,6 @@
-//! The foreground engine shared by `runtime` and (later) `dev`: boots a
-//! shepherd in this process, starts a flock, streams its bleats to stdout,
-//! and returns once nothing is online or a signal ends the supervisor.
+//! The foreground engine shared by `runtime` and `dev`: boots a shepherd in
+//! this process, starts a flock, streams its bleats to stdout, and returns
+//! once nothing is online or a signal ends the supervisor.
 //!
 //! Read decision 12 in this phase's plan before touching this file — the two
 //! callers share this engine because the spec describes their common
@@ -200,10 +200,12 @@ pub async fn run(
     let already_consumed = matches!(ending, Some(Ending::SupervisorExited { .. }));
 
     // Stop and delete the flock before asking the shepherd itself to go —
-    // `dev`'s own teardown (decision 12's table); `runtime` never sets
-    // `tidy_up`, so this is dead for Task 9's own caller and only reachable
-    // once Task 11 wires `dev` on top of this engine. Skipped when the
-    // supervisor is already gone: there is nothing left to ask.
+    // `dev`'s own teardown (decision 12's table); `runtime` always passes
+    // `tidy_up: false`, so this only ever runs for `dev`. Skipped when the
+    // supervisor is already gone: there is nothing left to ask — and when
+    // that is how this session ends, `BootOptions::delete_flock_on_shutdown`
+    // (set from this same `tidy_up`) is what still keeps the promise, since
+    // `RunningDaemon::run`'s own teardown gets there first.
     if tidy_up && !already_consumed {
         let _ = client
             .request(Request::Stop {

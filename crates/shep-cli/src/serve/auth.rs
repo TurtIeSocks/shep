@@ -32,7 +32,6 @@ const MAX_HEADER_LEN: usize = 1024;
 /// `Debug` at all (IR-41's stronger form). There is no line of output
 /// anywhere in shep where printing a credential is the right answer, so the
 /// way to be sure of that is for the type not to be printable.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct Credentials {
     expected: Vec<u8>,
 }
@@ -53,7 +52,6 @@ impl Credentials {
     /// Compares through [`ring::hmac::verify`] rather than a raw byte
     /// compare — see [`credentials_match`]'s doc comment for why, and for
     /// the deviation from this phase's original design.
-    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn satisfies(&self, header: Option<&str>) -> bool {
         let Some(header) = header else {
@@ -82,7 +80,6 @@ impl Credentials {
 /// part of it — nothing outside this crate can match on it, so there is no
 /// downstream matcher for the attribute to protect.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum AuthError {
     /// Reading `path` failed at the OS level — missing, a directory, or a
     /// permissions failure the OS itself enforces.
@@ -190,7 +187,6 @@ fn check_mode(_path: &Path) -> Result<(), AuthError> {
 /// accounts' access, not ours — so parsing first and refusing last is both
 /// correct and the only order under which
 /// `no_error_message_quotes_the_file` actually tests what its name says.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn load(path: &Path) -> Result<Credentials, AuthError> {
     let contents = std::fs::read_to_string(path).map_err(|source| AuthError::Io {
         path: path.to_path_buf(),

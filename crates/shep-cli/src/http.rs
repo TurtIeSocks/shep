@@ -81,14 +81,8 @@ pub enum HttpError {
     /// `mod http;`, not `pub mod http;` — so IR-20's `#[non_exhaustive]`
     /// question does not arise.
     ///
-    /// `write_head`'s only caller is `serve::worker` (Task 6), which does not
-    /// exist yet, so nothing outside this file's own tests constructs this
-    /// variant today — the plain (non-test) build sees no live constructor
-    /// and flags it dead. Silenced on that one axis, same shape as
-    /// `resolve_paths`'s own `#[cfg_attr(windows, allow(dead_code))]`
-    /// (`lib.rs`), and for the same reason: say which axis the code is
-    /// legitimately unreachable on rather than leave an unexplained warning.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `write_head`'s caller is `serve::worker`, which returns this variant
+    /// for a response header it cannot write out safely.
     BadHeader {
         /// What was bad: `"a header name"` or `"a header value"`.
         what: &'static str,
@@ -309,10 +303,8 @@ pub async fn write_response<W: AsyncWrite + Unpin>(
 
 /// One extra response header: a name and a value, both already final.
 ///
-/// Unreachable from the plain (non-test) build until `serve::worker` (Task 6)
-/// exists — see [`HttpError::BadHeader`]'s own doc for the full reasoning
-/// behind the `cfg_attr` below.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Built by `serve::worker`, which attaches these to a response before
+/// `write_head` writes them out.
 pub struct Header<'a> {
     /// The header name, written exactly as given.
     pub name: &'a str,
@@ -340,7 +332,6 @@ pub struct Header<'a> {
 ///   otherwise split the response and let a client inject headers of its own.
 ///   The caller answers 500; nothing is written to the stream first, so the
 ///   refusal cannot itself produce a malformed response.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn write_head<W: AsyncWrite + Unpin>(
     stream: &mut W,
     status: u16,
@@ -382,7 +373,6 @@ pub async fn write_head<W: AsyncWrite + Unpin>(
 /// (`0x20..=0x7e`) — a CR, an LF, or anything above it such as DEL. Any of
 /// these, written unescaped into a response head, splits it: a CRLF pair
 /// starts a new header line, and a lone CR or LF is enough for some clients.
-#[cfg_attr(not(test), allow(dead_code))]
 fn has_control_byte(s: &str) -> bool {
     s.bytes().any(|b| !(0x20..=0x7e).contains(&b))
 }

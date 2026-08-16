@@ -57,7 +57,6 @@ const FALLBACK: &str = "application/octet-stream";
 /// with no `.` at all, or an extension [`TYPES`] does not list, gets
 /// [`FALLBACK`].
 #[must_use]
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn content_type(path: &str) -> &'static str {
     let Some((_, extension)) = path.rsplit_once('.') else {
         return FALLBACK;

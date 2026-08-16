@@ -22,7 +22,6 @@ use nix::fcntl::OFlag;
 /// booting a server or capturing a live process's stderr. `contain` itself
 /// does the `eprintln!`; this function only builds the string, so a test can
 /// pin its content directly.
-#[cfg_attr(not(test), allow(dead_code))]
 fn symlink_refusal_notice(path: &Path) -> String {
     format!(
         "shep serve: refused {} — a symlink is not permitted in the docroot; \
@@ -91,7 +90,6 @@ fn symlink_refusal_notice(path: &Path) -> String {
 /// client which of "missing" and "forbidden" applies is a server that maps
 /// its own filesystem on request. The stderr line above is for the
 /// operator, not the response.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn contain(root: &Path, segments: &[String], follow_symlinks: bool) -> Option<PathBuf> {
     let mut joined = root.to_path_buf();
     for segment in segments {
@@ -149,7 +147,6 @@ pub async fn contain(root: &Path, segments: &[String], follow_symlinks: bool) ->
 /// # Errors
 /// `None` if the open failed for any reason, or if the thing opened is not a
 /// regular file. Every one of them is the caller's 404.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn open_regular(path: &Path) -> Option<(tokio::fs::File, u64)> {
     let file = tokio::fs::OpenOptions::new()
         .read(true)
