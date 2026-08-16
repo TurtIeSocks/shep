@@ -169,8 +169,11 @@ extraction, not one — this single command installs all three binaries:
 `shep`, plus the two container-entrypoint aliases `shep-runtime` and
 `shep-dev`.
 
-Add it to the README's status block at that point, replacing "has no install
-script".
+The README's status block, badges, and "Try it" section already carry this
+command as of 2026-08-16, ahead of the actual publish, per Rin's call that
+the docs should describe the install rather than wait for it. Nothing to
+edit there at publish time; just confirm the badges resolve once the crates
+are up.
 
 ## What is a blocker and what is not
 
