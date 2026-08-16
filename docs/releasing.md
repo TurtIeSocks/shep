@@ -50,7 +50,7 @@ what actually went up. Those are unfixable in place. On an alpha train the fix
 is `0.1.0-alpha.2` and costs nothing. On `0.1.0` the fix is `0.1.1` plus a
 yank, on four crates, in public.
 
-The cost is one line of friction: `cargo install shep-cli` does not select a
+The cost is one line of friction: `cargo install shep` does not select a
 pre-release, so the install command carries an explicit version until the
 first non-alpha release. That is a fair price for keeping `0.1.0` in reserve
 for the release that is actually complete.
@@ -143,7 +143,7 @@ spelled out:
 cargo publish -p shep-core
 cargo publish -p shep-client
 cargo publish -p shep-daemon
-cargo publish -p shep-cli
+cargo publish -p shep
 ```
 
 Each of the last three waits for the previous crate to appear in the index.
@@ -154,7 +154,7 @@ minute and rerun the one that failed.
 Afterwards, the install line becomes:
 
 ```bash
-cargo install shep-cli --version 0.1.0-alpha.1
+cargo install shep --version 0.1.0-alpha.1
 ```
 
 `shep-cli` carries three `[[bin]]` targets since Phase 15's library
@@ -224,7 +224,7 @@ script for an init system nobody here has ever booted it under.
 artefact that ships in shep-core's tarball**, because
 `crates/shep-core/src/config/flockfile.rs` `include_str!`s it — that is why
 it lives inside the package directory rather than at the repository root.
-Regenerate it with `cargo run -p shep-cli -- schema >
+Regenerate it with `cargo run -p shep -- schema >
 crates/shep-core/assets/flockfile.schema.json` before a release if
 `AppConfig` changed, though the drift test in `flockfile.rs` will have told
 you already: `cargo test -p shep-core` fails first.
@@ -249,7 +249,7 @@ Checked 2026-08-15: `shep`, `shep-core`, `shep-daemon`, `shep-client` and
 
 `shep` being free is the interesting one, because the binary is already called
 `shep` while the crate that builds it is `shep-cli`. Users would install it as
-`cargo install shep-cli` and then run `shep`. Renaming the crate to `shep`
+`cargo install shep` and then run `shep`. Renaming the crate to `shep`
 would make those match, and it is a rename of the package name only, not of
 the local directory. Whichever way that goes, the name is worth taking in the
 first publish rather than after somebody else notices it is available.

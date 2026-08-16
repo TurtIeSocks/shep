@@ -43,7 +43,7 @@ From Phase 15 on, `shep-cli` is a library with three thin `[[bin]]` targets
 over it (`shep`, `shep-runtime`, `shep-dev`) rather than one bare binary — the
 two container-entrypoint aliases spec §3 asks for cannot share a module tree
 without a library underneath them. A **shep-cli-scoped** run therefore needs
-both halves: `cargo test -p shep-cli --lib --bins --all-features`. `--bins`
+both halves: `cargo test -p shep --lib --bins --all-features`. `--bins`
 alone now runs almost nothing, since every unit test in the crate lives in the
 library.
 
@@ -78,7 +78,7 @@ branch is what a systemd `Type=notify` unit — the unit `shep startup` installs
 — depends on for readiness reporting, and it went five phases without a
 compiler ever reading it (platform audit #3). `--all-targets` is what reaches
 the test. shep-daemon has no `ring` in its tree, so this needs no cross C
-toolchain; `-p shep-cli` would, and is not in this gate — a macOS host has no
+toolchain; `-p shep` would, and is not in this gate — a macOS host has no
 `x86_64-linux-gnu-gcc` for `ring`'s build script to call, so `cargo check -p
 shep-cli --target x86_64-unknown-linux-gnu` fails outright here, gcc or no.
 
@@ -87,7 +87,7 @@ gate does not reach it.** Phase 15 added
 `crates/shep-cli/tests/init.rs::a_reparented_orphan_is_reaped` and
 `reap.rs::drain_reaps_a_real_reparented_orphan`, both Linux-only, in the one
 crate this gate deliberately excludes. Local checks give no signal on either
-— not this gate (excludes `-p shep-cli` for the reason above), not a bare
+— not this gate (excludes `-p shep` for the reason above), not a bare
 macOS `cargo test` (never compiles a `target_os = "linux"` item at all). What
 DOES cover them: `.github/workflows/test.yml`'s `test` job, whose
 `ubuntu-latest`/`ubuntu-24.04-arm` legs run `cargo test --workspace --locked

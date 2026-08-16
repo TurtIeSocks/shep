@@ -24,7 +24,7 @@ scene list the pinned snapshot tests read (`Scene::ALL` in
 the test suite checks. Regenerate them with:
 
 ```bash
-cargo test -p shep-cli --bins --all-features -- --ignored write_the_gallery
+cargo test -p shep --bins --all-features -- --ignored write_the_gallery
 ```
 
 ## What 12a settled
