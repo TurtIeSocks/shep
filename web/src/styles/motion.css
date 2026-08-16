@@ -49,6 +49,32 @@
 }
 
 /*
+ * Grazing sheep wander from a home position out to --walk-amp and back,
+ * turning at each end so they face the way they're walking (the sheep mark
+ * itself faces left at rest, so scaleX(-1) is "facing right"). Applied to
+ * the wrapper that carries the sheep's `left` position, not to the sheep
+ * mark itself, so it composes with that mark's own .anim-bob instead of
+ * fighting it for the `animation` property.
+ */
+@keyframes walk {
+  0% {
+    transform: translateX(0) scaleX(-1);
+  }
+  49% {
+    transform: translateX(var(--walk-amp, 3vw)) scaleX(-1);
+  }
+  50% {
+    transform: translateX(var(--walk-amp, 3vw)) scaleX(1);
+  }
+  99% {
+    transform: translateX(0) scaleX(1);
+  }
+  100% {
+    transform: translateX(0) scaleX(-1);
+  }
+}
+
+/*
  * Utility classes for the four animations. Each reads its duration/delay from
  * a custom property set inline on the element (falls back to the handoff's
  * default), and is a no-op unless the visitor has no reduced-motion preference.
@@ -72,6 +98,11 @@
   .anim-twinkle {
     animation: twinkle var(--twinkle-duration, 3.4s) ease-in-out infinite;
     animation-delay: var(--twinkle-delay, 0s);
+  }
+
+  .anim-walk {
+    animation: walk var(--walk-duration, 22s) ease-in-out infinite;
+    animation-delay: var(--walk-delay, 0s);
   }
 }
 

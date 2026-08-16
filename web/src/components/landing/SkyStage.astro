@@ -30,18 +30,74 @@ const stars = [
 
 const posts = [30, 180, 330, 480, 630, 780, 930, 1080, 1230, 1350];
 
+/*
+ * Clouds used to sit at raw viewport percentages, so at ordinary widths
+ * (below ~1240px, where .inner's max-width isn't yet centering the page)
+ * they landed inside the scene column's own horizontal span and hid behind
+ * the lede. left/right below are no longer viewport-relative: `.clouds`
+ * (see its rule below) is inset from the LEFT by --col-right, the widest
+ * scene column's actual right edge at the current width, computed with the
+ * same max-width/columnWidth math SceneSection.astro uses. So these
+ * percentages are of the safe zone to the right of every scene's text, and
+ * a cloud can never land under copy at any width.
+ */
 const clouds = [
-  { left: "8%", top: "52vh", width: "150px" },
-  { right: "14%", top: "128vh", width: "112px" },
-  { left: "34%", top: "262vh", width: "184px" },
-  { right: "9%", top: "332vh", width: "132px" },
-  { left: "12%", top: "392vh", width: "96px" },
+  { left: "6%", top: "52vh", width: "150px" },
+  { right: "18%", top: "128vh", width: "112px" },
+  { left: "38%", top: "262vh", width: "184px" },
+  { right: "10%", top: "332vh", width: "132px" },
+  { left: "20%", top: "392vh", width: "96px" },
 ];
 
+/*
+ * Depth for the grazing sheep: far/mid/near controls width (a clamp() in
+ * the stylesheet, not a fixed px, so the footprint itself shrinks with the
+ * viewport instead of only its position), walk speed, height against the
+ * hill, and z-index (the far sheep paints behind .fence — see that rule).
+ * left/bottom are home positions; --walk-amp is how far each one wanders
+ * from home before turning back (see the `walk` keyframes in motion.css).
+ * These lanes plus the dog's fixed spot were checked against each other at
+ * 320px — the tightest width, since every sheep's clamp() is pinned to its
+ * min there — with a positive clearance margin at every boundary; wider
+ * viewports only add more room. See the .depth-* / .watch-dog rules below.
+ */
 const grazing = [
-  { left: "7%", bottom: "9vh", width: 110, bobDuration: "5s", bobDelay: "0s", chewing: true },
-  { left: "31%", bottom: "4vh", width: 86, bobDuration: "6.4s", bobDelay: ".9s", chewing: false },
-  { left: "56%", bottom: "11vh", width: 68, bobDuration: "5.6s", bobDelay: ".4s", chewing: false },
+  {
+    depth: "far",
+    left: "10%",
+    bottom: "16vh",
+    width: 52,
+    bobDuration: "6.8s",
+    bobDelay: ".3s",
+    chewing: false,
+    walkAmp: "2.5vw",
+    walkDuration: "34s",
+    walkDelay: "0s",
+  },
+  {
+    depth: "mid",
+    left: "30%",
+    bottom: "8vh",
+    width: 72,
+    bobDuration: "5.6s",
+    bobDelay: ".8s",
+    chewing: true,
+    walkAmp: "2vw",
+    walkDuration: "24s",
+    walkDelay: "1.4s",
+  },
+  {
+    depth: "near",
+    left: "52%",
+    bottom: "2vh",
+    width: 92,
+    bobDuration: "4.8s",
+    bobDelay: "0s",
+    chewing: false,
+    walkAmp: "2.5vw",
+    walkDuration: "17s",
+    walkDelay: "2.6s",
+  },
 ];
 ---
 
@@ -123,8 +179,8 @@ const grazing = [
 
     {grazing.map((sheep) => (
       <div
-        class="grazing-sheep"
-        style={`left:${sheep.left};bottom:${sheep.bottom};`}
+        class={`grazing-sheep depth-${sheep.depth} anim-walk`}
+        style={`left:${sheep.left};bottom:${sheep.bottom};--walk-amp:${sheep.walkAmp};--walk-duration:${sheep.walkDuration};--walk-delay:${sheep.walkDelay};`}
       >
         <Sheep
           width={sheep.width}
@@ -137,7 +193,7 @@ const grazing = [
     ))}
 
     <div class="watch-dog">
-      <Dog width={138} wag />
+      <Dog width={126} wag />
     </div>
   </div>
 
@@ -153,6 +209,32 @@ const grazing = [
 <style>
   .stage {
     position: relative;
+    /*
+     * Mirrors SceneSection.astro's own layout math (.inner's max-width and
+     * padding, and the widest columnWidth of the five scenes — Scene2's
+     * min(660px,56vw)) so --col-right always lands on the actual right edge
+     * of the widest scene column at the current viewport width. Anything
+     * placed at left:var(--col-right) or further right is guaranteed clear
+     * of every scene's copy, at every width, instead of by coincidence.
+     */
+    --inner-max: 1240px;
+    --inner-pad: 28px;
+    --col-cap: 660px;
+    --col-vw: 56vw;
+    --inner-left: max(
+      var(--inner-pad),
+      calc((100vw - var(--inner-max)) / 2 + var(--inner-pad))
+    );
+    --col-right: calc(var(--inner-left) + min(var(--col-cap), var(--col-vw)));
+  }
+
+  @media (max-width: 680px) {
+    /* SceneSection.astro forces every column to min(92vw,520px) below this
+       same breakpoint — match it so --col-right stays accurate. */
+    .stage {
+      --col-cap: 520px;
+      --col-vw: 92vw;
+    }
   }
 
   .sky-gradient {
@@ -227,11 +309,25 @@ const grazing = [
   }
 
   .clouds {
+    position: absolute;
+    inset: 0;
+    left: var(--col-right);
     z-index: 1;
   }
 
   .cloud {
     position: absolute;
+  }
+
+  /* Below 680px the scene column claims up to 92vw (SceneSection.astro's
+     own mobile override) — there's no honest lane left for a cloud beside
+     the text, so hide them deliberately rather than let them get trapped
+     under copy again. Sun/moon/stars aren't scene-column-relative and are
+     unaffected. */
+  @media (max-width: 680px) {
+    .clouds {
+      display: none;
+    }
   }
 
   .pasture {
@@ -266,6 +362,10 @@ const grazing = [
     right: -6%;
     bottom: 7vh;
     height: 54px;
+    /* Above the hills' implicit stacking order but below the near/mid sheep
+       and dog (z-index 3) — the far sheep (z-index 1) sits behind this on
+       purpose, so it reads as grazing on the other side of the fence. */
+    z-index: 2;
   }
 
   .barn {
@@ -286,11 +386,49 @@ const grazing = [
     position: absolute;
   }
 
+  /*
+   * Depth: width is a clamp() rather than the Sheep.astro `width` prop's
+   * fixed px, so the footprint itself shrinks with the viewport (same fix
+   * as the clouds) instead of only its position — a fixed-px sheep next to
+   * a percentage lane is exactly how bug 2 happened. Further-away sheep are
+   * also smaller, higher up (bigger `bottom`, set inline per-instance),
+   * slower to walk, and desaturated/brightened to lose contrast against the
+   * hill, plus the far one paints behind .fence (z-index 1 < fence's 2).
+   */
+  .depth-far {
+    z-index: 1;
+    filter: saturate(0.58) brightness(1.07) opacity(0.85);
+  }
+
+  .depth-far :global(.sheep-mark) {
+    width: clamp(34px, 4.4vw, 58px) !important;
+  }
+
+  .depth-mid {
+    z-index: 3;
+  }
+
+  .depth-mid :global(.sheep-mark) {
+    width: clamp(48px, 6.2vw, 84px) !important;
+  }
+
+  .depth-near {
+    z-index: 3;
+  }
+
+  .depth-near :global(.sheep-mark) {
+    width: clamp(60px, 8vw, 108px) !important;
+  }
+
   .watch-dog {
     position: absolute;
-    right: 25%;
-    bottom: 5vh;
-    width: 138px;
+    right: 6%;
+    bottom: 4vh;
+    z-index: 3;
+  }
+
+  .watch-dog :global(.dog-mark) {
+    width: clamp(56px, 9.4vw, 126px) !important;
   }
 
   .night-wash {
@@ -336,26 +474,10 @@ const grazing = [
   }
 
   /* Responsive first pass (docs/shep-design/README.md, "Responsive": "scenery
-     reduced to a band rather than removed"). The grazing sheep and dog are
-     fixed-px marks positioned by percentage — comfortable spacing at
-     desktop widths, crowded and overlapping under ~600px where three sheep
-     plus a dog compete for less than 400px of horizontal room. Scaling the
-     whole cluster down (rather than repositioning each one) keeps their
-     relative composition intact. */
+     reduced to a band rather than removed"). The sheep/dog footprints are
+     already fluid (the clamp() widths above), so this only tightens the
+     hill band on short mobile viewports. */
   @media (max-width: 600px) {
-    .grazing-sheep,
-    .watch-dog {
-      transform: scale(0.62);
-    }
-
-    .grazing-sheep {
-      transform-origin: bottom left;
-    }
-
-    .watch-dog {
-      transform-origin: bottom right;
-    }
-
     .far-hill,
     .near-hill {
       height: 22vh;
