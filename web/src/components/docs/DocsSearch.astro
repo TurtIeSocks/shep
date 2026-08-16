@@ -53,7 +53,7 @@
     <kbd class="esc-key">esc</kbd>
   </div>
   <p id="docs-search-status" class="search-status" role="status"></p>
-  <ul id="docs-search-results" class="search-results"></ul>
+  <ul id="docs-search-results" class="search-results" role="listbox"></ul>
 </dialog>
 
 <style>
@@ -198,7 +198,8 @@
   }
 
   .search-results :global(a:hover),
-  .search-results :global(a:focus-visible) {
+  .search-results :global(a:focus-visible),
+  .search-results :global(a.active) {
     background: var(--butter);
     color: var(--ink);
   }
@@ -312,15 +313,45 @@
     dialog?.close();
   }
 
+  // Arrow-key selection over the results list. DOM focus stays in the
+  // input the whole time (a combobox pattern, not real focus movement) so
+  // typing keeps working between presses — selection is tracked as an
+  // index and painted onto the matching <a> as `.active` / aria-selected.
+  let selectedIndex = -1;
+
+  function currentLinks(): HTMLAnchorElement[] {
+    return results ? Array.from(results.querySelectorAll("a")) : [];
+  }
+
+  function paintSelection() {
+    const links = currentLinks();
+    links.forEach((a, i) => {
+      const isSelected = i === selectedIndex;
+      a.classList.toggle("active", isSelected);
+      a.setAttribute("aria-selected", String(isSelected));
+    });
+    links[selectedIndex]?.scrollIntoView({ block: "nearest" });
+  }
+
+  function moveSelection(delta: number) {
+    const links = currentLinks();
+    if (links.length === 0) return;
+    selectedIndex = (selectedIndex + delta + links.length) % links.length;
+    paintSelection();
+  }
+
   function renderResults(
     items: { url: string; excerpt: string; meta: { title?: string } }[],
   ) {
     if (!results) return;
+    selectedIndex = -1;
     results.replaceChildren();
     for (const item of items) {
       const li = document.createElement("li");
       const a = document.createElement("a");
       a.href = item.url;
+      a.setAttribute("role", "option");
+      a.setAttribute("aria-selected", "false");
 
       const titleEl = document.createElement("span");
       titleEl.className = "result-title";
@@ -391,6 +422,22 @@
       if (e.key === "Escape") {
         e.preventDefault();
         closeSearch();
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        moveSelection(1);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        moveSelection(-1);
+      } else if (e.key === "Enter") {
+        // Only intercept Enter once a result is actually selected — with
+        // none selected, native <input> Enter (submit a no-op form; here,
+        // nothing) is left alone rather than guessing a destination.
+        const links = currentLinks();
+        const target = links[selectedIndex];
+        if (target) {
+          e.preventDefault();
+          target.click();
+        }
       }
       return;
     }
