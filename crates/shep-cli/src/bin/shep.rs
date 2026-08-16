@@ -2,5 +2,5 @@
 #![forbid(unsafe_code)]
 
 fn main() -> std::process::ExitCode {
-    shep_cli::main()
+    shep::main()
 }
