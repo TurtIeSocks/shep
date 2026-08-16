@@ -15,13 +15,15 @@
  *
  * No client JS: <details> is natively keyboard- and screen-reader-operable
  * as a disclosure widget, so this needs no toggle script and keeps working
- * with JS disabled. Desktop forces the content permanently open with one
- * CSS rule (`.sidebar-content { display: block }` at >=861px) rather than
- * shipping two copies of the nav — that rule wins over the browser's own
- * `details:not([open]) > *:not(summary){display:none}` default because
- * author-origin rules beat user-agent-origin rules of equal importance
- * regardless of selector specificity, so it holds even though the `<details>`
- * carries no `open` attribute.
+ * with JS disabled. Desktop forces the content permanently open at >=861px
+ * with two rules, both needed: `.sidebar-content { display: block }` beats
+ * the old UA default (`details:not([open]) > *:not(summary){display:none}`)
+ * on engines that still use it, but modern Chromium wraps the content in a
+ * `::details-content` pseudo-element carrying its own
+ * `content-visibility: hidden` while closed, which a descendant's
+ * `display: block` cannot override — `.docs-sidebar::details-content {
+ * content-visibility: visible }` is what actually beats that. Confirmed by
+ * looking at a real desktop viewport, not just by reading the spec.
  */
 import { docsNav } from "../../data/docsNav";
 
@@ -160,6 +162,17 @@ const { activeSlug } = Astro.props;
   @media (min-width: 861px) {
     .sidebar-content {
       display: block;
+    }
+
+    /* Modern Chromium wraps <details> content in a ::details-content
+       pseudo-element that carries its own `content-visibility: hidden`
+       while the element is closed — a `display: block` on a descendant
+       cannot override that. This rule targets the pseudo-element itself
+       so the content actually paints on desktop; engines without it just
+       ignore an unknown pseudo-element and fall back to the rule above. */
+    .docs-sidebar::details-content {
+      content-visibility: visible;
+      block-size: auto;
     }
   }
 
