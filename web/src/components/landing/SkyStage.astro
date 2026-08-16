@@ -1043,8 +1043,16 @@ const grazing = [
 
   /* Responsive first pass (docs/shep-design/README.md, "Responsive": "scenery
      reduced to a band rather than removed"). The sheep/dog footprints are
-     already fluid (the clamp() widths above), so this only tightens the
-     hill band on short mobile viewports. */
+     already fluid (the clamp() widths above), so this tightens the hill
+     band on short mobile viewports — and everything ANCHORED to the
+     desktop hill band must move with it. The barn and mist are re-seated
+     onto the shrunken far hill (26% of the viewport floated the barn in
+     open sky once the hill dropped to 22vh), the barn's glow repeats the
+     barn's own bottom so it stays centered on the hayloft, and the front
+     line — the dog and the visiting mid roamer — drops below the fence's
+     lowered bottom edge, which is the same feet-clear-of-the-bottom-rail
+     rule the mid grazer's 3vh was originally chosen for. The roamer's
+     bottom is inline (per-instance), hence the !important. */
   @media (max-width: 600px) {
     .far-hill,
     .near-hill {
@@ -1053,6 +1061,27 @@ const grazing = [
 
     .fence {
       bottom: 4vh;
+    }
+
+    .barn {
+      bottom: 14vh;
+    }
+
+    .barn-glow {
+      bottom: calc(14vh + min(300px, 26vw) * 0.62 - 66px);
+    }
+
+    .mist {
+      bottom: 10vh;
+      height: 18vh;
+    }
+
+    .watch-dog {
+      bottom: 1.2vh;
+    }
+
+    .roamer-mid {
+      bottom: 1.8vh !important;
     }
   }
 
