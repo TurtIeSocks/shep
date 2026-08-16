@@ -78,7 +78,25 @@ branch is what a systemd `Type=notify` unit — the unit `shep startup` installs
 — depends on for readiness reporting, and it went five phases without a
 compiler ever reading it (platform audit #3). `--all-targets` is what reaches
 the test. shep-daemon has no `ring` in its tree, so this needs no cross C
-toolchain; `-p shep-cli` would, and is not in this gate.
+toolchain; `-p shep-cli` would, and is not in this gate — a macOS host has no
+`x86_64-linux-gnu-gcc` for `ring`'s build script to call, so `cargo check -p
+shep-cli --target x86_64-unknown-linux-gnu` fails outright here, gcc or no.
+
+**shep-cli carries its own `#[cfg(target_os = "linux")]` code now, and this
+gate does not reach it.** Phase 15 added
+`crates/shep-cli/tests/init.rs::a_reparented_orphan_is_reaped` and
+`reap.rs::drain_reaps_a_real_reparented_orphan`, both Linux-only, in the one
+crate this gate deliberately excludes. Local checks give no signal on either
+— not this gate (excludes `-p shep-cli` for the reason above), not a bare
+macOS `cargo test` (never compiles a `target_os = "linux"` item at all). What
+DOES cover them: `.github/workflows/test.yml`'s `test` job, whose
+`ubuntu-latest`/`ubuntu-24.04-arm` legs run `cargo test --workspace --locked
+--all-features` on real Linux. That workflow is `workflow_dispatch`-only
+while the repository is private (its own header comment explains the
+Actions-minutes cost), so as of this writing it has never actually run —
+these two tests are unverified on their own target platform. Don't assume
+local checks cover this crate on Linux; they don't, and nothing here does
+until that workflow runs for real.
 
 **Windows.** Every plan through Phase 6 carried this one; Phases 7-9 dropped
 it without saying so, and it never reached this file, which is why nothing
