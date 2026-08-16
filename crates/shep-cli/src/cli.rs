@@ -13,9 +13,21 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 /// The `shep` command line.
+///
+/// **`bin_name = "shep"` is load-bearing, not decoration.** Without it,
+/// clap renders every `Usage:` line from `argv[0]` rather than from `name`
+/// above — so `shep-runtime --help` prints `Usage: shep-runtime runtime
+/// ...` and `shep-dev --help` prints `Usage: shep-dev dev ...` (verified
+/// empirically: both alias binaries built and run with no override, Phase
+/// 15 Task 11). Pinned so every rendering of a verb's own usage line reads
+/// `shep <verb>` regardless of which of the three `[[bin]]` targets
+/// produced it — the alias binaries are convenience entrypoints for exactly
+/// that invocation, not commands in their own right, and their own
+/// `--help` should say so.
 #[derive(Debug, clap::Parser)]
 #[command(
     name = "shep",
+    bin_name = "shep",
     version,
     about = "A process manager for your flock",
     propagate_version = true
@@ -355,6 +367,20 @@ pub enum Commands {
     /// reading the exit status can tell "finished" from "died" and restart
     /// the container only for the second.
     Runtime(RuntimeArgs),
+    /// Run one Flockfile's flock in an isolated, throwaway foreground
+    /// session: `$SHEP_DEV_HOME` (default `~/.shep-dev`), forced `watch =
+    /// true` on every app, and a full stop-and-delete teardown when it ends.
+    ///
+    /// **`--home` and `$SHEP_HOME` are ignored.** Isolation is the whole
+    /// feature: an operator who exports `$SHEP_HOME` for their real flock
+    /// gets a stderr notice rather than a `dev` session that shares it and
+    /// silently forces `watch = true` onto production apps.
+    ///
+    /// Ends the moment the flock empties or this process is signalled —
+    /// whichever comes first — and either way leaves nothing running and no
+    /// shepherd behind. A `shep dev` that leaked a supervisor would stop
+    /// being trusted.
+    Dev(DevArgs),
     /// Write a Flockfile from a pm2 dump. Starts nothing.
     ///
     /// Reads `--from`, or `~/.pm2/dump.pm2` if it names nothing — whichever
@@ -875,6 +901,19 @@ pub struct RuntimeArgs {
     /// cannot happen, so a mis-read pid can never produce a fork loop.
     #[arg(long, hide = true)]
     pub supervise: bool,
+}
+
+/// Arguments to `shep dev`.
+///
+/// No `--home` of its own, and the global one does not apply — see
+/// `commands::dev::dev_home`.
+#[derive(Debug, clap::Args)]
+pub struct DevArgs {
+    /// Script or Flockfile to run (default: discovered in this directory)
+    pub target: Option<String>,
+    /// Name for this sheep (script form only)
+    #[arg(long)]
+    pub name: Option<String>,
 }
 
 /// clap value parser over shep's own four boolean spellings — NOT clap's

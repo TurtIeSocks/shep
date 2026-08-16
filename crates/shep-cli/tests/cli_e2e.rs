@@ -31,12 +31,14 @@
 
 #![cfg(unix)]
 
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Child, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use assert_cmd::cargo::CommandCargoExt as _;
 use tempfile::TempDir;
 
 /// Bound on every `shep` invocation in this file. `assert_cmd`'s
@@ -4788,4 +4790,231 @@ fn runtime_exits_when_the_flock_empties_with_a_code_that_says_why() {
         "an errored sheep must fail the container; stderr={}",
         String::from_utf8_lossy(&failed.stderr)
     );
+}
+
+// --- `shep dev` -------------------------------------------------------
+
+/// A `shep dev` invocation with `$SHEP_DEV_HOME` set to `dev_home`, timeout
+/// already attached. Never `--home` — decision 15: `dev` ignores it, so a
+/// helper that carried one would misrepresent what a real invocation looks
+/// like.
+fn shep_dev(dev_home: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("shep").unwrap();
+    cmd.env("SHEP_DEV_HOME", dev_home)
+        .arg("dev")
+        .timeout(CMD_TIMEOUT);
+    cmd
+}
+
+/// Copies `source` to nowhere, on a background thread. `shep dev` streams
+/// the flock's bleats to its own stdout for as long as it runs; if nothing
+/// drains that pipe it eventually fills and blocks the child, wedging
+/// [`spawn_shep_dev`]'s caller. Mirrors `tests/init.rs`'s own helper of the
+/// same name and shape — a shared one is not worth a `tests/support` module
+/// for the two files that need it.
+fn discard_in_background<R: Read + Send + 'static>(mut source: R) {
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut source, &mut std::io::sink());
+    });
+}
+
+/// Spawns `shep dev <flockfile>` with `$SHEP_DEV_HOME` set to `dev_home`,
+/// stdout and stderr both piped and immediately drained in the background.
+/// Unlike [`shep_dev`]'s `.output()` shape, this leaves the process alive so
+/// a caller can signal it — the point of
+/// [`dev_tidies_up_when_it_is_signalled_rather_than_when_the_flock_empties`],
+/// which needs `shep dev` still running when `SIGTERM` arrives.
+fn spawn_shep_dev(dev_home: &Path, flockfile: &Path) -> Child {
+    let mut child = std::process::Command::cargo_bin("shep")
+        .expect("locate the built shep binary")
+        .env("SHEP_DEV_HOME", dev_home)
+        .arg("dev")
+        .arg(flockfile)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn shep dev");
+    discard_in_background(child.stdout.take().unwrap());
+    discard_in_background(child.stderr.take().unwrap());
+    child
+}
+
+/// Polls `shep --home <dev_home> --format json flock` until the one app's
+/// row reports `online`, and returns that row. Tolerates the early window
+/// where `shep dev` has not bound its socket yet — unlike
+/// [`poll_flock_data`], which asserts success on every attempt and is only
+/// safe once a socket is already known to exist.
+fn wait_for_dev_online(dev_home: &Path, deadline: Duration) -> serde_json::Value {
+    let start = Instant::now();
+    loop {
+        let output = shep(dev_home)
+            .arg("--format")
+            .arg("json")
+            .arg("flock")
+            .output()
+            .unwrap();
+        if output.status.success()
+            && let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            && envelope["data"][0]["status"] == "online"
+        {
+            return envelope["data"][0].clone();
+        }
+        if start.elapsed() >= deadline {
+            panic!(
+                "shep dev's flock never reached online within {deadline:?}; last stdout={}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Polls `child.try_wait()` until it exits, or `timeout` elapses — a named
+/// panic instead of relying on `CMD_TIMEOUT`'s own kill inside `.output()`,
+/// which does not apply here since this file's `spawn_shep_dev` never calls
+/// `.output()`. Mirrors `tests/init.rs`'s own `wait_bounded`.
+fn wait_bounded(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll shep dev") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("shep dev did not exit within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// fails if `shep dev` leaves a shepherd or a flock behind. Runs a script
+/// that exits immediately with `autorestart = false`, so the auto-exit
+/// fires (the same debounce `runtime_exits_when_the_flock_empties_with_a_
+/// code_that_says_why` drives, `commands::empty::STRIKES` × `INTERVAL` = 3
+/// × 2s), then asserts the dev home has no live socket and that a `shep`
+/// pointed at that same home afterward finds no shepherd left to answer
+/// `flock` — decision 15's `tidy_up: true`, the one setting this case
+/// actually exercises (Step 11.4's own mutation: `tidy_up: false` reddens
+/// this on the second assertion, not the first).
+///
+/// `$SHEP_DEV_HOME` points at its own tempdir, never the harness's real
+/// `~/.shep-dev` — decision 15's second reason for the variable existing.
+#[test]
+fn dev_tidies_up_after_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let dev_home = tempfile::tempdir().unwrap();
+    let script = write_script(&dir, "batch.sh", "#!/bin/sh\nexit 0\n");
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"batch\"\nscript = \"{}\"\nautorestart = false\n",
+            script.display(),
+        ),
+    );
+
+    let output = shep_dev(dev_home.path()).arg(&flockfile).output().unwrap();
+    assert_success(&output);
+
+    let socket = dev_home.path().join("run/shep.sock");
+    assert!(!socket.exists(), "dev must not leave a live socket behind");
+
+    let flock_output = shep(dev_home.path()).arg("flock").output().unwrap();
+    assert!(
+        !flock_output.status.success(),
+        "no shepherd should remain at the dev home to answer `flock`: {flock_output:?}"
+    );
+}
+
+/// fails if Ctrl-C out of `shep dev` leaves a shepherd or a flock behind.
+///
+/// The auto-exit path above never sends a signal, and the signal path is
+/// the one people actually use — "a dev mode that leaks a supervisor is a
+/// dev mode people stop trusting" is `commands::dev`'s own claim and
+/// nothing else in this file checks it. Runs a long-lived script so nothing
+/// exits on its own, waits for the flock to reach `online` (proof the
+/// shepherd is up and the sheep is running, not merely that the process
+/// exists) and records the sheep's own pid, sends `SIGTERM` to the `shep
+/// dev` process itself, and asserts the same two things the auto-exit case
+/// does — no live socket, no shepherd left running — plus the one this
+/// case alone can make: the held sheep did not outlive its supervisor.
+#[test]
+fn dev_tidies_up_when_it_is_signalled_rather_than_when_the_flock_empties() {
+    let dir = tempfile::tempdir().unwrap();
+    let dev_home = tempfile::tempdir().unwrap();
+    let script = write_script(&dir, "held.sh", "#!/bin/sh\nsleep 60\n");
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"held\"\nscript = \"{}\"\n",
+            script.display()
+        ),
+    );
+
+    let mut child = spawn_shep_dev(dev_home.path(), &flockfile);
+    let dev_pid = child.id() as i32;
+
+    let online = wait_for_dev_online(dev_home.path(), FLOCK_DEADLINE);
+    let sheep_pid = online["pid"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("a real pid: {online}")) as i32;
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(dev_pid),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .expect("send SIGTERM to shep dev");
+
+    let status = wait_bounded(&mut child, FLOCK_DEADLINE);
+    assert!(
+        status.success(),
+        "a signalled dev session must still tidy up and exit cleanly: {status:?}"
+    );
+
+    let socket = dev_home.path().join("run/shep.sock");
+    assert!(!socket.exists(), "dev must not leave a live socket behind");
+
+    let flock_output = shep(dev_home.path()).arg("flock").output().unwrap();
+    assert!(
+        !flock_output.status.success(),
+        "no shepherd should remain at the dev home to answer `flock`: {flock_output:?}"
+    );
+
+    assert!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(sheep_pid), None).is_err(),
+        "the held sheep (pid {sheep_pid}) must not outlive the dev session"
+    );
+}
+
+/// fails if `shep-dev` or `shep-runtime` is not built, is not installed
+/// under that name, or does not reach its own verb. `--help` rather than a
+/// real run, so the test starts no shepherd and writes to no home.
+///
+/// **The assertion is the usage line, not the verb's name.** Once Tasks 9
+/// and 11 add the verbs, the ROOT `shep --help` lists `dev` and `runtime`
+/// among its subcommands — so `text.contains("dev")` passes even if
+/// `alias_argv` is deleted entirely and the binary prints root help.
+/// `Usage: shep dev` is printed only by that subcommand's own help. This is
+/// the plan's sixth dead-check shape, in the one test that covers the alias
+/// binaries at all.
+#[test]
+fn the_alias_binaries_exist_and_reach_their_own_verbs() {
+    for (bin, verb) in [("shep-dev", "dev"), ("shep-runtime", "runtime")] {
+        let output = Command::cargo_bin(bin)
+            .unwrap_or_else(|err| panic!("{bin} must be a [[bin]] target: {err}"))
+            .arg("--help")
+            .timeout(CMD_TIMEOUT)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains(&format!("Usage: shep {verb}")),
+            "{bin} --help must be {verb}'s own help, not the root's:\n{text}"
+        );
+        assert!(
+            !text.contains("lookout"),
+            "{bin} printed the root verb list, so the alias supplied no verb:\n{text}"
+        );
+    }
 }

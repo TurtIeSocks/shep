@@ -5,6 +5,7 @@
 pub mod admin;
 pub mod bleats;
 pub mod daemon;
+pub mod dev;
 pub mod dogs;
 pub(crate) mod empty;
 pub(crate) mod foreground;

@@ -79,7 +79,14 @@ pub async fn runtime(
 
 /// Discovers a Flockfile in the current directory, or reports
 /// [`ExitCode::Usage`] naming the ten filenames [`discover`] looked for.
-fn discovered_target(streams: &mut Streams<'_>, fmt: Format) -> Result<String, ExitCode> {
+///
+/// `pub(crate)`: `commands::dev` shares this rather than repeating it —
+/// `shep dev ./` and `shep runtime ./` cannot disagree about what "no
+/// target" discovers.
+pub(crate) fn discovered_target(
+    streams: &mut Streams<'_>,
+    fmt: Format,
+) -> Result<String, ExitCode> {
     let cwd = std::env::current_dir().map_err(|err| {
         let message = format!("could not read the current directory: {err}");
         let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), &message);

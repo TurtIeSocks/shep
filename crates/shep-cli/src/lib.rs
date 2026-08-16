@@ -57,6 +57,8 @@ use commands::bleats;
 #[cfg(unix)]
 use commands::daemon::{daemon_exit_code, run_daemon};
 #[cfg(unix)]
+use commands::dev;
+#[cfg(unix)]
 use commands::dogs;
 #[cfg(unix)]
 use commands::import;
@@ -325,6 +327,32 @@ async fn run(cli: Cli) -> ExitCode {
         _ => {}
     }
 
+    // Ahead of `resolve_paths` on purpose, not merely alongside `Serve`/
+    // `Runtime` below it: `dev` computes its own `$SHEP_DEV_HOME`-rooted
+    // paths (decision 15) and never reads `paths` from that shared gate, so
+    // routing it through the gate first would make a `$HOME`-less
+    // environment refuse `shep dev` for a reason the verb does not have —
+    // `commands::dev::dev_home`'s own doc gives the isolation argument this
+    // ordering protects. Unlocked handles for the same reason as `lookout`,
+    // `serve` and `runtime`: this runs until the flock empties or a signal
+    // ends it, in this same process.
+    if let Commands::Dev(ref args) = cli.command {
+        let mut out = std::io::stdout();
+        let mut err = std::io::stderr();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+        };
+        return dev::dev(
+            &mut streams,
+            fmt,
+            cli.global.quiet,
+            cli.global.home.is_some(),
+            args,
+        )
+        .await;
+    }
+
     let paths = match resolve_paths(&cli.global) {
         Ok(paths) => paths,
         Err(code) => {
@@ -571,6 +599,7 @@ async fn run(cli: Cli) -> ExitCode {
         | Commands::Whistle
         | Commands::Serve(_)
         | Commands::Runtime(_)
+        | Commands::Dev(_)
         | Commands::Dog(_) => {
             unreachable!("handled above: before the shared $SHEP_HOME gate, or on unlocked handles")
         }
