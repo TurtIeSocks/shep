@@ -206,9 +206,9 @@ const grazing = [
   </div>
 
   <div class="moon">
-    <span class="crater" style="left:16px;top:22px;width:13px;height:13px;" />
-    <span class="crater" style="left:42px;top:16px;width:9px;height:9px;" />
-    <span class="crater" style="left:34px;top:44px;width:16px;height:16px;" />
+    <span class="crater" style="left:21px;top:29px;width:17px;height:17px;" />
+    <span class="crater" style="left:55px;top:21px;width:12px;height:12px;" />
+    <span class="crater" style="left:45px;top:58px;width:21px;height:21px;" />
   </div>
 
   <div class="sun" aria-hidden="true"></div>
@@ -400,8 +400,13 @@ const grazing = [
     position: absolute;
     left: 17%;
     top: 9vh;
-    width: 76px;
-    height: 76px;
+    /* 100px, up from the original 76 (crater offsets above scaled with it,
+       x1.32). Its drift range stays at the 17vh-span figures — the extra
+       height only means the animation completes a moment before the disc
+       fully exits, and the 25-65% fade has it invisible long before that
+       seam could show. */
+    width: 100px;
+    height: 100px;
     border-radius: 50%;
     background: var(--illus-moon);
     border: 4px solid var(--line);
@@ -425,8 +430,12 @@ const grazing = [
        Placing it a third of a viewport earlier puts the crest back inside
        the orange dawn band instead of into an already-blue morning. */
     top: 190vh;
-    width: 124px;
-    height: 124px;
+    /* Fluid, capped at 168px (up from a fixed 124): at 60% left a fixed
+       disc this size would poke past a 375px viewport and horizontal
+       clipping would slice it flat — 34vw keeps the whole disc on screen
+       at any width, and aspect-ratio keeps it a circle. */
+    width: min(168px, 34vw);
+    aspect-ratio: 1;
     border-radius: 50%;
     background: var(--butter);
     border: 4px solid var(--line);
@@ -453,21 +462,21 @@ const grazing = [
   }
 
   .moon::before {
-    inset: -34px;
+    inset: -52px;
     background: radial-gradient(
       circle,
-      rgba(244, 240, 226, 0.4) 0%,
-      rgba(244, 240, 226, 0.14) 45%,
+      rgba(244, 240, 226, 0.45) 0%,
+      rgba(244, 240, 226, 0.16) 45%,
       rgba(244, 240, 226, 0) 70%
     );
   }
 
   .sun::before {
-    inset: -46px;
+    inset: -68px;
     background: radial-gradient(
       circle,
-      rgba(247, 228, 176, 0.8) 0%,
-      rgba(243, 196, 76, 0.32) 42%,
+      rgba(247, 228, 176, 0.85) 0%,
+      rgba(243, 196, 76, 0.36) 42%,
       rgba(243, 196, 76, 0) 70%
     );
   }
