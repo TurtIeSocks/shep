@@ -275,11 +275,15 @@ and distinct residue, not a footnote on the one above: the window moves to
 between that canonicalize and `open_regular`'s open of the path it
 returned — the per-request canonicalize-then-open gap the default mode
 exists specifically to avoid. Passing the flag is that trade, made
-deliberately; it prints a startup notice, and every refusal it still hits
-in default-refusing components elsewhere in the walk writes a line to
-stderr naming the refused path and the flag — the sheep's own bleats, and
-the only place an operator debugging an unexpected 404 can tell "refused a
-symlink" apart from "genuinely missing".
+deliberately; it prints a one-time startup notice naming the race it
+reopens. It writes no per-request diagnostic: the per-component check that
+refuses a symlink and logs it by name is the thing `--follow-symlinks`
+turns off, so a refusal under the flag — a canonicalized path landing
+outside the root, or a path that is simply missing — is a plain 404 with
+nothing in the sheep's own bleats to tell it apart from "genuinely
+missing". That per-path stderr line naming a refused symlink is a
+default-mode-only diagnostic; an operator running with the flag debugging
+an unexpected 404 has no equivalent to reach for.
 
 ### Metrics and serve binds
 
