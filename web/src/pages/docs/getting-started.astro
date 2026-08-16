@@ -26,14 +26,22 @@ import Callout from "../../components/docs/Callout.astro";
     </p>
 
     <Callout variant="careful">
-      There is no install script and no crates.io release yet. Building from
-      source is the only path, and only macOS and Linux work. On Windows
+      shep is a pre-release alpha, and only macOS and Linux work. On Windows
       every command prints <code>shep does not yet support Windows</code>
       and exits 1.
     </Callout>
 
-    <h2>1. Build it</h2>
-    <p>Rust 1.88 or newer, edition 2024.</p>
+    <h2>1. Install it</h2>
+    <div class="terminal">
+      <div><span class="prompt">$</span> cargo install shep --version 0.1.0-alpha.1</div>
+      <div><span class="prompt">$</span> shep --help</div>
+    </div>
+    <Callout variant="note">
+      This is a prerelease, and cargo ignores prereleases by default. The
+      exact <code>--version 0.1.0-alpha.1</code> is required; a bare
+      <code>cargo install shep</code> will not find it.
+    </Callout>
+    <p>Prefer to build it yourself, or want to hack on it?</p>
     <div class="terminal">
       <div><span class="prompt">$</span> git clone https://github.com/TurtIeSocks/shep.git</div>
       <div><span class="prompt">$</span> cd shep</div>
@@ -41,8 +49,9 @@ import Callout from "../../components/docs/Callout.astro";
       <div><span class="prompt">$</span> ./target/release/shep --help</div>
     </div>
     <p class="fine">
-      Put <code>target/release/shep</code> on your PATH, or keep typing the
-      full path. Everything below works either way.
+      Rust 1.88 or newer, edition 2024, if you build from source. Put
+      <code>target/release/shep</code> on your PATH, or keep typing the full
+      path. Everything below works either way.
     </p>
 
     <h2>2. Write a Flockfile</h2>
