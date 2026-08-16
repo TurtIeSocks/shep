@@ -42,10 +42,10 @@ kbd {
 }
 
 /*
- * Link color is meadow on the landing page but sky on docs/design-language
+ * Link color is meadow on the landing page but sky in the docs section
  * (--sky is documented as "reference material and inline doc links"). This is
- * the landing default; docs-scoped stylesheets should override `a { color }`
- * to var(--sky) when those pages are built.
+ * the landing default; DocsLayout.astro overrides `a { color }` to
+ * var(--sky) for every /docs/* page.
  */
 a {
   color: var(--meadow);

@@ -1,11 +1,12 @@
 ---
 /*
- * Docs / design-language theme toggle. Landing page has no toggle (it has
- * no dark mode — see tokens.css comment on --grass-deep / --barn).
+ * Docs theme toggle. Landing page has no toggle (it has no dark mode — see
+ * tokens.css comment on --grass-deep / --barn).
  *
- * variant "icon"  — 36px circular button, ☾ / ☀ only (docs header).
- * variant "label" — pill button, "☾ night pasture" / "☀ day pasture"
- *                    (design-language header).
+ * variant "icon"  — 36px circular button, ☾ / ☀ only (docs header, in use).
+ * variant "label" — pill button, "☾ night pasture" / "☀ day pasture".
+ *                    Not wired up anywhere currently; kept for a future
+ *                    page that wants the wordier form.
  */
 interface Props {
   variant?: "icon" | "label";
