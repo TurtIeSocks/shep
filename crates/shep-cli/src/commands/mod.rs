@@ -14,6 +14,7 @@ pub mod lifecycle;
 pub mod logs;
 pub mod muster;
 pub mod query;
+pub(crate) mod reap;
 pub mod runtime;
 pub mod schema;
 pub(crate) mod selector;

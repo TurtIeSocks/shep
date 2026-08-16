@@ -1,7 +1,9 @@
-//! `shep runtime`: resolves a Flockfile, then hands off to
+//! `shep runtime`: resolves a Flockfile, then either hands off to
 //! `commands::foreground`'s engine with `tidy_up: false` — decision 12's own
 //! table: a container going away has no reason to pay for a delete on the
-//! way out, and leaves the muster roll exactly as `runtime` found it.
+//! way out, and leaves the muster roll exactly as `runtime` found it — or,
+//! at PID 1, splits into `commands::reap`'s init loop first. Read decision
+//! 14 in Phase 15's plan before touching the split itself.
 
 use shep_core::config::discover;
 use shep_core::paths::ShepPaths;
@@ -9,6 +11,7 @@ use shep_core::paths::ShepPaths;
 use crate::cli::{Format, RuntimeArgs};
 use crate::commands::foreground::{self, ForegroundOptions};
 use crate::commands::lifecycle::{resolve_target, target_exit_code};
+use crate::commands::reap;
 use crate::exit::ExitCode;
 use crate::output::{Streams, emit_error};
 
@@ -55,17 +58,23 @@ pub async fn runtime(
         }
     };
 
-    foreground::run(
-        streams,
-        fmt,
-        quiet,
-        ForegroundOptions {
-            paths,
-            apps,
-            tidy_up: false,
-        },
-    )
-    .await
+    let options = ForegroundOptions {
+        paths,
+        apps,
+        tidy_up: false,
+    };
+
+    // Read once, right here, and nowhere else in the crate: it exists only
+    // to make the PID-1 split reachable from a test harness, following the
+    // panic probe's shape in `lib.rs`'s `run_argv`. See decision 14.
+    let forced = std::env::var_os("SHEP_FORCE_INIT").is_some();
+    if !reap::should_split(std::process::id(), args.supervise, forced) {
+        return foreground::run(streams, fmt, quiet, options).await;
+    }
+    // `Infallible` is an ordinary uninhabited enum, not the never type `!`,
+    // so it does not coerce to `ExitCode` as a bare tail expression — the
+    // empty match is what performs that coercion. `run_init` never returns.
+    match reap::run_init().await {}
 }
 
 /// Discovers a Flockfile in the current directory, or reports
