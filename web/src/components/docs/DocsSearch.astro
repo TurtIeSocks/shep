@@ -272,16 +272,62 @@
     "return import(specifier)",
   ) as (specifier: string) => Promise<PagefindModule>;
 
-  let pagefindPromise: Promise<PagefindModule | null> | undefined;
+  let pagefindPromise: Promise<PagefindModule> | undefined;
 
-  function loadPagefind(): Promise<PagefindModule | null> {
+  // Counts failed attempts so a retry's specifier can differ from the one
+  // that just failed — see the note on `attempt` below for why that's
+  // necessary and not just belt-and-suspenders.
+  let loadAttempt = 0;
+
+  // `import.meta.env.DEV` is a Vite/Astro build-time constant, not a guess
+  // from the shape of a caught error — it tells us, honestly, whether this
+  // bundle was ever going to find `dist/pagefind/` in the first place. That
+  // lets the catch block below distinguish the expected case (no index
+  // exists under `astro dev`) from a genuine failure on a build that should
+  // have one.
+  const isDev = import.meta.env.DEV;
+
+  // Failure must never be memoized: caching the rejected promise here would
+  // mean the first (possibly transient — a slow dev-server cold start, a
+  // dropped request) failure disables search for the rest of the page's
+  // life, with no way back short of a reload. Only a *resolved* promise is
+  // cached; a rejection clears `pagefindPromise` so the next keystroke tries
+  // again from scratch.
+  //
+  // That reset alone is not enough, though — confirmed empirically, not
+  // just reasoned about: a browser's per-document module map remembers a
+  // failed `import()` by its exact specifier string and will keep rejecting
+  // that same string without ever touching the network again, even after
+  // whatever caused the 404 is long fixed (a `pagefind.js` restored to disk
+  // mid-session still 404'd on retry here until the specifier changed). A
+  // harmless query param that only appears after a failure — `?attempt=1`,
+  // `?attempt=2`, … — forces each retry onto a specifier the module map has
+  // never seen, so it actually re-fetches. Pagefind resolves its own
+  // sibling assets (the worker, the wasm, the index fragments) relative to
+  // `import.meta.url`, and a query string doesn't change how that
+  // resolution works, so this is safe to add.
+  function loadPagefind(): Promise<PagefindModule> {
     if (!pagefindPromise) {
-      pagefindPromise = dynamicImport("/pagefind/pagefind.js")
+      const specifier =
+        loadAttempt === 0
+          ? "/pagefind/pagefind.js"
+          : `/pagefind/pagefind.js?attempt=${loadAttempt}`;
+      pagefindPromise = dynamicImport(specifier)
         .then(async (mod) => {
           await mod.init();
           return mod;
         })
-        .catch(() => null);
+        .catch((err: unknown) => {
+          pagefindPromise = undefined;
+          loadAttempt += 1;
+          console.error(
+            isDev
+              ? "[docs-search] Pagefind index not available under `astro dev` (expected — build the site to test search)."
+              : "[docs-search] Pagefind failed to load on a built site — this should not happen:",
+            err,
+          );
+          throw err;
+        });
     }
     return pagefindPromise;
   }
@@ -305,7 +351,11 @@
   function openSearch() {
     if (!dialog || dialog.open) return;
     dialog.showModal();
-    loadPagefind();
+    // Fire the load eagerly so it's warm by the first keystroke — its
+    // resolution isn't needed here, since `runSearch` awaits the same
+    // shared promise and reports the outcome. Swallow the rejection at
+    // this call site only; `loadPagefind`'s own `.catch` already logged it.
+    loadPagefind().catch(() => {});
     input?.focus();
   }
 
@@ -381,14 +431,22 @@
       return;
     }
 
-    const pagefind = await loadPagefind();
-    if (myToken !== searchToken) return;
-
-    if (!pagefind) {
+    let pagefind: PagefindModule;
+    try {
+      pagefind = await loadPagefind();
+    } catch {
+      if (myToken !== searchToken) return;
       results.replaceChildren();
-      status.textContent = "Search index unavailable in dev — build the site to try it.";
+      // The real error is on the console (logged in loadPagefind) either
+      // way — this text only needs to tell a reader which of the two
+      // situations they're in, since the fix differs: build the site, vs.
+      // report a bug.
+      status.textContent = isDev
+        ? "Search index unavailable in dev — build the site to try it."
+        : "Search failed unexpectedly — see the browser console for details.";
       return;
     }
+    if (myToken !== searchToken) return;
 
     const search = await pagefind.debouncedSearch(term);
     if (search === null || myToken !== searchToken) return;
