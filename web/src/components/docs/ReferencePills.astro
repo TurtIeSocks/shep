@@ -41,21 +41,21 @@ const pills = [
     label: item.source,
     href: `${REPO}/blob/main/${item.source}`,
     live: pillTargetsLive.github,
-    disabledReason: "Not public yet — the repo is private until launch.",
+    disabledReason: "Not public yet. The repo is private until launch.",
   },
   item.spec && {
     kind: "Spec" as const,
     label: item.spec.label,
     href: `${REPO}/blob/main/${SPEC_FILE}#${item.spec.anchor}`,
     live: pillTargetsLive.github,
-    disabledReason: "Not public yet — the repo is private until launch.",
+    disabledReason: "Not public yet. The repo is private until launch.",
   },
   item.api && {
     kind: "API" as const,
     label: item.api.label,
     href: `https://docs.rs/shep-core/latest/shep_core/${item.api.path}`,
     live: pillTargetsLive.docsRs,
-    disabledReason: "Not published yet — shep-core hasn't shipped to crates.io.",
+    disabledReason: "Not published yet. shep-core hasn't shipped to crates.io.",
   },
 ].filter(Boolean) as {
   kind: "Source" | "Spec" | "API";

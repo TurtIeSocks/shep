@@ -126,8 +126,8 @@ this sheep has not written a log in this $SHEP_HOME`;
     </p>
 
     <Callout variant="careful">
-      Lookout needs a real terminal. With stdout redirected — piped to a file
-      or another program — it refuses outright rather than writing escape
+      Lookout needs a real terminal. With stdout redirected (piped to a file
+      or another program) it refuses outright rather than writing escape
       sequences somewhere nobody will read them.
     </Callout>
 
@@ -154,24 +154,24 @@ this sheep has not written a log in this $SHEP_HOME`;
       The host strip is the line above the table: load average, host memory,
       the flock's own summed CPU and memory, and how long the machine's been
       up. Below the table, the detail pane restates the selected row in full
-      sentences and adds what the row can't fit — the untruncated name and
+      sentences and adds what the row can't fit: the untruncated name and
       both log paths. Neither one makes a second request to the shepherd;
       both are built from the same <code>ListFlock</code> reply the table
       already has, which is also why the detail pane can't show a sheep's
-      lambs — populating that field needs <code>Describe</code>'s
+      lambs: populating that field needs <code>Describe</code>'s
       process-table walk, and polling that per selection on a two-second
       timer was a cost this phase declined to add
       (<NotBuilt note="lambs in the detail pane" />).
     </p>
     <p>
       The bleats feed is the one pane that isn't built from the flock
-      listing — it re-reads the selected sheep's <code>out</code>/
+      listing: it re-reads the selected sheep's <code>out</code>/
       <code>err</code> log files from disk on every refresh, rather than
       subscribing to the bus. That's a deliberate cost: a busy flock pays one
       bounded 64&nbsp;KiB read per file per refresh, instead of making the
       dashboard the highest-volume subscriber on the bus for a pane most
       refreshes don't even redraw. When it can't show everything, it says so
-      instead of guessing — lines it read and dropped are counted exactly,
+      instead of guessing. Lines it read and dropped are counted exactly,
       and bytes below its window are reported in bytes, because nothing
       counted the lines inside them:
     </p>
@@ -180,8 +180,8 @@ this sheep has not written a log in this $SHEP_HOME`;
     <h2>When the terminal is small</h2>
     <p>
       Panes drop before columns do, least-diagnostic-first: below 24 rows the
-      detail pane goes — everything on it but the log paths already sits in
-      the row above it — below 18 the feed goes with it, and below 14 the
+      detail pane goes (everything on it but the log paths already sits in
+      the row above it). Below 18 the feed goes with it, and below 14 the
       host strip goes too, leaving only the flock table. Within the table,
       narrow widths drop columns in this order: FOLD, then RESTARTS and PID
       together, then MEM, then CPU, then UPTIME, leaving
@@ -190,33 +190,33 @@ this sheep has not written a log in this $SHEP_HOME`;
     <CodeBlock label="51×14">{narrow}</CodeBlock>
     <p>
       Below 33 columns or 6 rows, lookout refuses to draw rather than risk
-      overlapping garbage — the refusal message is short enough to survive
+      overlapping garbage. The refusal message is short enough to survive
       the terminal it's warning about:
     </p>
     <CodeBlock label="28×8">{tooNarrow}</CodeBlock>
 
     <h2>If the shepherd goes away</h2>
     <p>
-      Lookout re-dials five times — at 250/500/1000/2000/4000&nbsp;ms, about
-      7.75 seconds total — before it gives up. Once the ladder is exhausted
+      Lookout re-dials five times (at 250/500/1000/2000/4000&nbsp;ms, about
+      7.75 seconds total) before it gives up. Once the ladder is exhausted
       it shows a frozen banner, stops polling, and leaves the last known
       values on screen. The uptime column stops advancing with everything
       else: a dashboard whose clock kept ticking while the rest froze would
       be lying about a specific sheep by name. Lookout never exits on its
-      own — you quit with <code>q</code>.
+      own. You quit with <code>q</code>.
     </p>
     <CodeBlock label="120×30, shepherd dead">{frozen}</CodeBlock>
 
     <h2>Actions</h2>
     <p>
       <code>--allow-control</code> (or <code>shep set lookout.allow_control
-      true</code>) opens the gate, but exactly one action key exists —
-      <code>x</code> for stop — and it always refuses, in both gate states,
+      true</code>) opens the gate, but exactly one action key exists
+      (<code>x</code> for stop) and it always refuses, in both gate states,
       with a plain sentence rather than silently doing nothing:
     </p>
     <CodeBlock label="120×30, gate closed">{refused}</CodeBlock>
     <p>
-      This is a fat-finger catch, not a security boundary — lookout runs as
+      This is a fat-finger catch, not a security boundary: lookout runs as
       your own process under your own uid, so the shepherd has no way to
       refuse a keystroke it can't tell apart from you typing
       <code>shep stop</code> yourself. Search and filtering
@@ -230,7 +230,7 @@ this sheep has not written a log in this $SHEP_HOME`;
       <a href="/docs/kv" class="next-card">
         <div class="next-title">The KV store →</div>
         <div class="next-body">
-          <code>lookout.allow_control</code> lives here too — the same store
+          <code>lookout.allow_control</code> lives here too: the same store
           <code>shep set</code>/<code>get</code>/<code>unset</code> read and
           write directly, no shepherd required.
         </div>

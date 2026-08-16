@@ -41,8 +41,8 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
     <h1>Surviving reboots</h1>
     <ReferencePills slug="startup" />
     <p class="lede">
-      <code>shep startup</code> writes an init unit for the target user —
-      systemd, launchd, openrc, or a BSD <code>rc.d</code> script — picked
+      <code>shep startup</code> writes an init unit for the target user:
+      systemd, launchd, openrc, or a BSD <code>rc.d</code> script, picked
       automatically for the running host or named explicitly with
       <code>--init</code>. <code>shep unstartup</code> takes it back out.
       Neither talks to a running shepherd; both write and remove a single
@@ -51,14 +51,14 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
 
     <h2>Never escalates its own privilege</h2>
     <p>
-      Installing a unit needs root. shep never asks for it — without root it
+      Installing a unit needs root. shep never asks for it. Without root it
       prints the exact command to run and exits non-zero, so a script
       notices instead of silently doing nothing:
     </p>
     <CodeBlock label="real output, unprivileged, macOS">{realOutput}</CodeBlock>
     <p class="fine">
       A unit that was never installed reports <code>absent</code> rather than
-      failing — there's nothing left to guess at, on either verb. Under
+      failing. There's nothing left to guess at, on either verb. Under
       <code>sudo</code>, the unit is built for <code>$SUDO_USER</code> rather
       than root, so it supervises the flock the operator actually has.
     </p>
@@ -66,7 +66,7 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
     <h2>The PATH capture, and its one trap</h2>
     <p>
       A daemon started by systemd or launchd has no login shell and no
-      <code>.bashrc</code>/<code>.profile</code> behind it — without help,
+      <code>.bashrc</code>/<code>.profile</code> behind it. Without help,
       <code>PATH</code> at boot would be whatever minimal default the init
       system starts with, and any app whose interpreter lives outside
       <code>/usr/bin</code>/<code>/bin</code> would fail to spawn on the very
@@ -74,13 +74,13 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
       again to find out why. <code>shep startup</code> captures the
       <code>PATH</code> of the shell that ran it directly into the unit
       (<code>Environment="PATH=..."</code> on systemd, the plist's
-      <code>EnvironmentVariables</code> on launchd) — the mechanism that
+      <code>EnvironmentVariables</code> on launchd): the mechanism that
       makes an interpreter installed under <code>~/.bun/bin</code> or
       <code>~/.cargo/bin</code> findable after a reboot.
     </p>
     <Callout variant="careful">
       <code>sudo</code> on most distributions replaces <code>PATH</code> with
-      its own <code>secure_path</code> before your command ever runs — often
+      its own <code>secure_path</code> before your command ever runs: often
       dropping the exact <code>~/.bun</code> or <code>~/.cargo</code> entry
       the capture above exists to preserve. shep can't tell a sanitized
       <code>PATH</code> from an untouched one after the fact, but it knows
@@ -93,14 +93,14 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
 
     <h2>The runbook</h2>
     <p>
-      This is the full sequence a migration from pm2 walks through — import,
-      start, save, install, reboot, verify — end to end on a Linux box:
+      This is the full sequence a migration from pm2 walks through (import,
+      start, save, install, reboot, verify), end to end on a Linux box:
     </p>
     <CodeBlock>{runbook}</CodeBlock>
     <p>
       Step 8's <code>active (running)</code> means something specific: the
       generated unit is <code>Type=notify</code>, so systemd doesn't consider
-      it started until the daemon itself says so — and it sends that signal
+      it started until the daemon itself says so: it sends that signal
       only once the muster restore from step 6's roll has finished, not the
       moment the process execs. A green status at step 8 is already evidence
       the restore path works, before the reboot ever happens.
@@ -108,8 +108,8 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
 
     <h2>Honestly: openrc and the BSDs are untested</h2>
     <p>
-      All four unit renderers — systemd, launchd, openrc, FreeBSD/OpenBSD
-      <code>rc.d</code> — are pinned by exact-string tests, the same tier the
+      All four unit renderers (systemd, launchd, openrc, FreeBSD/OpenBSD
+      <code>rc.d</code>) are pinned by exact-string tests, the same tier the
       systemd unit has always had, since it too has only ever been
       <em>rendered</em>, on a Mac. That's a real and adequate tier for text.
       It is not a claim that the openrc or BSD scripts work: no FreeBSD,
@@ -123,7 +123,7 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
       has no <code>sd_notify</code> analogue, so its script's
       <code>start_post()</code> polls the shepherd's own control socket
       instead and blocks the "started" verdict until the first request is
-      answered — the same milestone <code>READY=1</code> proves on systemd,
+      answered: the same milestone <code>READY=1</code> proves on systemd,
       one step later. FreeBSD gets the same poll through
       <code>start_postcmd</code>. OpenBSD's <code>rc.subr</code> has no
       documented post-start hook at all; its script reports started as soon
@@ -136,7 +136,7 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
       <a href="/docs/from-pm2" class="next-card">
         <div class="next-title">Coming from pm2 →</div>
         <div class="next-body">
-          The runbook above is the tail end of this guide — start there for
+          The runbook above is the tail end of this guide: start there for
           the import step and the env rule that precedes it.
         </div>
       </a>
@@ -144,7 +144,7 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
         <div class="next-title">Containers →</div>
         <div class="next-body">
           Not a bare-metal reboot? <code>shep runtime</code> is the container
-          equivalent — no unit to install at all.
+          equivalent: no unit to install at all.
         </div>
       </a>
     </div>

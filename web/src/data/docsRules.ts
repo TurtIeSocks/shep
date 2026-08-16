@@ -25,7 +25,7 @@ export const usageRules: UsageRule[] = [
   },
   {
     title: "Destructive operations keep plain names",
-    body: "kill, delete, exit codes and error messages carry zero whimsy — misreading one costs a process.",
+    body: "kill, delete, exit codes and error messages carry zero whimsy: misreading one costs a process.",
   },
   {
     title: "Types may be themed when self-evident",

@@ -442,8 +442,8 @@
       // situations they're in, since the fix differs: build the site, vs.
       // report a bug.
       status.textContent = isDev
-        ? "Search index unavailable in dev — build the site to try it."
-        : "Search failed unexpectedly — see the browser console for details.";
+        ? "Search index unavailable in dev. Build the site to try it."
+        : "Search failed unexpectedly. See the browser console for details.";
       return;
     }
     if (myToken !== searchToken) return;

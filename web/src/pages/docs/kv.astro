@@ -42,7 +42,7 @@ KEY  VALUE`;
 
 <DocsLayout
   title="The KV store"
-  description="Three verbs, a file-locked JSON store, and no shepherd required — for the small stuff that has nowhere else to live."
+  description="Three verbs, a file-locked JSON store, and no shepherd required: for the small stuff that has nowhere else to live."
   crumb="Concepts / The KV store"
   activeSlug="kv"
 >
@@ -54,7 +54,7 @@ KEY  VALUE`;
       configures a sheep, <code>shep.toml</code> configures the shepherd and
       its dogs. Neither has a field for "the port the last on-call engineer
       picked" or a feature flag a provisioning script wants to leave a note
-      about. The KV store is what's left over — a flat, file-locked junk
+      about. The KV store is what's left over: a flat, file-locked junk
       drawer, explicitly not the primary config path.
     </p>
 
@@ -72,7 +72,7 @@ KEY  VALUE`;
       whatever was there. <code>shep get &lt;key&gt;</code> prints one value;
       <code>shep get</code> with no key lists everything.
       <code>shep unset &lt;key&gt;</code> removes one key;
-      <code>shep unset --all</code> empties the store — a flag, not a key
+      <code>shep unset --all</code> empties the store: a flag, not a key
       named <code>all</code>, because nothing stops you having a key called
       <code>all</code> and <code>shep unset all</code> would then mean
       something different depending on your own store.
@@ -83,7 +83,7 @@ KEY  VALUE`;
     <CodeBlock>{realOutput}</CodeBlock>
     <p class="fine">
       A key that was never there answers <code>NotFound</code> on both
-      <code>get</code> and <code>unset</code>, exit code 3 either way — a
+      <code>get</code> and <code>unset</code>, exit code 3 either way: a
       script can write <code>shep get feature.flag || echo default</code> and
       trust the exit code rather than parsing output to tell "empty" from
       "missing."
@@ -92,14 +92,14 @@ KEY  VALUE`;
     <h2>The key grammar</h2>
     <p>
       A key is <code>[A-Za-z0-9._-]</code>, one to 128 bytes, and can't start
-      with a dot. <strong>A dot is part of a name, not a path</strong> —
+      with a dot. <strong>A dot is part of a name, not a path</strong>:
       <code>bark.cooldown</code> is one flat key, not a nested object, and
       <code>shep get bark</code> won't find it. This is a deliberate
       departure from pm2's own dotted/colon store: a nesting grammar here
       would be a second config language, with its own quoting rules, for a
       store that's explicitly not the primary one. The narrow alphabet is
       also why <code>shep get $key</code> never needs quoting in a script. A
-      value is a string, capped at 4&nbsp;KiB — the store is read whole on
+      value is a string, capped at 4&nbsp;KiB: the store is read whole on
       every access, and the cap is what keeps <code>kv.json</code> from
       quietly becoming a blob store.
     </p>
@@ -107,12 +107,12 @@ KEY  VALUE`;
     <h2>No shepherd required</h2>
     <p>
       <code>shep set</code>/<code>get</code>/<code>unset</code> never touch
-      the socket — they read and write <code>$SHEP_HOME/kv.json</code>
+      the socket: they read and write <code>$SHEP_HOME/kv.json</code>
       directly, the same way <code>shep enable</code> writes
       <code>shep.toml</code> with nothing listening. That's what makes this
       store usable during provisioning, before any shepherd has ever booted
       on the machine. A dog reads the same store through
-      <code>shep_core::kv</code> rather than over the wire — a
+      <code>shep_core::kv</code> rather than over the wire: a
       <code>0600</code> file inside a <code>0700</code>
       <code>$SHEP_HOME</code>, opened by a process running as the same user,
       already has every property a socket round trip would have bought it.
@@ -120,13 +120,13 @@ KEY  VALUE`;
 
     <h2>Concurrent writers lose nothing</h2>
     <p>
-      Two <code>shep set</code> invocations racing — two provisioning
-      scripts, or an operator and a dog — are serialized by an exclusive
+      Two <code>shep set</code> invocations racing (two provisioning
+      scripts, or an operator and a dog) are serialized by an exclusive
       advisory lock on a sibling <code>kv.json.lock</code>. Whichever loses
       the race simply waits its turn; neither write is silently dropped. The
       file itself is written through a <code>BTreeMap</code>, so keys are
       always in sorted order and two writes of the same content produce
-      byte-identical files — safe to keep in a dotfiles repository,
+      byte-identical files: safe to keep in a dotfiles repository,
       <code>git add</code> and diff like any other small config file. Mode is
       <code>0600</code>.
     </p>
@@ -136,7 +136,7 @@ KEY  VALUE`;
       <a href="/docs/lookout" class="next-card">
         <div class="next-title">Lookout →</div>
         <div class="next-body">
-          <code>lookout.allow_control</code> is a KV key — set it with
+          <code>lookout.allow_control</code> is a KV key: set it with
           <code>shep set</code> instead of the <code>--allow-control</code>
           flag if you'd rather it stick.
         </div>
@@ -145,7 +145,7 @@ KEY  VALUE`;
         <div class="next-title">Dogs →</div>
         <div class="next-body">
           Per-dog settings live under <code>[dog.&lt;name&gt;]</code> in
-          <code>shep.toml</code>, not here — this page explains where the
+          <code>shep.toml</code>, not here. This page explains where the
           line falls.
         </div>
       </a>

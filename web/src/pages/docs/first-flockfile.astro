@@ -43,7 +43,7 @@ const fieldGroups: FieldGroup[] = [
     fields: [
       { name: "autorestart", type: "bool", default: "true", does: "Restart on unexpected exit." },
       { name: "autostart", type: "bool", default: "true", does: "Start when the daemon starts, or on shep muster." },
-      { name: "stop_exit_codes", type: "int[]", default: "[]", does: "Exit codes treated as a clean stop — no restart." },
+      { name: "stop_exit_codes", type: "int[]", default: "[]", does: "Exit codes treated as a clean stop, not a restart." },
       { name: "min_uptime", type: "duration", default: "1s", does: "Below this, an exit counts as unstable." },
       { name: "max_restarts", type: "integer", default: "16", does: "Consecutive unstable exits before errored." },
       { name: "restart_delay", type: "duration?", default: "none", does: "Fixed delay before every restart (alternative to backoff)." },
@@ -53,7 +53,7 @@ const fieldGroups: FieldGroup[] = [
   {
     title: "Stopping",
     fields: [
-      { name: "kill_signal", type: "string?", default: "SIGTERM", does: "One of SIGTERM/SIGINT/SIGQUIT/SIGUSR2 — the SIG prefix and case are both optional." },
+      { name: "kill_signal", type: "string?", default: "SIGTERM", does: "One of SIGTERM/SIGINT/SIGQUIT/SIGUSR2: the SIG prefix and case are both optional." },
       { name: "kill_timeout", type: "duration", default: "1.6s", does: "Grace period between the stop signal and SIGKILL." },
       { name: "shutdown_with_message", type: "bool", default: "false", does: "Send {\"kind\":\"shutdown\"} on the shepherd channel instead of a signal." },
       { name: "graceful_timeout", type: "duration", default: "8s", does: "Drain window for the old instance during a reload." },
@@ -83,7 +83,7 @@ const fieldGroups: FieldGroup[] = [
   {
     title: "Resources & organization",
     fields: [
-      { name: "max_memory", type: "size?", default: "none", does: "Memory ceiling — the polling enforcer restarts the sheep above it." },
+      { name: "max_memory", type: "size?", default: "none", does: "Memory ceiling: the polling enforcer restarts the sheep above it." },
       { name: "fold", type: "string?", default: "none", does: "Names the fold (group) this sheep belongs to." },
       { name: "user", type: "string?", default: "none", does: "Run as this user (unix)." },
       { name: "group", type: "string?", default: "none", does: "Run as this group (unix)." },
@@ -100,7 +100,7 @@ const fieldGroups: FieldGroup[] = [
   {
     title: "Networking & probes",
     fields: [
-      { name: "reuse_port", type: "bool", default: "false", does: "Inert today — reload already overlaps unconditionally. Kept so import doesn't drop it." },
+      { name: "reuse_port", type: "bool", default: "false", does: "Inert today. Reload already overlaps unconditionally. Kept so import doesn't drop it." },
       { name: "readiness_probe", type: "object?", default: "none", does: "HTTP/TCP/exec probe gating reload's await-ready step." },
       { name: "liveness_probe", type: "object?", default: "none", does: "HTTP/TCP/exec probe whose failures feed the restart policy." },
     ],
@@ -128,7 +128,7 @@ const fieldGroups: FieldGroup[] = [
     <h2>Two fields is still a complete one</h2>
     <p>
       <code>name</code> and <code>script</code> are the only two fields with
-      no default — everything else in the reference table below fills in on
+      no default. Everything else in the reference table below fills in on
       its own. <code>autorestart</code> and <code>autostart</code> both
       default to <code>true</code>, so a bare two-field entry is already a
       supervised, auto-starting sheep.
@@ -139,10 +139,10 @@ script = "./server"`}</CodeBlock>
 
     <h2>Formats and discovery</h2>
     <p>
-      TOML, YAML, JSON, and JSON5 all parse the same document shape — a list
+      TOML, YAML, JSON, and JSON5 all parse the same document shape: a list
       of app tables under one <code>app</code> key (<code>[[app]]</code> in
       TOML). <code>shep start</code> always takes an explicit
-      <code>&lt;TARGET&gt;</code> — clap refuses with "the following required
+      <code>&lt;TARGET&gt;</code>: clap refuses with "the following required
       arguments were not provided" if you leave it off. Discovery belongs to
       <code>shep runtime</code> and <code>shep dev</code>, whose
       <code>[TARGET]</code> is optional: run either with no argument and it
@@ -161,15 +161,15 @@ flockfile.json
 flockfile.json5`}</CodeBlock>
     <p>
       <code>.js</code> is a fifth format, and deliberately not on that list.
-      Reading one means running <code>node</code> on it — arbitrary code
-      execution — so discovery never selects a <code>.js</code> file no
+      Reading one means running <code>node</code> on it (arbitrary code
+      execution), so discovery never selects a <code>.js</code> file no
       matter what's sitting in the directory. It's read only when you name
       it explicitly with <code>--flockfile</code>:
     </p>
     <CodeBlock>{`$ shep start flock.config.js --flockfile`}</CodeBlock>
     <p class="fine">
       A pm2 <code>ecosystem.config.js</code> is not a Flockfile shep can read
-      this way — shep never parses pm2's config format at all. That's what
+      this way. shep never parses pm2's config format at all. That's what
       <code>shep import</code> is for: it reads a real <code>dump.pm2</code>
       and writes a Flockfile, once, rather than teaching <code>start</code>
       a second config dialect. See <a href="/docs/from-pm2">Coming from pm2</a>.
@@ -180,7 +180,7 @@ flockfile.json5`}</CodeBlock>
       a script, not as config. <code>cd</code>-ing into a cloned repository
       and running <code>shep runtime</code> or <code>shep dev</code> with no
       argument must never execute a stranger's JavaScript on your machine as
-      a side effect of looking for config — that's the whole reasoning
+      a side effect of looking for config. That's the whole reasoning
       behind the ten-name list above stopping at JSON5.
     </Callout>
 
@@ -189,7 +189,7 @@ flockfile.json5`}</CodeBlock>
       Two field types are small parsers of their own rather than bare
       numbers, so a typo in either fails at parse time instead of silently
       meaning something else. Both accept plain digits with one optional
-      trailing letter — nothing more:
+      trailing letter, nothing more:
     </p>
     <div class="grammar-grid">
       <div class="grammar-card">
@@ -205,14 +205,14 @@ flockfile.json5`}</CodeBlock>
         <div class="grammar-pattern"><code>^\d+(G|M|K)?$</code></div>
         <p>
           Plain digits are bytes; <code>K</code>/<code>M</code>/<code
-          >G</code> are binary units — KiB/MiB/GiB, not decimal. Uppercase
+          >G</code> are binary units: KiB/MiB/GiB, not decimal. Uppercase
           only, and each is exactly one letter.
         </p>
       </div>
     </div>
     <p>
       <code>512M</code> and <code>30s</code> parse. <code>512MB</code>,
-      <code>1.5G</code>, and <code>30S</code> all fail — a fractional size,
+      <code>1.5G</code>, and <code>30S</code> all fail: a fractional size,
       a two-letter unit, and an uppercase duration suffix, each rejected by
       the same strict grammar rather than rounded, guessed, or silently
       dropped:
@@ -226,7 +226,7 @@ memory size must be ASCII digits with an optional trailing G, M, or K`}</CodeBlo
 
     <h2>Unknown fields are a parse error, not a shrug</h2>
     <p>
-      Every Flockfile field name is checked against the real set — a typo'd
+      Every Flockfile field name is checked against the real set. A typo'd
       key is rejected at load, not ignored. This is the same guarantee spec
       writers get from <code>#[serde(deny_unknown_fields)]</code>, surfaced
       as a message that names the exact key and lists what would have been
@@ -248,7 +248,7 @@ unknown field \`max_memory_restart\`, expected one of \`name\`, \`script\`, \`ar
 `}</CodeBlock>
     <p class="fine">
       A parsed document with zero <code>[[app]]</code> entries is its own
-      distinct error, <code>Flockfile declares no apps</code> — an empty
+      distinct error, <code>Flockfile declares no apps</code>: an empty
       file isn't a no-op, since <code>shep start</code> with nothing to
       start almost always means the path was wrong.
     </p>
@@ -257,7 +257,7 @@ unknown field \`max_memory_restart\`, expected one of \`name\`, \`script\`, \`ar
     <p>
       Every field <code>AppConfig</code> accepts, grouped by what it's for.
       <code>readiness_probe</code> and <code>liveness_probe</code> each take
-      a nested object — <code>kind</code> (<code>http</code>/<code
+      a nested object: <code>kind</code> (<code>http</code>/<code
       >tcp</code>/<code>exec</code>), <code>target</code>, and optional
       <code>interval</code> (10s), <code>timeout</code> (5s), and
       <code>failure_threshold</code> (3).
@@ -317,21 +317,21 @@ unknown field \`max_memory_restart\`, expected one of \`name\`, \`script\`, \`ar
       }
     }`}</CodeBlock>
     <p class="fine">
-      That's the real first twenty lines, unedited — <code>head -20</code>
+      That's the real first twenty lines, unedited. <code>head -20</code>
       cuts off mid-<code>"app"</code> block, and the <code>"$schema"</code>
       key's own description is one long escaped line explaining itself,
       not the tidied multi-line prose above. The full document closes
       <code>"app"</code>, adds <code>"additionalProperties": false</code>,
-      and a <code>"$defs"</code> section with one entry per Flockfile field —
-      run the command yourself to see the rest.
+      and a <code>"$defs"</code> section with one entry per Flockfile field.
+      Run the command yourself to see the rest.
     </p>
     <p>
-      That <code>"$schema"</code> key is real and accepted — a JSON or
+      That <code>"$schema"</code> key is real and accepted: a JSON or
       JSON5 Flockfile can set it to a path and get editor completion, since
       neither format has a comment syntax an editor would look inside for a
       schema hint. shep itself reads the key and discards it; it never
       validates against whatever it points to. TOML doesn't need the key at
-      all — a leading <code>#:schema &lt;path&gt;</code> comment (the taplo
+      all: a leading <code>#:schema &lt;path&gt;</code> comment (the taplo
       convention) does the same job, invisibly to the parser.
     </p>
 

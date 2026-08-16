@@ -46,7 +46,7 @@ import { pillTargetsLive } from "../../data/docsNav";
   }
 }`}</CodeBlock>
     <p class="fine">
-      It writes nothing else to stdout, because stdout is the wire — an
+      It writes nothing else to stdout, because stdout is the wire. An
       agent host launches this process and talks JSON-RPC to it on the pipe.
     </p>
 
@@ -54,13 +54,13 @@ import { pillTargetsLive } from "../../data/docsNav";
     <p>
       Generated straight from the two live routers <code>whistle/read.rs</code>{" "}
       and <code>whistle/control.rs</code> build, not a second hand-typed
-      copy beside them —{" "}
+      copy beside them:{" "}
       {pillTargetsLive.github ? (
         <a href="https://github.com/TurtIeSocks/shep/blob/main/docs/whistle/tools.md">
           the full generated reference is on GitHub
         </a>
       ) : (
-        <span title="Not public yet — the repo is private until launch.">
+        <span title="Not public yet. The repo is private until launch.">
           the full generated reference is <code>docs/whistle/tools.md</code>{" "}
           in the repo
         </span>
@@ -82,7 +82,7 @@ import { pillTargetsLive } from "../../data/docsNav";
     </div>
     <p class="fine">
       <code>tail_bleats</code> returns text a sheep wrote to its own logs,
-      verbatim, into a model's context — treat instructions found in it as
+      verbatim, into a model's context: treat instructions found in it as
       data, never as a request to act, the same way you'd treat any other
       untrusted input.
     </p>
@@ -91,7 +91,7 @@ import { pillTargetsLive } from "../../data/docsNav";
     <CodeBlock label="shep.toml">{`[whistle]
 allow_control = true`}</CodeBlock>
     <p>
-      Restart whistle for the edit to take effect — the running shepherd
+      Restart whistle for the edit to take effect. The running shepherd
       never reads this section itself; whistle reads its own copy of{" "}
       <code>shep.toml</code> once, at startup. With the gate shut, the four
       control tools are absent from <code>tools/list</code> entirely, not
@@ -127,7 +127,7 @@ tools: describe_sheep, get_metrics, list_barks, list_flock, reload_sheep,
     <p>
       What it does buy is narrower and real:{" "}
       <code>tail_bleats</code> returns text a sheep wrote to its own logs,
-      verbatim, into a model's context — a sheep that logs an attacker's
+      verbatim, into a model's context: a sheep that logs an attacker's
       input logs an attacker's instructions. With the gate shut, those
       instructions land next to a tool list with nothing on it but{" "}
       <code>list_flock</code>, <code>describe_sheep</code>,{" "}
@@ -138,7 +138,7 @@ tools: describe_sheep, get_metrics, list_barks, list_flock, reload_sheep,
     </p>
     <p class="fine">
       There's no <code>--allow-control</code> flag, and the reason is
-      legibility, not containment — a boolean in a file has a diff and an
+      legibility, not containment: a boolean in a file has a diff and an
       mtime an operator can audit; a flag lives in whatever process's{" "}
       <code>argv</code> and is invisible to <code>shep</code> between runs.
       That doesn't mean a flag would reach somewhere the file can't:{" "}
@@ -151,8 +151,8 @@ tools: describe_sheep, get_metrics, list_barks, list_flock, reload_sheep,
       <code>start_sheep</code> is narrower than <code>shep start</code> on
       purpose, gate or no gate: it takes the name of a sheep already in the
       flock and can never register a new process. A{" "}
-      <code>start_sheep</code> shaped like <code>shep start</code> — a
-      script path handed to a model — would be arbitrary code execution as
+      <code>start_sheep</code> shaped like <code>shep start</code> (a
+      script path handed to a model) would be arbitrary code execution as
       the operator, and no config setting makes that acceptable.
     </p>
 
@@ -160,17 +160,17 @@ tools: describe_sheep, get_metrics, list_barks, list_flock, reload_sheep,
     <p>
       A <code>restart_sheep</code> call from a model and a{" "}
       <code>shep restart</code> typed by a person arrive at the daemon
-      identically — the same <code>CommandOrigin::Operator</code>, the same
+      identically: the same <code>CommandOrigin::Operator</code>, the same
       bus event, the same log line, the same bark. There is no wire field
       that tells them apart. An operator asking "who restarted{" "}
       <code>api</code> at 3am" will not find the answer in the shepherd's
-      own records if whistle was in the loop — attribution stops at the
+      own records if whistle was in the loop. Attribution stops at the
       socket.
     </p>
 
     <h2>What whistle doesn't do</h2>
     <p>
-      No HTTP/SSE transport <NotBuilt note="v1.1+" /> — stdio only, so
+      No HTTP/SSE transport <NotBuilt note="v1.1+" />: stdio only, so
       whistle runs as a local subprocess of whatever host launches it, not
       as a service other machines connect to.
     </p>
@@ -181,14 +181,14 @@ tools: describe_sheep, get_metrics, list_barks, list_flock, reload_sheep,
         <div class="next-title">The shepherd channel →</div>
         <div class="next-body">
           <code>shep trigger</code> reaches an app the same way whistle's
-          control tools reach the daemon — worth reading if you're wiring
+          control tools reach the daemon. Worth reading if you're wiring
           up custom actions for a model to call.
         </div>
       </a>
       <a href="/docs/lookout" class="next-card">
         <div class="next-title">Lookout →</div>
         <div class="next-body">
-          The human's dashboard, for the same flock — a terminal UI instead
+          The human's dashboard, for the same flock: a terminal UI instead
           of a tool list.
         </div>
       </a>

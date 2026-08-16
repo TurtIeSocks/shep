@@ -22,7 +22,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
     <ReferencePills slug="folds" />
     <p class="lede">
       A fold is a label, nothing more. It doesn't isolate a sheep's
-      filesystem, network, or resources — it just gives a group of sheep a
+      filesystem, network, or resources. It just gives a group of sheep a
       name you can select, list, and read off the flock table, so
       <code>backend</code> and <code>jobs</code> don't have to be regexes
       you keep retyping.
@@ -31,7 +31,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
     <h2>Setting one</h2>
     <p>
       Add <code>fold = "&lt;name&gt;"</code> to any app in a Flockfile. A
-      sheep with no <code>fold</code> field simply has none — it prints
+      sheep with no <code>fold</code> field simply has none. It prints
       <code>-</code> in the table and <code>null</code> under
       <code>--format json</code>.
     </p>
@@ -52,7 +52,7 @@ fold   = "jobs"`}</CodeBlock>
 
     <h2>Listing one</h2>
     <p>
-      <code>shep fold &lt;name&gt;</code> lists exactly that fold — nothing
+      <code>shep fold &lt;name&gt;</code> lists exactly that fold. Nothing
       else in the flock. It's <code>shep flock</code> pre-filtered, plus one
       thing the plain flock table never shows: a <strong>Lambs</strong>
       section under any sheep that has spawned children of its own, one per
@@ -73,23 +73,23 @@ PID    NAME
 64784  sleep
 64785  sleep`}</CodeBlock>
     <p>
-      A sheep with no children of its own gets no Lambs section at all — the
+      A sheep with no children of its own gets no Lambs section at all. The
       two above both happen to fork workers, which is why both get one. See
       <a href="/docs/json-output">JSON output</a> for how the same data
       surfaces as the <code>lambs</code> array under <code>--format json</code>.
     </p>
     <p>
       A fold name that matches nothing is the same <code>not_found</code>
-      error any other selector gives you, exit code 3 — not an empty list:
+      error any other selector gives you, exit code 3, not an empty list:
     </p>
     <CodeBlock>{`$ shep fold nonexistent
 error[not_found]: the daemon reported NotFound: selector matched no registered sheep`}</CodeBlock>
 
     <h2>Selecting one from any verb</h2>
     <p>
-      Every verb that takes a selector — <code>stop</code>,
+      Every verb that takes a selector (<code>stop</code>,
       <code>restart</code>, <code>delete</code>, <code>bleats</code>,
-      <code>trigger</code>, and the rest — accepts
+      <code>trigger</code>, and the rest) accepts
       <code>fold:&lt;name&gt;</code> in place of a name, an id, a
       <code>/regex/</code>, or <code>all</code>. It reaches every sheep
       carrying that fold in one call:
@@ -103,12 +103,12 @@ ID  NAME    STATUS   PID  RESTARTS  CPU  MEM  UPTIME  FOLD
       Selector parsing checks shapes in a fixed order, and it matters if a
       name is ambiguous with something else: the literal word
       <code>all</code>, then a <code>fold:</code> prefix, then
-      <code>/regex/</code> slashes, then — if the whole string is ASCII
-      digits — a numeric id. Only after all four fail does it fall back to
+      <code>/regex/</code> slashes, then (if the whole string is ASCII
+      digits) a numeric id. Only after all four fail does it fall back to
       treating the string as a plain name. A sheep named <code>2</code> is
       the practical edge of this: typing <code>2</code> as a selector always
       means "id 2", never "the sheep named 2", even if those aren't the same
-      sheep. <code>fold:</code> names don't collide with any of this — the
+      sheep. <code>fold:</code> names don't collide with any of this: the
       prefix is checked for before <code>/regex/</code> or a bare number, so
       a fold can be named anything, including <code>all</code> or a number,
       and <code>fold:&lt;that name&gt;</code> still reaches it.
@@ -116,14 +116,14 @@ ID  NAME    STATUS   PID  RESTARTS  CPU  MEM  UPTIME  FOLD
 
     <h2>What a fold is not</h2>
     <p>
-      Folds carry no uniqueness constraint and no nesting — a name is a flat
+      Folds carry no uniqueness constraint and no nesting: a name is a flat
       string, and two sheep can share one with nothing else in common. There
       is no <code>shep fold create</code> or config listing every fold that
       exists; a fold exists exactly as long as some sheep's
       <code>fold</code> field names it, and disappears the moment the last
       one does. If you're picturing folds as something closer to a
-      Kubernetes namespace or a cgroup, that's the wrong mental model —
-      the closest real comparison is a tag.
+      Kubernetes namespace or a cgroup, that's the wrong mental model.
+      The closest real comparison is a tag.
     </p>
 
     <h2>Where to go next</h2>

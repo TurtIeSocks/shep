@@ -52,7 +52,7 @@ export const lexiconSignposts: LexiconSignpost[] = [
   },
   {
     term: "the shepherd",
-    meaning: "The daemon — and only ever the daemon.",
+    meaning: "The daemon. Only ever the daemon.",
     cli: "log messages, docs",
     bg: "var(--fleece)",
     fg: "var(--ink)",

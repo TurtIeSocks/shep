@@ -26,7 +26,7 @@ const meta = {
   title: "CLI reference",
   crumb: "Reference / CLI",
   blurb:
-    "Every verb, its aliases, its flags, and its exit codes — generated from the same clap tree the binary parses with.",
+    "Every verb, its aliases, its flags, and its exit codes: generated from the same clap tree the binary parses with.",
 };
 const byName = new Map(cliReference.verbs.map((v) => [v.name, v]));
 
@@ -98,20 +98,20 @@ if (coveredCount !== cliReference.verbs.length) {
     <ReferencePills slug="cli" />
     <p class="lede">
       Every verb <code>shep {cliReference.version.replace(/^shep\s+/, "")}</code>
-      understands, generated from the binary's own <code>--help</code> — nothing
+      understands, generated from the binary's own <code>--help</code>. Nothing
       below is hand-typed.
     </p>
 
     <Callout variant="note">
       <code>--home</code>, <code>--format table|json</code> and <code>-q</code>/<code>--quiet</code>
-      work on every verb on this page — they're global flags, flattened onto each
+      work on every verb on this page. They're global flags, flattened onto each
       subcommand rather than repeated in the prose below. See the full dump under
       "Every verb, at a glance" for exactly how they render on each one.
     </Callout>
 
     <Callout variant="careful">
       Windows isn't supported yet. Every verb here prints an error naming that
-      and exits 1 on that platform — there's no partial subset that works.
+      and exits 1 on that platform. There's no partial subset that works.
     </Callout>
 
     <h2>Aliases at a glance</h2>
@@ -144,7 +144,7 @@ if (coveredCount !== cliReference.verbs.length) {
 
     <h2>Every verb, at a glance</h2>
     <p>
-      The exact output of <code>shep --help</code> against this build — the
+      The exact output of <code>shep --help</code> against this build: the
       full command list, the global options, and their defaults.
     </p>
     <CodeBlock label={`$ shep --help`}>{cliReference.topLevelHelp}</CodeBlock>
@@ -189,7 +189,7 @@ if (coveredCount !== cliReference.verbs.length) {
       <a href="/docs/terminology" class="next-card">
         <div class="next-title">Terminology →</div>
         <div class="next-body">
-          The words behind these verbs — fold, dog, sheep, bleat — and why
+          The words behind these verbs (fold, dog, sheep, bleat) and why
           they were picked.
         </div>
       </a>

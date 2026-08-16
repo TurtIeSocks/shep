@@ -42,7 +42,7 @@ import Callout from "../../components/docs/Callout.astro";
     </div>
     <p class="fine">
       Put <code>target/release/shep</code> on your PATH, or keep typing the
-      full path — everything below works either way.
+      full path. Everything below works either way.
     </p>
 
     <h2>2. Write a Flockfile</h2>
@@ -51,7 +51,7 @@ import Callout from "../../components/docs/Callout.astro";
       <code>.yaml</code>, <code>.json</code> and <code>.json5</code> all
       work. <code>shep start</code> below takes the path explicitly;
       <code>shep runtime</code> and <code>shep dev</code> can find one on
-      their own instead, by searching ten filenames in a fixed order — see
+      their own instead, by searching ten filenames in a fixed order: see
       <a href="/docs/first-flockfile">Your first Flockfile</a>.
     </p>
     <div class="file-panel">
@@ -63,7 +63,7 @@ import Callout from "../../components/docs/Callout.astro";
       </div>
     </div>
     <Callout variant="note">
-      Unknown fields are a parse error, not a shrug — a typo tells you at
+      Unknown fields are a parse error, not a shrug. A typo tells you at
       load instead of at 3am. Durations and sizes are strict on purpose:
       <code>512M</code> and <code>30s</code> parse; <code>512MB</code>,
       <code>1.5G</code> and <code>30S</code> do not.

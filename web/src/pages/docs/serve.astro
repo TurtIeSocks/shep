@@ -38,17 +38,17 @@ $ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/link.html
     <p class="lede">
       <code>shep serve &lt;dir&gt;</code> registers a sheep whose command line
       is this same invocation, canonicalized, with <code>--foreground</code>
-      appended — the worker answering every request <em>is</em> the
+      appended: the worker answering every request <em>is</em> the
       registered sheep, so <code>shep describe</code> shows exactly what
-      restarts if it dies. It's hand-rolled — six small modules over an HTTP
-      layer shared with the metrics dog — not built on axum or tower-http.
+      restarts if it dies. It's hand-rolled (six small modules over an HTTP
+      layer shared with the metrics dog), not built on axum or tower-http.
     </p>
 
     <h2>Try it</h2>
     <CodeBlock>$ shep serve ./dist --port 8080</CodeBlock>
     <p class="fine">
       Add <code>--foreground</code> to run the worker directly in this
-      terminal instead of registering a sheep — same worker either way, just
+      terminal instead of registering a sheep. Same worker either way, just
       without the supervision.
     </p>
 
@@ -65,10 +65,10 @@ $ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/link.html
     <CodeBlock>{requestCodes}</CodeBlock>
     <p>
       Traversal is refused in every encoding it was tried in, not just the
-      literal one. Dotfiles 404 — serving a repo checkout with
+      literal one. Dotfiles 404: serving a repo checkout with
       <code>shep serve .</code> would otherwise publish <code>.env</code> and
       the whole <code>.git</code> history. And <strong>any</strong> symlink
-      under the docroot 404s by default, not only one that leaves it — an
+      under the docroot 404s by default, not only one that leaves it: an
       in-docroot link like <code>dist/current -&gt;
       ../releases/2026-08-15</code> is refused along with everything else,
       because the leaf open carries <code>O_NOFOLLOW</code> but the
@@ -77,7 +77,7 @@ $ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/link.html
     </p>
 
     <Callout variant="careful">
-      <code>--follow-symlinks</code> reopens exactly that race — a
+      <code>--follow-symlinks</code> reopens exactly that race: a
       canonicalize-then-check that a file created in the docroot between the
       walk and the open can still slip past. It exists because a real deploy
       layout needs it (<code>current -&gt; releases/2026-08-15</code> won't
@@ -90,13 +90,13 @@ $ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/link.html
     <h2>The rest of the flags</h2>
     <p>
       <code>--listing</code> turns on directory listings for a folder with no
-      <code>index.html</code> — off by default, since a listing publishes
+      <code>index.html</code>, off by default, since a listing publishes
       every filename under it. <code>--hidden</code> serves dotfiles, mainly
       for <code>.well-known/acme-challenge</code>. <code>--spa</code> serves
       <code>index.html</code> for a path that doesn't exist, only for
       requests that accept HTML, so a missing script still 404s.
       <code>--auth &lt;file&gt;</code> requires one <code>user:password</code>
-      line, mode <code>0600</code>, on every request — sent as plain HTTP
+      line, mode <code>0600</code>, on every request. Sent as plain HTTP
       basic auth, base64 rather than encryption, so put a real proxy in front
       if that matters.
     </p>
@@ -104,7 +104,7 @@ $ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/link.html
       What isn't here: range requests, conditional requests, ETags,
       compression, keep-alive, TLS, HTTP/2, or any <code>PM2_SERVE_*</code>
       compatibility <NotBuilt note="range/conditional requests are v1.1 candidates" />.
-      <code>shep serve</code> takes no configuration from the environment —
+      <code>shep serve</code> takes no configuration from the environment:
       pass <code>--port</code>, <code>--bind</code>, <code>--spa</code>,
       <code>--auth</code> and the flags above on the command line instead.
       The visible cost today is no video seeking and a full re-read per
@@ -117,8 +117,8 @@ $ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/link.html
       is a regression before it's a fix if you weren't expecting it: listing
       and dotfiles are pm2's <em>on</em>, shep's <em>off</em>; following an
       in-docroot symlink is pm2's <em>on</em>, shep's <em>off</em>. All three
-      are one flag away — <code>--listing</code>, <code>--hidden</code>,
-      <code>--follow-symlinks</code> — once you've decided the trade is worth
+      are one flag away (<code>--listing</code>, <code>--hidden</code>,
+      <code>--follow-symlinks</code>) once you've decided the trade is worth
       it for your layout.
     </p>
     <h2>Where to go next</h2>
@@ -127,7 +127,7 @@ $ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/link.html
       <a href="/docs/containers" class="next-card">
         <div class="next-title">Containers →</div>
         <div class="next-body">
-          <code>shep runtime</code> and <code>shep dev</code> — the other two
+          <code>shep runtime</code> and <code>shep dev</code>: the other two
           verbs that shipped alongside <code>serve</code> in the same phase.
         </div>
       </a>

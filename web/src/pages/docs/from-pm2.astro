@@ -40,7 +40,7 @@ const verbTable: { pm2: string; shep: string; note?: string }[] = [
   {
     pm2: "pm2 reload",
     shep: "shep reload",
-    note: "needs the app to set SO_REUSEPORT itself — see below",
+    note: "needs the app to set SO_REUSEPORT itself: see below",
   },
   { pm2: "pm2 delete", shep: "shep delete" },
   { pm2: "pm2 list / ls / status", shep: "shep flock", note: "alias: list, ls" },
@@ -49,7 +49,7 @@ const verbTable: { pm2: string; shep: string; note?: string }[] = [
   {
     pm2: "pm2 scale <name> <n>",
     shep: "shep stock <name> <n>",
-    note: "alias: scale — always an absolute count in both",
+    note: "alias: scale (always an absolute count in both)",
   },
   { pm2: "pm2 save", shep: "shep save" },
   { pm2: "pm2 resurrect", shep: "shep muster", note: "hidden alias: resurrect" },
@@ -57,22 +57,22 @@ const verbTable: { pm2: string; shep: string; note?: string }[] = [
   { pm2: "pm2 unstartup", shep: "shep unstartup" },
   { pm2: "pm2 kill", shep: "shep kill" },
   { pm2: "pm2 flush", shep: "shep flush" },
-  { pm2: "pm2 serve <dir>", shep: "shep serve <dir>", note: "three defaults flip — see below" },
+  { pm2: "pm2 serve <dir>", shep: "shep serve <dir>", note: "three defaults flip: see below" },
   { pm2: "pm2-runtime", shep: "shep runtime", note: "or the shep-runtime alias binary" },
   { pm2: "pm2 sendSignal", shep: "shep signal" },
-  { pm2: "—", shep: "shep whisper", note: "no pm2 equivalent: writes a line to an app's stdin" },
+  { pm2: "-", shep: "shep whisper", note: "no pm2 equivalent: writes a line to an app's stdin" },
   {
     pm2: "pm2 trigger",
     shep: "shep trigger",
-    note: "different mechanism — pm2 calls a module method, shep sends over the app's own shepherd channel",
+    note: "different mechanism: pm2 calls a module method, shep sends over the app's own shepherd channel",
   },
   {
     pm2: "pm2 monit",
     shep: "shep lookout",
-    note: "alias: dash — a fuller dashboard, not a straight swap",
+    note: "alias: dash (a fuller dashboard, not a straight swap)",
   },
-  { pm2: "—", shep: "shep enable / disable / adopt / rehome", note: "dogs have no pm2 analogue" },
-  { pm2: "—", shep: "shep set / get / unset", note: "the KV store; nothing in pm2 does this" },
+  { pm2: "-", shep: "shep enable / disable / adopt / rehome", note: "dogs have no pm2 analogue" },
+  { pm2: "-", shep: "shep set / get / unset", note: "the KV store; nothing in pm2 does this" },
 ];
 ---
 
@@ -87,13 +87,13 @@ const verbTable: { pm2: string; shep: string; note?: string }[] = [
     <ReferencePills slug="from-pm2" />
     <p class="lede">
       <code>shep import</code> reads a real <code>dump.pm2</code> and writes
-      a Flockfile from it. It starts nothing — no daemon connection, no
+      a Flockfile from it. It starts nothing: no daemon connection, no
       socket, just a file read and a file write.
     </p>
 
     <Callout variant="careful">
-      Two things do not survive the trip, and neither is silently swallowed —
-      both are named on stderr at import time, before you have started
+      Two things do not survive the trip, and neither is silently swallowed.
+      Both are named on stderr at import time, before you have started
       anything: cluster-mode socket sharing, and most of the shell
       environment pm2 flattened into the dump. Both are covered below.
     </Callout>
@@ -101,7 +101,7 @@ const verbTable: { pm2: string; shep: string; note?: string }[] = [
     <h2>What it reads</h2>
     <p>
       Exactly one file: <code>~/.pm2/dump.pm2</code>, or whatever path
-      <code>--from</code> names — whichever <code>pm2 save</code> last wrote.
+      <code>--from</code> names: whichever <code>pm2 save</code> last wrote.
       It does not read <code>ecosystem.config.js</code> or any other pm2
       config format, and it never touches pm2's own state: nothing under
       <code>~/.pm2</code> is written or deleted by anything on this page.
@@ -110,7 +110,7 @@ const verbTable: { pm2: string; shep: string; note?: string }[] = [
       A dump row missing <code>pm_exec_path</code> is refused by name rather
       than imported as a broken app. Every app the importer does produce goes
       through the same config validation <code>shep start</code> applies to
-      a hand-written Flockfile, so a rejected field fails at import — not
+      a hand-written Flockfile, so a rejected field fails at import, not
       three seconds into a sheep's life after a reboot.
     </p>
 
@@ -127,7 +127,7 @@ const verbTable: { pm2: string; shep: string; note?: string }[] = [
 
     <h2>Try it</h2>
     <p>
-      The repo ships a synthetic three-app dump for exactly this — one
+      The repo ships a synthetic three-app dump for exactly this: one
       clustered Node API, one Bun worker with a declared env block, and one
       one-shot migration script. This is the real output of running
       <code>shep import --dry-run</code> against it.
@@ -188,7 +188,7 @@ cwd = "/srv/migrate"`}</CodeBlock>
       </div>
       <div class="row">
         <span><code>name</code></span>
-        <span><code>name</code> — the grouping key</span>
+        <span><code>name</code>: the grouping key</span>
       </div>
       <div class="row">
         <span><code>pm_cwd</code></span>
@@ -204,7 +204,7 @@ cwd = "/srv/migrate"`}</CodeBlock>
       </div>
       <div class="row">
         <span><code>exec_interpreter</code></span>
-        <span><code>interpreter</code> — absent when it was <code>"none"</code></span>
+        <span><code>interpreter</code>: absent when it was <code>"none"</code></span>
       </div>
       <div class="row">
         <span><code>autorestart</code></span>
@@ -220,11 +220,11 @@ cwd = "/srv/migrate"`}</CodeBlock>
       </div>
       <div class="row">
         <span><code>max_memory_restart</code> (bytes)</span>
-        <span><code>max_memory</code> — enforced against the whole process tree, not just the root pid</span>
+        <span><code>max_memory</code>: enforced against the whole process tree, not just the root pid</span>
       </div>
       <div class="row">
         <span>rows sharing a <code>name</code></span>
-        <span><code>instances</code> — the row count</span>
+        <span><code>instances</code>: the row count</span>
       </div>
       <div class="row">
         <span><code>exec_mode == "cluster_mode"</code></span>
@@ -241,7 +241,7 @@ cwd = "/srv/migrate"`}</CodeBlock>
     <h3>Cluster-mode socket sharing</h3>
     <p>
       pm2's cluster master holds one listen socket and hands connections to
-      its workers. shep has no such master — it binds nothing on any app's
+      its workers. shep has no such master. It binds nothing on any app's
       behalf. Running N instances of an app on one port only works if the
       app arranges the sharing itself, with <code>SO_REUSEPORT</code>
       (Node's <code>reusePort: true</code> listen option, which needs
@@ -251,8 +251,8 @@ cwd = "/srv/migrate"`}</CodeBlock>
     <p>
       <code>shep import</code> sets <code>reuse_port = true</code> on every
       app it found running in pm2 cluster mode and names it on stderr, but
-      setting the Flockfile field is not the same as the app doing the work
-      — if the app was never written to call <code>reusePort: true</code>,
+      setting the Flockfile field is not the same as the app doing the work:
+      if the app was never written to call <code>reusePort: true</code>,
       cluster mode does not work under shep no matter what the Flockfile
       says.
     </p>
@@ -260,7 +260,7 @@ cwd = "/srv/migrate"`}</CodeBlock>
     <h3>An inherited shell environment</h3>
     <p>
       pm2 flattens whatever shell started <code>pm2 start</code> into every
-      app it runs — <code>PATH</code>, <code>JAVA_HOME</code>, whatever else
+      app it runs: <code>PATH</code>, <code>JAVA_HOME</code>, whatever else
       your login session happened to have set. None of that was ever the
       app's own configuration, and a daemon started by systemd or launchd
       has no login shell behind it to reproduce it. <code>shep import</code>
@@ -281,7 +281,7 @@ cwd = "/srv/migrate"`}</CodeBlock>
         Everything else is <strong>named on stderr and left out</strong> of
         the Flockfile. The importer doesn't guess whether a stray
         <code>DATABASE_URL</code> is the app's real configuration or more
-        session noise the closed list doesn't happen to know — you decide
+        session noise the closed list doesn't happen to know. You decide
         where it belongs.
       </li>
     </ul>
@@ -336,13 +336,13 @@ cwd = "/srv/migrate"`}</CodeBlock>
       </li>
       <li>
         <strong>Every symlink under the docroot is refused</strong>, not only
-        one that leaves it, unless you pass <code>--follow-symlinks</code> —
+        one that leaves it, unless you pass <code>--follow-symlinks</code>:
         needed for a deploy layout like{" "}
         <code>current -&gt; releases/2026-08-15</code>.
       </li>
     </ul>
     <p class="fine">
-      There's no <code>PM2_SERVE_*</code> environment compatibility — pass
+      There's no <code>PM2_SERVE_*</code> environment compatibility: pass
       <code>--port</code>, <code>--bind</code>, <code>--spa</code> and
       <code>--auth &lt;file&gt;</code> on the command line instead.
     </p>
@@ -352,7 +352,7 @@ cwd = "/srv/migrate"`}</CodeBlock>
       <code>shep-runtime</code> is the container-entrypoint alias for
       <code>shep runtime</code>: a foreground, no-daemon supervisor that
       reads a Flockfile, boots the flock in-process, and exits once it
-      empties — 0 if every sheep stopped clean, 11 if one ended
+      empties: 0 if every sheep stopped clean, 11 if one ended
       <code>errored</code>, so an orchestrator can tell "finished" from
       "died". At PID 1 it also reaps re-parented zombies and forwards
       signals, which a container that skips this step accumulates until
@@ -362,7 +362,7 @@ cwd = "/srv/migrate"`}</CodeBlock>
     <h2>The runbook</h2>
     <p>
       Import, save, install the boot unit, then reboot and check the flock
-      came back — the sequence <code>docs/specs/shep-v1.md</code> describes
+      came back: the sequence <code>docs/specs/shep-v1.md</code> describes
       as the flagship migration scenario. Step 3 is the only step that
       touches pm2, and the only irreversible one in the list.
     </p>
@@ -380,7 +380,7 @@ cwd = "/srv/migrate"`}</CodeBlock>
     <Callout variant="note">
       Step 8 going <code>active (running)</code> means something specific:
       the generated unit is <code>Type=notify</code>, so systemd doesn't
-      consider it started until the daemon itself says so — and it only
+      consider it started until the daemon itself says so: it only
       sends that signal once step 6's muster restore has finished. A green
       status at step 8 is already evidence the restore path works, before
       the reboot ever happens.
@@ -392,7 +392,7 @@ cwd = "/srv/migrate"`}</CodeBlock>
       <code>startup</code> installed. Run unprivileged, it prints the same
       kind of paste-able <code>sudo</code> command <code>startup</code> does.
       A machine that never ran <code>startup</code> reports the unit
-      <code>absent</code> and exits successfully — nothing left to guess at.
+      <code>absent</code> and exits successfully. Nothing left to guess at.
       Nothing here is destructive to pm2 itself except the one step in the
       runbook that says so.
     </p>
@@ -415,7 +415,7 @@ cwd = "/srv/migrate"`}</CodeBlock>
       <a href="/docs/terminology" class="next-card">
         <div class="next-title">Terminology →</div>
         <div class="next-body">
-          Flock, fold, dog, bark — the words this page uses without
+          Flock, fold, dog, bark: the words this page uses without
           stopping to define them.
         </div>
       </a>

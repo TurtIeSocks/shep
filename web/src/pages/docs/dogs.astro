@@ -22,8 +22,8 @@ import VerbSignature from "../../components/docs/VerbSignature.astro";
     <h1>Dogs</h1>
     <ReferencePills slug="dogs" />
     <p class="lede">
-      A dog is a process the shepherd runs for its own sake, not for yours —
-      it watches the flock instead of being part of it. Two ship inside the
+      A dog is a process the shepherd runs for its own sake, not for yours.
+      It watches the flock instead of being part of it. Two ship inside the
       <code>shep</code> binary: <code>metrics</code>, a Prometheus endpoint,
       and <code>bark</code>, webhook alerts. You can also point
       <code>shep adopt</code> at a binary of your own and the shepherd will
@@ -31,7 +31,7 @@ import VerbSignature from "../../components/docs/VerbSignature.astro";
     </p>
 
     <Callout variant="note">
-      A dog is not the same thing as a sheep with a shepherd channel — see{" "}
+      A dog is not the same thing as a sheep with a shepherd channel: see{" "}
       <a href="/docs/shepherd-channel">the shepherd channel</a> for that.
       A sheep opens fd 3 and talks newline JSON to the daemon that already
       owns it. A dog is a separate client: it connects to
@@ -41,7 +41,7 @@ import VerbSignature from "../../components/docs/VerbSignature.astro";
 
     <h2>What a dog actually is</h2>
     <p>
-      Underneath, a dog is not a second kind of supervised process — it's an
+      Underneath, a dog is not a second kind of supervised process. It's an
       ordinary sheep with a marker on its entry saying where it came from
       (built-in, or adopted). The kill ladder, the backoff curve, the
       restart budget, what <code>Errored</code> means: none of it branches
@@ -51,8 +51,8 @@ import VerbSignature from "../../components/docs/VerbSignature.astro";
       sheep would.
     </p>
     <p>
-      <code>shep flock</code> prints the flock as two tables — sheep, then
-      dogs — and <code>shep dogs</code> prints the second one alone. A
+      <code>shep flock</code> prints the flock as two tables (sheep, then
+      dogs) and <code>shep dogs</code> prints the second one alone. A
       wildcard selector (<code>stop all</code>, <code>reload all</code>,{" "}
       <code>/regex/</code>) never touches a dog; naming one exactly always
       does, which is what lets <code>shep disable bark</code> reach a dog
@@ -64,7 +64,7 @@ import VerbSignature from "../../components/docs/VerbSignature.astro";
       <p>
         Writes <code>shep.toml</code> first, then starts the dog now if a
         shepherd is listening. Run it with nothing listening and it still
-        exits 0 — the config says the dog belongs, and the next shepherd
+        exits 0: the config says the dog belongs, and the next shepherd
         that boots brings it up. Nothing here autostarts a shepherd on your
         behalf; <code>shep muster</code> is the one verb in this CLI that
         does that.
@@ -95,7 +95,7 @@ metrics  built-in  online  39950  0         -    9.8M  1s
 $ shep disable metrics`}</CodeBlock>
     <p class="fine">
       Running <code>enable</code> and <code>adopt</code> at once from a
-      provisioning script is safe — each takes an exclusive lock on{" "}
+      provisioning script is safe: each takes an exclusive lock on{" "}
       <code>shep.toml</code> for its whole read-edit-write, so the second
       waits its turn.
     </p>
@@ -105,20 +105,20 @@ $ shep disable metrics`}</CodeBlock>
       A dog's settings live under <code>[dog.&lt;name&gt;]</code> in{" "}
       <code>shep.toml</code>, and they never travel through the dog's
       environment. Instead the dog connects to the socket and asks for its
-      own section over the wire — the daemon reads the file fresh for every
+      own section over the wire. The daemon reads the file fresh for every
       such request rather than serving a cached copy.
     </p>
     <p>
       An environment variable is readable from the process table, inherited
       by every child the dog spawns, and captured into a crash dump.{" "}
       <code>[dog.bark.sinks]</code> routinely holds a webhook URL, and a
-      webhook URL is a bearer credential — keeping the whole section off the
+      webhook URL is a bearer credential. Keeping the whole section off the
       environment means nobody has to remember which dog's config is
       sensitive.
     </p>
     <Callout variant="careful">
       Editing <code>[dog.&lt;name&gt;]</code> does not reach a dog that's
-      already running — it asked for its section once, at startup, and
+      already running. It asked for its section once, at startup, and
       nothing pushes it a new one. <code>shep disable &lt;name&gt; &amp;&amp;
       shep enable &lt;name&gt;</code> is what re-reads it: a fresh process
       asking a fresh question.
@@ -132,7 +132,7 @@ $ shep disable metrics`}</CodeBlock>
     <CodeBlock label="shep.toml">{`[dog.metrics]
 bind = "127.0.0.1:9615"`}</CodeBlock>
     <p>
-      Nothing accumulates between scrapes — every request rebuilds the
+      Nothing accumulates between scrapes. Every request rebuilds the
       reading from a fresh flock listing and a fresh host sample, verified
       by scraping it directly:
     </p>
@@ -165,7 +165,7 @@ shep_host_memory_total_bytes 51539607552`}</CodeBlock>
     <p class="fine">
       A reference Grafana dashboard built against this exact metric set ships
       in <code>assets/grafana/</code>. The default bind is loopback on
-      purpose — every series above carries a sheep's name as a label, and on
+      purpose. Every series above carries a sheep's name as a label, and on
       plenty of hosts that's the name of an internal service. Widening{" "}
       <code>bind</code> to <code>0.0.0.0</code> is one config line away, but
       metrics won't make that call for you by shipping wide and asking you
@@ -191,7 +191,7 @@ restarts = 5
 within = "2m"
 sinks = ["oncall"]`}</CodeBlock>
     <p>
-      Leave <code>[dog.bark.rules]</code> out and bark doesn't go quiet —
+      Leave <code>[dog.bark.rules]</code> out and bark doesn't go quiet:
       one rule is built in by default, firing on every configured sink
       whenever a sheep reaches <code>Errored</code>. That's the alert that
       must not be missed, so it needs no opt-in. <code>restart_rate</code>{" "}
@@ -203,7 +203,7 @@ sinks = ["oncall"]`}</CodeBlock>
     <Callout variant="careful">
       Verified directly: enable <code>bark</code> with{" "}
       <code>[dog.bark.sinks]</code> absent entirely and it does not run
-      quietly with nowhere to send alerts — the default rule still exists
+      quietly with nowhere to send alerts: the default rule still exists
       with zero sinks to route to, bark logs{" "}
       <code>rule 0 routes to no sink at all</code> on every restart attempt,
       and lands on <code>Errored</code>. A dog needs at least one configured
@@ -211,20 +211,20 @@ sinks = ["oncall"]`}</CodeBlock>
     </Callout>
     <p>
       Every rule debounces <strong>per subject</strong>, five minutes by
-      default, never globally — a global debounce would mean the second
+      default, never globally. A global debounce would mean the second
       sheep to go down during an incident goes silent, which is usually the
       incident's most interesting fact. The bus itself
       (<code>tokio::sync::broadcast</code>) drops what a lagging subscriber
       can't keep up with, so bark also polls the flock's state on a timer
-      (30s by default) and evaluates the same rules against that snapshot —
-      a dropped frame triggers an immediate poll instead of waiting. The two
+      (30s by default) and evaluates the same rules against that snapshot.
+      A dropped frame triggers an immediate poll instead of waiting. The two
       routes share one debounce record per subject, so an{" "}
       <code>Errored</code> seen by both fires once, not twice.
     </p>
     <p class="fine">
       Every fired alert is appended to <code>$SHEP_HOME/barks.jsonl</code>, a
       byte-capped ring (1MiB by default) that evicts the oldest record
-      first — the file <code>shep barks</code> reads. It's written through
+      first: the file <code>shep barks</code> reads. It's written through
       an advisory file lock, never truncated in place, because two different
       processes append to it: the bark dog when a rule fires, and the
       shepherd itself when an enabled dog exhausts its own restart budget.
@@ -233,9 +233,9 @@ sinks = ["oncall"]`}</CodeBlock>
     <h2>Writing your own</h2>
     <VerbSignature verb="adopt" usage="shep adopt <name> <path>">
       <p>
-        Third-party extension. Vets the binary once, at adopt time —
+        Third-party extension. Vets the binary once, at adopt time:
         refusing a path that doesn't exist, isn't a file, has no execute
-        bit, or is world-writable — then actually spawns it with no
+        bit, or is world-writable, then actually spawns it with no
         arguments and kills it immediately, because the only honest way to
         know whether this kernel can exec a file is to ask this kernel.
       </p>
@@ -256,7 +256,7 @@ NAME      SOURCE   SHEPHERD  STATUS
 watchdog  adopted  true      stopped`}</CodeBlock>
     <p>
       What gets recorded in <code>shep.toml</code> is the canonicalized,
-      absolute path — never whatever relative path you typed — because the
+      absolute path (never whatever relative path you typed) because the
       daemon may resolve it again after a reboot from a different working
       directory than the one <code>adopt</code> ran from.
     </p>
@@ -268,13 +268,13 @@ watchdog  adopted  true      stopped`}</CodeBlock>
       <code>Request::DogConfig {"{"} name {"}"}</code> to fetch your own
       section as opaque text. The one variable an adopted dog inherits from
       the shepherd's environment is <code>$SHEP_HOME</code>, which is how it
-      finds that socket in the first place — no <code>[dog.&lt;name&gt;]</code>{" "}
+      finds that socket in the first place: no <code>[dog.&lt;name&gt;]</code>{" "}
       value rides along beside it.
     </p>
     <Callout variant="careful">
       There is no sandbox, and it would be a mistake to assume one. An
       adopted dog runs at the shepherd's own trust level, with no isolation
-      beyond it — the same trust an ordinary sheep in your Flockfile already
+      beyond it: the same trust an ordinary sheep in your Flockfile already
       has. Adopting a dog does not grant anything beyond what any process
       your own config already starts could do.
     </Callout>
@@ -287,7 +287,7 @@ watchdog  adopted  true      stopped`}</CodeBlock>
       even running. That matters for one reason: bark has no webhook code of
       its own for reporting its own death, so if bark is the one that died,
       nothing pages anyone about it over Discord or Slack. What you get
-      instead is a local record — <code>shep barks</code> after the fact —
+      instead is a local record (<code>shep barks</code> after the fact)
       and the metrics dog's <code>shep_dog_up</code> gauge dropping to{" "}
       <code>0</code> for that dog's name.
     </p>
@@ -305,14 +305,14 @@ watchdog  adopted  true      stopped`}</CodeBlock>
       <a href="/docs/shepherd-channel" class="next-card">
         <div class="next-title">The shepherd channel →</div>
         <div class="next-body">
-          The other way something plugs into shep — for your own app, not
+          The other way something plugs into shep: for your own app, not
           for the shepherd's own plugins.
         </div>
       </a>
       <a href="/docs/whistle" class="next-card">
         <div class="next-title">whistle →</div>
         <div class="next-body">
-          The flock over MCP — a third way to reach it, this time for an AI
+          The flock over MCP: a third way to reach it, this time for an AI
           agent.
         </div>
       </a>

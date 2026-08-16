@@ -23,7 +23,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
     <p class="lede">
       Add <code>--format json</code> to any command and it prints one JSON
       object instead of a table, on the same stream it would have used
-      anyway — success on stdout, errors on stderr. Nothing about the
+      anyway: success on stdout, errors on stderr. Nothing about the
       command's behavior changes; only the rendering does.
     </p>
 
@@ -71,7 +71,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
   ]
 }`}</CodeBlock>
     <p>
-      <code>command</code> is the verb you typed, spelled out in full —
+      <code>command</code> is the verb you typed, spelled out in full:
       run it as <code>shep ls --format json</code> and <code>command</code>
       still reads <code>"flock"</code>, because that's what the daemon
       answered to, not the alias that got you there. <code>data</code> is
@@ -82,7 +82,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
 
     <h2>Errors get their own envelope</h2>
     <p>
-      A failed command prints a different, smaller shape to stderr — no
+      A failed command prints a different, smaller shape to stderr, no
       <code>command</code> key, because the command never produced a
       result:
     </p>
@@ -96,7 +96,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
     <p>
       <code>code</code> is the same word that appears in
       <code>error[&lt;code&gt;]: …</code> under the default table format,
-      and it's the same taxonomy as the process exit code — <code>3</code>
+      and it's the same taxonomy as the process exit code: <code>3</code>
       for <code>not_found</code>, <code>4</code> for
       <code>invalid_config</code>, and so on. A script can switch on
       <code>error.code</code> without parsing English, and the exit status
@@ -106,7 +106,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
     <h2>What <code>schema_version</code> promises</h2>
     <p>
       It's at <code>1</code> today, and it moves only for a breaking change
-      to some command's <code>data</code> shape — a field renamed, removed,
+      to some command's <code>data</code> shape: a field renamed, removed,
       or given a different type. Adding a new field to an existing payload
       does <strong>not</strong> bump it: a consumer that reads the keys it
       cares about and ignores the rest survives an additive release
@@ -115,14 +115,14 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
     <ul class="promise-list">
       <li>
         Check <code>schema_version</code> once, up front, rather than per
-        field — it's the one thing that tells you whether the shape you
+        field: it's the one thing that tells you whether the shape you
         coded against still applies.
       </li>
       <li>
         Don't assume every key is present on every row. <code>dog</code>
         is <code>null</code> for a plain sheep. <code>lambs</code> is
-        <code>null</code> from <code>shep flock</code> — the plain listing
-        never walks the process tree — but a populated array (empty if the
+        <code>null</code> from <code>shep flock</code> (the plain listing
+        never walks the process tree) but a populated array (empty if the
         sheep has spawned no children of its own) from both
         <code>shep describe</code> and <code>shep fold</code>, since fold
         renders the same per-sheep detail the table format's Lambs section
@@ -131,7 +131,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       </li>
       <li>
         <code>cpu_percent</code> reads <code>null</code>, not
-        <code>0</code>, when a sample wasn't available yet — a fresh sheep
+        <code>0</code>, when a sample wasn't available yet. A fresh sheep
         a few hundred milliseconds old, most often. Table format prints the
         same case as <code>-</code>, for the same reason: a confident zero
         would be a claim shep can't back up.
@@ -140,7 +140,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
 
     <Callout variant="note">
       <code>shep bleats --format json</code> is the one exception. A log
-      follow has no end, so there's nothing to close an envelope around —
+      follow has no end, so there's nothing to close an envelope around:
       it prints one JSON object per line, newline-delimited, with no
       <code>command</code> or <code>data</code> wrapper.
     </Callout>
@@ -149,8 +149,8 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
     <h2>Table format is not a lesser version of this</h2>
     <p>
       The default <code>--format table</code> and <code>--format json</code>
-      render from the same underlying data — there's no separate code path
-      that could drift between them — but table adds human formatting JSON
+      render from the same underlying data (there's no separate code path
+      that could drift between them) but table adds human formatting JSON
       doesn't: <code>uptime_ms: 1019</code> becomes <code>1s</code>,
       <code>memory_bytes: 1212416</code> becomes <code>1.2M</code>. If
       you're piping shep's output anywhere, reach for

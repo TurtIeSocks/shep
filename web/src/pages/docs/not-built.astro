@@ -12,7 +12,7 @@ import Callout from "../../components/docs/Callout.astro";
 
 <DocsLayout
   title="What's not built yet"
-  description="Windows, entirely, plus a short list of deliberate cuts and open design questions — sourced from docs/specs/deferred.md."
+  description="Windows, entirely, plus a short list of deliberate cuts and open design questions: sourced from docs/specs/deferred.md."
   crumb="Reference / What's not built"
   activeSlug="not-built"
 >
@@ -23,20 +23,20 @@ import Callout from "../../components/docs/Callout.astro";
       shep is feature-complete for v1 on macOS and Linux: every verb in the
       CLI reference, the whistle MCP server, all four lookout panes, dogs,
       serve/dev/runtime, and config and packaging. This page is the honest
-      remainder — one platform, and a short list of smaller cuts, each with
+      remainder: one platform, and a short list of smaller cuts, each with
       the reason it isn't here yet.
     </p>
 
-    <h2>Windows — the whole tier, not partial</h2>
+    <h2>Windows: the whole tier, not partial</h2>
     <p>
       Every command prints <code>shep does not yet support Windows</code> and
-      exits <code>1</code>. This isn't a gap in an otherwise-working port —
+      exits <code>1</code>. This isn't a gap in an otherwise-working port:
       no Windows code path exists to be partial. WSL2 covers the common case
       today.
     </p>
     <Callout variant="careful">
       This was a costed decision, not an indefinite punt. The earlier
-      estimate — "roughly +30-40% on the daemon's process-control layer" —
+      estimate ("roughly +30-40% on the daemon's process-control layer")
       was, in its own words, mostly guesswork. A real survey replaced it on
       2026-08-15: <strong>roughly 36-49 tasks across 4-5 phases, and a
       redesign wearing a port's clothes</strong>, not a port on its own. Rin
@@ -44,7 +44,7 @@ import Callout from "../../components/docs/Callout.astro";
       leaving it last on a list behind a guess.
     </Callout>
     <p>
-      Most of the surface is mechanical — 145 <code>cfg(unix)</code> sites,
+      Most of the surface is mechanical: 145 <code>cfg(unix)</code> sites,
       and un-gating them is close to free, since four whole module trees
       (<code>commands</code>, <code>dog</code>, <code>lookout</code>,
       <code>whistle</code>) turn out to contain no Unix API calls at all. The
@@ -62,13 +62,13 @@ import Callout from "../../components/docs/Callout.astro";
       <li>
         <strong>The shepherd channel can't be fd 3.</strong>
         <code>cmd.exe</code> has no fd-3 redirection, so the channel would
-        need to become a named pipe named by an environment variable instead
-        — the wire format survives, the transport doesn't.
+        need to become a named pipe named by an environment variable instead:
+        the wire format survives, the transport doesn't.
       </li>
       <li>
         <strong><code>user</code>/<code>group</code> would refuse
         permanently.</strong> Dropping privilege on Windows needs a logon
-        session or a primary-token privilege — a different feature, not a
+        session or a primary-token privilege: a different feature, not a
         different call.
       </li>
     </ul>
@@ -84,25 +84,25 @@ import Callout from "../../components/docs/Callout.astro";
     </p>
     <ul>
       <li>
-        <strong>HTTP/SSE transport for whistle</strong> — ships stdio-only
+        <strong>HTTP/SSE transport for whistle.</strong> Ships stdio-only
         first; an AI agent reaches it the way any MCP stdio server is
         reached today.
       </li>
       <li>
         <strong>cgroup v2 enforcement</strong> (<code>enforce =
-        "kernel"</code>) — the polling <code>LimitEnforcer</code> is the v1
+        "kernel"</code>). The polling <code>LimitEnforcer</code> is the v1
         tier; a kernel-enforced ceiling is later work.
       </li>
       <li>
-        <strong>The <code>@shep/io</code> npm shim</strong> — built on
+        <strong>The <code>@shep/io</code> npm shim.</strong> Built on
         demand, not before anyone's asked for it.
       </li>
       <li>
-        <strong>VCS metadata</strong> (the <code>vcs</code> feature) — off by
+        <strong>VCS metadata</strong> (the <code>vcs</code> feature). Off by
         default, not wired into the build.
       </li>
       <li>
-        <strong>A JSON status endpoint</strong> — resolved rather than just
+        <strong>A JSON status endpoint.</strong> Resolved rather than just
         deferred: the metrics dog serves Prometheus exposition text for a
         scraper, which turned out to be an incompatible shape for what would
         have been a hand-fetched dashboard payload. That's a different
@@ -128,8 +128,8 @@ import Callout from "../../components/docs/Callout.astro";
       <li>
         <strong>Lookout's actions, beyond a refusal.</strong> The control
         gate (<code>--allow-control</code>) exists and every action key
-        checks it, but exactly one action key exists — <code>x</code> for
-        stop — and it refuses honestly in both gate states. No action has
+        checks it, but exactly one action key exists (<code>x</code> for
+        stop) and it refuses honestly in both gate states. No action has
         landed behind the gate yet.
       </li>
       <li>
@@ -151,7 +151,7 @@ import Callout from "../../components/docs/Callout.astro";
         <div class="next-title">Lookout →</div>
         <div class="next-body">
           Three of the four "scheduled, not decided against" items live
-          here — see what the dashboard does today, and exactly where it
+          here: see what the dashboard does today, and exactly where it
           stops.
         </div>
       </a>

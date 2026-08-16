@@ -39,15 +39,15 @@ notice[watch_forced]: shep dev: forcing watch on devtest — each app's own \`wa
       swapped in for the container's own kind of disposability.
     </p>
 
-    <h2>shep runtime — the container entrypoint</h2>
+    <h2>shep runtime: the container entrypoint</h2>
     <p>
       <code>shep runtime</code> boots a shepherd in-process, runs one
       Flockfile's flock, and exits once nothing is left online.
-      <code>--no-restore</code> is always on — a container starts fresh from
+      <code>--no-restore</code> is always on. A container starts fresh from
       its Flockfile every time, never from a muster roll left on the image by
       a previous run. Bleats stream to this process's own stdout/stderr, so
       <code>docker logs</code> is the flock's log with no extra plumbing, and
-      the shepherd is still reachable over its own socket the whole time —
+      the shepherd is still reachable over its own socket the whole time:
       <code>shep flock</code> from a second terminal, or
       <code>docker exec</code>, works exactly as it would against a
       daemonized one.
@@ -57,19 +57,19 @@ notice[watch_forced]: shep dev: forcing watch on devtest — each app's own \`wa
       <code>shep-runtime</code> is a separate binary alias for
       <code>shep runtime</code>, built so <code>ENTRYPOINT</code> doesn't need
       to spell the subcommand out. <code>SHEP_HOME</code> is never defaulted
-      for you inside a container — an unset one fails fast naming the flag,
+      for you inside a container. An unset one fails fast naming the flag,
       rather than inventing <code>/var/lib/shep</code> at 2am.
     </p>
 
     <h3>Exit codes an orchestrator can act on</h3>
     <p>
       <code>shep runtime</code> exits <strong>0</strong> once the flock has
-      been empty and clean — every sheep <code>stopped</code>, none
-      <code>errored</code> — for three consecutive two-second polls: a batch
+      been empty and clean (every sheep <code>stopped</code>, none
+      <code>errored</code>) for three consecutive two-second polls: a batch
       job finishing its work. It exits <strong>11</strong>
       (<code>flock_empty</code>) instead when the flock emptied with at least
-      one sheep <code>errored</code> — a restart budget exhausted, or a spawn
-      that never came up — so an orchestrator reading the exit status can
+      one sheep <code>errored</code> (a restart budget exhausted, or a spawn
+      that never came up), so an orchestrator reading the exit status can
       tell "finished" from "died" and restart the container only for the
       second.
     </p>
@@ -78,7 +78,7 @@ notice[watch_forced]: shep dev: forcing watch on devtest — each app's own \`wa
     <p>
       When <code>shep runtime</code> genuinely is PID 1, it splits into a
       small init process first, rather than reaping orphans inside the
-      supervisor's own process — an in-process subreaper loop would race
+      supervisor's own process. An in-process subreaper loop would race
       tokio's own child reaping and corrupt the exact exit statuses shep
       promises elsewhere. The init instead relies on the kernel already
       treating real PID 1 as the implicit subreaper (it never calls
@@ -90,13 +90,13 @@ notice[watch_forced]: shep dev: forcing watch on devtest — each app's own \`wa
       SIGKILLing everything mid-shutdown.
     </p>
 
-    <h2>shep dev — the same shape for a laptop</h2>
+    <h2>shep dev: the same shape for a laptop</h2>
     <p>
       <code>shep dev</code> runs one Flockfile's flock in an isolated,
       throwaway foreground session: <code>$SHEP_DEV_HOME</code> (default
       <code>~/.shep-dev</code>), forced <code>watch = true</code> on every
       app regardless of what the Flockfile says, and a full stop-and-delete
-      teardown the moment the flock empties or the process is signalled —
+      teardown the moment the flock empties or the process is signalled,
       whichever comes first. Either way it leaves nothing running and no
       shepherd behind; a <code>shep dev</code> that leaked a supervisor would
       stop being trusted.
@@ -104,7 +104,7 @@ notice[watch_forced]: shep dev: forcing watch on devtest — each app's own \`wa
     <CodeBlock label="real output, 2026-08-16">{devNotices}</CodeBlock>
     <Callout variant="careful">
       <strong><code>--home</code> and <code>$SHEP_HOME</code> are
-      ignored</strong>, on purpose. Isolation is the whole feature — without
+      ignored</strong>, on purpose. Isolation is the whole feature. Without
       this, an operator who exports <code>$SHEP_HOME</code> for their real
       flock would get a "dev" session that shares it and silently forces
       <code>watch = true</code> onto production apps.
@@ -115,7 +115,7 @@ notice[watch_forced]: shep dev: forcing watch on devtest — each app's own \`wa
       <a href="/docs/serve" class="next-card">
         <div class="next-title">Serve →</div>
         <div class="next-body">
-          The third verb from the same phase — a static file server that
+          The third verb from the same phase: a static file server that
           registers itself as a managed sheep.
         </div>
       </a>
