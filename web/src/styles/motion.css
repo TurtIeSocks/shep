@@ -148,7 +148,6 @@
     transform: scaleX(calc(-1 * var(--face-in, 1)));
   }
 }
-}
 
 /*
  * A lamb's bounce — takes the place of `bob` on the mark wrapper (a lamb
@@ -166,21 +165,86 @@
 }
 
 /*
- * Leg swing for walking sheep: the two leg rects rotate in alternating
- * phase (the second leg runs the same animation offset by half a period —
- * see .anim-trot below). Amplitude is small on purpose: the walk and roam
- * transforms both have standing graze plateaus, and a gentle swing reads
- * as stepping while moving but only as weight-shifting while stood — the
- * alternative, syncing the swing to each rhythm's moving segments, would
- * need a keyframe forest per rhythm for no visible gain at sheep size.
+ * Leg swing for walking sheep, gated by whether the sheep is actually
+ * moving. Two registered custom properties multiply into one static
+ * transform on each leg:
+ *
+ *   rotate( --trot-amp * --trot-phase * 12deg )
+ *
+ * --trot-phase oscillates -1..1 forever on each leg rect (the second leg
+ * runs half a period out of phase), and --trot-amp is animated 0..1 on
+ * the legs' svg group by a GATE animation that shares the wrapper's walk
+ * or roam duration and delay, with keyframes mirroring that rhythm's
+ * moving segments. Standing still means amp 0 — legs hang straight — and
+ * the short ramps ease the swing in and out at each stop, so a sheep
+ * decelerates its stride instead of freezing mid-kick. The properties
+ * must be registered (@property, <number>) or they would not interpolate
+ * at all; browsers without @property support compute an invalid transform
+ * and simply leave the legs static, same as reduced motion.
  */
-@keyframes trot {
+@property --trot-phase {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+
+@property --trot-amp {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
+}
+
+@keyframes trot-swing {
   0%,
   100% {
-    transform: rotate(12deg);
+    --trot-phase: 1;
   }
   50% {
-    transform: rotate(-12deg);
+    --trot-phase: -1;
+  }
+}
+
+/* Moving segments of `walk`: 0-16, 31-47, 50-64, 81-97. */
+@keyframes trot-gate-walk {
+  0%,
+  17%,
+  30%,
+  48%,
+  52%,
+  65%,
+  80%,
+  98%,
+  100% {
+    --trot-amp: 0;
+  }
+  3%,
+  13%,
+  34%,
+  44%,
+  55%,
+  61%,
+  84%,
+  94% {
+    --trot-amp: 1;
+  }
+}
+
+/* Moving segments of `roam` (the visit pattern): 0-14, 46-52, 80-100.
+   0% and 100% both hold 1 — the loop wraps mid-stride offscreen. */
+@keyframes trot-gate-roam {
+  0%,
+  12%,
+  47.5%,
+  50.5%,
+  81%,
+  100% {
+    --trot-amp: 1;
+  }
+  15%,
+  45%,
+  53%,
+  78% {
+    --trot-amp: 0;
   }
 }
 
@@ -237,11 +301,28 @@
     /* fill-box so each rect rotates about its own hip, not the svg origin */
     transform-box: fill-box;
     transform-origin: 50% 12%;
-    animation: trot var(--trot-duration, 0.95s) ease-in-out infinite;
+    transform: rotate(
+      calc(var(--trot-amp, 0) * var(--trot-phase, 0) * 12deg)
+    );
+    animation: trot-swing var(--trot-duration, 0.95s) ease-in-out infinite;
   }
 
   .anim-trot .sheep-leg-b {
     animation-delay: calc(var(--trot-duration, 0.95s) / -2);
+  }
+
+  /* The amplitude gates ride the movement rhythm's own clock: same
+     duration and delay as the wrapper's walk/roam animation, inherited
+     as custom properties, so the gate can never drift out of sync with
+     the feet. */
+  .grazing-sheep .sheep-legs {
+    animation: trot-gate-walk var(--walk-duration, 22s) linear infinite;
+    animation-delay: var(--walk-delay, 0s);
+  }
+
+  .roamer .sheep-legs {
+    animation: trot-gate-roam var(--roam-duration, 110s) linear infinite;
+    animation-delay: var(--roam-delay, 0s);
   }
 }
 
