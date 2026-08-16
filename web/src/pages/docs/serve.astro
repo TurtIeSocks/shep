@@ -1,41 +1,216 @@
 ---
 /*
- * Stub page (docs/shep-design/README.md, "Screens > 2. Docs > Stub pages").
- * Ships as a stub on purpose for this milestone — see StubPanel.astro.
+ * Serve (`shep serve --help`, docs/migration.md §6, docs/specs/deferred.md's
+ * "shep serve, shep dev and shep runtime" entry). HTTP codes below were hit
+ * for real against a running `shep serve --format json` on 2026-08-16 — see
+ * this page's PR for the transcript.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
-import StubPanel from "../../components/docs/StubPanel.astro";
-import { stubMeta } from "../../data/docsNav";
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
+import NotBuilt from "../../components/docs/NotBuilt.astro";
 
-const meta = stubMeta["serve"];
+const followSymlinksNotice = `$ shep serve ./dist --follow-symlinks --format json
+{"schema_version":1,"notice":{"code":"follow_symlinks","message":"shep serve: --follow-symlinks reopens the check-then-open race (TOCTOU) the default per-component walk closes — a symlink under the docroot can now point anywhere this process can read"}}`;
+
+const requestCodes = `$ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/
+200
+$ curl -o /dev/null -w '%{http_code}\\n' 'http://127.0.0.1:8080/..%2f..%2fetc%2fpasswd'
+400
+$ curl -o /dev/null -w '%{http_code}\\n' --path-as-is 'http://127.0.0.1:8080/../../../../etc/passwd'
+400
+$ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/.env
+404
+$ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/link.html
+404`;
 ---
 
 <DocsLayout
-  title={meta.title}
-  description={meta.blurb}
-  crumb={meta.crumb}
+  title="Serve"
+  description="A static file server, hand-rolled and run as a managed sheep. Loopback by default, and every unsafe default is opt-in."
+  crumb="Deploying / Serve"
   activeSlug="serve"
 >
   <article>
-    <h1>{meta.title}</h1>
-    <p class="blurb">{meta.blurb}</p>
-    <StubPanel source={meta.source} />
+    <h1>Serve</h1>
+    <p class="lede">
+      <code>shep serve &lt;dir&gt;</code> registers a sheep whose command line
+      is this same invocation, canonicalized, with <code>--foreground</code>
+      appended — the worker answering every request <em>is</em> the
+      registered sheep, so <code>shep describe</code> shows exactly what
+      restarts if it dies. It's hand-rolled — six small modules over an HTTP
+      layer shared with the metrics dog — not built on axum or tower-http.
+    </p>
+
+    <h2>Try it</h2>
+    <CodeBlock>$ shep serve ./dist --port 8080</CodeBlock>
+    <p class="fine">
+      Add <code>--foreground</code> to run the worker directly in this
+      terminal instead of registering a sheep — same worker either way, just
+      without the supervision.
+    </p>
+
+    <h2>The security posture, checked against real requests</h2>
+    <p>
+      Every default below is the safe one, and every unsafe one is a named
+      flag rather than a config file nobody reads. Binds loopback
+      (<code>127.0.0.1:8080</code>) unless you pass a wider
+      <code>--bind</code>, which prints a stderr notice naming what it just
+      exposed. These four requests were run against a real
+      <code>shep serve</code> process, docroot containing an
+      <code>index.html</code>, a <code>.env</code>, and a symlink:
+    </p>
+    <CodeBlock>{requestCodes}</CodeBlock>
+    <p>
+      Traversal is refused in every encoding it was tried in, not just the
+      literal one. Dotfiles 404 — serving a repo checkout with
+      <code>shep serve .</code> would otherwise publish <code>.env</code> and
+      the whole <code>.git</code> history. And <strong>any</strong> symlink
+      under the docroot 404s by default, not only one that leaves it — an
+      in-docroot link like <code>dist/current -&gt;
+      ../releases/2026-08-15</code> is refused along with everything else,
+      because the leaf open carries <code>O_NOFOLLOW</code> but the
+      component walk ahead of it isn't atomic, and the default per-component
+      walk is what closes that race.
+    </p>
+
+    <Callout variant="careful">
+      <code>--follow-symlinks</code> reopens exactly that race — a
+      canonicalize-then-check that a file created in the docroot between the
+      walk and the open can still slip past. It exists because a real deploy
+      layout needs it (<code>current -&gt; releases/2026-08-15</code> won't
+      serve without it), and the notice fires every time you pass it, on
+      every request in the default mode that gets refused because you
+      didn't:
+    </Callout>
+    <CodeBlock>{followSymlinksNotice}</CodeBlock>
+
+    <h2>The rest of the flags</h2>
+    <p>
+      <code>--listing</code> turns on directory listings for a folder with no
+      <code>index.html</code> — off by default, since a listing publishes
+      every filename under it. <code>--hidden</code> serves dotfiles, mainly
+      for <code>.well-known/acme-challenge</code>. <code>--spa</code> serves
+      <code>index.html</code> for a path that doesn't exist, only for
+      requests that accept HTML, so a missing script still 404s.
+      <code>--auth &lt;file&gt;</code> requires one <code>user:password</code>
+      line, mode <code>0600</code>, on every request — sent as plain HTTP
+      basic auth, base64 rather than encryption, so put a real proxy in front
+      if that matters.
+    </p>
+    <p class="fine">
+      What isn't here: range requests, conditional requests, ETags,
+      compression, keep-alive, TLS, HTTP/2, or any <code>PM2_SERVE_*</code>
+      compatibility <NotBuilt note="range/conditional requests are v1.1 candidates" />.
+      shep reads only <code>SHEP_</code>-prefixed environment variables. The
+      visible cost today is no video seeking and a full re-read per request.
+    </p>
+
+    <h2>Coming from pm2</h2>
+    <p>
+      Three defaults are flipped from pm2's own <code>serve</code>, and each
+      is a regression before it's a fix if you weren't expecting it: listing
+      and dotfiles are pm2's <em>on</em>, shep's <em>off</em>; following an
+      in-docroot symlink is pm2's <em>on</em>, shep's <em>off</em>. All three
+      are one flag away — <code>--listing</code>, <code>--hidden</code>,
+      <code>--follow-symlinks</code> — once you've decided the trade is worth
+      it for your layout.
+    </p>
+
+    <div class="next-grid">
+      <a href="/docs/containers" class="next-card">
+        <div class="next-title">Containers →</div>
+        <div class="next-body">
+          <code>shep runtime</code> and <code>shep dev</code> — the other two
+          verbs that shipped alongside <code>serve</code> in the same phase.
+        </div>
+      </a>
+      <a href="/docs/from-pm2" class="next-card">
+        <div class="next-title">Coming from pm2 →</div>
+        <div class="next-body">
+          The full migration guide, including what doesn't survive the trip
+          from an <code>ecosystem.config.js</code> unchanged.
+        </div>
+      </a>
+    </div>
   </article>
 </DocsLayout>
 
 <style>
   h1 {
-    font-size: clamp(34px, 4.4vw, 52px);
+    font-size: clamp(36px, 4.6vw, 56px);
     line-height: 1;
     letter-spacing: -0.04em;
     margin: 0 0 18px;
   }
 
-  .blurb {
+  h2 {
+    font-size: 29px;
+    letter-spacing: -0.03em;
+    margin: 40px 0 8px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  .lede {
     font-size: 19px;
     line-height: 1.6;
     color: var(--ink-2);
-    margin: 0 0 34px;
-    max-width: 56ch;
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  .fine {
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink-3);
+    margin: -8px 0 30px;
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 8px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
   }
 </style>

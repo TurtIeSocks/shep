@@ -1,41 +1,230 @@
 ---
 /*
- * Stub page (docs/shep-design/README.md, "Screens > 2. Docs > Stub pages").
- * Ships as a stub on purpose for this milestone — see StubPanel.astro.
+ * The KV store (docs/kv.md, `shep set/get/unset --help`). Terminal output
+ * below was run for real against target/release/shep on 2026-08-16 — see
+ * this page's PR for the transcript.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
-import StubPanel from "../../components/docs/StubPanel.astro";
-import { stubMeta } from "../../data/docsNav";
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
 
-const meta = stubMeta["kv"];
+const threeVerbs = `$ shep set bark.cooldown 30s
+$ shep get bark.cooldown
+$ shep get
+$ shep unset bark.cooldown
+$ shep unset --all`;
+
+const realOutput = `$ shep set bark.cooldown 30s
+KEY            VALUE
+bark.cooldown  30s
+
+$ shep set feature.flag on
+$ shep get
+KEY            VALUE
+bark.cooldown  30s
+feature.flag   on
+
+$ shep get nope.key
+error[not_found]: \`nope.key\` is not set
+$ echo $?
+3
+
+$ shep unset bark.cooldown
+REMOVED
+1
+$ shep unset --all
+REMOVED
+1
+$ shep get
+KEY  VALUE`;
 ---
 
 <DocsLayout
-  title={meta.title}
-  description={meta.blurb}
-  crumb={meta.crumb}
+  title="The KV store"
+  description="Three verbs, a file-locked JSON store, and no shepherd required — for the small stuff that has nowhere else to live."
+  crumb="Concepts / The KV store"
   activeSlug="kv"
 >
   <article>
-    <h1>{meta.title}</h1>
-    <p class="blurb">{meta.blurb}</p>
-    <StubPanel source={meta.source} />
+    <h1>The KV store</h1>
+    <p class="lede">
+      Two files already configure everything shep runs: a Flockfile
+      configures a sheep, <code>shep.toml</code> configures the shepherd and
+      its dogs. Neither has a field for "the port the last on-call engineer
+      picked" or a feature flag a provisioning script wants to leave a note
+      about. The KV store is what's left over — a flat, file-locked junk
+      drawer, explicitly not the primary config path.
+    </p>
+
+    <Callout variant="note">
+      Reaching for this to configure a <em>sheep</em>? Put it in the
+      Flockfile. Configuring a <em>dog</em>? Put it under
+      <code>[dog.&lt;name&gt;]</code> in <code>shep.toml</code>. This store is
+      only for what's left after those two.
+    </Callout>
+
+    <h2>The three verbs</h2>
+    <CodeBlock>{threeVerbs}</CodeBlock>
+    <p>
+      <code>shep set &lt;key&gt; &lt;value&gt;</code> writes a key, replacing
+      whatever was there. <code>shep get &lt;key&gt;</code> prints one value;
+      <code>shep get</code> with no key lists everything.
+      <code>shep unset &lt;key&gt;</code> removes one key;
+      <code>shep unset --all</code> empties the store — a flag, not a key
+      named <code>all</code>, because nothing stops you having a key called
+      <code>all</code> and <code>shep unset all</code> would then mean
+      something different depending on your own store.
+    </p>
+
+    <h2>Real output</h2>
+    <p>Run against a fresh <code>$SHEP_HOME</code>, no shepherd listening:</p>
+    <CodeBlock>{realOutput}</CodeBlock>
+    <p class="fine">
+      A key that was never there answers <code>NotFound</code> on both
+      <code>get</code> and <code>unset</code>, exit code 3 either way — a
+      script can write <code>shep get feature.flag || echo default</code> and
+      trust the exit code rather than parsing output to tell "empty" from
+      "missing."
+    </p>
+
+    <h2>The key grammar</h2>
+    <p>
+      A key is <code>[A-Za-z0-9._-]</code>, one to 128 bytes, and can't start
+      with a dot. <strong>A dot is part of a name, not a path</strong> —
+      <code>bark.cooldown</code> is one flat key, not a nested object, and
+      <code>shep get bark</code> won't find it. This is a deliberate
+      departure from pm2's own dotted/colon store: a nesting grammar here
+      would be a second config language, with its own quoting rules, for a
+      store that's explicitly not the primary one. The narrow alphabet is
+      also why <code>shep get $key</code> never needs quoting in a script. A
+      value is a string, capped at 4&nbsp;KiB — the store is read whole on
+      every access, and the cap is what keeps <code>kv.json</code> from
+      quietly becoming a blob store.
+    </p>
+
+    <h2>No shepherd required</h2>
+    <p>
+      <code>shep set</code>/<code>get</code>/<code>unset</code> never touch
+      the socket — they read and write <code>$SHEP_HOME/kv.json</code>
+      directly, the same way <code>shep enable</code> writes
+      <code>shep.toml</code> with nothing listening. That's what makes this
+      store usable during provisioning, before any shepherd has ever booted
+      on the machine. A dog reads the same store through
+      <code>shep_core::kv</code> rather than over the wire — a
+      <code>0600</code> file inside a <code>0700</code>
+      <code>$SHEP_HOME</code>, opened by a process running as the same user,
+      already has every property a socket round trip would have bought it.
+    </p>
+
+    <h2>Concurrent writers lose nothing</h2>
+    <p>
+      Two <code>shep set</code> invocations racing — two provisioning
+      scripts, or an operator and a dog — are serialized by an exclusive
+      advisory lock on a sibling <code>kv.json.lock</code>. Whichever loses
+      the race simply waits its turn; neither write is silently dropped. The
+      file itself is written through a <code>BTreeMap</code>, so keys are
+      always in sorted order and two writes of the same content produce
+      byte-identical files — safe to keep in a dotfiles repository,
+      <code>git add</code> and diff like any other small config file. Mode is
+      <code>0600</code>.
+    </p>
+
+    <div class="next-grid">
+      <a href="/docs/lookout" class="next-card">
+        <div class="next-title">Lookout →</div>
+        <div class="next-body">
+          <code>lookout.allow_control</code> is a KV key — set it with
+          <code>shep set</code> instead of the <code>--allow-control</code>
+          flag if you'd rather it stick.
+        </div>
+      </a>
+      <a href="/docs/dogs" class="next-card">
+        <div class="next-title">Dogs →</div>
+        <div class="next-body">
+          Per-dog settings live under <code>[dog.&lt;name&gt;]</code> in
+          <code>shep.toml</code>, not here — this page explains where the
+          line falls.
+        </div>
+      </a>
+    </div>
   </article>
 </DocsLayout>
 
 <style>
   h1 {
-    font-size: clamp(34px, 4.4vw, 52px);
+    font-size: clamp(36px, 4.6vw, 56px);
     line-height: 1;
     letter-spacing: -0.04em;
     margin: 0 0 18px;
   }
 
-  .blurb {
+  h2 {
+    font-size: 29px;
+    letter-spacing: -0.03em;
+    margin: 40px 0 8px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  .lede {
     font-size: 19px;
     line-height: 1.6;
     color: var(--ink-2);
-    margin: 0 0 34px;
-    max-width: 56ch;
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  .fine {
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink-3);
+    margin: -8px 0 30px;
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 8px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
   }
 </style>

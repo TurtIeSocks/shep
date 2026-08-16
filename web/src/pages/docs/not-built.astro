@@ -1,41 +1,265 @@
 ---
 /*
- * Stub page (docs/shep-design/README.md, "Screens > 2. Docs > Stub pages").
- * Ships as a stub on purpose for this milestone — see StubPanel.astro.
+ * What's not built (docs/specs/deferred.md, docs/specs/windows-estimate.md).
+ * deferred.md is the single list this page ports from — re-check this page
+ * whenever that file changes. As of the 2026-08-12 spec↔implementation
+ * audit plus the 2026-08-15 Windows ruling.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
-import StubPanel from "../../components/docs/StubPanel.astro";
-import { stubMeta } from "../../data/docsNav";
-
-const meta = stubMeta["not-built"];
+import Callout from "../../components/docs/Callout.astro";
 ---
 
 <DocsLayout
-  title={meta.title}
-  description={meta.blurb}
-  crumb={meta.crumb}
+  title="What's not built yet"
+  description="Windows, entirely, plus a short list of deliberate cuts and open design questions — sourced from docs/specs/deferred.md."
+  crumb="Reference / What's not built"
   activeSlug="not-built"
 >
   <article>
-    <h1>{meta.title}</h1>
-    <p class="blurb">{meta.blurb}</p>
-    <StubPanel source={meta.source} />
+    <h1>What's not built yet</h1>
+    <p class="lede">
+      shep is feature-complete for v1 on macOS and Linux: every verb in the
+      CLI reference, the whistle MCP server, all four lookout panes, dogs,
+      serve/dev/runtime, and config and packaging. This page is the honest
+      remainder — one platform, and a short list of smaller cuts, each with
+      the reason it isn't here yet.
+    </p>
+
+    <h2>Windows — the whole tier, not partial</h2>
+    <p>
+      Every command prints <code>shep does not yet support Windows</code> and
+      exits <code>1</code>. This isn't a gap in an otherwise-working port —
+      no Windows code path exists to be partial. WSL2 covers the common case
+      today.
+    </p>
+    <Callout variant="careful">
+      This was a costed decision, not an indefinite punt. The earlier
+      estimate — "roughly +30-40% on the daemon's process-control layer" —
+      was, in its own words, mostly guesswork. A real survey replaced it on
+      2026-08-15: <strong>roughly 36-49 tasks across 4-5 phases, and a
+      redesign wearing a port's clothes</strong>, not a port on its own. Rin
+      ruled Windows out of v1 once that number existed to act on, rather than
+      leaving it last on a list behind a guess.
+    </Callout>
+    <p>
+      Most of the surface is mechanical — 145 <code>cfg(unix)</code> sites,
+      and un-gating them is close to free, since four whole module trees
+      (<code>commands</code>, <code>dog</code>, <code>lookout</code>,
+      <code>whistle</code>) turn out to contain no Unix API calls at all. The
+      cost concentrates in a handful of places where the
+      <strong>behaviour</strong>, not just the API, has no Windows analogue:
+    </p>
+    <ul>
+      <li>
+        <strong>Graceful stop has no equivalent.</strong>
+        <code>CTRL_BREAK_EVENT</code> reaches only console apps carrying
+        their own handler, so <code>shep stop</code> would degrade to
+        <code>shep kill</code> for anything that didn't opt into the
+        shepherd channel.
+      </li>
+      <li>
+        <strong>The shepherd channel can't be fd 3.</strong>
+        <code>cmd.exe</code> has no fd-3 redirection, so the channel would
+        need to become a named pipe named by an environment variable instead
+        — the wire format survives, the transport doesn't.
+      </li>
+      <li>
+        <strong><code>user</code>/<code>group</code> would refuse
+        permanently.</strong> Dropping privilege on Windows needs a logon
+        session or a primary-token privilege — a different feature, not a
+        different call.
+      </li>
+    </ul>
+    <p class="fine">
+      Also on the table and not yet decided: whether permanent non-support is
+      the right long-term answer. A tier isn't built once, it's maintained
+      forever on a platform nobody on this project runs day to day.
+    </p>
+
+    <h2>Five smaller cuts, argued for rather than just missing</h2>
+    <p>
+      Spec §2 names these as deliberate v1.1+ scope, not oversights:
+    </p>
+    <ul>
+      <li>
+        <strong>HTTP/SSE transport for whistle</strong> — ships stdio-only
+        first; an AI agent reaches it the way any MCP stdio server is
+        reached today.
+      </li>
+      <li>
+        <strong>cgroup v2 enforcement</strong> (<code>enforce =
+        "kernel"</code>) — the polling <code>LimitEnforcer</code> is the v1
+        tier; a kernel-enforced ceiling is later work.
+      </li>
+      <li>
+        <strong>The <code>@shep/io</code> npm shim</strong> — built on
+        demand, not before anyone's asked for it.
+      </li>
+      <li>
+        <strong>VCS metadata</strong> (the <code>vcs</code> feature) — off by
+        default, not wired into the build.
+      </li>
+      <li>
+        <strong>A JSON status endpoint</strong> — resolved rather than just
+        deferred: the metrics dog serves Prometheus exposition text for a
+        scraper, which turned out to be an incompatible shape for what would
+        have been a hand-fetched dashboard payload. That's a different
+        feature, not a narrower version of this one, so it stays its own
+        open item rather than folding into the dog.
+      </li>
+    </ul>
+
+    <h2>Scheduled, not decided against</h2>
+    <p>
+      These are named as v1.0 scope in the spec and simply haven't reached
+      the front of the queue:
+    </p>
+    <ul>
+      <li>
+        <strong>Lookout's search and filter.</strong> Excluded explicitly
+        from the phase that shipped the other three panes ("no filtering UI,
+        no elaborate layout"), and it still carries an open design question:
+        whether a filter line takes the CLI's own selector grammar or plain
+        substring matching. That call is Rin's, which is why the item stays
+        open rather than half-built either way.
+      </li>
+      <li>
+        <strong>Lookout's actions, beyond a refusal.</strong> The control
+        gate (<code>--allow-control</code>) exists and every action key
+        checks it, but exactly one action key exists — <code>x</code> for
+        stop — and it refuses honestly in both gate states. No action has
+        landed behind the gate yet.
+      </li>
+      <li>
+        <strong>Lambs in lookout's detail pane.</strong> Showing them needs
+        <code>Describe</code>'s process-table walk, and polling that per
+        selection on a two-second timer was a cost the phase that shipped the
+        detail pane declined to add.
+      </li>
+      <li>
+        <strong>OTLP export for the metrics dog.</strong> The dog serves
+        Prometheus exposition only today; no <code>otel</code> cargo feature
+        exists yet.
+      </li>
+    </ul>
+
+    <div class="next-grid">
+      <a href="/docs/lookout" class="next-card">
+        <div class="next-title">Lookout →</div>
+        <div class="next-body">
+          Three of the four "scheduled, not decided against" items live
+          here — see what the dashboard does today, and exactly where it
+          stops.
+        </div>
+      </a>
+      <a href="/docs/from-pm2" class="next-card">
+        <div class="next-title">Coming from pm2 →</div>
+        <div class="next-body">
+          On Windows today? The migration guide's env rule and runbook still
+          apply once WSL2 is the host.
+        </div>
+      </a>
+    </div>
   </article>
 </DocsLayout>
 
 <style>
   h1 {
-    font-size: clamp(34px, 4.4vw, 52px);
+    font-size: clamp(36px, 4.6vw, 56px);
     line-height: 1;
     letter-spacing: -0.04em;
     margin: 0 0 18px;
   }
 
-  .blurb {
+  h2 {
+    font-size: 29px;
+    letter-spacing: -0.03em;
+    margin: 40px 0 8px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  .lede {
     font-size: 19px;
     line-height: 1.6;
     color: var(--ink-2);
-    margin: 0 0 34px;
-    max-width: 56ch;
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  .fine {
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink-3);
+    margin: -8px 0 30px;
+  }
+
+  ul {
+    margin: 0 0 24px;
+    padding: 0;
+    list-style: none;
+    display: grid;
+    gap: 12px;
+  }
+
+  li {
+    background: var(--paper-2);
+    border: 2.5px solid var(--hair);
+    border-radius: 14px;
+    padding: 16px 18px;
+    font-size: 15.5px;
+    line-height: 1.6;
+    color: var(--ink-2);
+  }
+
+  li strong {
+    color: var(--ink);
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 8px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
   }
 </style>

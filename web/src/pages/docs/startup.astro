@@ -1,41 +1,228 @@
 ---
 /*
- * Stub page (docs/shep-design/README.md, "Screens > 2. Docs > Stub pages").
- * Ships as a stub on purpose for this milestone — see StubPanel.astro.
+ * Surviving reboots (`shep startup --help`, `shep unstartup --help`,
+ * docs/migration.md §§3-5,8, docs/specs/deferred.md's "shep startup /
+ * shep unstartup" entry). The `error[failure]`/`removed absent` lines below
+ * came from real `shep startup`/`unstartup` runs, unprivileged, on
+ * 2026-08-16.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
-import StubPanel from "../../components/docs/StubPanel.astro";
-import { stubMeta } from "../../data/docsNav";
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
 
-const meta = stubMeta["startup"];
+const realOutput = `$ shep startup
+error[failure]: installing the unit needs root; run: sudo /Users/rin/GitHub/pm2-rs/target/release/shep startup --user rin --home /tmp/shep_startup_demo
+
+$ shep unstartup
+ACTION   TARGET                                                       RESULT
+removed  /Library/LaunchDaemons/io.github.turtiesocks.shep.rin.plist  absent`;
+
+const runbook = `1.  shep import --dry-run           # read the Flockfile before it's written
+2.  shep import                     # writes ./Flockfile.toml; starts nothing
+3.  pm2 delete all && pm2 kill      # the one destructive step, and it's pm2's
+4.  shep start ./Flockfile.toml     # the flock comes up under shep
+5.  shep flock                      # every app online, CPU and MEM populated
+6.  shep save                       # names the roll it wrote and the app count
+7.  sudo shep startup --user <you>  # writes and enables the unit
+8.  systemctl status shep-<you>     # active (running), and green
+9.  reboot
+10. systemctl status shep-<you>     # active (running) WITHOUT anyone logging in
+11. shep flock                      # the same apps, new pids, uptime near zero`;
 ---
 
 <DocsLayout
-  title={meta.title}
-  description={meta.blurb}
-  crumb={meta.crumb}
+  title="Surviving reboots"
+  description="shep startup installs the init unit that brings the shepherd, and the flock it last saved, back after a reboot."
+  crumb="Deploying / Surviving reboots"
   activeSlug="startup"
 >
   <article>
-    <h1>{meta.title}</h1>
-    <p class="blurb">{meta.blurb}</p>
-    <StubPanel source={meta.source} />
+    <h1>Surviving reboots</h1>
+    <p class="lede">
+      <code>shep startup</code> writes an init unit for the target user —
+      systemd, launchd, openrc, or a BSD <code>rc.d</code> script — picked
+      automatically for the running host or named explicitly with
+      <code>--init</code>. <code>shep unstartup</code> takes it back out.
+      Neither talks to a running shepherd; both write and remove a single
+      unit file.
+    </p>
+
+    <h2>Never escalates its own privilege</h2>
+    <p>
+      Installing a unit needs root. shep never asks for it — without root it
+      prints the exact command to run and exits non-zero, so a script
+      notices instead of silently doing nothing:
+    </p>
+    <CodeBlock label="real output, unprivileged, macOS">{realOutput}</CodeBlock>
+    <p class="fine">
+      A unit that was never installed reports <code>absent</code> rather than
+      failing — there's nothing left to guess at, on either verb. Under
+      <code>sudo</code>, the unit is built for <code>$SUDO_USER</code> rather
+      than root, so it supervises the flock the operator actually has.
+    </p>
+
+    <h2>The PATH capture, and its one trap</h2>
+    <p>
+      A daemon started by systemd or launchd has no login shell and no
+      <code>.bashrc</code>/<code>.profile</code> behind it — without help,
+      <code>PATH</code> at boot would be whatever minimal default the init
+      system starts with, and any app whose interpreter lives outside
+      <code>/usr/bin</code>/<code>/bin</code> would fail to spawn on the very
+      first boot after migration, silently, until someone reboots the box
+      again to find out why. <code>shep startup</code> captures the
+      <code>PATH</code> of the shell that ran it directly into the unit
+      (<code>Environment="PATH=..."</code> on systemd, the plist's
+      <code>EnvironmentVariables</code> on launchd) — the mechanism that
+      makes an interpreter installed under <code>~/.bun/bin</code> or
+      <code>~/.cargo/bin</code> findable after a reboot.
+    </p>
+    <Callout variant="careful">
+      <code>sudo</code> on most distributions replaces <code>PATH</code> with
+      its own <code>secure_path</code> before your command ever runs — often
+      dropping the exact <code>~/.bun</code> or <code>~/.cargo</code> entry
+      the capture above exists to preserve. shep can't tell a sanitized
+      <code>PATH</code> from an untouched one after the fact, but it knows
+      when it's running under <code>sudo</code> and warns at install time,
+      naming the <code>PATH</code> about to go into the unit. If it's
+      missing something, rerun as <code>sudo --preserve-env=PATH shep
+      startup ...</code> instead (after <code>shep unstartup</code>, since
+      <code>startup</code> refuses to overwrite the unit it just wrote).
+    </Callout>
+
+    <h2>The runbook</h2>
+    <p>
+      This is the full sequence a migration from pm2 walks through — import,
+      start, save, install, reboot, verify — end to end on a Linux box:
+    </p>
+    <CodeBlock>{runbook}</CodeBlock>
+    <p>
+      Step 8's <code>active (running)</code> means something specific: the
+      generated unit is <code>Type=notify</code>, so systemd doesn't consider
+      it started until the daemon itself says so — and it sends that signal
+      only once the muster restore from step 6's roll has finished, not the
+      moment the process execs. A green status at step 8 is already evidence
+      the restore path works, before the reboot ever happens.
+    </p>
+
+    <h2>Honestly: openrc and the BSDs are untested</h2>
+    <p>
+      All four unit renderers — systemd, launchd, openrc, FreeBSD/OpenBSD
+      <code>rc.d</code> — are pinned by exact-string tests, the same tier the
+      systemd unit has always had, since it too has only ever been
+      <em>rendered</em>, on a Mac. That's a real and adequate tier for text.
+      It is not a claim that the openrc or BSD scripts work: no FreeBSD,
+      OpenBSD, or openrc host exists on this project's own machines, and
+      nobody has run them on their own init system. Nothing in these docs
+      claims otherwise until someone reports back from a host that actually
+      runs one.
+    </p>
+    <p>
+      One functional difference is already known, not just untested: openrc
+      has no <code>sd_notify</code> analogue, so its script's
+      <code>start_post()</code> polls the shepherd's own control socket
+      instead and blocks the "started" verdict until the first request is
+      answered — the same milestone <code>READY=1</code> proves on systemd,
+      one step later. FreeBSD gets the same poll through
+      <code>start_postcmd</code>. OpenBSD's <code>rc.subr</code> has no
+      documented post-start hook at all; its script reports started as soon
+      as the process is spawned and says so in its own header comment,
+      naming <code>shep flock</code> as the real check.
+    </p>
+
+    <div class="next-grid">
+      <a href="/docs/from-pm2" class="next-card">
+        <div class="next-title">Coming from pm2 →</div>
+        <div class="next-body">
+          The runbook above is the tail end of this guide — start there for
+          the import step and the env rule that precedes it.
+        </div>
+      </a>
+      <a href="/docs/containers" class="next-card">
+        <div class="next-title">Containers →</div>
+        <div class="next-body">
+          Not a bare-metal reboot? <code>shep runtime</code> is the container
+          equivalent — no unit to install at all.
+        </div>
+      </a>
+    </div>
   </article>
 </DocsLayout>
 
 <style>
   h1 {
-    font-size: clamp(34px, 4.4vw, 52px);
+    font-size: clamp(36px, 4.6vw, 56px);
     line-height: 1;
     letter-spacing: -0.04em;
     margin: 0 0 18px;
   }
 
-  .blurb {
+  h2 {
+    font-size: 29px;
+    letter-spacing: -0.03em;
+    margin: 40px 0 8px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  .lede {
     font-size: 19px;
     line-height: 1.6;
     color: var(--ink-2);
-    margin: 0 0 34px;
-    max-width: 56ch;
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  .fine {
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink-3);
+    margin: -8px 0 30px;
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 8px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
   }
 </style>
