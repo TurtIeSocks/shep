@@ -322,6 +322,16 @@ const grazing = [
     inset: 0;
     left: var(--col-right);
     z-index: 1;
+    /* Clouds are placed by percentage inside this lane but carry a fixed
+       pixel width, so at narrow widths one can reach past the lane's right
+       edge and give the document real horizontal scroll. Clip here rather
+       than on `.stage`: `.stage` also contains `.pasture`, and any overflow
+       value other than `visible` makes an ancestor a scroll container, which
+       silently disables `position: sticky` for its descendants. That is the
+       exact bug that flattened the whole scroll effect once already.
+       `.clouds` and `.pasture` are siblings, so clipping stops here. A cloud
+       cut off at the edge reads as one drifting out of the sky. */
+    overflow: hidden;
   }
 
   .cloud {
