@@ -766,7 +766,10 @@ const grazing = [
    */
   .depth-far {
     z-index: 1;
-    filter: saturate(0.58) brightness(1.07) opacity(0.85);
+    /* Desaturate and lift only — no opacity() term: translucent animals
+       read as ghosts (the fence showed straight through the black sheep),
+       and atmospheric distance comes through the contrast drop alone. */
+    filter: saturate(0.58) brightness(1.07);
   }
 
   .depth-far :global(.sheep-mark) {
@@ -828,7 +831,10 @@ const grazing = [
 
   .roamer-far {
     z-index: 1;
-    filter: saturate(0.58) brightness(1.07) opacity(0.85);
+    /* Desaturate and lift only — no opacity() term: translucent animals
+       read as ghosts (the fence showed straight through the black sheep),
+       and atmospheric distance comes through the contrast drop alone. */
+    filter: saturate(0.58) brightness(1.07);
   }
 
   .roamer-mid :global(.sheep-mark) {
