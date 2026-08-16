@@ -2,11 +2,12 @@
 /*
  * Docs sticky header (docs/shep-design/README.md, "Screens > 2. Docs >
  * Header"). Logo lockup back to the landing page, a "docs · pre-release"
- * pill, Home / Design language text links, the icon theme toggle, and an
+ * pill, a Home text link, the search trigger, the icon theme toggle, and an
  * ink GitHub button with a meadow shadow.
  */
 import Sheep from "../marks/Sheep.astro";
 import ThemeToggle from "../ThemeToggle.astro";
+import DocsSearch from "./DocsSearch.astro";
 ---
 
 <header class="docs-header">
@@ -20,7 +21,7 @@ import ThemeToggle from "../ThemeToggle.astro";
     </div>
     <div class="links">
       <a href="/" class="text-link">Home</a>
-      <a href="/design-language" class="text-link">Design language</a>
+      <DocsSearch />
       <ThemeToggle variant="icon" />
       <a
         href="https://github.com/TurtIeSocks/shep"

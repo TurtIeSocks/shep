@@ -1,0 +1,427 @@
+---
+/*
+ * Docs search trigger + dialog, backed by Pagefind
+ * (https://pagefind.app). `npm run build` runs `pagefind --site dist`
+ * after `astro build`, which reads every `<main data-pagefind-body>`
+ * (DocsLayout.astro) and writes the index + this component's runtime to
+ * `dist/pagefind/`. That directory does not exist under `astro dev` — the
+ * dynamic import below is wrapped in a try/catch for exactly that case, so
+ * search degrades to "index unavailable" locally instead of throwing.
+ *
+ * This wires Pagefind's low-level JS API by hand rather than pulling in
+ * `@pagefind/default-ui` — the default widget ships its own CSS that would
+ * fight tokens.css, and this site's palette/press-state/type scale is
+ * small enough to match directly. A native <dialog> gives focus trapping,
+ * Escape-to-close and a backdrop for free, so none of that is hand-rolled
+ * either.
+ *
+ * Result titles come from Pagefind's own default: the first <h1> on the
+ * page. Every /docs/* article already opens on one, so no
+ * `data-pagefind-meta="title"` is needed anywhere.
+ */
+---
+
+<button
+  type="button"
+  class="search-trigger press"
+  id="docs-search-trigger"
+  style="--shadow-offset:2px; --press-offset:1px;"
+  aria-haspopup="dialog"
+>
+  <svg width="15" height="15" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+    <circle cx="8.5" cy="8.5" r="6" stroke="currentColor" stroke-width="2" />
+    <path d="M13.3 13.3 18 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+  </svg>
+  <span class="trigger-label">Search</span>
+  <kbd class="trigger-key">/</kbd>
+</button>
+
+<dialog id="docs-search-dialog" class="search-dialog" aria-label="Search the docs">
+  <div class="search-field">
+    <svg width="17" height="17" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <circle cx="8.5" cy="8.5" r="6" stroke="currentColor" stroke-width="2" />
+      <path d="M13.3 13.3 18 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+    </svg>
+    <input
+      type="search"
+      id="docs-search-input"
+      placeholder="Search the docs…"
+      autocomplete="off"
+      spellcheck="false"
+      aria-label="Search the docs"
+    />
+    <kbd class="esc-key">esc</kbd>
+  </div>
+  <p id="docs-search-status" class="search-status" role="status"></p>
+  <ul id="docs-search-results" class="search-results"></ul>
+</dialog>
+
+<style>
+  .search-trigger {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-family: "Space Grotesk", sans-serif;
+    font-size: 14px;
+    font-weight: 500;
+    background: var(--paper-2);
+    color: var(--ink-2);
+    border: 2px solid var(--line);
+    border-radius: 999px;
+    padding: 7px 12px 7px 11px;
+    cursor: pointer;
+  }
+
+  .search-trigger:hover {
+    color: var(--ink);
+  }
+
+  .trigger-key {
+    font-family: "Space Mono", monospace;
+    font-size: 11px;
+    background: var(--paper);
+    border: 1.5px solid var(--hair);
+    border-radius: 5px;
+    padding: 1px 6px;
+    color: var(--ink-3);
+  }
+
+  /* Closed by default — a bare `dialog { display: flex }` would beat the
+     UA stylesheet's `dialog:not([open]) { display: none }`, since author
+     rules always outrank user-agent rules regardless of specificity, and
+     leave the dialog visible (and laid out inline) before it's ever
+     opened. Scoping the flex layout to `[open]` keeps `showModal()` the
+     only thing that shows it. */
+  .search-dialog {
+    width: min(560px, calc(100vw - 48px));
+    max-height: min(70vh, 560px);
+    margin: 10vh auto auto;
+    padding: 0;
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    background: var(--paper);
+    color: var(--ink);
+    box-shadow: 8px 8px 0 var(--shadow);
+    overflow: hidden;
+  }
+
+  .search-dialog[open] {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .search-dialog::backdrop {
+    background: rgba(23, 37, 28, 0.5);
+  }
+
+  .search-field {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px 18px;
+    border-bottom: 2px solid var(--hair);
+    color: var(--ink-3);
+    flex: none;
+  }
+
+  .search-field input {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    outline: none;
+    background: transparent;
+    color: var(--ink);
+    font-family: "Space Grotesk", sans-serif;
+    font-size: 16px;
+  }
+
+  .search-field input::placeholder {
+    color: var(--ink-3);
+  }
+
+  .esc-key {
+    font-family: "Space Mono", monospace;
+    font-size: 11px;
+    background: var(--paper-2);
+    border: 1.5px solid var(--hair);
+    border-radius: 5px;
+    padding: 2px 6px;
+    color: var(--ink-3);
+    flex: none;
+  }
+
+  .search-status {
+    margin: 0;
+    padding: 10px 18px 0;
+    font-family: "Space Mono", monospace;
+    font-size: 12px;
+    color: var(--ink-3);
+    flex: none;
+  }
+
+  .search-status:empty {
+    display: none;
+  }
+
+  .search-results {
+    list-style: none;
+    margin: 0;
+    padding: 8px;
+    overflow-y: auto;
+  }
+
+  .search-results:empty {
+    display: none;
+  }
+
+  /*
+   * :global() below is load-bearing, not stylistic: everything from here
+   * down (li, a, .result-title, .result-excerpt, the <mark> Pagefind
+   * injects into the excerpt) is created by document.createElement in the
+   * script at the bottom of this file, at runtime, after the build already
+   * finished handing out Astro's scoping attribute. A plain scoped
+   * `.search-results a {}` compiles to `.search-results a[data-astro-cid-…]`
+   * and silently matches nothing, since none of these elements carry that
+   * attribute — confirmed by building and searching, not just reading the
+   * CSS.
+   */
+  .search-results :global(li + li) {
+    margin-top: 4px;
+  }
+
+  .search-results :global(a) {
+    display: block;
+    padding: 10px 12px;
+    border-radius: 12px;
+    text-decoration: none;
+    color: var(--ink);
+  }
+
+  .search-results :global(a:hover),
+  .search-results :global(a:focus-visible) {
+    background: var(--butter);
+    color: var(--ink);
+  }
+
+  .search-results :global(.result-title) {
+    display: block;
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 700;
+    font-size: 15px;
+    margin-bottom: 3px;
+  }
+
+  .search-results :global(.result-excerpt) {
+    display: block;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+
+  .search-results :global(mark) {
+    background: var(--butter);
+    color: var(--ink);
+    border-radius: 3px;
+    padding: 0 1px;
+  }
+
+  @media (max-width: 520px) {
+    .trigger-label,
+    .trigger-key {
+      display: none;
+    }
+
+    .search-trigger {
+      padding: 8px;
+    }
+
+    .search-dialog {
+      margin-top: 6vh;
+    }
+  }
+</style>
+
+<script>
+  type PagefindModule = {
+    init: () => void | Promise<void>;
+    debouncedSearch: (
+      term: string,
+    ) => Promise<{ results: PagefindResultRef[] } | null>;
+  };
+
+  type PagefindResultRef = {
+    data: () => Promise<{
+      url: string;
+      excerpt: string;
+      meta: { title?: string };
+    }>;
+  };
+
+  // Vite still wraps a bare `import(/* @vite-ignore */ url)` in its
+  // `__vitePreload` modulepreload helper even with the ignore comment —
+  // the comment only skips specifier *rewriting*, not the wrapping — and
+  // that helper references a `__VITE_PRELOAD__` deps-list constant it never
+  // gets to inline for a specifier it can't statically analyze, throwing
+  // `ReferenceError: __VITE_PRELOAD__ is not defined` the instant this
+  // runs. Building the import call inside `new Function` hides it from
+  // Vite's import-analysis transform entirely, since there's no literal
+  // `import(...)` in this file's own source for it to find.
+  const dynamicImport = new Function(
+    "specifier",
+    "return import(specifier)",
+  ) as (specifier: string) => Promise<PagefindModule>;
+
+  let pagefindPromise: Promise<PagefindModule | null> | undefined;
+
+  function loadPagefind(): Promise<PagefindModule | null> {
+    if (!pagefindPromise) {
+      pagefindPromise = dynamicImport("/pagefind/pagefind.js")
+        .then(async (mod) => {
+          await mod.init();
+          return mod;
+        })
+        .catch(() => null);
+    }
+    return pagefindPromise;
+  }
+
+  const trigger = document.getElementById(
+    "docs-search-trigger",
+  ) as HTMLButtonElement | null;
+  const dialog = document.getElementById(
+    "docs-search-dialog",
+  ) as HTMLDialogElement | null;
+  const input = document.getElementById(
+    "docs-search-input",
+  ) as HTMLInputElement | null;
+  const results = document.getElementById(
+    "docs-search-results",
+  ) as HTMLUListElement | null;
+  const status = document.getElementById(
+    "docs-search-status",
+  ) as HTMLParagraphElement | null;
+
+  function openSearch() {
+    if (!dialog || dialog.open) return;
+    dialog.showModal();
+    loadPagefind();
+    input?.focus();
+  }
+
+  function closeSearch() {
+    dialog?.close();
+  }
+
+  function renderResults(
+    items: { url: string; excerpt: string; meta: { title?: string } }[],
+  ) {
+    if (!results) return;
+    results.replaceChildren();
+    for (const item of items) {
+      const li = document.createElement("li");
+      const a = document.createElement("a");
+      a.href = item.url;
+
+      const titleEl = document.createElement("span");
+      titleEl.className = "result-title";
+      titleEl.textContent = item.meta.title || item.url;
+
+      // item.excerpt is Pagefind-generated: escaped page text wrapped in
+      // <mark> around the matched term, nothing else — safe to inject.
+      const excerptEl = document.createElement("span");
+      excerptEl.className = "result-excerpt";
+      excerptEl.innerHTML = item.excerpt;
+
+      a.append(titleEl, excerptEl);
+      li.append(a);
+      results.append(li);
+    }
+  }
+
+  let searchToken = 0;
+
+  async function runSearch(term: string) {
+    const myToken = ++searchToken;
+    if (!results || !status) return;
+
+    if (!term) {
+      results.replaceChildren();
+      status.textContent = "";
+      return;
+    }
+
+    const pagefind = await loadPagefind();
+    if (myToken !== searchToken) return;
+
+    if (!pagefind) {
+      results.replaceChildren();
+      status.textContent = "Search index unavailable in dev — build the site to try it.";
+      return;
+    }
+
+    const search = await pagefind.debouncedSearch(term);
+    if (search === null || myToken !== searchToken) return;
+
+    if (search.results.length === 0) {
+      results.replaceChildren();
+      status.textContent = `No results for "${term}".`;
+      return;
+    }
+
+    const items = await Promise.all(
+      search.results.slice(0, 10).map((r) => r.data()),
+    );
+    if (myToken !== searchToken) return;
+
+    status.textContent = `${search.results.length} result${search.results.length === 1 ? "" : "s"}`;
+    renderResults(items);
+  }
+
+  trigger?.addEventListener("click", openSearch);
+
+  document.addEventListener("keydown", (e) => {
+    // <dialog>'s native "Escape closes the topmost modal" behavior is the
+    // primary path here — this listener does not stand in for it, it
+    // backstops it: a native <input type="search"> consumes a first Escape
+    // itself (clearing the field) before the dialog ever sees it, so a
+    // dialog opened with a non-empty query needs two presses on native
+    // handling alone. Closing explicitly here means one Escape always
+    // works, regardless of what's in the field.
+    if (dialog?.open) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeSearch();
+      }
+      return;
+    }
+
+    const target = e.target as HTMLElement | null;
+    const isTypingTarget =
+      target?.tagName === "INPUT" || target?.tagName === "TEXTAREA";
+
+    if (
+      (e.key === "/" && !isTypingTarget) ||
+      ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k")
+    ) {
+      e.preventDefault();
+      openSearch();
+    }
+  });
+
+  // Click on the backdrop (the ::backdrop pseudo-element registers as a
+  // click on the dialog element itself, since its content sits in child
+  // elements) closes the dialog.
+  dialog?.addEventListener("click", (e) => {
+    if (e.target === dialog) closeSearch();
+  });
+
+  dialog?.addEventListener("close", () => {
+    if (input) input.value = "";
+    results?.replaceChildren();
+    if (status) status.textContent = "";
+  });
+
+  input?.addEventListener("input", (e) => {
+    runSearch((e.target as HTMLInputElement).value.trim());
+  });
+</script>

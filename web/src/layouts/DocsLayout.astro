@@ -4,6 +4,13 @@
  * (docs/shep-design/README.md, "Screens > 2. Docs > Layout"). Wraps every
  * /docs/* route. Real routes, not the prototype's client-side page state —
  * each page here is its own file under web/src/pages/docs/.
+ *
+ * `data-pagefind-body` on `<main>` is what Pagefind (`npm run build` runs it
+ * over `dist/` after `astro build`) indexes — the landing page carries no
+ * such attribute, so it's excluded from the search index entirely, and the
+ * repeated footer license line is carved back out with
+ * `data-pagefind-ignore` so it doesn't pad every page's excerpt with the
+ * same boilerplate. See DocsSearch.astro for the query UI.
  */
 import Base from "./Base.astro";
 import DocsHeader from "../components/docs/DocsHeader.astro";
@@ -26,14 +33,13 @@ const { title, description, crumb, activeSlug } = Astro.props;
     <DocsHeader />
     <div class="grid">
       <DocsSidebar activeSlug={activeSlug} />
-      <main>
+      <main data-pagefind-body>
         <div class="crumb">{crumb}</div>
         <slot />
-        <footer class="docs-footer">
+        <footer class="docs-footer" data-pagefind-ignore>
           <span class="license">
             shep docs · pre-release · MIT OR Apache-2.0
           </span>
-          <a href="/design-language" class="dl-link">The design language →</a>
         </footer>
       </main>
     </div>
