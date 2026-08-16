@@ -6,6 +6,7 @@
  * crates/shep-core/src/config/app.rs for the `fold` field itself.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 ---
@@ -18,6 +19,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
 >
   <article>
     <h1>Folds</h1>
+    <ReferencePills slug="folds" />
     <p class="lede">
       A fold is a label, nothing more. It doesn't isolate a sheep's
       filesystem, network, or resources — it just gives a group of sheep a
@@ -51,13 +53,31 @@ fold   = "jobs"`}</CodeBlock>
     <h2>Listing one</h2>
     <p>
       <code>shep fold &lt;name&gt;</code> lists exactly that fold — nothing
-      else in the flock. It's <code>shep flock</code> pre-filtered, not a
-      separate view of anything.
+      else in the flock. It's <code>shep flock</code> pre-filtered, plus one
+      thing the plain flock table never shows: a <strong>Lambs</strong>
+      section under any sheep that has spawned children of its own, one per
+      sheep, listing every parent-pid descendant by PID and name:
     </p>
     <CodeBlock>{`$ shep fold backend
 ID  NAME    STATUS  PID    RESTARTS  CPU  MEM   UPTIME  FOLD
-0   web     online  40031  0         -    1.2M  3s      backend
-1   worker  online  40032  0         -    1.2M  3s      backend`}</CodeBlock>
+0   web     online  64778  0         -    4.2M  1s      backend
+1   worker  online  64782  0         -    4.2M  1s      backend
+
+Lambs of web (id 0) — parent-pid descendants of 64778, which is not exactly the set a stop kills
+PID    NAME
+64780  sleep
+64781  sleep
+
+Lambs of worker (id 1) — parent-pid descendants of 64782, which is not exactly the set a stop kills
+PID    NAME
+64784  sleep
+64785  sleep`}</CodeBlock>
+    <p>
+      A sheep with no children of its own gets no Lambs section at all — the
+      two above both happen to fork workers, which is why both get one. See
+      <a href="/docs/json-output">JSON output</a> for how the same data
+      surfaces as the <code>lambs</code> array under <code>--format json</code>.
+    </p>
     <p>
       A fold name that matches nothing is the same <code>not_found</code>
       error any other selector gives you, exit code 3 — not an empty list:
