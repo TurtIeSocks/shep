@@ -16,12 +16,17 @@
  * the fresh stdout/stderr in below.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 import VerbSignature from "../../components/docs/VerbSignature.astro";
-import { stubMeta } from "../../data/docsNav";
 
-const meta = stubMeta["from-pm2"];
+const meta = {
+  title: "Coming from pm2",
+  crumb: "Start here / Coming from pm2",
+  blurb:
+    "shep import reads a real dump.pm2 and writes a Flockfile. It starts nothing, and names on stderr everything that could not survive the trip unchanged.",
+};
 
 const verbTable: { pm2: string; shep: string; note?: string }[] = [
   { pm2: "pm2 start <script>", shep: "shep start <script>" },
@@ -79,6 +84,7 @@ const verbTable: { pm2: string; shep: string; note?: string }[] = [
 >
   <article>
     <h1>Coming from pm2</h1>
+    <ReferencePills slug="from-pm2" />
     <p class="lede">
       <code>shep import</code> reads a real <code>dump.pm2</code> and writes
       a Flockfile from it. It starts nothing — no daemon connection, no
