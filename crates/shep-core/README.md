@@ -20,7 +20,7 @@ This crate holds what the other three agree on:
 
 It has no process control and opens no sockets. Supervision lives in
 `shep-daemon`, talking to it lives in `shep-client`, and the `shep` binary
-itself is `shep-cli`.
+itself is built by the crate of the same name.
 
 shep is pre-release. Anything public here can change before 1.0, and the
 crate's [CHANGELOG](CHANGELOG.md) records what moved.

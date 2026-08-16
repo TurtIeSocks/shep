@@ -217,7 +217,7 @@ are recorded too, so that nobody reimplements them by accident.
 re-execs itself with a hidden subcommand, detaches, and reports readiness back
 over a pipe once its socket is bound. Four crates build it: `shep-core`
 (types, config, wire protocol), `shep-daemon` (the supervision engine),
-`shep-client` (async client), and `shep-cli` (the binary).
+`shep-client` (async client), and `shep` (the binary).
 
 **Tested by trying to break it.** Over a thousand tests, and the ones worth
 having are the ones made to fail on purpose: every phase ends with a mutation

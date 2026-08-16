@@ -4,7 +4,7 @@ Approved by Rin 2026-08-07. **shep** = the project, the binary, the brand. A she
 watching your processes. Playful shepherd/sheep/sheepdog terminology runs through the
 CLI, docs, and type names.
 
-Crates: `shep-core`, `shep-daemon`, `shep-client`, `shep-cli`. Binary: `shep`.
+Crates: `shep-core`, `shep-daemon`, `shep-client`, `shep`. Binary: `shep`.
 Free on crates.io (verified 2026-08-07): `shep`, `shepd`, plus reserves `bleat`,
 `sheepdog`, `fleece`, `crook` if satellite crates ever want them.
 

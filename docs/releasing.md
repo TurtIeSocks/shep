@@ -17,10 +17,10 @@ manifests:
 | `shep-core` | nothing in the workspace |
 | `shep-client` | `shep-core` |
 | `shep-daemon` | `shep-core` |
-| `shep-cli` | `shep-core`, `shep-daemon`, `shep-client` |
+| `shep` | `shep-core`, `shep-daemon`, `shep-client` |
 
 So: **shep-core, then shep-client and shep-daemon in either order, then
-shep-cli.** `shep-client` and `shep-daemon` do not know about each other.
+shep.** `shep-client` and `shep-daemon` do not know about each other.
 
 You do not have to drive that by hand. `cargo publish --workspace` computes
 the order itself and, unlike four separate `-p` runs, resolves the
@@ -157,7 +157,7 @@ Afterwards, the install line becomes:
 cargo install shep --version 0.1.0-alpha.1
 ```
 
-`shep-cli` carries three `[[bin]]` targets since Phase 15's library
+`shep` carries three `[[bin]]` targets since Phase 15's library
 extraction, not one — this single command installs all three binaries:
 `shep`, plus the two container-entrypoint aliases `shep-runtime` and
 `shep-dev`.
@@ -242,17 +242,24 @@ and cargo only reaches outside for `readme` and `license-file`. The
 tooling reads, so this is cosmetic. Copying or symlinking the two files into
 each crate directory would fix it whenever it starts to bother you.
 
-## The `shep` crate name is unclaimed
+## The `shep-cli` package was renamed to `shep`
 
-Checked 2026-08-15: `shep`, `shep-core`, `shep-daemon`, `shep-client` and
-`shep-cli` are all free on crates.io.
+Decided and done 2026-08-15. Checked that day: `shep`, `shep-core`,
+`shep-daemon`, `shep-client` and `shep-cli` were all free on crates.io.
 
-`shep` being free is the interesting one, because the binary is already called
-`shep` while the crate that builds it is `shep-cli`. Users would install it as
-`cargo install shep` and then run `shep`. Renaming the crate to `shep`
-would make those match, and it is a rename of the package name only, not of
-the local directory. Whichever way that goes, the name is worth taking in the
-first publish rather than after somebody else notices it is available.
+The binary was already called `shep` while the crate that built it was named
+`shep-cli`, so users would have installed it as `cargo install shep-cli` and
+then run `shep`. Renamed the package (not the directory — the checkout still
+keeps `crates/shep-cli/`, since Cargo takes the published name from the
+manifest, not the path) to `shep` so the install command and the binary name
+match: `cargo install shep`, then run `shep`.
+
+That leaves `shep-cli` unclaimed and sitting one character off `shep`'s own
+namespace — an obvious squat target once the other three crates are visible
+under a `shep-*` naming convention. `shep-cli` is published as a real
+redirect crate (see `crates/shep-cli-redirect/`) for exactly that reason:
+nothing was ever published under the old name, so the redirect is purely
+defensive, not a migration path anyone needs to follow.
 
 ## What the rehearsal found
 

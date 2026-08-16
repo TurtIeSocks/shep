@@ -39,10 +39,10 @@ the reason the unfiltered lib run costs ~25s instead. A mutation in
 watcher plumbing, or to timing-sensitive behavior in `extras.rs` or the
 sampler, does, so run the unfiltered lib suite when touching either.
 
-From Phase 15 on, `shep-cli` is a library with three thin `[[bin]]` targets
+From Phase 15 on, `shep` is a library with three thin `[[bin]]` targets
 over it (`shep`, `shep-runtime`, `shep-dev`) rather than one bare binary — the
 two container-entrypoint aliases spec §3 asks for cannot share a module tree
-without a library underneath them. A **shep-cli-scoped** run therefore needs
+without a library underneath them. A **shep-scoped** run therefore needs
 both halves: `cargo test -p shep --lib --bins --all-features`. `--bins`
 alone now runs almost nothing, since every unit test in the crate lives in the
 library.
@@ -80,9 +80,9 @@ compiler ever reading it (platform audit #3). `--all-targets` is what reaches
 the test. shep-daemon has no `ring` in its tree, so this needs no cross C
 toolchain; `-p shep` would, and is not in this gate — a macOS host has no
 `x86_64-linux-gnu-gcc` for `ring`'s build script to call, so `cargo check -p
-shep-cli --target x86_64-unknown-linux-gnu` fails outright here, gcc or no.
+shep --target x86_64-unknown-linux-gnu` fails outright here, gcc or no.
 
-**shep-cli carries its own `#[cfg(target_os = "linux")]` code now, and this
+**shep carries its own `#[cfg(target_os = "linux")]` code now, and this
 gate does not reach it.** Phase 15 added
 `crates/shep-cli/tests/init.rs::a_reparented_orphan_is_reaped` and
 `reap.rs::drain_reaps_a_real_reparented_orphan`, both Linux-only, in the one
@@ -152,7 +152,7 @@ re-running that suite in isolation with the mutation still applied.
 ## Architecture
 
 Four crates, one distributed binary (`shep`): shep-core, shep-daemon,
-shep-client, shep-cli — each crate's Cargo.toml `description` states its role.
+shep-client, shep — each crate's Cargo.toml `description` states its role.
 
 Daemonization = the binary re-execs itself with a hidden `daemon` subcommand.
 Module-by-module design: map.md (see above).
@@ -166,7 +166,7 @@ in this repo.** It fronts [docs/idiomatic-rust.md](docs/idiomatic-rust.md) —
 [docs/idiomatic-rust/lenses/](docs/idiomatic-rust/lenses/).
 
 Top drift risks (all observed in baseline testing): panicking constructors
-outside shep-cli, `std::error::Error` instead of `core::error::Error`, missing
+outside shep, `std::error::Error` instead of `core::error::Error`, missing
 `# Errors` doc sections, `# Panics` without `#[track_caller]`, widening input
 grammars beyond spec.
 
@@ -232,7 +232,7 @@ axum, no tower-http; dotfiles, directory listing, and every in-docroot
 symlink all refused by default), `shep runtime` (foreground, no-daemon, PID-1
 via a separate init process that reaps orphans and forwards signals), and
 `shep dev` (isolated `$SHEP_DEV_HOME`, forced watch, auto-exit) — plus the
-`shep-cli` library extraction the two container-entrypoint `[[bin]]` aliases
+`shep` library extraction the two container-entrypoint `[[bin]]` aliases
 needed underneath them. The v1.0 CLI surface is closed except for the
 Windows functional tier.
 

@@ -58,7 +58,7 @@ Four crates, one distributed binary (`shep`); see map.md for module detail.
   machines, watcher, workers, RPC server, bus, dog support. No binary.
 - `shep-client` — async client: connect-or-spawn, typed RPC, event streams.
   Re-exports shep-core.
-- `shep-cli` — the `shep` binary: clap surface, output/UX, lookout, whistle,
+- `shep` — the `shep` binary: clap surface, output/UX, lookout, whistle,
   serve, dogs, import, runtime/dev modes. Hidden `daemon` subcommand is the
   daemonization target (re-exec self, detached, readiness handshake over a
   pipe: child reports `{pid, version}` once the socket is bound). `[[bin]]`

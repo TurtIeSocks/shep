@@ -1,6 +1,6 @@
 ---
 name: shep-idiomatic-rust
-description: Use when writing, reviewing, or refactoring ANY Rust code in the shep workspace (shep-core, shep-daemon, shep-client, shep-cli) — new modules, types, traits, error enums, tests, docs, Cargo.toml edits, or CI config.
+description: Use when writing, reviewing, or refactoring ANY Rust code in the shep workspace (shep-core, shep-daemon, shep-client, shep) — new modules, types, traits, error enums, tests, docs, Cargo.toml edits, or CI config.
 ---
 
 # shep Idiomatic Rust
@@ -13,7 +13,7 @@ These are the rules agents violate when writing "good" Rust from instinct. Check
 
 | Check | Rule |
 |---|---|
-| NO panicking constructors outside shep-cli — return `Result`, even in `const fn` (drop constness or take pre-validated input) | IR-21 |
+| NO panicking constructors outside shep — return `Result`, even in `const fn` (drop constness or take pre-validated input) | IR-21 |
 | `impl core::error::Error`, never `std::error::Error` | IR-19 |
 | Every `Result`-returning pub fn has an `# Errors` doc section | IR-28 |
 | `# Panics` doc and `#[track_caller]` travel together — never one without the other | IR-21 |

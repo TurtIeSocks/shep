@@ -31,7 +31,7 @@ Priority when rules collide: **Readability > KISS > DRY** (Rin's global order).
 - **IR-6** Workspace denies: `missing_docs`, `missing_debug_implementations`,
   `clippy::undocumented_unsafe_blocks`. Each lib.rs adds
   `#![doc(test(attr(deny(warnings))))]` — doctests rot loudly.
-- **IR-7** `#![forbid(unsafe_code)]` in shep-core, shep-client, shep-cli.
+- **IR-7** `#![forbid(unsafe_code)]` in shep-core, shep-client, shep.
   shep-daemon: deny (nix/libc needs escape hatches — see IR-24).
 - **IR-8** `#[allow]` only at the narrowest scope (fn/block), enumerated lint,
   one-line reason comment. Never file- or crate-wide without justification.
@@ -69,7 +69,7 @@ Priority when rules collide: **Readability > KISS > DRY** (Rin's global order).
 - **IR-18** Small per-module error enums named for their construction site
   (`SpawnError` in daemon, `ConnectError` in client, `ProtocolError` in core
   next to the wire types). No crate-wide mega-enum; no `anyhow` outside
-  shep-cli.
+  shep.
 - **IR-19** Shape: derive `Debug, Clone, PartialEq, Eq` (+ `Copy` when
   fieldless); per-variant doc = the precise condition ("stale socket file"),
   not the name restated; manual `Display` via `f.write_str(match ...)`;
@@ -81,13 +81,18 @@ Priority when rules collide: **Readability > KISS > DRY** (Rin's global order).
   `pub` error enum in a LIBRARY crate (shep-core, shep-daemon, shep-client)
   gets it, because an out-of-tree consumer can match exhaustively and a new
   variant would break them with no version bump to say so; a `pub` error enum
-  in shep-cli does not, because the crate is `[[bin]]`-only and its own
-  exhaustive matches are the ones we want broken. Either way the comment is
+  in shep does not — not because the crate is `[[bin]]`-only (Phase 15 gave it
+  a `[lib]` target plus three `[[bin]]`s over it), but because its library
+  surface is deliberately three `ExitCode`-returning entry points (`main`,
+  `main_runtime`, `main_dev`) and nothing else: every module stays private
+  `mod`, so no error enum the crate defines is externally reachable at all —
+  `#[non_exhaustive]` would guard a match no one outside the crate can write.
+  The rule still holds; only the reason changed. Either way the comment is
   mandatory — `CronScheduleError` is the model for the negative case. Every
   wire enum gets it unconditionally, and so does `ProcessInfo`, the one wire
   STRUCT (Phase 10, wire audit #1).
 - **IR-21** Constructors return `Result`, validation-first with early returns.
-  Panicking conveniences exist only in shep-cli, carry `#[track_caller]` +
+  Panicking conveniences exist only in shep, carry `#[track_caller]` +
   `# Panics` doc (the two travel together, one commit), and panic messages
   include the offending value.
 
@@ -173,7 +178,7 @@ Priority when rules collide: **Readability > KISS > DRY** (Rin's global order).
 - **IR-38** `tests/` dir = at most one compile-only file per crate proving an
   external crate can implement the public trait (`todo!()` bodies fine).
   Everything behavioral is co-located `#[cfg(test)]`.
-- **IR-39** E2E tier (shep-cli): `assert_cmd` + fresh temp `SHEP_HOME` per
+- **IR-39** E2E tier (shep): `assert_cmd` + fresh temp `SHEP_HOME` per
   test + serde asserts on JSON output + insta snapshots of normalized stdout.
   No sleeps — event-driven waits with timeouts. Errors derive `PartialEq` so
   tests assert exact variants.
@@ -227,7 +232,7 @@ Priority when rules collide: **Readability > KISS > DRY** (Rin's global order).
 
 ```
 [ ] deps default-features=false, features commented + additive     (IR-2,3)
-[ ] no new panicking constructor outside shep-cli                  (IR-21)
+[ ] no new panicking constructor outside shep                      (IR-21)
 [ ] error enums: per-module, variant docs = conditions             (IR-18,19)
 [ ] unsafe only in sys.rs, SAFETY per block                        (IR-22,23)
 [ ] docs: # Errors on Result fns, # Panics ⇔ #[track_caller]       (IR-28,21)
