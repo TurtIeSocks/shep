@@ -67,8 +67,23 @@ import { lexiconSignposts } from "../../data/lexicon";
 
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(258px, 1fr));
+    /* Fixed 3 columns, not auto-fit: six signposts should read as 3x2 —
+       auto-fit at wide viewports packed four across and left an orphan
+       row of two. Steps to 2x3 and 1x6 as the viewport narrows. */
+    grid-template-columns: repeat(3, 1fr);
     gap: 26px;
+  }
+
+  @media (max-width: 980px) {
+    .grid {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+
+  @media (max-width: 620px) {
+    .grid {
+      grid-template-columns: 1fr;
+    }
   }
 
   .more {
