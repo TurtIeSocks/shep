@@ -7,6 +7,7 @@
  * 2026-08-16.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 
@@ -38,6 +39,7 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
 >
   <article>
     <h1>Surviving reboots</h1>
+    <ReferencePills slug="startup" />
     <p class="lede">
       <code>shep startup</code> writes an init unit for the target user —
       systemd, launchd, openrc, or a BSD <code>rc.d</code> script — picked
@@ -128,6 +130,7 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
       as the process is spawned and says so in its own header comment,
       naming <code>shep flock</code> as the real check.
     </p>
+    <h2>Where to go next</h2>
 
     <div class="next-grid">
       <a href="/docs/from-pm2" class="next-card">

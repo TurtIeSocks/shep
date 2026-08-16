@@ -6,6 +6,7 @@
  * by a real `shep dev` run on 2026-08-16.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 
@@ -29,6 +30,7 @@ notice[watch_forced]: shep dev: forcing watch on devtest — each app's own \`wa
 >
   <article>
     <h1>Containers</h1>
+    <ReferencePills slug="containers" />
     <p class="lede">
       Two verbs, one shape: run one Flockfile's flock in the foreground, no
       daemonization, exit when there's nothing left to supervise.
@@ -107,6 +109,7 @@ notice[watch_forced]: shep dev: forcing watch on devtest — each app's own \`wa
       flock would get a "dev" session that shares it and silently forces
       <code>watch = true</code> onto production apps.
     </Callout>
+    <h2>Where to go next</h2>
 
     <div class="next-grid">
       <a href="/docs/serve" class="next-card">
