@@ -114,10 +114,10 @@ const { title, description, crumb, activeSlug } = Astro.props;
   /*
    * Docs-scoped link color: sky, not the landing page's meadow default
    * (global.css's header comment calls this out as the docs override to
-   * make once docs existed). Button-styled anchors (StubPanel's "Read it on
-   * GitHub", the footer's "design language" link, each page's own card
-   * links) set `color` in their own component-scoped styles, which win on
-   * specificity over this plain `main a` rule — no exclusion list needed.
+   * make once docs existed). Button-styled anchors (the reference pills, the
+   * footer's "design language" link, each page's own card links) set
+   * `color` in their own component-scoped styles, which win on specificity
+   * over this plain `main a` rule — no exclusion list needed.
    */
   main :global(a) {
     color: var(--sky);
@@ -138,5 +138,6 @@ const { title, description, crumb, activeSlug } = Astro.props;
     background: var(--code-bg);
     border-radius: 5px;
     padding: 1px 6px;
+    overflow-wrap: anywhere;
   }
 </style>
