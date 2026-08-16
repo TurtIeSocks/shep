@@ -177,14 +177,13 @@ covers the gate, and why it has no CLI flag.
 
 ## What's not built yet
 
-Not started: `shep serve`, `shep dev`, and `shep runtime` — nothing behind
-those names exists yet. Everything else that used to be on this list shipped
-this phase: `.js` Flockfiles (behind an explicit `--flockfile` flag, never by
-extension alone — see [docs/migration.md](docs/migration.md)), the
-`schemars`-exported config JSON schema, a CLI-flag layer over `shep.toml`,
-and the openrc and BSD `rc.d` unit renderers. The last two are rendered and
-pinned by exact-string tests; nobody on this project has run them on their
-own init system yet.
+Everything spec §2 named for v1.0 is built, including `shep serve`,
+`shep dev`, and `shep runtime`, `.js` Flockfiles (behind an explicit
+`--flockfile` flag, never by extension alone — see
+[docs/migration.md](docs/migration.md)), the `schemars`-exported config JSON
+schema, a CLI-flag layer over `shep.toml`, and the openrc and BSD `rc.d` unit
+renderers. The last two are rendered and pinned by exact-string tests; nobody
+on this project has run them on their own init system yet.
 
 The lookout ships all four panes — the flock table, the bleats feed, the
 sheep detail pane, and the host-usage strip. Search/filter is still to come,
@@ -194,10 +193,13 @@ why. Rendered frames of what exists so far are in
 [docs/lookout/frames.txt](docs/lookout/frames.txt) (`frames.ansi` for the
 coloured version, read with `less -R`).
 
-Windows is last, and it is genuinely zero rather than partial. The workspace
-cross-compiles for it, a check restored this phase and currently passing, but
-the Windows legs in the test workflow have never run: CI here is
-manual-only, so no test has ever executed there, only a compile.
+shep runs on Linux and macOS. Windows is v1.1+, ruled out of v1 outright
+rather than left half-done: the estimate came in at roughly 36-49 tasks over
+4-5 phases, and it is a redesign, not a port — graceful stop, the shepherd
+channel, and privilege-dropping each need a different mechanism on that
+platform, not a Unix one carried across.
+[docs/specs/windows-estimate.md](docs/specs/windows-estimate.md) has the
+detail. WSL2 covers the common case today.
 
 [docs/specs/deferred.md](docs/specs/deferred.md) is the full list, including
 the six things deliberately held back past 1.0.
