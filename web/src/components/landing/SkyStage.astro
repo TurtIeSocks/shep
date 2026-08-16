@@ -77,7 +77,16 @@ const grazing = [
   {
     depth: "mid",
     left: "30%",
-    bottom: "8vh",
+    // 3vh, not the original 8vh: at 8vh the mid sheep's feet landed inside
+    // .fence's own band (bottom:7vh/54px tall, or bottom:4vh below 600px) at
+    // ordinary viewport heights, painting its legs directly over a rail
+    // since depth-mid is in front (z-index 3 > the fence's 2) — it read as
+    // standing on the fence. 3vh keeps its feet below the fence's bottom
+    // edge at both breakpoints (matching how the near sheep already clears
+    // it: its feet sit well past the fence's bottom rather than at the same
+    // height as a rail), while its back still rises in front of the fence
+    // as it walks past — a clean occlusion, not a coincidental balance.
+    bottom: "3vh",
     width: 72,
     bobDuration: "5.6s",
     bobDelay: ".8s",
