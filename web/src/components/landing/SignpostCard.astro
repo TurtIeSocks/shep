@@ -12,7 +12,9 @@ const { term, meaning, cli, bg, fg, tilt } = Astro.props;
 
 <div class="signpost-wrap">
   <div class="post" aria-hidden="true"></div>
-  <div class="card" style={`background:${bg};transform:rotate(${tilt});`}>
+  {/* background-color, never the background shorthand: the shorthand
+      would reset the stylesheet's plank background-image layers. */}
+  <div class="card" style={`background-color:${bg};transform:rotate(${tilt});`}>
     <div class="screws">
       <span></span>
       <span></span>
@@ -45,6 +47,27 @@ const { term, meaning, cli, bg, fg, tilt } = Astro.props;
     border-radius: 20px;
     box-shadow: 6px 6px 0 var(--shadow);
     padding: 22px 24px;
+    /*
+     * Painted wooden sign: the data-driven background color stays as the
+     * paint, and two low-alpha layers draw the boards over it — a dark
+     * seam every 38px, and a soft highlight right under each seam so the
+     * boards read bevelled. (A third vertical saw-mark layer was tried
+     * and cut: crossing lines read as graph paper, not wood.) The seam and
+     * highlight layers share the 38px period so they can't drift apart
+     * down a tall card. (Features.astro's cards use the same recipe over
+     * cream — change one, change the other.)
+     */
+    background-image:
+      repeating-linear-gradient(
+        180deg,
+        rgba(23, 37, 28, 0) 0 35px,
+        rgba(23, 37, 28, 0.18) 35px 38px
+      ),
+      repeating-linear-gradient(
+        180deg,
+        rgba(255, 255, 255, 0.16) 0 4px,
+        rgba(255, 255, 255, 0) 8px 38px
+      );
   }
 
   .screws {
