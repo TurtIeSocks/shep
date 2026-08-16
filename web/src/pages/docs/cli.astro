@@ -1,13 +1,85 @@
 ---
 /*
- * Stub page (docs/shep-design/README.md, "Screens > 2. Docs > Stub pages").
- * Ships as a stub on purpose for this milestone — see StubPanel.astro.
+ * CLI reference (docs/shep-design/README.md, "Screens > 2. Docs >
+ * Reference"). Every verb, its aliases, its usage line and its own
+ * --help output — none of it hand-typed. The data comes from
+ * web/src/data/cliReference.ts, which parses a checked-in dump of real
+ * `shep --help` / `shep <verb> --help` output
+ * (web/src/data/cli-reference.generated.txt, produced by
+ * web/scripts/generate-cli-reference.sh). Re-run that script and rebuild
+ * whenever a verb, an alias, or a flag changes in
+ * crates/shep-cli/src/cli.rs — this page cannot drift from it on its own,
+ * only fall behind until someone re-runs the generator.
+ *
+ * Verbs are grouped by what an operator is trying to do, not by their
+ * declaration order in the Commands enum — the grouping here is editorial,
+ * the content inside each VerbSignature is generated.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
-import StubPanel from "../../components/docs/StubPanel.astro";
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
+import VerbSignature from "../../components/docs/VerbSignature.astro";
+import { cliReference } from "../../data/cliReference";
 import { stubMeta } from "../../data/docsNav";
 
 const meta = stubMeta["cli"];
+const byName = new Map(cliReference.verbs.map((v) => [v.name, v]));
+
+const groups = [
+  {
+    title: "Managing a sheep",
+    verbs: ["start", "serve", "stop", "restart", "reload", "delete", "stock"],
+  },
+  {
+    title: "Inspecting the flock",
+    verbs: ["flock", "describe", "fold", "dogs"],
+  },
+  {
+    title: "Dogs",
+    verbs: ["enable", "disable", "adopt", "rehome"],
+  },
+  {
+    title: "Talking to a sheep",
+    verbs: ["trigger", "signal", "whisper"],
+  },
+  {
+    title: "Logs and alerts",
+    verbs: ["bleats", "reopen", "flush", "barks"],
+  },
+  {
+    title: "The KV store",
+    verbs: ["set", "get", "unset"],
+  },
+  {
+    title: "Interfaces",
+    verbs: ["lookout", "whistle"],
+  },
+  {
+    title: "The shepherd itself",
+    verbs: ["ping", "kill", "save", "muster"],
+  },
+  {
+    title: "Containers and dev sessions",
+    verbs: ["runtime", "dev"],
+  },
+  {
+    title: "Migrating and deploying",
+    verbs: ["import", "startup", "unstartup"],
+  },
+  {
+    title: "Shell completions",
+    verbs: ["completions"],
+  },
+];
+
+const coveredCount = groups.reduce((n, g) => n + g.verbs.length, 0);
+if (coveredCount !== cliReference.verbs.length) {
+  throw new Error(
+    `src/pages/docs/cli.astro: groups cover ${coveredCount} verbs but ` +
+      `cliReference has ${cliReference.verbs.length} — a verb was added, ` +
+      `removed, or renamed without updating this page's groups.`,
+  );
+}
 ---
 
 <DocsLayout
@@ -17,9 +89,112 @@ const meta = stubMeta["cli"];
   activeSlug="cli"
 >
   <article>
-    <h1>{meta.title}</h1>
-    <p class="blurb">{meta.blurb}</p>
-    <StubPanel source={meta.source} />
+    <h1>CLI reference</h1>
+    <p class="lede">
+      Every verb <code>shep {cliReference.version.replace(/^shep\s+/, "")}</code>
+      understands, generated from the binary's own <code>--help</code> — nothing
+      below is hand-typed.
+    </p>
+
+    <Callout variant="note">
+      <code>--home</code>, <code>--format table|json</code> and <code>-q</code>/<code>--quiet</code>
+      work on every verb on this page — they're global flags, flattened onto each
+      subcommand rather than repeated in the prose below. See the full dump under
+      "Every verb, at a glance" for exactly how they render on each one.
+    </Callout>
+
+    <Callout variant="careful">
+      Windows isn't supported yet. Every verb here prints an error naming that
+      and exits 1 on that platform — there's no partial subset that works.
+    </Callout>
+
+    <h2>Aliases at a glance</h2>
+    <p>
+      Five aliases are permanent, not shorthand that might go away: the theme
+      never costs a straight verb its plain name.
+    </p>
+    <div class="alias-grid">
+      <div class="alias-card">
+        <div class="themed">shep flock</div>
+        <div class="plain">list, ls</div>
+      </div>
+      <div class="alias-card">
+        <div class="themed">shep bleats</div>
+        <div class="plain">logs</div>
+      </div>
+      <div class="alias-card">
+        <div class="themed">shep lookout</div>
+        <div class="plain">dash</div>
+      </div>
+      <div class="alias-card">
+        <div class="themed">shep stock</div>
+        <div class="plain">scale</div>
+      </div>
+      <div class="alias-card">
+        <div class="themed">shep whisper</div>
+        <div class="plain">sendline</div>
+      </div>
+    </div>
+
+    <h2>Every verb, at a glance</h2>
+    <p>
+      The exact output of <code>shep --help</code> against this build — the
+      full command list, the global options, and their defaults.
+    </p>
+    <CodeBlock label={`$ shep --help`}>{cliReference.topLevelHelp}</CodeBlock>
+
+    {
+      groups.map((group) => (
+        <>
+          <h2>{group.title}</h2>
+          {group.verbs.map((name) => {
+            const verb = byName.get(name);
+            if (!verb) {
+              throw new Error(
+                `src/pages/docs/cli.astro: group "${group.title}" names ` +
+                  `unknown verb "${name}".`,
+              );
+            }
+            return (
+              <VerbSignature verb={verb.name} aliases={verb.aliases} usage={verb.usage}>
+                {verb.aboutHtml.map((para) => (
+                  <p set:html={para} />
+                ))}
+                <details class="full-help">
+                  <summary>full --help output</summary>
+                  <CodeBlock label={`$ shep ${verb.name} --help`}>{verb.helpText}</CodeBlock>
+                </details>
+              </VerbSignature>
+            );
+          })}
+        </>
+      ))
+    }
+
+    <h2>Where to go next</h2>
+    <div class="next-grid">
+      <a href="/docs/from-pm2" class="next-card">
+        <div class="next-title">Coming from pm2 →</div>
+        <div class="next-body">
+          The verb-by-verb translation table, and what a dump.pm2 import
+          can't carry over.
+        </div>
+      </a>
+      <a href="/docs/terminology" class="next-card">
+        <div class="next-title">Terminology →</div>
+        <div class="next-body">
+          The words behind these verbs — fold, dog, sheep, bleat — and why
+          they were picked.
+        </div>
+      </a>
+      <a href="/docs/json-output" class="next-card">
+        <div class="next-title">JSON output →</div>
+        <div class="next-body">
+          What <code>--format json</code> promises across a schema_version
+          bump.
+        </div>
+      </a>
+    </div>
   </article>
 </DocsLayout>
 
@@ -31,11 +206,127 @@ const meta = stubMeta["cli"];
     margin: 0 0 18px;
   }
 
-  .blurb {
+  h2 {
+    font-size: 26px;
+    letter-spacing: -0.03em;
+    margin: 44px 0 14px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  .lede {
     font-size: 19px;
     line-height: 1.6;
     color: var(--ink-2);
-    margin: 0 0 34px;
-    max-width: 56ch;
+    margin: 0 0 24px;
+    text-wrap: pretty;
+  }
+
+  article > p {
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    margin: 0 0 16px;
+    max-width: 68ch;
+  }
+
+  article > p code,
+  .lede code {
+    font-family: "Space Mono", monospace;
+    font-size: 0.88em;
+    background: var(--code-bg);
+    border-radius: 5px;
+    padding: 1px 6px;
+  }
+
+  .alias-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 12px;
+    margin: 0 0 12px;
+  }
+
+  .alias-card {
+    background: var(--paper-2);
+    border: 2.5px solid var(--hair);
+    border-radius: 14px;
+    padding: 12px 15px;
+  }
+
+  .alias-card .themed {
+    font-family: "Space Mono", monospace;
+    font-size: 13.5px;
+    font-weight: 700;
+    color: var(--meadow);
+  }
+
+  .alias-card .plain {
+    font-family: "Space Mono", monospace;
+    font-size: 12px;
+    color: var(--ink-3);
+    margin-top: 4px;
+  }
+
+  .full-help {
+    margin-top: 12px;
+  }
+
+  .full-help summary {
+    cursor: pointer;
+    font-family: "Space Mono", monospace;
+    font-size: 12.5px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    color: var(--ink-3);
+    padding: 2px 0;
+  }
+
+  .full-help[open] summary {
+    color: var(--ink);
+    margin-bottom: 8px;
+  }
+
+  .full-help :global(.code-block) {
+    margin-bottom: 0;
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-top: 20px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
   }
 </style>
