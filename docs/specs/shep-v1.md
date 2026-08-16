@@ -31,18 +31,28 @@ capture/tail/flush/reopen, watch-restart, cron-restart, memory-limit polling
 behind `LimitEnforcer`, SO_REUSEPORT reload for all runtimes, dogs
 infrastructure + metrics dog + bark dog, lookout TUI, whistle MCP (stdio),
 `shep import` + migration guide, startup scripts (systemd Type=notify,
-launchd, openrc, rc.d), Windows functional tier (named pipes + Job Objects;
-start/stop/list/logs work).
+launchd, openrc, rc.d).
 
 **v1.1 committed (design now, build later):** HTTP/SSE MCP transport; cgroup
-v2 enforcement (`enforce = "kernel"`); `@shep/io` npm shim (on demand);
-Windows polish (service integration, ctrl-event graceful stop, full e2e);
-vcs metadata (git revision shown in describe — `vcs` feature, off by
-default); `shep web` JSON status endpoint (if demand — metrics dog covers
-observability).
+v2 enforcement (`enforce = "kernel"`); `@shep/io` npm shim (on demand); the
+whole Windows tier — named pipes, Job Objects, start/stop/list/logs,
+service integration, ctrl-event graceful stop, full e2e; vcs metadata (git
+revision shown in describe — `vcs` feature, off by default); `shep web`
+JSON status endpoint (if demand — metrics dog covers observability).
 
 **v1.2 candidate:** fd-passing/LISTEN_FDS true cluster parity (Rin: "v1.1 or
 v1.2 even").
+
+**Amendment, 2026-08-15:** the line above used to split Windows into a v1.0
+"functional tier" (named pipes, Job Objects, start/stop/list/logs) and a
+v1.1 "polish" tier (service integration, ctrl-event graceful stop, full
+e2e). Rin ruled the whole tier out of v1.0 once an actual estimate
+existed rather than a guess — [windows-estimate.md](windows-estimate.md)
+puts it at roughly 36-49 tasks over 4-5 phases, and a redesign rather than
+a port. Windows is 0%, not partial, and stays that way through v1.0; see
+[deferred.md](deferred.md) for the up-to-date single list. §11 and §13
+below are corrected to match; this note exists so nobody reaches for the
+old split again.
 
 The two lists above cover what is *deliberately* deferred. What is named
 above as v1.0 but not yet built — the larger gap, tracked against the
@@ -459,10 +469,13 @@ daemon memory (explicit non-goal).
   tier 1. The reload overlap is unaffected by this — the new instance
   taking over 100% of new connections is the desired reload behavior on
   either platform.
-- **Windows v1 functional tier:** compiles + unit tests in CI from day one;
-  named-pipe RPC + Job Objects kill; start/stop/flock/bleats work. Typed
-  `StopSignal` keeps unix-isms out of core. Service + graceful ctrl-event +
-  e2e = v1.1.
+- **Windows:** out of v1.0 entirely, not a functional tier — see §2's
+  2026-08-15 amendment. The workspace cross-compiles for
+  `x86_64-pc-windows-gnu` and that check runs every phase, but no code path
+  runs there; every verb prints "shep does not yet support Windows" and
+  exits. Typed `StopSignal` keeps unix-isms out of core, which is what
+  keeps a future named-pipe RPC + Job Objects implementation a v1.1+
+  addition rather than a `core` rewrite.
 - Init integration: systemd unit generator uses `Type=notify` + sd_notify;
   launchd plist; openrc; freebsd/openbsd rc.d.
 
@@ -482,8 +495,9 @@ Trusted Publishing.
 
 1. All §2 v1.0 features implemented and documented.
 2. The four gates — `cargo fmt --check`, `cargo clippy -D warnings`,
-   `cargo check`, `cargo test` — green on tier-1 platforms + Windows
-   functional tier.
+   `cargo check`, `cargo test` — green on tier-1 platforms. Windows gets
+   `cargo check` only (§11): the tier isn't built, so there is nothing for
+   `clippy -D warnings` or `cargo test` to exercise there yet.
 3. Wire fixtures committed; SECURITY.md, migration.md, Grafana asset shipped.
 4. `shep import && shep save && reboot` → the flock survives on a Linux box
    (the flagship migration scenario; runbook in `docs/migration.md`).

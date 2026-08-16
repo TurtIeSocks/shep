@@ -187,7 +187,7 @@ stay true, not work left to do.
 
 - The task gate is green: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, and `cargo test --workspace
-  --all-features` at 1298 passed / 0 failed / 5 ignored.
+  --all-features` at 1432 passed / 0 failed / 5 ignored.
 - Every crate has `description`, `readme`, `keywords` and `categories`, and
   every category is a real crates.io slug. A category the registry does not
   recognise is rejected at upload, after earlier crates in the chain have

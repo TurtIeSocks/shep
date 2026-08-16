@@ -72,6 +72,17 @@ impl Default for SpawnOptions {
 
 /// What [`connect_or_spawn`] (or [`connect_or_spawn_with`]) had to do to hand
 /// back a connected [`Client`].
+///
+/// No `#[non_exhaustive]`: `connect_or_spawn`'s algorithm has exactly two
+/// steps — probe once, and if that fails, launch then probe on a backoff
+/// loop until the deadline — and each of this enum's variants is the success
+/// exit of one step. A third variant would need a third step in the
+/// algorithm, not just a new label for one of these two, the same closed-set
+/// reasoning `CronScheduleError` documents for its own single variant
+/// (IR-20). Contrast [`SpawnError`], which does carry the attribute: a
+/// failure can originate from either step, or from the launcher, or from
+/// exhausting the deadline, and that list is exactly the kind of thing a
+/// future revision adds another way to fail to.
 #[derive(Debug)]
 pub enum SpawnOutcome {
     /// The very first probe completed a handshake: a daemon was already up,

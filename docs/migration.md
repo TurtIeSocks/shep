@@ -83,7 +83,7 @@ if the app was never written to call `reusePort: true`, cluster mode does
 not work under shep no matter what the Flockfile says. Real fd-passing
 parity (shep handing out a socket the way pm2's master did, with no
 cooperation needed from the app) is a v1.2 target, not yet built — see
-[`docs/specs/deferred.md`](specs/deferred.md).
+`docs/specs/shep-v1.md` §2, "Versioned scope".
 
 **An inherited shell environment.** This is its own rule, below.
 
