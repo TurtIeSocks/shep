@@ -16,13 +16,18 @@
  * the content inside each VerbSignature is generated.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 import VerbSignature from "../../components/docs/VerbSignature.astro";
 import { cliReference } from "../../data/cliReference";
-import { stubMeta } from "../../data/docsNav";
 
-const meta = stubMeta["cli"];
+const meta = {
+  title: "CLI reference",
+  crumb: "Reference / CLI",
+  blurb:
+    "Every verb, its aliases, its flags, and its exit codes — generated from the same clap tree the binary parses with.",
+};
 const byName = new Map(cliReference.verbs.map((v) => [v.name, v]));
 
 const groups = [
@@ -90,6 +95,7 @@ if (coveredCount !== cliReference.verbs.length) {
 >
   <article>
     <h1>CLI reference</h1>
+    <ReferencePills slug="cli" />
     <p class="lede">
       Every verb <code>shep {cliReference.version.replace(/^shep\s+/, "")}</code>
       understands, generated from the binary's own <code>--help</code> — nothing
