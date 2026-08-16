@@ -6,6 +6,7 @@
  * this page's PR for the transcript.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 import NotBuilt from "../../components/docs/NotBuilt.astro";
@@ -33,6 +34,7 @@ $ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/link.html
 >
   <article>
     <h1>Serve</h1>
+    <ReferencePills slug="serve" />
     <p class="lede">
       <code>shep serve &lt;dir&gt;</code> registers a sheep whose command line
       is this same invocation, canonicalized, with <code>--foreground</code>
@@ -102,8 +104,11 @@ $ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/link.html
       What isn't here: range requests, conditional requests, ETags,
       compression, keep-alive, TLS, HTTP/2, or any <code>PM2_SERVE_*</code>
       compatibility <NotBuilt note="range/conditional requests are v1.1 candidates" />.
-      shep reads only <code>SHEP_</code>-prefixed environment variables. The
-      visible cost today is no video seeking and a full re-read per request.
+      <code>shep serve</code> takes no configuration from the environment —
+      pass <code>--port</code>, <code>--bind</code>, <code>--spa</code>,
+      <code>--auth</code> and the flags above on the command line instead.
+      The visible cost today is no video seeking and a full re-read per
+      request.
     </p>
 
     <h2>Coming from pm2</h2>
@@ -116,6 +121,7 @@ $ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/link.html
       <code>--follow-symlinks</code> — once you've decided the trade is worth
       it for your layout.
     </p>
+    <h2>Where to go next</h2>
 
     <div class="next-grid">
       <a href="/docs/containers" class="next-card">

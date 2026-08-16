@@ -262,9 +262,9 @@ it:
   incidental cost, so reach for it deliberately for a layout that needs it,
   not out of habit carried over from pm2.
 
-There is no `PM2_SERVE_*` environment compatibility — shep reads only
-`SHEP_`-prefixed variables. Pass `--port`, `--bind`, `--spa`, `--auth
-<creds-file>` and the three flags above on the command line instead.
+There is no `PM2_SERVE_*` environment compatibility — `shep serve` takes no
+configuration from the environment at all. Pass `--port`, `--bind`, `--spa`,
+`--auth <creds-file>` and the three flags above on the command line instead.
 
 ## 7. `pm2-runtime` → `shep runtime`
 
