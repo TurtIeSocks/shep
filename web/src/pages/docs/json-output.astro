@@ -6,6 +6,7 @@
  * against target/release/shep.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 ---
@@ -18,6 +19,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
 >
   <article>
     <h1>JSON output</h1>
+    <ReferencePills slug="json-output" />
     <p class="lede">
       Add <code>--format json</code> to any command and it prints one JSON
       object instead of a table, on the same stream it would have used
@@ -118,10 +120,14 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       </li>
       <li>
         Don't assume every key is present on every row. <code>dog</code>
-        is <code>null</code> for a plain sheep; <code>lambs</code> is
-        <code>null</code> everywhere except <code>shep describe</code>,
-        where it's an array (empty if the sheep has spawned no children of
-        its own yet).
+        is <code>null</code> for a plain sheep. <code>lambs</code> is
+        <code>null</code> from <code>shep flock</code> — the plain listing
+        never walks the process tree — but a populated array (empty if the
+        sheep has spawned no children of its own) from both
+        <code>shep describe</code> and <code>shep fold</code>, since fold
+        renders the same per-sheep detail the table format's Lambs section
+        shows. Check the key itself, not which command you ran, if you're
+        writing something generic.
       </li>
       <li>
         <code>cpu_percent</code> reads <code>null</code>, not
@@ -136,12 +142,9 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       <code>shep bleats --format json</code> is the one exception. A log
       follow has no end, so there's nothing to close an envelope around —
       it prints one JSON object per line, newline-delimited, with no
-      <code>command</code> or <code>data</code> wrapper:
-      <br />
-      <code>
-        {`{"schema_version":1,"id":0,"name":"web","stream":"out","line":"…"}`}
-      </code>
+      <code>command</code> or <code>data</code> wrapper.
     </Callout>
+    <CodeBlock label="shep bleats web --format json">{`{"schema_version":1,"id":0,"name":"web","stream":"out","line":"…"}`}</CodeBlock>
 
     <h2>Table format is not a lesser version of this</h2>
     <p>
