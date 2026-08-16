@@ -1,41 +1,272 @@
 ---
 /*
- * Stub page (docs/shep-design/README.md, "Screens > 2. Docs > Stub pages").
- * Ships as a stub on purpose for this milestone — see StubPanel.astro.
+ * JSON output (crates/shep-cli/src/output/mod.rs — SCHEMA_VERSION,
+ * OutputEnvelope, ErrorEnvelope, emit/emit_error — and docs/specs/shep-v1.md
+ * §9's exit-code table). Every command and JSON block below was run
+ * against target/release/shep.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
-import StubPanel from "../../components/docs/StubPanel.astro";
-import { stubMeta } from "../../data/docsNav";
-
-const meta = stubMeta["json-output"];
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
 ---
 
 <DocsLayout
-  title={meta.title}
-  description={meta.blurb}
-  crumb={meta.crumb}
+  title="JSON output"
+  description="Every shep command answers under --format json too, in a small versioned envelope built for piping rather than scraping."
+  crumb="Reference / JSON output"
   activeSlug="json-output"
 >
   <article>
-    <h1>{meta.title}</h1>
-    <p class="blurb">{meta.blurb}</p>
-    <StubPanel source={meta.source} />
+    <h1>JSON output</h1>
+    <p class="lede">
+      Add <code>--format json</code> to any command and it prints one JSON
+      object instead of a table, on the same stream it would have used
+      anyway — success on stdout, errors on stderr. Nothing about the
+      command's behavior changes; only the rendering does.
+    </p>
+
+    <h2>The envelope</h2>
+    <p>
+      Every non-streaming command wraps its payload in the same three
+      fields: a schema version, the verb name, and the data itself.
+      Here's <code>shep flock --format json</code> against a two-sheep
+      flock:
+    </p>
+    <CodeBlock label="shep flock --format json">{`{
+  "schema_version": 1,
+  "command": "flock",
+  "data": [
+    {
+      "id": 0,
+      "name": "web",
+      "status": "online",
+      "pid": 40968,
+      "restarts": 0,
+      "uptime_ms": 1019,
+      "fold": "backend",
+      "out_file": "/tmp/shepdemo/logs/web-0-out.log",
+      "err_file": "/tmp/shepdemo/logs/web-0-err.log",
+      "cpu_percent": null,
+      "memory_bytes": 1212416,
+      "dog": null,
+      "lambs": null
+    },
+    {
+      "id": 1,
+      "name": "worker",
+      "status": "online",
+      "pid": 40969,
+      "restarts": 0,
+      "uptime_ms": 1017,
+      "fold": "backend",
+      "out_file": "/tmp/shepdemo/logs/worker-0-out.log",
+      "err_file": "/tmp/shepdemo/logs/worker-0-err.log",
+      "cpu_percent": null,
+      "memory_bytes": 1212416,
+      "dog": null,
+      "lambs": null
+    }
+  ]
+}`}</CodeBlock>
+    <p>
+      <code>command</code> is the verb you typed, spelled out in full —
+      run it as <code>shep ls --format json</code> and <code>command</code>
+      still reads <code>"flock"</code>, because that's what the daemon
+      answered to, not the alias that got you there. <code>data</code> is
+      always the same shape for a given command: a single object for
+      something like <code>shep ping</code>, an array for anything that
+      lists multiple sheep.
+    </p>
+
+    <h2>Errors get their own envelope</h2>
+    <p>
+      A failed command prints a different, smaller shape to stderr — no
+      <code>command</code> key, because the command never produced a
+      result:
+    </p>
+    <CodeBlock label="shep describe doesnotexist --format json">{`{
+  "schema_version": 1,
+  "error": {
+    "code": "not_found",
+    "message": "the daemon reported NotFound: selector matched no registered sheep"
+  }
+}`}</CodeBlock>
+    <p>
+      <code>code</code> is the same word that appears in
+      <code>error[&lt;code&gt;]: …</code> under the default table format,
+      and it's the same taxonomy as the process exit code — <code>3</code>
+      for <code>not_found</code>, <code>4</code> for
+      <code>invalid_config</code>, and so on. A script can switch on
+      <code>error.code</code> without parsing English, and the exit status
+      confirms it independently.
+    </p>
+
+    <h2>What <code>schema_version</code> promises</h2>
+    <p>
+      It's at <code>1</code> today, and it moves only for a breaking change
+      to some command's <code>data</code> shape — a field renamed, removed,
+      or given a different type. Adding a new field to an existing payload
+      does <strong>not</strong> bump it: a consumer that reads the keys it
+      cares about and ignores the rest survives an additive release
+      untouched. The contract that's actually worth writing code against:
+    </p>
+    <ul class="promise-list">
+      <li>
+        Check <code>schema_version</code> once, up front, rather than per
+        field — it's the one thing that tells you whether the shape you
+        coded against still applies.
+      </li>
+      <li>
+        Don't assume every key is present on every row. <code>dog</code>
+        is <code>null</code> for a plain sheep; <code>lambs</code> is
+        <code>null</code> everywhere except <code>shep describe</code>,
+        where it's an array (empty if the sheep has spawned no children of
+        its own yet).
+      </li>
+      <li>
+        <code>cpu_percent</code> reads <code>null</code>, not
+        <code>0</code>, when a sample wasn't available yet — a fresh sheep
+        a few hundred milliseconds old, most often. Table format prints the
+        same case as <code>-</code>, for the same reason: a confident zero
+        would be a claim shep can't back up.
+      </li>
+    </ul>
+
+    <Callout variant="note">
+      <code>shep bleats --format json</code> is the one exception. A log
+      follow has no end, so there's nothing to close an envelope around —
+      it prints one JSON object per line, newline-delimited, with no
+      <code>command</code> or <code>data</code> wrapper:
+      <br />
+      <code>
+        {`{"schema_version":1,"id":0,"name":"web","stream":"out","line":"…"}`}
+      </code>
+    </Callout>
+
+    <h2>Table format is not a lesser version of this</h2>
+    <p>
+      The default <code>--format table</code> and <code>--format json</code>
+      render from the same underlying data — there's no separate code path
+      that could drift between them — but table adds human formatting JSON
+      doesn't: <code>uptime_ms: 1019</code> becomes <code>1s</code>,
+      <code>memory_bytes: 1212416</code> becomes <code>1.2M</code>. If
+      you're piping shep's output anywhere, reach for
+      <code>--format json</code> and do the formatting yourself rather than
+      parsing the table's columns.
+    </p>
+
+    <h2>Where to go next</h2>
+    <div class="next-grid">
+      <a href="/docs/cli" class="next-card">
+        <div class="next-title">CLI reference →</div>
+        <div class="next-body">
+          Every verb, its aliases, and the exit code it can hand back.
+        </div>
+      </a>
+      <a href="/docs/first-flockfile" class="next-card">
+        <div class="next-title">Your first Flockfile →</div>
+        <div class="next-body">
+          What produces the sheep this page's <code>flock</code> output
+          describes in the first place.
+        </div>
+      </a>
+    </div>
   </article>
 </DocsLayout>
 
 <style>
   h1 {
-    font-size: clamp(34px, 4.4vw, 52px);
+    font-size: clamp(36px, 4.6vw, 56px);
     line-height: 1;
     letter-spacing: -0.04em;
     margin: 0 0 18px;
   }
 
-  .blurb {
+  h2 {
+    font-size: 27px;
+    letter-spacing: -0.03em;
+    margin: 40px 0 12px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  .lede {
     font-size: 19px;
     line-height: 1.6;
     color: var(--ink-2);
-    margin: 0 0 34px;
-    max-width: 56ch;
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  code {
+    font-family: "Space Mono", monospace;
+    font-size: 0.9em;
+    background: var(--code-bg);
+    border-radius: 5px;
+    padding: 1px 6px;
+  }
+
+  .promise-list {
+    margin: 0 0 30px;
+    padding-left: 22px;
+    display: grid;
+    gap: 12px;
+  }
+
+  .promise-list li {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 8px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+
+  .next-body code {
+    font-size: 0.85em;
   }
 </style>

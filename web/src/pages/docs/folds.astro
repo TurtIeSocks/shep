@@ -1,41 +1,211 @@
 ---
 /*
- * Stub page (docs/shep-design/README.md, "Screens > 2. Docs > Stub pages").
- * Ships as a stub on purpose for this milestone — see StubPanel.astro.
+ * Folds (docs/specs/shep-v1.md §5 "Folds", §9 selector precedence).
+ * Commands and output below were run against target/release/shep — see
+ * crates/shep-core/src/selector.rs for selector precedence and
+ * crates/shep-core/src/config/app.rs for the `fold` field itself.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
-import StubPanel from "../../components/docs/StubPanel.astro";
-import { stubMeta } from "../../data/docsNav";
-
-const meta = stubMeta["folds"];
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
 ---
 
 <DocsLayout
-  title={meta.title}
-  description={meta.blurb}
-  crumb={meta.crumb}
+  title="Folds"
+  description="A fold is a namespace: fold = in a Flockfile puts a sheep in one, and fold:<name> reaches it from any verb."
+  crumb="Concepts / Folds"
   activeSlug="folds"
 >
   <article>
-    <h1>{meta.title}</h1>
-    <p class="blurb">{meta.blurb}</p>
-    <StubPanel source={meta.source} />
+    <h1>Folds</h1>
+    <p class="lede">
+      A fold is a label, nothing more. It doesn't isolate a sheep's
+      filesystem, network, or resources — it just gives a group of sheep a
+      name you can select, list, and read off the flock table, so
+      <code>backend</code> and <code>jobs</code> don't have to be regexes
+      you keep retyping.
+    </p>
+
+    <h2>Setting one</h2>
+    <p>
+      Add <code>fold = "&lt;name&gt;"</code> to any app in a Flockfile. A
+      sheep with no <code>fold</code> field simply has none — it prints
+      <code>-</code> in the table and <code>null</code> under
+      <code>--format json</code>.
+    </p>
+    <CodeBlock label="Flockfile.toml">{`[[app]]
+name   = "web"
+script = "./server"
+fold   = "backend"
+
+[[app]]
+name   = "worker"
+script = "./worker"
+fold   = "backend"
+
+[[app]]
+name   = "cron"
+script = "./cron"
+fold   = "jobs"`}</CodeBlock>
+
+    <h2>Listing one</h2>
+    <p>
+      <code>shep fold &lt;name&gt;</code> lists exactly that fold — nothing
+      else in the flock. It's <code>shep flock</code> pre-filtered, not a
+      separate view of anything.
+    </p>
+    <CodeBlock>{`$ shep fold backend
+ID  NAME    STATUS  PID    RESTARTS  CPU  MEM   UPTIME  FOLD
+0   web     online  40031  0         -    1.2M  3s      backend
+1   worker  online  40032  0         -    1.2M  3s      backend`}</CodeBlock>
+    <p>
+      A fold name that matches nothing is the same <code>not_found</code>
+      error any other selector gives you, exit code 3 — not an empty list:
+    </p>
+    <CodeBlock>{`$ shep fold nonexistent
+error[not_found]: the daemon reported NotFound: selector matched no registered sheep`}</CodeBlock>
+
+    <h2>Selecting one from any verb</h2>
+    <p>
+      Every verb that takes a selector — <code>stop</code>,
+      <code>restart</code>, <code>delete</code>, <code>bleats</code>,
+      <code>trigger</code>, and the rest — accepts
+      <code>fold:&lt;name&gt;</code> in place of a name, an id, a
+      <code>/regex/</code>, or <code>all</code>. It reaches every sheep
+      carrying that fold in one call:
+    </p>
+    <CodeBlock>{`$ shep stop fold:backend
+ID  NAME    STATUS   PID  RESTARTS  CPU  MEM  UPTIME  FOLD
+0   web     stopped  -    0         -    -    0s      backend
+1   worker  stopped  -    0         -    -    0s      backend`}</CodeBlock>
+
+    <Callout variant="note">
+      Selector parsing checks shapes in a fixed order, and it matters if a
+      name is ambiguous with something else: the literal word
+      <code>all</code>, then a <code>fold:</code> prefix, then
+      <code>/regex/</code> slashes, then — if the whole string is ASCII
+      digits — a numeric id. Only after all four fail does it fall back to
+      treating the string as a plain name. A sheep named <code>2</code> is
+      the practical edge of this: typing <code>2</code> as a selector always
+      means "id 2", never "the sheep named 2", even if those aren't the same
+      sheep. <code>fold:</code> names don't collide with any of this — the
+      prefix is checked for before <code>/regex/</code> or a bare number, so
+      a fold can be named anything, including <code>all</code> or a number,
+      and <code>fold:&lt;that name&gt;</code> still reaches it.
+    </Callout>
+
+    <h2>What a fold is not</h2>
+    <p>
+      Folds carry no uniqueness constraint and no nesting — a name is a flat
+      string, and two sheep can share one with nothing else in common. There
+      is no <code>shep fold create</code> or config listing every fold that
+      exists; a fold exists exactly as long as some sheep's
+      <code>fold</code> field names it, and disappears the moment the last
+      one does. If you're picturing folds as something closer to a
+      Kubernetes namespace or a cgroup, that's the wrong mental model —
+      the closest real comparison is a tag.
+    </p>
+
+    <h2>Where to go next</h2>
+    <div class="next-grid">
+      <a href="/docs/first-flockfile" class="next-card">
+        <div class="next-title">Your first Flockfile →</div>
+        <div class="next-body">
+          Every field a Flockfile understands, including <code>fold</code>
+          itself, and the strict grammars that catch typos.
+        </div>
+      </a>
+      <a href="/docs/json-output" class="next-card">
+        <div class="next-title">JSON output →</div>
+        <div class="next-body">
+          How a fold (or its absence) actually serializes under
+          <code>--format json</code>.
+        </div>
+      </a>
+    </div>
   </article>
 </DocsLayout>
 
 <style>
   h1 {
-    font-size: clamp(34px, 4.4vw, 52px);
+    font-size: clamp(36px, 4.6vw, 56px);
     line-height: 1;
     letter-spacing: -0.04em;
     margin: 0 0 18px;
   }
 
-  .blurb {
+  h2 {
+    font-size: 27px;
+    letter-spacing: -0.03em;
+    margin: 40px 0 12px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  .lede {
     font-size: 19px;
     line-height: 1.6;
     color: var(--ink-2);
-    margin: 0 0 34px;
-    max-width: 56ch;
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  code {
+    font-family: "Space Mono", monospace;
+    font-size: 0.9em;
+    background: var(--code-bg);
+    border-radius: 5px;
+    padding: 1px 6px;
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 8px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+
+  .next-body code {
+    font-size: 0.85em;
   }
 </style>

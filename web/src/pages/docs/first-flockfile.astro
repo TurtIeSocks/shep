@@ -1,41 +1,558 @@
 ---
 /*
- * Stub page (docs/shep-design/README.md, "Screens > 2. Docs > Stub pages").
- * Ships as a stub on purpose for this milestone — see StubPanel.astro.
+ * Your first Flockfile (docs/specs/shep-v1.md §5 "Configuration", and
+ * crates/shep-core/src/config/{app,flockfile}.rs and values.rs directly —
+ * the field table below is transcribed from AppConfig's own doc comments,
+ * not invented. Every command and error block was run against
+ * target/release/shep; `shep schema`'s output is the same schema committed
+ * at crates/shep-core/assets/flockfile.schema.json.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
-import StubPanel from "../../components/docs/StubPanel.astro";
-import { stubMeta } from "../../data/docsNav";
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
 
-const meta = stubMeta["first-flockfile"];
+interface Field {
+  name: string;
+  type: string;
+  default: string;
+  does: string;
+}
+
+interface FieldGroup {
+  title: string;
+  fields: Field[];
+}
+
+const fieldGroups: FieldGroup[] = [
+  {
+    title: "Identity & process",
+    fields: [
+      { name: "name", type: "string", default: "required", does: "Unique sheep name." },
+      { name: "script", type: "string", default: "required", does: "Executable or script path." },
+      { name: "args", type: "string[]", default: "[]", does: "Arguments passed to the script." },
+      { name: "cwd", type: "string?", default: "daemon's cwd", does: "Working directory at spawn." },
+      { name: "interpreter", type: "string?", default: "none", does: "Interpreter override; \"none\" runs the script directly." },
+      { name: "env", type: "map<string,string>", default: "{}", does: "Merged over the daemon's filtered environment." },
+      { name: "instances", type: "integer", default: "1", does: "Fork instance count (cluster mode)." },
+      { name: "increment_var", type: "string?", default: "SHEP_INSTANCE", does: "Env var receiving the instance slot number." },
+    ],
+  },
+  {
+    title: "Restart policy",
+    fields: [
+      { name: "autorestart", type: "bool", default: "true", does: "Restart on unexpected exit." },
+      { name: "autostart", type: "bool", default: "true", does: "Start when the daemon starts, or on shep muster." },
+      { name: "stop_exit_codes", type: "int[]", default: "[]", does: "Exit codes treated as a clean stop — no restart." },
+      { name: "min_uptime", type: "duration", default: "1s", does: "Below this, an exit counts as unstable." },
+      { name: "max_restarts", type: "integer", default: "16", does: "Consecutive unstable exits before errored." },
+      { name: "restart_delay", type: "duration?", default: "none", does: "Fixed delay before every restart (alternative to backoff)." },
+      { name: "exp_backoff_restart_delay", type: "duration?", default: "none", does: "Initial backoff; grows ×1.5, capped at 15s." },
+    ],
+  },
+  {
+    title: "Stopping",
+    fields: [
+      { name: "kill_signal", type: "string?", default: "SIGTERM", does: "One of SIGTERM/SIGINT/SIGQUIT/SIGUSR2 — the SIG prefix and case are both optional." },
+      { name: "kill_timeout", type: "duration", default: "1.6s", does: "Grace period between the stop signal and SIGKILL." },
+      { name: "shutdown_with_message", type: "bool", default: "false", does: "Send {\"kind\":\"shutdown\"} on the shepherd channel instead of a signal." },
+      { name: "graceful_timeout", type: "duration", default: "8s", does: "Drain window for the old instance during a reload." },
+    ],
+  },
+  {
+    title: "Startup signaling",
+    fields: [
+      { name: "listen_timeout", type: "duration", default: "3s", does: "Readiness fallback when no ready signal or probe is configured." },
+      { name: "wait_ready", type: "bool", default: "false", does: "Expect {\"kind\":\"ready\"} on the shepherd channel before treating the sheep as up." },
+      { name: "channel", type: "bool", default: "false", does: "Open the shepherd channel on fd 3, even without wait_ready or shutdown_with_message." },
+      { name: "stdin", type: "bool", default: "false", does: "Open a pipe on the sheep's stdin so shep whisper can write to it." },
+      { name: "action_timeout", type: "duration", default: "3s", does: "How long a triggered action gets to answer before it's TimedOut." },
+    ],
+  },
+  {
+    title: "Watching & scheduling",
+    fields: [
+      { name: "watch", type: "bool", default: "false", does: "Restart when watched files change." },
+      { name: "watch_options", type: "string[]", default: "[]", does: "Include globs; empty means watch the whole cwd." },
+      { name: "ignore_watch", type: "string[]", default: "[]", does: "Exclude globs, on top of the daemon's own dot-entry and node_modules defaults." },
+      { name: "watch_delay", type: "duration?", default: "500ms", does: "Debounce window before a watch-triggered restart." },
+      { name: "cron_restart", type: "string?", default: "none", does: "Croner-dialect cron pattern for scheduled restarts." },
+      { name: "cron_timezone", type: "string?", default: "none", does: "IANA timezone name for cron_restart." },
+    ],
+  },
+  {
+    title: "Resources & organization",
+    fields: [
+      { name: "max_memory", type: "size?", default: "none", does: "Memory ceiling — the polling enforcer restarts the sheep above it." },
+      { name: "fold", type: "string?", default: "none", does: "Names the fold (group) this sheep belongs to." },
+      { name: "user", type: "string?", default: "none", does: "Run as this user (unix)." },
+      { name: "group", type: "string?", default: "none", does: "Run as this group (unix)." },
+    ],
+  },
+  {
+    title: "Logs",
+    fields: [
+      { name: "out_file", type: "string?", default: "logs/<name>-<i>-out.log", does: "Stdout log file path override." },
+      { name: "err_file", type: "string?", default: "logs/<name>-<i>-err.log", does: "Stderr log file path override." },
+      { name: "merge_logs", type: "bool", default: "false", does: "Collapse every instance's logs into one file pair." },
+    ],
+  },
+  {
+    title: "Networking & probes",
+    fields: [
+      { name: "reuse_port", type: "bool", default: "false", does: "Inert today — reload already overlaps unconditionally. Kept so import doesn't drop it." },
+      { name: "readiness_probe", type: "object?", default: "none", does: "HTTP/TCP/exec probe gating reload's await-ready step." },
+      { name: "liveness_probe", type: "object?", default: "none", does: "HTTP/TCP/exec probe whose failures feed the restart policy." },
+    ],
+  },
+];
 ---
 
 <DocsLayout
-  title={meta.title}
-  description={meta.blurb}
-  crumb={meta.crumb}
+  title="Your first Flockfile"
+  description="Every field a Flockfile understands, the ten filenames config discovery searches, and the strict grammars that catch typos before they reach a running sheep."
+  crumb="Start here / Your first Flockfile"
   activeSlug="first-flockfile"
 >
   <article>
-    <h1>{meta.title}</h1>
-    <p class="blurb">{meta.blurb}</p>
-    <StubPanel source={meta.source} />
+    <h1>Your first Flockfile</h1>
+    <p class="lede">
+      <a href="/docs/getting-started">Getting started</a> showed a two-field
+      Flockfile and moved on. This page is what's underneath: every field
+      <code>AppConfig</code> understands, the four formats and ten filenames
+      config discovery will find on its own, and the grammar that turns a
+      typo into a parse error instead of a surprise at 3am.
+    </p>
+
+    <h2>Two fields is still a complete one</h2>
+    <p>
+      <code>name</code> and <code>script</code> are the only two fields with
+      no default — everything else in the reference table below fills in on
+      its own. <code>autorestart</code> and <code>autostart</code> both
+      default to <code>true</code>, so a bare two-field entry is already a
+      supervised, auto-starting sheep.
+    </p>
+    <CodeBlock label="Flockfile.toml">{`[[app]]
+name   = "web"
+script = "./server"`}</CodeBlock>
+
+    <h2>Formats and discovery</h2>
+    <p>
+      TOML, YAML, JSON, and JSON5 all parse the same document shape — a list
+      of app tables under one <code>app</code> key (<code>[[app]]</code> in
+      TOML). Run <code>shep start</code> with no argument and it searches
+      the current directory for these ten names, in order, and stops at the
+      first one it finds:
+    </p>
+    <CodeBlock>{`Flockfile.toml
+Flockfile.yaml
+Flockfile.yml
+Flockfile.json
+Flockfile.json5
+flockfile.toml
+flockfile.yaml
+flockfile.yml
+flockfile.json
+flockfile.json5`}</CodeBlock>
+    <p>
+      <code>.js</code> is a fifth format, and deliberately not on that list.
+      Reading one means running <code>node</code> on it — arbitrary code
+      execution — so discovery never selects a <code>.js</code> file no
+      matter what's sitting in the directory. It's read only when you name
+      it explicitly with <code>--flockfile</code>:
+    </p>
+    <CodeBlock>{`$ shep start ecosystem.config.js --flockfile`}</CodeBlock>
+    <Callout variant="careful">
+      Without <code>--flockfile</code>, <code>shep start server.js</code>
+      still means exactly what it always has: run <code>server.js</code> as
+      a script, not as config. <code>cd</code>-ing into a cloned repository
+      and running <code>shep start</code> must never execute a stranger's
+      JavaScript on your machine as a side effect of looking for config —
+      that's the whole reasoning behind the ten-name list above stopping at
+      JSON5.
+    </Callout>
+
+    <h2>Strict grammars</h2>
+    <p>
+      Two field types are small parsers of their own rather than bare
+      numbers, so a typo in either fails at parse time instead of silently
+      meaning something else. Both accept plain digits with one optional
+      trailing letter — nothing more:
+    </p>
+    <div class="grammar-grid">
+      <div class="grammar-card">
+        <div class="grammar-name">Durations</div>
+        <div class="grammar-pattern"><code>^\d+(h|m|s)?$</code></div>
+        <p>
+          Plain digits are milliseconds; <code>h</code>/<code>m</code>/<code
+          >s</code> are hours/minutes/seconds. Lowercase only.
+        </p>
+      </div>
+      <div class="grammar-card">
+        <div class="grammar-name">Sizes</div>
+        <div class="grammar-pattern"><code>^\d+(G|M|K)?$</code></div>
+        <p>
+          Plain digits are bytes; <code>K</code>/<code>M</code>/<code
+          >G</code> are binary units — KiB/MiB/GiB, not decimal. Uppercase
+          only, and each is exactly one letter.
+        </p>
+      </div>
+    </div>
+    <p>
+      <code>512M</code> and <code>30s</code> parse. <code>512MB</code>,
+      <code>1.5G</code>, and <code>30S</code> all fail — a fractional size,
+      a two-letter unit, and an uppercase duration suffix, each rejected by
+      the same strict grammar rather than rounded, guessed, or silently
+      dropped:
+    </p>
+    <CodeBlock label="Flockfile.toml → shep start">{`$ shep start Flockfile.toml
+error[invalid_config]: invalid TOML Flockfile: TOML parse error at line 4, column 14
+  |
+4 | max_memory = "512MB"
+  |              ^^^^^^^
+memory size must be ASCII digits with an optional trailing G, M, or K`}</CodeBlock>
+
+    <h2>Unknown fields are a parse error, not a shrug</h2>
+    <p>
+      Every Flockfile field name is checked against the real set — a typo'd
+      key is rejected at load, not ignored. This is the same guarantee spec
+      writers get from <code>#[serde(deny_unknown_fields)]</code>, surfaced
+      as a message that names the exact key and lists what would have been
+      accepted:
+    </p>
+    <CodeBlock label="max_memory_restart is not a real field">{`$ shep start Flockfile.toml
+error[invalid_config]: invalid TOML Flockfile: TOML parse error at line 4, column 1
+  |
+4 | max_memory_restart = "1G"
+  | ^^^^^^^^^^^^^^^^^^
+unknown field \`max_memory_restart\`, expected one of \`name\`, \`script\`, \`args\`, \`cwd\`,
+\`interpreter\`, \`env\`, \`instances\`, \`autorestart\`, \`autostart\`, \`stop_exit_codes\`,
+\`min_uptime\`, \`max_restarts\`, \`restart_delay\`, \`exp_backoff_restart_delay\`, \`kill_signal\`,
+\`kill_timeout\`, \`shutdown_with_message\`, \`listen_timeout\`, \`graceful_timeout\`,
+\`action_timeout\`, \`max_memory\`, \`watch\`, \`ignore_watch\`, \`watch_delay\`, \`cron_restart\`,
+\`fold\`, \`user\`, \`group\`, \`out_file\`, \`err_file\`, \`merge_logs\`, \`channel\`, \`stdin\`,
+\`wait_ready\`, \`reuse_port\`, \`readiness_probe\`, \`liveness_probe\`, \`watch_options\`,
+\`cron_timezone\`, \`increment_var\`
+`}</CodeBlock>
+    <p class="fine">
+      A parsed document with zero <code>[[app]]</code> entries is its own
+      distinct error, <code>Flockfile declares no apps</code> — an empty
+      file isn't a no-op, since <code>shep start</code> with nothing to
+      start almost always means the path was wrong.
+    </p>
+
+    <h2>The full field reference</h2>
+    <p>
+      Every field <code>AppConfig</code> accepts, grouped by what it's for.
+      <code>readiness_probe</code> and <code>liveness_probe</code> each take
+      a nested object — <code>kind</code> (<code>http</code>/<code
+      >tcp</code>/<code>exec</code>), <code>target</code>, and optional
+      <code>interval</code> (10s), <code>timeout</code> (5s), and
+      <code>failure_threshold</code> (3).
+    </p>
+    {
+      fieldGroups.map((group) => (
+        <div class="field-group">
+          <h3>{group.title}</h3>
+          <div class="field-table">
+            <div class="row header">
+              <span class="col-name">Field</span>
+              <span class="col-default">Default</span>
+              <span class="col-does">What it does</span>
+            </div>
+            {group.fields.map((f) => (
+              <div class="row">
+                <span class="col-name">
+                  <code>{f.name}</code>
+                  <span class="type">{f.type}</span>
+                </span>
+                <span class="col-default">{f.default}</span>
+                <span class="col-does">{f.does}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))
+    }
+
+    <h2>Get the schema directly</h2>
+    <p>
+      Everything above is generated from the same source the parser uses,
+      so it can't drift from what <code>shep</code> actually accepts.
+      <code>shep schema</code> prints it as JSON Schema, and the same output
+      is committed at <code>crates/shep-core/assets/flockfile.schema.json</code>
+      for an editor to point at:
+    </p>
+    <CodeBlock>{`$ shep schema | head -20
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Flockfile",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "description": "The editor's schema hint, read and discarded.",
+      "type": ["string", "null"],
+      "default": null
+    },
+    "app": {
+      "type": "array",
+      "default": [],
+      "items": { "$ref": "#/$defs/AppConfig" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "AppConfig": { "...": "one entry per field above" }
+  }
+}`}</CodeBlock>
+    <p>
+      That <code>"$schema"</code> key is real and accepted — a JSON or
+      JSON5 Flockfile can set it to a path and get editor completion, since
+      neither format has a comment syntax an editor would look inside for a
+      schema hint. shep itself reads the key and discards it; it never
+      validates against whatever it points to. TOML doesn't need the key at
+      all — a leading <code>#:schema &lt;path&gt;</code> comment (the taplo
+      convention) does the same job, invisibly to the parser.
+    </p>
+
+    <h2>Where to go next</h2>
+    <div class="next-grid">
+      <a href="/docs/folds" class="next-card">
+        <div class="next-title">Folds →</div>
+        <div class="next-body">
+          What the <code>fold</code> field is for, and how to select a whole
+          fold from any verb.
+        </div>
+      </a>
+      <a href="/docs/json-output" class="next-card">
+        <div class="next-title">JSON output →</div>
+        <div class="next-body">
+          How this same config surfaces back out through
+          <code>shep flock --format json</code>.
+        </div>
+      </a>
+      <a href="/docs/from-pm2" class="next-card">
+        <div class="next-title">Coming from pm2 →</div>
+        <div class="next-body">
+          Turn a real dump.pm2 into a Flockfile instead of writing one by
+          hand.
+        </div>
+      </a>
+    </div>
   </article>
 </DocsLayout>
 
 <style>
   h1 {
-    font-size: clamp(34px, 4.4vw, 52px);
+    font-size: clamp(36px, 4.6vw, 56px);
     line-height: 1;
     letter-spacing: -0.04em;
     margin: 0 0 18px;
   }
 
-  .blurb {
+  h2 {
+    font-size: 27px;
+    letter-spacing: -0.03em;
+    margin: 44px 0 12px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  h3 {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 16.5px;
+    letter-spacing: -0.01em;
+    margin: 0 0 10px;
+    color: var(--ink-2);
+  }
+
+  .lede {
     font-size: 19px;
     line-height: 1.6;
     color: var(--ink-2);
-    margin: 0 0 34px;
-    max-width: 56ch;
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  .fine {
+    font-size: 14.5px;
+    color: var(--ink-3);
+  }
+
+  code {
+    font-family: "Space Mono", monospace;
+    font-size: 0.88em;
+    background: var(--code-bg);
+    border-radius: 5px;
+    padding: 1px 6px;
+  }
+
+  .grammar-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 14px;
+    margin: 0 0 20px;
+  }
+
+  .grammar-card {
+    background: var(--paper-2);
+    border: 2.5px solid var(--hair);
+    border-radius: 16px;
+    padding: 18px 20px;
+  }
+
+  .grammar-name {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 15px;
+    margin-bottom: 8px;
+  }
+
+  .grammar-pattern {
+    margin-bottom: 10px;
+  }
+
+  .grammar-pattern code {
+    font-size: 14px;
+    padding: 3px 8px;
+  }
+
+  .grammar-card p {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--ink-3);
+  }
+
+  .field-group {
+    margin: 0 0 26px;
+  }
+
+  .field-table {
+    border: 3px solid var(--line);
+    border-radius: 16px;
+    overflow: hidden;
+  }
+
+  .field-table .row {
+    display: grid;
+    grid-template-columns: minmax(0, 210px) 130px minmax(0, 1fr);
+    gap: 14px;
+    padding: 11px 18px;
+    align-items: start;
+  }
+
+  .field-table .row.header {
+    background: var(--ink);
+    padding: 10px 18px;
+  }
+
+  .field-table .row:not(.header) {
+    border-bottom: 2px solid var(--hair);
+    background: var(--paper-2);
+  }
+
+  .field-table .row:last-child {
+    border-bottom: none;
+  }
+
+  .field-table .row.header span {
+    font-family: "Space Mono", monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  .field-table .row.header .col-name {
+    color: var(--butter);
+  }
+
+  .col-name code {
+    font-size: 12.5px;
+    padding: 1px 5px;
+  }
+
+  .col-name .type {
+    display: block;
+    font-family: "Space Mono", monospace;
+    font-size: 10.5px;
+    color: var(--ink-3);
+    margin-top: 3px;
+  }
+
+  .col-default {
+    font-family: "Space Mono", monospace;
+    font-size: 12px;
+    color: var(--ink-2);
+    line-height: 1.5;
+  }
+
+  .col-does {
+    font-size: 13.5px;
+    line-height: 1.5;
+    color: var(--ink);
+  }
+
+  @media (max-width: 640px) {
+    .field-table .row {
+      grid-template-columns: 1fr;
+      gap: 5px;
+    }
+
+    .field-table .row.header {
+      display: none;
+    }
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 8px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+
+  .next-body code {
+    font-size: 0.85em;
   }
 </style>
