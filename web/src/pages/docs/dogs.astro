@@ -1,41 +1,436 @@
 ---
 /*
- * Stub page (docs/shep-design/README.md, "Screens > 2. Docs > Stub pages").
- * Ships as a stub on purpose for this milestone — see StubPanel.astro.
+ * Dogs (docs/dogs.md, 254 lines, ported for a reader who is not a
+ * contributor). Every command and table below was run against
+ * target/release/shep during page-writing — see the commit message for the
+ * transcript. Quality bar: getting-started.astro.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
-import StubPanel from "../../components/docs/StubPanel.astro";
-import { stubMeta } from "../../data/docsNav";
-
-const meta = stubMeta["dogs"];
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
+import VerbSignature from "../../components/docs/VerbSignature.astro";
 ---
 
 <DocsLayout
-  title={meta.title}
-  description={meta.blurb}
-  crumb={meta.crumb}
+  title="Dogs"
+  description="The shepherd's own plugins: built-in metrics and alerting, and how to adopt a binary of your own."
+  crumb="Concepts / Dogs"
   activeSlug="dogs"
 >
   <article>
-    <h1>{meta.title}</h1>
-    <p class="blurb">{meta.blurb}</p>
-    <StubPanel source={meta.source} />
+    <h1>Dogs</h1>
+    <p class="lede">
+      A dog is a process the shepherd runs for its own sake, not for yours —
+      it watches the flock instead of being part of it. Two ship inside the
+      <code>shep</code> binary: <code>metrics</code>, a Prometheus endpoint,
+      and <code>bark</code>, webhook alerts. You can also point
+      <code>shep adopt</code> at a binary of your own and the shepherd will
+      supervise it the same way.
+    </p>
+
+    <Callout variant="note">
+      A dog is not the same thing as a sheep with a shepherd channel — see{" "}
+      <a href="/docs/shepherd-channel">the shepherd channel</a> for that.
+      A sheep opens fd 3 and talks newline JSON to the daemon that already
+      owns it. A dog is a separate client: it connects to
+      <code>shep.sock</code> and speaks the same wire protocol{" "}
+      <code>shep flock</code> or <code>shep describe</code> would.
+    </Callout>
+
+    <h2>What a dog actually is</h2>
+    <p>
+      Underneath, a dog is not a second kind of supervised process — it's an
+      ordinary sheep with a marker on its entry saying where it came from
+      (built-in, or adopted). The kill ladder, the backoff curve, the
+      restart budget, what <code>Errored</code> means: none of it branches
+      on whether an entry is a dog. A dog that restarts is still a dog when
+      it comes back, and a dog whose binary won't spawn shows up in{" "}
+      <code>shep dogs</code> as <code>Errored</code>, the same way a broken
+      sheep would.
+    </p>
+    <p>
+      <code>shep flock</code> prints the flock as two tables — sheep, then
+      dogs — and <code>shep dogs</code> prints the second one alone. A
+      wildcard selector (<code>stop all</code>, <code>reload all</code>,{" "}
+      <code>/regex/</code>) never touches a dog; naming one exactly always
+      does, which is what lets <code>shep disable bark</code> reach a dog
+      while a sweep of everything else leaves it running.
+    </p>
+
+    <h2>Turning one on</h2>
+    <VerbSignature verb="enable" usage="shep enable <name>">
+      <p>
+        Writes <code>shep.toml</code> first, then starts the dog now if a
+        shepherd is listening. Run it with nothing listening and it still
+        exits 0 — the config says the dog belongs, and the next shepherd
+        that boots brings it up. Nothing here autostarts a shepherd on your
+        behalf; <code>shep muster</code> is the one verb in this CLI that
+        does that.
+      </p>
+    </VerbSignature>
+    <VerbSignature verb="disable" usage="shep disable <name>">
+      <p>
+        The mirror: stops the dog if one is running and removes it from the
+        boot list either way.
+      </p>
+    </VerbSignature>
+    <CodeBlock>{`$ shep enable metrics
+NAME     SOURCE    SHEPHERD  STATUS
+metrics  built-in  true      online
+
+$ shep dogs
+NAME     SOURCE    STATUS  PID    RESTARTS  CPU  MEM   UPTIME
+metrics  built-in  online  39950  0         -    9.8M  1s
+
+$ shep flock
+ID  NAME  STATUS  PID    RESTARTS  CPU  MEM   UPTIME  FOLD
+0   web   online  39899  0         -    3.0M  5s      -
+
+Dogs
+NAME     SOURCE    STATUS  PID    RESTARTS  CPU  MEM   UPTIME
+metrics  built-in  online  39950  0         -    9.8M  1s
+
+$ shep disable metrics`}</CodeBlock>
+    <p class="fine">
+      Running <code>enable</code> and <code>adopt</code> at once from a
+      provisioning script is safe — each takes an exclusive lock on{" "}
+      <code>shep.toml</code> for its whole read-edit-write, so the second
+      waits its turn.
+    </p>
+
+    <h2>Configuration lives on the socket, not the environment</h2>
+    <p>
+      A dog's settings live under <code>[dog.&lt;name&gt;]</code> in{" "}
+      <code>shep.toml</code>, and they never travel through the dog's
+      environment. Instead the dog connects to the socket and asks for its
+      own section over the wire — the daemon reads the file fresh for every
+      such request rather than serving a cached copy.
+    </p>
+    <p>
+      An environment variable is readable from the process table, inherited
+      by every child the dog spawns, and captured into a crash dump.{" "}
+      <code>[dog.bark.sinks]</code> routinely holds a webhook URL, and a
+      webhook URL is a bearer credential — keeping the whole section off the
+      environment means nobody has to remember which dog's config is
+      sensitive.
+    </p>
+    <Callout variant="careful">
+      Editing <code>[dog.&lt;name&gt;]</code> does not reach a dog that's
+      already running — it asked for its section once, at startup, and
+      nothing pushes it a new one. <code>shep disable &lt;name&gt; &amp;&amp;
+      shep enable &lt;name&gt;</code> is what re-reads it: a fresh process
+      asking a fresh question.
+    </Callout>
+
+    <h2>The metrics dog</h2>
+    <p>
+      <code>shep enable metrics</code> serves Prometheus exposition text over
+      plain HTTP, bound to <code>127.0.0.1:9615</code> by default:
+    </p>
+    <CodeBlock label="shep.toml">{`[dog.metrics]
+bind = "127.0.0.1:9615"`}</CodeBlock>
+    <p>
+      Nothing accumulates between scrapes — every request rebuilds the
+      reading from a fresh flock listing and a fresh host sample, verified
+      by scraping it directly:
+    </p>
+    <CodeBlock>{`$ curl 127.0.0.1:9615/metrics
+shep_sheep_memory_bytes{sheep="web",id="0",fold=""} 3178496
+shep_sheep_restart_total{sheep="web",id="0",fold=""} 0
+shep_sheep_status{sheep="web",id="0",fold="",status="online"} 1
+shep_dog_up{dog="metrics",source="built-in"} 1
+shep_daemon_up{version="0.1.0-alpha.1"} 1
+shep_daemon_pid 39898
+shep_host_memory_total_bytes 51539607552`}</CodeBlock>
+    <div class="metrics-table">
+      <div class="row header">
+        <span>Metric</span>
+        <span>Meaning</span>
+      </div>
+      <div class="row"><span><code>shep_sheep_cpu_percent</code></span><span>Tree CPU as a percentage of one core, over the last sampling window.</span></div>
+      <div class="row"><span><code>shep_sheep_memory_bytes</code></span><span>Tree resident set size in bytes.</span></div>
+      <div class="row"><span><code>shep_sheep_restart_total</code></span><span>Restart count since registration.</span></div>
+      <div class="row"><span><code>shep_sheep_uptime_seconds</code></span><span>Seconds since this sheep's last successful start.</span></div>
+      <div class="row"><span><code>shep_sheep_status</code></span><span>1 for the status this sheep is currently in, 0 for every other status.</span></div>
+      <div class="row"><span><code>shep_dog_up</code></span><span>1 when this dog is online, 0 otherwise.</span></div>
+      <div class="row"><span><code>shep_daemon_up</code></span><span>Always 1: the scrape reached the shepherd.</span></div>
+      <div class="row"><span><code>shep_daemon_pid</code></span><span>The shepherd's own pid, so a restart is visible as a step change.</span></div>
+      <div class="row"><span><code>shep_host_memory_total_bytes</code></span><span>Total physical memory on the host.</span></div>
+      <div class="row"><span><code>shep_host_memory_used_bytes</code></span><span>Memory in use on the host, as the platform reports it.</span></div>
+      <div class="row"><span><code>shep_host_processes</code></span><span>Number of processes running on the host, the flock included.</span></div>
+      <div class="row"><span><code>shep_host_uptime_seconds</code></span><span>Seconds since the host booted.</span></div>
+    </div>
+    <p class="fine">
+      A reference Grafana dashboard built against this exact metric set ships
+      in <code>assets/grafana/</code>. The default bind is loopback on
+      purpose — every series above carries a sheep's name as a label, and on
+      plenty of hosts that's the name of an internal service. Widening{" "}
+      <code>bind</code> to <code>0.0.0.0</code> is one config line away, but
+      metrics won't make that call for you by shipping wide and asking you
+      to lock it down.
+    </p>
+
+    <h2>The bark dog</h2>
+    <p>
+      <code>shep enable bark</code> subscribes to the shepherd's event bus
+      and delivers to named webhook sinks:
+    </p>
+    <CodeBlock label="shep.toml">{`[dog.bark.sinks]
+oncall = { kind = "discord", url = "https://discord.com/api/webhooks/..." }
+audit = { kind = "json", url = "https://example.internal/hook" }
+
+[[dog.bark.rules]]
+on = "gave_up"
+sinks = ["oncall", "audit"]
+
+[[dog.bark.rules]]
+on = "restart_rate"
+restarts = 5
+within = "2m"
+sinks = ["oncall"]`}</CodeBlock>
+    <p>
+      Leave <code>[dog.bark.rules]</code> out and bark doesn't go quiet —
+      one rule is built in by default, firing on every configured sink
+      whenever a sheep reaches <code>Errored</code>. That's the alert that
+      must not be missed, so it needs no opt-in. <code>restart_rate</code>{" "}
+      is the opposite: an early warning for a sheep flapping but not yet{" "}
+      <code>Errored</code>, and it's opt-in because that's exactly the kind
+      of thing that pages someone at 3am for a blip if an operator didn't
+      choose the threshold themselves.
+    </p>
+    <Callout variant="careful">
+      Verified directly: enable <code>bark</code> with{" "}
+      <code>[dog.bark.sinks]</code> absent entirely and it does not run
+      quietly with nowhere to send alerts — the default rule still exists
+      with zero sinks to route to, bark logs{" "}
+      <code>rule 0 routes to no sink at all</code> on every restart attempt,
+      and lands on <code>Errored</code>. A dog needs at least one configured
+      sink before <code>shep enable bark</code> is worth running.
+    </Callout>
+    <p>
+      Every rule debounces <strong>per subject</strong>, five minutes by
+      default, never globally — a global debounce would mean the second
+      sheep to go down during an incident goes silent, which is usually the
+      incident's most interesting fact. The bus itself
+      (<code>tokio::sync::broadcast</code>) drops what a lagging subscriber
+      can't keep up with, so bark also polls the flock's state on a timer
+      (30s by default) and evaluates the same rules against that snapshot —
+      a dropped frame triggers an immediate poll instead of waiting. The two
+      routes share one debounce record per subject, so an{" "}
+      <code>Errored</code> seen by both fires once, not twice.
+    </p>
+    <p class="fine">
+      Every fired alert is appended to <code>$SHEP_HOME/barks.jsonl</code>, a
+      byte-capped ring (1MiB by default) that evicts the oldest record
+      first — the file <code>shep barks</code> reads. It's written through
+      an advisory file lock, never truncated in place, because two different
+      processes append to it: the bark dog when a rule fires, and the
+      shepherd itself when an enabled dog exhausts its own restart budget.
+    </p>
+
+    <h2>Writing your own</h2>
+    <VerbSignature verb="adopt" usage="shep adopt <name> <path>">
+      <p>
+        Third-party extension. Vets the binary once, at adopt time —
+        refusing a path that doesn't exist, isn't a file, has no execute
+        bit, or is world-writable — then actually spawns it with no
+        arguments and kills it immediately, because the only honest way to
+        know whether this kernel can exec a file is to ask this kernel.
+      </p>
+    </VerbSignature>
+    <VerbSignature verb="rehome" usage="shep rehome <name>">
+      <p>
+        <code>disable</code>'s counterpart for a third-party dog: stops it
+        if running and forgets the registration entirely, rather than
+        leaving it disabled-but-known.
+      </p>
+    </VerbSignature>
+    <CodeBlock>{`$ shep adopt watchdog ./bin/my-watchdog
+NAME      SOURCE   SHEPHERD  STATUS
+watchdog  adopted  true      online
+
+$ shep rehome watchdog
+NAME      SOURCE   SHEPHERD  STATUS
+watchdog  adopted  true      stopped`}</CodeBlock>
+    <p>
+      What gets recorded in <code>shep.toml</code> is the canonicalized,
+      absolute path — never whatever relative path you typed — because the
+      daemon may resolve it again after a reboot from a different working
+      directory than the one <code>adopt</code> ran from.
+    </p>
+    <p>
+      The wire a third-party dog speaks is the client protocol every other
+      client uses: connect to the Unix socket at{" "}
+      <code>$SHEP_HOME/run/shep.sock</code>, send <code>Hello</code>, wait
+      for <code>HelloAck</code>, then send{" "}
+      <code>Request::DogConfig {"{"} name {"}"}</code> to fetch your own
+      section as opaque text. The one variable an adopted dog inherits from
+      the shepherd's environment is <code>$SHEP_HOME</code>, which is how it
+      finds that socket in the first place — no <code>[dog.&lt;name&gt;]</code>{" "}
+      value rides along beside it.
+    </p>
+    <Callout variant="careful">
+      There is no sandbox, and it would be a mistake to assume one. An
+      adopted dog runs at the shepherd's own trust level, with no isolation
+      beyond it — the same trust an ordinary sheep in your Flockfile already
+      has. Adopting a dog does not grant anything beyond what any process
+      your own config already starts could do.
+    </Callout>
+
+    <h2>When a dog dies</h2>
+    <p>
+      If an enabled dog exhausts its own restart budget and lands on{" "}
+      <code>Errored</code>, the shepherd writes a record straight into{" "}
+      <code>barks.jsonl</code> itself, independent of whether the bark dog is
+      even running. That matters for one reason: bark has no webhook code of
+      its own for reporting its own death, so if bark is the one that died,
+      nothing pages anyone about it over Discord or Slack. What you get
+      instead is a local record — <code>shep barks</code> after the fact —
+      and the metrics dog's <code>shep_dog_up</code> gauge dropping to{" "}
+      <code>0</code> for that dog's name.
+    </p>
+    <p class="fine">
+      Nothing watches across dogs, and that's not an oversight: the
+      supervisor that restarts a crashed dog has no idea what a "dog" is
+      beyond the marker on its entry, so no dog is positioned to watch
+      another dog the way the shepherd watches all of them.{" "}
+      <code>shep barks</code> and the metrics endpoint are the two places
+      that say a dog went down.
+    </p>
+
+    <div class="next-grid">
+      <a href="/docs/shepherd-channel" class="next-card">
+        <div class="next-title">The shepherd channel →</div>
+        <div class="next-body">
+          The other way something plugs into shep — for your own app, not
+          for the shepherd's own plugins.
+        </div>
+      </a>
+      <a href="/docs/whistle" class="next-card">
+        <div class="next-title">whistle →</div>
+        <div class="next-body">
+          The flock over MCP — a third way to reach it, this time for an AI
+          agent.
+        </div>
+      </a>
+    </div>
   </article>
 </DocsLayout>
 
 <style>
   h1 {
-    font-size: clamp(34px, 4.4vw, 52px);
+    font-size: clamp(36px, 4.6vw, 56px);
     line-height: 1;
     letter-spacing: -0.04em;
     margin: 0 0 18px;
   }
 
-  .blurb {
+  h2 {
+    font-size: 27px;
+    letter-spacing: -0.03em;
+    margin: 44px 0 8px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  .lede {
     font-size: 19px;
     line-height: 1.6;
     color: var(--ink-2);
-    margin: 0 0 34px;
-    max-width: 56ch;
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  .fine {
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink-3);
+    margin: 0 0 22px;
+  }
+
+  .metrics-table {
+    border: 3px solid var(--line);
+    border-radius: 16px;
+    overflow: hidden;
+    margin: 0 0 20px;
+  }
+
+  .metrics-table .row {
+    display: grid;
+    grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
+    gap: 14px;
+    padding: 11px 18px;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+
+  .metrics-table .row:not(:last-child) {
+    border-bottom: 2px solid var(--hair);
+  }
+
+  .metrics-table .row.header {
+    background: var(--paper-2);
+    font-family: "Space Mono", monospace;
+    font-size: 11.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 700;
+  }
+
+  .metrics-table .row:not(.header) span:last-child {
+    color: var(--ink-2);
+  }
+
+  .metrics-table code {
+    font-family: "Space Mono", monospace;
+    font-size: 13px;
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 36px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
   }
 </style>

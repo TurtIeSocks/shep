@@ -1,41 +1,397 @@
 ---
 /*
- * Stub page (docs/shep-design/README.md, "Screens > 2. Docs > Stub pages").
- * Ships as a stub on purpose for this milestone — see StubPanel.astro.
+ * The shepherd channel (docs/shepherd-channel.md, 170 lines, ported for an
+ * app author rather than a shep contributor). Every command and message
+ * shape below was run against target/release/shep during page-writing,
+ * including a real Python app answering shep trigger over fd 3 — see the
+ * commit message for the transcript. Quality bar: getting-started.astro.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
-import StubPanel from "../../components/docs/StubPanel.astro";
-import { stubMeta } from "../../data/docsNav";
-
-const meta = stubMeta["shepherd-channel"];
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
+import VerbSignature from "../../components/docs/VerbSignature.astro";
 ---
 
 <DocsLayout
-  title={meta.title}
-  description={meta.blurb}
-  crumb={meta.crumb}
+  title="The shepherd channel"
+  description="A plain file descriptor carrying newline JSON: readiness, custom metrics, and answering shep trigger."
+  crumb="Concepts / The shepherd channel"
   activeSlug="shepherd-channel"
 >
   <article>
-    <h1>{meta.title}</h1>
-    <p class="blurb">{meta.blurb}</p>
-    <StubPanel source={meta.source} />
+    <h1>The shepherd channel</h1>
+    <p class="lede">
+      This is for anyone writing an app that runs under shep and wants to
+      talk back: send readiness, custom metrics, or answer a{" "}
+      <code>shep trigger</code>. It's language-agnostic — the channel is a
+      plain file descriptor carrying JSON text, nothing Rust-specific about
+      it.
+    </p>
+
+    <h2>Getting a channel</h2>
+    <p>
+      shep opens the channel — a socketpair, one end handed to your process
+      as an extra file descriptor — only when your app's Flockfile config
+      asks for one. Three fields open it, and any one is enough:
+    </p>
+    <ul>
+      <li><code>channel = true</code> — ask for it directly, no other behavior implied.</li>
+      <li><code>wait_ready = true</code> — implies a channel, because it needs one to receive your <code>ready</code> message.</li>
+      <li><code>shutdown_with_message = true</code> — also implies a channel, for the same reason in the other direction.</li>
+    </ul>
+    <p>
+      Leave all three unset and your app gets no fd 3 at all. This is
+      opt-in on purpose: a channel is a socketpair plus two pump tasks
+      running for the life of the process, and shep would rather not pay
+      that for an app that never uses it.
+    </p>
+    <CodeBlock label="Flockfile.toml">{`[[app]]
+name = "web"
+script = "./server"
+channel = true`}</CodeBlock>
+    <p class="fine">
+      The descriptor is <strong>fd 3</strong>, also exported as the{" "}
+      <code>SHEP_CHANNEL_FD</code> environment variable — read that instead
+      of hardcoding <code>3</code> if you want to be robust to it changing
+      later. It's a normal <em>blocking</em> file descriptor: a plain{" "}
+      <code>read()</code> parks your process until the daemon has something
+      to say, exactly like any other pipe. No event loop, non-blocking I/O,
+      or polling required — a shell script doing{" "}
+      <code>read -r line &lt;&amp;3</code> works. The daemon also exports{" "}
+      <code>SHEP_CHANNEL_VERSION</code> (currently <code>1</code>) so a
+      defensive app can notice a wire it's never seen rather than failing to
+      parse a line with nothing to connect that failure to.
+    </p>
+
+    <h2>The wire format</h2>
+    <p>
+      Newline-delimited JSON, one complete message per line, in both
+      directions. No framing header, no length prefix — just{" "}
+      <code>{"{...}"}\n{"{...}"}\n...</code>. Read a line, parse it as JSON,
+      act on it; build a JSON object, append <code>\n</code>, write it.
+    </p>
+
+    <h3>What you send (daemon reads this)</h3>
+    <div class="wire-table">
+      <div class="row header"><span>Message</span><span>Meaning</span></div>
+      <div class="row"><span><code>{`{"kind":"ready"}`}</code></span><span>You are up and ready to serve. Only meaningful if <code>wait_ready = true</code>.</span></div>
+      <div class="row"><span><code>{`{"kind":"metric","name":"<n>","value":<num>}`}</code></span><span>A custom metric sample. Currently logged by the daemon at debug level and nothing more — no dog reads it yet.</span></div>
+      <div class="row"><span><code>{`{"kind":"action-reply","action":"<n>","body":"<t>","id":<num>}`}</code></span><span>Your answer to a triggered action. <code>id</code> is optional — echo the one from the <code>action</code> message and shep matches your reply to that exact request.</span></div>
+    </div>
+
+    <h3>What you receive (daemon writes this)</h3>
+    <div class="wire-table">
+      <div class="row header"><span>Message</span><span>Meaning</span></div>
+      <div class="row"><span><code>{`{"kind":"shutdown"}`}</code></span><span>Sent instead of a stop signal when <code>shutdown_with_message = true</code>. The daemon still escalates to <code>SIGKILL</code> after <code>kill_timeout</code> if you take too long.</span></div>
+      <div class="row"><span><code>{`{"kind":"action","name":"<n>","id":<num>}`}</code></span><span>An operator ran <code>shep trigger</code> against you, optionally with <code>{`"params":"<text>"`}</code>. <code>id</code> is always present — echo it on your reply.</span></div>
+    </div>
+
+    <h2>A worked example</h2>
+    <p>
+      Two apps below, both answering the same <code>Flockfile.toml</code>{" "}
+      shape — <code>channel = true</code> and <code>wait_ready = true</code> —
+      and both actually run against a live shepherd for this page. The shell
+      one is the whole contract in five lines; the Python one adds action
+      replies.
+    </p>
+    <CodeBlock label="ready.sh">{`#!/bin/sh
+echo '{"kind":"ready"}' >&3
+while read -r line <&3; do
+  : # handle "shutdown" or "action" here
+done`}</CodeBlock>
+    <CodeBlock label="channel_app.py">{`import os, json, sys
+
+fd = int(os.environ.get("SHEP_CHANNEL_FD", "3"))
+r, w = os.fdopen(fd, "r", buffering=1), os.fdopen(fd, "w", buffering=1)
+
+w.write(json.dumps({"kind": "ready"}) + "\\n")
+w.flush()
+
+for line in r:
+    msg = json.loads(line)
+    if msg["kind"] == "action":
+        reply = {
+            "kind": "action-reply",
+            "action": msg["name"],
+            "body": f"handled {msg['name']} params={msg.get('params')}",
+            "id": msg["id"],
+        }
+        w.write(json.dumps(reply) + "\\n")
+        w.flush()
+    elif msg["kind"] == "shutdown":
+        sys.exit(0)`}</CodeBlock>
+    <p>
+      Started under shep with <code>channel = true</code> and{" "}
+      <code>wait_ready = true</code>, then triggered from another terminal —
+      real output, not a mockup:
+    </p>
+    <CodeBlock>{`$ shep trigger chatty reload-config "verbose"
+ID  NAME    OUTCOME  DETAIL
+5   chatty  replied  handled reload-config params=verbose
+
+$ shep trigger chatty ping --format json
+{"schema_version":1,"command":"trigger","data":[{"id":5,"name":"chatty","outcome":{"kind":"replied","body":"handled ping params=None"}}]}`}</CodeBlock>
+
+    <h2>Custom actions — the part most worth reading closely</h2>
+    <VerbSignature verb="trigger" usage="shep trigger <selector> <action> [params]">
+      <p>
+        How an operator reaches a running app directly, for whatever your
+        app defines an "action" to mean: force a GC, dump internal state,
+        flip a log level — whatever you want a running process to do
+        without restarting it.
+      </p>
+    </VerbSignature>
+    <p>
+      <strong>
+        The action name is entirely yours. shep never validates it, never
+        keeps a registry of known actions, and never inspects{" "}
+        <code>params</code>.
+      </strong>{" "}
+      Whatever the operator typed after the selector is sent to you
+      verbatim, for you to recognize or refuse. There is no way to ask the
+      daemon "what actions does this app support" — that documentation
+      lives with your app, not with shep.
+    </p>
+    <Callout variant="careful">
+      Reply even to an action you don't recognize — this is the one rule
+      that actually matters for a good operator experience. From the
+      daemon's side, an app thinking hard about a slow action and an app
+      that has no idea what it was just asked are indistinguishable — both
+      are silence. Only <code>action_timeout</code> (default 3s, capped at
+      58s) tells them apart. Send back{" "}
+      <code>{`{"kind":"action-reply","action":"reload-config","body":"unknown action: reload-config"}`}</code>{" "}
+      and the operator finds out immediately instead of waiting out the
+      full timeout for nothing.
+    </Callout>
+    <p>
+      <strong>The reply body is what the operator actually sees.</strong>{" "}
+      <code>shep trigger</code>'s <code>DETAIL</code> column is your{" "}
+      <code>body</code>, and <code>--format json</code> carries it whole
+      and untouched — verified above, <code>params=verbose</code> came back
+      exactly as sent. The table view is the only place it's ever altered,
+      and only for display: capped at 80 characters with a trailing{" "}
+      <code>...</code> when cut, embedded newlines shown as the two-character
+      escapes <code>\n</code>/<code>\r</code>. Neither limit exists on the
+      wire or in JSON output.
+    </p>
+    <p>
+      <strong>Echo the <code>id</code>, and your reply is matched exactly.</strong>{" "}
+      Every <code>action</code> message carries an <code>id</code> — an
+      opaque number, unique for the life of the daemon. Put it back on your{" "}
+      <code>action-reply</code> and shep hands your answer to that exact
+      request. Do that and the fallback matching below stops applying to
+      you.
+    </p>
+    <p class="fine">
+      If you don't echo it, shep matches your reply to a waiting trigger by
+      action name and by order — the behavior every app written before{" "}
+      <code>id</code> existed gets. It has a sharp edge: while a late reply
+      is settling a previous timeout's debt, an unstamped reply to a{" "}
+      <em>live</em> trigger of the same name is consumed as that debt
+      payment instead, and the live trigger reports <code>timed_out</code>{" "}
+      even though you answered it promptly. Echoing <code>id</code> is how
+      you make that impossible.
+    </p>
+
+    <h2>Not every sheep has a channel, and that's not a silent failure</h2>
+    <p>
+      An app configured with none of <code>channel</code>/<code>wait_ready</code>/
+      <code>shutdown_with_message</code> still gets a row back from{" "}
+      <code>shep trigger</code> — verified above with a plain sheep,{" "}
+      <code>web</code>, that never asked for a channel:
+    </p>
+    <CodeBlock>{`$ shep trigger web ping
+ID  NAME  OUTCOME     DETAIL
+0   web   no_channel  no shepherd channel — set channel = true, or wait_ready / shutdown_with_message, which imply it`}</CodeBlock>
+    <p class="fine">
+      A reload drainee — the old instance mid-swap-out — gets{" "}
+      <code>skipped</code> instead of a wait, because an answer from a
+      process on its way out would be worse than none. Neither of these
+      costs the operator a timeout; both are refused immediately.
+    </p>
+
+    <h2>Everything you write here is also public on the bus</h2>
+    <p>
+      Every message you send on fd 3 — <code>ready</code>,{" "}
+      <code>metric</code>, <code>action-reply</code> — is republished on the
+      daemon's event bus under <code>channel.*</code> (
+      <code>channel.ready</code>, <code>channel.metric</code>,{" "}
+      <code>channel.action_reply</code>), its own topic alongside{" "}
+      <code>process.*</code> and the log topics. Anyone subscribed to{" "}
+      <code>channel.*</code> sees it, not just the operator who happened to
+      send the trigger you were answering.
+    </p>
+    <p class="fine">
+      This isn't a security warning — nothing on this wire is a credential,
+      which is why the event carries your message whole rather than a
+      redacted stand-in. It's a reminder that a <code>body</code> you write
+      for one operator's terminal is also a <code>body</code> a dashboard, a
+      log aggregator, or a dog might render. Put in it what you'd be
+      comfortable with any subscriber seeing.
+    </p>
+
+    <h2>Summary for the impatient</h2>
+    <ul>
+      <li>Ask for a channel with <code>channel = true</code> (or get one free from <code>wait_ready</code> / <code>shutdown_with_message</code>).</li>
+      <li>Read <code>SHEP_CHANNEL_FD</code>, open that fd, read/write newline-delimited JSON.</li>
+      <li>A plain blocking read works — no event loop required.</li>
+      <li>Reply to every <code>action</code> message you receive, even ones you don't recognize, exactly once, promptly.</li>
+      <li>Echo the <code>id</code> — one field, and it's what makes a slow action's answer land on the right trigger.</li>
+      <li>What you put in <code>body</code> is what the operator reads back, and what anyone on <code>channel.*</code> reads too.</li>
+    </ul>
+
+    <div class="next-grid">
+      <a href="/docs/dogs" class="next-card">
+        <div class="next-title">Dogs →</div>
+        <div class="next-body">
+          The other way something plugs into shep — the shepherd's own
+          plugins, not your app.
+        </div>
+      </a>
+      <a href="/docs/whistle" class="next-card">
+        <div class="next-title">whistle →</div>
+        <div class="next-body">
+          <code>shep trigger</code> has a namesake tool over MCP — an AI
+          agent can send the same actions, when control is turned on.
+        </div>
+      </a>
+    </div>
   </article>
 </DocsLayout>
 
 <style>
   h1 {
-    font-size: clamp(34px, 4.4vw, 52px);
+    font-size: clamp(36px, 4.6vw, 56px);
     line-height: 1;
     letter-spacing: -0.04em;
     margin: 0 0 18px;
   }
 
-  .blurb {
+  h2 {
+    font-size: 27px;
+    letter-spacing: -0.03em;
+    margin: 44px 0 8px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  h3 {
+    font-size: 17px;
+    letter-spacing: -0.01em;
+    margin: 26px 0 8px;
+  }
+
+  .lede {
     font-size: 19px;
     line-height: 1.6;
     color: var(--ink-2);
-    margin: 0 0 34px;
-    max-width: 56ch;
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  .fine {
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink-3);
+    margin: 0 0 22px;
+  }
+
+  ul {
+    margin: 0 0 20px;
+    padding-left: 22px;
+    font-size: 16px;
+    line-height: 1.65;
+    color: var(--ink-2);
+  }
+
+  ul li {
+    margin-bottom: 8px;
+  }
+
+  .wire-table {
+    border: 3px solid var(--line);
+    border-radius: 16px;
+    overflow: hidden;
+    margin: 0 0 24px;
+  }
+
+  .wire-table .row {
+    display: grid;
+    grid-template-columns: minmax(200px, 340px) minmax(0, 1fr);
+    gap: 14px;
+    padding: 12px 18px;
+    font-size: 14px;
+    line-height: 1.55;
+  }
+
+  .wire-table .row:not(:last-child) {
+    border-bottom: 2px solid var(--hair);
+  }
+
+  .wire-table .row.header {
+    background: var(--paper-2);
+    font-family: "Space Mono", monospace;
+    font-size: 11.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 700;
+  }
+
+  .wire-table .row:not(.header) span:last-child {
+    color: var(--ink-2);
+  }
+
+  .wire-table code {
+    font-family: "Space Mono", monospace;
+    font-size: 12.5px;
+    overflow-wrap: anywhere;
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 36px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
   }
 </style>
