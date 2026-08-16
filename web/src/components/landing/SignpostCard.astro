@@ -11,7 +11,6 @@ const { term, meaning, cli, bg, fg, tilt } = Astro.props;
 ---
 
 <div class="signpost-wrap">
-  <div class="post" aria-hidden="true"></div>
   {/* background-color, never the background shorthand: the shorthand
       would reset the stylesheet's plank background-image layers. */}
   <div class="card" style={`background-color:${bg};transform:rotate(${tilt});`}>
@@ -26,20 +25,11 @@ const { term, meaning, cli, bg, fg, tilt } = Astro.props;
 </div>
 
 <style>
+  /* The old floating "post" stub above each card is gone — a bare 6px ink
+     bar hanging over a sign read as noise, not a stake, and the screws
+     plus planks already carry the signpost idea. */
   .signpost-wrap {
     position: relative;
-    padding-top: 26px;
-  }
-
-  .post {
-    position: absolute;
-    top: 0;
-    left: 50%;
-    width: 6px;
-    height: 30px;
-    background: var(--ink);
-    transform: translateX(-50%);
-    border-radius: 3px;
   }
 
   .card {
