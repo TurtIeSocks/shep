@@ -55,18 +55,37 @@
  * the wrapper that carries the sheep's `left` position, not to the sheep
  * mark itself, so it composes with that mark's own .anim-bob instead of
  * fighting it for the `animation` property.
+ *
+ * Not one long glide out and back: real sheep move in an amble-graze-amble
+ * rhythm, so each leg has a plateau partway (55% out, 40% back — offset so
+ * the two grazing spots differ) where the sheep stands still and its bob
+ * and chew read as head-down grazing. The utility class's ease-in-out
+ * applies per keyframe segment, which gives each amble a soft start and
+ * stop for free — no extra keyframes needed for the settle.
  */
 @keyframes walk {
   0% {
     transform: translateX(0) scaleX(-1);
   }
-  49% {
+  16% {
+    transform: translateX(calc(var(--walk-amp, 3vw) * 0.55)) scaleX(-1);
+  }
+  31% {
+    transform: translateX(calc(var(--walk-amp, 3vw) * 0.55)) scaleX(-1);
+  }
+  47% {
     transform: translateX(var(--walk-amp, 3vw)) scaleX(-1);
   }
   50% {
     transform: translateX(var(--walk-amp, 3vw)) scaleX(1);
   }
-  99% {
+  64% {
+    transform: translateX(calc(var(--walk-amp, 3vw) * 0.4)) scaleX(1);
+  }
+  81% {
+    transform: translateX(calc(var(--walk-amp, 3vw) * 0.4)) scaleX(1);
+  }
+  97% {
     transform: translateX(0) scaleX(1);
   }
   100% {
