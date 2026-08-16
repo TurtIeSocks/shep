@@ -7,6 +7,7 @@
  * commit message for the transcript. Quality bar: getting-started.astro.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 import VerbSignature from "../../components/docs/VerbSignature.astro";
@@ -20,6 +21,7 @@ import VerbSignature from "../../components/docs/VerbSignature.astro";
 >
   <article>
     <h1>The shepherd channel</h1>
+    <ReferencePills slug="shepherd-channel" />
     <p class="lede">
       This is for anyone writing an app that runs under shep and wants to
       talk back: send readiness, custom metrics, or answer a{" "}
@@ -73,17 +75,17 @@ channel = true`}</CodeBlock>
 
     <h3>What you send (daemon reads this)</h3>
     <div class="wire-table">
-      <div class="row header"><span>Message</span><span>Meaning</span></div>
-      <div class="row"><span><code>{`{"kind":"ready"}`}</code></span><span>You are up and ready to serve. Only meaningful if <code>wait_ready = true</code>.</span></div>
-      <div class="row"><span><code>{`{"kind":"metric","name":"<n>","value":<num>}`}</code></span><span>A custom metric sample. Currently logged by the daemon at debug level and nothing more — no dog reads it yet.</span></div>
-      <div class="row"><span><code>{`{"kind":"action-reply","action":"<n>","body":"<t>","id":<num>}`}</code></span><span>Your answer to a triggered action. <code>id</code> is optional — echo the one from the <code>action</code> message and shep matches your reply to that exact request.</span></div>
+      <div class="row header"><span>Message</span> <span>Meaning</span></div>
+      <div class="row"><span><code>{`{"kind":"ready"}`}</code></span> <span>You are up and ready to serve. Only meaningful if <code>wait_ready = true</code>.</span></div>
+      <div class="row"><span><code>{`{"kind":"metric","name":"<n>","value":<num>}`}</code></span> <span>A custom metric sample. Currently logged by the daemon at debug level and nothing more — no dog reads it yet.</span></div>
+      <div class="row"><span><code>{`{"kind":"action-reply","action":"<n>","body":"<t>","id":<num>}`}</code></span> <span>Your answer to a triggered action. <code>id</code> is optional — echo the one from the <code>action</code> message and shep matches your reply to that exact request.</span></div>
     </div>
 
     <h3>What you receive (daemon writes this)</h3>
     <div class="wire-table">
-      <div class="row header"><span>Message</span><span>Meaning</span></div>
-      <div class="row"><span><code>{`{"kind":"shutdown"}`}</code></span><span>Sent instead of a stop signal when <code>shutdown_with_message = true</code>. The daemon still escalates to <code>SIGKILL</code> after <code>kill_timeout</code> if you take too long.</span></div>
-      <div class="row"><span><code>{`{"kind":"action","name":"<n>","id":<num>}`}</code></span><span>An operator ran <code>shep trigger</code> against you, optionally with <code>{`"params":"<text>"`}</code>. <code>id</code> is always present — echo it on your reply.</span></div>
+      <div class="row header"><span>Message</span> <span>Meaning</span></div>
+      <div class="row"><span><code>{`{"kind":"shutdown"}`}</code></span> <span>Sent instead of a stop signal when <code>shutdown_with_message = true</code>. The daemon still escalates to <code>SIGKILL</code> after <code>kill_timeout</code> if you take too long.</span></div>
+      <div class="row"><span><code>{`{"kind":"action","name":"<n>","id":<num>}`}</code></span> <span>An operator ran <code>shep trigger</code> against you, optionally with <code>{`"params":"<text>"`}</code>. <code>id</code> is always present — echo it on your reply.</span></div>
     </div>
 
     <h2>A worked example</h2>
@@ -239,6 +241,7 @@ ID  NAME  OUTCOME     DETAIL
       <li>Echo the <code>id</code> — one field, and it's what makes a slow action's answer land on the right trigger.</li>
       <li>What you put in <code>body</code> is what the operator reads back, and what anyone on <code>channel.*</code> reads too.</li>
     </ul>
+    <h2>Where to go next</h2>
 
     <div class="next-grid">
       <a href="/docs/dogs" class="next-card">
