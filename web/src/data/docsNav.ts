@@ -35,6 +35,25 @@ export const docsNav: DocsNavGroup[] = [
       { slug: "folds", label: "Folds", built: false },
       { slug: "shepherd-channel", label: "The shepherd channel", built: false },
       { slug: "dogs", label: "Dogs", built: false },
+      { slug: "kv", label: "The KV store", built: false },
+    ],
+  },
+  {
+    // Alternate ways to reach a running flock, beyond the CLI itself — an
+    // AI agent's tool call and an operator's terminal dashboard.
+    label: "Interfaces",
+    items: [
+      { slug: "whistle", label: "Whistle (MCP)", built: false },
+      { slug: "lookout", label: "Lookout", built: false },
+    ],
+  },
+  {
+    // Where the flock runs, once it's not just a laptop anymore.
+    label: "Deploying",
+    items: [
+      { slug: "serve", label: "Serve", built: false },
+      { slug: "containers", label: "Containers", built: false },
+      { slug: "startup", label: "Surviving reboots", built: false },
     ],
   },
   {
@@ -56,11 +75,13 @@ export interface StubMeta {
 }
 
 /**
- * Copy for the eight stub pages. Blurbs are short and mostly evergreen
+ * Copy for every stub page — the original eight plus the six added when the
+ * site was brought up to date with everything shep can do (whistle, lookout,
+ * kv, serve, containers, startup). Blurbs are short and mostly evergreen
  * (what the page will cover, not shep's current build state) — the one
- * exception, "not-built", is checked against README.md's own "What's not
- * built yet" section as of 2026-08-15; re-check it whenever that section
- * changes.
+ * exception, "not-built", is checked against docs/specs/deferred.md's own
+ * scope-cut and build-queue sections as of 2026-08-16; re-check it whenever
+ * that file changes.
  */
 export const stubMeta: Record<string, StubMeta> = {
   "first-flockfile": {
@@ -98,6 +119,48 @@ export const stubMeta: Record<string, StubMeta> = {
       "A dog is a plugin the shepherd supervises for its own sake: it watches the flock rather than being part of it. metrics and bark ship inside the binary; adopt runs anyone else's.",
     source: "docs/dogs.md",
   },
+  kv: {
+    crumb: "Concepts / The KV store",
+    title: "The KV store",
+    blurb:
+      "Three verbs — set, get, unset — for the small stuff that has nowhere else to live: a file-locked JSON store, capped at 4 KiB a value, safe to keep in a dotfiles repo.",
+    source: "docs/kv.md",
+  },
+  whistle: {
+    crumb: "Interfaces / Whistle",
+    title: "Whistle",
+    blurb:
+      "An MCP server over stdio. It hands an AI agent the same flock a person reaches with shep flock — five read-only tools always on, four control tools gated behind a config flag that defaults to off.",
+    source: "docs/whistle/README.md",
+  },
+  lookout: {
+    crumb: "Interfaces / Lookout",
+    title: "Lookout",
+    blurb:
+      "A terminal dashboard over the shepherd: the flock table, a host-usage strip, and — once you select a row — that sheep's detail pane and its bleats feed.",
+    source: "docs/lookout/README.md",
+  },
+  serve: {
+    crumb: "Deploying / Serve",
+    title: "Serve",
+    blurb:
+      "A static file server, hand-rolled rather than framework-built, run as a managed sheep. Directory listing, dotfiles, and following symlinks are all off until you ask for them.",
+    source: "docs/specs/shep-v1.md",
+  },
+  containers: {
+    crumb: "Deploying / Containers",
+    title: "Containers",
+    blurb:
+      "shep runtime is the PID-1 entrypoint for a container: it reaps zombies, forwards signals, and exits when the flock empties. shep dev is the same idea for a laptop — an isolated $SHEP_HOME with watch forced on.",
+    source: "docs/specs/shep-v1.md",
+  },
+  startup: {
+    crumb: "Deploying / Surviving reboots",
+    title: "Surviving reboots",
+    blurb:
+      "shep startup installs the unit that brings the shepherd, and the flock it last saved, back after a reboot — systemd, launchd, openrc, or BSD rc.d. shep unstartup takes it back out.",
+    source: "docs/migration.md",
+  },
   cli: {
     crumb: "Reference / CLI",
     title: "CLI reference",
@@ -116,7 +179,7 @@ export const stubMeta: Record<string, StubMeta> = {
     crumb: "Reference / What's not built",
     title: "What's not built yet",
     blurb:
-      "The whistle MCP server, shep serve, shep dev and shep runtime, .js Flockfiles, a CLI-flag config layer, openrc and BSD rc.d units, and Windows entirely — the full list, including what's held back past 1.0 on purpose.",
+      "Windows, entirely — no functional tier exists yet. Past that the list is short: OTLP export for the metrics dog, lookout's search/filter and everything behind its action gate but stop, lambs in lookout's detail pane, HTTP/SSE transport for whistle, cgroup v2 enforcement, and the @shep/io npm shim.",
     source: "docs/specs/deferred.md",
   },
 };

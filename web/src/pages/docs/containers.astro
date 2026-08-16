@@ -1,0 +1,41 @@
+---
+/*
+ * Stub page (docs/shep-design/README.md, "Screens > 2. Docs > Stub pages").
+ * Ships as a stub on purpose for this milestone — see StubPanel.astro.
+ */
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import StubPanel from "../../components/docs/StubPanel.astro";
+import { stubMeta } from "../../data/docsNav";
+
+const meta = stubMeta["containers"];
+---
+
+<DocsLayout
+  title={meta.title}
+  description={meta.blurb}
+  crumb={meta.crumb}
+  activeSlug="containers"
+>
+  <article>
+    <h1>{meta.title}</h1>
+    <p class="blurb">{meta.blurb}</p>
+    <StubPanel source={meta.source} />
+  </article>
+</DocsLayout>
+
+<style>
+  h1 {
+    font-size: clamp(34px, 4.4vw, 52px);
+    line-height: 1;
+    letter-spacing: -0.04em;
+    margin: 0 0 18px;
+  }
+
+  .blurb {
+    font-size: 19px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    margin: 0 0 34px;
+    max-width: 56ch;
+  }
+</style>

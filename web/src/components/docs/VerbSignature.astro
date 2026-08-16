@@ -1,0 +1,95 @@
+---
+/*
+ * CLI verb-signature block, for the CLI reference page (and anywhere else a
+ * page wants to document one command in isolation — e.g. dogs.astro
+ * documenting `shep enable`). Verb name + aliases as pills, the usage line
+ * in mono, then a free-form slot for flags/description/examples.
+ *
+ * Usage:
+ *   <VerbSignature verb="start" aliases={["run"]} usage="shep start <file> [--force]">
+ *     <p>Starts every app a Flockfile names…</p>
+ *   </VerbSignature>
+ */
+interface Props {
+  /** e.g. "start". Rendered as `shep <verb>` in the head row. */
+  verb: string;
+  /** e.g. ["run"]. Omit for a verb with no alias. */
+  aliases?: string[];
+  /** Full usage line, e.g. "shep start <file> [--force] [--fold <name>]". */
+  usage: string;
+}
+
+const { verb, aliases = [], usage } = Astro.props;
+---
+
+<div class="verb-signature">
+  <div class="head">
+    <span class="verb">shep {verb}</span>
+    {aliases.map((alias) => <span class="alias">{alias}</span>)}
+  </div>
+  <div class="usage"><code>{usage}</code></div>
+  <div class="body"><slot /></div>
+</div>
+
+<style>
+  .verb-signature {
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    padding: 22px 24px;
+    margin: 0 0 24px;
+  }
+
+  .head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 9px;
+    margin-bottom: 12px;
+  }
+
+  .verb {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 19px;
+  }
+
+  .alias {
+    font-family: "Space Mono", monospace;
+    font-size: 11.5px;
+    letter-spacing: 0.04em;
+    color: var(--ink-3);
+    border: 1.5px solid var(--hair);
+    border-radius: 999px;
+    padding: 2px 9px;
+  }
+
+  .alias::before {
+    content: "alias: ";
+  }
+
+  .usage {
+    margin: 0 0 14px;
+  }
+
+  .usage code {
+    display: block;
+    font-family: "Space Mono", monospace;
+    font-size: 13.5px;
+    background: var(--code-bg);
+    border-radius: 8px;
+    padding: 9px 12px;
+    overflow-x: auto;
+    white-space: pre;
+  }
+
+  .body {
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink-2);
+  }
+
+  .body :global(p:last-child) {
+    margin-bottom: 0;
+  }
+</style>

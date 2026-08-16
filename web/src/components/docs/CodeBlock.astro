@@ -1,0 +1,116 @@
+---
+/*
+ * Docs code/terminal block, shared by every /docs/* page. Generalizes the
+ * `.terminal` panel getting-started.astro built by hand (dark
+ * illus-terminal-* literals, not theme tokens — tokens.css keeps those
+ * fixed on purpose, so a terminal reads as a terminal in either theme) and
+ * adds a copy button, matching CopyCloneButton.astro's landing-page pattern.
+ *
+ * Usage: put the block's literal content in the default slot, with
+ * whatever inline spans you want for color (getting-started.astro's
+ * .prompt/.key/.str/.num/.muted/.ok classes still work — this component
+ * ships no CSS for them, so bring your own <style> for custom highlighting
+ * per page, or copy those five from getting-started.astro if they fit).
+ * The copy button copies the slot's plain text content, spans stripped.
+ *
+ * Pass `label` for a filename header bar (like a Flockfile panel) instead
+ * of a bare terminal prompt.
+ */
+interface Props {
+  /** Optional filename/header bar, e.g. "Flockfile.toml". Omit for a bare terminal block. */
+  label?: string;
+}
+
+const { label } = Astro.props;
+---
+
+<div class="code-block">
+  {label && <div class="code-block-label">{label}</div>}
+  <div class="code-block-body">
+    <pre class="code-block-pre"><slot /></pre>
+    <button
+      type="button"
+      class="code-copy press"
+      data-code-copy
+      style="--shadow-offset:2px; --press-offset:1px;"
+      aria-label="Copy code"
+    >
+      <span data-copy-label>copy</span>
+    </button>
+  </div>
+</div>
+
+<style>
+  .code-block {
+    border: 3px solid var(--line);
+    border-radius: 16px;
+    overflow: hidden;
+    margin: 0 0 24px;
+  }
+
+  .code-block-label {
+    background: var(--paper-2);
+    padding: 10px 18px;
+    border-bottom: 2px solid var(--hair);
+    font-family: "Space Mono", monospace;
+    font-size: 12.5px;
+    font-weight: 700;
+  }
+
+  .code-block-body {
+    position: relative;
+    background: var(--illus-terminal-bg);
+  }
+
+  .code-block-pre {
+    margin: 0;
+    padding: 20px 56px 20px 22px;
+    font-family: "Space Mono", monospace;
+    font-size: 13.5px;
+    line-height: 1.9;
+    color: var(--illus-terminal-text);
+    overflow-x: auto;
+    white-space: pre;
+  }
+
+  .code-copy {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    font-family: "Space Grotesk", sans-serif;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    background: var(--paper-2);
+    color: var(--ink);
+    border: 2px solid var(--line);
+    border-radius: 8px;
+    padding: 5px 10px;
+    cursor: pointer;
+  }
+</style>
+
+<script>
+  const REVERT_DELAY_MS = 1800;
+
+  document
+    .querySelectorAll<HTMLButtonElement>("[data-code-copy]")
+    .forEach((button) => {
+      const label = button.querySelector<HTMLSpanElement>("[data-copy-label]");
+      const pre = button
+        .closest(".code-block-body")
+        ?.querySelector<HTMLPreElement>(".code-block-pre");
+      let revertTimer: ReturnType<typeof setTimeout> | undefined;
+
+      button.addEventListener("click", () => {
+        const text = pre?.textContent ?? "";
+        navigator.clipboard?.writeText(text);
+        if (label) label.textContent = "copied";
+        clearTimeout(revertTimer);
+        revertTimer = setTimeout(() => {
+          if (label) label.textContent = "copy";
+        }, REVERT_DELAY_MS);
+      });
+    });
+</script>
