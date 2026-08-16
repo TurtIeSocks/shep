@@ -682,10 +682,15 @@ src/
              reaper is **not** a subreaper + WNOHANG loop inside the supervisor's own
              process — that would race tokio's own child reaping and corrupt the exit
              statuses spec §4 promises are exact. Instead PID 1 splits into a separate init
-             process (`commands::reap`) that calls `set_child_subreaper`, forwards
-             SIGTERM/SIGINT/SIGHUP/SIGQUIT to the supervisor it spawns, and reaps every
-             orphan with a `WNOHANG` loop of its own — the init process, not the
-             supervisor, owns that loop (decision 14).
+             process (`commands::reap`) that relies on the kernel already treating real
+             PID 1 as the implicit subreaper — it never calls `set_child_subreaper` —
+             forwards SIGTERM/SIGINT/SIGHUP/SIGQUIT to the supervisor it spawns, and reaps
+             every orphan with a `WNOHANG` loop of its own — the init process, not the
+             supervisor, owns that loop (decision 14). `$SHEP_FORCE_INIT`, a test-only
+             override read by the caller of `should_split` and never by this module, drives
+             the same split off real PID 1; it gets identical signal forwarding but no
+             orphan reaping, since a non-PID-1 process with no subreaper bit set is not who
+             the kernel reparents orphans to.
   dev.rs             ← was lib/binaries/DevCLI.js
       Action: port
       Notes: ~/.pm2-dev namespace, forced watch, post-exec hook, auto-exit; bus subscription

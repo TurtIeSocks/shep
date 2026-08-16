@@ -840,11 +840,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   auto-exits once the flock is empty of online processes — exit 0 if every
   sheep stopped clean, exit 11 (`flock_empty`, a new exit code) if one ended
   in `errored`. At PID 1 it splits into a separate init process first, which
-  calls `set_child_subreaper`, forwards SIGTERM/SIGINT/SIGHUP/SIGQUIT to the
-  supervisor it spawns, and reaps every orphan with its own `WNOHANG` loop —
-  kept out of the supervisor's own process so it cannot race tokio's child
-  reaping. `shep-runtime` is the `[[bin]]` alias that supplies the `runtime`
-  verb for a container `ENTRYPOINT`.
+  relies on the kernel already treating real PID 1 as the implicit subreaper
+  (no `set_child_subreaper` call needed there), forwards
+  SIGTERM/SIGINT/SIGHUP/SIGQUIT to the supervisor it spawns, and reaps every
+  orphan with its own `WNOHANG` loop — kept out of the supervisor's own
+  process so it cannot race tokio's child reaping. `$SHEP_FORCE_INIT`, a
+  test-only override, drives the same split and signal forwarding off PID 1
+  but gets no orphan reaping, since the kernel then reparents orphans
+  elsewhere. `shep-runtime` is the `[[bin]]` alias that supplies the
+  `runtime` verb for a container `ENTRYPOINT`.
 - Add `shep dev`, an isolated foreground development flock: forced watch,
   auto-exit, and `$SHEP_DEV_HOME` (default `~/.shep-dev`, overridable for
   tests) instead of the operator's real `$SHEP_HOME`, so a `shep dev` run

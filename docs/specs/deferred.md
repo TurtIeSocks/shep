@@ -617,9 +617,15 @@ used to name:
 - **`runtime` splits into a separate init process when it is PID 1**, rather
   than reaping in the supervisor's own process. An in-process subreaper
   loop would race tokio's own child reaping and corrupt the exit statuses
-  spec §4 promises are exact; the init instead calls
-  `set_child_subreaper`, forwards SIGTERM/SIGINT/SIGHUP/SIGQUIT to the
-  supervisor it spawns, and reaps every orphan itself.
+  spec §4 promises are exact; the init instead relies on the kernel already
+  treating real PID 1 as the implicit subreaper — it never calls
+  `set_child_subreaper` — forwards SIGTERM/SIGINT/SIGHUP/SIGQUIT to the
+  supervisor it spawns, and reaps every orphan itself. That reaping only
+  happens when the init genuinely is PID 1: `$SHEP_FORCE_INIT`, a test-only
+  override that drives the same split off PID 1, gets identical signal
+  forwarding but not the reaping, since the kernel then reparents orphans
+  to whatever real subreaper it finds up the ancestor chain, not to this
+  process.
 - **`serve`'s remaining symlink race, stated as what it is**: the leaf open
   (`fs::open_regular`) carries `O_NOFOLLOW`, but the component walk that
   precedes it is not atomic. What that leaves an attacker who can create
