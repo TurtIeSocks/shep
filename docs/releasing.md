@@ -35,8 +35,8 @@ never frees the number, so `0.1.0` can be spent exactly once and never
 corrected. That matters more than usual here for two reasons.
 
 The first is that shep is genuinely pre-release, and the README already says
-so. Windows is zero rather than partial, lookout has one of its four panes,
-`shep serve` and `shep dev` do not exist, and CI has never run on its own. A
+so. Windows is zero rather than partial, lookout has no search/filter or
+working action keys beyond stop, and CI has never run on its own. A
 `0.1.0` on crates.io is a normal release under semver, and cargo
 resolves it for anyone who writes `shep-core = "0.1"`. A pre-release version
 is excluded from that matching by the semver spec, so `0.1.0-alpha.1` cannot
@@ -157,6 +157,11 @@ Afterwards, the install line becomes:
 cargo install shep-cli --version 0.1.0-alpha.1
 ```
 
+`shep-cli` carries three `[[bin]]` targets since Phase 15's library
+extraction, not one — this single command installs all three binaries:
+`shep`, plus the two container-entrypoint aliases `shep-runtime` and
+`shep-dev`.
+
 Add it to the README's status block at that point, replacing "has no install
 script".
 
@@ -200,13 +205,14 @@ cross-compiles for the target, and the README, the crate descriptions and the
 `shep-daemon` readme all say plainly that supervision is unix only. An alpha
 is allowed to have an unsupported platform. A `1.0.0` is not.
 
-**Several v1.0 spec items are unbuilt.** `shep serve`, `shep dev` and
-`shep runtime`, and three of lookout's four panes. All of them are named in
-[specs/deferred.md](specs/deferred.md), and none of them change the
-behaviour of what does exist. They are why the version is an alpha. `.js`
-Flockfiles, the schemars schema, the CLI-flag config layer, and openrc/BSD
-`rc.d` units shipped in Phase 14 — see the two paragraphs below for what
-that means for this release, specifically.
+**A handful of v1.0 spec items are still unbuilt.** `shep serve`, `shep dev`
+and `shep runtime` shipped in Phase 15 and are no longer among them; what
+remains is named in [specs/deferred.md](specs/deferred.md) — OTLP export on
+the metrics dog, and lookout's search/filter and its remaining action keys —
+and none of it changes the behaviour of what does exist. It is why the
+version is an alpha. `.js` Flockfiles, the schemars schema, the CLI-flag
+config layer, and openrc/BSD `rc.d` units shipped in Phase 14 — see the two
+paragraphs below for what that means for this release, specifically.
 
 **The three new init scripts are rendered and pinned by exact-string tests,
 and have not been executed on FreeBSD, OpenBSD, or an openrc host.** No such

@@ -808,6 +808,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   legibility a diffable file gives an auditor. Writes nothing to stdout but
   the JSON-RPC wire; a `shep.toml` that fails to parse reads as the gate
   shut, never open, and prints the parse failure to stderr.
+- **`shep-cli` is now a library crate with three thin `[[bin]]` targets over
+  it** (`shep`, `shep-runtime`, `shep-dev`), rather than one bare binary.
+  Every module stays private; the crate's whole public API is three
+  functions — `main`, `main_runtime`, `main_dev` — each returning
+  `std::process::ExitCode`. This is a packaging change only: it exists
+  because the two container-entrypoint aliases spec §3 asks for cannot share
+  a module tree between `[[bin]]` targets without a library crate
+  underneath, and it is deliberately not a second embedding API — that is
+  `shep-client`'s job. `cargo test -p shep-cli --lib --bins --all-features`
+  is the scoped test run from here on; `--bins` alone now runs almost
+  nothing.
+- Add `shep serve <dir>`, a static file server run as a managed sheep by
+  default (`--foreground` runs it in the current terminal instead).
+  Hand-rolled, not built on axum or tower-http. `--spa` serves `index.html`
+  for a missing path when the request accepts HTML; `--auth <creds-file>`
+  requires HTTP basic auth against a `user:password` line, checked in
+  constant time, from a file that must be mode 0600. Three exposure knobs
+  are off by default and each is a deliberate divergence from pm2's own
+  `serve`: `--listing` (a directory with no `index.html` 404s rather than
+  listing its contents), `--hidden` (a path with a dotfile component 404s,
+  so `shep serve .` in a repo checkout does not publish `.env` or `.git`),
+  and `--follow-symlinks` (every symlink under the docroot 404s, not only
+  one that leaves it — refused by a component-by-component walk, with a
+  stderr line naming the refused path and the flag, on top of an
+  `O_NOFOLLOW` leaf open that closes the remaining race for the default
+  case). `--bind` widens the loopback default; every response carries
+  `X-Content-Type-Options: nosniff`.
+- Add `shep runtime`, the foreground no-daemon mode for containers: resolves
+  a Flockfile, boots the flock in-process with no daemon socket, and
+  auto-exits once the flock is empty of online processes — exit 0 if every
+  sheep stopped clean, exit 11 (`flock_empty`, a new exit code) if one ended
+  in `errored`. At PID 1 it splits into a separate init process first, which
+  calls `set_child_subreaper`, forwards SIGTERM/SIGINT/SIGHUP/SIGQUIT to the
+  supervisor it spawns, and reaps every orphan with its own `WNOHANG` loop —
+  kept out of the supervisor's own process so it cannot race tokio's child
+  reaping. `shep-runtime` is the `[[bin]]` alias that supplies the `runtime`
+  verb for a container `ENTRYPOINT`.
+- Add `shep dev`, an isolated foreground development flock: forced watch,
+  auto-exit, and `$SHEP_DEV_HOME` (default `~/.shep-dev`, overridable for
+  tests) instead of the operator's real `$SHEP_HOME`, so a `shep dev` run
+  never touches a production flock's state. `shep-dev` is the `[[bin]]`
+  alias that supplies the `dev` verb.
 
 ### Changes
 

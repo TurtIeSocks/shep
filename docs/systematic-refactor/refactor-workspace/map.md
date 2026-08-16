@@ -609,6 +609,13 @@ src/
       Notes: multi-call binary (argv[0] dispatch) + [[bin]] aliases pm2-runtime/pm2-dev.
              Hidden `daemon` subcommand = daemonization target. Lazy daemon connection
              (kills --no-daemon argv-scan + startup 100ms hacks).
+      Drift (Phase 15, recorded): shipped as three real `[[bin]]` targets over a
+             `lib.rs` (`shep`, `shep-runtime`, `shep-dev`), not a multi-call binary —
+             argv[0] is never read. Each alias prepends its own verb before parsing
+             (decision 2), so `shep-runtime --version` works without `propagate_version`
+             surprises. The three functions the library exposes (`main`, `main_runtime`,
+             `main_dev`) are the crate's whole public API (decision 1) — the module tree
+             stays private because the crate is published to crates.io.
       The daemon's own diagnostics live HERE, not in shep-daemon (Phase 5 decision):
              `commands/daemon.rs`'s `install_log_subscriber` is called by `run_daemon` and
              deliberately NOT by `shep_daemon::boot`. A global subscriber installs once per
@@ -668,6 +675,17 @@ src/
       Notes: no-daemon mode = daemon event loop in-process. Exit-code contract exact
              (auto-exit fail_count 3 / 2s / code 2). PID-1 zombie reaping added (subreaper +
              WNOHANG loop — pm2 never reaped re-parented orphans).
+      Drift (Phase 15, recorded): the debounce shipped exactly as sketched
+             (fail_count 3 / 2s), but the exit code is **11**, not clap's own 2 — code 2 is
+             claimed by clap for usage errors and an orchestrator cannot act on a status
+             that means both "bad flag" and "dead app" (decision 13, spec §9 update). The
+             reaper is **not** a subreaper + WNOHANG loop inside the supervisor's own
+             process — that would race tokio's own child reaping and corrupt the exit
+             statuses spec §4 promises are exact. Instead PID 1 splits into a separate init
+             process (`commands::reap`) that calls `set_child_subreaper`, forwards
+             SIGTERM/SIGINT/SIGHUP/SIGQUIT to the supervisor it spawns, and reaps every
+             orphan with a `WNOHANG` loop of its own — the init process, not the
+             supervisor, owns that loop (decision 14).
   dev.rs             ← was lib/binaries/DevCLI.js
       Action: port
       Notes: ~/.pm2-dev namespace, forced watch, post-exec hook, auto-exit; bus subscription
@@ -753,6 +771,22 @@ src/
       Notes: axum + tower-http ServeDir (traversal/ranges free), SPA fallback, dir listing,
              basic-auth via ConstantTimeEq + creds file (not env), PM2_SERVE_* env compat.
              APM injection dropped. Runs as managed instance of own binary (hidden subcommand).
+      Drift (Phase 15, recorded): shipped as `serve/` with six modules — `path`, `fs`,
+             `mime`, `listing`, `auth`, `worker` — hand-rolled on `http.rs` (which moved up
+             out of `dog/` to the crate root, Task 2), not on axum + tower-http (Rin's
+             ruling, 2026-08-15: `docs/specs/deferred.md` has the reasoning). Directory
+             listing and dotfiles are both refused by default (`--listing`/`--hidden` opt
+             in), the reverse of pm2's own defaults. No `PM2_SERVE_*` env compatibility —
+             shep reads `SHEP_`-prefixed variables and nobody else's. Every symlink under
+             the docroot is refused by default, not only one that leaves it; `fs::contain`
+             walks each path component and refuses one that is a symlink unless
+             `--follow-symlinks` is set, and `fs::open_regular`'s leaf open carries
+             `O_NOFOLLOW` regardless — the walk is not atomic, so this closes the TOCTOU
+             for the common case without a per-request `canonicalize`, and the residue (a
+             local attacker who can create files in the docroot can still get a directory
+             component swapped between two stats) is documented, not claimed away. No range
+             requests, conditional requests, ETags, compression, keep-alive, TLS, or HTTP/2
+             — none are named in spec §9's serve sentence.
   web.rs             ← was lib/HttpInterface.js
       Action: rewrite
       Notes: GET / payload shape kept; 127.0.0.1 default, --with-env opt-in, bearer token opt.

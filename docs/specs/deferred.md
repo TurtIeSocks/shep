@@ -122,16 +122,6 @@ two-second poll timer for whichever sheep is selected is the cost this phase
 declined to add. Rendered frames of what both 12a and 12b built are in
 [docs/lookout/frames.txt](../lookout/frames.txt).
 
-**serve** (spec §9, §13) — static file server as a managed sheep. `axum`
-and `tower-http` are not dependencies of any crate.
-
-**dev / runtime** (spec §9, §13) — `shep dev` (isolated `$SHEP_HOME`,
-forced watch) and `shep runtime` (foreground no-daemon container mode,
-PID-1 zombie reaping). Neither verb exists, nor the `shep-runtime`/
-`shep-dev` `[[bin]]` aliases spec §3 describes — `shep-cli/Cargo.toml` has
-one `[[bin]]`.
-
-
 ## Known debt, recorded rather than built
 
 Not scope cuts and not unbuilt spec surface — these are things that exist and
@@ -600,3 +590,49 @@ with it; `signal_sheep` and `whisper` take free-form input whose blast
 radius is not shep's to bound; `scale_flock` takes a count a model can be
 off by an order of magnitude on. That is a judgement about what an agent
 should be trusted with, not a technical limit, and it is Rin's to overrule.
+
+**`shep serve`, `shep dev` and `shep runtime`** (spec §9, §13) **shipped**,
+Phase 15, closing the last three v1.0 verbs and the `[[bin]]` gap this file
+used to name:
+
+- **`serve` is hand-rolled, not axum/tower-http** (Rin's ruling, 2026-08-15).
+  `crates/shep-cli/src/serve/` is six modules — `path`, `fs`, `mime`,
+  `listing`, `auth`, `worker` — over `http.rs`, which moved up out of `dog/`
+  to the crate root to serve both.
+- **Directory listing is off by default**, where pm2's is on — `--listing`
+  opts in. A listing publishes every filename under the directory.
+- **Dotfiles are refused by default**, where pm2's `serve` publishes them —
+  the reverse of the listing flip and the same argument. `--hidden` opts
+  in; `.well-known/acme-challenge` is the use case it exists for.
+- **No range requests, no conditional requests, no ETags, no compression,
+  no keep-alive, no TLS, no HTTP/2, no `PM2_SERVE_*` compatibility.** None
+  are named in spec §9's serve sentence; shep reads only `SHEP_`-prefixed
+  variables. Range and conditional requests are v1.1 candidates — the
+  visible cost today is no video seeking and a full re-read per request.
+- **Exit code 11 (`flock_empty`) exists, and code 2 is clap's alone.**
+  `runtime`'s fail-fast status collided with clap's usage-error code; an
+  orchestrator cannot act on a status that means both "bad flag" and "dead
+  app", so it now has its own code — 0 if the flock emptied clean, 11 if a
+  sheep ended in `errored`.
+- **`runtime` splits into a separate init process when it is PID 1**, rather
+  than reaping in the supervisor's own process. An in-process subreaper
+  loop would race tokio's own child reaping and corrupt the exit statuses
+  spec §4 promises are exact; the init instead calls
+  `set_child_subreaper`, forwards SIGTERM/SIGINT/SIGHUP/SIGQUIT to the
+  supervisor it spawns, and reaps every orphan itself.
+- **`serve`'s remaining symlink race, stated as what it is**: the leaf open
+  (`fs::open_regular`) carries `O_NOFOLLOW`, but the component walk that
+  precedes it is not atomic. What that leaves an attacker who can create
+  files in the docroot between the walk and the open is a refusal or a
+  directory they already controlled — not a read outside the docroot.
+- **Any symlink under the docroot is refused by default, not only one that
+  leaves it** — only the docroot itself may be a symlink unless the
+  operator says otherwise. An in-docroot symlink pointing back inside the
+  docroot (`dist/current -> ../releases/2026-08-15`, a symlinked `assets/`)
+  404s by default, where pm2's serve and a canonicalize-then-check design
+  both serve it — the deliberate cost of closing the TOCTOU above without a
+  per-request `canonicalize`. It is off by default, one flag away:
+  `--follow-symlinks` opts back into canonicalize-then-check, reopening the
+  race, with a startup notice and, in the default mode on refusal, a
+  per-request stderr line naming the path so the choice and its cost are
+  never silent.

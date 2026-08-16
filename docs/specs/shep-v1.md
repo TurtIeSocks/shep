@@ -401,6 +401,7 @@ reach processes the operator never named.
 | 8 | deadline exceeded | The request outlived its deadline. |
 | 9 | internal | An unexpected daemon-side failure. |
 | 10 | daemon already running | Another daemon already holds this `$SHEP_HOME`. |
+| 11 | flock empty | The foreground flock emptied with a sheep in `errored`. `runtime`'s fail-fast status. |
 
 Code 10 is a contract across a process boundary, not merely a CLI detail: a
 CLI that loses the race to start a daemon learns it only from the exit
@@ -409,8 +410,10 @@ and the client must read 10 as "another daemon won — keep probing", never
 as a failure.
 
 Code 2 is claimed by clap for usage errors, which collides with the
-fail-fast code `runtime` is specified to use below. `runtime` resolves that
-when it is built.
+fail-fast code `runtime` is specified to use below. Resolved by giving
+`runtime`'s fail-fast status its own code, 11, rather than sharing clap's:
+an orchestrator watching the exit status cannot act on a code that means
+both "bad flag" and "dead app".
 
 **lookout (TUI):** ratatui; panes = flock table, bleats feed, sheep detail,
 host usage; event-driven redraw; search/filter.
@@ -425,8 +428,12 @@ json/yaml/js) → emits Flockfile + report of unmapped fields; `--start` to
 adopt immediately. Companion `docs/migration.md`. All pm2 format knowledge
 confined here.
 
-**serve:** static file server as a managed sheep (axum + tower-http, SPA
-fallback, dir listing, constant-time basic auth from creds file).
+**serve:** static file server as a managed sheep, hand-rolled rather than on
+axum + tower-http (Rin's ruling — `docs/specs/deferred.md` has the reasoning),
+SPA fallback, constant-time basic auth from a creds file. `--listing` and
+`--hidden` opt into directory listing and dotfiles, both off by default;
+`--bind` widens the loopback default; `--follow-symlinks` opts into following
+symlinks under the docroot, off by default.
 
 **dev:** isolated `$SHEP_HOME` (`~/.shep-dev`), forced watch, auto-exit.
 **runtime:** foreground no-daemon mode for containers: PID-1 zombie reaping,

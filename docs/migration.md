@@ -238,7 +238,61 @@ than after. If it is missing something, rerun as
 login `PATH` through instead. `systemctl cat shep-<user>` still shows
 what was actually written, at step 7 or any time after.
 
-## 6. Rolling back
+## 6. `pm2 serve` → `shep serve`
+
+`shep serve <dir>` is a hand-rolled static file server, not axum +
+tower-http, run as a managed sheep by default (add `--foreground` to run it
+in the current terminal instead). Three defaults are flipped from pm2's own
+`serve`, and each is a regression before it is a fix if you are not expecting
+it:
+
+- **Directory listing is off by default.** pm2 lists a directory that has no
+  `index.html`; shep 404s it unless you pass `--listing`. A listing publishes
+  every filename under the directory, and shep's posture is that the operator
+  opts into that rather than discovering it later.
+- **Dotfiles are refused by default.** pm2's `serve` publishes them; shep 404s
+  any path with a dotfile component unless you pass `--hidden`. Serving a repo
+  checkout with `shep serve .` would otherwise publish `.env` and the whole
+  `.git` history. `--hidden` exists mainly for `.well-known/acme-challenge`.
+- **Every symlink under the docroot is refused by default, not only one that
+  leaves it.** A deploy layout like `dist/current -> ../releases/2026-08-15`
+  or a symlinked `assets/` 404s unless you pass `--follow-symlinks`. Passing
+  it reopens a check-then-open race that the default mode closes without a
+  per-request `canonicalize` — that is the trade you are making, not an
+  incidental cost, so reach for it deliberately for a layout that needs it,
+  not out of habit carried over from pm2.
+
+There is no `PM2_SERVE_*` environment compatibility — shep reads only
+`SHEP_`-prefixed variables. Pass `--port`, `--bind`, `--spa`, `--auth
+<creds-file>` and the three flags above on the command line instead.
+
+## 7. `pm2-runtime` → `shep runtime`
+
+`shep-runtime` is the container entrypoint alias for `shep runtime`: a
+foreground, no-daemon supervisor that reads a Flockfile, boots the flock
+in-process, and auto-exits when it empties (exit 0 if every sheep stopped
+clean, exit 11 if one ended in `errored` — see `docs/specs/shep-v1.md`'s exit
+code table). At PID 1 it splits into a small init process first, so it can
+reap re-parented orphans and forward SIGTERM/SIGINT/SIGHUP/SIGQUIT to the
+supervisor — a container that skips this step accumulates zombies until
+`docker stop` waits out the full grace period before SIGKILLing everything
+mid-shutdown.
+
+A minimal Dockerfile:
+
+```dockerfile
+FROM debian:bookworm-slim
+COPY shep-runtime /usr/local/bin/shep-runtime
+COPY Flockfile.toml /shep/Flockfile.toml
+ENV SHEP_HOME=/shep
+WORKDIR /shep
+ENTRYPOINT ["shep-runtime"]
+```
+
+`SHEP_HOME` is not defaulted for you inside a container — an unset one fails
+fast naming the flag, rather than inventing `/var/lib/shep` at 2am.
+
+## 8. Rolling back
 
 `shep unstartup` disables and removes the unit `shep startup` installed:
 `sudo shep unstartup --user <you>`. Run unprivileged, it prints the same

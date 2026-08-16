@@ -39,6 +39,14 @@ the reason the unfiltered lib run costs ~25s instead. A mutation in
 watcher plumbing, or to timing-sensitive behavior in `extras.rs` or the
 sampler, does, so run the unfiltered lib suite when touching either.
 
+From Phase 15 on, `shep-cli` is a library with three thin `[[bin]]` targets
+over it (`shep`, `shep-runtime`, `shep-dev`) rather than one bare binary — the
+two container-entrypoint aliases spec §3 asks for cannot share a module tree
+without a library underneath them. A **shep-cli-scoped** run therefore needs
+both halves: `cargo test -p shep-cli --lib --bins --all-features`. `--bins`
+alone now runs almost nothing, since every unit test in the crate lives in the
+library.
+
 ### The task gate — run once, when the task is otherwise done
 
 ```bash
@@ -201,6 +209,14 @@ flags` daemon-config layer (`shep daemon --log-json/--log-level/--socket/
 --max-cron-sleep`), and openrc plus FreeBSD/OpenBSD `rc.d` renderers for
 `shep startup`/`unstartup` — the last two rendered and pinned by
 exact-string tests only, never executed on their own operating systems.
+Phase 15 merged: the last three v1 verbs — a hand-rolled `shep serve` (no
+axum, no tower-http; dotfiles, directory listing, and every in-docroot
+symlink all refused by default), `shep runtime` (foreground, no-daemon, PID-1
+via a separate init process that reaps orphans and forwards signals), and
+`shep dev` (isolated `$SHEP_DEV_HOME`, forced watch, auto-exit) — plus the
+`shep-cli` library extraction the two container-entrypoint `[[bin]]` aliases
+needed underneath them. The v1.0 CLI surface is closed except for the
+Windows functional tier.
 
 What's built vs. deferred to v1.1+: [docs/specs/deferred.md](docs/specs/deferred.md).
 Windows is 0%, not partial — every verb prints "not yet supported" and exits.

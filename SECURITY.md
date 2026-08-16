@@ -231,13 +231,63 @@ file at that same canonicalized path afterward — after adoption, before the
 daemon next execs it — is a window nothing here closes: the path is what is
 pinned, not a hash of what was read from it.
 
+### `shep serve`
+
+`shep serve <dir>` binds `127.0.0.1` by default, same as the metrics dog
+below; `--bind` widens that to a non-loopback address, at which point the
+operator owns any additional network controls (firewalling, TLS
+termination). Auth is HTTP basic, checked in constant time against a
+`user:password` line in a file `--auth` names, which must be mode 0600; it
+is sent over plain HTTP, so it is base64, not encryption, and any additional
+transport security is the operator's to add. Dotfiles are refused by
+default — `--hidden` opts in — so `shep serve .` in a repo checkout does not
+publish `.env` or `.git` by default the way pm2's own `serve` would.
+
+**Traversal:** every request path is resolved by walking one component at a
+time under the docroot rather than joining and canonicalizing the whole
+thing, so `..`, percent- and double-encoded traversal segments, a NUL byte,
+a raw or encoded backslash, and a drive prefix like `C:` are all refused —
+each with its own test. Auth is checked before path resolution, so an
+unauthenticated client cannot use a 400-vs-404 split to map the docroot's
+contents; every refusal in the resolver is 400 or 404, never 403, so the
+server never confirms the existence of a file it will not serve.
+
+**Symlinks: what the defences cover, and what they do not.** By default,
+every symlink under the docroot is refused, not only one whose target
+leaves it — `serve::fs::contain` walks the path component by component and
+refuses the first one that is a symlink. On top of that, the file's own
+open (`serve::fs::open_regular`) always carries `O_NOFOLLOW`, whether or not
+`--follow-symlinks` is set, as the last-line lock on the race the walk
+itself cannot close: the component walk is a sequence of separate
+`lstat`/`read_dir` calls, not one atomic resolve, so a local attacker who
+can create files in the docroot between the walk and the open can still get
+a directory component swapped underneath the request. What that residue
+buys such an attacker is a refusal (`O_NOFOLLOW` rejects the open) or, at
+worst, a path inside a directory they already controlled — not a read
+outside the docroot. State the residue as what it is; the race is narrowed,
+not gone.
+
+`--follow-symlinks` opts back into following symlinks under the docroot —
+for a deploy layout like `dist/current -> ../releases/2026-08-15` — by
+canonicalizing the resolved path once and checking it with
+`Path::starts_with` against the canonical root. That reopens a **larger**
+and distinct residue, not a footnote on the one above: the window moves to
+between that canonicalize and `open_regular`'s open of the path it
+returned — the per-request canonicalize-then-open gap the default mode
+exists specifically to avoid. Passing the flag is that trade, made
+deliberately; it prints a startup notice, and every refusal it still hits
+in default-refusing components elsewhere in the walk writes a line to
+stderr naming the refused path and the flag — the sheep's own bleats, and
+the only place an operator debugging an unexpected 404 can tell "refused a
+symlink" apart from "genuinely missing".
+
 ### Metrics and serve binds
 
-The metrics dog's Prometheus exposition endpoint and the `shep serve` static
-file server both bind `127.0.0.1` by default. Reaching either from another
-host requires an explicit config change to bind a non-loopback address, at
-which point the operator is responsible for any additional network
-controls (firewalling, TLS termination, auth).
+The metrics dog's Prometheus exposition endpoint binds `127.0.0.1` by
+default, same as `shep serve` above. Reaching it from another host requires
+an explicit config change to bind a non-loopback address, at which point the
+operator is responsible for any additional network controls (firewalling,
+TLS termination, auth).
 
 ## Non-goals
 

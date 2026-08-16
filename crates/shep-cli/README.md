@@ -34,6 +34,18 @@ envelope, so you can pipe it somewhere without scraping columns.
 
 `shep import` reads a real pm2 dump and writes a Flockfile out of it.
 
+This crate builds three binaries, not one: `shep` itself, plus
+`shep-runtime` and `shep-dev` — thin wrappers that prepend `runtime` and
+`dev` before parsing, for use as a container `ENTRYPOINT` (`shep runtime` and
+`shep dev` work identically through the `shep` binary; the aliases exist so a
+container image needs no shell to supply the verb). `cargo install shep-cli`
+installs all three.
+
+Embedding shep in another program is [`shep-client`](https://crates.io/crates/shep-client)'s
+job, not this crate's — `shep-cli` exposes nothing beyond its three `main*`
+entry points, each of which owns the whole process (exit code, `argv`, signal
+handling) the way a CLI is expected to.
+
 The repository README has the full lexicon, what works today, and what is not
 built yet. shep is pre-release: no tagged release, and several v1.0 items are
 still missing.

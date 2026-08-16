@@ -11,17 +11,18 @@
 //! tree that is `#[cfg(unix)]` in half its dispatch, an exit code it expects
 //! to own) this one does.
 //!
-//! A static file server (`serve`) and the container (`shep runtime`) and dev
-//! (`shep dev`) execution modes are spec'd (`docs/specs/shep-v1.md` §9) but
-//! not built — this crate depends on neither `axum` nor `tower-http`. Three
-//! `[[bin]]` targets sit over this library: `shep` itself, plus
-//! `shep-runtime` and `shep-dev`, the two container-entrypoint aliases that
-//! prepend their verb before parsing (see `main_runtime`/`main_dev`). The
-//! ratatui `lookout` dashboard has its shell and its flock table (Phase
-//! 12a); its other three panes — the bleats feed, the sheep detail and the
-//! host-usage strip — are 12b. Recorded here as deliberately absent or
-//! deliberately partial rather than letting either read as shipped; full
-//! inventory: `docs/specs/deferred.md`.
+//! `serve`, `runtime`, and `dev` (spec `docs/specs/shep-v1.md` §9) shipped in
+//! Phase 15: a hand-rolled static file server (no `axum`, no `tower-http`;
+//! Rin's ruling — the ledger has the reasoning), a foreground no-daemon
+//! container mode with a PID-1 init split for zombie reaping, and an isolated
+//! foreground development flock. Three `[[bin]]` targets sit over this
+//! library: `shep` itself, plus `shep-runtime` and `shep-dev`, the two
+//! container-entrypoint aliases that prepend their verb before parsing (see
+//! `main_runtime`/`main_dev`). The ratatui `lookout` dashboard has its shell
+//! and its flock table (Phase 12a); its other three panes — the bleats feed,
+//! the sheep detail and the host-usage strip — are 12b. Recorded here as
+//! deliberately absent or deliberately partial rather than letting either
+//! read as shipped; full inventory: `docs/specs/deferred.md`.
 
 #![forbid(unsafe_code)]
 
