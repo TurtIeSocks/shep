@@ -167,6 +167,7 @@ interface RoamerSpec {
   fleece?: string;
   bobDuration: string;
   bobDelay: string;
+  trotDuration: string;
   lamb?: { width: number; fleece?: string; gambolDuration: string };
 }
 
@@ -183,6 +184,7 @@ const roaming: RoamerSpec[] = [
     fleece: "#b5895f",
     bobDuration: "5.1s",
     bobDelay: ".6s",
+    trotDuration: "0.9s",
     lamb: { width: 36, gambolDuration: "1.15s" },
   },
   {
@@ -197,6 +199,7 @@ const roaming: RoamerSpec[] = [
     fleece: "#4b463d",
     bobDuration: "6.2s",
     bobDelay: ".2s",
+    trotDuration: "1.05s",
   },
   {
     depth: "far",
@@ -209,6 +212,7 @@ const roaming: RoamerSpec[] = [
     width: 44,
     bobDuration: "6.9s",
     bobDelay: ".9s",
+    trotDuration: "1.1s",
     /* width >= 32 so Sheep.astro's build-time legs rule keeps the lamb's
        legs — 28 produced a legless blob bouncing across the far hill. */
     lamb: { width: 34, fleece: "#b5895f", gambolDuration: "0.95s" },
@@ -246,6 +250,7 @@ const grazing = [
     bobDuration: "6.8s",
     bobDelay: ".3s",
     chewing: false,
+    trotDuration: "1.1s",
     walkAmp: "2.5vw",
     walkDuration: "34s",
     walkDelay: "0s",
@@ -267,6 +272,7 @@ const grazing = [
     bobDuration: "5.6s",
     bobDelay: ".8s",
     chewing: true,
+    trotDuration: "0.95s",
     walkAmp: "2vw",
     walkDuration: "24s",
     walkDelay: "1.4s",
@@ -279,6 +285,7 @@ const grazing = [
     bobDuration: "4.8s",
     bobDelay: "0s",
     chewing: false,
+    trotDuration: "0.85s",
     walkAmp: "2.5vw",
     walkDuration: "17s",
     walkDelay: "2.6s",
@@ -391,6 +398,8 @@ const grazing = [
           bobDuration={sheep.bobDuration}
           bobDelay={sheep.bobDelay}
           chewing={sheep.chewing}
+          trot
+          trotDuration={sheep.trotDuration}
         />
       </div>
     ))}
@@ -411,6 +420,8 @@ const grazing = [
             bob
             bobDuration={r.bobDuration}
             bobDelay={r.bobDelay}
+            trot
+            trotDuration={r.trotDuration}
           />
           {r.lamb && (
             <div class="lamb" style={`--gambol-duration:${r.lamb.gambolDuration};`}>

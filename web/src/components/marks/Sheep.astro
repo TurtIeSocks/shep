@@ -26,6 +26,11 @@ interface Props {
      --fleece token. The eye-white follows it so a dark sheep's eye reads
      as the same wool, not a stark white sticker. */
   fleece?: string;
+  /* Legs swing in alternating phase (the trot keyframes in motion.css) —
+     for sheep that walk or roam, not for a standing flock. No-op when the
+     width rule has already dropped the legs. */
+  trot?: boolean;
+  trotDuration?: string;
   class?: string;
 }
 
@@ -38,6 +43,8 @@ const {
   bobDuration = "5.6s",
   bobDelay = "0s",
   fleece,
+  trot = false,
+  trotDuration = "0.95s",
   class: className,
 } = Astro.props;
 
@@ -46,21 +53,22 @@ const wrapperStyle = [
   bob ? `--bob-duration:${bobDuration}` : null,
   bob ? `--bob-delay:${bobDelay}` : null,
   fleece ? `--sheep-fleece:${fleece}` : null,
+  trot ? `--trot-duration:${trotDuration}` : null,
 ]
   .filter(Boolean)
   .join(";");
 ---
 
 <div
-  class:list={["sheep-mark", bob && "anim-bob", className]}
+  class:list={["sheep-mark", bob && "anim-bob", trot && "anim-trot", className]}
   style={wrapperStyle}
 >
   <svg viewBox="0 0 104 78" width="100%" role="img" aria-label="a sheep">
     {
       legs && (
         <g fill="var(--ink)">
-          <rect x="40" y="52" width="8" height="21" rx="4" />
-          <rect x="66" y="52" width="8" height="21" rx="4" />
+          <rect class="sheep-leg-a" x="40" y="52" width="8" height="21" rx="4" />
+          <rect class="sheep-leg-b" x="66" y="52" width="8" height="21" rx="4" />
         </g>
       )
     }

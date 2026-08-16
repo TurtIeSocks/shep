@@ -160,6 +160,25 @@
 }
 
 /*
+ * Leg swing for walking sheep: the two leg rects rotate in alternating
+ * phase (the second leg runs the same animation offset by half a period —
+ * see .anim-trot below). Amplitude is small on purpose: the walk and roam
+ * transforms both have standing graze plateaus, and a gentle swing reads
+ * as stepping while moving but only as weight-shifting while stood — the
+ * alternative, syncing the swing to each rhythm's moving segments, would
+ * need a keyframe forest per rhythm for no visible gain at sheep size.
+ */
+@keyframes trot {
+  0%,
+  100% {
+    transform: rotate(12deg);
+  }
+  50% {
+    transform: rotate(-12deg);
+  }
+}
+
+/*
  * Utility classes for the four animations. Each reads its duration/delay from
  * a custom property set inline on the element (falls back to the handoff's
  * default), and is a no-op unless the visitor has no reduced-motion preference.
@@ -198,6 +217,18 @@
   .anim-gambol {
     animation: gambol var(--gambol-duration, 1.1s) ease-in-out infinite;
     animation-delay: var(--gambol-delay, 0s);
+  }
+
+  .anim-trot .sheep-leg-a,
+  .anim-trot .sheep-leg-b {
+    /* fill-box so each rect rotates about its own hip, not the svg origin */
+    transform-box: fill-box;
+    transform-origin: 50% 12%;
+    animation: trot var(--trot-duration, 0.95s) ease-in-out infinite;
+  }
+
+  .anim-trot .sheep-leg-b {
+    animation-delay: calc(var(--trot-duration, 0.95s) / -2);
   }
 }
 
