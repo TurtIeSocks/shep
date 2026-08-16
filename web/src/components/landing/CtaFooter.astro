@@ -1,54 +1,40 @@
 ---
 /*
- * CTA band + footer bar. Copy verbatim from docs/shep-design/README.md,
+ * Closing CTA. Copy verbatim from docs/shep-design/README.md,
  * "Screens > 1. Landing page > CTA footer", except "1030 tests" -> "Over a
  * thousand tests": that literal count already drifted once (README.md's
  * own copy made this exact fix — "Tested by trying to break it. Over a
  * thousand tests..." — so this page follows the source-of-truth voice
  * instead of reintroducing a number that decays every phase).
+ *
+ * The old ink footer bar (license line + a Docs link) and the decorative
+ * bobbing flock row are gone: the license lives with the docs, the nav
+ * already links Docs, and the living pasture behind this section carries
+ * far more sheep than a static row ever did. The page now ends on the
+ * scene itself.
  */
-import Sheep from "../marks/Sheep.astro";
-
-const flock = [
-  { width: 72, dur: "5.2s", delay: "0s" },
-  { width: 104, dur: "6.1s", delay: ".5s" },
-  { width: 58, dur: "4.6s", delay: "1.1s" },
-  { width: 88, dur: "5.7s", delay: ".2s" },
-  { width: 66, dur: "6.6s", delay: ".8s" },
-];
 ---
 
 <section class="cta">
   <div class="inner">
-    <div class="row">
-      <div class="copy">
-        <h2>Build it and tell me<br />what breaks.</h2>
-        <p>
-          Rust 1.88 or newer, edition 2024. Over a thousand tests, and every
-          task ends with a mutation pass: break a line on purpose, confirm a
-          test goes red, put it back.
-        </p>
-      </div>
-      <div class="buttons">
-        <a href="https://github.com/TurtIeSocks/shep" class="btn butter press" style="--shadow-offset:6px; --shadow-color:var(--ink); --press-offset:3px;">
-          Clone the repo
-        </a>
-        <a href="/docs" class="btn cream press" style="--shadow-offset:6px; --shadow-color:var(--ink); --press-offset:3px;">
-          Read the docs
-        </a>
-      </div>
-    </div>
-    <div class="flock" aria-hidden="true">
-      {flock.map((f) => (
-        <Sheep width={f.width} bob bobDuration={f.dur} bobDelay={f.delay} />
-      ))}
-    </div>
-  </div>
-  <div class="bar">
-    <div class="bar-inner">
-      <span class="license">MIT OR Apache-2.0, at your option.</span>
-      <div class="links">
-        <a href="/docs">Docs</a>
+    <div class="board">
+      <div class="row">
+        <div class="copy">
+          <h2>Build it and tell me<br />what breaks.</h2>
+          <p>
+            Rust 1.88 or newer, edition 2024. Over a thousand tests, and every
+            task ends with a mutation pass: break a line on purpose, confirm a
+            test goes red, put it back.
+          </p>
+        </div>
+        <div class="buttons">
+          <a href="https://github.com/TurtIeSocks/shep" class="btn butter press" style="--shadow-offset:6px; --shadow-color:var(--ink); --press-offset:3px;">
+            Clone the repo
+          </a>
+          <a href="/docs" class="btn cream press" style="--shadow-offset:6px; --shadow-color:var(--ink); --press-offset:3px;">
+            Read the docs
+          </a>
+        </div>
       </div>
     </div>
   </div>
@@ -58,12 +44,10 @@ const flock = [
   .cta {
     position: relative;
     z-index: 7;
-    /* No background — rides the sky stage (see Lexicon.astro), which is
-       why the copy below is ink-on-sky now instead of the cream-on-green
-       it wore over the old --grass-deep band. The closing .bar stays
-       solid ink: it's the page's baseboard, not a swapped-out backdrop.
-       clip, not hidden, as everywhere inside the stage. */
-    padding: 70px 0 0;
+    /* Rides the sky stage (see Lexicon.astro); the closing board below is
+       what keeps the copy readable over the scenery. clip, not hidden, as
+       everywhere inside the stage. */
+    padding: 70px 0 110px;
     overflow-x: clip;
   }
 
@@ -71,6 +55,50 @@ const flock = [
     max-width: 1240px;
     margin: 0 auto;
     padding: 0 28px;
+  }
+
+  /* Same whitewashed-plank language as the feature cards (the recipe note
+     lives in SignpostCard.astro): ink copy was unreadable straight over
+     the hills and the walking flock. 48px period, two 24px body lines. */
+  .board {
+    position: relative;
+    background: var(--paper-2);
+    border: 4px solid var(--line);
+    border-radius: 26px;
+    box-shadow: 9px 9px 0 var(--shadow);
+    padding: 44px 46px;
+    background-image:
+      repeating-linear-gradient(
+        180deg,
+        rgba(23, 37, 28, 0) 0 45px,
+        rgba(23, 37, 28, 0.12) 45px 48px
+      ),
+      repeating-linear-gradient(
+        180deg,
+        rgba(255, 255, 255, 0.12) 0 4px,
+        rgba(255, 255, 255, 0) 8px 48px
+      );
+    background-position-y: 10px;
+  }
+
+  .board::before,
+  .board::after {
+    content: "";
+    position: absolute;
+    top: 15px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--ink);
+    opacity: 0.55;
+  }
+
+  .board::before {
+    left: 15px;
+  }
+
+  .board::after {
+    right: 15px;
   }
 
   .row {
@@ -125,53 +153,6 @@ const flock = [
     color: var(--ink);
   }
 
-  .flock {
-    display: flex;
-    align-items: flex-end;
-    justify-content: center;
-    gap: 22px;
-    margin-top: 44px;
-  }
-
-  .bar {
-    background: var(--ink);
-    margin-top: -4px;
-    border-top: 4px solid var(--ink);
-  }
-
-  .bar-inner {
-    max-width: 1240px;
-    margin: 0 auto;
-    padding: 26px 28px;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    justify-content: space-between;
-    gap: 18px;
-  }
-
-  .license {
-    font-family: "Space Mono", monospace;
-    font-size: 12.5px;
-    color: #8fbfa4;
-  }
-
-  .links {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 20px;
-    font-size: 14.5px;
-  }
-
-  .links a {
-    color: var(--fleece);
-    text-decoration: none;
-  }
-
-  .links a:hover {
-    color: var(--butter);
-  }
-
   /* Responsive first pass (docs/shep-design/README.md, "Responsive"):
      single-column stack below ~640px instead of squeezing the button
      column into whatever space is left beside the heading. */
@@ -182,6 +163,10 @@ const flock = [
 
     .buttons {
       justify-items: stretch;
+    }
+
+    .board {
+      padding: 32px 26px;
     }
   }
 </style>
