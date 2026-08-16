@@ -2057,7 +2057,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "shep-cli"
+name = "shep"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
