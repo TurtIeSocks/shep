@@ -2,7 +2,7 @@
   "schema_version": 1,
   "command": "ping",
   "data": {
-    "daemon_version": "0.1.0",
+    "daemon_version": "0.1.0-alpha.1",
     "pid": null
   }
 }
