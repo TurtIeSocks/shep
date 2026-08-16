@@ -741,8 +741,8 @@ const grazing = [
     position: absolute;
     left: -3%;
     right: -3%;
-    bottom: 22%;
-    height: 24vh;
+    bottom: 21%;
+    height: 26vh;
     opacity: 0;
     background:
       radial-gradient(
@@ -751,7 +751,7 @@ const grazing = [
         rgba(251, 246, 231, 0) 70%
       ),
       radial-gradient(
-        46% 64% at 58% 38%,
+        46% 64% at 58% 42%,
         rgba(251, 246, 231, 0.6),
         rgba(251, 246, 231, 0) 72%
       ),
@@ -760,6 +760,26 @@ const grazing = [
         rgba(251, 246, 231, 0.7),
         rgba(251, 246, 231, 0) 70%
       );
+    /* The band is a hard-edged box, and any fog ellipse whose soft falloff
+       reaches past it gets sliced flat at the boundary — the middle puff's
+       vertical reach crossed the band's top and drew a visible straight
+       edge across the night sky. The mask fades the band's own edges so
+       nothing inside it can ever terminate in a hard line, whatever the
+       ellipse geometry above does. */
+    -webkit-mask-image: linear-gradient(
+      180deg,
+      transparent 0%,
+      #000 24%,
+      #000 76%,
+      transparent 100%
+    );
+    mask-image: linear-gradient(
+      180deg,
+      transparent 0%,
+      #000 24%,
+      #000 76%,
+      transparent 100%
+    );
   }
 
   .grazing-sheep {
