@@ -60,10 +60,10 @@ struct RawFlockfile {
 /// that runs in `cargo test` rather than in a CI job somebody can forget.
 ///
 /// It lives INSIDE this package, not at the repository root. `cargo package`
-/// packs only files under the package directory, and shep-core and shep-cli
+/// packs only files under the package directory, and shep-core and shep
 /// are both published (`docs/releasing.md`), so a root-relative
 /// `include_str!` would compile here and fail for everyone who runs
-/// `cargo install shep-cli`.
+/// `cargo install shep`.
 ///
 /// Read only by `the_committed_schema_is_current` below, so a plain `cargo
 /// build`/`clippy` (no `#[cfg(test)]`) sees no reader and flags it dead.

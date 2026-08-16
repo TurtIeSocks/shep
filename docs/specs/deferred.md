@@ -348,7 +348,7 @@ server at require time rather than exporting config — hangs `shep start`
 forever. There is no bound on the wait.
 
 Not built because a bound means a reaper thread in a crate that forbids
-unsafe code (`#![forbid(unsafe_code)]` on shep-cli), for a case where the
+unsafe code (`#![forbid(unsafe_code)]` on shep), for a case where the
 process is in the foreground, attached to the operator's own terminal, and
 already interruptible with Ctrl-C. What would force it: any path that
 evaluates a `.js` Flockfile unattended — a CI job or a provisioning script
@@ -535,7 +535,7 @@ A `.js` module that never returns hangs `shep start` forever; there is no
 timeout, recorded as known debt below.
 
 **schemars JSON-schema export** (spec §5) **shipped**, Phase 14, behind a
-non-default `schema` feature on shep-core that shep-cli turns on. The schema
+non-default `schema` feature on shep-core that shep turns on. The schema
 describes the Flockfile **document** (generated from `RawFlockfile`, the
 private type serde actually deserializes into, not from `AppConfig` alone —
 an `AppConfig`-only schema would reject every real Flockfile, since a

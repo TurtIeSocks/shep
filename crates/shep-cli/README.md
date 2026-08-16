@@ -1,4 +1,4 @@
-# shep-cli
+# shep
 
 The `shep` binary. [shep](https://github.com/TurtIeSocks/shep) is a process
 manager written in Rust: one binary runs a daemon called the shepherd, which
@@ -38,11 +38,11 @@ This crate builds three binaries, not one: `shep` itself, plus
 `shep-runtime` and `shep-dev` — thin wrappers that prepend `runtime` and
 `dev` before parsing, for use as a container `ENTRYPOINT` (`shep runtime` and
 `shep dev` work identically through the `shep` binary; the aliases exist so a
-container image needs no shell to supply the verb). `cargo install shep-cli`
+container image needs no shell to supply the verb). `cargo install shep`
 installs all three.
 
 Embedding shep in another program is [`shep-client`](https://crates.io/crates/shep-client)'s
-job, not this crate's — `shep-cli` exposes nothing beyond its three `main*`
+job, not this crate's — `shep` exposes nothing beyond its three `main*`
 entry points, each of which owns the whole process (exit code, `argv`, signal
 handling) the way a CLI is expected to.
 
