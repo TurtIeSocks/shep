@@ -10,6 +10,7 @@
  * inside a kept row is edited.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 import NotBuilt from "../../components/docs/NotBuilt.astro";
@@ -63,13 +64,40 @@ host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%  
   3     billing-reconciliation-worker         waiting-restart  -        3         -       -         1h 19m    -
   4     cron                                  stopped          -        0         -       -         1h 21m    -
   5     metrics                               online           48240    0         0.4%    11.0M     1h 22m    -
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+sheep 2  api   errored   pid -   restarts 14   uptime 1h 18m   cpu -   mem -   fold edge
+out  /home/rin/.shep/logs/api-2-out.log
+err  /home/rin/.shep/logs/api-2-err.log
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+bleats  api  … 1 earlier line not shown
+out  GET /healthz 200 3ms
+out  GET /v1/orders 200 44ms
+out  POST /v1/orders 201 88ms
+out  GET /v1/orders/8821 200 9ms
+out  connection pool: 14/50 in use
 q quit   j/k select   g/G first/last   r refresh                                                               read-only`;
 
 const refused = `shep lookout   /home/rin/.shep                                                                            6 in the flock
+host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h
   ID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   0     web                                   online           48211    0         3.4%    182.0M    1h 25m    edge
+  1     web                                   online           48212    0         2.9%    178.0M    1h 26m    edge
 > 2     api                                   online           48219    1         7.1%    241.0M    1h 28m    edge
+  3     billing-reconciliation-worker         online           48230    0         0.8%    96.0M     1h 29m    -
+  4     cron                                  online           48233    0         0.1%    8.0M      1h 31m    -
+  5     metrics                               online           48240    0         0.4%    11.0M     1h 32m    -
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+sheep 2  api   online   pid 48219   restarts 1   uptime 1h 28m   cpu 7.1%   mem 241.0M   fold edge
+out  /home/rin/.shep/logs/api-2-out.log
+err  /home/rin/.shep/logs/api-2-err.log
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+bleats  api  … 1 earlier line not shown
+out  GET /healthz 200 3ms
+out  GET /v1/orders 200 44ms
+out  POST /v1/orders 201 88ms
+out  GET /v1/orders/8821 200 9ms
+out  connection pool: 14/50 in use
 read-only: actions need --allow-control                                                                        read-only`;
 
 const startCmds = `$ shep lookout
@@ -88,6 +116,7 @@ this sheep has not written a log in this $SHEP_HOME`;
 >
   <article>
     <h1>Lookout</h1>
+    <ReferencePills slug="lookout" />
     <p class="lede">
       <code>shep lookout</code> (alias <code>dash</code>) is a live terminal
       dashboard over the shepherd. It reads the flock two ways at once: a
@@ -195,6 +224,7 @@ this sheep has not written a log in this $SHEP_HOME`;
       screen is also redundant with text, so <code>NO_COLOR</code> and a
       16-color terminal lose decoration, never information.
     </p>
+    <h2>Where to go next</h2>
 
     <div class="next-grid">
       <a href="/docs/kv" class="next-card">
