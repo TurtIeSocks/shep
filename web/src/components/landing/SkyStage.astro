@@ -460,7 +460,17 @@ const grazing = [
 
   .barn-glow {
     position: absolute;
-    right: calc(6% + min(300px, 26vw) / 2 - 66px);
+    /*
+     * Centers the glow on the barn: barn's own right offset (6%) plus half
+     * the barn's width minus half the glow's own 132px. Below ~500px the
+     * barn (min(300px,26vw)) shrinks past 132px, so the raw calc goes
+     * negative — a negative `right` pushes this box's right edge past the
+     * container's right edge, which is exactly what forced the page to
+     * scroll horizontally at 320px. max(0px, ...) keeps the glow pinned to
+     * the barn's right edge instead of overshooting past it once the barn
+     * is smaller than the glow itself.
+     */
+    right: max(0px, calc(6% + min(300px, 26vw) / 2 - 66px));
     bottom: calc(26% + min(300px, 26vw) * 0.62 - 66px);
     width: 132px;
     height: 132px;

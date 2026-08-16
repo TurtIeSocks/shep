@@ -15,7 +15,6 @@
 
 html {
   -webkit-text-size-adjust: 100%;
-  overflow-x: hidden;
 }
 
 body {
@@ -23,7 +22,6 @@ body {
   background: var(--paper);
   color: var(--ink);
   font-family: "Space Grotesk", system-ui, sans-serif;
-  overflow-x: hidden;
   transition:
     background 0.25s ease,
     color 0.25s ease;

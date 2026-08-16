@@ -103,4 +103,17 @@ import CopyCloneButton from "../CopyCloneButton.astro";
     box-shadow: 3px 3px 0 var(--shadow);
     color: var(--ink);
   }
+
+  /* Responsive first pass (docs/shep-design/README.md, "Responsive"). The
+     eyebrow pill is white-space:nowrap by design (it reads as one line) but
+     "A process manager written in Rust" at 12px + 0.12em tracking is wider
+     than the column at phone widths, which forced the whole page to scroll
+     horizontally. Below 480px (same breakpoint CopyCloneButton uses for the
+     same reason), let it wrap onto a second line instead. */
+  @media (max-width: 480px) {
+    .eyebrow {
+      white-space: normal;
+      max-width: 100%;
+    }
+  }
 </style>

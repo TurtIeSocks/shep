@@ -48,10 +48,15 @@ const CLONE_COMMAND = "git clone https://github.com/TurtIeSocks/shep.git";
      command text is white-space:nowrap by design (it reads as one typed
      line) but that overflows a phone-width viewport and forces the whole
      page to scroll horizontally. Below ~480px, wrap it and drop to a
-     smaller size instead. */
+     smaller size instead. white-space:normal only lets the command text
+     wrap within its own box — .copy-clone is a flex row, and the "copy"
+     label is a SEPARATE flex item, so without flex-wrap it stayed pinned
+     beside the now-multi-line command and pushed off the right edge of the
+     viewport. flex-wrap:wrap lets it drop under the command instead. */
   @media (max-width: 480px) {
     .copy-clone {
       white-space: normal;
+      flex-wrap: wrap;
       font-size: 12px;
       max-width: 100%;
     }
