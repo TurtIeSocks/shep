@@ -863,7 +863,8 @@ fn spawn_log_pump<O, E>(
 /// having created `0700` directories at a path someone else chose before
 /// refusing to write the log file there.
 async fn open_append(path: &Path) -> io::Result<tokio::fs::File> {
-    check_log_ancestry(path)?;
+    check_log_ancestry(path)
+        .inspect_err(|error| tracing::error!(?path, %error, "log ancestry check failed"))?;
 
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
