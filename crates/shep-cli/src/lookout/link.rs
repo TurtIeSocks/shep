@@ -93,11 +93,25 @@ impl fmt::Display for UiGone {
 
 impl core::error::Error for UiGone {}
 
+/// The receivers one connection borrows from the ladder and hands back when it
+/// ends.
+///
+/// A two-field struct rather than a tuple: three signatures and an `# Errors`
+/// section name it, and `Ok((polls, requests))` reads as nothing at any of
+/// them.
+#[derive(Debug)]
+pub struct Channels {
+    /// Out-of-band poll requests: the `r` key, and the reducer's own
+    /// [`super::app::Effect::PollNow`].
+    pub polls: mpsc::Receiver<()>,
+    /// One-shot requests the dashboard wants sent on this connection.
+    pub requests: mpsc::Receiver<super::app::Sent>,
+}
+
 /// Runs `opened` and everything that replaces it, until the ladder runs out.
 ///
 /// Sends [`Msg`]s to the UI over `msgs`, and takes a request for an
-/// out-of-band poll on `polls` (the `r` key, and the reducer's own
-/// [`super::app::Effect::PollNow`]).
+/// out-of-band poll and a one-shot request to send, both on `channels`.
 ///
 /// **`opened` is handed in, already connected.** The first dial belongs to
 /// `super::lookout`, which makes it before entering raw mode so that a
@@ -114,7 +128,7 @@ pub async fn run_link<S: Shepherd>(
     mut shepherd: S,
     opened: (S::Flock, S::Events),
     msgs: mpsc::Sender<Msg>,
-    mut polls: mpsc::Receiver<()>,
+    mut channels: Channels,
     period: Duration,
 ) {
     let mut attempt = 0u32;
@@ -162,13 +176,13 @@ pub async fn run_link<S: Shepherd>(
         attempt = 0;
         wait = RECONNECT_FIRST_WAIT;
 
-        match run_connected(flock, events, msgs.clone(), polls, period).await {
-            // The connection ended. `polls` comes back so the next rung can
+        match run_connected(flock, events, msgs.clone(), channels, period).await {
+            // The connection ended. `channels` comes back so the next rung can
             // hand it to the next connection — passed by value rather than by
             // `&mut` because `run_connected` is `tokio::spawn`ed directly by
             // its own tests, and a spawned future cannot borrow a caller's
             // local.
-            Ok(returned) => polls = returned,
+            Ok(returned) => channels = returned,
             // The UI is gone. Nothing left to report to.
             Err(UiGone) => return,
         }
@@ -178,8 +192,8 @@ pub async fn run_link<S: Shepherd>(
 /// One connection's lifetime: an opening listing, then subscribe-and-poll
 /// until the subscription ends.
 ///
-/// Returns the poll receiver on `Ok`, so the next rung of the ladder can hand
-/// it to the next connection.
+/// Returns `channels` on `Ok`, so the next rung of the ladder can hand it to
+/// the next connection.
 ///
 /// # Errors
 /// [`UiGone`] when the dashboard's own [`Msg`] channel has closed — the only
@@ -199,9 +213,9 @@ pub async fn run_connected<F: FlockSource, E: EventSource>(
     flock: F,
     mut events: E,
     msgs: mpsc::Sender<Msg>,
-    mut polls: mpsc::Receiver<()>,
+    mut channels: Channels,
     period: Duration,
-) -> Result<mpsc::Receiver<()>, UiGone> {
+) -> Result<Channels, UiGone> {
     // The opening listing. Every connection begins with one — a cold start and
     // a reconnect need the same first snapshot, and this is the one place that
     // serves both. Every poll count in this module's tests counts it.
@@ -220,11 +234,25 @@ pub async fn run_connected<F: FlockSource, E: EventSource>(
     loop {
         tokio::select! {
             _ = ticker.tick() => reconcile(&flock, &msgs).await?,
-            _ = polls.recv() => reconcile(&flock, &msgs).await?,
+            _ = channels.polls.recv() => reconcile(&flock, &msgs).await?,
+            // `Some(sent) = ...`, not `_ = ...`: a receiver whose senders have
+            // all been dropped is `Ready(None)` forever, and a `_` pattern
+            // would spin this loop at full tilt. The pattern not matching
+            // disables the branch instead.
+            Some(sent) = channels.requests.recv() => {
+                // Awaited inline, which holds the other arms for the
+                // request's duration. That is already this loop's established
+                // behaviour: the poll arm awaits `reconcile` the same way,
+                // bounded by the client's own deadline.
+                let result = flock.send(sent.request()).await;
+                msgs.send(Msg::Replied { sent, result })
+                    .await
+                    .map_err(|_| UiGone)?;
+            }
             next = events.next_event() => match next {
                 // The subscription ended: the connection is gone. Back to the
                 // ladder.
-                None => return Ok(polls),
+                None => return Ok(channels),
                 Some(Ok(event)) => {
                     // `Dropped` is a real, named variant this binary
                     // understands, so it gets a repair as well as being
@@ -283,10 +311,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use shep_core::protocol::{ProcessEventKind, ProcessInfo};
+    use shep_core::protocol::{ProcessEventKind, ProcessInfo, Request, Response, SelectorSpec};
     use shep_core::status::ProcStatus;
     use tokio::sync::broadcast;
 
+    use crate::lookout::app::Sent;
     // Named only from here: `run_link`'s own error arm never spells the type.
     use crate::lookout::source::LinkError;
 
@@ -304,6 +333,12 @@ mod tests {
         async fn flock(&self) -> Result<Vec<ProcessInfo>, RequestError> {
             self.polls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![sheep(1)])
+        }
+
+        // Ignores its argument: the tests that use this fixture are about
+        // poll counting and know nothing about requests.
+        async fn send(&self, _request: Request) -> Result<Response, RequestError> {
+            Ok(Response::Described(Vec::new()))
         }
     }
 
@@ -337,6 +372,7 @@ mod tests {
         let polls = Arc::new(AtomicU64::new(0));
         let (msg_tx, mut msg_rx) = mpsc::channel(64);
         let (_poll_tx, poll_rx) = mpsc::channel(1);
+        let (_request_tx, request_rx) = mpsc::channel(2);
 
         // Overrun the capacity-2 channel before the loop ever reads it.
         for id in 0..8 {
@@ -355,7 +391,10 @@ mod tests {
             flock,
             BroadcastEvents(rx),
             msg_tx,
-            poll_rx,
+            Channels {
+                polls: poll_rx,
+                requests: request_rx,
+            },
             // A poll period far longer than this test, so ANY poll beyond the
             // opening listing is attributable to the lag and to nothing else.
             Duration::from_secs(3600),
@@ -402,6 +441,7 @@ mod tests {
         let polls = Arc::new(AtomicU64::new(0));
         let (msg_tx, mut msg_rx) = mpsc::channel(64);
         let (_poll_tx, poll_rx) = mpsc::channel(1);
+        let (_request_tx, request_rx) = mpsc::channel(2);
         let _ = tx.send(BusEvent::Dropped { count: 9 });
 
         let task = tokio::spawn(run_connected(
@@ -410,7 +450,10 @@ mod tests {
             },
             BroadcastEvents(rx),
             msg_tx,
-            poll_rx,
+            Channels {
+                polls: poll_rx,
+                requests: request_rx,
+            },
             Duration::from_secs(3600),
         ));
 
@@ -469,6 +512,7 @@ mod tests {
         let attempts = Arc::new(AtomicU64::new(0));
         let (msg_tx, mut msg_rx) = mpsc::channel(64);
         let (_poll_tx, poll_rx) = mpsc::channel(1);
+        let (_request_tx, request_rx) = mpsc::channel(2);
 
         // `run_link` is HANDED its first connection rather than dialling for
         // it — the opening dial is `lookout::lookout`'s, before raw mode, so
@@ -490,7 +534,10 @@ mod tests {
                 BroadcastEvents(opening_rx),
             ),
             msg_tx,
-            poll_rx,
+            Channels {
+                polls: poll_rx,
+                requests: request_rx,
+            },
             Duration::from_secs(2),
         ));
 
@@ -577,6 +624,7 @@ mod tests {
         let polls = Arc::new(AtomicU64::new(0));
         let (msg_tx, mut msg_rx) = mpsc::channel(64);
         let (_poll_tx, poll_rx) = mpsc::channel(1);
+        let (_request_tx, request_rx) = mpsc::channel(2);
 
         // The opening connection ends immediately, with its own counter, so
         // `polls` below counts only what the RECONNECTED one listed.
@@ -596,7 +644,10 @@ mod tests {
                 BroadcastEvents(opening_rx),
             ),
             msg_tx,
-            poll_rx,
+            Channels {
+                polls: poll_rx,
+                requests: request_rx,
+            },
             Duration::from_secs(2),
         ));
 
@@ -646,13 +697,17 @@ mod tests {
         let polls = Arc::new(AtomicU64::new(0));
         let (msg_tx, _msg_rx) = mpsc::channel(256);
         let (_poll_tx, poll_rx) = mpsc::channel(1);
+        let (_request_tx, request_rx) = mpsc::channel(2);
         let task = tokio::spawn(run_connected(
             CountingFlock {
                 polls: Arc::clone(&polls),
             },
             BroadcastEvents(rx),
             msg_tx,
-            poll_rx,
+            Channels {
+                polls: poll_rx,
+                requests: request_rx,
+            },
             Duration::from_secs(2),
         ));
 
@@ -670,5 +725,75 @@ mod tests {
         );
         drop(tx);
         task.abort();
+    }
+
+    /// A flock source that records every `send` request it was asked, and
+    /// answers each with one row. IR-33: hand-rolled, no mock crate.
+    struct RecordingFlock {
+        seen: Arc<std::sync::Mutex<Vec<Request>>>,
+    }
+
+    impl FlockSource for RecordingFlock {
+        async fn flock(&self) -> Result<Vec<ProcessInfo>, RequestError> {
+            Ok(vec![sheep(1)])
+        }
+
+        async fn send(&self, request: Request) -> Result<Response, RequestError> {
+            self.seen.lock().unwrap().push(request.clone());
+            Ok(Response::Described(vec![sheep(1)]))
+        }
+    }
+
+    /// fails if a request never reaches the shepherd, or if its reply never
+    /// comes back tagged with what it answered. The echo tag is what routes a
+    /// reply with no correlation id, including an `Err` that carries no shape
+    /// of its own.
+    ///
+    /// IR-46: the wait is bounded, so a loop that never sends hangs nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_reaches_the_shepherd_and_its_reply_comes_back() {
+        let (msg_tx, mut msg_rx) = mpsc::channel(64);
+        let (_poll_tx, poll_rx) = mpsc::channel(1);
+        let (request_tx, request_rx) = mpsc::channel(2);
+        let (_events_tx, events_rx) = broadcast::channel(4);
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let flock = RecordingFlock {
+            seen: Arc::clone(&seen),
+        };
+        let task = tokio::spawn(run_connected(
+            flock,
+            BroadcastEvents(events_rx),
+            msg_tx,
+            Channels {
+                polls: poll_rx,
+                requests: request_rx,
+            },
+            Duration::from_secs(3600),
+        ));
+        request_tx.send(Sent::Lambs { id: 7 }).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut answered = None;
+        while answered.is_none() {
+            let Ok(Some(msg)) = tokio::time::timeout_at(deadline, msg_rx.recv()).await else {
+                break;
+            };
+            if let Msg::Replied { sent, result } = msg {
+                answered = Some((sent, result));
+            }
+        }
+        task.abort();
+
+        let (sent, result) = answered.expect("the reply came back");
+        assert_eq!(sent, Sent::Lambs { id: 7 }, "tagged with what it answered");
+        assert!(matches!(result, Ok(Response::Described(_))));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Request::Describe {
+                selector: SelectorSpec::Id(7)
+            }],
+            "the id it was asked about, as a selector, and nothing else"
+        );
     }
 }

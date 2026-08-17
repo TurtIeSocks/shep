@@ -60,6 +60,22 @@ pub trait FlockSource: Send + Sync {
     /// Whatever the underlying source could not answer with — for the real
     /// implementation, whatever `Request::ListFlock` failed with.
     fn flock(&self) -> impl Future<Output = Result<Vec<ProcessInfo>, RequestError>> + Send;
+
+    /// Sends one request over this connection and returns the shepherd's
+    /// answer, whatever it is.
+    ///
+    /// Unlike [`Self::flock`], this does NOT swallow an unrecognised
+    /// [`Response`] into an empty success. `Response` is `#[non_exhaustive]`,
+    /// and a reply this binary does not understand is a fact the operator has
+    /// to be told about: `flock()` can afford to shrug one off because the
+    /// next poll asks again two seconds later, and an action or a lamb fetch
+    /// has no next poll.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the underlying connection failed the request with.
+    fn send(&self, request: Request)
+    -> impl Future<Output = Result<Response, RequestError>> + Send;
 }
 
 /// One source of bus frames.
@@ -171,6 +187,15 @@ impl FlockSource for ClientFlock {
             // next poll asks again.
             _unrecognised => Ok(Vec::new()),
         }
+    }
+
+    async fn send(&self, request: Request) -> Result<Response, RequestError> {
+        // The client's own default deadline, which is what every one of these
+        // verbs already gets from the CLI: `commands::lifecycle` passes
+        // `deadline: None` for stop, restart and reload, and `Reloading` is an
+        // acceptance rather than a completed swap, so a longer budget would
+        // buy nothing.
+        self.0.request(request).await
     }
 }
 

@@ -30,7 +30,10 @@ use core::fmt;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use shep_core::protocol::{BusEvent, ProcessEventKind, ProcessInfo};
+use shep_client::RequestError;
+use shep_core::protocol::{
+    BusEvent, Lamb, ProcessEventKind, ProcessInfo, Request, Response, SelectorSpec,
+};
 use shep_core::status::ProcStatus;
 
 use super::theme::Palette;
@@ -171,6 +174,13 @@ pub enum Msg {
         /// What the read found, including what it could not show.
         tail: super::tail::Tail,
     },
+    /// A request this dashboard asked for came back. `sent` is the echo tag.
+    Replied {
+        /// What was asked.
+        sent: Sent,
+        /// What the shepherd said, or why it could not be asked.
+        result: Result<Response, RequestError>,
+    },
 }
 
 /// What the caller has to do after an update.
@@ -219,6 +229,61 @@ pub struct Row {
     /// When [`Self::info`] was received — the origin for this row's live
     /// uptime, so a value two seconds old is never rendered as current.
     pub anchor: Instant,
+}
+
+/// One request the dashboard asked the link task to send, carried back on the
+/// reply so it can be routed.
+///
+/// An echo tag rather than a correlation id: the answer to a request can be an
+/// `Err` that carries no shape of its own, so the only thing that reliably
+/// says which request a reply belongs to is the request itself, handed along
+/// beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sent {
+    /// The selected sheep's process tree.
+    Lambs {
+        /// Which sheep was asked about.
+        id: u32,
+    },
+}
+
+impl Sent {
+    /// The wire request this asks for.
+    #[must_use]
+    pub fn request(&self) -> Request {
+        match *self {
+            Self::Lambs { id } => Request::Describe {
+                selector: SelectorSpec::Id(id),
+            },
+        }
+    }
+}
+
+/// What one lamb fetch came back with.
+///
+/// Three variants because `ProcessInfo::lambs` distinguishes three states and
+/// the pane says three different sentences. The CLI has wording for only one
+/// of them: `output::emit_described` skips the lamb caption for `None` and for
+/// an empty vector alike, so there is nothing to borrow for the other two and
+/// the pane says its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LambWalk {
+    /// The shepherd walked the process table. Possibly to no descendants.
+    Walked(Vec<Lamb>),
+    /// The reply carried no walk at all, which for a `Describe` means this
+    /// sheep has no pid to walk from.
+    NotWalked,
+    /// The request did not come back, or came back as something this binary
+    /// does not understand.
+    Failed,
+}
+
+/// One lamb reading, and which sheep it was taken for.
+#[derive(Debug, Clone)]
+pub struct LambReading {
+    id: u32,
+    at: Instant,
+    walk: LambWalk,
 }
 
 /// A short line the status bar shows instead of the key hints, cleared by the
@@ -305,6 +370,12 @@ pub struct App {
     /// [`super::view::bleats::feed_lines`] reads the same way it reads a
     /// sheep that has genuinely written nothing.
     feed: super::tail::Tail,
+    /// The last lamb reading, or `None` before there has been one.
+    ///
+    /// Keyed by the id it was taken for, so a reading for a sheep that is no
+    /// longer selected, and a request a full channel dropped, both read as
+    /// "not read yet" without a second field tracking them.
+    lambs: Option<LambReading>,
 }
 
 impl App {
@@ -325,6 +396,7 @@ impl App {
             host: None,
             host_unsupported: false,
             feed: super::tail::Tail::default(),
+            lambs: None,
         }
     }
 
@@ -420,7 +492,40 @@ impl App {
                 self.feed = tail;
                 Effect::None
             }
+            Msg::Replied { sent, result } => match sent {
+                Sent::Lambs { id } => self.on_lambs(id, result),
+            },
         }
+    }
+
+    /// Records one lamb reading. Always [`Effect::None`]: a reducer that
+    /// answered a reading with another request would spin the UI task.
+    fn on_lambs(&mut self, id: u32, result: Result<Response, RequestError>) -> Effect {
+        // The same guard `Msg::Bleats` carries, for the same reason: this
+        // fetch is armed before a freeze can land, and a reading that reached
+        // the frame afterwards would be newer than the banner saying the
+        // values are frozen.
+        if matches!(self.link, Link::Lost { .. }) {
+            return Effect::None;
+        }
+        let walk = match result {
+            Ok(Response::Described(rows)) => rows
+                .into_iter()
+                .find(|info| info.id == id)
+                .map_or(LambWalk::Failed, |info| {
+                    info.lambs.map_or(LambWalk::NotWalked, LambWalk::Walked)
+                }),
+            // An `Err`, or a reply this binary does not recognise. Neither is
+            // an empty walk, and reporting either as one would say "none
+            // found" about a process table nobody read.
+            _ => LambWalk::Failed,
+        };
+        self.lambs = Some(LambReading {
+            id,
+            at: self.now,
+            walk,
+        });
+        Effect::None
     }
 
     fn on_event(&mut self, event: BusEvent) -> Effect {
@@ -849,6 +954,22 @@ impl App {
         }
         let elapsed = self.now.saturating_duration_since(row.anchor);
         Some(row.info.uptime_ms.saturating_add(millis(elapsed)))
+    }
+
+    /// The lamb reading for sheep `id`, with its age in milliseconds as of
+    /// this dashboard's own clock.
+    ///
+    /// `None` when there is no reading, or when the one there is was taken for
+    /// a different sheep. The age comes from [`Self::now`], the same clock the
+    /// uptime column reads, which means it stops when the dashboard freezes,
+    /// for the same reason.
+    #[must_use]
+    pub fn lambs_for(&self, id: u32) -> Option<(&LambWalk, u64)> {
+        let reading = self.lambs.as_ref().filter(|reading| reading.id == id)?;
+        Some((
+            &reading.walk,
+            millis(self.now.saturating_duration_since(reading.at)),
+        ))
     }
 }
 
@@ -1733,5 +1854,113 @@ mod tests {
         app.set_filter(String::new());
         assert_eq!(app.rows().len(), 4);
         assert_eq!(app.selected(), Some(1), "seated again");
+    }
+
+    /// fails if the three states `ProcessInfo::lambs` distinguishes get
+    /// collapsed. The wire type keeps them apart on purpose: `None` means this
+    /// reply did not walk, `Some(vec![])` means it walked and found nothing,
+    /// and the pane says different sentences for each because they are
+    /// different facts about the machine.
+    #[test]
+    fn a_lamb_reply_records_which_of_the_three_states_it_saw() {
+        let (mut app, t0) = started();
+        let walked = ProcessInfo::builder(1, "web", ProcStatus::Online)
+            .lambs(Some(vec![Lamb::new(48_220, "node")]))
+            .build();
+        app.update(Msg::Replied {
+            sent: Sent::Lambs { id: 1 },
+            result: Ok(Response::Described(vec![walked])),
+        });
+        assert!(matches!(app.lambs_for(1), Some((LambWalk::Walked(lambs), _)) if lambs.len() == 1));
+
+        let empty = ProcessInfo::builder(1, "web", ProcStatus::Online)
+            .lambs(Some(Vec::new()))
+            .build();
+        app.update(Msg::Replied {
+            sent: Sent::Lambs { id: 1 },
+            result: Ok(Response::Described(vec![empty])),
+        });
+        assert!(matches!(app.lambs_for(1), Some((LambWalk::Walked(lambs), _)) if lambs.is_empty()));
+
+        let unwalked = ProcessInfo::builder(1, "web", ProcStatus::Stopped).build();
+        app.update(Msg::Replied {
+            sent: Sent::Lambs { id: 1 },
+            result: Ok(Response::Described(vec![unwalked])),
+        });
+        assert!(matches!(app.lambs_for(1), Some((LambWalk::NotWalked, _))));
+        let _ = t0;
+    }
+
+    /// fails if a reading taken for one sheep is shown against another. The
+    /// reading carries the id it was taken for and the pane asks by id, so a
+    /// request dropped by a full channel and a reply for the previous
+    /// selection both read as "not read yet" with no second field to track
+    /// them.
+    #[test]
+    fn a_reading_for_another_sheep_reads_as_not_read_yet() {
+        let (mut app, _t0) = started();
+        app.update(Msg::Replied {
+            sent: Sent::Lambs { id: 1 },
+            result: Ok(Response::Described(vec![
+                ProcessInfo::builder(1, "web", ProcStatus::Online)
+                    .lambs(Some(vec![Lamb::new(48_220, "node")]))
+                    .build(),
+            ])),
+        });
+        assert!(app.lambs_for(1).is_some());
+        assert!(app.lambs_for(2).is_none(), "not this sheep's reading");
+    }
+
+    /// fails if a failed lamb fetch steals the status bar. It is a decoration
+    /// on a pane, not an operator's action, and the pane already says what it
+    /// does not know (A17).
+    #[test]
+    fn a_failed_lamb_fetch_says_so_in_the_pane_and_raises_no_notice() {
+        let (mut app, _t0) = started();
+        app.update(Msg::Replied {
+            sent: Sent::Lambs { id: 1 },
+            result: Err(RequestError::Closed),
+        });
+        assert!(matches!(app.lambs_for(1), Some((LambWalk::Failed, _))));
+        assert!(app.notice().is_none(), "no notice for a decoration");
+    }
+
+    /// fails if an unrecognised reply is recorded as a successful walk.
+    /// `Response` is `#[non_exhaustive]`; a variant this binary predates is
+    /// not a lamb list and must not read as an empty one, which would say
+    /// "none found" about a machine nobody looked at.
+    #[test]
+    fn an_unrecognised_lamb_reply_is_a_failure_and_not_an_empty_walk() {
+        let (mut app, _t0) = started();
+        app.update(Msg::Replied {
+            sent: Sent::Lambs { id: 1 },
+            result: Ok(Response::Pong),
+        });
+        assert!(matches!(app.lambs_for(1), Some((LambWalk::Failed, _))));
+    }
+
+    /// fails if a reading landing after a freeze reaches the frame. Same guard
+    /// and same reason as `Msg::Bleats`: the fetch is armed before the freeze
+    /// can land, so a reply can still be in flight when `Msg::Frozen` arrives,
+    /// and content newer than a banner saying the values are frozen is the
+    /// contradiction-on-one-frame this dashboard refuses everywhere else.
+    #[test]
+    fn a_lamb_reply_after_a_freeze_is_refused() {
+        let (mut app, _t0) = started();
+        app.update(Msg::Frozen {
+            at_local: "2026-08-16 09:00:00".to_string(),
+        });
+        app.update(Msg::Replied {
+            sent: Sent::Lambs { id: 1 },
+            result: Ok(Response::Described(vec![
+                ProcessInfo::builder(1, "web", ProcStatus::Online)
+                    .lambs(Some(vec![Lamb::new(48_220, "node")]))
+                    .build(),
+            ])),
+        });
+        assert!(
+            app.lambs_for(1).is_none(),
+            "the frozen frame learned nothing"
+        );
     }
 }

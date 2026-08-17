@@ -9,13 +9,14 @@
 //! on every refresh instead of subscribing to `log.*`. `docs/lookout/README.md`
 //! says what the rendered frames are for.
 //!
-//! **Two tasks, two channels.** The link task ([`link::run_link`]) owns the
+//! **Two tasks, three channels.** The link task ([`link::run_link`]) owns the
 //! connection: it subscribes, polls, repairs on a drop, climbs a bounded
 //! reconnect ladder and freezes when it runs out. The UI loop ([`run_ui`])
 //! owns the screen: it reads the keyboard, applies [`app::Msg`]s to
-//! [`app::App`], and redraws. They talk over an `mpsc` in each direction —
-//! `Msg`s out of the link, poll requests into it. Neither borrows the other,
-//! which is what lets each be tested on its own.
+//! [`app::App`], and redraws. They talk over an `mpsc` each way — `Msg`s out
+//! of the link, and into it: poll requests, and one-shot [`app::Sent`]
+//! requests the dashboard asks the link to send on this connection. Neither
+//! task borrows the other, which is what lets each be tested on its own.
 //!
 //! **This verb does not exit when the shepherd dies.** `bleats` does, and that
 //! is right for a follow. A standing dashboard that vanished would take the
@@ -183,13 +184,20 @@ pub async fn lookout(
 
     let (msg_tx, msg_rx) = mpsc::channel(1024);
     let (poll_tx, poll_rx) = mpsc::channel(8);
+    // Capacity 2: one action plus one lamb fetch is the most that can be
+    // outstanding, because the reducer refuses a second action while one is in
+    // flight and the lamb fetch is coalesced onto the redraw gate.
+    let (request_tx, request_rx) = mpsc::channel(2);
     // The connection opened above is handed straight in, so the link task
     // never dials for its first one.
     let link = tokio::spawn(link::run_link(
         shepherd,
         opened,
         msg_tx,
-        poll_rx,
+        link::Channels {
+            polls: poll_rx,
+            requests: request_rx,
+        },
         link::FLOCK_POLL,
     ));
 
@@ -200,6 +208,7 @@ pub async fn lookout(
         events,
         msg_rx,
         poll_tx,
+        request_tx,
         source::LocalReader::new(),
     )
     .await;
@@ -280,6 +289,7 @@ pub async fn run_ui<B: Backend, S, L>(
     events: S,
     mut msgs: mpsc::Receiver<Msg>,
     polls: mpsc::Sender<()>,
+    requests: mpsc::Sender<self::app::Sent>,
     mut local: L,
 ) -> Terminal<B>
 where
@@ -490,6 +500,7 @@ mod tests {
     async fn the_loop_draws_and_quits_on_a_keypress() {
         let (msg_tx, msg_rx) = mpsc::channel(16);
         let (poll_tx, _poll_rx) = mpsc::channel(1);
+        let (request_tx, _request_rx) = mpsc::channel(2);
         let app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
@@ -507,7 +518,15 @@ mod tests {
         drop(msg_tx);
         let done = tokio::time::timeout(
             Duration::from_secs(10),
-            run_ui(app, terminal, keys, msg_rx, poll_tx, FakeLocal::default()),
+            run_ui(
+                app,
+                terminal,
+                keys,
+                msg_rx,
+                poll_tx,
+                request_tx,
+                FakeLocal::default(),
+            ),
         )
         .await;
         let terminal = done.expect("the loop left on `q` within ten seconds");
@@ -532,6 +551,7 @@ mod tests {
     async fn a_drop_forwards_a_poll_request_to_the_link_task() {
         let (msg_tx, msg_rx) = mpsc::channel(16);
         let (poll_tx, mut poll_rx) = mpsc::channel(4);
+        let (request_tx, _request_rx) = mpsc::channel(2);
         msg_tx
             .send(Msg::Event(BusEvent::Dropped { count: 4 }))
             .await
@@ -554,6 +574,7 @@ mod tests {
                 stream::empty(),
                 msg_rx,
                 poll_tx,
+                request_tx,
                 FakeLocal::default(),
             ),
         )
@@ -605,6 +626,7 @@ mod tests {
     async fn the_heartbeat_asks_the_local_reader_for_a_host_sample() {
         let (msg_tx, msg_rx) = mpsc::channel(64);
         let (poll_tx, _poll_rx) = mpsc::channel(4);
+        let (request_tx, _request_rx) = mpsc::channel(2);
         let local = FakeLocal::default();
         let hosts = Arc::clone(&local.hosts);
 
@@ -623,7 +645,15 @@ mod tests {
         let terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
         let _ = tokio::time::timeout(
             Duration::from_secs(10),
-            run_ui(app, terminal, stream::empty(), msg_rx, poll_tx, local),
+            run_ui(
+                app,
+                terminal,
+                stream::empty(),
+                msg_rx,
+                poll_tx,
+                request_tx,
+                local,
+            ),
         )
         .await
         .expect("the loop left within ten seconds");
@@ -661,6 +691,7 @@ mod tests {
     async fn a_heartbeat_puts_the_host_strip_on_the_frame() {
         let (msg_tx, msg_rx) = mpsc::channel(64);
         let (poll_tx, _poll_rx) = mpsc::channel(4);
+        let (request_tx, _request_rx) = mpsc::channel(2);
         let local = FakeLocal {
             sample: Some(crate::lookout::view::fixtures::sample()),
             ..FakeLocal::default()
@@ -690,7 +721,15 @@ mod tests {
         let terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
         let terminal = tokio::time::timeout(
             Duration::from_secs(10),
-            run_ui(app, terminal, stream::empty(), msg_rx, poll_tx, local),
+            run_ui(
+                app,
+                terminal,
+                stream::empty(),
+                msg_rx,
+                poll_tx,
+                request_tx,
+                local,
+            ),
         )
         .await
         .expect("the loop left within ten seconds");
@@ -743,6 +782,7 @@ mod tests {
     async fn a_burst_of_selection_moves_costs_one_read_and_not_one_per_key() {
         let (msg_tx, msg_rx) = mpsc::channel(64);
         let (poll_tx, _poll_rx) = mpsc::channel(4);
+        let (request_tx, _request_rx) = mpsc::channel(2);
         let local = FakeLocal::default();
         let tails = Arc::clone(&local.tails);
 
@@ -787,7 +827,15 @@ mod tests {
         let terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
         let _ = tokio::time::timeout(
             Duration::from_secs(5),
-            run_ui(app, terminal, stream::empty(), msg_rx, poll_tx, local),
+            run_ui(
+                app,
+                terminal,
+                stream::empty(),
+                msg_rx,
+                poll_tx,
+                request_tx,
+                local,
+            ),
         )
         .await
         .expect("the loop left within five seconds");
