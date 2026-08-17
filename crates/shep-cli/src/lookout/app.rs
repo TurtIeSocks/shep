@@ -776,16 +776,26 @@ impl App {
                         Effect::None
                     };
                 }
-                // An upsert cannot orphan the selection — the row it names
-                // either already existed (so the id is still in the map) or
-                // is new (so it cannot be the one the selection pointed at).
-                // The only case that needs a reseat is the flock going from
-                // empty to non-empty, which is when `selected` is `None` and
-                // ought not to be.
-                let was_empty = self.flock.is_empty();
+                // An upsert cannot orphan the selection from `self.flock` —
+                // the row it names either already existed (so the id is
+                // still in the map) or is new (so it cannot be the one the
+                // selection pointed at) — but it CAN orphan it from the
+                // VISIBLE sequence `reseat` and `j`/`k` actually walk: a
+                // rename that moves the selected row out of the current
+                // filter leaves its id in `self.flock` while dropping it out
+                // of `visible_ids()`. The old `was_empty`-only guard missed
+                // that case (Phase 16 review Minor #6): the cursor stayed
+                // pinned to an id the table had stopped drawing, and `j`/`k`
+                // did nothing until the next snapshot repaired it. Reading
+                // `previous` before the insert and always reseating covers
+                // both that case and the empty-to-non-empty one below with
+                // the same call — `reseat` itself is a no-op read when the
+                // selection is still seated, so the common case costs one
+                // cheap check.
+                let previous = self.selected_index();
                 let anchor = self.now;
                 self.flock.insert(info.id, Row { info, anchor });
-                if was_empty && self.reseat(None) {
+                if self.reseat(previous) {
                     return Effect::RefreshSelected;
                 }
                 Effect::None
