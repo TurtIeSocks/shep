@@ -546,6 +546,9 @@ mod tests {
 
         /// The name `sampler` reports for `pid`, or `None` if the walk did
         /// not see it.
+        ///
+        /// `cfg(unix)` alongside its only caller, below.
+        #[cfg(unix)]
         fn name_of(sampler: &SysinfoSampler, pid: u32) -> Option<String> {
             sampler
                 .identify()
@@ -566,6 +569,16 @@ mod tests {
         // One pid throughout: `sh` execs into `sleep` in place. Real elapsed
         // time is the point of the case (there is no seam that could fake an
         // `execve`), which is why it lives in `slow`.
+        //
+        // `#[cfg(unix)]`: both halves of what this proves are unix-only.
+        // `/bin/sh` does not exist on Windows to spawn, and the phenomenon
+        // under test — one pid staying alive across a `fork` and then
+        // changing name in place when it `exec`s — is `fork`+`execve`
+        // itself, which Windows' process model (`CreateProcess`, a new pid
+        // every time) has no equivalent of. There is no portable case to
+        // write here; the daemon's Windows tier has no sampler calling
+        // `identify` yet either (spec §11's functional tier is unbuilt).
+        #[cfg(unix)]
         #[test]
         fn identify_reports_the_name_a_lamb_execed_into_not_the_one_it_forked_with() {
             let mut child = Command::new("/bin/sh")

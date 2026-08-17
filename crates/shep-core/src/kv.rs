@@ -48,10 +48,11 @@ use core::fmt;
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::Path;
-// `PathBuf` backs `lock_path` below, which is `cfg(unix)`-only (POSIX advisory
-// locking has no Windows equivalent here) — gated the same way so a
-// non-unix target does not carry an unused import.
-#[cfg(unix)]
+// `PathBuf` backs `lock_path` below, which both platform arms of `KvLock`
+// need — the unix one for `nix::fcntl::Flock`'s target, the windows one for
+// the `share_mode(0)` handle — so it is gated the same way `lock_path` is,
+// rather than to `cfg(unix)` alone.
+#[cfg(any(unix, windows))]
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -187,9 +188,10 @@ fn check_key(key: &str) -> Result<(), KvError> {
 /// it sits in `$SHEP_HOME` next to the store and inherits that directory's
 /// `0700`.
 ///
-/// `cfg(unix)` alongside its only caller — [`KvLock::acquire`] is a
-/// documented no-op on Windows, so there is no lock file to name there.
-#[cfg(unix)]
+/// `cfg(any(unix, windows))` alongside its two callers — [`KvLock::acquire`]
+/// names a real lock file on both platforms now, unix through `flock(2)` and
+/// windows through an exclusive `share_mode(0)` open.
+#[cfg(any(unix, windows))]
 fn lock_path(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
@@ -212,6 +214,13 @@ struct KvLock {
     /// underscore because it is held, never read.
     #[cfg(unix)]
     _flock: nix::fcntl::Flock<std::fs::File>,
+    /// The lock file, opened with `share_mode(0)` so no other handle —
+    /// same-process or not, read or write — can open it while this one is
+    /// live. Released by this handle's `Drop`, the same role `_flock` plays
+    /// on unix. Named with a leading underscore because it is held, never
+    /// read.
+    #[cfg(windows)]
+    _handle: std::fs::File,
 }
 
 impl KvLock {
@@ -238,23 +247,59 @@ impl KvLock {
             .map_err(|(_file, errno)| std::io::Error::from(errno))
     }
 
-    /// Deliberate no-op on Windows — see [`barks::RingLock::acquire`](crate::barks)
-    /// for the full reasoning, which applies here unchanged.
+    /// Blocks until this process holds the store's lock exclusively.
+    ///
+    /// `flock(2)` has no Windows equivalent, but `share_mode(0)` gives the
+    /// same exclusivity through a different door: opening the lock file with
+    /// every share flag cleared means no other handle — another process's or
+    /// this one's, read or write — can be opened on it while this handle
+    /// lives, which is mandatory (enforced by the OS on every open, not just
+    /// respected by cooperating callers) exactly as `flock` is. What it does
+    /// not give is a blocking wait: a contended open fails immediately with
+    /// `ERROR_SHARING_VIOLATION` rather than parking the thread the way
+    /// `flock`'s `LockExclusive` does, so this polls on a short sleep until
+    /// the open succeeds. Two writers in the *same* process are covered too —
+    /// Windows share-mode denial is per-file, not per-process, so a second
+    /// thread's open contends with the first thread's open handle exactly as
+    /// a second process's would.
     ///
     /// # Errors
-    /// Never — the signature matches the unix arm so the caller has one
-    /// shape.
-    /// # Non-unix
-    /// There is no lock here — this returns a handle that holds nothing, and
-    /// two concurrent writers can lose each other's edits. That is sound only
-    /// because every verb refuses on Windows before reaching this code
-    /// (`shep-cli`'s entry point). Anyone un-gating Windows must build the
-    /// lock first: `LockFileEx` is mandatory rather than advisory, so the
-    /// unix design does not port directly, but `OpenOptionsExt::share_mode(0)`
-    /// is safe std and needs a retry loop where `flock` blocks.
-    #[cfg(not(unix))]
-    fn acquire(_path: &Path) -> std::io::Result<Self> {
-        Ok(Self {})
+    /// The lock file could not be created beside `path`, or the open failed
+    /// for a reason other than sharing contention (contention retries rather
+    /// than failing).
+    #[cfg(windows)]
+    fn acquire(path: &Path) -> std::io::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// Windows' `ERROR_SHARING_VIOLATION`: another handle already holds
+        /// share access this open's `share_mode(0)` denies. Hardcoded rather
+        /// than pulled from `windows-sys` — this crate has no Windows-only
+        /// dependency today, and one well-known, stable error code does not
+        /// earn it one.
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+
+        /// How long a contended retry sleeps before trying again. Short
+        /// enough that a lock held for a normal `set`/`get`'s duration (a
+        /// handful of small file operations) costs this loop only a few
+        /// iterations, long enough not to spin the CPU while it waits.
+        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+
+        let lock_path = lock_path(path);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .open(&lock_path)
+            {
+                Ok(handle) => return Ok(Self { _handle: handle }),
+                Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 

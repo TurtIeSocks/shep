@@ -1249,6 +1249,19 @@ mod tests {
     /// forever waiting for a signal that never arrives. Exercising the
     /// daemon dispatch arm for real belongs in the e2e tier
     /// (`tests/cli_e2e.rs`), against an isolated `--home`, not here.
+    ///
+    /// `#[cfg(unix)]`: what this proves is specific to the unix arm's
+    /// early-dispatch shape — that `Completions` is one of the handful of
+    /// verbs routed around `resolve_paths` rather than through it. The
+    /// windows arm has no such split to prove anything about: it refuses
+    /// every verb unconditionally, `completions` included, before it can
+    /// even become a question of whether paths were resolved. Windows is
+    /// shep's 0% tier by deliberate, standing decision (`CLAUDE.md`: "every
+    /// verb prints \"not yet supported\" and exits") — carving out
+    /// `completions` as the one working verb there is a real product
+    /// decision, not one this test should make unilaterally by asserting
+    /// `Success` against an arm that was never built to return it.
+    #[cfg(unix)]
     #[tokio::test]
     async fn completions_never_resolves_paths() {
         use clap::Parser;

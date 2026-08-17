@@ -1,2 +1,10 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# `include_str!`ed as a byte-exact fixture in
+# crates/shep-core/src/config/flockfile.rs's `the_committed_schema_is_current`
+# test, which compares it against a runtime-generated string that always uses
+# `\n`. `text=auto` alone still checks this out CRLF on a `core.autocrlf=true`
+# Windows client, which the comparison then sees as a spurious diff on every
+# line — force LF on every platform instead of normalizing in the assertion.
+crates/shep-core/assets/flockfile.schema.json text eol=lf

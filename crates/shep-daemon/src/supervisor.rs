@@ -7629,9 +7629,9 @@ mod tests {
                     .out_file
                     .as_deref()
                     .expect("a listed sheep has a log path");
-                let stem = out
-                    .rsplit('/')
-                    .next()
+                let stem = std::path::Path::new(out)
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
                     .and_then(|file| file.strip_suffix("-out.log"))
                     .and_then(|stem| stem.strip_prefix(&format!("{name}-")))
                     .expect("a derived log path is `<name>-<instance>-out.log`");
