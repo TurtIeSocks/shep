@@ -29,9 +29,15 @@
 
 pub mod app;
 // `#[cfg(test)]`: every item in `frames` is read by tests and by the gallery
-// writer, and by nothing else. `shep-cli` is `[[bin]]`-only, so `pub` exempts
-// nothing from `dead_code` — see `output::table::render_table`, which carries
-// an `#[allow(dead_code)]` and a comment saying exactly this.
+// writer, and by nothing else. The package has had a `[lib]` target since
+// Phase 14, but `pub` here still exempts nothing from `dead_code`: `mod
+// lookout` in `lib.rs` is private, not `pub mod`, and `lib.rs`'s own doc
+// comment states the crate's whole public API as three entry points, every
+// other item private — so `pub mod frames` nested inside a private module is
+// invisible outside this crate regardless of the keyword. Reachability turns
+// on module privacy, not on whether a `[lib]` target exists. See
+// `output::table::render_table`, which carries an `#[allow(dead_code)]` and a
+// comment saying the same thing from the other direction.
 #[cfg(test)]
 pub mod frames;
 pub mod input;

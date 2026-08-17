@@ -22,12 +22,16 @@
 //! regenerating the gallery is one command.
 //!
 //! **`#[cfg(test)]` at the `mod` declaration in `super::mod`, not a plain
-//! `pub mod`.** `shep-cli` is `[[bin]]`-only, so in a normal build the only
-//! reachability root is `main` — nothing here is called outside this
-//! module's own tests, so a plain `pub mod` fails the task gate on
-//! `dead_code`. Gating the whole module means these items simply do not
-//! exist in a non-test build, and cost nothing when they run under
-//! `cargo test`.
+//! `pub mod`.** The package (`shep`) has had a `[lib]` target since Phase 14,
+//! but that does not exempt this module from `dead_code`: `mod lookout` in
+//! `lib.rs` is private, and `lib.rs`'s own doc comment states the crate's
+//! whole public API as three entry points — `main`, `main_runtime`,
+//! `main_dev` — with every other item private. A `pub mod frames` nested
+//! inside a private module is unreachable from outside this crate regardless
+//! of the keyword, so nothing here is called outside this module's own
+//! tests, and a plain `pub mod` fails the task gate on `dead_code`. Gating
+//! the whole module means these items simply do not exist in a non-test
+//! build, and cost nothing when they run under `cargo test`.
 
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
