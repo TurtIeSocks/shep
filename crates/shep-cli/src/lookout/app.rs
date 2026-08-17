@@ -57,6 +57,19 @@ pub enum Control {
     Allowed,
 }
 
+/// Which keymap is in force.
+///
+/// Held by the reducer and passed to [`super::input::map_key`] at the call
+/// site, so the crossterm edge stays in one file and this module keeps
+/// holding no terminal types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    /// The ordinary dashboard keys.
+    Normal,
+    /// The filter box is open and every printable key is text.
+    Text,
+}
+
 /// The keys lookout binds, named by what they mean rather than by which key
 /// produces them.
 ///
@@ -65,8 +78,12 @@ pub enum Control {
 /// translation at the edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyPress {
-    /// `q`, `Esc`, or `Ctrl-C`.
+    /// `q` in normal mode, or `Ctrl-C` in either.
     Quit,
+    /// `Esc` in normal mode. Cancels an armed confirm if there is one, else
+    /// clears the filter if there is one, else quits. The reducer decides,
+    /// because the keymap cannot see any of those three states.
+    Escape,
     /// `k` or `Up` — the selection moves up one row.
     SelectUp,
     /// `j` or `Down` — the selection moves down one row.
@@ -80,6 +97,16 @@ pub enum KeyPress {
     /// `x` — the one action key. Refuses in both control states, today; see
     /// the plan's design decision 2.
     Stop,
+    /// `/` — open the filter box, carrying whatever query is already set.
+    FilterStart,
+    /// One printable character typed into the box.
+    FilterChar(char),
+    /// `Backspace` in the box.
+    FilterBackspace,
+    /// `Enter` in the box: apply and leave.
+    FilterApply,
+    /// `Esc` in the box: clear the filter and leave.
+    FilterAbandon,
 }
 
 /// Everything that can change the dashboard.
@@ -248,6 +275,9 @@ pub struct App {
     /// Taken literally, spaces included, with no trimming (A6): this repo does
     /// not widen an accepted input format without a basis in the spec.
     filter: String,
+    /// Which keymap [`super::input::map_key`] is called with. Normal until
+    /// `/` opens the box; the reducer, not the keymap, owns this state.
+    mode: InputMode,
     link: Link,
     notice: Option<Notice>,
     palette: Palette,
@@ -285,6 +315,7 @@ impl App {
             flock: BTreeMap::new(),
             selected: None,
             filter: String::new(),
+            mode: InputMode::Normal,
             link: Link::Live,
             notice: None,
             palette,
@@ -452,9 +483,26 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyPress) -> Effect {
+        // While the box is open every KEY is text. That is not the same as
+        // nothing being able to raise a notice: three of them arrive on
+        // messages that are not keys at all, and the status bar rather than
+        // this branch is what keeps them off the query. See `on_text_key`.
+        if self.mode == InputMode::Text {
+            return self.on_text_key(key);
+        }
         self.notice = None;
         match key {
             KeyPress::Quit => Effect::Quit,
+            // The one key whose meaning depends on state, and the screen says
+            // which meaning is in force: the bar reads `esc clear` for
+            // exactly as long as clearing is what it does.
+            KeyPress::Escape => {
+                if self.filter.is_empty() {
+                    Effect::Quit
+                } else {
+                    self.set_filter(String::new())
+                }
+            }
             // The one key that does I/O, and it refuses honestly once the
             // link task has ended: its poll receiver is gone by then, so an
             // `Effect::PollNow` would be a `try_send` into a closed channel
@@ -485,6 +533,57 @@ impl App {
                 self.notice = Some(Notice { text, grave: true });
                 Effect::None
             }
+            KeyPress::FilterStart => {
+                self.mode = InputMode::Text;
+                Effect::None
+            }
+            // `map_key` produces these only in text mode, which the branch at
+            // the top of this function has already taken. Named rather than
+            // wildcarded so a future variant does not fall silently into an
+            // arm that ignores it.
+            KeyPress::FilterChar(_)
+            | KeyPress::FilterBackspace
+            | KeyPress::FilterApply
+            | KeyPress::FilterAbandon => Effect::None,
+        }
+    }
+
+    /// The filter box's keymap.
+    ///
+    /// Ctrl-C still quits: in raw mode it is a key event and not a signal,
+    /// and a text box that swallowed it would leave the operator reaching for
+    /// `kill -9` from another window, past every restore path
+    /// [`super::term`] has.
+    ///
+    /// Deliberately does NOT clear [`Self::notice`], unlike the normal-mode
+    /// branch above it. A notice can be raised while this box is open, by
+    /// `Msg::BusLagged`, `BusEvent::Dropped` or `BusEvent::DaemonShutdown`,
+    /// none of which is a keypress; clearing here would destroy it because
+    /// somebody was mid-word. The status bar hides it under the box instead
+    /// and shows it when the box closes. See the phase plan's "Shapes the
+    /// design named" #2.
+    fn on_text_key(&mut self, key: KeyPress) -> Effect {
+        match key {
+            KeyPress::Quit => Effect::Quit,
+            KeyPress::FilterChar(typed) => {
+                let mut query = self.filter.clone();
+                query.push(typed);
+                self.set_filter(query)
+            }
+            KeyPress::FilterBackspace => {
+                let mut query = self.filter.clone();
+                query.pop();
+                self.set_filter(query)
+            }
+            KeyPress::FilterApply => {
+                self.mode = InputMode::Normal;
+                Effect::None
+            }
+            KeyPress::FilterAbandon => {
+                self.mode = InputMode::Normal;
+                self.set_filter(String::new())
+            }
+            _ => Effect::None,
         }
     }
 
@@ -638,6 +737,13 @@ impl App {
     #[must_use]
     pub fn filter(&self) -> &str {
         &self.filter
+    }
+
+    /// Which keymap is currently in force, for `super::run_ui`'s call to
+    /// [`super::input::map_key`].
+    #[must_use]
+    pub fn mode(&self) -> InputMode {
+        self.mode
     }
 
     /// How many sheep the shepherd last reported, whatever the filter hides.
@@ -1136,6 +1242,131 @@ mod tests {
             assert_ne!(app.update(msg), Effect::Quit);
         }
         assert_eq!(app.update(Msg::Key(KeyPress::Quit)), Effect::Quit);
+    }
+
+    /// fails if `Esc` starts quitting out from under a filter. It is the one
+    /// key whose meaning depends on state, which is acceptable only because
+    /// the status bar reads `esc clear` for as long as that is in force and
+    /// the title keeps `2 of 4 in the flock` on screen.
+    ///
+    /// **Deviation from the plan's literal (Task 2, Step 2.2):** the plan
+    /// asserts `Effect::RefreshFeed` here. Traced against `reseat`/
+    /// `set_filter` (both shipped, unchanged, in Task 1): clearing a filter
+    /// only WIDENS the visible set, so a selection valid under the narrower
+    /// filter is — by construction — still valid under the wider one.
+    /// `reseat`'s very first line (`if self.selected_index().is_some() {
+    /// return false; }`) therefore always takes the no-reseat path on any
+    /// widening change, for every fixture, not just this one — there is no
+    /// selected sheep for which clearing a filter could report a move. Empty
+    /// filter's own doc says `RefreshFeed` rides "a selection that actually
+    /// moved"; here it correctly did not, so `Effect::None` is the honest
+    /// answer, not a bug this task should paper over by nudging `reseat`.
+    #[test]
+    fn esc_clears_the_filter_instead_of_quitting_while_one_is_set() {
+        let mut app = filtered("web");
+        assert_eq!(app.update(Msg::Key(KeyPress::Escape)), Effect::None);
+        assert_eq!(app.filter(), "");
+        assert_eq!(app.rows().len(), 4);
+    }
+
+    /// fails if the clear becomes unconditional, which is the mirror bug: `q`
+    /// and Ctrl-C quit from every non-editing state, and so does `Esc` when
+    /// there is no filter to take away first.
+    #[test]
+    fn esc_still_quits_with_no_filter_set() {
+        let (mut app, _t0) = started();
+        assert_eq!(app.update(Msg::Key(KeyPress::Escape)), Effect::Quit);
+    }
+
+    /// fails if typing into the box stops narrowing the table live, or if
+    /// `Enter` narrows it a second time. The design's `filter_editing` frame
+    /// is mid-type with the table already narrowed; applying only changes
+    /// which keys mean what.
+    #[test]
+    fn the_table_narrows_while_the_query_is_still_being_typed() {
+        let (mut app, _t0) = started();
+        app.update(Msg::Key(KeyPress::FilterStart));
+        assert_eq!(app.mode(), InputMode::Text);
+        for letter in ['w', 'e', 'b'] {
+            app.update(Msg::Key(KeyPress::FilterChar(letter)));
+        }
+        assert_eq!(app.rows().len(), 1, "narrowed before Enter");
+        app.update(Msg::Key(KeyPress::FilterApply));
+        assert_eq!(app.mode(), InputMode::Normal);
+        assert_eq!(
+            app.rows().len(),
+            1,
+            "and applying changed nothing but the mode"
+        );
+    }
+
+    /// fails if backspace stops widening the table again.
+    #[test]
+    fn backspace_widens_the_table_back_out() {
+        let (mut app, _t0) = started();
+        app.update(Msg::Key(KeyPress::FilterStart));
+        app.update(Msg::Key(KeyPress::FilterChar('w')));
+        app.update(Msg::Key(KeyPress::FilterChar('z')));
+        assert_eq!(app.rows().len(), 0);
+        app.update(Msg::Key(KeyPress::FilterBackspace));
+        assert_eq!(
+            app.rows().len(),
+            2,
+            "wz became w, which matches web and worker"
+        );
+    }
+
+    /// fails if abandoning the box leaves the filter behind. `Esc` while
+    /// editing clears and leaves; the two halves are one action.
+    #[test]
+    fn esc_while_editing_clears_the_filter_and_leaves_the_box() {
+        let (mut app, _t0) = started();
+        app.update(Msg::Key(KeyPress::FilterStart));
+        app.update(Msg::Key(KeyPress::FilterChar('w')));
+        app.update(Msg::Key(KeyPress::FilterAbandon));
+        assert_eq!(app.mode(), InputMode::Normal);
+        assert_eq!(app.filter(), "");
+        assert_eq!(app.rows().len(), 3);
+    }
+
+    /// fails if a notice survives into the filter box. Two things keep the
+    /// query visible and this is one of them: opening the box takes any
+    /// standing notice down (the `self.notice = None` at the top of
+    /// `on_key`'s normal branch, which `FilterStart` goes through), and slot
+    /// 2 of the bar keeps a notice raised LATER, while the box is open, from
+    /// covering it. The second is what actually matters, because
+    /// `Msg::BusLagged`, `BusEvent::Dropped` and `BusEvent::DaemonShutdown`
+    /// all raise notices with no keypress involved and keep arriving while
+    /// somebody types; see the phase plan's "Shapes the design named" #2.
+    /// This test pins the first, which is what stops a stale notice
+    /// reappearing the instant the box closes.
+    #[test]
+    fn opening_the_filter_takes_a_notice_off_the_bar() {
+        let (mut app, _t0) = started();
+        app.update(Msg::Event(BusEvent::Dropped { count: 3 }));
+        assert!(app.notice().is_some());
+        app.update(Msg::Key(KeyPress::FilterStart));
+        assert!(app.notice().is_none(), "the box is what the bar shows now");
+    }
+
+    /// fails if a notice raised WHILE the box is open is destroyed rather
+    /// than deferred. The rejected fix for the same problem was to clear
+    /// `self.notice` at the top of `on_text_key`; it would lose a
+    /// `DaemonShutdown` because the operator happened to be mid-word. The bar
+    /// hides the notice under the box (slot 2) and this pins that the notice
+    /// itself is still there to be shown when the box closes.
+    #[test]
+    fn a_notice_raised_while_typing_is_deferred_and_not_destroyed() {
+        let (mut app, _t0) = started();
+        app.update(Msg::Key(KeyPress::FilterStart));
+        app.update(Msg::Key(KeyPress::FilterChar('w')));
+        app.update(Msg::Event(BusEvent::DaemonShutdown));
+        app.update(Msg::Key(KeyPress::FilterChar('e')));
+        assert!(
+            app.notice().is_some(),
+            "typing did not wipe the shepherd's announcement"
+        );
+        assert_eq!(app.filter(), "we", "and the box kept the query");
     }
 
     /// fails if a reconnect leaves the dashboard in a state that says nothing.

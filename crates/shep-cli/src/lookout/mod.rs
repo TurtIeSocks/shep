@@ -359,7 +359,7 @@ where
             } => break,
             event = events.next(), if !keys_done => match event {
                 Some(Ok(crossterm::event::Event::Resize(..))) => Some(Msg::Resize),
-                Some(Ok(event)) => input::map_key(&event).map(Msg::Key),
+                Some(Ok(event)) => input::map_key(&event, app.mode()).map(Msg::Key),
                 // A key source that has ENDED, or has started erroring. The
                 // real one does neither in ordinary use; a test's ends on its
                 // last scripted key, and a stdin whose descriptor has gone bad
