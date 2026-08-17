@@ -13,7 +13,7 @@ Traced 2026-08-07 via 9 parallel agents (function-level on <500-line files, flow
 | API core | [trace/apiCore.md](trace/apiCore.md) | API.js (1933 LOC), Log*, Monit, Dashboard, Version, UX/* |
 | API extra | [trace/apiExtra.md](trace/apiExtra.md) | Startup, Configuration, Extra, Containerizer, Deploy, Serve, Modules/*, pm2-plus/*, schema.json |
 | CLI | [trace/cli.md](trace/cli.md) | binaries/* (CLI.js full command enum), bin/*, completion |
-| Aux plumbing | [trace/aux.md](trace/aux.md) | Common.js, Utility, Configuration store, HttpInterface, OtelManager, Worker, VersionCheck, tools/*, templates |
+| Aux plumbing | [trace/aux-plumbing.md](trace/aux-plumbing.md) | Common.js, Utility, Configuration store, HttpInterface, OtelManager, Worker, VersionCheck, tools/*, templates |
 | Ecosystem | [trace/eco.md](trace/eco.md) | pm2-io-agent, pm2-io-bpm, vizion, packager, types/, full 22-dep audit |
 | Tests/CI | [trace/tests.md](trace/tests.md) | Full suite inventory, CI matrix, coverage holes |
 | rand style | [trace/randStyle.md](trace/randStyle.md) | Conventions to adopt (workspace, lints, docs, errors, tests, release) |

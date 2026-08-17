@@ -59,7 +59,7 @@ pn = "pn"
 # `aux.md`'s own line already marks the first one "(sic, typo'd export)".
 gracefull = "gracefull" # trace/rpc.md:14 — pm2's own `gracefullExit`
 instanciate = "instanciate" # trace/cli.md:95 — pm2's own `Runtime.instanciate`
-knonw = "knonw" # trace/aux.md:9 — pm2's own `knonwConfigFileExtensions`
+knonw = "knonw" # trace/aux-plumbing.md:9 — pm2's own `knonwConfigFileExtensions`
 formated = "formated" # trace/core.md:23 — pm2's own `getFormatedProcesses`
 shouldnot = "shouldnot" # trace/tests.md:13 — pm2's own test helper name
 resurect = "resurect" # trace/tests.md:48 — pm2's own `resurect_state.mocha.js`
