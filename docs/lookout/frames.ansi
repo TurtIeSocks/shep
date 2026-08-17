@@ -269,7 +269,7 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m
 Mid-type at 100x14. The table has already narrowed to the two sheep whose names contain the query, the title counts the narrowed set and the whole flock, and the status bar carries the query, a cursor, and the three keys that mean anything while the box is open.
 
 shep lookout   /home/rin/.shep                                                  [0m[38;5;245m 2 of 6 in the flock[0m
-[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.3%   flock mem 360.0M  …[0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …[0m
   [0m[38;5;245mID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────[0m
   0     web               [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
@@ -288,7 +288,7 @@ shep lookout   /home/rin/.shep                                                  
 The same query applied. The box is closed, the table is still narrowed, and the bar has changed to name the two keys that now touch the filter.
 
 shep lookout   /home/rin/.shep                                                  [0m[38;5;245m 2 of 6 in the flock[0m
-[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.3%   flock mem 360.0M  …[0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …[0m
   [0m[38;5;245mID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────[0m
   0     web               [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
@@ -307,7 +307,7 @@ shep lookout   /home/rin/.shep                                                  
 A query nothing matches. The table names the query rather than claiming the flock is empty, and the title keeps the flock's real size on screen.
 
 shep lookout   /home/rin/.shep                                                  [0m[38;5;245m 0 of 6 in the flock[0m
-[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu -   flock mem -   up 6d 3h[0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …[0m
   [0m[38;5;245mID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────[0m
 [0m[38;5;245mno sheep's name contains "zzz"[0m                                                                      [0m

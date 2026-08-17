@@ -3,7 +3,7 @@ source: crates/shep-cli/src/lookout/frames.rs
 expression: render_text(&buffer)
 ---
 shep lookout   /home/rin/.shep                                                   0 of 6 in the flock
-host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu -   flock mem -   up 6d 3h
+host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
   ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 no sheep's name contains "zzz"                                                                      

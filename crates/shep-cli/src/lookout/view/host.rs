@@ -6,6 +6,14 @@
 //! narrow terminal must never leave a bare `mem 12.4G` beside a bare
 //! `mem 706.0M`.
 //!
+//! The flock half sums [`super::super::app::App::all_rows`], the WHOLE
+//! flock, never [`super::super::app::App::rows`], the table's current view.
+//! A strip that named itself `flock cpu`/`flock mem` is a claim about the
+//! machine's total load, and a name filter narrowing the table must not
+//! quietly narrow that claim along with it (Phase 16 review Important #4); the
+//! title bar is where the filtered-vs-total split already lives
+//! (`2 of 6 in the flock`), one row above this one.
+//!
 //! Segments are joined **in the drop order** — `up` last, then the flock's
 //! memory, its CPU, the host's memory, with the load average first — and the
 //! line is fitted with [`super::flock::fit`], the same call every other line
@@ -62,11 +70,16 @@ fn segments(app: &App) -> Vec<String> {
         None => out.push("host  not read yet".to_string()),
     }
 
-    // Summed from the rows already on screen, never requested. `-` and not
-    // `0.0%` when nothing reported: `ProcessInfo::cpu_percent`'s own doc is
+    // Summed from the WHOLE flock, `all_rows`, not the table's current
+    // `rows`: a filter that narrows what's on screen must not also narrow
+    // what this strip claims about the machine, and `-` here must keep
+    // meaning "no reading", never "the filter matched nothing" — see the
+    // module doc and `App::all_rows`. Never requested on its own: this is
+    // the same `ListFlock` reply the table already has. `-` and not `0.0%`
+    // when nothing reported: `ProcessInfo::cpu_percent`'s own doc is
     // explicit that `None` is unknown, and rendering unknown as zero claims a
     // measurement the shepherd never made.
-    let rows = app.rows();
+    let rows = app.all_rows();
     let cpu: Option<f32> = rows
         .iter()
         .filter_map(|row| row.info.cpu_percent)
@@ -189,5 +202,34 @@ mod tests {
 
         // Both keep the flock half, which lookout can always compute.
         assert!(rendered(&strip_line(&unsupported, 200)).contains("flock cpu"));
+    }
+
+    /// fails if the strip's flock totals move when a filter narrows the
+    /// table. The strip is a claim about the whole machine, not about
+    /// whatever the table currently shows, and Phase 16 review Important #4
+    /// caught `flock cpu`/`flock mem` silently summing the FILTERED set
+    /// while staying labelled `flock` — a filter matching nothing made a
+    /// running flock's strip print `-`, the same cell this dashboard
+    /// reserves for "no reading arrived yet".
+    #[test]
+    fn the_flock_totals_ignore_the_filter() {
+        let mut app = with_host(sample(), flock_of(4, 1));
+        let full = rendered(&strip_line(&app, 200));
+        assert!(full.contains("flock cpu 3.5%"), "sanity: got {full:?}");
+
+        // A filter matching nothing empties the table (`rows()`) without
+        // touching the flock itself (`all_rows()`, what the strip reads).
+        app.set_filter_for_tests("zzz");
+        assert!(app.rows().is_empty(), "sanity: the filter matched nothing");
+        let filtered = rendered(&strip_line(&app, 200));
+
+        assert_eq!(
+            full, filtered,
+            "the strip must not change when the table's filter does: {filtered:?}"
+        );
+        assert!(
+            !filtered.contains("flock cpu -"),
+            "a filter matching nothing is not the same as no reading arriving: {filtered:?}"
+        );
     }
 }

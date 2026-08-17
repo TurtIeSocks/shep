@@ -261,7 +261,7 @@ read-only: actions need --allow-control                                         
 Mid-type at 100x14. The table has already narrowed to the two sheep whose names contain the query, the title counts the narrowed set and the whole flock, and the status bar carries the query, a cursor, and the three keys that mean anything while the box is open.
 
 shep lookout   /home/rin/.shep                                                   2 of 6 in the flock
-host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.3%   flock mem 360.0M  …
+host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
   ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────
   0     web               online           48211    0         3.4%    182.0M    1h 25m    edge      
@@ -279,7 +279,7 @@ filter  web▏   enter applies   esc cancels   ctrl-c quits                     
 The same query applied. The box is closed, the table is still narrowed, and the bar has changed to name the two keys that now touch the filter.
 
 shep lookout   /home/rin/.shep                                                   2 of 6 in the flock
-host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.3%   flock mem 360.0M  …
+host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
   ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────
   0     web               online           48211    0         3.4%    182.0M    1h 25m    edge      
@@ -297,7 +297,7 @@ filter "web"   / edit   esc clear                                               
 A query nothing matches. The table names the query rather than claiming the flock is empty, and the title keeps the flock's real size on screen.
 
 shep lookout   /home/rin/.shep                                                   0 of 6 in the flock
-host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu -   flock mem -   up 6d 3h
+host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
   ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 no sheep's name contains "zzz"                                                                      

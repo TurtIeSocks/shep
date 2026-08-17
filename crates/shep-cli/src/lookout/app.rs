@@ -1204,12 +1204,32 @@ impl App {
         Effect::RefreshSelected
     }
 
-    /// The flock, in id order.
+    /// The flock the table draws, in id order: the whole flock, or whatever
+    /// the filter leaves of it. See [`Self::all_rows`] for the unfiltered
+    /// sequence a pane describing the machine as a whole, not the table's
+    /// current view, needs instead.
     #[must_use]
     pub fn rows(&self) -> Vec<&Row> {
         self.visible_ids()
             .filter_map(|id| self.flock.get(&id))
             .collect()
+    }
+
+    /// Every sheep the shepherd last reported, in id order, whatever the
+    /// filter hides.
+    ///
+    /// The host strip reads this rather than [`Self::rows`]: Phase 16 review
+    /// Important #4 caught `flock cpu`/`flock mem` silently summing the FILTERED
+    /// set while staying labelled `flock`, so a filter that matched nothing
+    /// made the strip print `-` for a running flock the strip had simply
+    /// stopped looking at. `-` is reserved for a genuine unknown reading
+    /// ([`ProcessInfo::cpu_percent`]'s own doc), not for "the table's query
+    /// happens to exclude everything right now", and the title bar already
+    /// carries the filtered-vs-total distinction (`2 of 6 in the flock`) so
+    /// the strip does not have to.
+    #[must_use]
+    pub fn all_rows(&self) -> Vec<&Row> {
+        self.flock.values().collect()
     }
 
     /// Replaces the filter and puts the selection back on a visible sheep.
@@ -1388,6 +1408,16 @@ impl App {
     #[cfg(test)]
     pub(crate) fn set_control_for_tests(&mut self, control: Control) {
         self.control = control;
+    }
+
+    /// Sets the filter directly, bypassing the reseat [`Self::set_filter`]
+    /// does. `set_filter` is private to this module; this is the one line
+    /// that lets `view::host`'s tests (a sibling module, not a descendant)
+    /// build a dashboard with a filter already applied, the same shape
+    /// [`Self::set_control_for_tests`] takes for the control gate.
+    #[cfg(test)]
+    pub(crate) fn set_filter_for_tests(&mut self, query: &str) {
+        self.filter = query.to_string();
     }
 }
 
