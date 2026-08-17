@@ -320,19 +320,40 @@ fn a_reparented_orphan_is_reaped() {
 
     nix::sys::prctl::set_child_subreaper(true).expect("Linux has supported this since 3.4");
 
-    // A shell that forks a short-lived grandchild and exits immediately,
-    // so the grandchild is reparented to this test process.
+    // A shell that forks a short-lived grandchild, prints its pid via `$!`,
+    // and exits immediately, so the grandchild is reparented to this test
+    // process. The printed pid is what lets the wait below target that ONE
+    // process instead of `-1` ("any child of mine"): every `#[test]` in
+    // this binary runs as a thread in one shared OS process, so a wildcard
+    // wait is not scoped to this test's own subtree — it happily reaps
+    // whatever child of the process happens to have exited, including one
+    // a concurrently-running test spawned and is itself still waiting on.
+    // That is exactly what CI hit: this test's `waitpid(-1, ...)` reaped
+    // `a_supervisor_killed_by_sigkill_makes_the_init_exit_137`'s child out
+    // from under it, which then saw `ECHILD` polling a pid the kernel no
+    // longer had any record of.
     let mut shell = std::process::Command::new("/bin/sh")
-        .args(["-c", "(sleep 0.2; exit 3) & exit 0"])
+        .args(["-c", "(sleep 0.2; exit 3) & echo $!"])
+        .stdout(Stdio::piped())
         .spawn()
         .expect("spawn the shell");
+    let mut printed_pid = String::new();
+    BufReader::new(shell.stdout.take().expect("shell stdout was piped"))
+        .read_line(&mut printed_pid)
+        .expect("read the grandchild's pid off the shell's stdout");
     let _ = shell.wait();
+    let grandchild_pid = Pid::from_raw(
+        printed_pid
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("shell printed no valid pid ({e}): {printed_pid:?}")),
+    );
 
     // Bounded drain: never `loop {}` against a real kernel event.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut reaped_an_orphan = false;
     while Instant::now() < deadline {
-        match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+        match waitpid(grandchild_pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(_, 3)) => {
                 reaped_an_orphan = true;
                 break;
