@@ -127,7 +127,15 @@ toml.workspace = true
 # `toml` 0.8 already pulls in `toml_edit` 0.22.27 as its own backing
 # implementation (`Cargo.lock`), and `default-features = false` plus this
 # exact feature pair matches what that pulls in already.
-toml_edit = { version = "0.22", default-features = false, features = ["display", "parse"] }
+#
+# Floor 0.22.7, not the bare "0.22" that reads: `DocumentMut` itself (the
+# type this whole dependency exists for) is a 0.22.7 rename of the older
+# `Document` — `-Z minimal-versions` picked 0.22.0 without this and failed
+# `shep_toml.rs`'s import with `no DocumentMut in the root` (CI run
+# 32023586026). The "0.22" in the prose above was never wrong about what
+# ships; it was wrong about what the declared floor let `-Z minimal-versions`
+# pick.
+toml_edit = { version = "0.22.7", default-features = false, features = ["display", "parse"] }
 # `commands::shep_toml`'s write path: `shep.toml` is staged in a sibling temp
 # file at `0600` (mode at creation, via `Builder::permissions`), `fsync`ed and
 # `rename`d over the original, the same shape shep-core's `barks::write_ring`
@@ -175,6 +183,16 @@ nix = { workspace = true, features = ["fs"] }
 # phase gate runs.
 ratatui.workspace = true
 crossterm.workspace = true
+# Not used by any code in this crate — see the workspace `Cargo.toml`'s own
+# comment on this pin. It exists only to force `-Z minimal-versions` to a
+# `time` floor high enough for `ratatui-widgets`' `calendar.rs` (pulled in by
+# `ratatui` above unconditionally, unix-only like this whole block) to
+# compile. Living here rather than at the workspace level keeps it out of
+# the Windows dependency graph, same as `ratatui`/`crossterm` themselves.
+time.workspace = true
+# Same reasoning, same pin style, one more `ratatui` transitive floor: see
+# the workspace `Cargo.toml`'s comment on this one too.
+instability.workspace = true
 # The MCP server behind `shep whistle`. Unix-only for the same reason
 # `ratatui` and `crossterm` above are: `src/whistle/` is `#[cfg(unix)]`,
 # because it needs a unix socket to reach a shepherd, and the Windows leg of

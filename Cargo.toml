@@ -74,13 +74,20 @@ globset = { version = "0.4.11", default-features = false }
 # landed in Phase 2a but never rehearsed against `-Z minimal-versions` with the `process`
 # feature before Task 2's bus rehearsal caught it) needs two later APIs:
 # `Command::as_std_mut` (added 1.39.1 — 1.39.0 was yanked) and `Command::process_group`
-# losing its `#[cfg(tokio_unstable)]` gate (1.40.0). Floor to 1.40 — the lowest we've
-# empirically confirmed builds and passes the workspace under `-Z minimal-versions`.
-tokio = { version = "1.40", default-features = false }
+# losing its `#[cfg(tokio_unstable)]` gate (1.40.0). Floor 1.41: `extras.rs`'s own
+# `mod tests` calls `JoinHandle::id`/`AbortHandle::id` (task IDs), which carried the
+# same `#[cfg(tokio_unstable)]` gate through 1.40.0 and only stabilized in 1.41.0 — CI
+# run 32023586026's `minimal-versions` job caught 1.40 failing to compile `shep-daemon`'s
+# own test target with exactly that gate.
+tokio = { version = "1.41", default-features = false }
 # 0.7.0 has a broken minimum floor: it needs a newer tokio (mpsc `reserve_owned`, absent
 # from tokio 1.0.1) and a working log/tracing bridge (`trace!` fails to resolve under
 # minimal deps). Fixed in 0.7.1, which also pulls in a tokio floor high enough to compile.
-tokio-util = { version = "0.7.1", default-features = false, features = ["codec"] }
+# Floor 0.7.9: `rmcp`'s `transport::async_rw` imports `tokio_util::bytes` — a `pub use
+# bytes;` re-export this crate did not carry until 0.7.9 (0.7.1 has no `bytes` item at
+# all). `-Z minimal-versions` picked 0.7.1 for it without this and failed to compile
+# `rmcp` with `unresolved import` (same CI run as the `tokio` floor above).
+tokio-util = { version = "0.7.9", default-features = false, features = ["codec"] }
 bytes = { version = "1", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # Only shep-daemon: process-group signal delivery and process-related syscalls for the
@@ -113,12 +120,14 @@ lazy_static = { version = "1.0.2", default-features = false }
 # payload); 1.18.0 has a JSON-serialization regression with exactly that shape, fixed
 # in 1.18.1.
 insta = { version = "1.18.1", default-features = false, features = ["json"] }
-# Floor 3.9: shep-core's `barks::write_ring` stages the ring through
+# Floor 3.10: shep-core's `barks::write_ring` stages the ring through
 # `Builder::permissions`, so the temp file is created at 0600 in the `open` call
-# rather than chmod'ed afterwards. That builder method landed in tempfile 3.9.0 —
-# `-Z minimal-versions` picks 3.0.0 without this and fails with `no method named
-# permissions found for struct Builder`.
-tempfile = { version = "3.9", default-features = false }
+# rather than chmod'ed afterwards. That builder method landed in tempfile
+# 3.10.0 (confirmed against the upstream CHANGELOG, not just a guess this
+# time — 3.9 was one minor short and still let `-Z minimal-versions` pick a
+# `Builder` without it, failing with `no method named permissions found for
+# struct Builder`).
+tempfile = { version = "3.10", default-features = false }
 # Only shep-daemon (dev): property tests on the kill ladder / supervisor state machine.
 proptest = { version = "1", default-features = false, features = ["std"] }
 # For the event-bus subscription stream: `broadcast::Receiver` has no poll
@@ -220,8 +229,13 @@ webpki-roots = "0.26"
 # explicitly so it can never skew from our own direct dependency below;
 # `layout-cache` is the memoized layout solver; `underline-color` is what makes
 # a coloured underline expressible without a second style pass. Not
-# `all-widgets` (gates the calendar widget alone, unused) and not `macros`
-# (ratatui-macros is sugar; KISS).
+# `all-widgets` (opts this crate's own `default` list into the calendar
+# widget) and not `macros` (ratatui-macros is sugar; KISS) — though the
+# calendar widget itself is *not* actually avoidable this way: `ratatui`'s
+# own manifest depends on `ratatui-widgets` plainly (no `default-features =
+# false`), and `ratatui-widgets`' OWN default list turns its `calendar`
+# feature on regardless of anything requested here. See the `time` pin below
+# for what that costs under `-Z minimal-versions`.
 ratatui = { version = "0.30", default-features = false, features = ["std", "crossterm_0_29", "layout-cache", "underline-color"] }
 # The backend, named directly rather than reached through ratatui's re-export:
 # `crossterm::event::EventStream` (the async input source the UI loop selects
@@ -232,6 +246,27 @@ ratatui = { version = "0.30", default-features = false, features = ["std", "cros
 # `#[cfg(unix)]` like `commands` and `dog`, and the Windows leg of
 # `main.rs::run` refuses every verb before dispatching to any of them.
 crossterm = { version = "0.29", default-features = false, features = ["events", "event-stream"] }
+# Not used directly anywhere in this workspace — pinned only to force the
+# resolved floor. `ratatui-widgets` (pulled in unconditionally by `ratatui`,
+# see the comment above) declares `time = "0.3"`, i.e. accepts 0.3.0, but its
+# own `calendar.rs` calls two methods `time` added well after that:
+# `Date::replace_day` (0.3.9) and `Month::length` (0.3.37, confirmed against
+# `time`'s own source — 0.3.36 has no such method). `-Z minimal-versions`
+# picked 0.3.0 for it without this pin and failed to compile
+# `ratatui-widgets`, first on the earlier method and then, once that alone
+# was fixed, on the later one (CI run 32023586026 only caught the first;
+# the second showed up rehearsing the fix locally). Floor to whichever of
+# the two lands later — currently `Month::length`.
+time = { version = "0.3.37", default-features = false }
+# Also not used directly — same reasoning and same crate as the `time` pin
+# above. `ratatui` 0.30.0 declares `instability = "0.3"`, i.e. accepts
+# 0.3.0, but its own `widgets.rs` applies `#[instability::unstable(...)]`
+# to a braced `pub use { A, B };` re-export — an item shape `instability`'s
+# macro could not handle at all until 0.3.4 (confirmed against its source:
+# 0.3.0's expansion match has no `Item::Use` arm and panics with
+# "unsupported item type" on anything it does not recognize; 0.3.4 adds
+# that arm). `-Z minimal-versions` picked 0.3.0 and hit exactly that panic.
+instability = { version = "0.3.4", default-features = false }
 # The MCP SDK, for `shep whistle` (spec §8, §9). Rin's ruling (2026-08-14),
 # taken against a hand-rolled stdio JSON-RPC loop: MCP is an evolving
 # protocol, and tracking an SDK beats owning a parser for something whose
