@@ -1695,7 +1695,7 @@ mod tests {
         let app = filtered("zzz");
         assert_eq!(app.rows().len(), 0);
         assert_eq!(app.selected(), None);
-        assert_eq!(app.selected_row().is_none(), true);
+        assert!(app.selected_row().is_none());
         assert_eq!(app.flock_len(), 4, "the flock is still four sheep");
     }
 

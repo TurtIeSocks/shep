@@ -31,4 +31,4 @@ this sheep has not written a log in this $SHEP_HOME
                                                                                                                         
                                                                                                                         
                                                                                                                         
-q quit   j/k select   g/G first/last   r refresh                                                               read-only
+q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only

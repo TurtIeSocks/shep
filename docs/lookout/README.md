@@ -72,6 +72,15 @@ cargo test -p shep --bins --all-features -- --ignored write_the_gallery
   whenever a snapshot replaces the flock map or the selected sheep drops out
   of it. The two panes below the table both describe whichever sheep is
   selected.
+- **A name filter, narrowing the table in place.** `/` opens a box in the
+  status bar; typing narrows the table to sheep whose name contains the
+  query, `Enter` applies it and closes the box, `Esc` cancels the edit, and
+  `Ctrl-C` still quits from inside the box. Once a filter is applied, `Esc`
+  clears it rather than quitting — the one carve-out to "every other key
+  cancels" a filter needs, so an operator does not have to reach for `/`
+  and backspace to get back to the whole flock. The title carries a second
+  number, `2 of 6 in the flock`, for as long as a filter is narrowing what
+  the table shows.
 - **The bleats feed reads log files, not the bus.** It re-reads the
   selected sheep's `out`/`err` log files from disk on every refresh, rather
   than subscribing to the `log.*` bus topic. A busy flock costs one bounded
@@ -99,9 +108,6 @@ cargo test -p shep --bins --all-features -- --ignored write_the_gallery
 
 ## What is still open
 
-- **Search/filter.** Rin's v1 ruling for 12b excluded it explicitly, and it
-  still carries an unresolved question from 12a: whether a filter line takes
-  the CLI's own selector grammar or plain substring matching.
 - **Actions behind the gate.** The gate exists and refuses honestly; no
   action beyond `x`'s refusal has landed behind it yet.
 - **Lambs in the detail pane.** Showing them needs `Describe`'s

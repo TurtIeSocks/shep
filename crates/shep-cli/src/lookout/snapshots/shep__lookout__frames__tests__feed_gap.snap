@@ -31,4 +31,4 @@ out  GET /v1/orders/26 200 34ms
 out  GET /v1/orders/27 200 35ms                                                                                         
 out  GET /v1/orders/28 200 36ms                                                                                         
 out  GET /v1/orders/29 200 37ms                                                                                         
-q quit   j/k select   g/G first/last   r refresh                                                               read-only
+q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only

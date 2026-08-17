@@ -8,7 +8,7 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::super::app::{App, Control, Link};
+use super::super::app::{App, Control, InputMode, Link};
 use super::flock::fit;
 
 /// The title: what this is, where it points, and how big the flock is.
@@ -24,8 +24,13 @@ use super::flock::fit;
 pub fn title_line(app: &App, home: &str, width: u16) -> Line<'static> {
     let palette = app.palette();
     let left = format!("shep lookout   {home}");
-    let count = app.rows().len();
-    let right = format!(" {count} in the flock");
+    let visible = app.rows().len();
+    let total = app.flock_len();
+    let right = if app.filter().is_empty() {
+        format!(" {total} in the flock")
+    } else {
+        format!(" {visible} of {total} in the flock")
+    };
     Line::from(vec![
         Span::raw(fit(
             &left,
@@ -57,35 +62,54 @@ pub fn banner_line(app: &App) -> Option<Line<'static>> {
     }
 }
 
-/// The bottom line: a notice if there is one, else the key hints; then the
-/// control state, always.
+/// The bottom line: six slots, highest priority first — an armed confirm,
+/// the filter box while editing, a notice, an in-flight action, the applied
+/// filter line, then the key hint — with the control state always rendered
+/// on the right. See the phase plan's "Shapes the design named" #2 for why
+/// the box and the applied filter line are two slots and not one.
+///
+/// Slots 1 (armed confirm) and 4 (in-flight action) are Task 9's; this task
+/// leaves the chain shaped for them without writing their arms.
 #[must_use]
 pub fn status_line(app: &App, width: u16) -> Line<'static> {
     let palette = app.palette();
-    let (left, left_style) = match app.notice() {
-        Some(notice) => (
+    let (left, left_style) = if app.mode() == InputMode::Text {
+        // ABOVE the notice, not below it. `Msg::BusLagged`,
+        // `BusEvent::Dropped` and `BusEvent::DaemonShutdown` all raise notices
+        // with no keypress involved, and they keep arriving while somebody is
+        // typing a sheep name; a notice that covered the box would take the
+        // query off the screen mid-word, and `on_text_key` does not clear
+        // notices, so nothing the operator typed would bring it back. The
+        // notice is not lost: it is what this slot shows the moment the box
+        // closes. A report of a past event does not outrank an interaction in
+        // progress.
+        //
+        // The cursor is a character, not a style: the ANSI gallery renders
+        // foregrounds only, and a reversed cell would come out unstyled there.
+        // Same call the selection marker already makes.
+        (
+            format!(
+                "filter  {}\u{258f}   enter applies   esc cancels   ctrl-c quits",
+                app.filter()
+            ),
+            palette.attention(),
+        )
+    } else if let Some(notice) = app.notice() {
+        (
             notice.to_string(),
             if notice.is_grave() {
                 palette.refusal()
             } else {
                 palette.attention()
             },
-        ),
-        // `x` (stop) is bound and still always refuses — see `App::on_key`
-        // — so it is left out of the hint rather than marked somehow. This
-        // file's own standing rule is that every sentence here is literal;
-        // a hint that needs a footnote to be true is not literal, it is an
-        // asterisk. The key still works as a refusal, and still exercises
-        // the control gate; it is only the advertisement that is gone.
-        None => (
-            // `select`/`first/last`, not `scroll`/`top/bottom`: the pane
-            // carries a cursor now and the viewport is derived from it. Same
-            // 48 characters as the original 12a scroll-hint text, so the
-            // truncation test at 49 columns still measures what it was
-            // written to measure.
-            "q quit   j/k select   g/G first/last   r refresh".to_string(),
+        )
+    } else if !app.filter().is_empty() {
+        (
+            format!("filter \"{}\"   / edit   esc clear", app.filter()),
             palette.muted(),
-        ),
+        )
+    } else {
+        (hint_for(app.control()), palette.muted())
     };
     // Always rendered, in both states. An operator who does not know whether
     // their dashboard can act is one keystroke from finding out the wrong
@@ -111,6 +135,26 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
     ])
 }
 
+/// The key hint.
+///
+/// One form for both control states in this task, which is what shipped: there
+/// is nothing to advertise behind the gate yet. Task 9 gives it a second form
+/// once the three action keys exist, at which point this file's standing rule
+/// applies to it. Writing that second form here would put `x stop   R restart
+/// L reload` on the screen of a build where two of those three keys do
+/// nothing, which is the asterisk-instead-of-a-hint failure the rule is about,
+/// shipped by the plan rather than by the code.
+///
+/// The text is 59 characters, up from the 48 that shipped. It still truncates
+/// at the 39 columns the 49-column gap test leaves for it, and the first 40
+/// characters are byte-identical to the old hint, so
+/// `a_truncated_hint_still_leaves_a_gap_before_the_control_label` measures
+/// exactly what it was written to measure and the `narrow` and `cramped`
+/// frames do not move.
+fn hint_for(_control: Control) -> String {
+    "q quit   j/k select   g/G first/last   r refresh   / filter".to_string()
+}
+
 /// A run of `─` across the pane, under the header.
 ///
 /// One rule, not a box. `output::table`'s own doc argues that a table a
@@ -127,14 +171,17 @@ mod tests {
     use std::ffi::OsStr;
     use std::time::Instant;
 
+    use shep_core::protocol::BusEvent;
+
+    use super::super::fixtures::{editing_app, filtered_app, rendered};
     use super::*;
-    use crate::lookout::app::App;
+    use crate::lookout::app::{App, KeyPress, Msg};
     use crate::lookout::theme::Palette;
 
     /// fails if the truncated key hint ever butts straight against the
     /// control-state label again. Pinned at 49 columns, not because any
     /// gallery scene happens to be that width, but because that is exactly
-    /// where the bug shipped: the default hint is 48 characters, the label
+    /// where the bug shipped: the default hint is 59 characters, the label
     /// 9, and at this width the hint truncates while the label still fits,
     /// which is the one combination that makes a missing gap visible. (An
     /// earlier version of this comment tied the width to the `narrow`
@@ -174,7 +221,8 @@ mod tests {
     /// be shipping the exact lie this task exists to remove, on the one
     /// surface where it is visible.
     ///
-    /// The replacement is the same 48 characters as the original, so
+    /// The replacement is 59 characters, up from the original 48, but its
+    /// first 40 characters are unchanged, so
     /// `a_truncated_hint_still_leaves_a_gap_before_the_control_label` at 49
     /// columns is measuring the same thing it measured before.
     #[test]
@@ -218,5 +266,93 @@ mod tests {
 
         assert_eq!(rendered.chars().count(), 120);
         assert!(rendered.ends_with(" control enabled"));
+    }
+
+    /// fails if the title stops carrying the flock's real size while a filter
+    /// is on. `{visible} in the flock` alone understates the flock, and an
+    /// operator who cannot see that a filter is hiding rows is an operator
+    /// about to conclude that sheep have vanished.
+    #[test]
+    fn the_title_counts_both_numbers_while_a_filter_is_on() {
+        let app = filtered_app("web");
+        let title = rendered(&title_line(&app, "/home/rin/.shep", 120));
+        assert!(title.contains("2 of 4 in the flock"), "got {title:?}");
+    }
+
+    /// fails if the unfiltered title changes at all. It is on every frame in
+    /// the gallery and nothing about this feature touches it.
+    #[test]
+    fn the_unfiltered_title_is_unchanged() {
+        let app = filtered_app("");
+        let title = rendered(&title_line(&app, "/home/rin/.shep", 120));
+        assert!(title.contains("4 in the flock"), "got {title:?}");
+        assert!(
+            !title.contains(" of "),
+            "no second number when nothing is hidden"
+        );
+    }
+
+    /// fails if the bar stops saying what the two filter keys do. The whole
+    /// argument for `esc` meaning something different while a filter is set is
+    /// that the screen says so at the moment it is true.
+    #[test]
+    fn the_bar_names_the_filter_keys_while_a_filter_is_applied() {
+        let app = filtered_app("web");
+        let bar = rendered(&status_line(&app, 120));
+        assert!(bar.contains("filter \"web\""), "the query, quoted: {bar:?}");
+        assert!(bar.contains("/ edit"), "got {bar:?}");
+        assert!(bar.contains("esc clear"), "got {bar:?}");
+    }
+
+    /// fails if the box stops showing what is being typed, or stops naming the
+    /// only three keys that mean anything while it is open.
+    #[test]
+    fn the_bar_carries_the_query_and_a_cursor_while_editing() {
+        let app = editing_app("we");
+        let bar = rendered(&status_line(&app, 120));
+        assert!(
+            bar.contains("filter  we\u{258f}"),
+            "query then cursor: {bar:?}"
+        );
+        assert!(bar.contains("enter applies"), "got {bar:?}");
+        assert!(bar.contains("esc cancels"), "got {bar:?}");
+        assert!(bar.contains("ctrl-c quits"), "got {bar:?}");
+    }
+
+    /// fails if a notice covers the box. A `Dropped` event arrives with no
+    /// keypress and `on_text_key` does not clear notices, so a bar that
+    /// ranked the notice higher would take the operator's half-typed query
+    /// off the screen and leave it off until they pressed Enter or Esc.
+    #[test]
+    fn a_notice_raised_while_typing_does_not_cover_the_box() {
+        let mut app = editing_app("we");
+        app.update(Msg::Event(BusEvent::Dropped { count: 3 }));
+        let bar = rendered(&status_line(&app, 120));
+        assert!(
+            bar.contains("filter  we\u{258f}"),
+            "the box is still there: {bar:?}"
+        );
+        assert!(!bar.contains("dropped 3 events"), "got {bar:?}");
+    }
+
+    /// fails if the deferred notice never gets its turn. The mirror of the
+    /// test above: hiding a notice under the box is only honest if closing the
+    /// box shows it.
+    #[test]
+    fn closing_the_box_shows_the_notice_that_was_waiting() {
+        let mut app = editing_app("we");
+        app.update(Msg::Event(BusEvent::Dropped { count: 3 }));
+        app.update(Msg::Key(KeyPress::FilterApply));
+        let bar = rendered(&status_line(&app, 120));
+        assert!(bar.contains("dropped 3 events"), "got {bar:?}");
+    }
+
+    /// fails if `/` stops being advertised. It is the only way into the box
+    /// and nothing else on the screen hints at it.
+    #[test]
+    fn the_read_only_hint_advertises_the_filter_key() {
+        let app = filtered_app("");
+        let hint = rendered(&status_line(&app, 200));
+        assert!(hint.contains("/ filter"), "got {hint:?}");
     }
 }

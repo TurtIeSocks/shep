@@ -239,7 +239,15 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
     let viewport = usize::from(floor - y);
     let rows = app.rows();
     if rows.is_empty() {
-        let line = Line::from(Span::styled("the flock is empty", palette.muted()));
+        // Two sentences, because there are two reasons and an operator cannot
+        // tell them apart from a blank table. `the flock is empty` stays for
+        // the case it describes and no other.
+        let text = if app.flock_len() == 0 {
+            "the flock is empty".to_string()
+        } else {
+            format!("no sheep's name contains \"{}\"", app.filter())
+        };
+        let line = Line::from(Span::styled(text, palette.muted()));
         buffer.set_line(area.x, y, &line, width);
     } else {
         let offset = flock::scroll_offset(app.selected_index().unwrap_or(0), viewport, rows.len());
@@ -368,6 +376,43 @@ mod tests {
         let frame = draw_to(&app, 100, 12);
         assert!(frame.contains("STATUS"));
         assert!(frame.contains("the flock is empty"));
+    }
+
+    /// fails if a filter that matches nothing says the flock is empty. It is
+    /// not empty, and that sentence belongs to the case it describes. Three
+    /// panes say three different things here because there are three different
+    /// reasons, which is the `empty` scene's own principle.
+    #[test]
+    fn a_filter_matching_nothing_does_not_say_the_flock_is_empty() {
+        let app = fixtures::filtered_app("zzz");
+        let frame = draw_to(&app, 120, 30);
+        assert!(
+            frame.contains("no sheep's name contains \"zzz\""),
+            "the table body names the query: {frame:?}"
+        );
+        assert!(
+            !frame.contains("the flock is empty"),
+            "and does not claim the flock is: {frame:?}"
+        );
+        assert!(
+            frame.contains("no sheep selected: no name contains \"zzz\""),
+            "the detail pane says its own reason: {frame:?}"
+        );
+        assert!(
+            frame.contains("bleats  no sheep is selected"),
+            "the feed's sentence is already true and is unchanged: {frame:?}"
+        );
+    }
+
+    /// fails if the genuinely empty flock loses its own sentence. The mirror
+    /// of the test above: one of the two branches getting the other's text is
+    /// the failure, and only asserting both catches it.
+    #[test]
+    fn an_empty_flock_still_says_the_flock_is_empty() {
+        let app = fixtures::filtered_app_of(Vec::new(), "");
+        let frame = draw_to(&app, 120, 30);
+        assert!(frame.contains("the flock is empty"), "got {frame:?}");
+        assert!(!frame.contains("no sheep's name contains"), "got {frame:?}");
     }
 
     /// fails if the table stops leaving room for the marker, or if the marker

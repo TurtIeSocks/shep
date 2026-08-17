@@ -1,13 +1,13 @@
-shep lookout — Phase 12b frames
+shep lookout — Phase 16 frames
 ================================
 
 These are real frames, rendered headlessly through ratatui's TestBackend by
 
-    cargo test -p shep-cli --bins --all-features -- --ignored write_the_gallery
+    cargo test -p shep --lib --all-features -- --ignored write_the_gallery
 
 Nothing here is a mockup.
 
-frames.ansi is the same fourteen frames with colour; read it with `less -R`.
+frames.ansi is the same seventeen frames with colour; read it with `less -R`.
 
 All four panes are here: the flock table (the spine), the host-usage strip,
 the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
@@ -57,7 +57,7 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m
 [0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
 [0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
 [0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only[0m
 
 
 === errored  (120x30) ===
@@ -92,7 +92,7 @@ sheep 2  api   [0m[38;5;166merrored[0m   pid -   restarts 14   uptime 1h 18m 
 [0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
 [0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
 [0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only[0m
 
 
 === empty  (100x28) ===
@@ -125,7 +125,7 @@ shep lookout   /home/rin/.shep                                                  
                                                                                                     [0m
                                                                                                     [0m
                                                                                                     [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                           read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter                                read-only[0m
 
 
 === narrow  (51x14) ===
@@ -192,7 +192,7 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m
 [0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
 [0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
 [0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only[0m
 
 
 === frozen  (120x30) ===
@@ -227,11 +227,11 @@ sheep 2  api   [0m[38;5;166merrored[0m   pid -   restarts 14   uptime 1h 18m 
 [0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
 [0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
 [0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only[0m
 
 
 === refused  (120x30) ===
-`x` with actions gated off. Both refusals are literal — nothing about damage gets charming — and the panes below carry on.
+`x` with actions gated off. The refusal is literal, nothing about damage gets charming, and the panes below carry on.
 
 shep lookout   /home/rin/.shep                                                                           [0m[38;5;245m 6 in the flock[0m
 [0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           [0m
@@ -265,6 +265,63 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m
 [0m[38;5;166mread-only: actions need --allow-control                                                                       [0m[38;5;245m read-only[0m
 
 
+=== filter_editing  (100x14) ===
+Mid-type at 100x14. The table has already narrowed to the two sheep whose names contain the query, the title counts the narrowed set and the whole flock, and the status bar carries the query, a cursor, and the three keys that mean anything while the box is open.
+
+shep lookout   /home/rin/.shep                                                  [0m[38;5;245m 2 of 6 in the flock[0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.3%   flock mem 360.0M  …[0m
+  [0m[38;5;245mID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+  0     web               [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
+> 1     web               [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+[0m[38;5;221mfilter  web▏   enter applies   esc cancels   ctrl-c quits                                 [0m[38;5;245m read-only[0m
+
+
+=== filter_active  (100x14) ===
+The same query applied. The box is closed, the table is still narrowed, and the bar has changed to name the two keys that now touch the filter.
+
+shep lookout   /home/rin/.shep                                                  [0m[38;5;245m 2 of 6 in the flock[0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.3%   flock mem 360.0M  …[0m
+  [0m[38;5;245mID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+  0     web               [0m[38;5;29monline         [0m  48211    0         3.4%    182.0M    1h 25m    edge      [0m
+> 1     web               [0m[38;5;29monline         [0m  48212    0         2.9%    178.0M    1h 26m    edge      [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+[0m[38;5;245mfilter "web"   / edit   esc clear                                                          read-only[0m
+
+
+=== filter_no_match  (100x14) ===
+A query nothing matches. The table names the query rather than claiming the flock is empty, and the title keeps the flock's real size on screen.
+
+shep lookout   /home/rin/.shep                                                  [0m[38;5;245m 0 of 6 in the flock[0m
+[0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu -   flock mem -   up 6d 3h[0m
+  [0m[38;5;245mID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      [0m
+[0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+[0m[38;5;245mno sheep's name contains "zzz"[0m                                                                      [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+                                                                                                    [0m
+[0m[38;5;221mfilter  zzz▏   enter applies   esc cancels   ctrl-c quits                                 [0m[38;5;245m read-only[0m
+
+
 === no_detail  (120x20) ===
 20 rows: the detail pane is the first to go, because every number on it but the log paths is already in the row above it.
 
@@ -287,7 +344,7 @@ shep lookout   /home/rin/.shep                                                  
 [0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
 [0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
 [0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only[0m
 
 
 === table_only  (120x12) ===
@@ -304,7 +361,7 @@ shep lookout   /home/rin/.shep                                                  
   5     metrics                               [0m[38;5;29monline         [0m  48240    0         0.4%    11.0M     1h 32m    -         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only[0m
 
 
 === feed_gap  (120x30) ===
@@ -339,7 +396,7 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m
 [0m[38;5;245mout  [0mGET /v1/orders/27 200 35ms                                                                                         [0m
 [0m[38;5;245mout  [0mGET /v1/orders/28 200 36ms                                                                                         [0m
 [0m[38;5;245mout  [0mGET /v1/orders/29 200 37ms                                                                                         [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only[0m
 
 
 === feed_missing  (120x30) ===
@@ -374,7 +431,7 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only[0m
 
 
 === cramped  (33x26) ===
@@ -440,4 +497,4 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m
 [0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
 [0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
 [0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh                                                               read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only[0m

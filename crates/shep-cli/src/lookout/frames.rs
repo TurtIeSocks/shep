@@ -140,6 +140,12 @@ pub enum Scene {
     Frozen,
     /// The read-only refusal.
     Refused,
+    /// Mid-type: the table has already narrowed and the box is still open.
+    FilterEditing,
+    /// Applied and no longer editing.
+    FilterActive,
+    /// A query nothing matches.
+    FilterNoMatch,
     /// 20 rows: the 18-tier. The detail pane is gone; the strip and the feed
     /// are not.
     NoDetail,
@@ -166,6 +172,9 @@ impl Scene {
         Self::Retrying,
         Self::Frozen,
         Self::Refused,
+        Self::FilterEditing,
+        Self::FilterActive,
+        Self::FilterNoMatch,
         Self::NoDetail,
         Self::TableOnly,
         Self::FeedGap,
@@ -186,6 +195,9 @@ impl Scene {
             Self::Retrying => "retrying",
             Self::Frozen => "frozen",
             Self::Refused => "refused",
+            Self::FilterEditing => "filter_editing",
+            Self::FilterActive => "filter_active",
+            Self::FilterNoMatch => "filter_no_match",
             Self::NoDetail => "no_detail",
             Self::TableOnly => "table_only",
             Self::FeedGap => "feed_gap",
@@ -196,7 +208,7 @@ impl Scene {
     }
 
     /// One sentence saying what this frame is for, printed above it in the
-    /// gallery so Rin does not have to hold fourteen of them in her head.
+    /// gallery so Rin does not have to hold seventeen of them in her head.
     ///
     /// Every clause here is pinned by an assertion in
     /// `every_scene_shows_the_thing_it_is_named_for` — a caption may not say
@@ -226,7 +238,16 @@ impl Scene {
                 "The ladder ran out. Last known values stay, the uptime clock has stopped, and so has the host strip — one line ticking over on a frozen screen is a contradiction on the same frame."
             }
             Self::Refused => {
-                "`x` with actions gated off. Both refusals are literal — nothing about damage gets charming — and the panes below carry on."
+                "`x` with actions gated off. The refusal is literal, nothing about damage gets charming, and the panes below carry on."
+            }
+            Self::FilterEditing => {
+                "Mid-type at 100x14. The table has already narrowed to the two sheep whose names contain the query, the title counts the narrowed set and the whole flock, and the status bar carries the query, a cursor, and the three keys that mean anything while the box is open."
+            }
+            Self::FilterActive => {
+                "The same query applied. The box is closed, the table is still narrowed, and the bar has changed to name the two keys that now touch the filter."
+            }
+            Self::FilterNoMatch => {
+                "A query nothing matches. The table names the query rather than claiming the flock is empty, and the title keeps the flock's real size on screen."
             }
             Self::NoDetail => {
                 "20 rows: the detail pane is the first to go, because every number on it but the log paths is already in the row above it."
@@ -264,6 +285,7 @@ impl Scene {
             // and UPTIME still there.
             Self::Narrow => (51, 14),
             Self::TooNarrow => (28, 8),
+            Self::FilterEditing | Self::FilterActive | Self::FilterNoMatch => (100, 14),
             Self::NoDetail => (120, 20),
             Self::TableOnly => (120, 12),
             Self::Cramped => (33, 26),
@@ -455,6 +477,24 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         app.update(Msg::Key(KeyPress::SelectDown));
     }
 
+    match which {
+        Scene::FilterEditing | Scene::FilterNoMatch | Scene::FilterActive => {
+            app.update(Msg::Key(KeyPress::FilterStart));
+            let query = if which == Scene::FilterNoMatch {
+                "zzz"
+            } else {
+                "web"
+            };
+            for typed in query.chars() {
+                app.update(Msg::Key(KeyPress::FilterChar(typed)));
+            }
+            if which == Scene::FilterActive {
+                app.update(Msg::Key(KeyPress::FilterApply));
+            }
+        }
+        _ => {}
+    }
+
     // Every live scene gets a host sample, including the FROZEN one — a
     // strip with no host sample at all would render "host  not read yet"
     // whether or not the freeze guard existed, so this baseline sample is
@@ -637,16 +677,16 @@ fn sheep(
 /// Not a doc comment on the test: this text is read by a person opening
 /// `docs/lookout/frames.txt` with no context at all, and it is the only
 /// place that says where those frames came from.
-const GALLERY_PREAMBLE: &str = "shep lookout — Phase 12b frames
+const GALLERY_PREAMBLE: &str = "shep lookout — Phase 16 frames
 ================================
 
 These are real frames, rendered headlessly through ratatui's TestBackend by
 
-    cargo test -p shep-cli --bins --all-features -- --ignored write_the_gallery
+    cargo test -p shep --lib --all-features -- --ignored write_the_gallery
 
 Nothing here is a mockup.
 
-frames.ansi is the same fourteen frames with colour; read it with `less -R`.
+frames.ansi is the same seventeen frames with colour; read it with `less -R`.
 
 All four panes are here: the flock table (the spine), the host-usage strip,
 the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
@@ -711,7 +751,7 @@ mod tests {
     /// the plan: "every clause of every caption is one assertion here, or it
     /// is deleted from the caption."
     #[test]
-    #[allow(clippy::too_many_lines)] // fourteen captions, each pinned clause by clause
+    #[allow(clippy::too_many_lines)] // seventeen captions, each pinned clause by clause
     fn every_scene_shows_the_thing_it_is_named_for() {
         // "All three panes at 120x30: the host strip under the title, the
         //  detail pane and the bleats feed under the table. `>` marks the
@@ -918,14 +958,55 @@ mod tests {
             "stopped's STATUS cell shares the chrome's muted grey rather than standing out"
         );
 
-        // "`x` with actions gated off. Both refusals are literal — nothing
-        //  about damage gets charming — and the panes below carry on."
+        // "`x` with actions gated off. The refusal is literal, nothing about
+        //  damage gets charming, and the panes below carry on."
         let refused = render_text(&scene(Scene::Refused).1);
         assert!(refused.contains("--allow-control"));
         assert!(
             refused.contains("bleats  api"),
             "a refusal does not blank the screen"
         );
+
+        // "Mid-type at 100x14. The table has already narrowed to the two
+        //  sheep whose names contain the query, the title counts the
+        //  narrowed set and the whole flock, and the status bar carries the
+        //  query, a cursor, and the three keys that mean anything while the
+        //  box is open."
+        let editing = render_text(&scene(Scene::FilterEditing).1);
+        assert_eq!(
+            editing
+                .lines()
+                .filter(|line| line.contains("  web  "))
+                .count(),
+            2,
+            "two rows survived the query"
+        );
+        assert!(!editing.contains("billing"), "and the rest did not");
+        assert!(editing.contains("2 of 6 in the flock"), "got {editing:?}");
+        assert!(
+            editing.contains("filter  web\u{258f}"),
+            "the query and the cursor"
+        );
+        for named in ["enter applies", "esc cancels", "ctrl-c quits"] {
+            assert!(editing.contains(named), "the box names {named}");
+        }
+
+        // "The same query applied. The box is closed, the table is still
+        //  narrowed, and the bar has changed to name the two keys that now
+        //  touch the filter."
+        let active = render_text(&scene(Scene::FilterActive).1);
+        assert!(active.contains("filter \"web\""), "the box is closed");
+        assert!(!active.contains("enter applies"), "and its keys are gone");
+        assert!(active.contains("2 of 6 in the flock"), "still narrowed");
+        assert!(active.contains("/ edit") && active.contains("esc clear"));
+
+        // "A query nothing matches. The table names the query rather than
+        //  claiming the flock is empty, and the title keeps the flock's real
+        //  size on screen."
+        let none = render_text(&scene(Scene::FilterNoMatch).1);
+        assert!(none.contains("no sheep's name contains \"zzz\""));
+        assert!(!none.contains("the flock is empty"));
+        assert!(none.contains("0 of 6 in the flock"));
 
         // "sysinfo reports this platform unsupported. The strip says so and
         //  keeps the flock's own totals, which lookout can always compute."
@@ -962,7 +1043,7 @@ mod tests {
         // above already guarantees it, so it would be a line that cannot
         // fail. The literal can — it is what catches a scene added to the
         // enum and not to `ALL`, or the reverse.
-        assert_eq!(Scene::ALL.len(), 14);
+        assert_eq!(Scene::ALL.len(), 17);
     }
 
     /// fails if a 12b pane introduced a text MODIFIER. `sgr` renders
@@ -1037,7 +1118,7 @@ mod tests {
     /// test run may do. Run it deliberately:
     ///
     /// ```text
-    /// cargo test -p shep-cli --bins --all-features -- --ignored write_the_gallery
+    /// cargo test -p shep --lib --all-features -- --ignored write_the_gallery
     /// ```
     ///
     /// This is the ONE ignored test this phase adds — the `ignored` count

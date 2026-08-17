@@ -28,11 +28,13 @@ pub fn detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         // Names the CAUSE, not the fact. An operator can see the pane is
         // empty; what they cannot see is whether that is a broken
         // dashboard or a shepherd with nothing registered.
+        let why = if app.flock_len() == 0 {
+            "no sheep selected: the flock is empty".to_string()
+        } else {
+            format!("no sheep selected: no name contains \"{}\"", app.filter())
+        };
         return vec![
-            Line::from(Span::styled(
-                fit("no sheep selected: the flock is empty", width),
-                palette.muted(),
-            )),
+            Line::from(Span::styled(fit(&why, width), palette.muted())),
             Line::from(Span::raw(String::new())),
             Line::from(Span::raw(String::new())),
         ];

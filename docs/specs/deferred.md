@@ -97,15 +97,6 @@ for what phase is next.
 Prometheus exposition only; no `otel` cargo feature exists in
 `crates/shep-cli/Cargo.toml`.
 
-**lookout's search/filter** (spec §9) — `shep lookout` ships all four panes
-spec §9 names (Phase 12a's shell and flock table, Phase 12b's host-usage
-strip, sheep detail pane and bleats feed), but no filter or search line.
-Rin's v1 ruling for 12b excluded it explicitly ("no filtering UI, no
-elaborate layout"), and it also carries an unresolved design question 12a
-already wrote down: whether the filter takes the CLI's own selector grammar
-or plain substring matching. That choice is Rin's, not this file's, and is
-why the item stays open rather than half-built either way.
-
 **lookout actions** (spec §9) — the control gate (`--allow-control`,
 `lookout.allow_control`) exists and every action key checks it, but there is
 still exactly one action key, `x` (stop), and it refuses honestly in both

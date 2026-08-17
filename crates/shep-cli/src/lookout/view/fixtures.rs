@@ -212,3 +212,53 @@ pub fn rendered(line: &Line<'static>) -> String {
 pub fn render_all(lines: &[Line<'static>]) -> String {
     lines.iter().map(rendered).collect::<Vec<_>>().join("\n")
 }
+
+/// Four sheep at ids 1..=4 named `web`, `api`, `web-worker`, `cron`, with
+/// `query` typed into the filter box and applied. An empty `query` leaves the
+/// dashboard unfiltered, which is what the "nothing changed" assertions need.
+///
+/// Two of the four contain `web`, with `api` between them, so a fixture that
+/// stepped over hidden rows would show up as a wrong count rather than as a
+/// passing test.
+pub fn filtered_app(query: &str) -> App {
+    filtered_app_of(named_flock(), query)
+}
+
+/// [`filtered_app`] over an explicit flock, for the empty-flock mirror.
+pub fn filtered_app_of(flock: Vec<ProcessInfo>, query: &str) -> App {
+    let mut app = app_with(flock, plain());
+    if !query.is_empty() {
+        app.update(Msg::Key(KeyPress::FilterStart));
+        for typed in query.chars() {
+            app.update(Msg::Key(KeyPress::FilterChar(typed)));
+        }
+        app.update(Msg::Key(KeyPress::FilterApply));
+    }
+    app
+}
+
+/// The same four sheep with `query` half-typed and the box still OPEN: no
+/// `FilterApply`, which is the whole difference between this and
+/// [`filtered_app`].
+pub fn editing_app(query: &str) -> App {
+    let mut app = app_with(named_flock(), plain());
+    app.update(Msg::Key(KeyPress::FilterStart));
+    for typed in query.chars() {
+        app.update(Msg::Key(KeyPress::FilterChar(typed)));
+    }
+    app
+}
+
+/// The four named sheep the filter fixtures share. `flock_of` names its sheep
+/// `sheep-0`..`sheep-N`, which every query would match or miss together.
+fn named_flock() -> Vec<ProcessInfo> {
+    [(1, "web"), (2, "api"), (3, "web-worker"), (4, "cron")]
+        .into_iter()
+        .map(|(id, name)| {
+            ProcessInfo::builder(id, name, ProcStatus::Online)
+                .pid(Some(48_000 + id))
+                .uptime_ms(4_512_000)
+                .build()
+        })
+        .collect()
+}

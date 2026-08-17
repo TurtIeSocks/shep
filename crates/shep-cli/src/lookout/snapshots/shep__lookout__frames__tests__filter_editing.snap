@@ -1,0 +1,18 @@
+---
+source: crates/shep-cli/src/lookout/frames.rs
+expression: render_text(&buffer)
+---
+shep lookout   /home/rin/.shep                                                   2 of 6 in the flock
+host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.3%   flock mem 360.0M  …
+  ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  0     web               online           48211    0         3.4%    182.0M    1h 25m    edge      
+> 1     web               online           48212    0         2.9%    178.0M    1h 26m    edge      
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+filter  web▏   enter applies   esc cancels   ctrl-c quits                                  read-only

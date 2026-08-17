@@ -13,4 +13,4 @@ shep lookout   /home/rin/.shep                                                  
   5     metrics                               online           48240    0         0.4%    11.0M     1h 32m    -         
                                                                                                                         
                                                                                                                         
-q quit   j/k select   g/G first/last   r refresh                                                               read-only
+q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only

@@ -1,13 +1,13 @@
-shep lookout — Phase 12b frames
+shep lookout — Phase 16 frames
 ================================
 
 These are real frames, rendered headlessly through ratatui's TestBackend by
 
-    cargo test -p shep-cli --bins --all-features -- --ignored write_the_gallery
+    cargo test -p shep --lib --all-features -- --ignored write_the_gallery
 
 Nothing here is a mockup.
 
-frames.ansi is the same fourteen frames with colour; read it with `less -R`.
+frames.ansi is the same seventeen frames with colour; read it with `less -R`.
 
 All four panes are here: the flock table (the spine), the host-usage strip,
 the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
@@ -57,7 +57,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh                                                               read-only
+q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
 
 === errored  (120x30) ===
 One errored, one waiting to restart, one stopped, with the selection parked on the errored sheep. Each row's own STATUS cell is the only coloured cell in that row.
@@ -91,7 +91,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh                                                               read-only
+q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
 
 === empty  (100x28) ===
 No sheep registered. Each of the three panes says why it is empty, and the three sentences are different because the three reasons are.
@@ -123,7 +123,7 @@ bleats  no sheep is selected
                                                                                                     
                                                                                                     
                                                                                                     
-q quit   j/k select   g/G first/last   r refresh                                           read-only
+q quit   j/k select   g/G first/last   r refresh   / filter                                read-only
 
 === narrow  (51x14) ===
 51 columns: FOLD, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY. The host strip fits; the detail pane and the feed do not, at 14 rows.
@@ -187,7 +187,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh                                                               read-only
+q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
 
 === frozen  (120x30) ===
 The ladder ran out. Last known values stay, the uptime clock has stopped, and so has the host strip — one line ticking over on a frozen screen is a contradiction on the same frame.
@@ -221,10 +221,10 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh                                                               read-only
+q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
 
 === refused  (120x30) ===
-`x` with actions gated off. Both refusals are literal — nothing about damage gets charming — and the panes below carry on.
+`x` with actions gated off. The refusal is literal, nothing about damage gets charming, and the panes below carry on.
 
 shep lookout   /home/rin/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
@@ -257,6 +257,60 @@ out  GET /v1/orders/8821 200 9ms
 out  connection pool: 14/50 in use                                                                                      
 read-only: actions need --allow-control                                                                        read-only
 
+=== filter_editing  (100x14) ===
+Mid-type at 100x14. The table has already narrowed to the two sheep whose names contain the query, the title counts the narrowed set and the whole flock, and the status bar carries the query, a cursor, and the three keys that mean anything while the box is open.
+
+shep lookout   /home/rin/.shep                                                   2 of 6 in the flock
+host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.3%   flock mem 360.0M  …
+  ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  0     web               online           48211    0         3.4%    182.0M    1h 25m    edge      
+> 1     web               online           48212    0         2.9%    178.0M    1h 26m    edge      
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+filter  web▏   enter applies   esc cancels   ctrl-c quits                                  read-only
+
+=== filter_active  (100x14) ===
+The same query applied. The box is closed, the table is still narrowed, and the bar has changed to name the two keys that now touch the filter.
+
+shep lookout   /home/rin/.shep                                                   2 of 6 in the flock
+host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.3%   flock mem 360.0M  …
+  ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  0     web               online           48211    0         3.4%    182.0M    1h 25m    edge      
+> 1     web               online           48212    0         2.9%    178.0M    1h 26m    edge      
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+filter "web"   / edit   esc clear                                                          read-only
+
+=== filter_no_match  (100x14) ===
+A query nothing matches. The table names the query rather than claiming the flock is empty, and the title keeps the flock's real size on screen.
+
+shep lookout   /home/rin/.shep                                                   0 of 6 in the flock
+host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu -   flock mem -   up 6d 3h
+  ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────
+no sheep's name contains "zzz"                                                                      
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+filter  zzz▏   enter applies   esc cancels   ctrl-c quits                                  read-only
+
 === no_detail  (120x20) ===
 20 rows: the detail pane is the first to go, because every number on it but the log paths is already in the row above it.
 
@@ -279,7 +333,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh                                                               read-only
+q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
 
 === table_only  (120x12) ===
 12 rows: no optional panes at all. This is 12a's frame, and the only thing that changed is the two-column gutter the marker sits in.
@@ -295,7 +349,7 @@ shep lookout   /home/rin/.shep                                                  
   5     metrics                               online           48240    0         0.4%    11.0M     1h 32m    -         
                                                                                                                         
                                                                                                                         
-q quit   j/k select   g/G first/last   r refresh                                                               read-only
+q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
 
 === feed_gap  (120x30) ===
 The feed under a burst: 3.8 megabytes were never read and some hundreds of lines were read and dropped. The pane counts both, and counts them separately, because it knows the second exactly and cannot know how many lines are in the first.
@@ -329,7 +383,7 @@ out  GET /v1/orders/26 200 34ms
 out  GET /v1/orders/27 200 35ms                                                                                         
 out  GET /v1/orders/28 200 36ms                                                                                         
 out  GET /v1/orders/29 200 37ms                                                                                         
-q quit   j/k select   g/G first/last   r refresh                                                               read-only
+q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
 
 === feed_missing  (120x30) ===
 The selected sheep has never written a log in this $SHEP_HOME. The feed names that cause rather than sitting blank.
@@ -363,7 +417,7 @@ this sheep has not written a log in this $SHEP_HOME
                                                                                                                         
                                                                                                                         
                                                                                                                         
-q quit   j/k select   g/G first/last   r refresh                                                               read-only
+q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
 
 === cramped  (33x26) ===
 33 columns: the narrowest terminal that draws. 26 rows — a couple more than the 24-row floor for all three panes being up, so this frame has a little breathing room rather than sitting exactly on the edge. Everything truncates with an ellipsis; nothing overlaps.
@@ -427,4 +481,4 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh                                                               read-only
+q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
