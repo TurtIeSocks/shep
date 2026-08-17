@@ -203,11 +203,13 @@ stay true, not work left to do.
 
 ### Not blockers
 
-**CI has never run automatically.** The workflow is `workflow_dispatch` only,
-because the repository is private and Actions bills macOS at 10x. The gates it
-would run are the gates that run locally, and they are green. Turning the
-triggers on is the right move when the repository goes public, and it is not a
-precondition for an alpha.
+**CI runs automatically now.** `push` to `main` and `pull_request` trigger the
+full workflow as of 2026-08-16; before that it was `workflow_dispatch` only,
+kept off while the repository is private and Actions bills macOS at 10x. The
+weekly `schedule` row stays off for the same billing reason, since a full
+19-job run against an unchanged tree spends the expensive part of the file to
+learn nothing. The gates it runs are the same ones that run locally, and they
+are green.
 
 **Windows is zero.** Every verb prints `shep does not yet support Windows` and
 exits 1. That is a documented state, not a broken build: the workspace
