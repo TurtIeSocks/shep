@@ -54,9 +54,8 @@ use super::theme::Palette;
 pub enum Control {
     /// Actions refuse. The default.
     ReadOnly,
-    /// Actions are permitted — there is still exactly one action key
-    /// (`x`, stop) and no action lands behind the gate yet, so it refuses
-    /// too, with a different sentence.
+    /// Actions are permitted. Three keys arm a confirm — `x` (stop), `R`
+    /// (restart) and `L` (reload) — and Enter sends it.
     Allowed,
 }
 
@@ -97,9 +96,12 @@ pub enum KeyPress {
     SelectLast,
     /// `r` — poll now.
     Refresh,
-    /// `x` — the one action key. Refuses in both control states, today; see
-    /// the plan's design decision 2.
-    Stop,
+    /// `x`, `R` or `L` — arms a confirm for the given verb, or refuses and
+    /// says why. See [`ActionVerb`].
+    Action(ActionVerb),
+    /// `Enter` in normal mode. Sends an armed confirm; does nothing
+    /// otherwise.
+    Confirm,
     /// `/` — open the filter box, carrying whatever query is already set.
     FilterStart,
     /// One printable character typed into the box.
@@ -181,10 +183,25 @@ pub enum Msg {
         /// What the shepherd said, or why it could not be asked.
         result: Result<Response, RequestError>,
     },
+    /// A request the caller could not hand to the link task.
+    ///
+    /// The reducer has already entered the in-flight state by the time
+    /// `run_ui` tries to send, so a `try_send` that fails has to come back:
+    /// otherwise the bar keeps saying "sent, waiting for the shepherd" about a
+    /// request nobody has, and the one-action-at-a-time guard refuses every
+    /// later action for the life of the process.
+    Unsent {
+        /// What could not be sent.
+        sent: Sent,
+    },
 }
 
 /// What the caller has to do after an update.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: [`Self::Send`] carries a [`Sent`], whose `Sent::Action`
+/// variant carries a `String`. Nothing matches on an `Effect` by reference,
+/// so no call site changes for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     /// Nothing.
     None,
@@ -208,6 +225,9 @@ pub enum Effect {
     /// by the callers of `reseat` on the same condition they already use to
     /// choose between `RefreshFeed` and `None`.
     RefreshSelected,
+    /// Send a request to the shepherd. Raised by [`App::confirm`] once an
+    /// armed action's Enter lands; `super::run_ui` is what actually sends it.
+    Send(Sent),
     /// Leave.
     Quit,
 }
@@ -255,16 +275,34 @@ pub enum Sent {
         /// Which sheep was asked about.
         id: u32,
     },
+    /// One action against one sheep. `name` rides along so a reply can be
+    /// reported by name even after the sheep has left the flock.
+    Action {
+        /// Which verb.
+        verb: ActionVerb,
+        /// The pinned sheep.
+        id: u32,
+        /// Its name at arm time.
+        name: String,
+    },
 }
 
 impl Sent {
     /// The wire request this asks for.
     #[must_use]
     pub fn request(&self) -> Request {
-        match *self {
+        match self {
             Self::Lambs { id } => Request::Describe {
-                selector: SelectorSpec::Id(id),
+                selector: SelectorSpec::Id(*id),
             },
+            Self::Action { verb, id, .. } => {
+                let selector = SelectorSpec::Id(*id);
+                match verb {
+                    ActionVerb::Stop => Request::Stop { selector },
+                    ActionVerb::Restart => Request::Restart { selector },
+                    ActionVerb::Reload => Request::Reload { selector },
+                }
+            }
         }
     }
 }
@@ -320,6 +358,89 @@ impl fmt::Display for Notice {
         f.write_str(&self.text)
     }
 }
+
+/// What an action key does.
+///
+/// Three verbs, and deliberately not four: `start` is whistle's and the CLI's,
+/// by Rin's ruling. Delete, scale, signal and whisper stay CLI-only for
+/// whistle's own reasons: each takes a parameter a dashboard has nowhere to
+/// put, or removes an app from the registry, which is the one action no
+/// keypress should be one Enter away from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionVerb {
+    /// `x`. Stops the sheep; it stays registered.
+    Stop,
+    /// `R`, on shift because `r` is refresh.
+    Restart,
+    /// `L`, on shift for symmetry with `R`.
+    Reload,
+}
+
+impl ActionVerb {
+    /// The word the prompt and every outcome sentence begin with.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::Reload => "reload",
+        }
+    }
+}
+
+/// Whether an action has been sent yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// Armed, waiting for the operator's Enter. Nothing has gone out.
+    Armed,
+    /// Sent, waiting for the shepherd.
+    Sent,
+}
+
+/// The one action this dashboard is in the middle of.
+///
+/// The target is captured HERE, by id and by name, and never re-read from the
+/// selection: a snapshot can land between the arming keypress and the Enter,
+/// and a confirmation that re-read the cursor could act on a sheep the
+/// operator never pointed at.
+///
+/// One field on [`App`] rather than two `Option`s, so "armed" and "in flight"
+/// cannot both be true. That is the same claim the one-action-at-a-time rule
+/// makes, made in the type instead of in a guard.
+#[derive(Debug, Clone)]
+struct Action {
+    verb: ActionVerb,
+    id: u32,
+    name: String,
+    /// When it was armed. Only an armed action expires.
+    at: Instant,
+    stage: Stage,
+}
+
+/// What the status bar needs to know about the action in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionState<'a> {
+    /// Which verb.
+    pub verb: ActionVerb,
+    /// The pinned sheep's id.
+    pub id: u32,
+    /// The pinned sheep's name, as it was when the key was pressed.
+    pub name: &'a str,
+    /// False while it is a question, true once it has gone out.
+    pub sent: bool,
+}
+
+/// How long an armed confirm waits for its Enter.
+///
+/// Ten seconds. A prompt left armed while the operator walks away, followed by
+/// an Enter typed at what they think is a shell, is the same fat finger
+/// arriving by a slower route. It rides `Msg::Tick`, so it costs one `Instant`
+/// comparison and no timer (A11).
+pub const CONFIRM_EXPIRY: Duration = Duration::from_secs(10);
+
+/// The sentence `r` gives when the link is gone. The action keys refuse with
+/// the same one, so the two cannot drift apart.
+const LINK_GONE: &str = "the shepherd is gone — nothing left to ask";
 
 /// The whole dashboard's state.
 #[derive(Debug)]
@@ -386,6 +507,8 @@ pub struct App {
     /// longer selected, and a request a full channel dropped, both read as
     /// "not read yet" without a second field tracking them.
     lambs: Option<LambReading>,
+    /// The one action this dashboard is in the middle of, or `None`.
+    action: Option<Action>,
 }
 
 impl App {
@@ -407,6 +530,7 @@ impl App {
             host_unsupported: false,
             feed: super::tail::Tail::default(),
             lambs: None,
+            action: None,
         }
     }
 
@@ -428,6 +552,7 @@ impl App {
                     .map(|info| (info.id, Row { info, anchor: at }))
                     .collect();
                 self.reseat(previous);
+                self.forget_missing_target();
                 // Unconditional, and NOT `if reseat(..)`: the paths on the
                 // selected row may have changed even when the selection did
                 // not, and this is the whole of the feed's cadence. See design
@@ -447,6 +572,7 @@ impl App {
             Msg::Retrying { attempt } => {
                 if !matches!(self.link, Link::Lost { .. }) {
                     self.link = Link::Retrying { attempt };
+                    self.disarm_on_link_change();
                 }
                 Effect::None
             }
@@ -458,12 +584,20 @@ impl App {
             }
             Msg::Frozen { at_local } => {
                 self.link = Link::Lost { at_local };
+                self.disarm_on_link_change();
                 Effect::None
             }
             Msg::Tick { now } => {
                 // The one line that keeps a frozen dashboard honest.
                 if !matches!(self.link, Link::Lost { .. }) {
                     self.now = now;
+                    let expired = self.action.as_ref().is_some_and(|action| {
+                        action.stage == Stage::Armed
+                            && now.saturating_duration_since(action.at) >= CONFIRM_EXPIRY
+                    });
+                    if expired {
+                        self.action = None;
+                    }
                 }
                 Effect::None
             }
@@ -504,6 +638,37 @@ impl App {
             }
             Msg::Replied { sent, result } => match sent {
                 Sent::Lambs { id } => self.on_lambs(id, result),
+                // A placeholder: `Sent` gaining `Action` this task makes this
+                // match non-exhaustive, and the phase plan's Task 7 text does
+                // not show a fix — Task 8 ("the reply") is titled for exactly
+                // this and is expected to replace this arm with a real
+                // `on_action_reply`. Reported as a plan gap; `_ = result` so
+                // the unused reply does not warn in the meantime.
+                Sent::Action { .. } => {
+                    let _ = result;
+                    Effect::None
+                }
+            },
+            Msg::Unsent { sent } => match sent {
+                Sent::Action { verb, id, name } => {
+                    self.action = None;
+                    self.notice = Some(Notice {
+                        // "it was not sent", and no cause. The reducer does
+                        // not know one: the channel holds 2, it is shared with
+                        // lamb fetches, and `run_connected` awaits each
+                        // request inline, so `Full` is reachable while the
+                        // shepherd is perfectly reachable and merely slow.
+                        // Naming a cause nothing observed is the failure the
+                        // `-` CPU cell exists to prevent.
+                        text: format!("{} {name} (id {id}): it was not sent", verb.label()),
+                        grave: true,
+                    });
+                    Effect::None
+                }
+                // A dropped lamb fetch already reads as "not read yet", which
+                // is what the pane says. Nothing to report and nothing to
+                // clear.
+                Sent::Lambs { .. } => Effect::None,
             },
         }
     }
@@ -544,6 +709,7 @@ impl App {
                 if matches!(event, ProcessEventKind::Delete) {
                     let previous = self.selected_index();
                     self.flock.remove(&info.id);
+                    self.forget_missing_target();
                     return if self.reseat(previous) {
                         Effect::RefreshSelected
                     } else {
@@ -605,6 +771,43 @@ impl App {
         if self.mode == InputMode::Text {
             return self.on_text_key(key);
         }
+        // Checked BEFORE the ordinary dispatch, and a cancelling keypress is
+        // CONSUMED. A stray `j` during a pending confirm cancels it and does
+        // not also move the selection: if it did both, the operator would see
+        // the prompt vanish and the cursor move, and the next reflexive Enter
+        // would act on a target they had already lost track of.
+        //
+        // Cancelling is silent. Nothing happened, and reporting nothing as if
+        // it were something trains an operator to ignore the status bar.
+        //
+        // One consequence worth naming: `/` cancels before it opens the filter
+        // box, so a confirm and a filter edit can never coexist. That closes
+        // the whole interaction between the two features by construction
+        // rather than by rule.
+        if self
+            .action
+            .as_ref()
+            .is_some_and(|action| action.stage == Stage::Armed)
+        {
+            if key == KeyPress::Confirm {
+                return self.confirm();
+            }
+            // The one key the cancel does not consume. `input.rs`'s own doc
+            // says why: dropping Ctrl-C would leave the most reflexive way out
+            // of a terminal program doing nothing, and the operator's next
+            // move is `kill -9` from another window, past every restore path
+            // `super::term` has. Quitting DISCARDS the confirm rather than
+            // acting on it, so the property this rule exists for is untouched;
+            // that property is about a cancelling key also doing its ordinary
+            // job on a target the operator has lost track of. Text mode makes
+            // the same carve-out. See the phase plan's "Shapes the design
+            // named" #4.
+            if key == KeyPress::Quit {
+                return Effect::Quit;
+            }
+            self.action = None;
+            return Effect::None;
+        }
         self.notice = None;
         match key {
             KeyPress::Quit => Effect::Quit,
@@ -625,7 +828,7 @@ impl App {
             KeyPress::Refresh => {
                 if matches!(self.link, Link::Lost { .. }) {
                     self.notice = Some(Notice {
-                        text: "the shepherd is gone — nothing left to ask".to_string(),
+                        text: LINK_GONE.to_string(),
                         grave: true,
                     });
                     return Effect::None;
@@ -636,18 +839,14 @@ impl App {
             KeyPress::SelectDown => self.select_by(1),
             KeyPress::SelectFirst => self.select_at(0),
             KeyPress::SelectLast => self.select_at(self.visible_len().saturating_sub(1)),
-            KeyPress::Stop => {
-                // Both texts are literal. The design language's standing rule
-                // is that nothing about damage gets charming, and a stop is
-                // damage; the house rule says destructive operations and error
-                // text stay plain.
-                let text = match self.control {
-                    Control::ReadOnly => "read-only: actions need --allow-control".to_string(),
-                    Control::Allowed => "stop is not built yet".to_string(),
-                };
-                self.notice = Some(Notice { text, grave: true });
-                Effect::None
-            }
+            KeyPress::Action(verb) => self.arm(verb),
+            // Enter means nothing outside an armed confirm. It reaches this
+            // match whenever nothing is armed, which includes while an action
+            // is IN FLIGHT, because the routing rule above only fires on
+            // `Stage::Armed`. Named rather than swept into a wildcard: on the
+            // one key whose job is to confirm a stop, an unspecified arm is
+            // one edit away from being the wrong arm.
+            KeyPress::Confirm => Effect::None,
             KeyPress::FilterStart => {
                 self.mode = InputMode::Text;
                 Effect::None
@@ -660,6 +859,113 @@ impl App {
             | KeyPress::FilterBackspace
             | KeyPress::FilterApply
             | KeyPress::FilterAbandon => Effect::None,
+        }
+    }
+
+    /// Arms a confirm, or refuses and says why.
+    ///
+    /// Every refusal happens HERE rather than at confirm time, so an operator
+    /// never answers a question that was never going to be honoured. Every
+    /// sentence is literal: the standing rule is that nothing about damage
+    /// gets charming, and a stop is damage.
+    ///
+    /// The ladder's order is the design's error table, read top to bottom:
+    /// gate, link, nothing selected, one already in flight. It only shows when
+    /// two conditions hold at once, and there is no reason to reorder an
+    /// approved table.
+    fn arm(&mut self, verb: ActionVerb) -> Effect {
+        let refusal = if self.control == Control::ReadOnly {
+            Some("read-only: actions need --allow-control".to_string())
+        } else if !matches!(self.link, Link::Live) {
+            // The same sentence `r` already gives when the link is gone,
+            // moved into `LINK_GONE` by this task and reused rather than
+            // retyped.
+            Some(LINK_GONE.to_string())
+        } else if self.selected_row().is_none() {
+            Some("no sheep is selected".to_string())
+        } else if self.action.is_some() {
+            Some("one action is already in flight".to_string())
+        } else {
+            None
+        };
+        if let Some(text) = refusal {
+            self.notice = Some(Notice { text, grave: true });
+            return Effect::None;
+        }
+        let row = self.selected_row().expect("checked just above");
+        self.action = Some(Action {
+            verb,
+            id: row.info.id,
+            name: row.info.name.clone(),
+            at: self.now,
+            stage: Stage::Armed,
+        });
+        Effect::None
+    }
+
+    /// The operator's Enter. Sends, or refuses because the target left.
+    fn confirm(&mut self) -> Effect {
+        let Some(action) = self.action.take() else {
+            return Effect::None;
+        };
+        // The whole flock, not the visible set: a filter typed after arming
+        // hides a sheep, it does not remove it.
+        if !self.flock.contains_key(&action.id) {
+            self.notice = Some(Notice {
+                text: format!(
+                    "{} {} (id {}): it is no longer in the flock",
+                    action.verb.label(),
+                    action.name,
+                    action.id
+                ),
+                grave: true,
+            });
+            return Effect::None;
+        }
+        let sent = Sent::Action {
+            verb: action.verb,
+            id: action.id,
+            name: action.name.clone(),
+        };
+        self.action = Some(Action {
+            stage: Stage::Sent,
+            ..action
+        });
+        Effect::Send(sent)
+    }
+
+    /// Takes an armed prompt off the screen once its sheep is gone, rather
+    /// than leaving a question about nothing. Called from the `Snapshot` arm
+    /// and from the `Delete` arm; an action already in flight keeps its line.
+    fn forget_missing_target(&mut self) {
+        let gone = self.action.as_ref().is_some_and(|action| {
+            action.stage == Stage::Armed && !self.flock.contains_key(&action.id)
+        });
+        if gone {
+            self.action = None;
+        }
+    }
+
+    /// Takes an armed prompt off the screen when the link stops being live.
+    ///
+    /// Called from the `Msg::Retrying` and `Msg::Frozen` arms. A9 refuses to
+    /// ARM unless the link is `Live`; without this, a prompt armed a moment
+    /// earlier would outlive the connection it was going to be sent over, and
+    /// on a frozen dashboard it would never expire either, because `now` stops
+    /// advancing and the expiry check rides it. Silent, like every other
+    /// cancel: nothing happened, and the banner appearing on the same frame
+    /// already says why.
+    ///
+    /// An action already SENT keeps its line. It is a real request, and
+    /// `run_connected` answers it with an `Err` before its loop ends, so the
+    /// in-flight line always resolves rather than hanging.
+    fn disarm_on_link_change(&mut self) {
+        if self
+            .action
+            .as_ref()
+            .is_some_and(|action| action.stage == Stage::Armed)
+        {
+            self.action = None;
         }
     }
 
@@ -981,6 +1287,18 @@ impl App {
             millis(self.now.saturating_duration_since(reading.at)),
         ))
     }
+
+    /// The action in progress, for the status bar.
+    #[must_use]
+    pub fn action(&self) -> Option<ActionState<'_>> {
+        let action = self.action.as_ref()?;
+        Some(ActionState {
+            verb: action.verb,
+            id: action.id,
+            name: &action.name,
+            sent: action.stage == Stage::Sent,
+        })
+    }
 }
 
 /// Saturating `Duration` -> milliseconds. A lookout left open for 580 million
@@ -1019,6 +1337,297 @@ mod tests {
             at: t0,
         });
         (app, t0)
+    }
+
+    /// `started()`'s three sheep with the gate open and the cursor parked in
+    /// the middle, on `api` at id 2.
+    ///
+    /// Mid-list on purpose. Half the tests below assert that a stray `j` did
+    /// NOT move the cursor, and a cursor already clamped at either end would
+    /// pass those tests whether the routing rule consumed the key or not.
+    fn allowed() -> App {
+        let t0 = Instant::now();
+        let mut app = App::new(
+            Palette::detect(None, None, None),
+            Control::Allowed,
+            "/home/rin/.shep".to_string(),
+            t0,
+        );
+        app.update(Msg::Snapshot {
+            rows: vec![
+                sheep(1, "web", ProcStatus::Online),
+                sheep(2, "api", ProcStatus::Online),
+                sheep(3, "worker", ProcStatus::Online),
+            ],
+            at: t0,
+        });
+        app.update(Msg::Tick { now: t0 });
+        app.update(Msg::Key(KeyPress::SelectDown));
+        app
+    }
+
+    /// fails if an action key acts. It arms, and nothing has been sent: the
+    /// whole point of the gate is that one keystroke in a dashboard somebody
+    /// is reading does not become an action.
+    #[test]
+    fn an_action_key_arms_a_confirm_and_sends_nothing() {
+        let mut app = allowed();
+        assert_eq!(
+            app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop))),
+            Effect::None
+        );
+        let armed = app.action().expect("armed");
+        assert_eq!(armed.verb, ActionVerb::Stop);
+        assert_eq!(armed.id, 2);
+        assert_eq!(armed.name, "api");
+        assert!(!armed.sent, "nothing has gone out");
+    }
+
+    /// fails if the action key itself confirms, or if only `Esc` cancels. A
+    /// confirm the action key could complete is the double-tap the gate exists
+    /// to catch, on a keyboard that may be repeating.
+    #[test]
+    fn only_enter_confirms_and_every_other_key_cancels() {
+        for key in [
+            KeyPress::SelectDown,
+            KeyPress::SelectUp,
+            KeyPress::SelectFirst,
+            KeyPress::Refresh,
+            KeyPress::Escape,
+            KeyPress::FilterStart,
+            KeyPress::Action(ActionVerb::Stop),
+            KeyPress::Action(ActionVerb::Restart),
+        ] {
+            let mut app = allowed();
+            app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+            assert!(app.action().is_some(), "armed before {key:?}");
+            assert_eq!(
+                app.update(Msg::Key(key)),
+                Effect::None,
+                "{key:?} sent something"
+            );
+            assert!(app.action().is_none(), "{key:?} did not cancel");
+        }
+
+        let mut app = allowed();
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        assert!(
+            matches!(app.update(Msg::Key(KeyPress::Confirm)), Effect::Send(_)),
+            "and Enter is the one key that sends"
+        );
+    }
+
+    /// fails if a cancelling keypress ALSO does its ordinary job. This is the
+    /// failure mode the whole feature is about: the operator would see the
+    /// prompt vanish and the cursor move, and the next reflexive Enter would
+    /// act on a target they had already lost track of.
+    ///
+    /// Three assertions, because each catches a different half of the bug: the
+    /// prompt is gone, the cursor did NOT move, and no effect leaked out. The
+    /// selection is parked mid-list by `allowed()` so a `j` genuinely could
+    /// move it.
+    #[test]
+    fn a_cancelling_key_is_consumed_and_does_not_also_move_the_selection() {
+        let mut app = allowed();
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Restart)));
+        let before = app.selected();
+        let effect = app.update(Msg::Key(KeyPress::SelectDown));
+        assert!(app.action().is_none(), "the stray j cancelled the confirm");
+        assert_eq!(app.selected(), before, "and did not also move the cursor");
+        assert_eq!(effect, Effect::None, "nor ask for a feed read or a walk");
+    }
+
+    /// fails if the confirm re-reads the cursor at Enter time. A snapshot can
+    /// land between the arming keypress and the Enter, and a confirmation
+    /// built from `self.selected` would then act on a sheep the operator never
+    /// pointed at. The snapshot below deletes the armed sheep's neighbour so
+    /// the cursor genuinely reseats.
+    #[test]
+    fn the_confirm_is_pinned_to_the_id_it_was_armed_on() {
+        let mut app = allowed();
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        app.update(Msg::Snapshot {
+            rows: vec![
+                sheep(2, "api", ProcStatus::Online),
+                sheep(9, "new", ProcStatus::Online),
+            ],
+            at: Instant::now(),
+        });
+        let Effect::Send(sent) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter sends");
+        };
+        assert_eq!(
+            sent,
+            Sent::Action {
+                verb: ActionVerb::Stop,
+                id: 2,
+                name: "api".to_string()
+            }
+        );
+    }
+
+    /// fails if a confirm whose sheep left the flock sends anyway. The one
+    /// refusal that has to happen at confirm time rather than at arm time.
+    #[test]
+    fn a_confirm_whose_sheep_left_the_flock_refuses_instead_of_sending() {
+        let mut app = allowed();
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        app.update(Msg::Event(BusEvent::Process {
+            event: ProcessEventKind::Delete,
+            info: sheep(2, "api", ProcStatus::Stopped),
+            manually: true,
+            at_ms: 0,
+        }));
+        // The prompt came off the screen as soon as the reducer learned the
+        // sheep was gone, rather than sitting there as a question about
+        // nothing.
+        assert!(app.action().is_none());
+        assert_eq!(app.update(Msg::Key(KeyPress::Confirm)), Effect::None);
+    }
+
+    /// fails if a prompt left armed while the operator walks away never
+    /// expires. Driven by `Msg::Tick`, so there is no sleep here (IR-33).
+    #[test]
+    fn a_confirm_expires_after_ten_seconds_of_ticks() {
+        let mut app = allowed();
+        let t0 = Instant::now();
+        app.update(Msg::Tick { now: t0 });
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Reload)));
+        app.update(Msg::Tick {
+            now: t0 + Duration::from_secs(9),
+        });
+        assert!(app.action().is_some(), "nine seconds is still armed");
+        app.update(Msg::Tick {
+            now: t0 + Duration::from_secs(10),
+        });
+        assert!(app.action().is_none(), "ten is not");
+    }
+
+    /// fails if arming is allowed while the link is not live. An action typed
+    /// during the eight second reconnect ladder would otherwise queue and land
+    /// seconds later, on a connection the operator has stopped watching (A9).
+    #[test]
+    fn every_action_key_refuses_while_the_link_is_not_live() {
+        for link in [
+            Msg::Retrying { attempt: 2 },
+            Msg::Frozen {
+                at_local: "2026-08-16 09:00:00".to_string(),
+            },
+        ] {
+            let mut app = allowed();
+            app.update(link);
+            app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+            assert!(app.action().is_none());
+            assert!(app.notice().is_some_and(Notice::is_grave));
+        }
+    }
+
+    /// fails if a second action can be armed while one is in flight. The
+    /// in-flight line names one action; a second one would make it ambiguous
+    /// which (A12).
+    #[test]
+    fn a_second_action_refuses_while_one_is_in_flight() {
+        let mut app = allowed();
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        app.update(Msg::Key(KeyPress::Confirm));
+        assert!(app.action().is_some_and(|action| action.sent));
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Restart)));
+        assert_eq!(
+            app.notice().map(ToString::to_string).as_deref(),
+            Some("one action is already in flight")
+        );
+        let action = app.action().expect("the first one is untouched");
+        assert_eq!(action.verb, ActionVerb::Stop);
+        assert!(action.sent);
+    }
+
+    /// fails if the in-flight line is stored as a notice. A notice is cleared
+    /// by the next keypress, and an in-flight action whose only sign on screen
+    /// could be wiped by a stray `j` is a dashboard hiding something it knows.
+    #[test]
+    fn an_in_flight_line_survives_a_keypress() {
+        let mut app = allowed();
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        app.update(Msg::Key(KeyPress::Confirm));
+        app.update(Msg::Key(KeyPress::SelectDown));
+        assert!(
+            app.action().is_some_and(|action| action.sent),
+            "the keypress moved the cursor and left the in-flight state alone"
+        );
+    }
+
+    /// fails if `q` or Ctrl-C stops quitting while a prompt is up. The routing
+    /// rule consumes every other key; this is the one carve-out, and
+    /// `input.rs`'s own doc says why: an operator whose most reflexive way out
+    /// of a terminal program stops working reaches for `kill -9` from another
+    /// window, past every restore path `term` has. Quitting discards the
+    /// confirm rather than acting on it, so nothing this rule protects is
+    /// weakened. See the phase plan's "Shapes the design named" #4.
+    #[test]
+    fn quit_still_quits_while_a_confirm_is_armed() {
+        let mut app = allowed();
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        assert_eq!(app.update(Msg::Key(KeyPress::Quit)), Effect::Quit);
+    }
+
+    /// fails if Enter does something when nothing is armed. It reaches the
+    /// ordinary match in two states an operator can be in: nothing armed at
+    /// all, and one action already in flight. Neither may send.
+    #[test]
+    fn enter_outside_an_armed_confirm_does_nothing() {
+        let mut app = allowed();
+        assert_eq!(app.update(Msg::Key(KeyPress::Confirm)), Effect::None);
+        assert!(app.action().is_none());
+
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        app.update(Msg::Key(KeyPress::Confirm));
+        assert!(app.action().is_some_and(|action| action.sent), "in flight");
+        assert_eq!(
+            app.update(Msg::Key(KeyPress::Confirm)),
+            Effect::None,
+            "a second Enter does not re-send"
+        );
+    }
+
+    /// fails if a request the channel could not take leaves the dashboard
+    /// claiming an action is in flight forever, which would also refuse every
+    /// later action for the life of the process.
+    #[test]
+    fn a_request_that_could_not_be_sent_says_so_and_clears_the_state() {
+        let mut app = allowed();
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        let Effect::Send(sent) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter sends");
+        };
+        app.update(Msg::Unsent { sent });
+        assert!(app.action().is_none());
+        assert!(app.notice().is_some_and(Notice::is_grave));
+    }
+
+    /// fails if an armed prompt outlives the connection it was going to be
+    /// sent over. Both halves matter: `Retrying` because A9 says an action
+    /// typed during the reconnect ladder is refused rather than queued, and
+    /// `Frozen` because a frozen dashboard's `now` stops advancing, so an
+    /// armed prompt there would never expire either.
+    #[test]
+    fn a_link_that_stops_being_live_takes_an_armed_prompt_down() {
+        for link in [
+            Msg::Retrying { attempt: 2 },
+            Msg::Frozen {
+                at_local: "2026-08-16 09:00:00".to_string(),
+            },
+        ] {
+            let mut app = allowed();
+            app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+            assert!(app.action().is_some(), "armed while live");
+            app.update(link);
+            assert!(app.action().is_none(), "and gone once the link is not");
+            assert_eq!(
+                app.update(Msg::Key(KeyPress::Confirm)),
+                Effect::None,
+                "so Enter has nothing to send"
+            );
+        }
     }
 
     /// fails if the poll stops being the truth. A bus event upserts, but a
@@ -1369,32 +1978,28 @@ mod tests {
         assert_eq!(app.uptime_ms(1), Some(60_000));
     }
 
-    /// fails if the control gate stops refusing, or starts refusing with
-    /// whimsy. Both refusals are literal: the design language's own standing
-    /// rule is that nothing about damage gets charming, and a stop is damage.
+    /// fails if the gate is checked for one key and not the others. Replaces
+    /// `the_stop_key_refuses_in_both_control_states`: that test's whole
+    /// subject was that `x` refuses in BOTH gate states, and half of that
+    /// stopped being true this task — behind an open gate `x` now arms. Its
+    /// read-only half is strictly subsumed here, which covers all three
+    /// verbs; its control-enabled half moved out and became
+    /// `an_action_key_arms_a_confirm_and_sends_nothing` below.
     #[test]
-    fn the_stop_key_refuses_in_both_control_states() {
-        let (mut app, _) = started();
-        assert_eq!(app.update(Msg::Key(KeyPress::Stop)), Effect::None);
-        let read_only = app.notice().expect("a refusal is a notice").to_string();
-        assert!(read_only.contains("read-only"));
-        assert!(read_only.contains("--allow-control"));
-
-        let t0 = Instant::now();
-        let mut allowed = App::new(
-            Palette::detect(None, None, None),
-            Control::Allowed,
-            "/home/rin/.shep".to_string(),
-            t0,
-        );
-        allowed.update(Msg::Snapshot {
-            rows: vec![sheep(1, "web", ProcStatus::Online)],
-            at: t0,
-        });
-        assert_eq!(allowed.update(Msg::Key(KeyPress::Stop)), Effect::None);
-        let not_built = allowed.notice().expect("a refusal is a notice").to_string();
-        assert!(not_built.contains("not built yet"));
-        assert_ne!(read_only, not_built);
+    fn every_action_key_refuses_while_the_gate_is_closed() {
+        for verb in [ActionVerb::Stop, ActionVerb::Restart, ActionVerb::Reload] {
+            let (mut app, _t0) = started();
+            app.update(Msg::Key(KeyPress::Action(verb)));
+            assert!(
+                app.action().is_none(),
+                "{verb:?} armed behind a closed gate"
+            );
+            assert_eq!(
+                app.notice().map(ToString::to_string).as_deref(),
+                Some("read-only: actions need --allow-control"),
+                "{verb:?}"
+            );
+        }
     }
 
     /// fails if lookout learns to exit on its own. A `DaemonShutdown` is a
@@ -1637,7 +2242,7 @@ mod tests {
     #[test]
     fn the_next_keypress_clears_the_notice() {
         let (mut app, _) = started();
-        app.update(Msg::Key(KeyPress::Stop));
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
         assert!(app.notice().is_some());
         app.update(Msg::Key(KeyPress::SelectDown));
         assert!(app.notice().is_none());

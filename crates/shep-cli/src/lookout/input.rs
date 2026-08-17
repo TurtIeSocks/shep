@@ -6,7 +6,7 @@
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use super::app::{InputMode, KeyPress};
+use super::app::{ActionVerb, InputMode, KeyPress};
 
 /// The [`KeyPress`] this event means under `mode`, or `None` for a key
 /// lookout does not bind there.
@@ -60,7 +60,10 @@ pub fn map_key(event: &Event, mode: InputMode) -> Option<KeyPress> {
         KeyCode::Char('g') | KeyCode::Home => Some(KeyPress::SelectFirst),
         KeyCode::Char('G') | KeyCode::End => Some(KeyPress::SelectLast),
         KeyCode::Char('r') => Some(KeyPress::Refresh),
-        KeyCode::Char('x') => Some(KeyPress::Stop),
+        KeyCode::Char('x') => Some(KeyPress::Action(ActionVerb::Stop)),
+        KeyCode::Char('R') => Some(KeyPress::Action(ActionVerb::Restart)),
+        KeyCode::Char('L') => Some(KeyPress::Action(ActionVerb::Reload)),
+        KeyCode::Enter => Some(KeyPress::Confirm),
         _ => None,
     }
 }
@@ -75,12 +78,13 @@ mod tests {
     }
 
     /// fails if a key stops resolving, or starts resolving to the wrong thing.
-    /// `x` in particular: it is the one key wired to an action, so a keymap
-    /// that silently rebound it would be a keymap that acts on the wrong
-    /// intent once a future phase makes the action real — it still refuses
-    /// today, in both control states. `Esc` resolves to [`KeyPress::Escape`],
-    /// not [`KeyPress::Quit`]: the reducer, not the keymap, decides what it
-    /// means, because that depends on whether a filter is set.
+    /// `x`, `R` and `L` in particular: they are the three keys wired to an
+    /// action, so a keymap that silently rebound one would be a keymap that
+    /// acts on the wrong intent — the reducer's confirm gate is the only
+    /// thing standing between this key and a running process. `Esc` resolves
+    /// to [`KeyPress::Escape`], not [`KeyPress::Quit`]: the reducer, not the
+    /// keymap, decides what it means, because that depends on whether a
+    /// filter is set.
     #[test]
     fn every_bound_key_resolves_to_its_press() {
         assert_eq!(
@@ -121,7 +125,15 @@ mod tests {
         );
         assert_eq!(
             map_key(&key(KeyCode::Char('x')), InputMode::Normal),
-            Some(KeyPress::Stop)
+            Some(KeyPress::Action(ActionVerb::Stop))
+        );
+        assert_eq!(
+            map_key(&key(KeyCode::Char('R')), InputMode::Normal),
+            Some(KeyPress::Action(ActionVerb::Restart))
+        );
+        assert_eq!(
+            map_key(&key(KeyCode::Char('L')), InputMode::Normal),
+            Some(KeyPress::Action(ActionVerb::Reload))
         );
         assert_eq!(map_key(&key(KeyCode::Char('z')), InputMode::Normal), None);
     }

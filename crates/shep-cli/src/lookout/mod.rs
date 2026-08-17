@@ -477,6 +477,22 @@ where
                 lambs_dirty = true;
                 dirty = true;
             }
+            Effect::Send(sent) => {
+                // `try_send`, not `send`: blocking the UI on a full channel
+                // would stall the screen for as long as the shepherd is slow.
+                // A failure comes straight back to the reducer rather than
+                // being dropped, because the reducer is already showing an
+                // in-flight line about it.
+                if let Err(err) = requests.try_send(sent) {
+                    let (mpsc::error::TrySendError::Full(sent)
+                    | mpsc::error::TrySendError::Closed(sent)) = err;
+                    // `let _`: `Msg::Unsent` returns `Effect::None` by
+                    // construction, and acting on a returned effect here is
+                    // the one place this design could recurse.
+                    let _ = app.update(Msg::Unsent { sent });
+                }
+                dirty = true;
+            }
             Effect::None => dirty = true,
         }
     }

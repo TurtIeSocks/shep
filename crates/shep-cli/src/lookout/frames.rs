@@ -40,7 +40,7 @@ use ratatui::style::Color;
 use shep_core::protocol::{Lamb, ProcessInfo, Response};
 use shep_core::status::ProcStatus;
 
-use super::app::{App, Control, KeyPress, Msg, Sent};
+use super::app::{ActionVerb, App, Control, KeyPress, Msg, Sent};
 use super::source::HostSample;
 use super::tail::{Stream, Tail, TailLine};
 use super::theme::Palette;
@@ -617,7 +617,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
             });
         }
         Scene::Refused => {
-            app.update(Msg::Key(KeyPress::Stop));
+            app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
         }
         _ => {}
     }
