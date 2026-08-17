@@ -1573,19 +1573,43 @@ mod tests {
     /// fails if the confirm re-reads the cursor at Enter time. A snapshot can
     /// land between the arming keypress and the Enter, and a confirmation
     /// built from `self.selected` would then act on a sheep the operator never
-    /// pointed at. The snapshot below deletes the armed sheep's neighbour so
-    /// the cursor genuinely reseats.
+    /// pointed at.
+    ///
+    /// Task 7's original version of this test armed on id 2 then had a
+    /// snapshot delete id 2's NEIGHBOUR, expecting that to move the cursor.
+    /// It never did: `reseat`'s own rule is "an id that survived is left
+    /// alone, whatever row it now occupies" — id 2 survived every one of
+    /// those snapshots, so `self.selected` stayed 2 right alongside
+    /// `action.id`, and the mutation this test exists to catch (reading
+    /// `self.selected` instead of the pinned `action.id`) could not redden
+    /// it. Phase 16 review Minor #7.
+    ///
+    /// This version applies a filter before arming, then has the snapshot
+    /// RENAME the armed sheep out of that filter while a second sheep enters
+    /// it. The armed id (2) still survives in `self.flock` — a rename is not
+    /// a delete, so `confirm`'s "did the target leave" check must not fire —
+    /// but it drops out of `visible_ids()`, so `reseat` moves the cursor to
+    /// the other match. That genuinely separates `self.selected` (9) from
+    /// `action.id` (2), which is what makes the pin observable: the fixed
+    /// code sends id 2 under its arm-time name "api", and the mutation Task 7
+    /// tried would instead send id 9 under whatever the snapshot named it.
     #[test]
     fn the_confirm_is_pinned_to_the_id_it_was_armed_on() {
         let mut app = allowed();
+        app.set_filter("api".to_string());
         app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
         app.update(Msg::Snapshot {
             rows: vec![
-                sheep(2, "api", ProcStatus::Online),
-                sheep(9, "new", ProcStatus::Online),
+                sheep(2, "gateway", ProcStatus::Online),
+                sheep(9, "api-new", ProcStatus::Online),
             ],
             at: Instant::now(),
         });
+        assert_eq!(
+            app.selected(),
+            Some(9),
+            "sanity: the cursor followed the filter off the armed id"
+        );
         let Effect::Send(sent) = app.update(Msg::Key(KeyPress::Confirm)) else {
             panic!("Enter sends");
         };
