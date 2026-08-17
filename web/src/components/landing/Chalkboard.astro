@@ -15,11 +15,15 @@ import { notBuiltYet } from "../../data/chalkboard";
         <div class="kicker">today on the board</div>
         <h2>What's not built yet</h2>
         <p>
-          This board is short on purpose. Most of v1.0 already shipped, and
-          what's left below is genuinely unbuilt. Windows isn't on it: it's out of v1
-          entirely, a deliberate call rather than something still queued. The
-          workspace cross-compiles for it and that check runs on every
-          change, but no test has ever executed there, only a compile.
+          This board is short on purpose, and it just got shorter. Lookout's
+          last three items shipped, so the v1.0 queue is down to one thing:
+          OTLP export on the metrics dog. A handful of other features are
+          missing from shep too, but not because they're pending. They were
+          cut from v1 by decision, and they live in the deferred doc rather
+          than on this board. Windows is the biggest of those: ruled out of
+          v1 entirely rather than left half done. The workspace
+          cross-compiles for it and that check runs on every change, but no
+          test has ever executed there, only a compile.
         </p>
         <div class="pills">
           {

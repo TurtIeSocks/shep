@@ -24,8 +24,9 @@
  * design" section rather than shipping — see Chalkboard.astro's own prose
  * for that one, since it is a permanent cut, not a build-queue item this
  * list tracks), `.js` Flockfile, schemars JSON-schema export, and the
- * daemon-config flags layer — so this list is down to the four items
- * deferred.md's section currently names.
+ * daemon-config flags layer. Phase 16 shipped the last three lookout items —
+ * search/filter, the action keys, and lambs in the detail pane — so this
+ * list is down to the one item deferred.md's section currently names.
  */
 // `?raw` (see lexicon.ts's header comment for why, not node:fs +
 // import.meta.url) inlines the file's text content at build time.
@@ -40,12 +41,6 @@ interface ChalkboardItem {
 
 const notBuiltYetItems: ChalkboardItem[] = [
   { anchor: "OTLP export (metrics dog)", display: "OTLP export" },
-  { anchor: "lookout's search/filter", display: "lookout's search and filter" },
-  { anchor: "lookout actions", display: "lookout's actions" },
-  {
-    anchor: "lambs in the detail pane",
-    display: "lambs in lookout's detail pane",
-  },
 ];
 
 export const notBuiltYet: string[] = notBuiltYetItems.map((item) => item.display);
