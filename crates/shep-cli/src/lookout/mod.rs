@@ -49,7 +49,7 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use shep_core::paths::ShepPaths;
 use tokio::sync::mpsc;
 
-use self::app::{App, Control, Effect, Msg};
+use self::app::{App, Control, Effect, Msg, Sent};
 // The trait, for the opening dial below. `BusEvent` and `KeyPress` are named
 // only from the test module and are imported there, not here: an import used
 // solely by `#[cfg(test)]` code warns in the ordinary build, and `-D warnings`
@@ -278,11 +278,13 @@ pub fn resolve_control(flag: bool, kv: &Path) -> Control {
 /// arm 4, the heartbeat: sampling memory and a load average costs
 /// microseconds and no process-table walk, so it rides along for free rather
 /// than re-deriving the arm-retirement reasoning this doc just walked
-/// through. The feed rides the redraw gate below instead of an arm at all —
-/// `Effect::RefreshFeed` sets `feed_dirty`, and the read happens immediately
-/// before the frame that shows its result, coalescing a held key's burst of
-/// moved selections into one read per [`MIN_REDRAW`] window rather than one
-/// per keypress. See the phase plan's design decisions 3 and 11.
+/// through. The feed and the lambs both ride the redraw gate below instead of
+/// an arm at all — `Effect::RefreshFeed` and `Effect::RefreshSelected` set
+/// `feed_dirty` and/or `lambs_dirty`, and the work happens immediately before
+/// the frame that shows its result, coalescing a held key's burst of moved
+/// selections into one read and one `Describe` per [`MIN_REDRAW`] window
+/// rather than one per keypress. See the phase plan's design decisions 3
+/// and 11.
 pub async fn run_ui<B: Backend, S, L>(
     mut app: App,
     mut terminal: Terminal<B>,
@@ -311,6 +313,11 @@ where
     // has run. See the doc above this function for why this is a flag rather
     // than an `mpsc` arm.
     let mut feed_dirty = false;
+    // Set by `Effect::RefreshSelected` and by `Effect::PollNow`, cleared once
+    // the coalesced request below has gone out. A flag rather than an `mpsc`
+    // arm, for the reason this function's doc gives about the `biased`
+    // select's arm retirement.
+    let mut lambs_dirty = false;
     // `Option`, not `Instant::now() - MIN_REDRAW`: subtracting from a fresh
     // `Instant` is a panic on a platform whose monotonic clock starts near
     // zero, and "has never drawn" is what the first iteration actually means.
@@ -347,6 +354,24 @@ where
             let _ = app.update(Msg::Bleats { tail });
             feed_dirty = false;
             dirty = true;
+        }
+        if lambs_dirty && may_draw {
+            // The height is read here and not in the reducer: `run_ui` knows
+            // the terminal, `App` deliberately does not, and a terminal too
+            // short to draw the detail pane must not pay for a process-table
+            // walk it cannot show. A size that cannot be read is treated as
+            // too short, which errs toward asking for nothing.
+            let height = terminal.size().map_or(0, |size| size.height);
+            if view::panes_for(height).detail {
+                if let Some(id) = app.selected() {
+                    // `try_send`, for `Effect::PollNow`'s reason: a full
+                    // channel means a request is already queued, and a
+                    // dropped lamb fetch reads as "not read yet", which the
+                    // pane already knows how to say.
+                    let _ = requests.try_send(Sent::Lambs { id });
+                }
+            }
+            lambs_dirty = false;
         }
         if dirty && may_draw {
             let _ = terminal.draw(|frame| view::draw(&app, frame));
@@ -430,17 +455,26 @@ where
                 // already accounts for, by refusing `r` outright once the link
                 // is `Lost` rather than letting a request vanish here.
                 let _ = polls.try_send(());
+                // `r` means "tell me again", so it refreshes everything the
+                // pane shows and not only the table.
+                lambs_dirty = true;
                 dirty = true;
             }
-            // Not the read. `Effect::RefreshFeed` arrives once per moved
-            // selection, and ordinary terminals deliver a held `j` as
-            // twenty to thirty Press events a second — so doing the I/O
-            // here would put a synchronous 128 KiB read behind every
-            // repeat, on the task that also owns the redraw. Coalesced onto
-            // `MIN_REDRAW` above instead, which is the same gate the draw
-            // already uses.
+            // Not the read. `Effect::RefreshFeed` arrives once per snapshot,
+            // and `Effect::RefreshSelected` arrives once per moved selection
+            // — ordinary terminals deliver a held `j` as twenty to thirty
+            // Press events a second, so doing the I/O here would put a
+            // synchronous 128 KiB read (and a `Describe` request) behind
+            // every repeat, on the task that also owns the redraw. Coalesced
+            // onto `MIN_REDRAW` above instead, which is the same gate the
+            // draw already uses.
             Effect::RefreshFeed => {
                 feed_dirty = true;
+                dirty = true;
+            }
+            Effect::RefreshSelected => {
+                feed_dirty = true;
+                lambs_dirty = true;
                 dirty = true;
             }
             Effect::None => dirty = true,
@@ -463,7 +497,7 @@ mod tests {
     use shep_core::protocol::{BusEvent, ProcessInfo};
     use shep_core::status::ProcStatus;
 
-    use crate::lookout::app::{App, Control, KeyPress};
+    use crate::lookout::app::{App, Control, KeyPress, Sent};
     use crate::lookout::source::{HostSample, Local};
     use crate::lookout::tail::Tail;
     use crate::lookout::theme::Palette;
@@ -844,6 +878,140 @@ mod tests {
             tails.load(Ordering::Relaxed),
             1,
             "a snapshot and twenty selection moves must coalesce into one read"
+        );
+    }
+
+    /// fails if a held `j` fires one `Describe` per keypress. Ordinary
+    /// terminals deliver auto-repeat as twenty to thirty Press events a
+    /// second, and each one moves the selection; without the redraw gate this
+    /// feature would be exactly the fixed-clock process-table walk it exists
+    /// to avoid, only faster. One request per redraw window, not one per key.
+    ///
+    /// IR-46: bounded by a real, short sleep and a real, generous timeout.
+    #[tokio::test]
+    async fn a_burst_of_selection_moves_costs_one_lamb_request() {
+        let (msg_tx, msg_rx) = mpsc::channel(64);
+        let (poll_tx, _poll_rx) = mpsc::channel(4);
+        let (request_tx, mut request_rx) = mpsc::channel(2);
+        let local = FakeLocal::default();
+
+        let at = Instant::now();
+        msg_tx
+            .send(Msg::Snapshot {
+                rows: (0..8)
+                    .map(|id| {
+                        ProcessInfo::builder(id, format!("sheep-{id}"), ProcStatus::Online).build()
+                    })
+                    .collect(),
+                at,
+            })
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            msg_tx.send(Msg::Key(KeyPress::SelectDown)).await.unwrap();
+        }
+        tokio::spawn(async move {
+            // Same nudge-then-quit shape as the feed's own burst test, and
+            // the same real-clock caveat: the redraw gate is read once per
+            // loop iteration, so real time elapsing while the loop is
+            // blocked in `select!` is never observed on its own.
+            tokio::time::sleep(MIN_REDRAW * 3).await;
+            let _ = msg_tx.send(Msg::Resize).await;
+            tokio::time::sleep(MIN_REDRAW).await;
+            let _ = msg_tx.send(Msg::Key(KeyPress::Quit)).await;
+        });
+
+        let app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/tmp/shep".to_string(),
+            Instant::now(),
+        );
+        let terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_ui(
+                app,
+                terminal,
+                stream::empty(),
+                msg_rx,
+                poll_tx,
+                request_tx,
+                local,
+            ),
+        )
+        .await
+        .expect("the loop left within five seconds");
+
+        let mut asked = 0;
+        while let Ok(sent) = request_rx.try_recv() {
+            assert!(matches!(sent, Sent::Lambs { .. }));
+            asked += 1;
+        }
+        assert_eq!(asked, 1, "twenty moves, one Describe");
+    }
+
+    /// fails if a terminal too short to draw the detail pane still pays for
+    /// it. `run_ui` knows the height; the reducer does not, and does not need
+    /// to.
+    ///
+    /// IR-46: bounded the same way.
+    #[tokio::test]
+    async fn no_lambs_are_requested_when_the_detail_pane_is_not_drawn() {
+        let (msg_tx, msg_rx) = mpsc::channel(64);
+        let (poll_tx, _poll_rx) = mpsc::channel(4);
+        let (request_tx, mut request_rx) = mpsc::channel(2);
+        let local = FakeLocal::default();
+
+        let at = Instant::now();
+        msg_tx
+            .send(Msg::Snapshot {
+                rows: (0..8)
+                    .map(|id| {
+                        ProcessInfo::builder(id, format!("sheep-{id}"), ProcStatus::Online).build()
+                    })
+                    .collect(),
+                at,
+            })
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            msg_tx.send(Msg::Key(KeyPress::SelectDown)).await.unwrap();
+        }
+        tokio::spawn(async move {
+            tokio::time::sleep(MIN_REDRAW * 3).await;
+            let _ = msg_tx.send(Msg::Resize).await;
+            tokio::time::sleep(MIN_REDRAW).await;
+            let _ = msg_tx.send(Msg::Key(KeyPress::Quit)).await;
+        });
+
+        let app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/tmp/shep".to_string(),
+            Instant::now(),
+        );
+        // The 18-row tier: `view::panes_for(20).detail` is false, so the
+        // detail pane is not drawn even though the host strip and feed are.
+        let terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_ui(
+                app,
+                terminal,
+                stream::empty(),
+                msg_rx,
+                poll_tx,
+                request_tx,
+                local,
+            ),
+        )
+        .await
+        .expect("the loop left within five seconds");
+
+        assert!(
+            request_rx.try_recv().is_err(),
+            "no lamb request when the detail pane is not drawn"
         );
     }
 }

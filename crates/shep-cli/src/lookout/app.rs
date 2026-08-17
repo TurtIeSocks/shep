@@ -198,6 +198,16 @@ pub enum Effect {
     /// all refresh it), and so does a selection that actually moved. See the
     /// phase plan's design decision 2.
     RefreshFeed,
+    /// Re-read the selected sheep's log files AND ask the shepherd for its
+    /// lambs.
+    ///
+    /// Held apart from [`Self::RefreshFeed`] because the two triggers differ:
+    /// a snapshot must refresh the feed, since the selected row's log paths
+    /// can have changed, and must not fetch lambs, since it fires every two
+    /// seconds. Returned by `select_at` when the selection actually moved, and
+    /// by the callers of `reseat` on the same condition they already use to
+    /// choose between `RefreshFeed` and `None`.
+    RefreshSelected,
     /// Leave.
     Quit,
 }
@@ -535,7 +545,7 @@ impl App {
                     let previous = self.selected_index();
                     self.flock.remove(&info.id);
                     return if self.reseat(previous) {
-                        Effect::RefreshFeed
+                        Effect::RefreshSelected
                     } else {
                         Effect::None
                     };
@@ -550,7 +560,7 @@ impl App {
                 let anchor = self.now;
                 self.flock.insert(info.id, Row { info, anchor });
                 if was_empty && self.reseat(None) {
-                    return Effect::RefreshFeed;
+                    return Effect::RefreshSelected;
                 }
                 Effect::None
             }
@@ -729,7 +739,7 @@ impl App {
     /// two-hundred-sheep flock every time an unrelated sheep was deleted.
     ///
     /// Returns whether the selection changed, which is what decides between
-    /// [`Effect::RefreshFeed`] and [`Effect::None`].
+    /// [`Effect::RefreshSelected`] and [`Effect::None`].
     fn reseat(&mut self, previous_index: Option<usize>) -> bool {
         // `selected_index`, NOT `flock.contains_key`: a selection the filter
         // is hiding is not seated, however present its id still is in the map.
@@ -782,9 +792,9 @@ impl App {
     /// Selects the row at `index`, clamped to the flock, and reports whether
     /// that changed anything.
     ///
-    /// `Effect::None` when it did not: [`Effect::RefreshFeed`] reads two files
-    /// off disk, and a held `k` at the top of the flock must not do that once
-    /// per keypress.
+    /// `Effect::None` when it did not: [`Effect::RefreshSelected`] reads two
+    /// files off disk and asks the shepherd for lambs, and a held `k` at the
+    /// top of the flock must not do that once per keypress.
     fn select_at(&mut self, index: usize) -> Effect {
         let visible = self.visible_len();
         if visible == 0 {
@@ -804,7 +814,7 @@ impl App {
         if matches!(self.link, Link::Lost { .. }) {
             return Effect::None;
         }
-        Effect::RefreshFeed
+        Effect::RefreshSelected
     }
 
     /// The flock, in id order.
@@ -830,10 +840,10 @@ impl App {
         let previous = self.selected_index();
         self.filter = query;
         if self.reseat(previous) && !matches!(self.link, Link::Lost { .. }) {
-            // The cursor moved, so the feed is about to describe a different
-            // sheep. A frozen dashboard reads nothing, for the reason
-            // `select_at` already states.
-            return Effect::RefreshFeed;
+            // The cursor moved, so the feed and the lambs are about to
+            // describe a different sheep. A frozen dashboard reads nothing,
+            // for the reason `select_at` already states.
+            return Effect::RefreshSelected;
         }
         Effect::None
     }
@@ -1128,18 +1138,19 @@ mod tests {
 
     /// fails if moving the selection stops asking for a feed refresh, or
     /// starts asking for one when the selection did not move. The second half
-    /// is the one that matters: `RefreshFeed` reads two files off disk, and a
-    /// held `k` at the top of the flock must not do that once per keypress.
+    /// is the one that matters: `RefreshSelected` reads two files off disk
+    /// and asks the shepherd for lambs, and a held `k` at the top of the
+    /// flock must not do that once per keypress.
     #[test]
     fn a_selection_that_moves_refreshes_the_feed_and_one_that_cannot_does_not() {
         let (mut app, _) = started();
         assert_eq!(
             app.update(Msg::Key(KeyPress::SelectDown)),
-            Effect::RefreshFeed
+            Effect::RefreshSelected
         );
         assert_eq!(
             app.update(Msg::Key(KeyPress::SelectFirst)),
-            Effect::RefreshFeed
+            Effect::RefreshSelected
         );
         assert_eq!(
             app.update(Msg::Key(KeyPress::SelectUp)),
@@ -1148,13 +1159,55 @@ mod tests {
         );
         assert_eq!(
             app.update(Msg::Key(KeyPress::SelectLast)),
-            Effect::RefreshFeed
+            Effect::RefreshSelected
         );
         assert_eq!(
             app.update(Msg::Key(KeyPress::SelectDown)),
             Effect::None,
             "already at the bottom"
         );
+    }
+
+    /// fails if a moved selection stops asking for lambs. The pane describes
+    /// the selected sheep, so the trigger is the selection changing and
+    /// nothing else.
+    #[test]
+    fn moving_the_selection_asks_for_lambs() {
+        let (mut app, _t0) = started();
+        assert_eq!(
+            app.update(Msg::Key(KeyPress::SelectDown)),
+            Effect::RefreshSelected
+        );
+    }
+
+    /// fails if the two-second listing starts asking for lambs, which is the
+    /// whole cost decision inverted. `with_lambs`'s own doc says `ListFlock`
+    /// declines the walk because a flock listing is what an operator leaves
+    /// running in a loop; a dashboard putting a full machine enumeration on a
+    /// fixed 2s clock, times however many lookout windows are open, is the
+    /// daemon paying exactly the cost its own code was written to avoid.
+    #[test]
+    fn a_snapshot_refreshes_the_feed_and_does_not_ask_for_lambs() {
+        let (mut app, t0) = started();
+        assert_eq!(
+            app.update(Msg::Snapshot {
+                rows: vec![sheep(1, "web", ProcStatus::Online)],
+                at: t0,
+            }),
+            Effect::RefreshFeed
+        );
+    }
+
+    /// fails if a frozen dashboard asks the shepherd for anything. Inherited
+    /// from `select_at`'s shipped rule rather than restated: the link is gone,
+    /// so there is nothing to ask.
+    #[test]
+    fn nothing_is_requested_while_the_link_is_lost() {
+        let (mut app, _t0) = started();
+        app.update(Msg::Frozen {
+            at_local: "2026-08-16 09:00:00".to_string(),
+        });
+        assert_eq!(app.update(Msg::Key(KeyPress::SelectDown)), Effect::None);
     }
 
     /// fails if a snapshot stops refreshing the feed. This is the whole
