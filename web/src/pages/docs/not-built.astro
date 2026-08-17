@@ -113,31 +113,12 @@ import Callout from "../../components/docs/Callout.astro";
 
     <h2>Scheduled, not decided against</h2>
     <p>
-      These are named as v1.0 scope in the spec and simply haven't reached
-      the front of the queue:
+      Named as v1.0 scope in the spec and hasn't reached the front of the
+      queue. Lookout's three items in this section shipped in Phase 16
+      (search and filter, the action keys behind the control gate, and
+      lambs in the detail pane), which leaves one:
     </p>
     <ul>
-      <li>
-        <strong>Lookout's search and filter.</strong> Excluded explicitly
-        from the phase that shipped the other three panes ("no filtering UI,
-        no elaborate layout"), and it still carries an open design question:
-        whether a filter line takes the CLI's own selector grammar or plain
-        substring matching. That call is Rin's, which is why the item stays
-        open rather than half-built either way.
-      </li>
-      <li>
-        <strong>Lookout's actions, beyond a refusal.</strong> The control
-        gate (<code>--allow-control</code>) exists and every action key
-        checks it, but exactly one action key exists (<code>x</code> for
-        stop) and it refuses honestly in both gate states. No action has
-        landed behind the gate yet.
-      </li>
-      <li>
-        <strong>Lambs in lookout's detail pane.</strong> Showing them needs
-        <code>Describe</code>'s process-table walk, and polling that per
-        selection on a two-second timer was a cost the phase that shipped the
-        detail pane declined to add.
-      </li>
       <li>
         <strong>OTLP export for the metrics dog.</strong> The dog serves
         Prometheus exposition only today; no <code>otel</code> cargo feature
@@ -150,9 +131,8 @@ import Callout from "../../components/docs/Callout.astro";
       <a href="/docs/lookout" class="next-card">
         <div class="next-title">Lookout →</div>
         <div class="next-body">
-          Three of the four "scheduled, not decided against" items live
-          here: see what the dashboard does today, and exactly where it
-          stops.
+          See what the dashboard does today, including the filter, the
+          actions, and lambs in the detail pane.
         </div>
       </a>
       <a href="/docs/from-pm2" class="next-card">
