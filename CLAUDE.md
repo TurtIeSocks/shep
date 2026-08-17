@@ -233,8 +233,13 @@ symlink all refused by default), `shep runtime` (foreground, no-daemon, PID-1
 via a separate init process that reaps orphans and forwards signals), and
 `shep dev` (isolated `$SHEP_DEV_HOME`, forced watch, auto-exit) — plus the
 `shep` library extraction the two container-entrypoint `[[bin]]` aliases
-needed underneath them. The v1.0 CLI surface is closed except for the
-Windows functional tier.
+needed underneath them. Phase 16 merged too: `shep lookout`'s last three
+pieces — a name filter that narrows the flock table in place, lambs in the
+sheep detail pane (fetched separately with `Request::Describe`, never on the
+two-second poll), and the three action keys (`x` stop, `R` restart, `L`
+reload) behind the `--allow-control` gate, each arming a confirm rather than
+acting on the keypress that pressed it. No wire change. The v1.0 CLI surface
+is closed except for the Windows functional tier.
 
 What's built vs. deferred to v1.1+: [docs/specs/deferred.md](docs/specs/deferred.md).
 Windows is 0%, not partial — every verb prints "not yet supported" and exits.

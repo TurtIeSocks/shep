@@ -647,7 +647,7 @@ shep lookout   /home/rin/.shep                                                  
 
 
 === action_refused_offline  (100x14) ===
-An action key pressed while the link is coming back. The refusal is the same sentence `r` gives, one row under a banner saying the shepherd is being reconnected to.
+An action key pressed while the link is coming back. The refusal is the same sentence `r` gives, under a banner saying the shepherd is being reconnected to.
 
 shep lookout   /home/rin/.shep                                                       [0m[38;5;245m 6 in the flock[0m
 [0m[38;5;221mthe shepherd stopped answering — reconnecting (attempt 3)[0m                                           [0m

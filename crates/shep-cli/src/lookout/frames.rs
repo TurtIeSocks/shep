@@ -316,7 +316,7 @@ impl Scene {
                 "The shepherd refused while the request was out, and its own sentence is forwarded rather than rewritten. The sheep has left the flock in the listing behind it, so the table is one row shorter and the cursor has moved to the row below."
             }
             Self::ActionRefusedOffline => {
-                "An action key pressed while the link is coming back. The refusal is the same sentence `r` gives, one row under a banner saying the shepherd is being reconnected to."
+                "An action key pressed while the link is coming back. The refusal is the same sentence `r` gives, under a banner saying the shepherd is being reconnected to."
             }
         }
     }
@@ -1389,7 +1389,7 @@ mod tests {
         );
 
         // "An action key pressed while the link is coming back. The refusal
-        //  is the same sentence `r` gives, one row under a banner saying the
+        //  is the same sentence `r` gives, under a banner saying the
         //  shepherd is being reconnected to."
         let offline = render_text(&scene(Scene::ActionRefusedOffline).1);
         assert!(offline.contains("reconnecting (attempt 3)"), "the banner");

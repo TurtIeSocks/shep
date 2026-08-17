@@ -778,10 +778,11 @@ pub struct BleatsArgs {
 pub struct LookoutArgs {
     /// Open the dashboard's action gate. Off by default.
     ///
-    /// This phase wires the gate but not the actions: every action key
-    /// still refuses either way, honestly, with a message saying why —
-    /// `stop is not built yet` once this flag is set. Actions land in a
-    /// later phase and will check this same gate.
+    /// With the gate open, `x` (stop), `R` (restart) and `L` (reload) each
+    /// arm a confirm instead of acting on the keypress that pressed it;
+    /// Enter sends the request, any other key cancels, and an unanswered
+    /// confirm expires after ten seconds. Off, all three refuse outright
+    /// with `read-only: actions need --allow-control`.
     ///
     /// A guard against a keystroke in a window you were reading, not a
     /// security boundary: lookout runs as you, so anything it could do you can

@@ -18,14 +18,14 @@
 //! foreground development flock. Three `[[bin]]` targets sit over this
 //! library: `shep` itself, plus `shep-runtime` and `shep-dev`, the two
 //! container-entrypoint aliases that prepend their verb before parsing (see
-//! `main_runtime`/`main_dev`). The ratatui `lookout` dashboard ships all four
-//! panes — the flock table and shell (Phase 12a), plus the bleats feed, the
-//! sheep detail pane and the host-usage strip (Phase 12b). Its search/filter
-//! and its actions are what remains: the control gate exists, but `x` (stop)
-//! is the only key bound to one, and it refuses either way with a message
-//! saying why. Recorded here as deliberately absent or deliberately partial
-//! rather than letting either read as shipped; full inventory:
-//! `docs/specs/deferred.md`.
+//! `main_runtime`/`main_dev`). The ratatui `lookout` dashboard ships complete
+//! as of Phase 16: all four panes — the flock table and shell (Phase 12a),
+//! plus the bleats feed, the sheep detail pane and the host-usage strip
+//! (Phase 12b) — a name filter that narrows the table in place, lambs in the
+//! detail pane, and the three action keys (`x` stop, `R` restart, `L`
+//! reload) behind the `--allow-control` gate, each arming a confirm rather
+//! than acting on the keypress that pressed it. Remaining workspace debt,
+//! none of it here: `docs/specs/deferred.md`.
 
 #![forbid(unsafe_code)]
 

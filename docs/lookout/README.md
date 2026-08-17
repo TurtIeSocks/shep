@@ -14,8 +14,8 @@ phase before deciding what came next.
 
 ## Reading the frames
 
-- `frames.txt` — fourteen scenes, plain text. Open it in any editor.
-- `frames.ansi` — the same fourteen scenes, with colour. Read it with
+- `frames.txt` — twenty-four scenes, plain text. Open it in any editor.
+- `frames.ansi` — the same twenty-four scenes, with colour. Read it with
   `less -R` so the escape codes render instead of printing literally.
 
 Both files are generated, not hand-written, and both come from the same

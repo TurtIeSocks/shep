@@ -624,7 +624,7 @@ host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7% 
 restart api (id 2): the shepherd restarted it                                        control enabled
 
 === action_refused_offline  (100x14) ===
-An action key pressed while the link is coming back. The refusal is the same sentence `r` gives, one row under a banner saying the shepherd is being reconnected to.
+An action key pressed while the link is coming back. The refusal is the same sentence `r` gives, under a banner saying the shepherd is being reconnected to.
 
 shep lookout   /home/rin/.shep                                                        6 in the flock
 the shepherd stopped answering — reconnecting (attempt 3)                                           

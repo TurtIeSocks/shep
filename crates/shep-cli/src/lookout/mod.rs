@@ -4,10 +4,13 @@
 //! row now grows a sheep detail pane ([`view::detail`]) and a bleats feed
 //! ([`view::bleats`]) beneath it, with a host-usage strip
 //! ([`view::host`]) above. A narrow or short terminal drops panes before it
-//! drops columns — [`view::panes_for`] is the tier table. `source::TOPICS`
-//! has the argument for why the feed re-reads the selected sheep's log files
-//! on every refresh instead of subscribing to `log.*`. `docs/lookout/README.md`
-//! says what the rendered frames are for.
+//! drops columns — [`view::panes_for`] is the tier table. `/` opens a name
+//! filter in the status bar ([`app::App::on_key`]'s text-mode arm) that
+//! narrows the table to matching rows in place, without touching what the
+//! link task fetches. `source::TOPICS` has the argument for why the feed
+//! re-reads the selected sheep's log files on every refresh instead of
+//! subscribing to `log.*`. `docs/lookout/README.md` says what the rendered
+//! frames are for.
 //!
 //! **Two tasks, three channels.** The link task ([`link::run_link`]) owns the
 //! connection: it subscribes, polls, repairs on a drop, climbs a bounded
