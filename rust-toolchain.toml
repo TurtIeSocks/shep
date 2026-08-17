@@ -1,0 +1,20 @@
+# Pins the toolchain so a local run and CI are the same thing.
+#
+# Without this the project inherits whatever the machine defaults to. On
+# 2026-08-17 that was nightly here while CI tested 1.88 and stable, which made
+# every local "the suite is green" a claim about a toolchain nobody ships. It
+# stayed invisible until a cargo layout change moved test binaries under
+# `build/<pkg>/<hash>/out/` and broke two tests on nightly alone.
+#
+# `stable` rather than a fixed version: CI's own matrix is 1.88 (the MSRV, and
+# the floor `rust-version` declares) plus stable, so this matches the leg that
+# moves. MSRV breakage is CI's job to catch, not this file's.
+#
+# The targets are the two cross-checks the task gate runs. Note that
+# x86_64-pc-windows-gnu additionally needs a host C toolchain that rustup
+# cannot supply (`brew install mingw-w64`), because `ring`'s build script runs
+# `cc`; CLAUDE.md says so where the gate is documented.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu"]
