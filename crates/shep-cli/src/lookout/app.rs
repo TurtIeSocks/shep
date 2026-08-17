@@ -638,16 +638,7 @@ impl App {
             }
             Msg::Replied { sent, result } => match sent {
                 Sent::Lambs { id } => self.on_lambs(id, result),
-                // A placeholder: `Sent` gaining `Action` this task makes this
-                // match non-exhaustive, and the phase plan's Task 7 text does
-                // not show a fix — Task 8 ("the reply") is titled for exactly
-                // this and is expected to replace this arm with a real
-                // `on_action_reply`. Reported as a plan gap; `_ = result` so
-                // the unused reply does not warn in the meantime.
-                Sent::Action { .. } => {
-                    let _ = result;
-                    Effect::None
-                }
+                Sent::Action { verb, id, name } => self.on_action_reply(verb, id, &name, result),
             },
             Msg::Unsent { sent } => match sent {
                 Sent::Action { verb, id, name } => {
@@ -700,6 +691,75 @@ impl App {
             at: self.now,
             walk,
         });
+        Effect::None
+    }
+
+    /// One action's answer: the shepherd's rows upserted, and one sentence.
+    ///
+    /// No provisional row state is invented anywhere on this path. The three
+    /// replies carry `Vec<ProcessInfo>`, so the table updates from the
+    /// shepherd's own words; an `online, restart sent...` in the STATUS column
+    /// would be a guess printed in the one column whose whole job is to be
+    /// true, and it would have to negotiate with the narrow-terminal column
+    /// drop order for the privilege.
+    fn on_action_reply(
+        &mut self,
+        verb: ActionVerb,
+        id: u32,
+        name: &str,
+        result: Result<Response, RequestError>,
+    ) -> Effect {
+        self.action = None;
+        let prefix = format!("{} {name} (id {id})", verb.label());
+        // Each verb accepts its own reply and no other. A `Stopped` answering
+        // a `Restart` carries rows and would upsert perfectly happily, which
+        // is why the guards are on the arms rather than a single
+        // rows-carrying match.
+        let rows = match result {
+            Ok(Response::Stopped(rows)) if verb == ActionVerb::Stop => rows,
+            Ok(Response::Restarted(rows)) if verb == ActionVerb::Restart => rows,
+            Ok(Response::Reloading(rows)) if verb == ActionVerb::Reload => rows,
+            Ok(_unrecognised) => {
+                self.notice = Some(Notice {
+                    text: format!(
+                        "{prefix}: the shepherd answered something this lookout does not understand"
+                    ),
+                    grave: true,
+                });
+                return Effect::None;
+            }
+            // The daemon's own message, not `RequestError`'s full `Display`:
+            // the latter interpolates the code with `{:?}` and produces
+            // "the daemon reported NotFound: ...", which puts a Rust
+            // identifier on an operator's screen. The message alone is
+            // already a sentence a human wrote.
+            Err(RequestError::Rpc(err)) => {
+                self.notice = Some(Notice {
+                    text: format!("{prefix}: {}", err.message),
+                    grave: true,
+                });
+                return Effect::None;
+            }
+            Err(other) => {
+                self.notice = Some(Notice {
+                    text: format!("{prefix}: {other}"),
+                    grave: true,
+                });
+                return Effect::None;
+            }
+        };
+        let anchor = self.now;
+        let was_empty = self.flock.is_empty();
+        for info in rows {
+            self.flock.insert(info.id, Row { info, anchor });
+        }
+        self.notice = Some(Notice {
+            text: format!("{prefix}: {}", outcome(verb)),
+            grave: false,
+        });
+        if was_empty && self.reseat(None) {
+            return Effect::RefreshSelected;
+        }
         Effect::None
     }
 
@@ -1308,10 +1368,23 @@ fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// What the bar says once the shepherd has answered.
+///
+/// Reload's wording is not decoration. `Response::Reloading` is an acceptance
+/// and not a result, and the swaps arrive afterwards on the bus, which the
+/// table already consumes.
+const fn outcome(verb: ActionVerb) -> &'static str {
+    match verb {
+        ActionVerb::Stop => "the shepherd stopped it",
+        ActionVerb::Restart => "the shepherd restarted it",
+        ActionVerb::Reload => "accepted, the swaps report themselves as they happen",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shep_core::protocol::ProcessEventKind;
+    use shep_core::protocol::{ProcessEventKind, RpcError, RpcErrorCode};
 
     fn sheep(id: u32, name: &str, status: ProcStatus) -> ProcessInfo {
         ProcessInfo::builder(id, name, status)
@@ -2620,5 +2693,154 @@ mod tests {
             app.lambs_for(1).is_none(),
             "the frozen frame learned nothing"
         );
+    }
+
+    /// fails if the reply's rows are thrown away and the table left to wait
+    /// for the next poll. The shepherd's own rows are right there.
+    #[test]
+    fn an_accepted_stop_upserts_the_rows_the_shepherd_returned() {
+        let mut app = allowed();
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        app.update(Msg::Key(KeyPress::Confirm));
+        app.update(Msg::Replied {
+            sent: Sent::Action {
+                verb: ActionVerb::Stop,
+                id: 2,
+                name: "api".to_string(),
+            },
+            result: Ok(Response::Stopped(vec![sheep(
+                2,
+                "api",
+                ProcStatus::Stopped,
+            )])),
+        });
+        assert_eq!(
+            app.rows()
+                .iter()
+                .find(|row| row.info.id == 2)
+                .map(|row| row.info.status),
+            Some(ProcStatus::Stopped),
+            "the table shows what the shepherd said, without waiting for a poll"
+        );
+        assert_eq!(
+            app.notice().map(ToString::to_string).as_deref(),
+            Some("stop api (id 2): the shepherd stopped it")
+        );
+        assert!(app.action().is_none(), "the in-flight state cleared");
+    }
+
+    /// fails if a reload reply claims the swap finished. `Response::Reloading`
+    /// is an ACCEPTANCE, its own doc says so, and the swaps arrive afterwards
+    /// on the bus as `process.reload` / `process.reloaded` /
+    /// `process.reload_abandoned`, which the table already consumes. A
+    /// sentence saying "reloaded" would be the one lie this reply makes easy
+    /// to tell.
+    #[test]
+    fn a_reload_reply_does_not_claim_the_swap_finished() {
+        let mut app = allowed();
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Reload)));
+        app.update(Msg::Key(KeyPress::Confirm));
+        app.update(Msg::Replied {
+            sent: Sent::Action {
+                verb: ActionVerb::Reload,
+                id: 2,
+                name: "api".to_string(),
+            },
+            result: Ok(Response::Reloading(vec![sheep(
+                2,
+                "api",
+                ProcStatus::Online,
+            )])),
+        });
+        let said = app.notice().map(ToString::to_string).unwrap_or_default();
+        assert_eq!(
+            said,
+            "reload api (id 2): accepted, the swaps report themselves as they happen"
+        );
+        assert!(!said.contains("reloaded"), "got {said:?}");
+    }
+
+    /// fails if the daemon's own words are replaced with a canned string. The
+    /// message is a sentence a human wrote; `RequestError`'s full `Display`
+    /// interpolates the code with `{:?}` and would put a Rust identifier on an
+    /// operator's screen.
+    #[test]
+    fn a_daemon_refusal_reaches_the_bar_in_the_daemons_own_words() {
+        let mut app = allowed();
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Restart)));
+        app.update(Msg::Key(KeyPress::Confirm));
+        app.update(Msg::Replied {
+            sent: Sent::Action {
+                verb: ActionVerb::Restart,
+                id: 2,
+                name: "api".to_string(),
+            },
+            result: Err(RequestError::Rpc(RpcError {
+                code: RpcErrorCode::NotFound,
+                message: "selector matched no registered sheep".to_string(),
+            })),
+        });
+        let said = app.notice().map(ToString::to_string).unwrap_or_default();
+        assert_eq!(
+            said,
+            "restart api (id 2): selector matched no registered sheep"
+        );
+        assert!(!said.contains("NotFound"), "no Rust identifiers: {said:?}");
+        assert!(app.notice().is_some_and(Notice::is_grave));
+    }
+
+    /// fails if a connection that died mid-request reports as anything else.
+    #[test]
+    fn a_connection_that_died_mid_request_says_so_under_the_same_prefix() {
+        let mut app = allowed();
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        app.update(Msg::Key(KeyPress::Confirm));
+        app.update(Msg::Replied {
+            sent: Sent::Action {
+                verb: ActionVerb::Stop,
+                id: 2,
+                name: "api".to_string(),
+            },
+            result: Err(RequestError::Closed),
+        });
+        let said = app.notice().map(ToString::to_string).unwrap_or_default();
+        assert!(said.starts_with("stop api (id 2): "), "got {said:?}");
+        assert!(said.contains(&RequestError::Closed.to_string()));
+    }
+
+    /// fails if a reply this binary does not understand reads as success.
+    /// `Response` is `#[non_exhaustive]`, and swallowing an unrecognised
+    /// variant into `Ok` is what `flock()` does and what this must not: a
+    /// stop that silently reported success while the sheep kept running is the
+    /// worst outcome this feature has.
+    ///
+    /// The second half is the sharper case: the RIGHT SHAPE for the wrong
+    /// verb. A `Stopped` answering a `Restart` carries rows and would upsert
+    /// happily.
+    #[test]
+    fn an_unrecognised_reply_says_so_rather_than_reading_as_success() {
+        for reply in [
+            Response::Pong,
+            Response::Stopped(vec![sheep(2, "api", ProcStatus::Stopped)]),
+        ] {
+            let mut app = allowed();
+            app.update(Msg::Key(KeyPress::Action(ActionVerb::Restart)));
+            app.update(Msg::Key(KeyPress::Confirm));
+            app.update(Msg::Replied {
+                sent: Sent::Action {
+                    verb: ActionVerb::Restart,
+                    id: 2,
+                    name: "api".to_string(),
+                },
+                result: Ok(reply),
+            });
+            assert_eq!(
+                app.notice().map(ToString::to_string).as_deref(),
+                Some(
+                    "restart api (id 2): the shepherd answered something this lookout does not understand"
+                )
+            );
+            assert!(app.notice().is_some_and(Notice::is_grave));
+        }
     }
 }
