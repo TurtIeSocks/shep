@@ -542,14 +542,31 @@ mod tests {
 
             // A bounded `timeout` + `recv`, not a bare `try_recv` (Global
             // Constraints rule 11). Both an expired timeout (nothing arrived)
-            // and a closed channel (the debouncer thread already tore down and
-            // dropped its sender) are honest readings of "delivery stopped";
-            // only a delivered batch is the leak this test exists to catch.
-            match timeout(NO_EVENT_WINDOW, rx.recv()).await {
-                Err(_) => {}   // window elapsed with nothing arriving — expected
-                Ok(None) => {} // sender dropped alongside the debouncer thread — expected
-                Ok(Some(batch)) => {
-                    panic!("unexpected batch delivered after WatchSource was dropped: {batch:?}")
+            // and a closed channel (the debouncer thread already tore down
+            // and dropped its sender) are honest readings of "delivery
+            // stopped".
+            //
+            // A batch naming `first.txt` is NOT the leak: `WatchSource`'s
+            // own doc says the debouncer's OS thread "may still emit one
+            // final batch" after the stop flag flips, and a loaded machine
+            // can duplicate the raw fs event behind `first.txt`'s own
+            // (already-consumed) write — observed directly, both here and
+            // on CI, as a stray batch containing `first.txt` and nothing
+            // else. The one honest reading of "the drop leaked" is a batch
+            // that names `second.txt`, the write that happens after the
+            // drop; only that fails the test. Loop rather than a single
+            // `recv`, so a harmless `first.txt` straggler can't hide a real
+            // `second.txt` leak that follows it within the same window.
+            let deadline = Instant::now() + NO_EVENT_WINDOW;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match timeout(remaining, rx.recv()).await {
+                    Err(_) => break,   // window elapsed with nothing further — expected
+                    Ok(None) => break, // sender dropped alongside the debouncer thread — expected
+                    Ok(Some(batch)) => assert!(
+                        !batch.paths.iter().any(|p| p.ends_with("second.txt")),
+                        "unexpected batch delivered after WatchSource was dropped: {batch:?}"
+                    ),
                 }
             }
         }
