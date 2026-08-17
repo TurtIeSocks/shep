@@ -1115,6 +1115,45 @@ fn poll_flock(home: &Path, done: impl Fn(&serde_json::Value) -> bool) -> serde_j
     poll_flock_data(home, FLOCK_DEADLINE, |data| done(&data[0]))[0].clone()
 }
 
+/// Runs `shep --home <home> --format json describe <name>` until its lamb
+/// tree is non-empty, or [`FLOCK_DEADLINE`] expires, returning the last
+/// `Output` either way — the fixture-comparison case's own version of the
+/// same wait [`describe_renders_a_real_sheeps_lamb_tree`] already does over
+/// the table renderer.
+///
+/// `describe` walks the live process tree only inside its own handler, so
+/// the very first call after `start` races the shell script's own fork: on
+/// this test's script, `/bin/sh` has to fork and exec the trailing `sleep`
+/// before the walk can see it, and that fork has not necessarily happened
+/// yet. Pinning a committed fixture with an empty `lambs` array — this
+/// file's original shape — bet on losing that race forever, which is
+/// exactly backwards: the sheep always eventually has the lamb, so the
+/// fixture should describe the state the sheep reaches, and this is what
+/// waits for it rather than sampling whatever the first call happened to
+/// catch.
+fn poll_describe_lambs(home: &Path, name: &str, deadline: Duration) -> Output {
+    let start = Instant::now();
+    loop {
+        let output = shep(home)
+            .arg("--format")
+            .arg("json")
+            .arg("describe")
+            .arg(name)
+            .output()
+            .unwrap();
+        assert_success(&output);
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|e| panic!("describe stdout was not JSON: {e}"));
+        let has_lamb = envelope["data"][0]["lambs"]
+            .as_array()
+            .is_some_and(|lambs| !lambs.is_empty());
+        if has_lamb || start.elapsed() >= deadline {
+            return output;
+        }
+        std::thread::sleep(FLOCK_POLL_INTERVAL);
+    }
+}
+
 /// The `data[]` element named `name`, for the two cases that run a control
 /// sheep beside the one under test.
 ///
@@ -1197,6 +1236,16 @@ fn normalize_process_info(info: &mut serde_json::Value, home: &Path, name: &str,
     info["err_file"] = serde_json::Value::Null;
     info["cpu_percent"] = serde_json::Value::Null;
     info["memory_bytes"] = serde_json::Value::Null;
+    // `lambs[].pid` races the same way the fields above do — the process
+    // table pid `describe`'s own walk found — so it is nulled the same way.
+    // `lambs[].name` stays: it names the program the OS reports for that
+    // pid, deterministic once the walk has actually caught it (the caller's
+    // job, via `poll_describe_lambs`, not this function's).
+    if let Some(lambs) = info["lambs"].as_array_mut() {
+        for lamb in lambs {
+            lamb["pid"] = serde_json::Value::Null;
+        }
+    }
 }
 
 /// Whether the verb an envelope answers takes a live resource reading.
@@ -1541,14 +1590,7 @@ fn json_format_matches_the_committed_fixtures() {
     assert_success(&flock_out);
     assert_envelope_matches_fixture(&flock_out, home, "flock", "fixture", Samples::Live);
 
-    let describe_out = shep(home)
-        .arg("--format")
-        .arg("json")
-        .arg("describe")
-        .arg("fixture")
-        .output()
-        .unwrap();
-    assert_success(&describe_out);
+    let describe_out = poll_describe_lambs(home, "fixture", FLOCK_DEADLINE);
     assert_envelope_matches_fixture(&describe_out, home, "describe", "fixture", Samples::Live);
 
     let ping_out = shep(home)

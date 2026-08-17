@@ -15,7 +15,12 @@
       "cpu_percent": null,
       "memory_bytes": null,
       "dog": null,
-      "lambs": []
+      "lambs": [
+        {
+          "pid": null,
+          "name": "sleep"
+        }
+      ]
     }
   ]
 }
