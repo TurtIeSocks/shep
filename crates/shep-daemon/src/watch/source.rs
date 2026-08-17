@@ -69,17 +69,35 @@ pub struct WatchSource {
 /// proven by this module's own
 /// `a_symlinked_root_delivers_the_resolved_path_not_the_one_passed_in` test.
 /// A caller that strips `root` as a literal path prefix (`WatchFilter`) must
-/// canonicalize `root` first, or a delivered path never looks like it lies
-/// under the tree it was just reported from.
+/// canonicalize its own copy of `root` first (as `extras.rs`'s `arm_watch`
+/// does), or a delivered path never looks like it lies under the tree it was
+/// just reported from — this function canonicalizes only the copy it hands
+/// to the OS watch, not anything the caller goes on to hold.
+///
+/// The guarantee is this function's own, not the backend's: `root` is
+/// resolved here, before it is ever handed to notify, rather than trusted to
+/// arrive already resolved or to come back resolved on its own. FSEvents
+/// happens to resolve symlinks on macOS regardless, but inotify on Linux
+/// builds every delivered path by joining whatever root it was actually
+/// armed with — arm it with a symlink and every batch carries that symlink
+/// right back. Canonicalizing here is what makes the promise hold on both.
 ///
 /// # Errors
 ///
 /// - [`WatchError::Backend`] — notify could not create a watcher.
-/// - [`WatchError::Watch`] — notify could not watch `root`, carrying the path.
+/// - [`WatchError::Watch`] — `root` could not be resolved to a canonical
+///   path, or notify could not watch it once resolved. Either way the
+///   error carries `root` exactly as this function was called with it.
 pub fn watch_tree(
     root: &Path,
     delay: Duration,
 ) -> Result<(WatchSource, mpsc::UnboundedReceiver<WatchBatch>), WatchError> {
+    let resolved = std::fs::canonicalize(root).map_err(|err| WatchError::Watch {
+        path: root.to_path_buf(),
+        reason: err.to_string(),
+    })?;
+    let root = resolved.as_path();
+
     let (tx, rx) = mpsc::unbounded_channel();
     // Cloned into the handler closure below, which outlives this call: the
     // closure runs on the debouncer's own thread for as long as it lives,
@@ -211,9 +229,12 @@ pub enum WatchError {
         /// notify's own rendered reason.
         reason: String,
     },
-    /// notify could not begin watching the path: it does not exist, it is not
-    /// readable, or the backend's watch limit is exhausted. Carries the path
-    /// and notify's rendered reason.
+    /// The path could not be watched: `watch_tree` could not resolve it to
+    /// a canonical path (it does not exist, or a symlink in it is broken),
+    /// or notify could not begin watching it once resolved (not readable,
+    /// or the backend's watch limit is exhausted). Carries the path exactly
+    /// as `watch_tree` was called with it, and notify's rendered reason
+    /// where notify is the one that failed.
     Watch {
         /// The path notify could not watch.
         path: PathBuf,
