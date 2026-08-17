@@ -602,15 +602,29 @@ mod tests {
     /// Skips, loudly, where the tool does not exist: this is a macOS
     /// development machine's ordinary state, and a test that failed there
     /// would be disabled rather than fixed. On the Linux CI leg it runs.
+    ///
+    /// Builds its own spec rather than [`spec`]'s: `verify` resolves
+    /// `ExecStart`/`ExecReload`/`ExecStop` against the real filesystem and
+    /// rejects the unit if the named command is not an existing, executable
+    /// file — unlike every other test in this file, which only checks the
+    /// rendered text. `spec()`'s `/usr/local/bin/shep` is a fixture value
+    /// the exact-string tests above pin byte for byte; it does not exist on
+    /// the machine running this test (confirmed against CI run 32023586026,
+    /// where `verify` rejected it three times over — once per `Exec*` line
+    /// — with `Command /usr/local/bin/shep is not executable`). This process's
+    /// own executable always exists and is executable, so it stands in.
     #[test]
     fn systemd_analyze_accepts_the_generated_unit() {
         let Ok(analyze) = which_systemd_analyze() else {
             eprintln!("skipping: systemd-analyze is not on this machine");
             return;
         };
+        let mut unit_spec = spec();
+        unit_spec.exec = std::env::current_exe().unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shep-deploy.service");
-        std::fs::write(&path, systemd_unit(&spec())).unwrap();
+        std::fs::write(&path, systemd_unit(&unit_spec)).unwrap();
         let out = std::process::Command::new(analyze)
             .arg("verify")
             .arg(&path)
