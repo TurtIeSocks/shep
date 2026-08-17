@@ -87,7 +87,7 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - run: 'cargo test -p shep-daemon --locked --no-default-features -- --skip ::slow:: --skip two_concurrent_boots'
       - run: 'cargo test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots'
-  # Tests that need a quiet machine, run once, serially, on one runner.
+  # Tests that need a quiet machine, run serially in a job of their own.
   #
   # Two groups belong here and neither is a flaky test in the usual sense:
   # both assert something real that a contended runner cannot hold still for.
@@ -103,13 +103,27 @@ jobs:
   # They are NOT `#[ignore]`d: the tier's own doc says it exists so the full
   # suite covers the real backend, and this project has already found a Linux
   # branch that went five phases without a compiler reading it.
+  #
+  # One leg per watcher backend -- FSEvents, inotify, ReadDirectoryChangesW --
+  # since the backend is the thing under test. No second Linux leg: the arm
+  # runner would exercise the same inotify. Stable only, for the same reason;
+  # the compiler is not what varies here. `--workspace`, matching the skip the
+  # other jobs apply, so a `mod slow` added outside shep-daemon later cannot
+  # end up skipped everywhere and run nowhere.
+  #
+  # libtest takes both filters positionally, so this is one command. On
+  # Windows the boot half matches nothing, because `boot.rs`'s tests are
+  # `cfg(unix)` -- that is the platform split, not a filter typo.
   slow:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
-      - run: 'cargo test --workspace --locked --all-features -- --test-threads=1 ::slow::'
-      - run: cargo test -p shep-daemon --locked --all-features -- --test-threads=1 two_concurrent_boots
+      - run: 'cargo test --workspace --locked --all-features -- --test-threads=1 ::slow:: two_concurrent_boots'
   coverage:
     runs-on: ubuntu-latest
     steps:
