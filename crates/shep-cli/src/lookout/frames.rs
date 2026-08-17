@@ -37,10 +37,10 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 
-use shep_core::protocol::ProcessInfo;
+use shep_core::protocol::{Lamb, ProcessInfo, Response};
 use shep_core::status::ProcStatus;
 
-use super::app::{App, Control, KeyPress, Msg};
+use super::app::{App, Control, KeyPress, Msg, Sent};
 use super::source::HostSample;
 use super::tail::{Stream, Tail, TailLine};
 use super::theme::Palette;
@@ -159,6 +159,11 @@ pub enum Scene {
     Cramped,
     /// `sysinfo` reports this platform unsupported.
     HostUnknown,
+    /// The detail pane with a lamb list.
+    Lambs,
+    /// The detail pane on a sheep with no pid, where the shepherd had no tree
+    /// to walk.
+    LambsUnknown,
 }
 
 impl Scene {
@@ -181,6 +186,8 @@ impl Scene {
         Self::FeedMissing,
         Self::Cramped,
         Self::HostUnknown,
+        Self::Lambs,
+        Self::LambsUnknown,
     ];
 
     /// The snapshot name and the gallery heading.
@@ -204,11 +211,13 @@ impl Scene {
             Self::FeedMissing => "feed_missing",
             Self::Cramped => "cramped",
             Self::HostUnknown => "host_unknown",
+            Self::Lambs => "lambs",
+            Self::LambsUnknown => "lambs_unknown",
         }
     }
 
     /// One sentence saying what this frame is for, printed above it in the
-    /// gallery so Rin does not have to hold seventeen of them in her head.
+    /// gallery so Rin does not have to hold nineteen of them in her head.
     ///
     /// Every clause here is pinned by an assertion in
     /// `every_scene_shows_the_thing_it_is_named_for` — a caption may not say
@@ -267,6 +276,12 @@ impl Scene {
             Self::HostUnknown => {
                 "`sysinfo` reports this platform unsupported. The strip says so and keeps the flock's own totals, which lookout can always compute."
             }
+            Self::Lambs => {
+                "The detail pane with a lamb list: how many descendants the shepherd's walk found, how old that reading is, and each lamb's pid and executable name. The stamp sits before the list so a narrow terminal truncates lambs rather than the caveat."
+            }
+            Self::LambsUnknown => {
+                "The same pane on a stopped sheep. The shepherd had no pid to walk from and left the field unset rather than empty, and the line says which of the two it is looking at rather than reporting none found."
+            }
         }
     }
 
@@ -290,8 +305,8 @@ impl Scene {
             Self::TableOnly => (120, 12),
             Self::Cramped => (33, 26),
             // HealthyWide, Errored, Retrying, Frozen, Refused, FeedGap,
-            // FeedMissing, HostUnknown: every scene that carries all three
-            // optional panes at their ordinary rows.
+            // FeedMissing, HostUnknown, Lambs, LambsUnknown: every scene that
+            // carries all three optional panes at their ordinary rows.
             _ => (120, 30),
         }
     }
@@ -337,7 +352,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
 
     let flock = match which {
         Scene::Empty => Vec::new(),
-        Scene::Errored | Scene::Frozen => vec![
+        Scene::Errored | Scene::Frozen | Scene::LambsUnknown => vec![
             sheep(
                 0,
                 "web",
@@ -477,6 +492,13 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         app.update(Msg::Key(KeyPress::SelectDown));
     }
 
+    // `LambsUnknown` wants `cron`, id 4 — two rows further down than `api`,
+    // where the block above already parked the cursor.
+    if which == Scene::LambsUnknown {
+        app.update(Msg::Key(KeyPress::SelectDown));
+        app.update(Msg::Key(KeyPress::SelectDown));
+    }
+
     match which {
         Scene::FilterEditing | Scene::FilterNoMatch | Scene::FilterActive => {
             app.update(Msg::Key(KeyPress::FilterStart));
@@ -519,6 +541,46 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
     app.update(Msg::Bleats {
         tail: feed_for(which),
     });
+
+    // `Scene::Frozen` gets a reading too, applied here — while the link is
+    // still `Live` — because `on_lambs` refuses once it is `Lost`, the same
+    // guard `Msg::Bleats` carries. It is not there to support a test: the
+    // property that a reading does not age once frozen is pinned in
+    // `detail.rs`'s own unit test, where the two ages differ by construction
+    // rather than by elapsed time. This frame is a picture, and pictures are
+    // what Rin reads.
+    if matches!(which, Scene::Lambs | Scene::Frozen) {
+        app.update(Msg::Replied {
+            sent: Sent::Lambs { id: 2 },
+            result: Ok(Response::Described(vec![
+                ProcessInfo::builder(2, "api", ProcStatus::Online)
+                    .pid(Some(48_219))
+                    .lambs(Some(vec![
+                        Lamb::new(48_220, "node"),
+                        Lamb::new(48_221, "node"),
+                        Lamb::new(48_222, "node"),
+                    ]))
+                    .build(),
+            ])),
+        });
+    }
+
+    // `LambsUnknown`'s own reading: `cron` (id 4) has no pid, so the
+    // shepherd's walk never ran. The plan's own code block for this step
+    // never applied a reply for this scene, which leaves `lambs_for(4)`
+    // `None` and renders "not read yet" rather than the caption's own
+    // "this sheep is not running" sentence the assertions below pin — a gap
+    // reported alongside this task rather than silently worked around.
+    if which == Scene::LambsUnknown {
+        app.update(Msg::Replied {
+            sent: Sent::Lambs { id: 4 },
+            result: Ok(Response::Described(vec![
+                ProcessInfo::builder(4, "cron", ProcStatus::Stopped)
+                    .lambs(None)
+                    .build(),
+            ])),
+        });
+    }
 
     // The `Msg::Host` above and the two `SelectDown`s are applied BEFORE
     // `Msg::Frozen` below, because the reducer refuses both after — which is
@@ -686,7 +748,7 @@ These are real frames, rendered headlessly through ratatui's TestBackend by
 
 Nothing here is a mockup.
 
-frames.ansi is the same seventeen frames with colour; read it with `less -R`.
+frames.ansi is the same nineteen frames with colour; read it with `less -R`.
 
 All four panes are here: the flock table (the spine), the host-usage strip,
 the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
@@ -751,7 +813,7 @@ mod tests {
     /// the plan: "every clause of every caption is one assertion here, or it
     /// is deleted from the caption."
     #[test]
-    #[allow(clippy::too_many_lines)] // seventeen captions, each pinned clause by clause
+    #[allow(clippy::too_many_lines)] // nineteen captions, each pinned clause by clause
     fn every_scene_shows_the_thing_it_is_named_for() {
         // "All three panes at 120x30: the host strip under the title, the
         //  detail pane and the bleats feed under the table. `>` marks the
@@ -1016,6 +1078,34 @@ mod tests {
             unknown.contains("flock cpu"),
             "the half lookout can compute survives"
         );
+
+        // "The detail pane with a lamb list: how many descendants the
+        //  shepherd's walk found, how old that reading is, and each lamb's
+        //  pid and executable name. The stamp sits before the list so a
+        //  narrow terminal truncates lambs rather than the caveat."
+        let lambs = render_text(&scene(Scene::Lambs).1);
+        assert!(lambs.contains("lambs  3 parent-pid descendants, read "));
+        assert!(lambs.contains("48220 node"), "each lamb's pid and name");
+        let line = lambs
+            .lines()
+            .find(|line| line.starts_with("lambs  "))
+            .expect("the lamb line");
+        assert!(
+            line.find("read ").unwrap() < line.find("48220").unwrap(),
+            "the stamp comes before the list"
+        );
+
+        // "The same pane on a stopped sheep. The shepherd had no pid to walk
+        //  from and left the field unset rather than empty, and the line
+        //  says which of the two it is looking at rather than reporting none
+        //  found."
+        let unknown = render_text(&scene(Scene::LambsUnknown).1);
+        assert!(unknown.contains("lambs  this sheep is not running, so there is no tree to walk"));
+        assert!(
+            !unknown.contains("none found"),
+            "which is the other sentence"
+        );
+        assert!(unknown.contains("sheep 4  cron"), "on the stopped sheep");
     }
 
     /// fails if a scene is added to [`Scene::ALL`] without a caption, or with
@@ -1043,7 +1133,7 @@ mod tests {
         // above already guarantees it, so it would be a line that cannot
         // fail. The literal can — it is what catches a scene added to the
         // enum and not to `ALL`, or the reverse.
-        assert_eq!(Scene::ALL.len(), 17);
+        assert_eq!(Scene::ALL.len(), 19);
     }
 
     /// fails if a 12b pane introduced a text MODIFIER. `sgr` renders
@@ -1089,6 +1179,10 @@ mod tests {
         assert_eq!(
             ten_minutes, sixteen_hours,
             "the frozen frame's uptime column advanced after the link was lost"
+        );
+        assert!(
+            ten_minutes.lines().any(|line| line.starts_with("lambs  ")),
+            "the frozen frame has a lamb line for the comparison above to cover"
         );
 
         let live_ten = render_text(&scene_with(Scene::HealthyWide, Duration::from_secs(600)));

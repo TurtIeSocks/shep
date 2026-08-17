@@ -19,9 +19,9 @@ host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%  
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                                                                                        
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 sheep 2  api   errored   pid -   restarts 14   uptime 1h 18m   cpu -   mem -   fold edge                                
+lambs  3 parent-pid descendants, read 0s ago   48220 node   48221 node   48222 node                                     
 out  /home/rin/.shep/logs/api-2-out.log                                                                                 
 err  /home/rin/.shep/logs/api-2-err.log                                                                                 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

@@ -19,9 +19,9 @@ host  usage is not available on this platform   flock cpu 14.7%   flock mem 716.
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                                                                                        
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 sheep 2  api   online   pid 48219   restarts 1   uptime 1h 28m   cpu 7.1%   mem 241.0M   fold edge                      
+lambs  not read yet                                                                                                     
 out  /home/rin/.shep/logs/api-2-out.log                                                                                 
 err  /home/rin/.shep/logs/api-2-err.log                                                                                 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

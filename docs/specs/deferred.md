@@ -104,15 +104,6 @@ gate states: `read-only: actions need --allow-control` when the gate is
 closed, `stop is not built yet` when it is open. No action has landed behind
 the gate.
 
-**lambs in the detail pane** (spec §9) — the sheep detail pane
-([`crates/shep-cli/src/lookout/view/detail.rs`](../../crates/shep-cli/src/lookout/view/detail.rs))
-reads only the `ProcessInfo` the flock table's own rows already carry, so it
-never shows `lambs`. `ListFlock` deliberately does not populate that field;
-only `Describe` does, with a process-table walk, and calling `Describe` on a
-two-second poll timer for whichever sheep is selected is the cost this phase
-declined to add. Rendered frames of what both 12a and 12b built are in
-[docs/lookout/frames.txt](../lookout/frames.txt).
-
 ## Known debt, recorded rather than built
 
 Not scope cuts and not unbuilt spec surface — these are things that exist and

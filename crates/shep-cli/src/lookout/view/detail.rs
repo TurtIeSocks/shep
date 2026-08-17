@@ -1,26 +1,26 @@
-//! The sheep detail pane: three lines about the selected sheep.
+//! The sheep detail pane: four lines about the selected sheep.
 //!
-//! **Everything here comes from the `ProcessInfo` the flock table's own rows
-//! are built from.** No second request, no `Request::Describe`, and therefore
-//! no lamb list — `ProcessInfo::lambs` is `None` on a `ListFlock` reply by
-//! construction, and its doc says why: the walk costs a second pass over the
-//! machine's process table, and a flock listing is the thing an operator
-//! leaves running in a loop.
+//! Three of the four come from the `ProcessInfo` the flock table's own rows
+//! are built from. The lamb line alone is different: it comes from a
+//! `Request::Describe` fetched on selection change and on `r`, never on the
+//! two-second poll — `ListFlock` never populates `ProcessInfo::lambs`, and its
+//! own doc says why, so this pane asks separately for the one thing the table
+//! cannot answer.
 //!
 //! What it adds over the row above it: the UNTRUNCATED name (the NAME column
 //! ends in `…`, and a truncated name is one an operator types into
 //! `shep stop`), both log paths (the first thing anyone wants once the feed
-//! shows them a crash), and whichever fields the current width tier has
-//! dropped.
+//! shows them a crash), the lamb line, and whichever fields the current width
+//! tier has dropped.
 
 use ratatui::text::{Line, Span};
 use shep_core::protocol::DogSource;
 
-use super::super::app::App;
+use super::super::app::{App, LambWalk};
 use super::flock::fit;
 use crate::output::{human_bytes, human_duration};
 
-/// The pane's three content lines. Its rule is [`super::draw`]'s.
+/// The pane's four content lines. Its rule is [`super::draw`]'s.
 #[must_use]
 pub fn detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let palette = app.palette();
@@ -35,6 +35,7 @@ pub fn detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         };
         return vec![
             Line::from(Span::styled(fit(&why, width), palette.muted())),
+            Line::from(Span::raw(String::new())),
             Line::from(Span::raw(String::new())),
             Line::from(Span::raw(String::new())),
         ];
@@ -80,9 +81,58 @@ pub fn detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 width.saturating_sub(u16::try_from(used).unwrap_or(width)),
             )),
         ]),
+        lamb_line(app, info.id, width, palette),
         path_line("out", info.out_file.as_deref(), width, palette),
         path_line("err", info.err_file.as_deref(), width, palette),
     ]
+}
+
+/// The lamb line: what the last walk found, and how old it is.
+///
+/// The age comes first. This file's own rule is that the rarest field goes
+/// last so a narrow terminal truncates it first, and here that rule inverts:
+/// a truncated list is still honest, while a list whose stamp was truncated
+/// away is a stale reading presented as current.
+///
+/// It does not repeat the CLI's "not exactly the set a stop kills" clause.
+/// "parent-pid descendants" is already precisely true, and forty characters of
+/// warning on every frame trains an operator to stop reading the pane (A16).
+fn lamb_line(
+    app: &App,
+    id: u32,
+    width: u16,
+    palette: super::super::theme::Palette,
+) -> Line<'static> {
+    let text = match app.lambs_for(id) {
+        None => "lambs  not read yet".to_string(),
+        Some((LambWalk::Failed, _)) => {
+            "lambs  the shepherd did not answer that request".to_string()
+        }
+        Some((LambWalk::NotWalked, _)) => {
+            "lambs  this sheep is not running, so there is no tree to walk".to_string()
+        }
+        Some((LambWalk::Walked(lambs), age)) if lambs.is_empty() => {
+            format!("lambs  none found, read {} ago", human_duration(age))
+        }
+        Some((LambWalk::Walked(lambs), age)) => {
+            let noun = if lambs.len() == 1 {
+                "descendant"
+            } else {
+                "descendants"
+            };
+            let list = lambs
+                .iter()
+                .map(|lamb| format!("{} {}", lamb.pid, lamb.name))
+                .collect::<Vec<_>>()
+                .join("   ");
+            format!(
+                "lambs  {} parent-pid {noun}, read {} ago   {list}",
+                lambs.len(),
+                human_duration(age)
+            )
+        }
+    };
+    Line::from(Span::styled(fit(&text, width), palette.muted()))
 }
 
 /// One log-path line, or a sentence saying why there is none.
@@ -106,36 +156,122 @@ fn path_line(
 
 #[cfg(test)]
 mod tests {
-    use shep_core::protocol::ProcessInfo;
+    use std::time::Duration;
+
+    use shep_core::protocol::{Lamb, ProcessInfo};
     use shep_core::status::ProcStatus;
 
     use super::super::fixtures::{
-        coloured, render_all, sheep_with_lambs, with_selection, with_selection_and_palette,
+        app_with_lamb_reading_at, coloured, lamb_line_of, render_all, rendered, sheep_with_lambs,
+        with_lamb_reading, with_lamb_reading_for, with_selection, with_selection_and_palette,
     };
     use super::*;
-    use crate::lookout::app::{App, Control};
+    use crate::lookout::app::{App, Control, LambWalk, Msg};
     use crate::lookout::theme::Palette;
 
-    /// fails if the pane starts claiming a lamb list. `ProcessInfo::lambs` is
-    /// `None` on a `ListFlock` reply by construction, and its own doc says
-    /// why: the walk costs a second pass over the machine's process table, and
-    /// a flock listing is the thing an operator leaves running in a loop. A
-    /// dashboard polling `Describe` every two seconds would put that walk on a
-    /// timer.
-    ///
-    /// Asserted on the RENDERED pane rather than on the source, because the
-    /// failure this guards is a caption or a heading promising something the
-    /// pane cannot show.
+    /// fails if the pane collapses any two of the five states it can be in.
+    /// Three of them are distinctions `ProcessInfo::lambs` was built to keep
+    /// (walked and non-empty, walked and empty, not walked at all) and the CLI
+    /// has wording for only the first, so the other four sentences are this
+    /// pane's own.
     #[test]
-    fn the_detail_pane_never_mentions_lambs() {
-        let app = with_selection(sheep_with_lambs());
-        let rendered = render_all(&detail_lines(&app, 200));
-        for forbidden in ["lamb", "LAMB", "children", "tree"] {
+    fn the_pane_says_which_lamb_state_it_is_in() {
+        let cases: [(LambWalk, &str); 3] = [
+            (
+                LambWalk::Walked(vec![Lamb::new(48_220, "node"), Lamb::new(48_221, "node")]),
+                "lambs  2 parent-pid descendants, read ",
+            ),
+            (LambWalk::Walked(Vec::new()), "lambs  none found, read "),
+            (
+                LambWalk::NotWalked,
+                "lambs  this sheep is not running, so there is no tree to walk",
+            ),
+        ];
+        for (walk, expected) in cases {
+            let app = with_lamb_reading(walk);
+            let rendered = render_all(&detail_lines(&app, 200));
             assert!(
-                !rendered.contains(forbidden),
-                "found {forbidden:?} in {rendered:?}"
+                rendered.contains(expected),
+                "expected {expected:?} in {rendered:?}"
             );
         }
+
+        let failed = with_lamb_reading(LambWalk::Failed);
+        assert!(
+            render_all(&detail_lines(&failed, 200))
+                .contains("lambs  the shepherd did not answer that request")
+        );
+
+        let unread = with_selection(sheep_with_lambs());
+        assert!(render_all(&detail_lines(&unread, 200)).contains("lambs  not read yet"));
+    }
+
+    /// fails if a single lamb reads as "1 parent-pid descendants".
+    #[test]
+    fn one_lamb_is_a_descendant_and_not_descendants() {
+        let app = with_lamb_reading(LambWalk::Walked(vec![Lamb::new(48_220, "node")]));
+        let rendered = render_all(&detail_lines(&app, 200));
+        assert!(
+            rendered.contains("1 parent-pid descendant, read "),
+            "got {rendered:?}"
+        );
+    }
+
+    /// fails if the staleness stamp moves after the list, or goes away.
+    /// `detail.rs`'s standing rule is that the rarest field goes last so a
+    /// narrow terminal truncates it first; here that rule inverts, because a
+    /// truncated list is still honest and a list whose "read 4m ago" was
+    /// truncated away is a stale reading presented as current.
+    #[test]
+    fn the_lamb_line_carries_its_age_before_its_list() {
+        let app = with_lamb_reading(LambWalk::Walked(vec![Lamb::new(48_220, "node")]));
+        let line = rendered(&detail_lines(&app, 200)[1]);
+        let stamp = line.find("read ").expect("a stamp");
+        let list = line.find("48220").expect("a list");
+        assert!(stamp < list, "the caveat must survive truncation: {line:?}");
+    }
+
+    /// fails if the pane starts showing a reading taken for another sheep.
+    #[test]
+    fn a_reading_for_another_sheep_is_not_drawn_here() {
+        // with_lamb_reading pins its reading to the selected sheep's id;
+        // this one pins it to a different one and expects the unread sentence.
+        let app = with_lamb_reading_for(11, LambWalk::Walked(vec![Lamb::new(48_220, "node")]));
+        assert!(render_all(&detail_lines(&app, 200)).contains("lambs  not read yet"));
+    }
+
+    /// fails if the stamp reads a live clock instead of `App::now`, and fails
+    /// again if a frozen dashboard's stamp creeps. Two halves, and BOTH are
+    /// needed: the first proves the stamp moves at all, the second proves it
+    /// stops when the banner says the values did.
+    ///
+    /// This is a unit test rather than a two-age frame comparison, and that is
+    /// the point. Rendering the frozen scene at two ages cannot fail for this
+    /// mutation: both renders happen at the same wall-clock instant, so a live
+    /// clock produces the same string in both and the frames stay identical.
+    /// Here the two ages differ by construction, because they are `Msg::Tick`
+    /// arithmetic rather than elapsed time. No sleep (IR-33).
+    #[test]
+    fn the_stamp_ages_on_a_live_dashboard_and_stops_on_a_frozen_one() {
+        let (mut app, t0) =
+            app_with_lamb_reading_at(LambWalk::Walked(vec![Lamb::new(48_220, "node")]));
+        app.update(Msg::Tick {
+            now: t0 + Duration::from_secs(120),
+        });
+        let live = lamb_line_of(&app);
+        assert!(live.contains("read 2m ago"), "the stamp aged: {live:?}");
+
+        app.update(Msg::Frozen {
+            at_local: "2026-08-16 09:00:00".to_string(),
+        });
+        app.update(Msg::Tick {
+            now: t0 + Duration::from_secs(3_600),
+        });
+        assert_eq!(
+            lamb_line_of(&app),
+            live,
+            "a frozen dashboard's reading must not age"
+        );
     }
 
     /// fails if the pane stops showing what the ROW above it cannot. Three

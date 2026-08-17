@@ -50,8 +50,8 @@ const CHROME_ROWS: u16 = 4;
 /// The host strip is one line.
 const HOST_ROWS: u16 = 1;
 
-/// The detail pane: one rule and three lines.
-const DETAIL_ROWS: u16 = 4;
+/// The detail pane: one rule and four lines.
+const DETAIL_ROWS: u16 = 5;
 
 /// The bleats feed: one rule, one header, five lines.
 const FEED_ROWS: u16 = 7;
@@ -550,6 +550,22 @@ mod tests {
                 fixed + floor
             );
         }
+    }
+
+    /// fails if the pane grew a line and the tier table did not grow with it.
+    /// `every_pane_tier_fits_the_height_it_claims` picks `DETAIL_ROWS` up
+    /// automatically and should stay green; if it does not, the tier table is
+    /// wrong, not the test. At 24 rows the fixed cost becomes chrome 4, banner
+    /// 1, host 1, detail 5, feed 7, which is 18, leaving 6 for the table
+    /// against the tier test's floor of 3.
+    #[test]
+    fn the_detail_pane_claims_the_rows_it_draws() {
+        let app = fixtures::with_selection(fixtures::sheep_with_lambs());
+        assert_eq!(
+            detail::detail_lines(&app, 120).len(),
+            usize::from(DETAIL_ROWS - 1),
+            "one rule plus its content lines"
+        );
     }
 
     /// fails if the drop order changes without someone re-arguing it. The

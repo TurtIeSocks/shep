@@ -90,11 +90,14 @@ cargo test -p shep --bins --all-features -- --ignored write_the_gallery
   reader saw and discarded count exactly, and bytes below its window report
   as bytes, because nothing counted the lines in those and guessing would be
   worse than saying so.
-- **The detail pane reads what the table already has.** No second request,
-  no `Request::Describe`, and therefore no lamb list — `ProcessInfo::lambs`
-  is `None` on the `ListFlock` reply the table is built from. It adds the
-  untruncated name, both log paths, and whichever columns the current width
-  tier has dropped.
+- **The detail pane reads what the table already has, with one exception.**
+  Every line but the last comes from the same `ProcessInfo` the table's own
+  rows are built from: the untruncated name, both log paths, and whichever
+  columns the current width tier has dropped. The lamb line is the
+  exception — `ProcessInfo::lambs` is `None` on the `ListFlock` reply the
+  table is built from, so the pane fetches it separately with a
+  `Request::Describe` on selection change and on `r`, never on the
+  two-second poll, and it carries its own age stamp because of that.
 - **Short terminals drop panes before they drop columns.** A plain 80×24
   gets all three: host strip, detail pane, feed. Below 24 rows the detail
   pane goes first, below 18 the feed goes with it, and below 14 the host
@@ -110,6 +113,3 @@ cargo test -p shep --bins --all-features -- --ignored write_the_gallery
 
 - **Actions behind the gate.** The gate exists and refuses honestly; no
   action beyond `x`'s refusal has landed behind it yet.
-- **Lambs in the detail pane.** Showing them needs `Describe`'s
-  process-table walk, and polling that per selection on a two-second timer
-  is a cost this phase declined to add.
