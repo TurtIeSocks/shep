@@ -5,6 +5,12 @@
 /benches/target
 *.snap.new
 
+# Raw profiles from a local `cargo llvm-cov` run. The wrapper writes them
+# beside each crate's manifest rather than under `/target`, so the bare entry
+# above does not cover them, and a coverage run leaves a dozen or more
+# untracked files behind.
+*.profraw
+
 # macOS Finder droppings
 .DS_Store
 
