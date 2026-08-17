@@ -661,6 +661,42 @@ async fn connect_or_spawn_client(
     }
 }
 
+/// Renders a failed connect for an operator rather than for a library caller.
+///
+/// `shep-client`'s own `Display` is correct and deliberately plain: it names
+/// the path and forwards the OS error, which is what an embedder needs. It is
+/// the wrong sentence for the most common way a person meets this error, which
+/// is running a read-only verb on a machine where no shepherd has ever run.
+/// The socket file is simply absent, `connect(2)` returns `ENOENT`, and the
+/// operator is told `No such file or directory (os error 2)` about a path they
+/// did not choose and were not expecting to think about. It reads as a broken
+/// install; it means an empty pasture.
+///
+/// So the absent-socket case gets its own sentence and the next command. Every
+/// other failure keeps the library's wording, because `EACCES` and
+/// `ECONNREFUSED` mean something specific and an operator hitting them needs
+/// the detail: a refused connection is a socket that exists with nothing
+/// listening, which is a stale file rather than a missing shepherd.
+///
+/// This lives here and not in `shep-client` on purpose. That crate is
+/// published for embedders, and a library has no business telling its caller
+/// to run a shell command.
+#[cfg(unix)]
+fn unreachable_message(err: &shep_client::ConnectError) -> String {
+    match err {
+        shep_client::ConnectError::Connect { path, source }
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            format!(
+                "no shepherd is running (no socket at `{}`); \
+                 start one with `shep start <target>`",
+                path.display()
+            )
+        }
+        other => other.to_string(),
+    }
+}
+
 /// Connects to the daemon at `paths.socket`. Never autostarts — see
 /// [`run`]'s own doc for why that matters.
 #[cfg(unix)]
@@ -673,7 +709,12 @@ async fn connect_client(
         Ok(client) => Ok(client),
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = output::emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
+            let _ = output::emit_error(
+                &mut *streams.err,
+                fmt,
+                code.code_str(),
+                &unreachable_message(&err),
+            );
             Err(code)
         }
     }
@@ -1214,5 +1255,43 @@ mod tests {
         let argv = ["shep", "completions", "bash"];
         let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} failed: {e}"));
         assert_eq!(run(cli).await, ExitCode::Success);
+    }
+
+    /// fails if the absent-socket case stops naming the next command, or if a
+    /// different `connect(2)` failure starts being flattened into it.
+    ///
+    /// `ENOENT` is the shape a person meets on a machine where no shepherd has
+    /// ever run, and the whole point of the special case is that it stops
+    /// reading like a broken install. `EACCES` is a genuinely different
+    /// problem: the socket is there and this user may not have it. Telling
+    /// someone to `shep start` in that case would send them to the wrong fix.
+    #[cfg(unix)]
+    #[test]
+    fn an_absent_socket_names_the_next_command_and_other_failures_do_not() {
+        use std::io::{Error, ErrorKind};
+
+        let absent = shep_client::ConnectError::Connect {
+            path: std::path::PathBuf::from("/root/.shep/run/shep.sock"),
+            source: Error::from(ErrorKind::NotFound),
+        };
+        assert_eq!(
+            unreachable_message(&absent),
+            "no shepherd is running (no socket at `/root/.shep/run/shep.sock`); \
+             start one with `shep start <target>`"
+        );
+
+        let denied = shep_client::ConnectError::Connect {
+            path: std::path::PathBuf::from("/root/.shep/run/shep.sock"),
+            source: Error::from(ErrorKind::PermissionDenied),
+        };
+        let text = unreachable_message(&denied);
+        assert!(
+            text.starts_with("could not connect to `/root/.shep/run/shep.sock`:"),
+            "a permission failure must keep the library's wording, got {text:?}"
+        );
+        assert!(
+            !text.contains("shep start"),
+            "a permission failure must not send the operator to `shep start`, got {text:?}"
+        );
     }
 }

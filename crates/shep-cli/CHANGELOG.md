@@ -15,6 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0-alpha.1] - 2026-08-16
 
+### Fixes
+
+- A read-only verb run where no shepherd has ever started now says so, instead
+  of forwarding the raw `connect(2)` failure. `shep flock` on a fresh machine
+  used to print ``could not connect to `/root/.shep/run/shep.sock`: No such
+  file or directory (os error 2)``, which is accurate and reads like a broken
+  install, about a path the operator did not choose. It now prints `no shepherd
+  is running (no socket at <path>); start one with `shep start <target>``.
+  Only the absent-socket case changes: a permission failure or a refused
+  connection keeps the OS detail, because those mean something specific and a
+  refusal in particular is a stale socket file rather than a missing shepherd,
+  which `shep start` would not fix. `shep-client`'s own wording is unchanged,
+  since it is published for embedders and a library should not tell its caller
+  to run a shell command.
+
 ### Additions
 
 - Add `--flockfile` to `shep start`. With it, `shep start <path> --flockfile`
