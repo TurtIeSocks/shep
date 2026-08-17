@@ -236,6 +236,18 @@ pub struct App {
     /// disagreement between a stored offset and a stored cursor impossible
     /// rather than merely unlikely.
     selected: Option<u32>,
+    /// The live substring filter over sheep NAMES, empty when there is none.
+    ///
+    /// Case-insensitive `contains`, and nothing else: not the CLI's selector
+    /// grammar, not a regex, no understanding of `fold:`, `all` or ids. The
+    /// grammar is exact-match on both the variants an operator would type
+    /// while narrowing, so it cannot narrow as you type, and a half-typed
+    /// `/re` parses as a search for a sheep literally named `/re` rather than
+    /// refusing. See the design's feature 1 and assumption A1.
+    ///
+    /// Taken literally, spaces included, with no trimming (A6): this repo does
+    /// not widen an accepted input format without a basis in the spec.
+    filter: String,
     link: Link,
     notice: Option<Notice>,
     palette: Palette,
@@ -272,6 +284,7 @@ impl App {
         Self {
             flock: BTreeMap::new(),
             selected: None,
+            filter: String::new(),
             link: Link::Live,
             notice: None,
             palette,
@@ -459,7 +472,7 @@ impl App {
             KeyPress::SelectUp => self.select_by(-1),
             KeyPress::SelectDown => self.select_by(1),
             KeyPress::SelectFirst => self.select_at(0),
-            KeyPress::SelectLast => self.select_at(self.flock.len().saturating_sub(1)),
+            KeyPress::SelectLast => self.select_at(self.visible_len().saturating_sub(1)),
             KeyPress::Stop => {
                 // Both texts are literal. The design language's standing rule
                 // is that nothing about damage gets charming, and a stop is
@@ -475,6 +488,33 @@ impl App {
         }
     }
 
+    /// The ids the table draws, in id order: the whole flock, or whatever the
+    /// filter leaves of it.
+    ///
+    /// [`Self::rows`], [`Self::select_at`], [`Self::select_by`],
+    /// [`Self::reseat`] and [`Self::selected_index`] all read this sequence
+    /// and nothing else. That is the whole point of it: a filter that hid rows
+    /// `j` and `k` still stepped over would move the cursor onto a sheep
+    /// nobody can see, and every pane below the table would then describe that
+    /// sheep with nothing on screen saying so.
+    ///
+    /// One lowercase allocation per call, for the query only. The flock is a
+    /// `BTreeMap` an operator is looking at, so it is tens of rows, not
+    /// thousands, and a cached needle would be a second source of truth for
+    /// [`Self::filter`].
+    fn visible_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        let needle = self.filter.to_lowercase();
+        self.flock.iter().filter_map(move |(id, row)| {
+            let shown = needle.is_empty() || row.info.name.to_lowercase().contains(&needle);
+            shown.then_some(*id)
+        })
+    }
+
+    /// How many rows the table draws.
+    fn visible_len(&self) -> usize {
+        self.visible_ids().count()
+    }
+
     /// Puts the selection back on a real sheep after the flock changed.
     ///
     /// `previous_index` is where the selection sat **before** the change, read
@@ -487,16 +527,38 @@ impl App {
     /// Returns whether the selection changed, which is what decides between
     /// [`Effect::RefreshFeed`] and [`Effect::None`].
     fn reseat(&mut self, previous_index: Option<usize>) -> bool {
+        // `selected_index`, NOT `flock.contains_key`: a selection the filter
+        // is hiding is not seated, however present its id still is in the map.
+        // This one line is the difference between a cursor that follows the
+        // filter and one that wanders behind it.
+        //
+        // It comes FIRST, where the shipped `flock.is_empty()` check used to.
+        // The order is behaviour-preserving (a seated selection implies at
+        // least one visible row), and it is what makes Step 1.6's mutation
+        // able to reach the nothing-matches case: with the emptiness test
+        // above it, reverting this line changes nothing when the query
+        // matches no sheep, because the early return has already fired.
+        if self.selected_index().is_some() {
+            return false;
+        }
         let before = self.selected;
-        if self.flock.is_empty() {
+        let visible = self.visible_len();
+        if visible == 0 {
             self.selected = None;
             return before != self.selected;
         }
-        if self.selected.is_some_and(|id| self.flock.contains_key(&id)) {
-            return false;
-        }
-        let index = previous_index.unwrap_or(0).min(self.flock.len() - 1);
-        self.selected = self.flock.keys().nth(index).copied();
+        let index = previous_index.unwrap_or(0).min(visible - 1);
+        // Bound first, then assigned. `self.selected = self.visible_ids()
+        // .nth(index);` does NOT compile: `visible_ids` returns
+        // `impl Iterator<Item = u32> + '_`, whose temporary holds a shared
+        // borrow of ALL of `self` to the end of the statement, so the
+        // assignment overlaps it and rustc raises E0506. The line this
+        // replaces borrowed one FIELD (`self.flock.keys()`), which is why it
+        // was fine. `select_at` below takes the same two-line shape for the
+        // same reason. Verified with rustc on an edition-2024 scaffold, both
+        // ways round.
+        let next = self.visible_ids().nth(index);
+        self.selected = next;
         before != self.selected
     }
 
@@ -520,11 +582,11 @@ impl App {
     /// off disk, and a held `k` at the top of the flock must not do that once
     /// per keypress.
     fn select_at(&mut self, index: usize) -> Effect {
-        if self.flock.is_empty() {
+        let visible = self.visible_len();
+        if visible == 0 {
             return Effect::None;
         }
-        let index = index.min(self.flock.len() - 1);
-        let next = self.flock.keys().nth(index).copied();
+        let next = self.visible_ids().nth(index.min(visible - 1));
         if next == self.selected {
             return Effect::None;
         }
@@ -544,7 +606,49 @@ impl App {
     /// The flock, in id order.
     #[must_use]
     pub fn rows(&self) -> Vec<&Row> {
-        self.flock.values().collect()
+        self.visible_ids()
+            .filter_map(|id| self.flock.get(&id))
+            .collect()
+    }
+
+    /// Replaces the filter and puts the selection back on a visible sheep.
+    ///
+    /// Private, and its only production caller is [`Self::on_key`]'s text-mode
+    /// arm (Task 2). The reseat is the whole reason this is not a plain field
+    /// assignment: a keystroke that narrows the query can hide the selected
+    /// sheep, and the selection then falls to whatever occupies the same
+    /// position, clamped to the last visible row, which is `reseat`'s shipped
+    /// rule applied to a new cause.
+    fn set_filter(&mut self, query: String) -> Effect {
+        if self.filter == query {
+            return Effect::None;
+        }
+        let previous = self.selected_index();
+        self.filter = query;
+        if self.reseat(previous) && !matches!(self.link, Link::Lost { .. }) {
+            // The cursor moved, so the feed is about to describe a different
+            // sheep. A frozen dashboard reads nothing, for the reason
+            // `select_at` already states.
+            return Effect::RefreshFeed;
+        }
+        Effect::None
+    }
+
+    /// The filter as typed, empty when there is none.
+    #[must_use]
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// How many sheep the shepherd last reported, whatever the filter hides.
+    ///
+    /// The title reads this beside `rows().len()`. A title that could only
+    /// read the narrowed count would understate the flock while a filter is
+    /// on, which is the confident wrong number this dashboard's `-` cells and
+    /// its frozen uptime clock both exist to avoid.
+    #[must_use]
+    pub fn flock_len(&self) -> usize {
+        self.flock.len()
     }
 
     /// The selected sheep's id, or `None` for an empty flock.
@@ -559,7 +663,7 @@ impl App {
     #[must_use]
     pub fn selected_index(&self) -> Option<usize> {
         let id = self.selected?;
-        self.flock.keys().position(|key| *key == id)
+        self.visible_ids().position(|key| key == id)
     }
 
     /// The selected sheep's row, which the detail pane and the feed read.
@@ -1232,5 +1336,171 @@ mod tests {
             &live_tail,
             "the tail read after the freeze must not reach the rendered frame"
         );
+    }
+
+    /// A dashboard whose filter is set without any keymap involved. Task 2
+    /// wires `/` to this; this task proves the sequence underneath it.
+    ///
+    /// Four sheep, two of which contain `web`: `web` at id 1 and `web-worker`
+    /// at id 3, with `api` at id 2 sitting BETWEEN them in the map. The gap is
+    /// deliberate. It is what makes `j` stepping over a hidden row a
+    /// falsifiable claim rather than one a contiguous fixture would pass by
+    /// accident.
+    fn filtered(query: &str) -> App {
+        let t0 = Instant::now();
+        let mut app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/home/rin/.shep".to_string(),
+            t0,
+        );
+        app.update(Msg::Snapshot {
+            rows: vec![
+                sheep(1, "web", ProcStatus::Online),
+                sheep(2, "api", ProcStatus::Online),
+                sheep(3, "web-worker", ProcStatus::Online),
+                sheep(4, "cron", ProcStatus::Online),
+            ],
+            at: t0,
+        });
+        app.set_filter(query.to_string());
+        app
+    }
+
+    /// fails if the table stops narrowing, or if the flock's real size stops
+    /// being available beside the narrowed one. The title reads both numbers
+    /// and a title that could only read the narrowed one would understate the
+    /// flock, which is the same confident wrong number the `-` CPU cell and
+    /// the frozen uptime rule exist to prevent.
+    #[test]
+    fn a_filter_narrows_the_rows_and_leaves_the_real_size_readable() {
+        let app = filtered("web");
+        assert_eq!(app.rows().len(), 2, "web and web-worker");
+        assert_eq!(app.flock_len(), 4, "the flock did not get smaller");
+    }
+
+    /// fails if the filter matches whole names instead of substrings, which is
+    /// precisely the failure the CLI's selector grammar would have had:
+    /// `ProcessSelector`'s `Name` compares with `==`, so typing `w`, `we`,
+    /// `web` toward `web-worker` matches nothing at every step.
+    #[test]
+    fn the_filter_matches_a_substring_and_not_a_whole_name() {
+        assert_eq!(filtered("wor").rows().len(), 1, "web-worker, by its middle");
+        assert_eq!(filtered("w").rows().len(), 2);
+    }
+
+    /// fails if either `to_lowercase` is dropped. Both directions, because
+    /// dropping one of the two leaves the other test passing.
+    #[test]
+    fn the_filter_ignores_case_in_both_directions() {
+        let t0 = Instant::now();
+        let mut app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/home/rin/.shep".to_string(),
+            t0,
+        );
+        app.update(Msg::Snapshot {
+            rows: vec![sheep(1, "WebEdge", ProcStatus::Online)],
+            at: t0,
+        });
+        app.set_filter("webedge".to_string());
+        assert_eq!(
+            app.rows().len(),
+            1,
+            "a lowercase query against a mixed name"
+        );
+        app.set_filter("WEBEDGE".to_string());
+        assert_eq!(app.rows().len(), 1, "and an uppercase one");
+    }
+
+    /// fails if `select_by` walks the whole flock again. This is the whole
+    /// point of the task: `j` from the first visible row must land on the
+    /// second VISIBLE row, not on whatever id happens to sit next in the map.
+    #[test]
+    fn j_and_k_step_only_over_visible_rows() {
+        let mut app = filtered("web");
+        assert_eq!(app.selected(), Some(1), "the first visible sheep");
+        app.update(Msg::Key(KeyPress::SelectDown));
+        assert_eq!(app.selected(), Some(3), "web-worker, skipping api at id 2");
+        app.update(Msg::Key(KeyPress::SelectDown));
+        assert_eq!(app.selected(), Some(3), "clamped at the last visible row");
+        app.update(Msg::Key(KeyPress::SelectUp));
+        assert_eq!(app.selected(), Some(1));
+    }
+
+    /// fails if `SelectLast` measures the flock rather than the visible set.
+    #[test]
+    fn select_last_lands_on_the_last_visible_row() {
+        let mut app = filtered("web");
+        app.update(Msg::Key(KeyPress::SelectLast));
+        assert_eq!(app.selected(), Some(3), "web-worker, not cron at id 4");
+    }
+
+    /// fails if a filter that hides the selection snaps to row 0, or drops the
+    /// selection entirely while rows are still visible. `reseat`'s shipped
+    /// rule is that a lost selection falls to whatever now occupies the same
+    /// POSITION, clamped: snapping to the top would throw an operator to the
+    /// start of a two hundred sheep flock for typing one more character.
+    #[test]
+    fn a_filter_that_hides_the_selection_clamps_to_the_nearest_visible_row() {
+        let mut app = filtered("");
+        app.update(Msg::Key(KeyPress::SelectLast));
+        assert_eq!(app.selected(), Some(4), "cron, position 3 of 4");
+        app.set_filter("web".to_string());
+        assert_eq!(
+            app.selected(),
+            Some(3),
+            "position 3 clamps to the last visible row, which is web-worker"
+        );
+    }
+
+    /// fails if nothing-matches leaves the selection pointing at a hidden
+    /// sheep. Every pane below the table describes the selection, so a
+    /// selection nobody can see is four panes describing a sheep that is not
+    /// on screen.
+    #[test]
+    fn nothing_visible_means_nothing_selected() {
+        let app = filtered("zzz");
+        assert_eq!(app.rows().len(), 0);
+        assert_eq!(app.selected(), None);
+        assert_eq!(app.selected_row().is_none(), true);
+        assert_eq!(app.flock_len(), 4, "the flock is still four sheep");
+    }
+
+    /// fails if a snapshot clears the filter, or rebuilds the table from the
+    /// unfiltered map. The two-second `ListFlock` reply REPLACES `self.flock`
+    /// wholesale and is by far the most frequent message this reducer sees, so
+    /// a regression here would make the filter appear to work for two seconds
+    /// and then silently widen the table under an operator who is still
+    /// reading it, with the title's `2 of 4` the only thing left saying a
+    /// filter is on.
+    #[test]
+    fn a_filter_survives_the_two_second_snapshot() {
+        let mut app = filtered("web");
+        let t1 = Instant::now();
+        app.update(Msg::Snapshot {
+            rows: vec![
+                sheep(1, "web", ProcStatus::Online),
+                sheep(2, "api", ProcStatus::Online),
+                sheep(3, "web-worker", ProcStatus::Online),
+                sheep(4, "cron", ProcStatus::Online),
+            ],
+            at: t1,
+        });
+        assert_eq!(app.filter(), "web", "the snapshot did not clear it");
+        assert_eq!(app.rows().len(), 2, "and did not widen the table");
+        assert_eq!(app.flock_len(), 4);
+    }
+
+    /// fails if clearing the filter does not bring the whole flock back, or
+    /// leaves the selection unseated. An empty query is the same as no filter,
+    /// which is also what `Enter` on an empty box has to mean.
+    #[test]
+    fn an_empty_query_is_the_same_as_no_filter() {
+        let mut app = filtered("zzz");
+        app.set_filter(String::new());
+        assert_eq!(app.rows().len(), 4);
+        assert_eq!(app.selected(), Some(1), "seated again");
     }
 }
