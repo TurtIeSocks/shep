@@ -318,8 +318,12 @@ mod tests {
             .expect("watch source ended before a batch arrived")
     }
 
-    /// Waits up to [`SMOKE_DEADLINE`] for a batch satisfying `wanted`, and
-    /// returns every batch delivered up to and including it.
+    /// Waits up to `within` for a batch satisfying `wanted`, and returns every
+    /// batch delivered up to and including it.
+    ///
+    /// `within` rather than [`SMOKE_DEADLINE`] for everyone: a test whose own
+    /// debounce window is wider than the shared deadline would time out before
+    /// its first batch could legitimately arrive.
     ///
     /// A test must not assume a write lands in the *next* batch. The debouncer
     /// merges events into one handler call only while they share a `tick_rate`
@@ -342,10 +346,11 @@ mod tests {
     /// arrive.
     async fn batches_until(
         rx: &mut UnboundedReceiver<WatchBatch>,
+        within: Duration,
         wanted_desc: &str,
         wanted: impl Fn(&WatchBatch) -> bool,
     ) -> Vec<WatchBatch> {
-        let deadline = Instant::now() + SMOKE_DEADLINE;
+        let deadline = Instant::now() + within;
         let mut seen = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -474,7 +479,21 @@ mod tests {
     // `WatchSource`'s drop not being instant) and steal a tick's worth of
     // scheduling from this one — so the margin is generous rather than
     // tight.
-    const COALESCE_TEST_DELAY: Duration = Duration::from_secs(1);
+    //
+    // Widened again, from 1s, after the same test failed on a GitHub
+    // windows-latest runner with
+    //
+    //     got [WatchBatch { paths: ["...\first.txt"], .. },
+    //          WatchBatch { paths: ["...\second.txt"], .. }]
+    //
+    // — two writes issued back to back, arriving one tick apart. The number
+    // that matters is the slice, not the window: at 1s the slice was 250ms,
+    // and a two-core runner took longer than that to hand the watcher both
+    // events. 4s makes the slice a full second. That is a bound on how long
+    // the machine may stall, so it is a guess at how slow a shared runner
+    // gets rather than a fact about the debouncer, and a slower one could
+    // still miss.
+    const COALESCE_TEST_DELAY: Duration = Duration::from_secs(4);
 
     // fails if a missing root is silently accepted, reported as the wrong
     // variant, or reported with an empty reason
@@ -567,7 +586,7 @@ mod tests {
             // directories rather than the file -- measured as
             // `paths: ["<root>/a", "<root>/a/b"]` -- with the file arriving in
             // a later one. See `batches_until`.
-            batches_until(&mut rx, &format!("{file:?}"), |batch| {
+            batches_until(&mut rx, SMOKE_DEADLINE, &format!("{file:?}"), |batch| {
                 batch.paths.contains(&file)
             })
             .await;
@@ -642,7 +661,7 @@ mod tests {
             // that they produced exactly two. Linux delivers `first.txt` more
             // than once for one write, so counting batches would fail on a
             // backend difference rather than on the behaviour under test.
-            let batches = batches_until(&mut rx, &format!("{second:?}"), |batch| {
+            let batches = batches_until(&mut rx, SMOKE_DEADLINE, &format!("{second:?}"), |batch| {
                 batch.paths.contains(&second)
             })
             .await;
@@ -665,6 +684,7 @@ mod tests {
             let root = canonical_root(&dir);
             let (_source, mut rx) = watch_tree(&root, COALESCE_TEST_DELAY).unwrap();
 
+            let started = Instant::now();
             let first = crate::testing::touch(&root, "first.txt").unwrap();
             let second = crate::testing::touch(&root, "second.txt").unwrap();
 
@@ -673,10 +693,25 @@ mod tests {
             // case the test exists for -- while tolerating the extra batches
             // inotify delivers for the same two writes, which a trailing
             // "and nothing else arrives" check used to reject.
-            batches_until(&mut rx, "both writes together", |batch| {
-                batch.paths.contains(&first) && batch.paths.contains(&second)
-            })
+            let batches = batches_until(
+                &mut rx,
+                COALESCE_TEST_DELAY * 3,
+                "both writes together",
+                |batch| batch.paths.contains(&first) && batch.paths.contains(&second),
+            )
             .await;
+
+            // The half of the same property that no amount of load can break:
+            // a stalled machine can only make a batch arrive later, never
+            // sooner, so an early one means `delay` was not waited out at all.
+            // Worth asserting separately because the coalescing half above is
+            // a race against the runner and this one is not.
+            assert!(
+                started.elapsed() >= COALESCE_TEST_DELAY,
+                "the first batch arrived after {:?}, inside `delay` ({COALESCE_TEST_DELAY:?}) — \
+                 got {batches:?}",
+                started.elapsed()
+            );
         }
 
         // fails if deleting a watched path panics the handler thread or
