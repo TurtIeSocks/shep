@@ -318,6 +318,55 @@ mod tests {
             .expect("watch source ended before a batch arrived")
     }
 
+    /// Waits up to [`SMOKE_DEADLINE`] for a batch satisfying `wanted`, and
+    /// returns every batch delivered up to and including it.
+    ///
+    /// A test must not assume a write lands in the *next* batch. The debouncer
+    /// merges events into one handler call only while they share a `tick_rate`
+    /// slice (`delay / 4`), and the backends disagree about how many events a
+    /// single write even produces: FSEvents coalesces in the kernel, while
+    /// inotify reports the create, the write and the close separately, and the
+    /// parent directory's change besides. One `fs::write` therefore arrives as
+    /// one batch on macOS and as two or three on Linux, in whatever order the
+    /// tick boundary happens to fall.
+    ///
+    /// Asserting on the first batch alone was measured at 4 failures in 10
+    /// serial runs on an *idle* Linux box, so this is not load: it is a real
+    /// difference in what the backends report, and no amount of quiet fixes
+    /// it.
+    ///
+    /// # Panics
+    ///
+    /// If the deadline passes with no matching batch, or the source ends
+    /// first. Either message names what was wanted and every batch that did
+    /// arrive.
+    async fn batches_until(
+        rx: &mut UnboundedReceiver<WatchBatch>,
+        wanted_desc: &str,
+        wanted: impl Fn(&WatchBatch) -> bool,
+    ) -> Vec<WatchBatch> {
+        let deadline = Instant::now() + SMOKE_DEADLINE;
+        let mut seen = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match timeout(remaining, rx.recv()).await {
+                Ok(Some(batch)) => {
+                    let matched = wanted(&batch);
+                    seen.push(batch);
+                    if matched {
+                        return seen;
+                    }
+                }
+                Ok(None) => {
+                    panic!("watch source ended before {wanted_desc} arrived; got {seen:?}")
+                }
+                Err(_) => {
+                    panic!("no batch carried {wanted_desc} within the deadline; got {seen:?}")
+                }
+            }
+        }
+    }
+
     // fails if [`forward_batch`] stops reading notify's own `Rescan` flag —
     // `let rescan = false;`, or a rescan inferred from `paths.is_empty()`.
     // A rescan means notify dropped events and wants the tree re-read, and it
@@ -514,11 +563,14 @@ mod tests {
             let file = nested.join("created.txt");
             std::fs::write(&file, b"hello").unwrap();
 
-            let batch = expect_batch(&mut rx).await;
-            assert!(
-                batch.paths.contains(&file),
-                "expected {file:?} in the batch, got {batch:?}"
-            );
+            // Not `expect_batch`: on inotify the first batch is often the two
+            // directories rather than the file -- measured as
+            // `paths: ["<root>/a", "<root>/a/b"]` -- with the file arriving in
+            // a later one. See `batches_until`.
+            batches_until(&mut rx, &format!("{file:?}"), |batch| {
+                batch.paths.contains(&file)
+            })
+            .await;
         }
 
         // fails if the debouncer guard is leaked (a `std::mem::forget`-equivalent,
@@ -586,21 +638,24 @@ mod tests {
             tokio::time::sleep(TEST_DELAY * 4).await;
             let second = crate::testing::touch(&root, "second.txt").unwrap();
 
-            let batch_one = expect_batch(&mut rx).await;
+            // The property is that the two writes did not *share* a batch, not
+            // that they produced exactly two. Linux delivers `first.txt` more
+            // than once for one write, so counting batches would fail on a
+            // backend difference rather than on the behaviour under test.
+            let batches = batches_until(&mut rx, &format!("{second:?}"), |batch| {
+                batch.paths.contains(&second)
+            })
+            .await;
             assert!(
-                batch_one.paths.contains(&first),
-                "expected {first:?} in the first batch, got {batch_one:?}"
-            );
-            assert!(
-                !batch_one.paths.contains(&second),
+                !batches
+                    .iter()
+                    .any(|b| b.paths.contains(&first) && b.paths.contains(&second)),
                 "the two writes coalesced into one batch despite the gap \
-             exceeding `delay` — got {batch_one:?}"
+             exceeding `delay` — got {batches:?}"
             );
-
-            let batch_two = expect_batch(&mut rx).await;
             assert!(
-                batch_two.paths.contains(&second),
-                "expected {second:?} in a batch of its own, got {batch_two:?}"
+                batches.iter().any(|b| b.paths.contains(&first)),
+                "expected {first:?} in an earlier batch than {second:?}, got {batches:?}"
             );
         }
 
@@ -613,21 +668,15 @@ mod tests {
             let first = crate::testing::touch(&root, "first.txt").unwrap();
             let second = crate::testing::touch(&root, "second.txt").unwrap();
 
-            let batch = expect_batch(&mut rx).await;
-            assert!(
-                batch.paths.contains(&first),
-                "expected {first:?} in {batch:?}"
-            );
-            assert!(
-                batch.paths.contains(&second),
-                "writes inside `delay` must land in one batch, got {batch:?}"
-            );
-
-            match timeout(NO_EVENT_WINDOW, rx.recv()).await {
-                Err(_) => {} // window elapsed with nothing further — expected
-                Ok(None) => panic!("watch source ended unexpectedly"),
-                Ok(Some(extra)) => panic!("unexpected second batch: {extra:?}"),
-            }
+            // Some batch must carry both. A debouncer that flushed each event
+            // independently would never produce one, so this still fails the
+            // case the test exists for -- while tolerating the extra batches
+            // inotify delivers for the same two writes, which a trailing
+            // "and nothing else arrives" check used to reject.
+            batches_until(&mut rx, "both writes together", |batch| {
+                batch.paths.contains(&first) && batch.paths.contains(&second)
+            })
+            .await;
         }
 
         // fails if deleting a watched path panics the handler thread or
