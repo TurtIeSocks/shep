@@ -31,13 +31,23 @@ cargo test -p shep-daemon --lib --all-features -- --skip ::slow::
 
 **~1.3s, 437 of 454 lib tests** — the exact counts drift every time a task
 adds one, so treat them as a shape, not a checksum; two briefs have now
-shipped a stale figure. The 17 tests this skips live in a nested `mod slow`
-inside each file's `mod tests` (in `watch/source.rs`, `watch/mod.rs`, and
-`extras.rs`) and wait on real macOS FSEvents or real elapsed time; they are
-the reason the unfiltered lib run costs ~25s instead. A mutation in
-`supervisor.rs` does not need them — but a change to `watch/source.rs`'s
-watcher plumbing, or to timing-sensitive behavior in `extras.rs` or the
-sampler, does, so run the unfiltered lib suite when touching either.
+shipped a stale figure. The 18 tests this skips live in a nested `mod slow`
+inside each file's `mod tests` — `extras.rs` has 9, `watch/source.rs` 7, and
+`watch/mod.rs` and `limits/sample.rs` one each — and wait on real macOS
+FSEvents or real elapsed time; they are the reason the unfiltered lib run
+costs ~25s instead. A mutation in `supervisor.rs` does not need them — but a
+change to `watch/source.rs`'s watcher plumbing, or to timing-sensitive
+behavior in `extras.rs` or the sampler, does, so run the unfiltered lib suite
+when touching either.
+
+CI runs that tier as its own serial `slow` job and skips it everywhere else,
+because a contended runner cannot hold a wall clock still: the debouncer
+tests were the whole of CI's red for four runs. `boot.rs`'s
+`two_concurrent_boots_on_a_stale_socket_exactly_one_wins` rides along in that
+job for the same reason without being in a `mod slow` — it is fast, but it
+races two threads and needs the machine quiet. Add a timing- or
+contention-sensitive test and it needs the same treatment; the workflow's
+skip list names both groups explicitly.
 
 From Phase 15 on, `shep` is a library with three thin `[[bin]]` targets
 over it (`shep`, `shep-runtime`, `shep-dev`) rather than one bare binary — the
