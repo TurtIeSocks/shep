@@ -200,13 +200,14 @@ schema, a CLI-flag layer over `shep.toml`, and the openrc and BSD `rc.d` unit
 renderers. The last two are rendered and pinned by exact-string tests; nobody
 on this project has run them on their own init system yet.
 
-The lookout ships all four panes — the flock table, the bleats feed, the
-sheep detail pane, and the host-usage strip. Search/filter is still to come,
-and so are the actions: the control gate exists, but `x` (stop) is the only
-key bound to one and it refuses either way, honestly, with a message saying
-why. Rendered frames of what exists so far are in
+Lookout ships complete: the flock table, the bleats feed, the sheep detail
+pane (lambs included), the host-usage strip, a name filter, and the three
+action keys, `x` for stop, `R` for restart, `L` for reload, behind the
+`--allow-control` gate. There's no `start` key: lookout only ever acts on a
+sheep already in the flock. Rendered frames of it are in
 [docs/lookout/frames.txt](docs/lookout/frames.txt) (`frames.ansi` for the
-coloured version, read with `less -R`).
+coloured version, read with `less -R`). What's left of the v1.0 queue is
+smaller now: OTLP export on the metrics dog.
 
 shep runs on Linux and macOS. Windows is v1.1+, ruled out of v1 outright
 rather than left half-done: the estimate came in at roughly 36-49 tasks over

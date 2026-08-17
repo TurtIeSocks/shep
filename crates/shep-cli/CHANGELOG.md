@@ -74,14 +74,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   screen moves as things happen, then re-lists the flock every two seconds so
   a dropped event cannot leave it quietly wrong. Selecting a row grows the
   detail pane and the bleats feed, which re-reads the selected sheep's log
-  files on every refresh; a host-usage strip sits above. A narrow or short
-  terminal drops panes before it drops columns. If the shepherd stops
+  files on every refresh, and adds its lambs, fetched once on selection
+  rather than on every listing; a host-usage strip sits above. A narrow or
+  short terminal drops panes before it drops columns. If the shepherd stops
   answering it re-dials five times over about eight seconds, then says so and
-  freezes — the last known values stay on screen and it does not exit. The
-  action gate — `--allow-control` or `shep set lookout.allow_control true` —
-  is wired, but no action checks it yet: `x` (stop) is bound and refuses
-  either way, honestly, with a message saying why. Search and filter, and the
-  actions themselves, are still to come.
+  freezes: the last known values stay on screen and it does not exit. `/`
+  opens a name filter that narrows the table as you type, without losing
+  track of the flock's true size. The action gate (`--allow-control` or
+  `shep set lookout.allow_control true`) is closed by default; open, three
+  keys arm a confirm on the selected sheep, `x` for stop, `R` for restart,
+  `L` for reload, and Enter sends it while any other key cancels. There is
+  no `start` key: lookout only ever acts on a sheep already in the flock,
+  and the gate is a fat-finger catch, not a security boundary, since lookout
+  runs as your own process under your own uid.
 - Add `shep stock <name> <count>` (alias `scale`) — "stocking rate" is the
   husbandry term for how many animals a piece of land runs.
 - Add `shep signal <selector> <signal>`.
