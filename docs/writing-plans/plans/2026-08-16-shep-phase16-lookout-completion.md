@@ -1258,7 +1258,8 @@ cargo fmt --all --check
 cargo test -p shep --lib --bins --all-features
 ```
 
-Roughly `579 passed` (567 plus twelve). `failed` stays 0.
+Roughly `578 passed` (567 plus eleven: four in `input.rs` and seven in
+`app.rs`, per Step 2.2 above). `failed` stays 0.
 
 ### Step 2.6 - MUTATION
 
@@ -2374,12 +2375,15 @@ Two of those need a word, because the first draft of this plan got both wrong
 and a baseline that does not print what it claims is worthless downstream.
 
 - **`Effect::RefreshFeed` is a `grep -n`, not a `grep -c`.** The count at HEAD
-  is 12, not 4: it appears in five doc comments as well as in the code, which
+  is 12, not 4: it appears in four doc comments as well as in the code, which
   is the "a whole-file grep whose word also appears in a doc comment" shape
   from the baselines section above. What this task needs is the list of call
   sites, which is the four `Effect::RefreshFeed` expressions at `app.rs:309`
   (the `Snapshot` arm), `:389` and `:404` (the two `on_event` arms) and `:541`
-  (`select_at`), plus the three test assertions at `:807`, `:811` and `:820`.
+  (`select_at`), plus the four test assertions at `:807`, `:811`, `:820` and
+  `:842`. The last of those four is the one Step 5.3a says must NOT change,
+  in `a_snapshot_refreshes_the_feed_unless_the_link_is_frozen`; the other
+  three are in the shipped test Step 5.3a turns into `Effect::RefreshSelected`.
   Count the call, not the word.
 - **The `lookout::` total is a moving target by construction** and this task
   runs in the middle of the phase. It prints `94 passed; 0 failed; 1 ignored`
@@ -4399,14 +4403,17 @@ pub fn acting_app(verb: ActionVerb) -> App {
 /// has something in three slots at once and the ordering assertion has
 /// something to fail on.
 ///
-/// Order matters: the filter is applied first, then the notice is raised, then
-/// the action is armed. Arming after the notice is what leaves the notice
-/// standing, because `on_key`'s normal branch clears it on the way past.
+/// Order matters: the filter is applied first, then the action is armed, then
+/// the notice is raised - NOT the other way round. Arming is a keypress, and
+/// `on_key`'s normal branch opens with `self.notice = None`, so arming AFTER
+/// the notice would wipe the very notice this fixture exists to leave
+/// standing. `Msg::Event(BusEvent::Dropped { .. })` never passes through
+/// `on_key` at all, so raising the notice last is what makes it survive.
 pub fn armed_app_with_a_filter_and_a_notice() -> App {
     let mut app = filtered_app("api");
     app.set_control_for_tests(Control::Allowed);
-    app.update(Msg::Event(BusEvent::Dropped { count: 3 }));
     app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+    app.update(Msg::Event(BusEvent::Dropped { count: 3 }));
     app
 }
 ```
@@ -4663,10 +4670,34 @@ table and `contains` over the whole frame cannot tell one row from another:
 
 ```rust
     /// The table row for `name`, or `None` if the table does not draw one.
+    ///
+    /// The selection marker (`>`) sits on the row itself, in its own
+    /// one-character gutter column ahead of the id, so a marked row's tokens
+    /// are shifted one place right of an unmarked row's: `nth(1)` is the id,
+    /// not the name. Stripping the marker first keeps both cases on the same
+    /// token index, and the marker never appears anywhere else on a line, so
+    /// `trim_start_matches` cannot eat anything else.
     fn row_for<'a>(frame: &'a str, name: &str) -> Option<&'a str> {
-        frame
-            .lines()
-            .find(|line| line.split_whitespace().nth(1) == Some(name))
+        frame.lines().find(|line| {
+            line.trim_start_matches('>').split_whitespace().nth(1) == Some(name)
+        })
+    }
+
+    /// Whether the MARKED row's name starts with `prefix`. For a name the
+    /// NAME column has truncated, the exact truncated string depends on
+    /// terminal width, so a literal expected value would be wrong at any
+    /// width this test was not written against. `prefix` only needs to fit
+    /// inside the eight-column floor `name_width` never shrinks below to be
+    /// safe here.
+    fn marked_row_name_starts_with(frame: &str, prefix: &str) -> bool {
+        frame.lines().any(|line| {
+            line.starts_with('>')
+                && line
+                    .trim_start_matches('>')
+                    .split_whitespace()
+                    .nth(1)
+                    .is_some_and(|name| name.starts_with(prefix))
+        })
     }
 ```
 
@@ -4703,8 +4734,8 @@ table and `contains` over the whole frame cannot tell one row from another:
         assert!(refused.contains("5 in the flock"), "one row shorter");
         assert!(row_for(&refused, "api").is_none(), "api is the row that went");
         assert!(
-            row_for(&refused, "billing-reconciliation…").is_some_and(|row| row.starts_with('>')),
-            "and the cursor has moved to the row below"
+            marked_row_name_starts_with(&refused, "billing"),
+            "and the cursor has moved to the row below: {refused:?}"
         );
 
         let offline = render_text(&scene(Scene::ActionRefusedOffline).1);
@@ -4724,6 +4755,10 @@ table and `contains` over the whole frame cannot tell one row from another:
 pid from the listing's 48219 is what makes "the reply's own row reached the
 table" falsifiable; the same pid would pass whether the rows were upserted or
 ignored.
+
+`flock_without_api()` is the default six-sheep flock (the one `scene_with`
+already builds for every scene besides `Empty`, `Errored` and `Frozen`) with
+id 2 removed: five rows, ids 0, 1, 3, 4, 5.
 
 `assert_eq!(Scene::ALL.len(), 19)` becomes `24`.
 
@@ -4920,7 +4955,7 @@ not show.
 
 ## The frames, and what each one proves
 
-Ten new, thirteen changed. Rin decides what this looks like from these, not
+Ten new, twelve changed. Rin decides what this looks like from these, not
 from a spec sentence.
 
 Twelve and not fourteen. **`too_narrow` and `narrow` do not change at all in
@@ -4950,7 +4985,8 @@ not Task 3's; `no_detail` and `table_only` are in Task 3's but not Task 6's.
 | `action_refused` | 100x14 | The shepherd's own sentence forwarded, with no Rust identifier in it, over a listing that has lost the sheep. |
 | `action_refused_offline` | 100x14 | An action key while the link is coming back. The banner and the refusal on one frame, which is what makes the question in the next section answerable. |
 | `refused` (changed) | 120x30 | The read-only refusal, with a caption that no longer claims there are two refusals. |
-| the other twelve (changed) | as before | One extra detail-pane row and the filter key in the hint, and nothing else. |
+| the other eleven (changed) | as before | One extra detail-pane row and the filter key in the hint, and nothing else. |
+| `too_narrow`, `narrow` (unchanged) | as before | Below `MIN_TERM_WIDTH`, and truncating the hint to a shared 40-character prefix either way, respectively - neither gains a detail row or a filter key, so this phase moves neither. |
 
 ## One thing worth looking at in the frames, and why it is not being changed here
 
