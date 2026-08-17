@@ -25,9 +25,8 @@ order:
    first (`kill_signal` accepts a typo and then sends the wrong signal
    forever; an on-time `ActionReply` can be matched to the wrong request),
    then the wire and config asymmetries, then the tooling and doc staleness.
-2. **The rest of the v1.0 surface** — lookout, serve, dev/runtime,
-   `.js` Flockfile, schemars, the daemon-config flags layer, and openrc +
-   BSD rc.d.
+2. **The rest of the v1.0 surface** — serve, dev/runtime, `.js` Flockfile,
+   schemars, the daemon-config flags layer, and openrc + BSD rc.d.
 3. ~~**The Windows functional tier — last**~~ (Rin, 2026-08-12). **Superseded
    2026-08-15: Windows is out of v1 entirely** and moved to the v1.1+ section
    below. The estimate that was "mostly guesswork" has since been made, and it
@@ -96,13 +95,6 @@ for what phase is next.
 **OTLP export (metrics dog)** (spec §8) — the metrics dog serves
 Prometheus exposition only; no `otel` cargo feature exists in
 `crates/shep-cli/Cargo.toml`.
-
-**lookout actions** (spec §9) — the control gate (`--allow-control`,
-`lookout.allow_control`) exists and every action key checks it, but there is
-still exactly one action key, `x` (stop), and it refuses honestly in both
-gate states: `read-only: actions need --allow-control` when the gate is
-closed, `stop is not built yet` when it is open. No action has landed behind
-the gate.
 
 ## Known debt, recorded rather than built
 

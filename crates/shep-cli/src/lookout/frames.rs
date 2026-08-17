@@ -37,7 +37,8 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 
-use shep_core::protocol::{Lamb, ProcessInfo, Response};
+use shep_client::RequestError;
+use shep_core::protocol::{Lamb, ProcessInfo, Response, RpcError, RpcErrorCode};
 use shep_core::status::ProcStatus;
 
 use super::app::{ActionVerb, App, Control, KeyPress, Msg, Sent};
@@ -164,6 +165,16 @@ pub enum Scene {
     /// The detail pane on a sheep with no pid, where the shepherd had no tree
     /// to walk.
     LambsUnknown,
+    /// An action key pressed with the gate open. Nothing has been sent.
+    Confirm,
+    /// Enter pressed. The request is out.
+    Acting,
+    /// The shepherd refused, in its own words.
+    ActionRefused,
+    /// The shepherd did it, and the bar says so in the non-grave style.
+    ActionAccepted,
+    /// An action key pressed while the link is coming back.
+    ActionRefusedOffline,
 }
 
 impl Scene {
@@ -188,6 +199,11 @@ impl Scene {
         Self::HostUnknown,
         Self::Lambs,
         Self::LambsUnknown,
+        Self::Confirm,
+        Self::Acting,
+        Self::ActionRefused,
+        Self::ActionAccepted,
+        Self::ActionRefusedOffline,
     ];
 
     /// The snapshot name and the gallery heading.
@@ -213,11 +229,16 @@ impl Scene {
             Self::HostUnknown => "host_unknown",
             Self::Lambs => "lambs",
             Self::LambsUnknown => "lambs_unknown",
+            Self::Confirm => "confirm",
+            Self::Acting => "acting",
+            Self::ActionRefused => "action_refused",
+            Self::ActionAccepted => "action_accepted",
+            Self::ActionRefusedOffline => "action_refused_offline",
         }
     }
 
     /// One sentence saying what this frame is for, printed above it in the
-    /// gallery so Rin does not have to hold nineteen of them in her head.
+    /// gallery so Rin does not have to hold twenty-four of them in her head.
     ///
     /// Every clause here is pinned by an assertion in
     /// `every_scene_shows_the_thing_it_is_named_for` — a caption may not say
@@ -282,6 +303,39 @@ impl Scene {
             Self::LambsUnknown => {
                 "The same pane on a stopped sheep. The shepherd had no pid to walk from and left the field unset rather than empty, and the line says which of the two it is looking at rather than reporting none found."
             }
+            Self::Confirm => {
+                "`R` pressed with the gate open. Nothing has been sent: the bar asks a question naming the verb and the exact sheep, and `api` is still online in the table behind it."
+            }
+            Self::Acting => {
+                "Enter pressed. The request is out and nothing on the table has changed, because nothing the shepherd has said has changed: `api` is still online and the cursor has not moved."
+            }
+            Self::ActionAccepted => {
+                "The shepherd answered. The bar says what it did, in the non-grave style a refusal does not get, and the table shows the row the reply carried rather than waiting for the next poll."
+            }
+            Self::ActionRefused => {
+                "The shepherd refused while the request was out, and its own sentence is forwarded rather than rewritten. The sheep has left the flock in the listing behind it, so the table is one row shorter and the cursor has moved to the row below."
+            }
+            Self::ActionRefusedOffline => {
+                "An action key pressed while the link is coming back. The refusal is the same sentence `r` gives, one row under a banner saying the shepherd is being reconnected to."
+            }
+        }
+    }
+
+    /// Whether this scene's dashboard may act.
+    ///
+    /// `Lambs` is in here as well as the three action scenes: its bar has
+    /// nothing in the left slot, so it is the one frame in the gallery that
+    /// shows the control-enabled key hint.
+    #[must_use]
+    pub const fn control(self) -> Control {
+        match self {
+            Self::Confirm
+            | Self::Acting
+            | Self::ActionRefused
+            | Self::ActionAccepted
+            | Self::ActionRefusedOffline
+            | Self::Lambs => Control::Allowed,
+            _ => Control::ReadOnly,
         }
     }
 
@@ -304,6 +358,11 @@ impl Scene {
             Self::NoDetail => (120, 20),
             Self::TableOnly => (120, 12),
             Self::Cramped => (33, 26),
+            Self::Confirm
+            | Self::Acting
+            | Self::ActionRefused
+            | Self::ActionAccepted
+            | Self::ActionRefusedOffline => (100, 14),
             // HealthyWide, Errored, Retrying, Frozen, Refused, FeedGap,
             // FeedMissing, HostUnknown, Lambs, LambsUnknown: every scene that
             // carries all three optional panes at their ordinary rows.
@@ -343,12 +402,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
 
     let palette = Palette::detect(None, Some(OsStr::new("xterm-256color")), None);
     let t0 = Instant::now();
-    let mut app = App::new(
-        palette,
-        Control::ReadOnly,
-        "/home/rin/.shep".to_string(),
-        t0,
-    );
+    let mut app = App::new(palette, which.control(), "/home/rin/.shep".to_string(), t0);
 
     let flock = match which {
         Scene::Empty => Vec::new(),
@@ -630,6 +684,62 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
     // becomes testable.
     app.update(Msg::Tick { now: t0 + age });
 
+    // The five action scenes, applied AFTER the last tick rather than
+    // alongside `Retrying`/`Frozen`/`Refused` above. `scene()` renders at
+    // `age` = 600 seconds, and `CONFIRM_EXPIRY` is 10: an armed confirm built
+    // before that tick would already have expired by the time this function
+    // draws it, which is exactly the defect `Confirm`'s own frame exists to
+    // show the ABSENCE of. A `Sent` action never expires (only `Stage::Armed`
+    // does), so `Acting`, `ActionAccepted` and `ActionRefused` would have been
+    // safe either side of the tick; `Confirm` is the one that is not, so all
+    // five sit here together rather than splitting the rule across two
+    // places.
+    match which {
+        Scene::ActionRefusedOffline => {
+            // The link has to stop being live BEFORE the key is pressed, or
+            // `arm` would accept it — the order is the whole state this
+            // scene shows.
+            app.update(Msg::Retrying { attempt: 3 });
+            app.update(Msg::Key(KeyPress::Action(ActionVerb::Restart)));
+        }
+        Scene::Confirm | Scene::Acting | Scene::ActionRefused | Scene::ActionAccepted => {
+            app.update(Msg::Key(KeyPress::Action(ActionVerb::Restart)));
+            if which != Scene::Confirm {
+                app.update(Msg::Key(KeyPress::Confirm));
+            }
+            if which == Scene::ActionAccepted {
+                app.update(Msg::Replied {
+                    sent: Sent::Action {
+                        verb: ActionVerb::Restart,
+                        id: 2,
+                        name: "api".to_string(),
+                    },
+                    result: Ok(Response::Restarted(vec![restarted_api()])),
+                });
+            }
+            if which == Scene::ActionRefused {
+                // The sheep leaves the flock while the request is out, which
+                // is what makes the daemon's own sentence the true one.
+                app.update(Msg::Snapshot {
+                    rows: flock_without_api(),
+                    at: t0,
+                });
+                app.update(Msg::Replied {
+                    sent: Sent::Action {
+                        verb: ActionVerb::Restart,
+                        id: 2,
+                        name: "api".to_string(),
+                    },
+                    result: Err(RequestError::Rpc(RpcError {
+                        code: RpcErrorCode::NotFound,
+                        message: "selector matched no registered sheep".to_string(),
+                    })),
+                });
+            }
+        }
+        _ => {}
+    }
+
     let (width, height) = which.size();
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| draw(&app, frame)).unwrap();
@@ -734,6 +844,82 @@ fn sheep(
         .build()
 }
 
+/// The row `ActionAccepted`'s reply carries: `api` at id 2, restarted.
+///
+/// **Pid 48299, not the listing's 48219.** A different pid is what makes
+/// "the reply's own row reached the table" falsifiable — the same pid would
+/// pass whether the reply's row was upserted or silently ignored in favour
+/// of what the last poll already had.
+fn restarted_api() -> ProcessInfo {
+    sheep(
+        2,
+        "api",
+        ProcStatus::Online,
+        Some(48_299),
+        2,
+        Some(7.1),
+        Some(241 << 20),
+        Some("edge"),
+    )
+}
+
+/// The default six-sheep flock `scene_with`'s `_` arm builds, with id 2
+/// (`api`) removed: five rows, ids 0, 1, 3, 4, 5.
+fn flock_without_api() -> Vec<ProcessInfo> {
+    vec![
+        sheep(
+            0,
+            "web",
+            ProcStatus::Online,
+            Some(48_211),
+            0,
+            Some(3.4),
+            Some(182 << 20),
+            Some("edge"),
+        ),
+        sheep(
+            1,
+            "web",
+            ProcStatus::Online,
+            Some(48_212),
+            0,
+            Some(2.9),
+            Some(178 << 20),
+            Some("edge"),
+        ),
+        sheep(
+            3,
+            "billing-reconciliation-worker",
+            ProcStatus::Online,
+            Some(48_230),
+            0,
+            Some(0.8),
+            Some(96 << 20),
+            None,
+        ),
+        sheep(
+            4,
+            "cron",
+            ProcStatus::Online,
+            Some(48_233),
+            0,
+            Some(0.1),
+            Some(8 << 20),
+            None,
+        ),
+        sheep(
+            5,
+            "metrics",
+            ProcStatus::Online,
+            Some(48_240),
+            0,
+            Some(0.4),
+            Some(11 << 20),
+            None,
+        ),
+    ]
+}
+
 /// The header both gallery files open with.
 ///
 /// Not a doc comment on the test: this text is read by a person opening
@@ -748,7 +934,7 @@ These are real frames, rendered headlessly through ratatui's TestBackend by
 
 Nothing here is a mockup.
 
-frames.ansi is the same nineteen frames with colour; read it with `less -R`.
+frames.ansi is the same twenty-four frames with colour; read it with `less -R`.
 
 All four panes are here: the flock table (the spine), the host-usage strip,
 the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
@@ -803,6 +989,46 @@ mod tests {
         }
     }
 
+    /// The table row for `name`, or `None` if the table does not draw one.
+    ///
+    /// The selection marker (`>`) sits on the row itself, in its own
+    /// one-character gutter column ahead of the id, so a marked row's tokens
+    /// are shifted one place right of an unmarked row's: `nth(1)` is the id,
+    /// not the name. Stripping the marker first keeps both cases on the same
+    /// token index, and the marker never appears anywhere else on a line, so
+    /// `trim_start_matches` cannot eat anything else.
+    ///
+    /// The `nth(0)` numeric-id guard is load-bearing, not decoration: the
+    /// status bar's own in-flight and outcome lines both open `{verb} {name}
+    /// (id {id})`, so `restart api (id 2): ...` has `"api"` at token index 1
+    /// too. Without the guard this finds the BAR line naming the sheep
+    /// rather than a table row (or, worse, `None` of them) — exactly the
+    /// case `ActionRefused`'s own assertions exercise, where the bar and the
+    /// table disagree about `api` on purpose.
+    fn row_for<'a>(frame: &'a str, name: &str) -> Option<&'a str> {
+        frame.lines().find(|line| {
+            let mut tokens = line.trim_start_matches('>').split_whitespace();
+            tokens.next().is_some_and(|id| id.parse::<u32>().is_ok()) && tokens.next() == Some(name)
+        })
+    }
+
+    /// Whether the MARKED row's name starts with `prefix`. For a name the
+    /// NAME column has truncated, the exact truncated string depends on
+    /// terminal width, so a literal expected value would be wrong at any
+    /// width this test was not written against. `prefix` only needs to fit
+    /// inside the eight-column floor `name_width` never shrinks below to be
+    /// safe here.
+    fn marked_row_name_starts_with(frame: &str, prefix: &str) -> bool {
+        frame.lines().any(|line| {
+            line.starts_with('>')
+                && line
+                    .trim_start_matches('>')
+                    .split_whitespace()
+                    .nth(1)
+                    .is_some_and(|name| name.starts_with(prefix))
+        })
+    }
+
     /// fails if a scene stops rendering what it is named for. Each
     /// assertion is the one sentence that scene exists to show Rin — if one
     /// of these stops being true, the frame she is looking at is not the
@@ -813,7 +1039,7 @@ mod tests {
     /// the plan: "every clause of every caption is one assertion here, or it
     /// is deleted from the caption."
     #[test]
-    #[allow(clippy::too_many_lines)] // nineteen captions, each pinned clause by clause
+    #[allow(clippy::too_many_lines)] // twenty-four captions, each pinned clause by clause
     fn every_scene_shows_the_thing_it_is_named_for() {
         // "All three panes at 120x30: the host strip under the title, the
         //  detail pane and the bleats feed under the table. `>` marks the
@@ -1106,6 +1332,79 @@ mod tests {
             "which is the other sentence"
         );
         assert!(unknown.contains("sheep 4  cron"), "on the stopped sheep");
+
+        // "`R` pressed with the gate open. Nothing has been sent: the bar
+        //  asks a question naming the verb and the exact sheep, and `api` is
+        //  still online in the table behind it."
+        let confirm = render_text(&scene(Scene::Confirm).1);
+        assert!(confirm.contains("restart api (id 2)? enter confirms, any other key cancels"));
+        assert!(confirm.contains("control enabled"), "the gate is open");
+        assert!(
+            row_for(&confirm, "api").is_some_and(|row| row.contains("online")),
+            "nothing was sent, so api is still online: {confirm:?}"
+        );
+
+        // "Enter pressed. The request is out and nothing on the table has
+        //  changed, because nothing the shepherd has said has changed:
+        //  `api` is still online and the cursor has not moved."
+        let acting = render_text(&scene(Scene::Acting).1);
+        assert!(acting.contains("restart api (id 2): sent, waiting for the shepherd"));
+        assert!(
+            row_for(&acting, "api").is_some_and(|row| row.starts_with('>')),
+            "the table is untouched: the marker is still on api"
+        );
+        assert!(
+            row_for(&acting, "api").is_some_and(|row| row.contains("online")),
+            "and the row still says what the shepherd last said"
+        );
+
+        // "The shepherd answered. The bar says what it did, in the non-grave
+        //  style a refusal does not get, and the table shows the row the
+        //  reply carried rather than waiting for the next poll."
+        let accepted = render_text(&scene(Scene::ActionAccepted).1);
+        assert!(accepted.contains("restart api (id 2): the shepherd restarted it"));
+        assert!(
+            row_for(&accepted, "api").is_some_and(|row| row.contains("48299")),
+            "the reply's own row reached the table without waiting for a poll"
+        );
+
+        // "The shepherd refused while the request was out, and its own
+        //  sentence is forwarded rather than rewritten. The sheep has left
+        //  the flock in the listing behind it, so the table is one row
+        //  shorter and the cursor has moved to the row below."
+        let refused = render_text(&scene(Scene::ActionRefused).1);
+        assert!(refused.contains("restart api (id 2): selector matched no registered sheep"));
+        assert!(
+            !refused.contains("NotFound"),
+            "no Rust identifiers on the bar"
+        );
+        assert!(refused.contains("5 in the flock"), "one row shorter");
+        assert!(
+            row_for(&refused, "api").is_none(),
+            "api is the row that went"
+        );
+        assert!(
+            marked_row_name_starts_with(&refused, "billing"),
+            "and the cursor has moved to the row below: {refused:?}"
+        );
+
+        // "An action key pressed while the link is coming back. The refusal
+        //  is the same sentence `r` gives, one row under a banner saying the
+        //  shepherd is being reconnected to."
+        let offline = render_text(&scene(Scene::ActionRefusedOffline).1);
+        assert!(offline.contains("reconnecting (attempt 3)"), "the banner");
+        assert!(
+            offline.contains("nothing left to ask"),
+            "and the refusal under it"
+        );
+
+        // The one frame in the gallery whose left slot is empty while the
+        // gate is open, which makes it the only one that shows the control
+        // hint.
+        let lambs_bar = render_text(&scene(Scene::Lambs).1);
+        for key in ["x stop", "R restart", "L reload"] {
+            assert!(lambs_bar.contains(key), "the control hint names {key}");
+        }
     }
 
     /// fails if a scene is added to [`Scene::ALL`] without a caption, or with
@@ -1133,7 +1432,7 @@ mod tests {
         // above already guarantees it, so it would be a line that cannot
         // fail. The literal can — it is what catches a scene added to the
         // enum and not to `ALL`, or the reverse.
-        assert_eq!(Scene::ALL.len(), 19);
+        assert_eq!(Scene::ALL.len(), 24);
     }
 
     /// fails if a 12b pane introduced a text MODIFIER. `sgr` renders

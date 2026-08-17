@@ -7,7 +7,7 @@ These are real frames, rendered headlessly through ratatui's TestBackend by
 
 Nothing here is a mockup.
 
-frames.ansi is the same nineteen frames with colour; read it with `less -R`.
+frames.ansi is the same twenty-four frames with colour; read it with `less -R`.
 
 All four panes are here: the flock table (the spine), the host-usage strip,
 the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
@@ -515,7 +515,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+q quit   j/k select   / filter   x stop   R restart   L reload                                           control enabled
 
 === lambs_unknown  (120x30) ===
 The same pane on a stopped sheep. The shepherd had no pid to walk from and left the field unset rather than empty, and the line says which of the two it is looking at rather than reporting none found.
@@ -550,3 +550,93 @@ out  POST /v1/orders 201 88ms
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
 q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+
+=== confirm  (100x14) ===
+`R` pressed with the gate open. Nothing has been sent: the bar asks a question naming the verb and the exact sheep, and `api` is still online in the table behind it.
+
+shep lookout   /home/rin/.shep                                                        6 in the flock
+host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
+  ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  0     web               online           48211    0         3.4%    182.0M    1h 25m    edge      
+  1     web               online           48212    0         2.9%    178.0M    1h 26m    edge      
+> 2     api               online           48219    1         7.1%    241.0M    1h 28m    edge      
+  3     billing-reconci…  online           48230    0         0.8%    96.0M     1h 29m    -         
+  4     cron              online           48233    0         0.1%    8.0M      1h 31m    -         
+  5     metrics           online           48240    0         0.4%    11.0M     1h 32m    -         
+                                                                                                    
+                                                                                                    
+                                                                                                    
+restart api (id 2)? enter confirms, any other key cancels                            control enabled
+
+=== acting  (100x14) ===
+Enter pressed. The request is out and nothing on the table has changed, because nothing the shepherd has said has changed: `api` is still online and the cursor has not moved.
+
+shep lookout   /home/rin/.shep                                                        6 in the flock
+host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
+  ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  0     web               online           48211    0         3.4%    182.0M    1h 25m    edge      
+  1     web               online           48212    0         2.9%    178.0M    1h 26m    edge      
+> 2     api               online           48219    1         7.1%    241.0M    1h 28m    edge      
+  3     billing-reconci…  online           48230    0         0.8%    96.0M     1h 29m    -         
+  4     cron              online           48233    0         0.1%    8.0M      1h 31m    -         
+  5     metrics           online           48240    0         0.4%    11.0M     1h 32m    -         
+                                                                                                    
+                                                                                                    
+                                                                                                    
+restart api (id 2): sent, waiting for the shepherd                                   control enabled
+
+=== action_refused  (100x14) ===
+The shepherd refused while the request was out, and its own sentence is forwarded rather than rewritten. The sheep has left the flock in the listing behind it, so the table is one row shorter and the cursor has moved to the row below.
+
+shep lookout   /home/rin/.shep                                                        5 in the flock
+host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 7.6%   flock mem 475.0M  …
+  ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  0     web               online           48211    0         3.4%    182.0M    1h 25m    edge      
+  1     web               online           48212    0         2.9%    178.0M    1h 26m    edge      
+> 3     billing-reconci…  online           48230    0         0.8%    96.0M     1h 29m    -         
+  4     cron              online           48233    0         0.1%    8.0M      1h 31m    -         
+  5     metrics           online           48240    0         0.4%    11.0M     1h 32m    -         
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+restart api (id 2): selector matched no registered sheep                             control enabled
+
+=== action_accepted  (100x14) ===
+The shepherd answered. The bar says what it did, in the non-grave style a refusal does not get, and the table shows the row the reply carried rather than waiting for the next poll.
+
+shep lookout   /home/rin/.shep                                                        6 in the flock
+host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
+  ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  0     web               online           48211    0         3.4%    182.0M    1h 25m    edge      
+  1     web               online           48212    0         2.9%    178.0M    1h 26m    edge      
+> 2     api               online           48299    2         7.1%    241.0M    1h 18m    edge      
+  3     billing-reconci…  online           48230    0         0.8%    96.0M     1h 29m    -         
+  4     cron              online           48233    0         0.1%    8.0M      1h 31m    -         
+  5     metrics           online           48240    0         0.4%    11.0M     1h 32m    -         
+                                                                                                    
+                                                                                                    
+                                                                                                    
+restart api (id 2): the shepherd restarted it                                        control enabled
+
+=== action_refused_offline  (100x14) ===
+An action key pressed while the link is coming back. The refusal is the same sentence `r` gives, one row under a banner saying the shepherd is being reconnected to.
+
+shep lookout   /home/rin/.shep                                                        6 in the flock
+the shepherd stopped answering — reconnecting (attempt 3)                                           
+host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
+  ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  0     web               online           48211    0         3.4%    182.0M    1h 25m    edge      
+  1     web               online           48212    0         2.9%    178.0M    1h 26m    edge      
+> 2     api               online           48219    1         7.1%    241.0M    1h 28m    edge      
+  3     billing-reconci…  online           48230    0         0.8%    96.0M     1h 29m    -         
+  4     cron              online           48233    0         0.1%    8.0M      1h 31m    -         
+  5     metrics           online           48240    0         0.4%    11.0M     1h 32m    -         
+                                                                                                    
+                                                                                                    
+the shepherd is gone — nothing left to ask                                           control enabled

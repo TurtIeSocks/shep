@@ -1359,6 +1359,15 @@ impl App {
             sent: action.stage == Stage::Sent,
         })
     }
+
+    /// Overrides the control gate a fixture built with. `App::new` takes
+    /// [`Control`] and every shipped fixture hard-codes [`Control::ReadOnly`];
+    /// this is the one line that lets the action-key tests build a dashboard
+    /// with the gate open without a second copy of `app_with`.
+    #[cfg(test)]
+    pub(crate) fn set_control_for_tests(&mut self, control: Control) {
+        self.control = control;
+    }
 }
 
 /// Saturating `Duration` -> milliseconds. A lookout left open for 580 million

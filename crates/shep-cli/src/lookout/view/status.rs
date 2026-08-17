@@ -67,13 +67,23 @@ pub fn banner_line(app: &App) -> Option<Line<'static>> {
 /// filter line, then the key hint — with the control state always rendered
 /// on the right. See the phase plan's "Shapes the design named" #2 for why
 /// the box and the applied filter line are two slots and not one.
-///
-/// Slots 1 (armed confirm) and 4 (in-flight action) are Task 9's; this task
-/// leaves the chain shaped for them without writing their arms.
 #[must_use]
 pub fn status_line(app: &App, width: u16) -> Line<'static> {
     let palette = app.palette();
-    let (left, left_style) = if app.mode() == InputMode::Text {
+    let (left, left_style) = if let Some(action) = app.action().filter(|a| !a.sent) {
+        // Slot 1. A18: a question awaiting an answer outranks everything,
+        // including the filter box, which it cannot coexist with anyway
+        // because `/` cancels a confirm before it opens the box.
+        (
+            format!(
+                "{} {} (id {})? enter confirms, any other key cancels",
+                action.verb.label(),
+                action.name,
+                action.id
+            ),
+            palette.attention(),
+        )
+    } else if app.mode() == InputMode::Text {
         // ABOVE the notice, not below it. `Msg::BusLagged`,
         // `BusEvent::Dropped` and `BusEvent::DaemonShutdown` all raise notices
         // with no keypress involved, and they keep arriving while somebody is
@@ -103,6 +113,33 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
                 palette.attention()
             },
         )
+    } else if let Some(action) = app.action() {
+        // Slot 4. BELOW the notice, and that is load-bearing rather than a
+        // concession. `arm`'s "one action is already in flight" IS a notice,
+        // so a bar that put this line above notices would swallow the answer
+        // to the operator's own keypress: they press `R` while a stop is out,
+        // the screen does not change, and the dashboard has hidden a refusal
+        // it made. Every bus-raised notice (`Dropped`, `BusLagged`,
+        // `DaemonShutdown`) would be equally invisible for as long as an
+        // action was in flight. A18 puts the notice above the filter line and
+        // the design puts this line above the filter line; the notice above
+        // this is what satisfies both.
+        //
+        // What the design DOES require of this state is that a keypress
+        // cannot wipe it, and that is a property of the reducer, not of this
+        // order: the next keypress clears the notice and this line comes
+        // back.
+        let text = format!(
+            "{} {} (id {}): sent, waiting for the shepherd",
+            action.verb.label(),
+            action.name,
+            action.id
+        );
+        // `attention`, the same butter the non-grave notice uses. Not a
+        // modal, not a box, not a `ratatui::widgets::Clear`: there is no
+        // overlay anywhere in this module, and one rule under the header
+        // beats a full border for a pane somebody reads at 3am.
+        (text, palette.attention())
     } else if !app.filter().is_empty() {
         (
             format!("filter \"{}\"   / edit   esc clear", app.filter()),
@@ -137,22 +174,25 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
 
 /// The key hint.
 ///
-/// One form for both control states in this task, which is what shipped: there
-/// is nothing to advertise behind the gate yet. Task 9 gives it a second form
-/// once the three action keys exist, at which point this file's standing rule
-/// applies to it. Writing that second form here would put `x stop   R restart
-/// L reload` on the screen of a build where two of those three keys do
-/// nothing, which is the asterisk-instead-of-a-hint failure the rule is about,
-/// shipped by the plan rather than by the code.
+/// Two forms now that the three action keys exist. This file's standing
+/// rule: a hint that needs a footnote to be true is an asterisk, not a hint,
+/// so `Control::Allowed`'s form is only ever handed to a dashboard where `x`,
+/// `R` and `L` really do arm a confirm.
 ///
-/// The text is 59 characters, up from the 48 that shipped. It still truncates
-/// at the 39 columns the 49-column gap test leaves for it, and the first 40
-/// characters are byte-identical to the old hint, so
-/// `a_truncated_hint_still_leaves_a_gap_before_the_control_label` measures
-/// exactly what it was written to measure and the `narrow` and `cramped`
-/// frames do not move.
-fn hint_for(_control: Control) -> String {
-    "q quit   j/k select   g/G first/last   r refresh   / filter".to_string()
+/// The read-only text is 59 characters, up from the 48 that shipped before
+/// this phase. It still truncates at the 39 columns the 49-column gap test
+/// leaves for it, and the first 40 characters are byte-identical to the old
+/// hint, so `a_truncated_hint_still_leaves_a_gap_before_the_control_label`
+/// measures exactly what it was written to measure and the `narrow` and
+/// `cramped` frames do not move.
+fn hint_for(control: Control) -> String {
+    match control {
+        Control::ReadOnly => "q quit   j/k select   g/G first/last   r refresh   / filter",
+        // `g/G` and `r` drop out to make room. They are the two an operator
+        // rediscovers by pressing them; an action key is not.
+        Control::Allowed => "q quit   j/k select   / filter   x stop   R restart   L reload",
+    }
+    .to_string()
 }
 
 /// A run of `─` across the pane, under the header.
@@ -173,9 +213,12 @@ mod tests {
 
     use shep_core::protocol::BusEvent;
 
-    use super::super::fixtures::{editing_app, filtered_app, rendered};
+    use super::super::fixtures::{
+        acting_app, allowed_app, armed_app, armed_app_with_a_filter_and_a_notice, editing_app,
+        filtered_app, rendered,
+    };
     use super::*;
-    use crate::lookout::app::{App, KeyPress, Msg};
+    use crate::lookout::app::{ActionVerb, App, KeyPress, Msg};
     use crate::lookout::theme::Palette;
 
     /// fails if the truncated key hint ever butts straight against the
@@ -354,5 +397,116 @@ mod tests {
         let app = filtered_app("");
         let hint = rendered(&status_line(&app, 200));
         assert!(hint.contains("/ filter"), "got {hint:?}");
+    }
+
+    /// fails if the prompt stops naming the verb and the exact sheep, or stops
+    /// saying what answers it. A question an operator has to guess the answer
+    /// to is worse than no question.
+    #[test]
+    fn an_armed_confirm_names_the_verb_the_sheep_and_the_answer() {
+        let app = armed_app(ActionVerb::Restart);
+        let bar = rendered(&status_line(&app, 120));
+        assert!(bar.contains("restart api (id 2)?"), "got {bar:?}");
+        assert!(
+            bar.contains("enter confirms, any other key cancels"),
+            "got {bar:?}"
+        );
+    }
+
+    /// fails if the in-flight line stops saying that the shepherd has not
+    /// answered yet. Nothing on the table has changed at this point, because
+    /// nothing the shepherd said has changed yet, and the bar is the only
+    /// thing on screen that knows a request is out.
+    #[test]
+    fn an_in_flight_action_says_it_is_waiting() {
+        let app = acting_app(ActionVerb::Stop);
+        let bar = rendered(&status_line(&app, 120));
+        assert!(
+            bar.contains("stop api (id 2): sent, waiting for the shepherd"),
+            "got {bar:?}"
+        );
+    }
+
+    /// fails if the prompt loses its place at the top of the bar. A question
+    /// awaiting an answer outranks a report of something that already
+    /// happened, which outranks a persistent state the title also signals
+    /// (A18).
+    #[test]
+    fn the_confirm_outranks_a_notice_and_the_filter_line() {
+        let app = armed_app_with_a_filter_and_a_notice();
+        let bar = rendered(&status_line(&app, 120));
+        assert!(bar.contains("stop api (id 2)?"), "got {bar:?}");
+        assert!(
+            !bar.contains("filter \""),
+            "the filter line is below it: {bar:?}"
+        );
+    }
+
+    /// fails if a refusal made while an action is in flight never reaches the
+    /// screen. THIS is the test the four-slot ordering would have failed, and
+    /// no reducer test can catch it: `arm`'s "one action is already in flight"
+    /// is a `Notice`, so a bar that ranked the in-flight line above notices
+    /// would set it, assert it in the reducer, and never draw it. The operator
+    /// presses `R` while a stop is out, nothing on screen changes, and the
+    /// dashboard has silently swallowed the answer to their own keypress.
+    ///
+    /// The second half is the same defect arriving from the bus rather than
+    /// from a key: `Dropped`, `BusLagged` and `DaemonShutdown` would all be
+    /// invisible for as long as an action was in flight.
+    #[test]
+    fn a_refusal_while_an_action_is_in_flight_reaches_the_bar() {
+        let mut app = acting_app(ActionVerb::Stop);
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Restart)));
+        let bar = rendered(&status_line(&app, 120));
+        assert!(
+            bar.contains("one action is already in flight"),
+            "the refusal is on the bar, not only in the reducer: {bar:?}"
+        );
+
+        let mut app = acting_app(ActionVerb::Stop);
+        app.update(Msg::Event(BusEvent::DaemonShutdown));
+        let bar = rendered(&status_line(&app, 120));
+        assert!(bar.contains("the shepherd is shutting down"), "got {bar:?}");
+    }
+
+    /// fails if the in-flight line does not come back once the notice is
+    /// cleared. The mirror of the test above, and what makes ranking the
+    /// notice higher honest rather than lossy: the covering is transient, and
+    /// the next keypress ends it.
+    #[test]
+    fn the_in_flight_line_comes_back_when_the_notice_clears() {
+        let mut app = acting_app(ActionVerb::Stop);
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Restart)));
+        app.update(Msg::Key(KeyPress::SelectDown));
+        let bar = rendered(&status_line(&app, 120));
+        assert!(
+            bar.contains("stop api (id 2): sent, waiting for the shepherd"),
+            "got {bar:?}"
+        );
+    }
+
+    /// fails if the action keys are advertised behind a closed gate. This
+    /// file's standing rule: a hint that needs a footnote to be true is an
+    /// asterisk, not a hint.
+    #[test]
+    fn the_action_keys_are_advertised_only_when_the_gate_is_open() {
+        let closed = rendered(&status_line(&filtered_app(""), 200));
+        for key in ["x stop", "R restart", "L reload"] {
+            assert!(
+                !closed.contains(key),
+                "{key} advertised read-only: {closed:?}"
+            );
+        }
+        let open = rendered(&status_line(&allowed_app(), 200));
+        for key in ["x stop", "R restart", "L reload"] {
+            assert!(
+                open.contains(key),
+                "{key} missing when the gate is open: {open:?}"
+            );
+        }
+        assert!(
+            open.contains("/ filter"),
+            "and the filter key survives both forms"
+        );
     }
 }

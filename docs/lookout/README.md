@@ -44,14 +44,16 @@ cargo test -p shep --bins --all-features -- --ignored write_the_gallery
   that was never there.
 - **Actions are gated off by default, and it says so.** `--allow-control`
   (or `lookout.allow_control = "true"` in the KV store) has to be set before
-  any action key does anything. Exactly one action key exists, `x` (stop),
-  and it never acts — it refuses in both states, with a literal sentence
-  (`read-only: actions need --allow-control`, or `stop is not built yet`
-  once control is allowed but the action isn't). The status bar always says
-  which state is in force. This is a fat-finger catch, not a security
-  boundary: lookout runs as the operator's own process, under the
-  operator's own uid, so the shepherd has no way to refuse a keypress it
-  cannot tell apart from `shep stop`.
+  any action key does anything. Three action keys exist — `x` (stop), `R`
+  (restart) and `L` (reload) — and none of them acts on the keypress that
+  pressed it: an action key arms a confirm, Enter confirms it, any other key
+  cancels it, `q` and Ctrl-C still quit even with a prompt up, and an armed
+  prompt nobody answers expires after ten seconds. Read-only refuses
+  outright, with a literal sentence (`read-only: actions need
+  --allow-control`). The status bar always says which state is in force.
+  This is a fat-finger catch, not a security boundary: lookout runs as the
+  operator's own process, under the operator's own uid, so the shepherd has
+  no way to refuse a keypress it cannot tell apart from `shep stop`.
 - **Colour is always redundant with text.** Every coloured cell says the
   same thing in words that the colour is repeating — the STATUS column
   prints `errored` under `--bark`, the banner prints `the shepherd has
@@ -109,7 +111,7 @@ cargo test -p shep --bins --all-features -- --ignored write_the_gallery
   `no_detail` scene in `frames.txt` is the 120×20 case — feed present,
   detail gone.
 
-## What is still open
-
-- **Actions behind the gate.** The gate exists and refuses honestly; no
-  action beyond `x`'s refusal has landed behind it yet.
+`shep lookout` ships complete as of Phase 16: the filter, lambs in the detail
+pane, and the three action keys behind the gate are all built. See
+[docs/specs/deferred.md](../specs/deferred.md) for the workspace's remaining
+debt.

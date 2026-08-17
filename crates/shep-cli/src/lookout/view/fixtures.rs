@@ -6,10 +6,10 @@ use std::time::Instant;
 
 use ratatui::text::Line;
 use shep_client::RequestError;
-use shep_core::protocol::{Lamb, ProcessInfo, Response};
+use shep_core::protocol::{BusEvent, Lamb, ProcessInfo, Response};
 use shep_core::status::ProcStatus;
 
-use super::super::app::{App, Control, KeyPress, LambWalk, Msg, Sent};
+use super::super::app::{ActionVerb, App, Control, KeyPress, LambWalk, Msg, Sent};
 use super::super::source::HostSample;
 use super::super::tail::{Stream, Tail, TailLine};
 use super::super::theme::Palette;
@@ -324,4 +324,45 @@ fn named_flock() -> Vec<ProcessInfo> {
                 .build()
         })
         .collect()
+}
+
+/// [`filtered_app`]'s four sheep with the gate open and the cursor on `api`
+/// at id 2, which is the sheep every action assertion in this file names.
+pub fn allowed_app() -> App {
+    let mut app = app_with(named_flock(), plain());
+    app.set_control_for_tests(Control::Allowed);
+    app.update(Msg::Key(KeyPress::SelectDown));
+    app
+}
+
+/// [`allowed_app`] with `verb` armed and nothing sent.
+pub fn armed_app(verb: ActionVerb) -> App {
+    let mut app = allowed_app();
+    app.update(Msg::Key(KeyPress::Action(verb)));
+    app
+}
+
+/// [`armed_app`] confirmed: the request is out and the reply has not landed.
+pub fn acting_app(verb: ActionVerb) -> App {
+    let mut app = armed_app(verb);
+    app.update(Msg::Key(KeyPress::Confirm));
+    app
+}
+
+/// An armed confirm with a filter applied AND a notice standing, so the bar
+/// has something in three slots at once and the ordering assertion has
+/// something to fail on.
+///
+/// Order matters: the filter is applied first, then the action is armed, then
+/// the notice is raised — NOT the other way round. Arming is a keypress, and
+/// `on_key`'s normal branch opens with `self.notice = None`, so arming AFTER
+/// the notice would wipe the very notice this fixture exists to leave
+/// standing. `Msg::Event(BusEvent::Dropped { .. })` never passes through
+/// `on_key` at all, so raising the notice last is what makes it survive.
+pub fn armed_app_with_a_filter_and_a_notice() -> App {
+    let mut app = filtered_app("api");
+    app.set_control_for_tests(Control::Allowed);
+    app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+    app.update(Msg::Event(BusEvent::Dropped { count: 3 }));
+    app
 }

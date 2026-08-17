@@ -1,5 +1,6 @@
 ---
 source: crates/shep-cli/src/lookout/frames.rs
+assertion_line: 1496
 expression: render_text(&buffer)
 ---
 shep lookout   /home/rin/.shep                                                                            6 in the flock
@@ -31,4 +32,4 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+q quit   j/k select   / filter   x stop   R restart   L reload                                           control enabled
