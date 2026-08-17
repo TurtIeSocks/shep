@@ -946,10 +946,21 @@ impl App {
     fn arm(&mut self, verb: ActionVerb) -> Effect {
         let refusal = if self.control == Control::ReadOnly {
             Some("read-only: actions need --allow-control".to_string())
-        } else if !matches!(self.link, Link::Live) {
-            // The same sentence `r` already gives when the link is gone,
-            // moved into `LINK_GONE` by this task and reused rather than
-            // retyped.
+        } else if let Link::Retrying { attempt } = self.link {
+            // NOT `LINK_GONE` here: that sentence says the shepherd is gone,
+            // which is false while it is still being redialled, and a
+            // refusal saying so under a banner that says "reconnecting" was
+            // Phase 16 review Minor #8 — two contradictory claims on one
+            // frame. This is the status bar's own sentence for the state
+            // (`view/status.rs`), so the refusal agrees with the banner
+            // above it instead of overriding it.
+            Some(format!(
+                "the shepherd stopped answering — reconnecting (attempt {attempt})"
+            ))
+        } else if matches!(self.link, Link::Lost { .. }) {
+            // The same sentence `r` gives once the ladder is exhausted: at
+            // that point the shepherd really is gone, so `LINK_GONE` is
+            // literally true rather than merely reused for convenience.
             Some(LINK_GONE.to_string())
         } else if self.selected_row().is_none() {
             Some("no sheep is selected".to_string())

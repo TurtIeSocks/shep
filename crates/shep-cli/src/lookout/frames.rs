@@ -316,7 +316,7 @@ impl Scene {
                 "The shepherd refused while the request was out, and its own sentence is forwarded rather than rewritten. The sheep has left the flock in the listing behind it, so the table is one row shorter and the cursor has moved to the row below."
             }
             Self::ActionRefusedOffline => {
-                "An action key pressed while the link is coming back. The refusal is the same sentence `r` gives, under a banner saying the shepherd is being reconnected to."
+                "An action key pressed while the link is coming back. The refusal names the same reconnect attempt the banner above it does, rather than the exhausted-ladder sentence — Phase 16 review Minor #8 caught the two disagreeing on one frame."
             }
         }
     }
@@ -1389,13 +1389,18 @@ mod tests {
         );
 
         // "An action key pressed while the link is coming back. The refusal
-        //  is the same sentence `r` gives, under a banner saying the
-        //  shepherd is being reconnected to."
+        //  names the same reconnect attempt the banner above it does, rather
+        //  than the exhausted-ladder sentence."
         let offline = render_text(&scene(Scene::ActionRefusedOffline).1);
-        assert!(offline.contains("reconnecting (attempt 3)"), "the banner");
+        assert_eq!(
+            offline.matches("reconnecting (attempt 3)").count(),
+            2,
+            "the banner and the refusal under it agree, rather than one \
+             saying reconnecting and the other saying gone: {offline:?}"
+        );
         assert!(
-            offline.contains("nothing left to ask"),
-            "and the refusal under it"
+            !offline.contains("nothing left to ask"),
+            "the ladder has not run out yet, so the refusal must not claim it has: {offline:?}"
         );
 
         // The one frame in the gallery whose left slot is empty while the
