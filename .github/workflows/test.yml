@@ -124,13 +124,31 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
       - run: 'cargo test --workspace --locked --all-features -- --test-threads=1 ::slow:: two_concurrent_boots'
+  # `cargo llvm-cov` on its own runs `cargo test --tests`, and `--tests` does
+  # not build a package's examples. `daemon_e2e`'s two reload tests exec
+  # `examples/reuse_port_sheep`, the SO_REUSEPORT fixture the whole reload
+  # measurement rests on, and fail without it. `--all-targets` does not help:
+  # it compiles examples in test mode into `deps/` rather than uplifting a
+  # plain binary into `examples/`, which is the path the test looks in.
+  #
+  # So this drives llvm-cov by hand instead. `show-env` exports the wrapper and
+  # profile settings, an ordinary `cargo test` builds examples the same way
+  # every other job does, and `report` reads the profile data afterwards.
+  #
+  # The bug is older than the `slow` split above and was hidden by it: cargo
+  # stops at the first failing test binary, and the lib tier used to fail
+  # first, so this job never reached `daemon_e2e`.
   coverage:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal --component llvm-tools
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: 'cargo llvm-cov --workspace --locked --lcov --output-path lcov.info -- --skip ::slow:: --skip two_concurrent_boots'
+      - run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov clean --workspace
+          cargo test --workspace --locked -- --skip ::slow:: --skip two_concurrent_boots
+          cargo llvm-cov report --lcov --output-path lcov.info
       - uses: actions/upload-artifact@v4
         with: { name: coverage, path: lcov.info }
   bench:
