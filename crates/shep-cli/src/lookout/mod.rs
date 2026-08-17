@@ -362,14 +362,14 @@ where
             // walk it cannot show. A size that cannot be read is treated as
             // too short, which errs toward asking for nothing.
             let height = terminal.size().map_or(0, |size| size.height);
-            if view::panes_for(height).detail {
-                if let Some(id) = app.selected() {
-                    // `try_send`, for `Effect::PollNow`'s reason: a full
-                    // channel means a request is already queued, and a
-                    // dropped lamb fetch reads as "not read yet", which the
-                    // pane already knows how to say.
-                    let _ = requests.try_send(Sent::Lambs { id });
-                }
+            if view::panes_for(height).detail
+                && let Some(id) = app.selected()
+            {
+                // `try_send`, for `Effect::PollNow`'s reason: a full
+                // channel means a request is already queued, and a
+                // dropped lamb fetch reads as "not read yet", which the
+                // pane already knows how to say.
+                let _ = requests.try_send(Sent::Lambs { id });
             }
             lambs_dirty = false;
         }
