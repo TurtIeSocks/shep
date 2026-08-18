@@ -727,4 +727,167 @@ mod tests {
             render_boxed(&headers, &rows, &priorities, 20)
         );
     }
+
+    // --- Task 7: pin every level, through the real rendering seam ---------
+    //
+    // Every snapshot below goes through `crate::output::table_of`, the seam
+    // `emit`/`emit_flock`/`emit_described` all call, over a `FlockRows` built
+    // from real `ProcessInfo` values -- never `render_boxed` called on
+    // hand-written cells. That is the whole difference between pinning box
+    // drawing and pinning the feature this branch built: the face comes from
+    // `vocabulary::face`, the colour from `output::paint::style_for` keyed
+    // off `vocabulary::role_of`, and the STATUS-word retry from `table_of`
+    // itself, and a snapshot that hand-writes `"(o.o) online"` walks past all
+    // three.
+
+    use std::ffi::OsStr;
+
+    use shep_core::protocol::ProcessInfo;
+    use shep_core::status::ProcStatus;
+
+    use crate::output::table_of;
+    use crate::style::{Presentation, StyleLevel};
+
+    /// Four sheep, one per role [`crate::vocabulary::role_of`] maps a status
+    /// to -- Meadow (Online), Butter (`butter`), Bark (Errored), Ink3
+    /// (Stopped). Every row the same status would pin one face and say
+    /// nothing about the other three (this task's own brief's Correction 2).
+    ///
+    /// `butter` is a parameter rather than fixed at `Starting`, because the
+    /// two snapshots below need two different Butter-role words at the same
+    /// fallback terminal width: `full_wide` wants `Starting` (`"starting"`,
+    /// 8 characters) so nothing needs to drop, and the narrow snapshot wants
+    /// `WaitingRestart` (`"waiting-restart"`, 15) specifically because it is
+    /// the longest status word -- see that test's own doc for the width
+    /// arithmetic this difference drives.
+    ///
+    /// Every other column is sized to fit `output::terminal_width`'s own
+    /// fallback of 80: `cargo test` gives `table_of` no real terminal behind
+    /// stdout (output is captured), so `crossterm::terminal::size()` errors
+    /// and every real call in this module lands on that fallback -- the same
+    /// assumption `the_word_drops_before_a_whole_column_does` above already
+    /// relies on for its own single-row fixture.
+    fn mixed_flock(butter: ProcStatus) -> FlockRows {
+        FlockRows(vec![
+            ProcessInfo::builder(0, "web", ProcStatus::Online)
+                .pid(Some(1234))
+                .uptime_ms(3_723_000) // 1h 2m
+                .build(),
+            ProcessInfo::builder(1, "worker", butter).build(),
+            ProcessInfo::builder(2, "api", ProcStatus::Errored)
+                .restarts(4)
+                .build(),
+            ProcessInfo::builder(3, "cron", ProcStatus::Stopped).build(),
+        ])
+    }
+
+    /// A deep (256-colour) terminal, `xterm-256color` -- the same string
+    /// `output/mod.rs`'s own Task 5b tests use to exercise
+    /// `output::paint::style_for`'s deep tier rather than the 16-colour
+    /// fallback, since a snapshot pinned at the shallow tier would not catch
+    /// a regression in the tier most terminals in the wild actually use.
+    fn deep_terminal() -> Option<&'static OsStr> {
+        Some(OsStr::new("xterm-256color"))
+    }
+
+    /// `full`, comfortably inside 80 columns: face, word and colour all
+    /// present, nothing dropped. `mixed_flock`'s own doc has the width
+    /// arithmetic (78 of 80 columns used) that keeps this one under the
+    /// fallback with every column and the word both in play.
+    #[test]
+    fn full_wide_pins_face_word_and_colour_for_a_mixed_flock() {
+        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None);
+        let rendered = table_of(&mixed_flock(ProcStatus::Starting), presentation);
+        assert!(
+            !rendered.contains("hidden"),
+            "this fixture must fit without dropping a column: {rendered}"
+        );
+        insta::assert_snapshot!(rendered);
+    }
+
+    /// `full`, narrow enough that the STATUS word has dropped but no whole
+    /// column has -- spec §2's own ordering, and the one width-driven
+    /// behaviour a hand-written `render_boxed` call cannot exercise, since
+    /// only `table_of`'s two-pass retry knows to ask [`Render::rows_for`]
+    /// again with the word turned off.
+    ///
+    /// Swapping `mixed_flock`'s Butter row from `Starting` to
+    /// `WaitingRestart` grows its STATUS content from `"(o~o) starting"`
+    /// (14 columns) to `"(o~o) waiting-restart"` (21) -- seven columns more,
+    /// which alone pushes the first, word-included pass from 78 to 85 and
+    /// over the 80-column fallback. `render_boxed_ex`'s own priority order
+    /// (`FlockRows::PRIORITIES`) drops FOLD first, landing back at 78 --
+    /// still over budget by nothing, so the retry never has to touch a
+    /// second column. The retry itself asks for every column again with the
+    /// word off; every face is exactly 5 columns regardless of status
+    /// (`vocabulary::face`'s own invariant), so STATUS falls back to its
+    /// 6-column header width and the whole table fits at 70 -- word gone,
+    /// FOLD back, no footer.
+    #[test]
+    fn full_narrow_drops_the_status_word_before_a_whole_column() {
+        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None);
+        let rendered = table_of(&mixed_flock(ProcStatus::WaitingRestart), presentation);
+        assert!(
+            !rendered.contains("waiting-restart"),
+            "the word should have dropped: {rendered}"
+        );
+        assert!(
+            !rendered.contains("hidden"),
+            "and no whole column should have needed to: {rendered}"
+        );
+        insta::assert_snapshot!(rendered);
+    }
+
+    /// `plain`: boxes and colour survive, the word rides alone -- `plain` is
+    /// "no sheep", not "no colour" (spec §2, and `output/mod.rs`'s own
+    /// `the_three_levels_render_the_status_column_differently_and_look_right`
+    /// asserts the same thing without pinning the exact render).
+    #[test]
+    fn plain_pins_the_boxed_table_with_words_and_colour_but_no_face() {
+        let presentation = Presentation::new(StyleLevel::Plain, None, deep_terminal(), None);
+        let rendered = table_of(&mixed_flock(ProcStatus::Starting), presentation);
+        assert!(!rendered.contains("(o.o)"), "no face at plain: {rendered}");
+        insta::assert_snapshot!(rendered);
+    }
+
+    /// `bare`: the hard rule made visible. Byte-identical to what
+    /// `render_table` printed before this whole feature existed -- no box,
+    /// no face, no escape -- so a border or an escape byte reaching this
+    /// file in review is the regression `cli_e2e.rs`'s piped-output assertion
+    /// exists to catch at the process boundary, seen here at the unit level
+    /// instead.
+    #[test]
+    fn bare_pins_the_byte_identical_plain_table() {
+        let rendered = table_of(&mixed_flock(ProcStatus::Starting), Presentation::BARE);
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "bare must never emit an escape: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('┌') && !rendered.contains('│') && !rendered.contains('└'),
+            "bare must never draw a box: {rendered}"
+        );
+        insta::assert_snapshot!(rendered);
+    }
+
+    /// `full` under `NO_COLOR`: sheep and boxes survive, colour alone is
+    /// vetoed -- the gap Correction 2 names explicitly: the spec asks for
+    /// this case and the earlier tasks' plan had no snapshot for it, only
+    /// `output/mod.rs`'s own assertion-based
+    /// `no_color_at_full_keeps_sheep_and_boxes_but_drops_colour`.
+    #[test]
+    fn full_under_no_color_pins_sheep_and_boxes_without_colour() {
+        let presentation = Presentation::new(
+            StyleLevel::Full,
+            Some(OsStr::new("1")),
+            deep_terminal(),
+            None,
+        );
+        let rendered = table_of(&mixed_flock(ProcStatus::Starting), presentation);
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "NO_COLOR must leave no escape byte: {rendered:?}"
+        );
+        insta::assert_snapshot!(rendered);
+    }
 }
