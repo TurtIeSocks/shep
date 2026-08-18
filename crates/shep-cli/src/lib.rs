@@ -43,10 +43,12 @@ mod launch;
 mod lookout;
 mod output;
 mod serve;
+mod welcome;
 #[cfg(unix)]
 mod whistle;
 
 use std::ffi::OsString;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -463,7 +465,20 @@ async fn run(cli: Cli) -> ExitCode {
                     return code;
                 }
             };
-            let _ = home_is_new; // bound in the welcome task
+            if home_is_new {
+                let mut err = std::io::stderr();
+                let mut sink = std::io::sink();
+                let mut streams = Streams {
+                    out: &mut sink,
+                    err: &mut err,
+                };
+                welcome::on_first_run(
+                    &mut streams,
+                    fmt,
+                    &paths.home,
+                    std::io::stderr().is_terminal(),
+                );
+            }
             let mut out = std::io::stdout().lock();
             let mut err = std::io::stderr().lock();
             let mut streams = Streams {
@@ -529,7 +544,23 @@ async fn run(cli: Cli) -> ExitCode {
             return code;
         }
     };
-    let _ = home_is_new; // bound in the welcome task
+    // `Welcome` is excluded because its own arm prints the same text to
+    // stdout a moment later, and a `shep welcome` that created the home
+    // should print once, not twice.
+    if home_is_new && !matches!(cli.command, Commands::Welcome) {
+        let mut err = std::io::stderr();
+        let mut sink = std::io::sink();
+        let mut streams = Streams {
+            out: &mut sink,
+            err: &mut err,
+        };
+        welcome::on_first_run(
+            &mut streams,
+            fmt,
+            &paths.home,
+            std::io::stderr().is_terminal(),
+        );
+    }
 
     // `dog` is a re-exec target like `daemon` — long-lived until signalled —
     // and, per `dog::run_dog`'s own doc, writes its own diagnostics straight
@@ -622,6 +653,10 @@ async fn run(cli: Cli) -> ExitCode {
     };
 
     match cli.command {
+        // No client: the welcome is local text about a local directory, and
+        // asking a shepherd for it would make `shep welcome` fail on exactly
+        // the fresh machine it exists to greet.
+        Commands::Welcome => welcome::welcome(&mut streams, fmt, &paths.home),
         Commands::Start(ref args) => {
             match connect_or_spawn_client(&mut streams, fmt, &paths).await {
                 Ok(client) => lifecycle::start(&client, &mut streams, fmt, args).await,

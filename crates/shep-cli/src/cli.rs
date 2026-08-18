@@ -428,6 +428,11 @@ pub enum Commands {
     /// Static only: sheep names, fold names and other daemon-side
     /// identifiers are never completed.
     Completions(CompletionArgs),
+    /// Print the welcome: the sheep, and the five commands worth knowing.
+    ///
+    /// The same text a fresh `$SHEP_HOME` prints once on its own. Here it is
+    /// the command's output rather than a diagnostic, so it goes to stdout.
+    Welcome,
     /// Graceful stop. Easter-egg alias for `stop`.
     #[command(hide = true)]
     Thatlldo(SelectorArgs),
