@@ -463,37 +463,28 @@ mod tests {
         );
     }
 
-    // fails if `delay` is honoured too eagerly (e.g. treated as zero, or
-    // each event flushed independently regardless of `delay`): these two
-    // near-simultaneous writes would then arrive as two batches instead of
-    // one. No sleep between them on purpose. A wider-than-`TEST_DELAY` local
-    // window is deliberate too: the debouncer only combines events into one
-    // handler call when both are still ready in the same `tick_rate` slice
-    // (`delay / 4`), and at `TEST_DELAY`'s 12.5ms slice, a couple of
-    // milliseconds of real FSEvents/thread-scheduling jitter between the two
-    // writes was enough to straddle a tick and flake this test. A wider
-    // window buys the same proof more slack, without slowing every other
-    // test in this module that does not need it. Measured flaky at 300ms
-    // (roughly 1 run in 8) on a loaded dev machine — a prior test's
-    // debouncer thread can still be winding down (see the struct doc on
-    // `WatchSource`'s drop not being instant) and steal a tick's worth of
-    // scheduling from this one — so the margin is generous rather than
-    // tight.
+    // The window `no_batch_arrives_before_delay_has_elapsed` measures against.
     //
-    // Widened again, from 1s, after the same test failed on a GitHub
-    // windows-latest runner with
+    // This test used to assert coalescing too -- that two writes issued back
+    // to back share one batch -- and that assertion is gone, after failing on
+    // GitHub's windows-latest at a 1s window and again at 4s. Widening was
+    // the wrong instrument. Whether two events land in the same batch depends
+    // on the debouncer merging them inside one `tick_rate` slice
+    // (`delay / 4`), which depends in turn on the OS delivering both within
+    // that slice, and a shared two-core runner is under no obligation to. The
+    // number was always a guess at how slow that machine gets, and there is
+    // no guess that is safe.
     //
-    //     got [WatchBatch { paths: ["...\first.txt"], .. },
-    //          WatchBatch { paths: ["...\second.txt"], .. }]
+    // What is left is the half shep actually owns and load cannot break. The
+    // regression this test was written for is `delay` being ignored -- passed
+    // as zero, or flushed on every event regardless -- and either shows up as
+    // a batch arriving too EARLY. A stalled machine can only push a batch
+    // later, never sooner, so the assertion has no race in it at all.
     //
-    // — two writes issued back to back, arriving one tick apart. The number
-    // that matters is the slice, not the window: at 1s the slice was 250ms,
-    // and a two-core runner took longer than that to hand the watcher both
-    // events. 4s makes the slice a full second. That is a bound on how long
-    // the machine may stall, so it is a guess at how slow a shared runner
-    // gets rather than a fact about the debouncer, and a slower one could
-    // still miss.
-    const COALESCE_TEST_DELAY: Duration = Duration::from_secs(4);
+    // Coalescing itself is `notify-debouncer-full`'s behaviour rather than
+    // ours; shep's only lever on it is the `delay` it passes, which is
+    // exactly what the elapsed-time bound checks.
+    const HOLD_TEST_DELAY: Duration = Duration::from_secs(1);
 
     // fails if a missing root is silently accepted, reported as the wrong
     // variant, or reported with an empty reason
@@ -679,36 +670,21 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn writes_within_delay_coalesce_into_one_batch() {
+        async fn no_batch_arrives_before_delay_has_elapsed() {
             let dir = tempfile::tempdir().unwrap();
             let root = canonical_root(&dir);
-            let (_source, mut rx) = watch_tree(&root, COALESCE_TEST_DELAY).unwrap();
+            let (_source, mut rx) = watch_tree(&root, HOLD_TEST_DELAY).unwrap();
 
             let started = Instant::now();
-            let first = crate::testing::touch(&root, "first.txt").unwrap();
-            let second = crate::testing::touch(&root, "second.txt").unwrap();
+            let file = crate::testing::touch(&root, "first.txt").unwrap();
 
-            // Some batch must carry both. A debouncer that flushed each event
-            // independently would never produce one, so this still fails the
-            // case the test exists for -- while tolerating the extra batches
-            // inotify delivers for the same two writes, which a trailing
-            // "and nothing else arrives" check used to reject.
-            let batches = batches_until(
-                &mut rx,
-                COALESCE_TEST_DELAY * 3,
-                "both writes together",
-                |batch| batch.paths.contains(&first) && batch.paths.contains(&second),
-            )
+            let batches = batches_until(&mut rx, HOLD_TEST_DELAY * 4, &format!("{file:?}"), |b| {
+                b.paths.contains(&file)
+            })
             .await;
-
-            // The half of the same property that no amount of load can break:
-            // a stalled machine can only make a batch arrive later, never
-            // sooner, so an early one means `delay` was not waited out at all.
-            // Worth asserting separately because the coalescing half above is
-            // a race against the runner and this one is not.
             assert!(
-                started.elapsed() >= COALESCE_TEST_DELAY,
-                "the first batch arrived after {:?}, inside `delay` ({COALESCE_TEST_DELAY:?}) — \
+                started.elapsed() >= HOLD_TEST_DELAY,
+                "a batch arrived after {:?}, inside `delay` ({HOLD_TEST_DELAY:?}) -- \
                  got {batches:?}",
                 started.elapsed()
             );
