@@ -50,7 +50,7 @@ mod welcome;
 mod whistle;
 
 use std::ffi::OsString;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -169,7 +169,12 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
     if std::env::var_os("SHEP_TERM_PANIC_PROBE").is_some() {
         lookout::term::probe_panic_for_test();
     }
-    let cli = Cli::parse_from(argv);
+    // `try_parse_from`, not `parse_from`: the latter prints and exits inside
+    // clap, and two of the four invocations that should carry a shepherd
+    // status line -- bare `shep`, and `shep help` -- never become a `Cli` at
+    // all. Holding the result lets those two be answered before clap has its
+    // say. Ok invocations are unaffected.
+    let parsed = Cli::try_parse_from(argv.clone());
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -180,7 +185,52 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
             return std::process::ExitCode::from(ExitCode::Failure as u8);
         }
     };
+    let cli = match parsed {
+        Ok(cli) => cli,
+        Err(err) => {
+            #[cfg(unix)]
+            if matches!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::MissingSubcommand
+            ) {
+                runtime.block_on(print_shepherd_status(&argv));
+            }
+            // clap renders the help or the usage error and picks the exit
+            // code, exactly as `parse_from` would have.
+            err.exit();
+        }
+    };
     std::process::ExitCode::from(runtime.block_on(run(cli)) as u8)
+}
+
+/// Prints the one-line shepherd status to stderr, for an invocation clap
+/// answers by itself.
+///
+/// stderr rather than stdout so `shep help > file` and
+/// `shep completions zsh > _shep` stay clean -- the completion script above
+/// all, which is 1900 lines of shell meant to be sourced, and would execute
+/// a status line as code.
+///
+/// Silent when stderr is not a terminal, matching the welcome, and silent
+/// when `argv` names a `--home`: the parse that would have told us which
+/// home is the parse that just failed, and a line naming the wrong flock is
+/// worse than no line.
+#[cfg(unix)]
+async fn print_shepherd_status(argv: &[OsString]) {
+    if !std::io::stderr().is_terminal() || argv.iter().any(|a| a == "--home") {
+        return;
+    }
+    let global = GlobalArgs {
+        home: None,
+        format: Format::Table,
+        quiet: false,
+    };
+    let Ok(paths) = resolve_paths(&global) else {
+        return;
+    };
+    let status = status::ShepherdStatus::probe(&paths).await;
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "{}", status::one_line(&status));
 }
 
 /// Turns `--home`/`$SHEP_HOME`/`$HOME` into a resolved [`ShepPaths`].
@@ -455,6 +505,16 @@ async fn run(cli: Cli) -> ExitCode {
     // stays up until it is signalled — and there is no such case today.
     match cli.command {
         Commands::Completions(ref args) => {
+            // Status to stderr before the script: `shep completions zsh`
+            // writes 1900 lines of shell to stdout, meant to be redirected
+            // or sourced, and a status line in it would be executed.
+            if let Ok(paths) = resolve_paths(&cli.global) {
+                let shepherd = status::ShepherdStatus::probe(&paths).await;
+                if std::io::stderr().is_terminal() {
+                    let mut err = std::io::stderr();
+                    let _ = writeln!(err, "{}", status::one_line(&shepherd));
+                }
+            }
             let mut out = std::io::stdout().lock();
             return completions::completions(&mut out, args);
         }
@@ -666,7 +726,17 @@ async fn run(cli: Cli) -> ExitCode {
         // No client: the welcome is local text about a local directory, and
         // asking a shepherd for it would make `shep welcome` fail on exactly
         // the fresh machine it exists to greet.
-        Commands::Welcome => welcome::welcome(&mut streams, fmt, &paths.home),
+        Commands::Welcome => {
+            let shepherd = status::ShepherdStatus::probe(&paths).await;
+            let code = welcome::welcome(&mut streams, fmt, &paths.home);
+            // After the text, not before: the welcome ends on "shep welcome
+            // shows this again", and the status is the one line that changes
+            // between runs.
+            if fmt == Format::Table && std::io::stderr().is_terminal() {
+                let _ = writeln!(streams.err, "{}", status::one_line(&shepherd));
+            }
+            code
+        }
         Commands::Start(ref args) => {
             match connect_or_spawn_client(&mut streams, fmt, &paths).await {
                 Ok(client) => lifecycle::start(&client, &mut streams, fmt, args).await,

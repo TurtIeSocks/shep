@@ -89,6 +89,27 @@ impl ShepherdStatus {
     }
 }
 
+/// One line for the quiet verbs, naming the home so the flock's location is
+/// discoverable without having to provoke an error message to learn it.
+///
+/// Only the four verbs that produce no flock data of their own get this:
+/// `shep` with no verb, `welcome`, `help`, `completions`. On any other
+/// command the fact that it worked already tells you the shepherd is up, and
+/// a preamble repeating that on every invocation is the
+/// banner-on-every-command pattern this project turned down.
+pub(crate) fn one_line(status: &ShepherdStatus) -> String {
+    match &status.online {
+        Some(Online { pid, .. }) => format!(
+            "shepherd online (pid {pid}), flock at {}",
+            status.home.display()
+        ),
+        None => format!(
+            "no shepherd running, flock at {}. `shep start` brings one up.",
+            status.home.display()
+        ),
+    }
+}
+
 /// `shep ping`'s JSON payload.
 ///
 /// Its own type rather than a `rows::` entry with a `Render` impl: `Render`
@@ -170,6 +191,52 @@ pub(crate) fn render_ping(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(online: Option<Online>) -> ShepherdStatus {
+        ShepherdStatus {
+            online,
+            home: PathBuf::from("/home/rin/.shep"),
+            socket: PathBuf::from("/home/rin/.shep/run/shep.sock"),
+        }
+    }
+
+    /// The offline line has to carry the way out, because the reader seeing
+    /// it is the reader who does not know what to type next.
+    #[test]
+    fn the_offline_line_names_the_home_and_the_way_out() {
+        let line = one_line(&at(None));
+        assert!(line.contains("no shepherd running"), "{line}");
+        assert!(line.contains("/home/rin/.shep"), "{line}");
+        assert!(line.contains("shep start"), "{line}");
+    }
+
+    /// Online, the pid is the useful part: it is what you reach for to know
+    /// whether the thing you are looking at is the thing you started.
+    #[test]
+    fn the_online_line_names_the_pid_and_the_home() {
+        let line = one_line(&at(Some(Online {
+            version: "0.1.0-alpha.1".to_owned(),
+            pid: 4823,
+        })));
+        assert!(line.contains("online"), "{line}");
+        assert!(line.contains("4823"), "{line}");
+        assert!(line.contains("/home/rin/.shep"), "{line}");
+    }
+
+    /// No em dashes in copy a user reads.
+    #[test]
+    fn the_status_lines_have_no_em_dashes() {
+        for line in [
+            one_line(&at(None)),
+            one_line(&at(Some(Online {
+                version: "0.1.0".to_owned(),
+                pid: 1,
+            }))),
+        ] {
+            assert!(!line.contains('\u{2014}'), "em dash in {line:?}");
+            assert!(!line.contains('\u{2013}'), "en dash in {line:?}");
+        }
+    }
 
     /// Reporting online must rest on a real `Request::Ping` round-trip, not
     /// on the handshake alone: a daemon can hold a listening socket and
