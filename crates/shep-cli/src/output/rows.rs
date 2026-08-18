@@ -275,6 +275,20 @@ impl Render for DogRows {
         // needs to grow to cover.
         "lambs",
     ];
+
+    // Parallel to `headers()` above: `["NAME", "SOURCE", "STATUS", "PID",
+    // "RESTARTS", "CPU", "MEM", "UPTIME"]`. NAME and STATUS are what
+    // identify a row -- the same floor `FlockRows` uses for its own
+    // ID/NAME/STATUS -- so they sit at `0`. The five columns this table
+    // shares with `FlockRows` (UPTIME, PID, MEM, RESTARTS, CPU) keep that
+    // table's own drop order exactly, so an operator who has learned one
+    // table's behaviour is not surprised by the other. SOURCE is the one
+    // column this table has that `FlockRows` does not: it says where the
+    // binary came from, not whether the dog is healthy, so it is the least
+    // essential column here -- the same role `FOLD` plays for the flock --
+    // and drops first. `dog_priorities_line_up_with_dog_headers` (below)
+    // pins both the length and which two columns sit at `0`.
+    const PRIORITIES: &'static [u8] = &[0, 6, 0, 2, 4, 5, 3, 1];
 }
 
 /// One sheep's lamb tree, as `describe`'s second table.
@@ -314,6 +328,19 @@ impl Render for LambRows {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Parallel to `headers()` above: `["PID", "NAME"]`. Both are floor
+    // columns at `0`, not one placeholder for the other: a lamb has
+    // exactly these two facts, both are identity (which process, which
+    // command), and there is nothing left over to designate droppable --
+    // unlike `FlockRows`/`DogRows`, which each have a column beyond their
+    // own floor. Two columns is already below `render_boxed`'s own floor
+    // of three, so this table never actually narrows regardless of what
+    // the array says; it is still spelled out explicitly (rather than left
+    // at the trait's all-zero default) so a header added here later does
+    // not silently inherit "never drops" by omission.
+    // `lamb_priorities_line_up_with_lamb_headers` (below) pins the length.
+    const PRIORITIES: &'static [u8] = &[0, 0];
 }
 
 /// `shep enable <name>`: what the config edit and, if a shepherd is
@@ -1643,6 +1670,30 @@ pub(crate) mod tests {
         );
     }
 
+    /// fails if `LambRows::headers()` and `LambRows::PRIORITIES` drift
+    /// apart -- the same drift `flock_priorities_line_up_with_flock_headers`
+    /// guards for `FlockRows`. Both columns are floor: a lamb has exactly
+    /// PID and NAME, and neither is less essential than the other.
+    #[test]
+    fn lamb_priorities_line_up_with_lamb_headers() {
+        let headers = LambRows::headers();
+        let priorities = LambRows::PRIORITIES;
+        assert_eq!(
+            headers.len(),
+            priorities.len(),
+            "headers() has {} columns but PRIORITIES has {} — they must move together",
+            headers.len(),
+            priorities.len(),
+        );
+        let floor: Vec<&str> = headers
+            .iter()
+            .zip(priorities)
+            .filter(|&(_, &p)| p == 0)
+            .map(|(&h, _)| h)
+            .collect();
+        assert_eq!(floor, vec!["PID", "NAME"]);
+    }
+
     /// fails if `SOURCE` renders the adopted binary's path into the table.
     /// A path is wider than every other column combined and would push
     /// UPTIME off a terminal — the same reason `FlockRows` keeps the log
@@ -1685,6 +1736,36 @@ pub(crate) mod tests {
             |j| &j[0],
             &["UPTIME", "CPU", "MEM", "SOURCE"],
         );
+    }
+
+    /// fails if `DogRows::headers()` and `DogRows::PRIORITIES` drift apart
+    /// -- the same drift `flock_priorities_line_up_with_flock_headers`
+    /// guards for `FlockRows`. NAME and STATUS are the floor: they are what
+    /// identify which dog a row is about, the same role ID/NAME/STATUS play
+    /// for a sheep. Before this test existed the type carried no
+    /// `PRIORITIES` override at all (the trait default, all zeros), which
+    /// meant this table never narrowed under a real terminal while the
+    /// sheep table directly above it did -- the dogs table wrapped and its
+    /// own borders broke at any width under about 75 columns. Reversed in
+    /// review; see this task's report for the fuller account.
+    #[test]
+    fn dog_priorities_line_up_with_dog_headers() {
+        let headers = DogRows::headers();
+        let priorities = DogRows::PRIORITIES;
+        assert_eq!(
+            headers.len(),
+            priorities.len(),
+            "headers() has {} columns but PRIORITIES has {} — they must move together",
+            headers.len(),
+            priorities.len(),
+        );
+        let floor: Vec<&str> = headers
+            .iter()
+            .zip(priorities)
+            .filter(|&(_, &p)| p == 0)
+            .map(|(&h, _)| h)
+            .collect();
+        assert_eq!(floor, vec!["NAME", "STATUS"]);
     }
 
     /// fails if `DogEnabledRow` grows a field that never reaches the table —
