@@ -1696,20 +1696,44 @@ fn exit_codes_and_stream_discipline() {
         .unwrap();
     assert_json_error(&usage, 2, "usage");
 
-    // A separate, never-created home: `flock` never autostarts (only
-    // `start` does, per `main.rs`), so "nonexistent directory" stays true
-    // for the whole invocation, unlike `start` against the same path.
+    // A separate home that exists but has never had a daemon: `flock` never
+    // autostarts (only `start` does, per `main.rs`), so "nothing is
+    // listening" stays true for the whole invocation, unlike `start` against
+    // the same path.
+    //
+    // The directory is created deliberately. An absent `--home` is now its
+    // own refusal, asserted just below, so a never-created path would prove
+    // the wrong thing here — it would never reach the connect at all.
     let cold = tempfile::tempdir().unwrap();
-    let missing_home = cold.path().join("gone");
-    let unreachable = shep(&missing_home)
+    let quiet_home = cold.path().join("no-daemon-here");
+    std::fs::create_dir_all(&quiet_home).unwrap();
+    let unreachable = shep(&quiet_home)
         .arg("--format")
         .arg("json")
         .arg("flock")
         .output()
         .unwrap();
     assert_json_error(&unreachable, 5, "daemon_unreachable");
-    // `missing_home` never had a daemon (that is the point of this
-    // sub-case) — nothing to gracefully kill there. `home` does.
+
+    // And a `--home` naming a directory that is not there is a usage error
+    // rather than an unreachable daemon, because there is no flock at that
+    // path to be unreachable. The likeliest cause is a typo, and creating it
+    // would leave a second empty flock for someone to lose processes in.
+    let missing_home = cold.path().join("gone");
+    let absent = shep(&missing_home)
+        .arg("--format")
+        .arg("json")
+        .arg("flock")
+        .output()
+        .unwrap();
+    assert_json_error(&absent, 2, "usage");
+    assert!(
+        !missing_home.exists(),
+        "a refused --home must be left on disk exactly as it was found"
+    );
+
+    // Neither of those homes ever had a daemon (that is the point of both
+    // sub-cases) — nothing to gracefully kill there. `home` does.
 
     graceful_kill(home);
 }
