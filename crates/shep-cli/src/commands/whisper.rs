@@ -63,9 +63,13 @@ pub async fn whisper(
     };
 
     match client.request(body).await {
-        Ok(Response::SentLine(rows)) => {
-            write_outcome(emit(&mut *streams.out, fmt, "whisper", SentLineRows(rows)))
-        }
+        Ok(Response::SentLine(rows)) => write_outcome(emit(
+            &mut *streams.out,
+            fmt,
+            "whisper",
+            SentLineRows(rows),
+            streams.style,
+        )),
         Ok(_unrecognised) => {
             let message = "the daemon answered with a response this client does not understand";
             let _ = emit_error(
@@ -117,6 +121,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             whisper(&client, &mut streams, Format::Table, args).await
         };
@@ -209,6 +214,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             whisper(&client, &mut streams, Format::Table, &args("ghost", "gc")).await
         };

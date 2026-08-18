@@ -188,10 +188,9 @@ const FLOOR_COLUMNS: usize = 3;
 /// table the same width, and that width inside the terminal unless the
 /// floor itself does not fit.
 ///
-/// Not called outside this module's own tests yet: the CLI surface that
-/// wires this into a real command is Task 5. `#[allow(dead_code)]` says so
-/// explicitly rather than inventing a call site nothing needs yet.
-#[allow(dead_code)]
+/// Called by [`super::table_of`], which every table-rendering command in
+/// `commands/` goes through — `emit`, `emit_flock` and `emit_described` all
+/// call it, never `render_boxed` directly.
 pub(crate) fn render_boxed(
     headers: &[&str],
     rows: &[Vec<String>],

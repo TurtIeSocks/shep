@@ -62,6 +62,7 @@ pub async fn trigger(
             fmt,
             "trigger",
             TriggeredRows(replies),
+            streams.style,
         )),
         Ok(_unrecognised) => {
             let message = "the daemon answered with a response this client does not understand";
@@ -111,6 +112,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             trigger(
                 &client,
@@ -144,6 +146,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             trigger(
                 &client,
@@ -176,6 +179,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
         let _ = trigger(
             &client,
@@ -218,6 +222,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             trigger(
                 &client,

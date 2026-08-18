@@ -42,6 +42,7 @@ pub use rows::{
 pub use table::{human_bytes, human_duration, local_timestamp, render_table};
 
 use crate::cli::Format;
+use crate::style::StyleLevel;
 
 /// Bumped only for a breaking change to any command's `data` shape.
 /// Additive fields do not bump it.
@@ -84,6 +85,22 @@ pub struct Streams<'a> {
     pub out: &'a mut dyn io::Write,
     /// Diagnostics and errors — what `emit_error` writes to.
     pub err: &'a mut dyn io::Write,
+    /// How much this invocation dresses up its output.
+    ///
+    /// Carried here rather than passed to `emit` on its own because
+    /// `Streams` already reaches every command, and a global would break
+    /// this crate's rule that presentation inputs are parameters, never a
+    /// call inside the function that renders (`commands/daemon.rs`'s
+    /// `ansi_enabled` follows the same rule for `NO_COLOR`).
+    ///
+    /// `Bare` is the field's documented safe value for a construction that
+    /// wants today's plain output — every test fixture in the crate uses it
+    /// — so a construction that reaches for the wrong default renders
+    /// exactly what shep printed before this feature, the safe direction to
+    /// fail. There is no `Default` impl to enforce that automatically:
+    /// `Streams` holds `&mut dyn io::Write`, which is not `Default`, so
+    /// every field is always named at the call site regardless.
+    pub style: StyleLevel,
 }
 
 impl std::fmt::Debug for Streams<'_> {
@@ -132,23 +149,31 @@ pub trait Render: Serialize {
     /// (`"note", // internal only, never shown to a user`); an entry with no
     /// comment is a review gap, not a pass.
     const JSON_ONLY: &'static [&'static str];
+
+    /// Per-column drop priority for [`table::render_boxed`], parallel to
+    /// [`Self::headers`]: index `i` here is the priority of column `i` there.
+    /// `0` never drops — [`table::render_boxed`]'s own floor. The default is all
+    /// zeros, so a payload type that does not implement this opts out of
+    /// adaptive dropping entirely rather than dropping in an order nobody
+    /// chose; [`rows::FlockRows`] is the one type that overrides it, per the
+    /// spec's own priority table.
+    const PRIORITIES: &'static [u8] = &[];
 }
 
-/// Renders `data` to `out` in `fmt`.
+/// Renders `data` to `out` as `fmt` calls for, boxed or plain per `style`.
 ///
-/// Not called outside this module's own tests yet: `commands/` — the code
-/// that will call it once a real payload exists to render — is Tasks 7-11.
-/// `#[allow(dead_code)]` says so explicitly rather than inventing a call
-/// site nothing needs yet.
+/// Called by every command in `commands/` once it has a real payload to
+/// render — `write_outcome(emit(&mut *streams.out, fmt, "<verb>", data,
+/// streams.style))` is the shape all of them share.
 ///
 /// # Errors
 /// The underlying write failed.
-#[allow(dead_code)]
 pub fn emit<T: Render>(
     out: &mut dyn io::Write,
     fmt: Format,
     command: &str,
     data: T,
+    style: StyleLevel,
 ) -> io::Result<()> {
     match fmt {
         Format::Json => {
@@ -160,7 +185,50 @@ pub fn emit<T: Render>(
             serde_json::to_writer(&mut *out, &envelope)?;
             writeln!(out)
         }
-        Format::Table => write!(out, "{}", render_table(&data)),
+        Format::Table => write!(out, "{}", table_of(&data, style)),
+    }
+}
+
+/// Renders one [`Render`] payload as [`render_table`] or [`table::render_boxed`],
+/// whichever `style` calls for.
+///
+/// The one branch [`emit`], [`emit_flock`] and [`emit_described`] all make on
+/// every table they render, factored out here so those four call sites stay
+/// one decision instead of reimplementing it four times. [`table::render_boxed`]
+/// needs a terminal width; [`terminal_width`] is the same unconditional-
+/// fallback measurement every one of them would otherwise recompute.
+fn table_of<T: Render>(data: &T, style: StyleLevel) -> String {
+    if style.boxes() {
+        table::render_boxed(T::headers(), &data.rows(), T::PRIORITIES, terminal_width())
+    } else {
+        render_table(data)
+    }
+}
+
+/// The terminal's width, or 80 when there is not one.
+///
+/// `crossterm` is a `shep-cli` dependency only inside its `cfg(unix)` block
+/// — deliberately, so a Windows build does not link a terminal stack it can
+/// never use — so the fallback is unconditional rather than an error path.
+/// A width of `0`, which some terminals and CI harnesses report, is treated
+/// the same as absent: `render_boxed` would otherwise read it as "drop every
+/// droppable column," for no reason a real terminal ever gave it.
+///
+/// Only ever consulted when [`table_of`] has already decided `style.boxes()`
+/// is true, and `style` is forced to [`StyleLevel::Bare`]
+/// (`lib.rs`'s `run_argv`) whenever stdout is not a terminal — so a real
+/// call here always has a real terminal behind it.
+fn terminal_width() -> usize {
+    #[cfg(unix)]
+    {
+        crossterm::terminal::size().map_or(80, |(w, _)| match w {
+            0 => 80,
+            w => usize::from(w),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        80
     }
 }
 
@@ -173,15 +241,15 @@ pub fn emit<T: Render>(
 /// rendering OF, so a consumer never has to reassemble one from two.
 ///
 /// `Format::Table` partitions `listing` on [`ProcessInfo::dog`], renders
-/// the sheep half through [`render_table::<FlockRows>`](render_table) as
-/// `flock` always has, and — only when the dogs half is non-empty — appends
-/// a blank line, a `Dogs` caption, and the dogs half through
-/// [`render_table::<DogRows>`](render_table). Nothing about widths,
-/// padding, char-counting or the empty-payload header rule is reimplemented
-/// here: both calls go through the one [`render_table`] every other payload
-/// uses, sized independently because the two tables share no columns. A
-/// flock with no dogs prints exactly what it printed before this type
-/// existed — no caption, no second table.
+/// the sheep half through [`table_of::<FlockRows>`](table_of) as `flock`
+/// always has, and — only when the dogs half is non-empty — appends a blank
+/// line, a `Dogs` caption, and the dogs half through
+/// [`table_of::<DogRows>`](table_of). Nothing about widths, padding,
+/// char-counting, the empty-payload header rule or the boxed/plain choice is
+/// reimplemented here: both calls go through the one [`table_of`] every
+/// other payload uses, sized independently because the two tables share no
+/// columns. A flock with no dogs prints exactly what it printed before this
+/// type existed — no caption, no second table.
 ///
 /// # Errors
 /// The underlying write failed.
@@ -195,18 +263,19 @@ pub fn emit_flock(
     fmt: Format,
     command: &str,
     listing: Vec<ProcessInfo>,
+    style: StyleLevel,
 ) -> io::Result<()> {
     match fmt {
-        Format::Json => emit(out, fmt, command, FlockRows(listing)),
+        Format::Json => emit(out, fmt, command, FlockRows(listing), style),
         Format::Table => {
             let (dogs, sheep): (Vec<ProcessInfo>, Vec<ProcessInfo>) =
                 listing.into_iter().partition(|p| p.dog.is_some());
-            write!(out, "{}", render_table(&FlockRows(sheep)))?;
+            write!(out, "{}", table_of(&FlockRows(sheep), style))?;
             if dogs.is_empty() {
                 return Ok(());
             }
             write!(out, "\nDogs\n")?;
-            write!(out, "{}", render_table(&DogRows(dogs)))
+            write!(out, "{}", table_of(&DogRows(dogs), style))
         }
     }
 }
@@ -221,10 +290,10 @@ pub fn emit_flock(
 /// follows for dogs.
 ///
 /// `Format::Table` renders the sheep through
-/// [`render_table::<FlockRows>`](render_table), exactly as `describe`
-/// always has, then — only for a sheep whose `lambs` is `Some` and
-/// non-empty — a blank line, a caption, and that sheep's lambs through
-/// [`render_table::<LambRows>`](render_table).
+/// [`table_of::<FlockRows>`](table_of), exactly as `describe` always has,
+/// then — only for a sheep whose `lambs` is `Some` and non-empty — a blank
+/// line, a caption, and that sheep's lambs through
+/// [`table_of::<LambRows>`](table_of).
 ///
 /// A sheep with no lambs, and a sheep whose reply did not walk for any,
 /// both print exactly what `describe` printed before this function
@@ -251,12 +320,13 @@ pub fn emit_described(
     fmt: Format,
     command: &str,
     listing: Vec<ProcessInfo>,
+    style: StyleLevel,
 ) -> io::Result<()> {
     match fmt {
-        Format::Json => emit(out, fmt, command, FlockRows(listing)),
+        Format::Json => emit(out, fmt, command, FlockRows(listing), style),
         Format::Table => {
             let flock = FlockRows(listing);
-            write!(out, "{}", render_table(&flock))?;
+            write!(out, "{}", table_of(&flock, style))?;
             for sheep in &flock.0 {
                 let Some(lambs) = &sheep.lambs else {
                     continue;
@@ -274,7 +344,7 @@ pub fn emit_described(
                         .pid
                         .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                 )?;
-                write!(out, "{}", render_table(&LambRows(lambs.clone())))?;
+                write!(out, "{}", table_of(&LambRows(lambs.clone()), style))?;
             }
             Ok(())
         }
@@ -505,13 +575,27 @@ mod tests {
     #[test]
     fn emit_honours_the_format_it_is_given() {
         let mut json_out = Vec::new();
-        emit(&mut json_out, Format::Json, "flock", sample_flock()).unwrap();
+        emit(
+            &mut json_out,
+            Format::Json,
+            "flock",
+            sample_flock(),
+            StyleLevel::Bare,
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&json_out).unwrap();
         assert_eq!(parsed["command"], "flock");
         assert_eq!(parsed["data"].as_array().unwrap().len(), 3);
 
         let mut table_out = Vec::new();
-        emit(&mut table_out, Format::Table, "flock", sample_flock()).unwrap();
+        emit(
+            &mut table_out,
+            Format::Table,
+            "flock",
+            sample_flock(),
+            StyleLevel::Bare,
+        )
+        .unwrap();
         let text = String::from_utf8(table_out).unwrap();
         assert!(text.contains("NAME"));
         assert!(
@@ -528,7 +612,14 @@ mod tests {
     #[test]
     fn a_flock_listing_prints_the_dogs_in_their_own_table() {
         let mut out = Vec::new();
-        emit_flock(&mut out, Format::Table, "flock", mixed_listing()).unwrap();
+        emit_flock(
+            &mut out,
+            Format::Table,
+            "flock",
+            mixed_listing(),
+            StyleLevel::Bare,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
 
         let (sheep_table, dogs_table) = text.split_once("\nDogs\n").expect("a Dogs caption");
@@ -549,7 +640,14 @@ mod tests {
     #[test]
     fn the_json_surface_stays_one_array_of_every_entry() {
         let mut out = Vec::new();
-        emit_flock(&mut out, Format::Json, "flock", mixed_listing()).unwrap();
+        emit_flock(
+            &mut out,
+            Format::Json,
+            "flock",
+            mixed_listing(),
+            StyleLevel::Bare,
+        )
+        .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(json["schema_version"], 1);
         assert_eq!(json["data"].as_array().unwrap().len(), 2);
@@ -564,7 +662,14 @@ mod tests {
     #[test]
     fn a_flock_with_no_dogs_prints_one_table_and_no_caption() {
         let mut out = Vec::new();
-        emit_flock(&mut out, Format::Table, "flock", vec![sheep_info("web")]).unwrap();
+        emit_flock(
+            &mut out,
+            Format::Table,
+            "flock",
+            vec![sheep_info("web")],
+            StyleLevel::Bare,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("Dogs"));
     }
@@ -581,7 +686,14 @@ mod tests {
             .lambs(Some(vec![Lamb::new(4243, "node")]))
             .build();
         let mut out = Vec::new();
-        emit_described(&mut out, Format::Table, "describe", vec![info]).unwrap();
+        emit_described(
+            &mut out,
+            Format::Table,
+            "describe",
+            vec![info],
+            StyleLevel::Bare,
+        )
+        .unwrap();
         let rendered = String::from_utf8(out).unwrap();
 
         assert!(rendered.contains("parent-pid descendants"), "{rendered}");
@@ -611,7 +723,14 @@ mod tests {
 
         for info in [bare, walked_empty] {
             let mut out = Vec::new();
-            emit_described(&mut out, Format::Table, "describe", vec![info.clone()]).unwrap();
+            emit_described(
+                &mut out,
+                Format::Table,
+                "describe",
+                vec![info.clone()],
+                StyleLevel::Bare,
+            )
+            .unwrap();
             let rendered = String::from_utf8(out).unwrap();
             assert!(!rendered.contains("Lambs of"), "{rendered}");
         }
@@ -628,7 +747,14 @@ mod tests {
             .lambs(Some(vec![Lamb::new(4243, "node")]))
             .build();
         let mut out = Vec::new();
-        emit_described(&mut out, Format::Json, "describe", vec![info]).unwrap();
+        emit_described(
+            &mut out,
+            Format::Json,
+            "describe",
+            vec![info],
+            StyleLevel::Bare,
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let rows = value["data"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
@@ -648,6 +774,7 @@ mod tests {
         let streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
         assert_eq!(format!("{streams:?}"), "Streams { .. }");
     }

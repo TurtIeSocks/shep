@@ -64,7 +64,13 @@ where
 {
     match client.request_with_deadline(body, deadline).await {
         Ok(response) => match extract(response) {
-            Some(payload) => write_outcome(emit(&mut *streams.out, fmt, command, payload)),
+            Some(payload) => write_outcome(emit(
+                &mut *streams.out,
+                fmt,
+                command,
+                payload,
+                streams.style,
+            )),
             None => {
                 let message = "the daemon answered with a response this client does not understand";
                 let _ = emit_error(
@@ -313,7 +319,13 @@ pub fn flush_daemon(streams: &mut Streams<'_>, fmt: Format, paths: &ShepPaths) -
         );
         return ExitCode::Failure;
     }
-    write_outcome(emit(&mut *streams.out, fmt, "flush", EmptiedFiles(emptied)))
+    write_outcome(emit(
+        &mut *streams.out,
+        fmt,
+        "flush",
+        EmptiedFiles(emptied),
+        streams.style,
+    ))
 }
 
 #[cfg(test)]
@@ -359,6 +371,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             let _ = reopen(&client, &mut streams, Format::Table, &args(input)).await;
             let sent = envelopes.recv().await.unwrap();
@@ -399,6 +412,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
 
         let _ = reopen(&client, &mut streams, Format::Table, &args("all")).await;
@@ -430,6 +444,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             reopen(&client, &mut streams, Format::Table, &args("/[/")).await
         };
@@ -454,6 +469,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
         let code = reopen(&client, &mut streams, Format::Table, &args("ghost")).await;
         assert_eq!(code, ExitCode::NotFound);
@@ -488,6 +504,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             let _ = flush(&client, &mut streams, Format::Table, &flush_args(input)).await;
             let sent = envelopes.recv().await.unwrap();
@@ -519,6 +536,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
 
         let _ = flush(&client, &mut streams, Format::Table, &flush_args("all")).await;
@@ -551,6 +569,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             flush(&client, &mut streams, Format::Table, &flush_args("/[/")).await
         };
@@ -588,6 +607,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
         let code = flush(&client, &mut streams, Format::Table, &flush_args("ghost")).await;
         assert_eq!(code, ExitCode::NotFound);
@@ -624,6 +644,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
 
         let code = flush_daemon(&mut streams, Format::Json, &paths);
@@ -661,6 +682,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
 
         let code = flush_daemon(&mut streams, Format::Json, &paths);
@@ -704,6 +726,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
 
         let code = flush_daemon(&mut streams, Format::Table, &paths);

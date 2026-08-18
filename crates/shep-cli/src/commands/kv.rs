@@ -58,7 +58,7 @@ pub fn set(
                 key: args.key.clone(),
                 value: args.value.clone(),
             }]);
-            write_outcome(emit(&mut *streams.out, fmt, "set", row))
+            write_outcome(emit(&mut *streams.out, fmt, "set", row, streams.style))
         }
         Err(err) => fail(streams, fmt, &err),
     }
@@ -86,7 +86,7 @@ pub fn get(
                         .map(|(key, value)| KvEntry { key, value })
                         .collect(),
                 );
-                write_outcome(emit(&mut *streams.out, fmt, "get", rows))
+                write_outcome(emit(&mut *streams.out, fmt, "get", rows, streams.style))
             }
             Err(err) => fail(streams, fmt, &err),
         };
@@ -98,7 +98,7 @@ pub fn get(
                 key: key.clone(),
                 value,
             }]);
-            write_outcome(emit(&mut *streams.out, fmt, "get", row))
+            write_outcome(emit(&mut *streams.out, fmt, "get", row, streams.style))
         }
         Ok(None) => {
             let message = format!("`{key}` is not set");
@@ -133,6 +133,7 @@ pub fn unset(
                 fmt,
                 "unset",
                 KvUnsetRow { removed },
+                streams.style,
             )),
             Err(err) => fail(streams, fmt, &err),
         };
@@ -151,6 +152,7 @@ pub fn unset(
             fmt,
             "unset",
             KvUnsetRow { removed: 1 },
+            streams.style,
         )),
         Ok(false) => {
             let message = format!("`{key}` is not set");
@@ -171,7 +173,11 @@ mod tests {
     use super::*;
 
     fn streams<'a>(out: &'a mut Vec<u8>, err: &'a mut Vec<u8>) -> Streams<'a> {
-        Streams { out, err }
+        Streams {
+            out,
+            err,
+            style: crate::style::StyleLevel::Bare,
+        }
     }
 
     /// `$SHEP_HOME` pinned to `dir` itself (not a nested `.shep`), so

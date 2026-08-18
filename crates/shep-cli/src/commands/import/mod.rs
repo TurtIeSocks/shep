@@ -164,7 +164,7 @@ pub fn import(streams: &mut Streams<'_>, fmt: Format, args: &ImportArgs) -> Exit
             })
             .collect(),
     );
-    write_outcome(emit(&mut *streams.out, fmt, "import", rows))
+    write_outcome(emit(&mut *streams.out, fmt, "import", rows, streams.style))
 }
 
 /// `args.from`, or `$HOME/.pm2/dump.pm2` if it names nothing.
@@ -259,6 +259,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out_buf,
                 err: &mut err_buf,
+                style: crate::style::StyleLevel::Bare,
             };
             import(
                 &mut streams,
@@ -286,6 +287,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out_buf,
                 err: &mut err_buf,
+                style: crate::style::StyleLevel::Bare,
             };
             import(&mut streams, Format::Table, &args(&dump, &out, true, false))
         };
@@ -320,6 +322,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out_buf,
                 err: &mut err_buf,
+                style: crate::style::StyleLevel::Bare,
             };
             let _ = import(&mut streams, Format::Table, &args(&dump, &out, true, false));
         }
@@ -345,6 +348,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out_buf,
                 err: &mut err_buf,
+                style: crate::style::StyleLevel::Bare,
             };
             import(
                 &mut streams,
@@ -373,6 +377,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out_buf,
                 err: &mut err_buf,
+                style: crate::style::StyleLevel::Bare,
             };
             import(
                 &mut streams,

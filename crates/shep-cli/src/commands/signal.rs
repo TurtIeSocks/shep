@@ -69,6 +69,7 @@ pub async fn signal(
             fmt,
             "signal",
             SignalledRows(replies),
+            streams.style,
         )),
         Ok(_unrecognised) => {
             let message = "the daemon answered with a response this client does not understand";
@@ -119,6 +120,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             signal(&client, &mut streams, Format::Table, &args("/[/", "hup")).await
         };
@@ -142,6 +144,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             signal(
                 &client,
@@ -175,6 +178,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             signal(
                 &client,
@@ -203,6 +207,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
         let _ = signal(&client, &mut streams, Format::Table, &args("web", "hup")).await;
 
@@ -232,6 +237,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             signal(&client, &mut streams, Format::Table, &args("web", "hup")).await
         };

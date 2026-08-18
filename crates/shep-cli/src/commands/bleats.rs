@@ -714,6 +714,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -773,6 +774,7 @@ mod tests {
                 let mut streams = Streams {
                     out: &mut out,
                     err: &mut err,
+                    style: crate::style::StyleLevel::Bare,
                 };
                 tokio::time::timeout(
                     RUN_TIMEOUT,
@@ -824,6 +826,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -870,6 +873,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
 
         let args = follow_args("all");
@@ -918,6 +922,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -956,6 +961,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -1000,6 +1006,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -1051,6 +1058,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -1115,6 +1123,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -1170,6 +1179,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -1228,6 +1238,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -1301,6 +1312,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -1356,6 +1368,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -1400,6 +1413,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -1455,6 +1469,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -1525,6 +1540,7 @@ mod tests {
                 let mut streams = Streams {
                     out: &mut out,
                     err: &mut err,
+                    style: crate::style::StyleLevel::Bare,
                 };
                 tokio::time::timeout(
                     RUN_TIMEOUT,
@@ -1577,6 +1593,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -1633,6 +1650,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -1683,6 +1701,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -1728,6 +1747,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
@@ -1774,6 +1794,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,

@@ -130,6 +130,14 @@ pub struct GlobalArgs {
     /// own line or a real error, both of which still print regardless.
     #[arg(short, long, global = true)]
     pub quiet: bool,
+    /// How much this invocation dresses up its output: `full`, `plain`, or
+    /// `bare`
+    ///
+    /// Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`, which is
+    /// [`crate::style::resolve`]'s whole precedence order — `shep style`
+    /// reports which of the three answered. Omit to let those decide.
+    #[arg(long, global = true, value_enum)]
+    pub style: Option<crate::style::StyleLevel>,
     /// Talk to a different shepherd
     ///
     /// Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You
@@ -1577,6 +1585,29 @@ mod tests {
         assert_eq!(cli.global.format, Format::Table);
         let cli = Cli::try_parse_from(["shep", "--format", "json", "flock"]).unwrap();
         assert_eq!(cli.global.format, Format::Json);
+    }
+
+    /// fails if `--style` stops being optional (a run must still work with
+    /// nothing said, falling through to `$SHEP_STYLE`/`shep.toml`/default —
+    /// see `style::resolve`), or if a level clap now rejects or mis-parses.
+    #[test]
+    fn style_flag_defaults_to_unset_and_accepts_the_three_levels() {
+        use crate::style::StyleLevel;
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["shep", "flock"]).unwrap();
+        assert_eq!(cli.global.style, None);
+
+        for (raw, expected) in [
+            ("full", StyleLevel::Full),
+            ("plain", StyleLevel::Plain),
+            ("bare", StyleLevel::Bare),
+        ] {
+            let cli = Cli::try_parse_from(["shep", "--style", raw, "flock"]).unwrap();
+            assert_eq!(cli.global.style, Some(expected), "--style {raw}");
+        }
+
+        assert!(Cli::try_parse_from(["shep", "--style", "loud", "flock"]).is_err());
     }
 
     /// `std::env::set_var` is `unsafe` in edition 2024 and this crate is

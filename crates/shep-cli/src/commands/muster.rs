@@ -32,6 +32,7 @@ pub async fn save(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> Ex
             fmt,
             "save",
             SavedRollRow { file: path, apps },
+            streams.style,
         )),
         Ok(_unrecognised) => {
             let message = "the daemon answered with a response this client does not understand";
@@ -91,7 +92,13 @@ pub async fn muster(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> 
                     "the muster roll restored nothing",
                 );
             }
-            write_outcome(emit(&mut *streams.out, fmt, "muster", FlockRows(procs)))
+            write_outcome(emit(
+                &mut *streams.out,
+                fmt,
+                "muster",
+                FlockRows(procs),
+                streams.style,
+            ))
         }
         Ok(_unrecognised) => {
             let message = "the daemon answered with a response this client does not understand";
@@ -142,6 +149,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
         let _ = save(&client, &mut streams, Format::Table).await;
 
@@ -171,6 +179,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             save(&client, &mut streams, Format::Table).await
         };
@@ -193,6 +202,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
         let _ = muster(&client, &mut streams, Format::Table).await;
 
@@ -240,6 +250,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             muster(&client, &mut streams, Format::Table).await
         };

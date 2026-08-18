@@ -401,7 +401,13 @@ where
 {
     match client.request_with_deadline(body, deadline).await {
         Ok(response) => match extract(response) {
-            Some(payload) => write_outcome(emit(&mut *streams.out, fmt, command, payload)),
+            Some(payload) => write_outcome(emit(
+                &mut *streams.out,
+                fmt,
+                command,
+                payload,
+                streams.style,
+            )),
             None => {
                 let message = "the daemon answered with a response this client does not understand";
                 let _ = emit_error(

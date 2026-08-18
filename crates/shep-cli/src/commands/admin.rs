@@ -90,6 +90,7 @@ pub async fn kill_with_wait(
                         pid,
                         socket_removed: true,
                     },
+                    streams.style,
                 ))
             } else {
                 let message = "the daemon acknowledged shutdown, but teardown is still in progress";
@@ -161,6 +162,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             kill(client, &mut streams, Format::Table).await
         };
@@ -187,6 +189,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             kill_with_wait(
                 client,

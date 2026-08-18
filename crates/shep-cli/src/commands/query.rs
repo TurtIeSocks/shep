@@ -52,7 +52,13 @@ where
 {
     match client.request(body).await {
         Ok(response) => match extract(response) {
-            Some(payload) => write_outcome(emit(&mut *streams.out, fmt, command, payload)),
+            Some(payload) => write_outcome(emit(
+                &mut *streams.out,
+                fmt,
+                command,
+                payload,
+                streams.style,
+            )),
             None => {
                 let message = "the daemon answered with a response this client does not understand";
                 let _ = emit_error(
@@ -91,9 +97,13 @@ async fn describe_selector(
     selector: SelectorSpec,
 ) -> ExitCode {
     match client.request(Request::Describe { selector }).await {
-        Ok(Response::Described(procs)) => {
-            write_outcome(emit_described(&mut *streams.out, fmt, command, procs))
-        }
+        Ok(Response::Described(procs)) => write_outcome(emit_described(
+            &mut *streams.out,
+            fmt,
+            command,
+            procs,
+            streams.style,
+        )),
         Ok(_) => {
             let message = "the daemon answered with a response this client does not understand";
             let _ = emit_error(
@@ -170,7 +180,13 @@ pub fn flock_from_roll(streams: &mut Streams<'_>, fmt: Format, paths: &ShepPaths
     // there is nothing. JSON still gets the empty array, because a script
     // parsing this wants one shape, not two.
     if !(empty && fmt == Format::Table) {
-        let _ = emit(&mut *streams.out, fmt, "flock", RolledSheepRows(sheep));
+        let _ = emit(
+            &mut *streams.out,
+            fmt,
+            "flock",
+            RolledSheepRows(sheep),
+            streams.style,
+        );
     }
     if fmt == Format::Table && !empty {
         let _ = writeln!(streams.err, "`shep muster` brings them back.");
@@ -190,9 +206,13 @@ pub fn flock_from_roll(streams: &mut Streams<'_>, fmt: Format, paths: &ShepPaths
 /// here has.
 pub async fn flock(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> ExitCode {
     match client.request(Request::ListFlock).await {
-        Ok(Response::Flock(procs)) => {
-            write_outcome(emit_flock(&mut *streams.out, fmt, "flock", procs))
-        }
+        Ok(Response::Flock(procs)) => write_outcome(emit_flock(
+            &mut *streams.out,
+            fmt,
+            "flock",
+            procs,
+            streams.style,
+        )),
         Ok(_) => {
             let message = "the daemon answered with a response this client does not understand";
             let _ = emit_error(
@@ -321,6 +341,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
         let _ = flock(&client, &mut streams, Format::Table).await;
         let sent = tokio::time::timeout(RECV_TIMEOUT, envelopes.recv())
@@ -353,6 +374,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             let args = SelectorArgs {
                 selectors: vec![input.into()],
@@ -387,6 +409,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             describe(
                 &client,
@@ -418,6 +441,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
         let _ = fold(
             &client,
@@ -462,6 +486,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             flock(&client, &mut streams, Format::Json).await
         };
@@ -493,6 +518,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             describe(
                 &client,

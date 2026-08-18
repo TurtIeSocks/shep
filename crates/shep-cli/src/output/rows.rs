@@ -103,6 +103,17 @@ impl Render for FlockRows {
         // every other verb answering `ProcessInfo`.
         "lambs",
     ];
+
+    // Parallel to `headers()` above: `["ID", "NAME", "STATUS", "PID",
+    // "RESTARTS", "CPU", "MEM", "UPTIME", "FOLD"]`. `flock` is the table
+    // this whole feature is drawn of, so it is the one payload type the
+    // design spec gives an explicit priority table: ID/NAME/STATUS never
+    // drop (`0`), then UPTIME, PID, MEM, RESTARTS, CPU, FOLD, in that
+    // dropping order. `flock_priorities_line_up_with_flock_headers` (below)
+    // pins both the length and which three columns sit at `0`, because
+    // these two arrays drift silently -- a header inserted without its
+    // priority shifts every priority after it onto the wrong column.
+    const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 5, 3, 1, 6];
 }
 
 /// The dogs half of a flock listing: the `ProcessInfo`s whose `dog` marker
@@ -1526,6 +1537,37 @@ pub(crate) mod tests {
         // not raw echoes of `uptime_ms`/`cpu_percent`/`memory_bytes` — see
         // the doc comment on `assert_no_drift` above.
         assert_no_drift(&sample_flock(), |j| &j[0], &["UPTIME", "CPU", "MEM"]);
+    }
+
+    /// fails if `FlockRows::headers()` and `FlockRows::PRIORITIES` drift
+    /// apart. The two are parallel arrays edited by hand in two different
+    /// places, and nothing but this test notices a header inserted (or
+    /// reordered) without its priority: every priority after the gap would
+    /// silently point at the wrong column, and `render_boxed` would start
+    /// dropping the wrong one under a narrow terminal.
+    #[test]
+    fn flock_priorities_line_up_with_flock_headers() {
+        let headers = FlockRows::headers();
+        let priorities = FlockRows::PRIORITIES;
+        assert_eq!(
+            headers.len(),
+            priorities.len(),
+            "headers() has {} columns but PRIORITIES has {} — they must move together",
+            headers.len(),
+            priorities.len(),
+        );
+
+        // ID/NAME/STATUS are the floor `render_boxed` refuses to drop below
+        // -- a table that cannot say which sheep a row is about has stopped
+        // being a table -- so they are exactly the three columns priority
+        // `0` must name, in this order.
+        let floor: Vec<&str> = headers
+            .iter()
+            .zip(priorities)
+            .filter(|&(_, &p)| p == 0)
+            .map(|(&h, _)| h)
+            .collect();
+        assert_eq!(floor, vec!["ID", "NAME", "STATUS"]);
     }
 
     /// fails if `LambRows` grows a field that never reaches the table, or

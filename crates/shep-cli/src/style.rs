@@ -9,7 +9,14 @@ use std::fmt;
 /// wants a calmer table, and someone who wants today's output wants all of
 /// it gone. `NO_COLOR` remains orthogonal because it is a cross-ecosystem
 /// convention about colour alone, not about layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `clap::ValueEnum` so `--style` and this type's own [`Self::parse`] agree
+/// on spelling by construction: clap's derive and `parse` both lowercase the
+/// variant name, so `full`/`plain`/`bare` is the one grammar, read by the
+/// flag, `$SHEP_STYLE`, and `shep.toml`'s `[style] level` alike (the latter
+/// two go through [`clap::ValueEnum::from_str`], the flag through clap's own
+/// parser).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum StyleLevel {
     /// Sheep, boxes and colour.
     Full,
@@ -23,9 +30,9 @@ pub(crate) enum StyleLevel {
 impl StyleLevel {
     /// Whether sheep appear at all.
     ///
-    /// Not called outside this module's own tests yet: the renderer that
-    /// reads it is Task 5. `#[allow(dead_code)]` says so explicitly rather
-    /// than inventing a call site nothing needs yet.
+    /// Not called outside this module's own tests yet: sheep art itself is
+    /// Task 6's job. `#[allow(dead_code)]` says so explicitly rather than
+    /// inventing a call site nothing needs yet.
     #[allow(dead_code)]
     pub(crate) const fn sheep(self) -> bool {
         matches!(self, Self::Full)
@@ -33,9 +40,12 @@ impl StyleLevel {
 
     /// Whether tables are box-drawn.
     ///
-    /// Not called outside this module's own tests yet, for the same reason
-    /// [`Self::sheep`] carries the same attribute.
-    #[allow(dead_code)]
+    /// Read by `output`'s private `table_of` helper, which is how every
+    /// table renderer in the crate picks between
+    /// [`crate::output::render_table`] and `table.rs`'s own `render_boxed`
+    /// -- both `table_of` and `render_boxed` are `output`-internal, so this
+    /// doc names them in prose rather than as intra-doc links a reader
+    /// outside that module could not follow anyway.
     pub(crate) const fn boxes(self) -> bool {
         matches!(self, Self::Full | Self::Plain)
     }
@@ -43,8 +53,10 @@ impl StyleLevel {
     /// Whether anything is coloured. `NO_COLOR` can still veto this; it
     /// cannot enable it.
     ///
-    /// Not called outside this module's own tests yet, for the same reason
-    /// [`Self::sheep`] carries the same attribute.
+    /// Not called outside this module's own tests yet: nothing this crate
+    /// renders emits colour before Task 6, so there is nothing yet for this
+    /// to gate. `#[allow(dead_code)]` says so explicitly rather than
+    /// inventing a call site nothing needs yet.
     #[allow(dead_code)]
     pub(crate) const fn colour(self) -> bool {
         matches!(self, Self::Full | Self::Plain)

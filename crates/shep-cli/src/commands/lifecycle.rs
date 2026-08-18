@@ -388,7 +388,13 @@ where
 {
     match client.request_with_deadline(body, deadline).await {
         Ok(response) => match extract(response) {
-            Some(payload) => write_outcome(emit(&mut *streams.out, fmt, command, payload)),
+            Some(payload) => write_outcome(emit(
+                &mut *streams.out,
+                fmt,
+                command,
+                payload,
+                streams.style,
+            )),
             None => {
                 let message = "the daemon answered with a response this client does not understand";
                 let _ = emit_error(
@@ -582,7 +588,13 @@ pub async fn start(
         let mut started = Vec::new();
         let code = start_one(client, streams, fmt, args, None, discovered, &mut started).await;
         if !started.is_empty() {
-            let wrote = write_outcome(emit(&mut *streams.out, fmt, "start", FlockRows(started)));
+            let wrote = write_outcome(emit(
+                &mut *streams.out,
+                fmt,
+                "start",
+                FlockRows(started),
+                streams.style,
+            ));
             if wrote != ExitCode::Success {
                 return wrote;
             }
@@ -613,7 +625,13 @@ pub async fn start(
     // header per target would be the only place in the CLI where asking for
     // three things prints three tables.
     if !started.is_empty() {
-        let wrote = write_outcome(emit(&mut *streams.out, fmt, "start", FlockRows(started)));
+        let wrote = write_outcome(emit(
+            &mut *streams.out,
+            fmt,
+            "start",
+            FlockRows(started),
+            streams.style,
+        ));
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -769,7 +787,13 @@ pub async fn stop(
     )
     .await;
     if !procs.is_empty() {
-        let wrote = write_outcome(emit(&mut *streams.out, fmt, "stop", FlockRows(procs)));
+        let wrote = write_outcome(emit(
+            &mut *streams.out,
+            fmt,
+            "stop",
+            FlockRows(procs),
+            streams.style,
+        ));
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -802,7 +826,13 @@ pub async fn restart(
     )
     .await;
     if !procs.is_empty() {
-        let wrote = write_outcome(emit(&mut *streams.out, fmt, "restart", FlockRows(procs)));
+        let wrote = write_outcome(emit(
+            &mut *streams.out,
+            fmt,
+            "restart",
+            FlockRows(procs),
+            streams.style,
+        ));
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -844,7 +874,13 @@ pub async fn reload(
     )
     .await;
     if !procs.is_empty() {
-        let wrote = write_outcome(emit(&mut *streams.out, fmt, "reload", FlockRows(procs)));
+        let wrote = write_outcome(emit(
+            &mut *streams.out,
+            fmt,
+            "reload",
+            FlockRows(procs),
+            streams.style,
+        ));
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -877,7 +913,13 @@ pub async fn delete(
     )
     .await;
     if !ids.is_empty() {
-        let wrote = write_outcome(emit(&mut *streams.out, fmt, "delete", DeletedIds(ids)));
+        let wrote = write_outcome(emit(
+            &mut *streams.out,
+            fmt,
+            "delete",
+            DeletedIds(ids),
+            streams.style,
+        ));
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -954,6 +996,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             let _ = start(
                 &client,
@@ -1244,6 +1287,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             start(
                 &client,
@@ -1291,6 +1335,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             start(
                 &client,
@@ -1322,6 +1367,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             start(
                 &client,
@@ -1394,6 +1440,7 @@ mod tests {
                 let mut streams = Streams {
                     out: &mut out,
                     err: &mut err,
+                    style: crate::style::StyleLevel::Bare,
                 };
                 let args = SelectorArgs {
                     selectors: vec![input.into()],
@@ -1442,6 +1489,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             stop(
                 &client,
@@ -1471,6 +1519,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
         let code = stop(
             &client,
@@ -1513,6 +1562,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
 
         let _ = start(
@@ -1562,6 +1612,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
         let mut args = start_args(srv.to_str().unwrap());
         args.fold = Some("backend".to_string());
@@ -1592,6 +1643,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style: crate::style::StyleLevel::Bare,
         };
         let _ = stock(
             &client,
@@ -1633,6 +1685,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style: crate::style::StyleLevel::Bare,
             };
             stock(
                 &client,

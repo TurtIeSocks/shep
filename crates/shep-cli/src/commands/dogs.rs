@@ -145,7 +145,7 @@ async fn enable_after_config(
             shepherd_acted: false,
             status: NO_SHEPHERD_ENABLE_STATUS.to_string(),
         };
-        return write_outcome(emit(&mut *streams.out, fmt, "enable", row));
+        return write_outcome(emit(&mut *streams.out, fmt, "enable", row, streams.style));
     };
     // An `EnableDog` reaching a name a sheep already holds comes back as
     // `RpcErrorCode::InvalidConfig` with the daemon's own message naming
@@ -164,7 +164,7 @@ async fn enable_after_config(
                 shepherd_acted: true,
                 status: info.status.to_string(),
             };
-            write_outcome(emit(&mut *streams.out, fmt, "enable", row))
+            write_outcome(emit(&mut *streams.out, fmt, "enable", row, streams.style))
         }
         Ok(_) => {
             let message = "the daemon answered with a response this client does not understand";
@@ -224,7 +224,7 @@ async fn disable_after_config(
             shepherd_acted: false,
             status: NO_SHEPHERD_DISABLE_STATUS.to_string(),
         };
-        return write_outcome(emit(&mut *streams.out, fmt, "disable", row));
+        return write_outcome(emit(&mut *streams.out, fmt, "disable", row, streams.style));
     };
     // `Response::Deleted`, the same reply `Delete` gives — `DisableDog`'s
     // own doc (`shep-core/src/protocol/request.rs`) says disabling
@@ -243,7 +243,7 @@ async fn disable_after_config(
                 shepherd_acted: true,
                 status: DISABLED_STATUS.to_string(),
             };
-            write_outcome(emit(&mut *streams.out, fmt, "disable", row))
+            write_outcome(emit(&mut *streams.out, fmt, "disable", row, streams.style))
         }
         Ok(_) => {
             let message = "the daemon answered with a response this client does not understand";
@@ -604,7 +604,7 @@ async fn adopt_after_config(
             shepherd_acted: false,
             status: NO_SHEPHERD_ENABLE_STATUS.to_string(),
         };
-        return write_outcome(emit(&mut *streams.out, fmt, "adopt", row));
+        return write_outcome(emit(&mut *streams.out, fmt, "adopt", row, streams.style));
     };
     let request = Request::EnableDog {
         name: name.to_string(),
@@ -618,7 +618,7 @@ async fn adopt_after_config(
                 shepherd_acted: true,
                 status: info.status.to_string(),
             };
-            write_outcome(emit(&mut *streams.out, fmt, "adopt", row))
+            write_outcome(emit(&mut *streams.out, fmt, "adopt", row, streams.style))
         }
         Ok(_) => {
             let message = "the daemon answered with a response this client does not understand";
@@ -683,7 +683,7 @@ async fn rehome_after_config(
             shepherd_acted: false,
             status: NO_SHEPHERD_DISABLE_STATUS.to_string(),
         };
-        return write_outcome(emit(&mut *streams.out, fmt, "rehome", row));
+        return write_outcome(emit(&mut *streams.out, fmt, "rehome", row, streams.style));
     };
     match client
         .request(Request::DisableDog {
@@ -698,7 +698,7 @@ async fn rehome_after_config(
                 shepherd_acted: true,
                 status: DISABLED_STATUS.to_string(),
             };
-            write_outcome(emit(&mut *streams.out, fmt, "rehome", row))
+            write_outcome(emit(&mut *streams.out, fmt, "rehome", row, streams.style))
         }
         Ok(_) => {
             let message = "the daemon answered with a response this client does not understand";
@@ -753,7 +753,13 @@ pub fn barks(
         let keep_from = history.len().saturating_sub(tail);
         history.drain(..keep_from);
     }
-    write_outcome(emit(&mut *streams.out, fmt, "barks", BarkRows(history)))
+    write_outcome(emit(
+        &mut *streams.out,
+        fmt,
+        "barks",
+        BarkRows(history),
+        streams.style,
+    ))
 }
 
 #[cfg(test)]
@@ -767,7 +773,11 @@ mod tests {
     use super::*;
 
     fn streams<'a>(out: &'a mut Vec<u8>, err: &'a mut Vec<u8>) -> Streams<'a> {
-        Streams { out, err }
+        Streams {
+            out,
+            err,
+            style: crate::style::StyleLevel::Bare,
+        }
     }
 
     /// fails if `enable` sends anything but `EnableDog` with the name and

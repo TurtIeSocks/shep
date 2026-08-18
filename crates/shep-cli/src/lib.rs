@@ -202,7 +202,18 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
             err.exit();
         }
     };
-    std::process::ExitCode::from(runtime.block_on(run(cli)) as u8)
+    // Resolved once, here, and passed down rather than re-derived at each of
+    // the two `run` arms (`cfg(unix)`/`cfg(windows)`) or at every `Streams`
+    // construction inside them — see `resolve_style` and `must_render_bare`
+    // for why the two steps (what is configured, and whether the hard rule
+    // overrides it) are kept separate.
+    let (configured, _source) = resolve_style(&cli.global);
+    let style = if must_render_bare(std::io::stdout().is_terminal(), cli.global.format) {
+        style::StyleLevel::Bare
+    } else {
+        configured
+    };
+    std::process::ExitCode::from(runtime.block_on(run(cli, style)) as u8)
 }
 
 /// Prints the one-line shepherd status to stderr, for an invocation clap
@@ -226,6 +237,10 @@ async fn print_shepherd_status(argv: &[OsString]) {
         home: None,
         format: Format::Table,
         quiet: false,
+        // This status line is plain prose to stderr, not a rendered
+        // command's table — nothing here reads `style`, so there is no
+        // level for this synthetic `GlobalArgs` to get right.
+        style: None,
     };
     let Ok(paths) = resolve_paths(&global) else {
         return;
@@ -251,11 +266,11 @@ async fn print_shepherd_status(argv: &[OsString]) {
 /// `--home` invocation still works in an environment with no `$HOME` at all.
 ///
 /// Pure tier on purpose (no `#[cfg(unix)]`): its own test runs on every
-/// target. The Windows build's `run` does not call it yet — refusing
-/// outright is the whole Windows deliverable for now — so this function is
-/// only reachable from non-test code on unix; `#[cfg_attr]` says so
-/// explicitly rather than leaving an unexplained Windows-only warning.
-#[cfg_attr(windows, allow(dead_code))]
+/// target, and [`resolve_style`] below calls it from `run_argv` — shared,
+/// unconditional code — to find `shep.toml` for the style level's config
+/// layer. That is the one Windows call site today; the Windows build's `run`
+/// itself still does not call it, since refusing outright is the whole
+/// Windows deliverable for now.
 fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
     let env = |key: &str| match key {
         "SHEP_HOME" => global
@@ -270,6 +285,82 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
         (None, None) => return Err(ExitCode::Usage),
     };
     Ok(ShepPaths::resolve(&env, &home_dir))
+}
+
+/// Parses `shep.toml`'s `[style] level` into a [`style::StyleLevel`].
+///
+/// `None` covers every way this layer can say nothing: no file, a file that
+/// will not parse, no `[style]` table, or a `level` this build does not
+/// recognise. All of those read the same as "the config did not answer" —
+/// [`style::resolve`]'s own contract for its `config` parameter — rather
+/// than as a refusal, matching [`whistle::gate::resolve_control`]'s reading
+/// of a broken `shep.toml` as "no" rather than an error.
+///
+/// Takes the file's already-read text, not a path, for the same reason
+/// `resolve_control` does: every case becomes a pure function of a string,
+/// testable without a tempdir.
+///
+/// The `&|_| None` environment closure is [`shep_core::config::DaemonConfig::load`]'s
+/// layering for `SHEP_LOG_JSON`/`SHEP_LOG_LEVEL`/`SHEP_SOCKET`/
+/// `SHEP_MAX_CRON_SLEEP` — none of which touches `[style]` in either
+/// direction, so `None` here defends nothing and costs nothing either.
+fn style_from_config(shep_toml: Option<&str>) -> Option<style::StyleLevel> {
+    use clap::ValueEnum;
+    shep_core::config::DaemonConfig::load(shep_toml, &|_| None)
+        .ok()?
+        .style
+        .level
+        .and_then(|raw| style::StyleLevel::from_str(&raw, true).ok())
+}
+
+/// Resolves the level in force and which layer chose it: `--style`, then
+/// `$SHEP_STYLE`, then `shep.toml`'s `[style] level`, then `full` —
+/// [`style::resolve`]'s own precedence order.
+///
+/// Reads `shep.toml` itself via [`resolve_paths`] rather than waiting for
+/// [`ensure_home`]: `--style` and `$SHEP_STYLE` must still work with no
+/// `$SHEP_HOME` resolvable at all (a container with no `$HOME`, say), and
+/// `resolve_paths` is the side-effect-free half of path resolution — unlike
+/// `ensure_home`, it never creates a directory just to answer this question.
+/// A `shep.toml` that cannot be read yet (paths unresolved, or the file is
+/// simply not there) reads the same as an empty config: the layer below it
+/// in precedence answers instead.
+///
+/// This is deliberately NOT where the hard rule (`--format json` and a
+/// non-terminal stdout force [`style::StyleLevel::Bare`]) is applied — see
+/// [`run_argv`]. `shep style`'s own report reads this function's unforced
+/// result: an operator piping `shep style | cat` needs to see what is
+/// actually configured, not `bare` every time regardless, which is exactly
+/// the "edited shep.toml and saw nothing change" failure
+/// [`style::StyleSource`]'s doc says this command exists to prevent.
+fn resolve_style(global: &GlobalArgs) -> (style::StyleLevel, style::StyleSource) {
+    let config_text = resolve_paths(global)
+        .ok()
+        .and_then(|paths| std::fs::read_to_string(paths.daemon_config).ok());
+    style::resolve(
+        global.style,
+        std::env::var("SHEP_STYLE").ok().as_deref(),
+        style_from_config(config_text.as_deref()),
+    )
+}
+
+/// Whether output must render exactly as it always has: no boxes, no
+/// colour, no sheep, regardless of what `--style`/`$SHEP_STYLE`/`shep.toml`
+/// asked for.
+///
+/// The hard rule from the spec (`docs/brainstorming/specs/2026-08-18-pretty-cli-design.md`
+/// §3, "The hard rule"): piped output and `--format json` must be
+/// byte-identical to before this feature, because `cli_e2e` asserts exact
+/// stdout through a pipe and `shep completions` writes ~1900 lines of shell
+/// a stray escape would execute as code.
+///
+/// Takes terminal-ness as a parameter rather than calling `is_terminal()`
+/// itself, matching this crate's own idiom for a presentation input
+/// (`commands/daemon.rs`'s `ansi_enabled` does the same for `NO_COLOR`): the
+/// real call happens once, at [`run_argv`], and this stays a pure decision
+/// the test below can exercise directly.
+fn must_render_bare(stdout_is_terminal: bool, fmt: cli::Format) -> bool {
+    !stdout_is_terminal || fmt == cli::Format::Json
 }
 
 /// Why [`ensure_home`] would not hand back a layout.
@@ -464,8 +555,16 @@ fn ensure_home_at(paths: ShepPaths, explicit: bool) -> Result<(ShepPaths, bool),
 /// block below, for the unrelated reason that block's own comment gives —
 /// it runs until signalled, so it may not hold a stdout/stderr guard for a
 /// process lifetime.
+///
+/// `style` is [`run_argv`]'s resolved level, already forced to
+/// [`style::StyleLevel::Bare`] there if the hard rule applies — every
+/// `Streams` this function builds carries it unchanged. `Commands::Style`
+/// is the one exception: its own report reads [`resolve_style`] again,
+/// unforced, because it answers a different question ("what is
+/// configured") than every other arm's `style` field does ("how do I
+/// render this table").
 #[cfg(unix)]
-async fn run(cli: Cli) -> ExitCode {
+async fn run(cli: Cli, style: style::StyleLevel) -> ExitCode {
     let fmt = cli.global.format;
 
     // `StdoutLock`/`StderrLock` are process-wide and are held for as long as
@@ -543,6 +642,7 @@ async fn run(cli: Cli) -> ExitCode {
                 let mut streams = Streams {
                     out: &mut sink,
                     err: &mut err,
+                    style,
                 };
                 welcome::on_first_run(
                     &mut streams,
@@ -556,6 +656,7 @@ async fn run(cli: Cli) -> ExitCode {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style,
             };
             return startup::startup(&mut streams, fmt, Some(paths.home.as_path()), args);
         }
@@ -565,6 +666,7 @@ async fn run(cli: Cli) -> ExitCode {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style,
             };
             return startup::unstartup(&mut streams, fmt, args);
         }
@@ -576,6 +678,7 @@ async fn run(cli: Cli) -> ExitCode {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
+                style,
             };
             return schema::schema(&mut streams, fmt);
         }
@@ -597,6 +700,7 @@ async fn run(cli: Cli) -> ExitCode {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style,
         };
         return dev::dev(
             &mut streams,
@@ -625,6 +729,7 @@ async fn run(cli: Cli) -> ExitCode {
         let mut streams = Streams {
             out: &mut sink,
             err: &mut err,
+            style,
         };
         welcome::on_first_run(
             &mut streams,
@@ -653,6 +758,7 @@ async fn run(cli: Cli) -> ExitCode {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style,
         };
         return match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => bleats::bleats(&client, &mut streams, fmt, cli.global.quiet, args).await,
@@ -670,6 +776,7 @@ async fn run(cli: Cli) -> ExitCode {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style,
         };
         return lookout::lookout(&mut streams, fmt, &paths, args).await;
     }
@@ -686,6 +793,7 @@ async fn run(cli: Cli) -> ExitCode {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style,
         };
         return serve_command(&mut streams, fmt, &paths, args).await;
     }
@@ -702,6 +810,7 @@ async fn run(cli: Cli) -> ExitCode {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
+            style,
         };
         return runtime::runtime(&mut streams, fmt, cli.global.quiet, paths, args).await;
     }
@@ -722,6 +831,7 @@ async fn run(cli: Cli) -> ExitCode {
     let mut streams = Streams {
         out: &mut out,
         err: &mut err,
+        style,
     };
 
     match cli.command {
@@ -739,12 +849,14 @@ async fn run(cli: Cli) -> ExitCode {
             }
             code
         }
-        // `--style` and a `[style]` read out of `shep.toml` are not wired up
-        // yet -- both `None` here is deliberate for this task, and Task 5 is
-        // where the flag and the config file join `$SHEP_STYLE` below.
+        // Deliberately re-resolves rather than reading `style` (this
+        // function's own parameter): that value is already forced to
+        // `Bare` under the hard rule (piped stdout, `--format json`), and
+        // this report's whole job is telling an operator what is
+        // configured -- reporting `bare` every time it was piped would
+        // hide the answer `shep style` exists to give. See `resolve_style`.
         Commands::Style(_) => {
-            let (level, source) =
-                style::resolve(None, std::env::var("SHEP_STYLE").ok().as_deref(), None);
+            let (level, source) = resolve_style(&cli.global);
             let message = format!("{level} (from {source})");
             let _ = output::emit_notice(&mut *streams.out, fmt, "style", &message);
             ExitCode::Success
@@ -1158,8 +1270,13 @@ async fn run_daemon_command(fmt: Format, global: &GlobalArgs, args: &DaemonArgs)
 /// `async fn` purely so the call site in `main` needs no `cfg` of its own —
 /// it awaits nothing, and the resulting `clippy::unused_async` is
 /// pedantic-only, so it does not trip the gate.
+///
+/// `style` is [`run_argv`]'s resolved level, threaded through for the same
+/// reason the unix arm takes it — a uniform `run` signature across both
+/// `cfg` arms — even though nothing on this arm renders a table yet to read
+/// it back.
 #[cfg(windows)]
-async fn run(cli: Cli) -> ExitCode {
+async fn run(cli: Cli, style: style::StyleLevel) -> ExitCode {
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
     // No `mut` on `streams` here (unlike the unix arm): this arm only ever
@@ -1169,6 +1286,7 @@ async fn run(cli: Cli) -> ExitCode {
     let streams = Streams {
         out: &mut out,
         err: &mut err,
+        style,
     };
     let _ = output::emit_error(
         &mut *streams.err,
@@ -1623,14 +1741,14 @@ mod tests {
 
         let cli = Cli::try_parse_from(["shep", "--home", missing, "startup"]).unwrap();
         assert_eq!(
-            run(cli).await,
+            run(cli, style::StyleLevel::Bare).await,
             ExitCode::Usage,
             "startup must refuse a $SHEP_HOME that is not there"
         );
 
         let cli = Cli::try_parse_from(["shep", "--home", missing, "unstartup"]).unwrap();
         assert_ne!(
-            run(cli).await,
+            run(cli, style::StyleLevel::Bare).await,
             ExitCode::Usage,
             "unstartup removes a unit and never reads the home a --home names"
         );
@@ -1671,12 +1789,97 @@ mod tests {
             home: Some("/tmp/explicit".into()),
             format: cli::Format::Table,
             quiet: false,
+            style: None,
         };
         let paths = resolve_paths(&global).unwrap();
         assert_eq!(paths.home, std::path::Path::new("/tmp/explicit"));
         assert_eq!(
             paths.socket,
             std::path::Path::new("/tmp/explicit/run/shep.sock")
+        );
+    }
+
+    /// fails if the hard rule's condition drifts from "piped, or JSON" —
+    /// either a missing OR that only forces on one of the two, or an
+    /// inverted terminal check, would leave a border or an escape reaching
+    /// piped stdout.
+    #[test]
+    fn must_render_bare_is_true_exactly_for_a_piped_stdout_or_a_json_format() {
+        assert!(
+            !must_render_bare(true, cli::Format::Table),
+            "a real terminal asking for a table gets to render one"
+        );
+        assert!(
+            must_render_bare(false, cli::Format::Table),
+            "piped stdout must render bare even under --format table"
+        );
+        assert!(
+            must_render_bare(true, cli::Format::Json),
+            "--format json must render bare even at a real terminal"
+        );
+        assert!(must_render_bare(false, cli::Format::Json));
+    }
+
+    /// fails if `style_from_config` stops reading a real `[style] level`, or
+    /// starts treating a missing file, a broken file, an absent `[style]`
+    /// table, or an unrecognised level name as anything but "the config did
+    /// not answer" — matching `whistle::gate::resolve_control`'s reading of
+    /// a broken `shep.toml` as "no" rather than an error.
+    #[test]
+    fn style_from_config_reads_the_level_and_is_lenient_about_everything_else() {
+        assert_eq!(
+            style_from_config(Some("[style]\nlevel = \"plain\"\n")),
+            Some(style::StyleLevel::Plain)
+        );
+        assert_eq!(style_from_config(None), None, "no file at all");
+        assert_eq!(style_from_config(Some("")), None, "an empty file");
+        assert_eq!(
+            style_from_config(Some("[style")),
+            None,
+            "a file that will not parse"
+        );
+        assert_eq!(
+            style_from_config(Some("[daemon]\nlog_level = \"info\"\n")),
+            None,
+            "a config with no [style] table at all"
+        );
+        assert_eq!(
+            style_from_config(Some("[style]\nlevel = \"loud\"\n")),
+            None,
+            "a level this build does not recognise"
+        );
+    }
+
+    /// fails if `resolve_style` stops honouring `--style`, ignores
+    /// `$SHEP_HOME`'s `shep.toml` in favour of the wrong file, or reorders
+    /// the flag-over-config precedence `style::resolve` already owns —
+    /// this test is about `resolve_style` actually wiring the flag and a
+    /// real file into that function, not about the precedence rule itself
+    /// (pinned directly in `style.rs`).
+    #[test]
+    fn resolve_style_reads_the_flag_and_the_real_shep_toml_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shep.toml"), "[style]\nlevel = \"plain\"\n").unwrap();
+        let global = cli::GlobalArgs {
+            home: Some(dir.path().to_path_buf()),
+            format: cli::Format::Table,
+            quiet: false,
+            style: None,
+        };
+        assert_eq!(
+            resolve_style(&global),
+            (style::StyleLevel::Plain, style::StyleSource::Config),
+            "with no flag, shep.toml's own level answers"
+        );
+
+        let global = cli::GlobalArgs {
+            style: Some(style::StyleLevel::Bare),
+            ..global
+        };
+        assert_eq!(
+            resolve_style(&global),
+            (style::StyleLevel::Bare, style::StyleSource::Flag),
+            "the flag wins over the very shep.toml that set plain above"
         );
     }
 
@@ -1735,7 +1938,7 @@ mod tests {
         use clap::Parser;
         let argv = ["shep", "completions", "bash"];
         let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} failed: {e}"));
-        assert_eq!(run(cli).await, ExitCode::Success);
+        assert_eq!(run(cli, style::StyleLevel::Bare).await, ExitCode::Success);
     }
 
     /// fails if the absent-socket case stops naming the next command, or if a
