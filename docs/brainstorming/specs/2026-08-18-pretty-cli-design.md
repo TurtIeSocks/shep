@@ -111,9 +111,22 @@ column is.
 
 The status-to-role mapping is taken verbatim from
 `lookout/theme.rs:103`'s `status()`, so the two renderings agree by
-construction rather than by intent. **The face vocabulary is new and must be
-added to `theme.rs` beside the colours**, not defined in `output/`, so that
-`lookout` can adopt the same faces without a second source of truth.
+construction rather than by intent.
+
+**Corrected after the spec was approved.** The first version of this section
+said the faces must live in `theme.rs`. They cannot: `mod lookout` is
+`#[cfg(unix)]` (`lib.rs:42`), so `theme.rs` does not exist on Windows, while
+`output/` is unconditional and must compile there. A renderer cannot depend
+on a module that is not built.
+
+Instead a new platform-neutral module, `crates/shep-cli/src/vocabulary.rs`,
+owns what both renderers share: the four **role names**, the status-to-role
+mapping, and the face glyphs. Neither renderer defines either. Each binds
+roles to its own colour type -- `lookout/theme.rs` to ratatui's `Color`,
+`output/` to `anstyle::Style` -- because those types come from different
+crates and one of them is unix-only. One vocabulary, two bindings, no cfg
+problem. A face or a status-to-role decision made anywhere but
+`vocabulary.rs` is a review defect.
 
 Face-plus-word is 15 columns; face alone is 5, which is *narrower* than
 today's plain `stopped` plus padding. Whimsy buys column budget here rather
@@ -207,16 +220,18 @@ stay plain, the theme never costs clarity. So:
 palette. After this there are two flock tables with two renderers, and that
 is a real seam worth stating rather than discovering.
 
-They **share the vocabulary and not the code**: `theme.rs` owns the palette
-and (newly) the face glyphs; `output/table.rs` owns box drawing for the CLI;
+They **share the vocabulary and not the code**: `vocabulary.rs` owns the role
+names, the status mapping and the faces; `theme.rs` binds roles to ratatui
+colours; `output/table.rs` binds them to `anstyle` and owns box drawing;
 ratatui owns layout for the TUI. Sharing rendering would mean making one of
 them render through the other's model, which is a much larger change than
 this design earns.
 
 The risk this leaves is drift: someone changes a face in one place and not
-the other. The mitigation is that both read the same constants, so a face
-change is a one-line edit in `theme.rs` that both pick up. A colour or face
-defined in `output/` rather than `theme.rs` is a review defect.
+the other. The mitigation is that both read the same constants, so a face change is a
+one-line edit in `vocabulary.rs` that both pick up. A face or a
+status-to-role mapping defined in `theme.rs` or `output/` rather than in
+`vocabulary.rs` is a review defect.
 
 ## 7. Dependency facts, checked
 
