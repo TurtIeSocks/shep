@@ -641,12 +641,17 @@ pub struct ServeArgs {
 /// link to it does not resolve under `cargo doc`).
 #[derive(Debug, clap::Args)]
 pub struct SelectorArgs {
-    /// One or more: name, id, `all`, `/regex/`, or `fold:<name>`
+    /// One or more: name, id, `all`, `zeus-*`, `/regex/`, or `fold:<name>`
     ///
     /// Several are applied in turn, not atomically: `shep stop a b c` where
     /// `b` matches nothing still stops `a` and `c`, and the exit code is the
-    /// first failure. A shell glob like `zeus-*` is expanded by the SHELL
-    /// against filenames before shep sees it, so quote it or use `/^zeus-/`.
+    /// first failure.
+    ///
+    /// A pattern carrying `*`, `?`, `[` or `{` is a glob, anchored, so
+    /// `zeus-*` selects `zeus-auth` and not `my-zeus-auth`. Quote it: your
+    /// shell expands `zeus-*` against filenames first, and zsh refuses
+    /// outright when none match. A name with no such character is exact, so
+    /// `web.1` is the sheep called `web.1`.
     #[arg(required = true, num_args = 1..)]
     pub selectors: Vec<String>,
 }

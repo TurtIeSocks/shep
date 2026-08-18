@@ -414,6 +414,16 @@ src/
              starting it again would leave a one-instance app running two and the next save
              would persist the pair. `RpcContext::save_roll_now` is the on-demand write
              `Request::SaveRoll` reaches, answering `Option<SavedRoll { path, apps }>` —
+      Drift (2026-08-18, recorded): the selector grammar takes globs. A target carrying `*`,
+             `?`, `[` or `{` compiles through `globset` and becomes a `ProcessSelector::Regex`,
+             anchored, so `zeus-*` selects `zeus-auth` and not `my-zeus-auth`. Deliberately NOT
+             a `SelectorSpec` variant of its own: that type is the wire, and an older daemon
+             could not deserialize an unknown variant, so a glob works against a shepherd built
+             before globs existed. `globset` owns the semantics rather than a hand-rolled
+             translation; its `(?-u)` prefix is stripped because it compiles for BYTES and
+             `regex::Regex` refuses a pattern that could match invalid UTF-8. A name with no
+             metacharacter stays exact, which is the whole reason globs beat regex here --
+             `web.1` is the sheep called `web.1`, not a pattern where `.` means any character.
       Drift (2026-08-18, recorded): membership survives everything but `delete`. `restorable`
              used to return one list and select `instances_running > 0 && autostart`, which made
              `shep stop` destructive across a daemon restart — the sheep left the flock entirely
