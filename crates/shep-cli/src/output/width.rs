@@ -14,11 +14,22 @@
 /// a case nobody has hit, and the property test in `table.rs` will catch it
 /// the moment someone does.
 ///
+/// Control characters (`char::is_control`, which includes `\n` and `\t`)
+/// measure as zero width. Neither occupies a column: a newline starts a new
+/// line instead of advancing one, and a tab expands to a variable number
+/// nothing here can predict. Zero is the honest answer to "how wide is
+/// this", not "safe to print" -- a control character can still split a
+/// table row in two or blow out a terminal's tab stops, and stripping or
+/// escaping it before it reaches a cell is the box-drawn renderer's job in
+/// Task 4, not this function's. Measuring and sanitising are different
+/// problems; this function only does the first.
+///
 /// Not called outside this module's own tests yet: the caller is Task 4,
 /// the box-drawn table that pads a cell by this instead of by `len()`.
 /// `#[allow(dead_code)]` says so explicitly rather than inventing a call
 /// site nothing needs yet.
 #[allow(dead_code)]
+#[must_use]
 pub(crate) fn visible_width(s: &str) -> usize {
     let mut width = 0;
     let mut chars = s.chars();
@@ -38,7 +49,7 @@ pub(crate) fn visible_width(s: &str) -> usize {
                     }
                 }
             }
-        } else {
+        } else if !c.is_control() {
             width += 1;
         }
     }
@@ -73,5 +84,23 @@ mod tests {
     fn non_ascii_text_counts_characters() {
         assert_eq!(visible_width("café"), 4);
         assert_eq!(visible_width("日本"), 2, "counted as chars, not bytes");
+    }
+
+    /// A `\t` occupies no fixed number of columns -- expansion is a
+    /// terminal's decision, not this function's -- so it contributes zero
+    /// rather than the one `chars().count()` would give it.
+    #[test]
+    fn an_embedded_tab_contributes_no_width() {
+        assert_eq!(visible_width("web\tworker"), 9);
+    }
+
+    /// A `\n` starts a new line instead of advancing one, so it is not a
+    /// column either. `normalize()` (shep-core) rejects only `/`, `\`, `.`
+    /// and `..` in an app name, so a name carrying an embedded newline
+    /// reaches this function today -- this is the case the reviewer flagged
+    /// as reachable rather than theoretical.
+    #[test]
+    fn an_embedded_newline_contributes_no_width() {
+        assert_eq!(visible_width("web\nworker"), 9);
     }
 }
