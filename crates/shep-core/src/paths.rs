@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 /// Resolved filesystem layout for one shep home
 ///
 /// All paths are derived from `$SHEP_HOME` (default `<home>/.shep`); nothing
-/// here touches the filesystem — creation happens daemon-side.
+/// here touches the filesystem. The root itself is created by the CLI's own
+/// `ensure_home`, for the commands that need it before any daemon exists
+/// (`startup` above all), and everything under it by
+/// `shep_daemon::boot::init_dirs` on each boot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShepPaths {
     /// Root: `$SHEP_HOME`

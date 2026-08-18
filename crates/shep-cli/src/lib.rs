@@ -216,6 +216,154 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
     Ok(ShepPaths::resolve(&env, &home_dir))
 }
 
+/// Why [`ensure_home`] would not hand back a layout.
+///
+/// A type rather than a bare [`ExitCode`] because two of the three carry the
+/// path they are about, and an operator cannot act on a refusal that does not
+/// name it.
+#[cfg_attr(windows, allow(dead_code))]
+#[derive(Debug)]
+enum HomeRefusal {
+    /// None of `--home`, `$SHEP_HOME` or `$HOME` resolved a root directory.
+    Unresolved,
+    /// `--home`/`$SHEP_HOME` named a directory that is not there. Never
+    /// created: see [`ensure_home_at`] for why a named path is not a path
+    /// shep may invent.
+    Missing(PathBuf),
+    /// The default home did not exist and could not be created.
+    Io {
+        /// The directory whose creation failed.
+        path: PathBuf,
+        /// What the filesystem said.
+        source: std::io::Error,
+    },
+}
+
+impl core::fmt::Display for HomeRefusal {
+    /// The operator-facing message, remedy included.
+    ///
+    /// Multi-line for [`Self::Missing`] on purpose: the two ways out are the
+    /// whole value of the message, and a reader who has just mistyped a path
+    /// is exactly the reader who needs them spelled out.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unresolved => f.write_str(UNRESOLVED_HOME),
+            Self::Missing(path) => write!(
+                f,
+                "no flock at {path}\n  \
+                 did you mean to drop --home? the default is ~/.shep\n  \
+                 to set up a flock there deliberately:  mkdir -p {path}",
+                path = path.display(),
+            ),
+            Self::Io { path, source } => {
+                write!(f, "could not create {}: {source}", path.display())
+            }
+        }
+    }
+}
+
+impl core::error::Error for HomeRefusal {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Unresolved | Self::Missing(_) => None,
+            Self::Io { source, .. } => Some(source),
+        }
+    }
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+impl HomeRefusal {
+    /// The status the command ends with.
+    ///
+    /// `Internal` rather than `Usage` for the io case: the operator asked for
+    /// something reasonable and shep failed to do it, which is not a usage
+    /// error however it reads at the terminal.
+    fn code(&self) -> ExitCode {
+        match self {
+            Self::Unresolved | Self::Missing(_) => ExitCode::Usage,
+            Self::Io { .. } => ExitCode::Internal,
+        }
+    }
+}
+
+/// Resolves `$SHEP_HOME` and makes sure the directory is there, reporting
+/// whether this call is what created it.
+///
+/// # Errors
+///
+/// Every variant of [`HomeRefusal`]; see [`ensure_home_at`], which this wraps
+/// with the environment resolved.
+#[cfg_attr(windows, allow(dead_code))]
+fn ensure_home(global: &GlobalArgs) -> Result<(ShepPaths, bool), HomeRefusal> {
+    let paths = resolve_paths(global).map_err(|_| HomeRefusal::Unresolved)?;
+    ensure_home_at(paths, global.home.is_some())
+}
+
+/// [`ensure_home`] with the environment already resolved away.
+///
+/// The asymmetry between a default home and a named one is the whole point.
+/// `~/.shep` is a name shep chose, so shep may conjure it; `/srv/api` is a
+/// name the operator typed, and the likeliest reason it is not there is a
+/// typo. Creating a typo'd path silently would leave a second, empty,
+/// invisible flock behind, and the bug report that follows is "shep lost all
+/// my processes" when the truth is "you are looking at a different flock".
+///
+/// Only the root is created here. `logs/`, `pids/` and `run/` remain
+/// `shep_daemon::boot::init_dirs`' job, which runs on every boot and
+/// re-tightens all of them. This exists for the commands that need the root
+/// before any daemon has started, `startup` above all.
+///
+/// Split from [`ensure_home`] so the rule is testable without mutating
+/// `$HOME`, which is process-global and shared by every test in this binary.
+/// `ShepPaths::resolve` takes its environment as a closure for the same
+/// reason; this follows that idiom one layer up. `explicit` is whether the
+/// operator named this home themselves, by either `--home` or `$SHEP_HOME`.
+///
+/// # Errors
+///
+/// - [`HomeRefusal::Missing`] — `explicit`, and the directory is not there.
+/// - [`HomeRefusal::Io`] — the directory could not be created.
+#[cfg_attr(windows, allow(dead_code))]
+fn ensure_home_at(paths: ShepPaths, explicit: bool) -> Result<(ShepPaths, bool), HomeRefusal> {
+    if paths.home.is_dir() {
+        return Ok((paths, false));
+    }
+    if explicit {
+        return Err(HomeRefusal::Missing(paths.home));
+    }
+
+    // `.mode(DIR_MODE)` at creation rather than `create_dir_all` followed by
+    // `set_permissions`, matching `launch.rs`'s log directory and
+    // `boot::create_dir_at_dir_mode`: a create-then-chmod sequence leaves a
+    // window in which the directory exists at whatever the ambient umask
+    // allows, and on a shared machine that window is enough for another user
+    // to open a handle that survives the later chmod. Do not "simplify" this.
+    let built = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(shep_daemon::boot::DIR_MODE)
+                .create(&paths.home)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .create(&paths.home)
+        }
+    };
+
+    match built {
+        Ok(()) => Ok((paths, true)),
+        Err(source) => Err(HomeRefusal::Io {
+            path: paths.home,
+            source,
+        }),
+    }
+}
+
 /// Parses, resolves `$SHEP_HOME` for the verbs that need it, and dispatches
 /// to the verb's own module.
 ///
@@ -299,14 +447,30 @@ async fn run(cli: Cli) -> ExitCode {
             return completions::completions(&mut out, args);
         }
         Commands::Daemon(ref args) => return run_daemon_command(fmt, &cli.global, args).await,
+        // Routed through `ensure_home` rather than reading `--home` raw:
+        // this is the verb that installs a unit without starting anything,
+        // so it is the one that needs `$SHEP_HOME` to exist beforehand, and
+        // for three phases it was the only command that refused instead of
+        // creating it. `install` keeps its own check as well -- see
+        // `a_shep_home_that_does_not_exist_is_refused` for the trap that
+        // guards -- but this gate fires first and says more.
         Commands::Startup(ref args) => {
+            let (paths, home_is_new) = match ensure_home(&cli.global) {
+                Ok(resolved) => resolved,
+                Err(refusal) => {
+                    let code = refusal.code();
+                    emit_error_locked(fmt, code, &refusal.to_string());
+                    return code;
+                }
+            };
+            let _ = home_is_new; // bound in the welcome task
             let mut out = std::io::stdout().lock();
             let mut err = std::io::stderr().lock();
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
             };
-            return startup::startup(&mut streams, fmt, cli.global.home.as_deref(), args);
+            return startup::startup(&mut streams, fmt, Some(paths.home.as_path()), args);
         }
         Commands::Unstartup(ref args) => {
             let mut out = std::io::stdout().lock();
@@ -357,13 +521,15 @@ async fn run(cli: Cli) -> ExitCode {
         .await;
     }
 
-    let paths = match resolve_paths(&cli.global) {
-        Ok(paths) => paths,
-        Err(code) => {
-            emit_error_locked(fmt, code, UNRESOLVED_HOME);
+    let (paths, home_is_new) = match ensure_home(&cli.global) {
+        Ok(resolved) => resolved,
+        Err(refusal) => {
+            let code = refusal.code();
+            emit_error_locked(fmt, code, &refusal.to_string());
             return code;
         }
     };
+    let _ = home_is_new; // bound in the welcome task
 
     // `dog` is a re-exec target like `daemon` — long-lived until signalled —
     // and, per `dog::run_dog`'s own doc, writes its own diagnostics straight
@@ -795,6 +961,87 @@ async fn run(cli: Cli) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A [`ShepPaths`] rooted at `root`, standing in for whatever
+    /// `resolve_paths` would have produced, so the rule can be exercised
+    /// without touching the process-global `$HOME`.
+    #[cfg(unix)]
+    fn paths_at(root: &std::path::Path) -> ShepPaths {
+        let home = root.join(".shep").to_string_lossy().into_owned();
+        let env = |key: &str| (key == "SHEP_HOME").then(|| home.clone());
+        ShepPaths::resolve(&env, std::path::Path::new("/nonexistent"))
+    }
+
+    /// The transcript that started this: a fresh machine, the pm2 flow
+    /// (`cargo install shep` then `shep startup`), and the very first
+    /// command fails. `~/.shep` is a name shep chose, so shep may create it.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_default_home_is_created_and_reported_as_new() {
+        let root = tempfile::tempdir().unwrap();
+
+        let (paths, created) =
+            ensure_home_at(paths_at(root.path()), false).expect("a default home is created");
+        assert_eq!(paths.home, root.path().join(".shep"));
+        assert!(
+            created,
+            "the first call must report that it created the home"
+        );
+        assert!(
+            paths.home.is_dir(),
+            "the home must exist on disk afterwards"
+        );
+
+        let (_, created_again) =
+            ensure_home_at(paths_at(root.path()), false).expect("second call succeeds");
+        assert!(
+            !created_again,
+            "a home that was already there is not newly created"
+        );
+    }
+
+    /// A path the operator typed is not a path shep may invent. The likeliest
+    /// reason it is missing is a typo, and creating it would turn that typo
+    /// into a second, empty, invisible flock -- after which the bug report is
+    /// "shep lost all my processes".
+    #[cfg(unix)]
+    #[test]
+    fn an_explicitly_named_missing_home_is_refused_and_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths_at(&root.path().join("srv").join("typo"));
+        let named = paths.home.clone();
+
+        let refusal = ensure_home_at(paths, true).expect_err("a named missing home is refused");
+        assert_eq!(refusal.code(), ExitCode::Usage);
+        let message = refusal.to_string();
+        assert!(
+            message.contains(&named.display().to_string()),
+            "the refusal must name the path it refused: {message}"
+        );
+        assert!(
+            message.contains("~/.shep"),
+            "the refusal must point at the default as the way out: {message}"
+        );
+        assert!(
+            !named.exists(),
+            "a refused path must be left on disk exactly as it was found"
+        );
+    }
+
+    /// The mode is why this cannot be `create_dir_all`: a create-then-chmod
+    /// sequence leaves the directory at the ambient umask for as long as the
+    /// two syscalls are apart, and on a shared machine that is long enough
+    /// for another user to open a handle that survives the chmod.
+    #[cfg(unix)]
+    #[test]
+    fn a_created_home_is_owner_only_from_the_moment_it_exists() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let (paths, _) = ensure_home_at(paths_at(root.path()), false).unwrap();
+        let mode = std::fs::metadata(&paths.home).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "a fresh $SHEP_HOME must be owner-only");
+    }
 
     /// fails if an alias binary stops supplying its own verb.
     #[test]
