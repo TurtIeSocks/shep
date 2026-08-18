@@ -53,7 +53,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
         let selector = parse_selector(&mut streams, Format::Table, "web").unwrap();
         assert!(matches!(selector, ProcessSelector::Name(name) if name == "web"));
@@ -71,7 +71,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
         let code = parse_selector(&mut streams, Format::Table, "/[/").unwrap_err();
         assert_eq!(code, ExitCode::Usage);

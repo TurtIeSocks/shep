@@ -173,6 +173,24 @@ pub fn human_bytes(bytes: u64) -> String {
 /// this is only the floor below which [`render_boxed`] refuses to go.
 const FLOOR_COLUMNS: usize = 3;
 
+/// [`render_boxed`]'s rendered string, paired with exactly which headers it
+/// hid.
+///
+/// `table_of`'s two-pass STATUS-word retry (spec §2: the word drops before
+/// any whole column does) needs to know whether the first pass hid
+/// anything, without either scraping the footer string for the same answer
+/// or re-deriving this function's own `sum(w + 3) + 1` fit arithmetic a
+/// second time -- both of those are the kind of duplicated knowledge that
+/// drifts silently. [`render_boxed`] itself is a thin wrapper over
+/// [`render_boxed_ex`], kept so its own callers here (the property test and
+/// the unit tests below) see no difference.
+pub(crate) struct BoxedTable {
+    pub(crate) rendered: String,
+    /// Headers hidden this render, sorted -- the same order the footer
+    /// names them in. Empty when everything fit.
+    pub(crate) dropped: Vec<String>,
+}
+
 /// Renders `rows` as a box-drawn table that fits `term_width`.
 ///
 /// Columns are dropped by descending priority until the table fits, never
@@ -188,15 +206,35 @@ const FLOOR_COLUMNS: usize = 3;
 /// table the same width, and that width inside the terminal unless the
 /// floor itself does not fit.
 ///
-/// Called by [`super::table_of`], which every table-rendering command in
-/// `commands/` goes through — `emit`, `emit_flock` and `emit_described` all
-/// call it, never `render_boxed` directly.
+/// `output::mod`'s `table_of` -- every real caller in this crate -- reaches
+/// for [`render_boxed_ex`] instead, for the dropped-column list this
+/// function's own footer only renders as prose. Only this module's own
+/// tests call this form directly, so a plain (non-test) build has no
+/// caller at all. `#[allow(dead_code)]` says so explicitly rather than
+/// inventing a call site nothing needs yet.
+#[allow(dead_code)]
 pub(crate) fn render_boxed(
     headers: &[&str],
     rows: &[Vec<String>],
     priorities: &[u8],
     term_width: usize,
 ) -> String {
+    render_boxed_ex(headers, rows, priorities, term_width).rendered
+}
+
+/// [`render_boxed`], returning the dropped-column list alongside the
+/// string rather than only a footer naming them in prose. See
+/// [`BoxedTable`] for why a caller would want that.
+///
+/// Called by [`super::table_of`], which every table-rendering command in
+/// `commands/` goes through — `emit`, `emit_flock` and `emit_described` all
+/// reach it, never `render_boxed`/`render_boxed_ex` directly.
+pub(crate) fn render_boxed_ex(
+    headers: &[&str],
+    rows: &[Vec<String>],
+    priorities: &[u8],
+    term_width: usize,
+) -> BoxedTable {
     let mut keep: Vec<usize> = (0..headers.len()).collect();
     let mut dropped: Vec<&str> = Vec::new();
 
@@ -258,14 +296,20 @@ pub(crate) fn render_boxed(
     }
     out.push_str(&rule("└", "┴", "┘"));
 
+    // Sorted unconditionally, not only inside the `if` below: `BoxedTable`
+    // documents `dropped` as sorted, and sorting an empty `Vec` is a no-op
+    // anyway.
+    dropped.sort_unstable();
     if !dropped.is_empty() {
-        dropped.sort_unstable();
         out.push_str(&format!(
             "  {} hidden. Widen the window, or use --format json.\n",
             dropped.join(", ")
         ));
     }
-    out
+    BoxedTable {
+        rendered: out,
+        dropped: dropped.into_iter().map(str::to_string).collect(),
+    }
 }
 
 /// The visible width each kept column needs: the widest of its header and
@@ -651,5 +695,36 @@ mod tests {
         let footer = out.lines().last().unwrap();
         assert!(!footer.contains('\u{2014}'), "em dash in footer: {footer}");
         assert!(!footer.contains('\u{2013}'), "en dash in footer: {footer}");
+    }
+
+    /// `render_boxed_ex`'s own dropped list matches the footer it renders --
+    /// `table_of`'s two-pass retry (`output/mod.rs`) trusts this list
+    /// instead of re-deriving it, so this pins that the two never disagree.
+    /// `render_boxed` (its thin wrapper) renders the identical string.
+    #[test]
+    fn render_boxed_ex_reports_exactly_what_it_dropped() {
+        let headers = ["ID", "NAME", "STATUS", "CPU", "FOLD"];
+        let rows = vec![vec![
+            "0".into(),
+            "a".into(),
+            "(o.o)".into(),
+            "0%".into(),
+            "b".into(),
+        ]];
+        let priorities = [0, 0, 0, 5, 6];
+
+        let fits = render_boxed_ex(&headers, &rows, &priorities, 200);
+        assert!(fits.dropped.is_empty(), "everything fits at 200");
+        assert_eq!(
+            fits.rendered,
+            render_boxed(&headers, &rows, &priorities, 200)
+        );
+
+        let narrow = render_boxed_ex(&headers, &rows, &priorities, 20);
+        assert_eq!(narrow.dropped, vec!["CPU".to_string(), "FOLD".to_string()]);
+        assert_eq!(
+            narrow.rendered,
+            render_boxed(&headers, &rows, &priorities, 20)
+        );
     }
 }

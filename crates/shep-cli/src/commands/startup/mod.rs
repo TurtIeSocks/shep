@@ -839,7 +839,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             install(
                 &mut streams,
@@ -878,7 +878,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             install(&mut streams, Format::Table, &plan, Privilege::Unprivileged);
         }
@@ -899,7 +899,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             // Root, deliberately: an unprivileged run would refuse for the
             // other reason and this case would pass without ever exercising
@@ -946,7 +946,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             install(&mut streams, Format::Table, &plan, Privilege::Root)
         };
@@ -987,7 +987,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             remove(
                 &mut streams,
@@ -1017,7 +1017,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             remove(&mut streams, Format::Table, &plan, Privilege::Unprivileged)
         };
@@ -1103,7 +1103,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             report(&mut streams, Format::Table, "startup", steps)
         };

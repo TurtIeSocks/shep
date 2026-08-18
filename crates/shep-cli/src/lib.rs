@@ -210,11 +210,25 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
     // for why the two steps (what is configured, and whether the hard rule
     // overrides it) are kept separate.
     let (configured, _source) = resolve_style(&cli.global);
-    let style = if must_render_bare(std::io::stdout().is_terminal(), cli.global.format) {
+    let level = if must_render_bare(std::io::stdout().is_terminal(), cli.global.format) {
         style::StyleLevel::Bare
     } else {
         configured
     };
+    // `NO_COLOR`/`$TERM`/`$COLORTERM` read here, once, and nowhere else --
+    // the same reason `level` itself is resolved here rather than inside
+    // `run`: every `Streams` construction downstream gets a value, never a
+    // call. `must_render_bare`'s hard rule already forced `level` to `Bare`
+    // above when it applies, and `Presentation::new`'s own `colour` folding
+    // (`level.colour() && !no_color_set(..)`) is `false` for `Bare`
+    // regardless of what the environment says, so the hard rule holds
+    // either way.
+    let style = style::Presentation::new(
+        level,
+        std::env::var_os("NO_COLOR").as_deref(),
+        std::env::var_os("TERM").as_deref(),
+        std::env::var_os("COLORTERM").as_deref(),
+    );
     std::process::ExitCode::from(runtime.block_on(run(cli, style)) as u8)
 }
 
@@ -579,9 +593,10 @@ fn ensure_home_at(paths: ShepPaths, explicit: bool) -> Result<(ShepPaths, bool),
 /// it runs until signalled, so it may not hold a stdout/stderr guard for a
 /// process lifetime.
 ///
-/// `style` is [`run_argv`]'s resolved level, already forced to
-/// [`style::StyleLevel::Bare`] there if the hard rule applies — every
-/// `Streams` this function builds carries it unchanged. `Commands::Style`
+/// `style` is [`run_argv`]'s resolved [`style::Presentation`], whose level
+/// is already forced to [`style::StyleLevel::Bare`] there if the hard rule
+/// applies — every `Streams` this function builds carries it unchanged.
+/// `Commands::Style`
 /// is the one exception: with no level to set, its report reads
 /// [`resolve_style`] again, unforced, because it answers a different
 /// question ("what is configured") than every other arm's `style` field
@@ -591,7 +606,7 @@ fn ensure_home_at(paths: ShepPaths, explicit: bool) -> Result<(ShepPaths, bool),
 /// wrote is what will actually run or whether `--style`/`$SHEP_STYLE`
 /// still outranks it.
 #[cfg(unix)]
-async fn run(cli: Cli, style: style::StyleLevel) -> ExitCode {
+async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
     let fmt = cli.global.format;
 
     // `StdoutLock`/`StderrLock` are process-wide and are held for as long as
@@ -1351,12 +1366,12 @@ async fn run_daemon_command(fmt: Format, global: &GlobalArgs, args: &DaemonArgs)
 /// it awaits nothing, and the resulting `clippy::unused_async` is
 /// pedantic-only, so it does not trip the gate.
 ///
-/// `style` is [`run_argv`]'s resolved level, threaded through for the same
-/// reason the unix arm takes it — a uniform `run` signature across both
-/// `cfg` arms — even though nothing on this arm renders a table yet to read
-/// it back.
+/// `style` is [`run_argv`]'s resolved [`style::Presentation`], threaded
+/// through for the same reason the unix arm takes it — a uniform `run`
+/// signature across both `cfg` arms — even though nothing on this arm
+/// renders a table yet to read it back.
 #[cfg(windows)]
-async fn run(cli: Cli, style: style::StyleLevel) -> ExitCode {
+async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
     // No `mut` on `streams` here (unlike the unix arm): this arm only ever
@@ -1821,14 +1836,14 @@ mod tests {
 
         let cli = Cli::try_parse_from(["shep", "--home", missing, "startup"]).unwrap();
         assert_eq!(
-            run(cli, style::StyleLevel::Bare).await,
+            run(cli, style::Presentation::BARE).await,
             ExitCode::Usage,
             "startup must refuse a $SHEP_HOME that is not there"
         );
 
         let cli = Cli::try_parse_from(["shep", "--home", missing, "unstartup"]).unwrap();
         assert_ne!(
-            run(cli, style::StyleLevel::Bare).await,
+            run(cli, style::Presentation::BARE).await,
             ExitCode::Usage,
             "unstartup removes a unit and never reads the home a --home names"
         );
@@ -1995,7 +2010,7 @@ mod tests {
             let home = dir.path().to_str().unwrap();
             let cli = Cli::try_parse_from(["shep", "--home", home, "style", raw]).unwrap();
             assert_eq!(
-                run(cli, style::StyleLevel::Bare).await,
+                run(cli, style::Presentation::BARE).await,
                 ExitCode::Success,
                 "style {raw}"
             );
@@ -2020,7 +2035,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_str().unwrap();
         let cli = Cli::try_parse_from(["shep", "--home", home, "style"]).unwrap();
-        assert_eq!(run(cli, style::StyleLevel::Bare).await, ExitCode::Success);
+        assert_eq!(run(cli, style::Presentation::BARE).await, ExitCode::Success);
 
         assert!(
             !dir.path().join("shep.toml").exists(),
@@ -2083,7 +2098,7 @@ mod tests {
         use clap::Parser;
         let argv = ["shep", "completions", "bash"];
         let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} failed: {e}"));
-        assert_eq!(run(cli, style::StyleLevel::Bare).await, ExitCode::Success);
+        assert_eq!(run(cli, style::Presentation::BARE).await, ExitCode::Success);
     }
 
     /// fails if the absent-socket case stops naming the next command, or if a

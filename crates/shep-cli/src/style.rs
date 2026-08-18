@@ -1,5 +1,6 @@
 //! How much shep dresses up its output, and where that decision came from.
 
+use std::ffi::OsStr;
 use std::fmt;
 
 /// How much shep dresses up its output.
@@ -30,10 +31,10 @@ pub(crate) enum StyleLevel {
 impl StyleLevel {
     /// Whether sheep appear at all.
     ///
-    /// Not called outside this module's own tests yet: sheep art itself is
-    /// Task 6's job. `#[allow(dead_code)]` says so explicitly rather than
-    /// inventing a call site nothing needs yet.
-    #[allow(dead_code)]
+    /// Read by `output::rows::FlockRows`'s own STATUS cell, which draws the
+    /// face at `Full` and nothing but the plain status word otherwise.
+    /// Milestone sheep art elsewhere (an empty flock, `shep muster`) is a
+    /// separate, later task's job and is not gated here.
     pub(crate) const fn sheep(self) -> bool {
         matches!(self, Self::Full)
     }
@@ -53,11 +54,9 @@ impl StyleLevel {
     /// Whether anything is coloured. `NO_COLOR` can still veto this; it
     /// cannot enable it.
     ///
-    /// Not called outside this module's own tests yet: nothing this crate
-    /// renders emits colour before Task 6, so there is nothing yet for this
-    /// to gate. `#[allow(dead_code)]` says so explicitly rather than
-    /// inventing a call site nothing needs yet.
-    #[allow(dead_code)]
+    /// Read by [`Presentation::new`], the one place `NO_COLOR` is folded in
+    /// -- this method alone answers what the level asked for, before the
+    /// environment gets a veto.
     pub(crate) const fn colour(self) -> bool {
         matches!(self, Self::Full | Self::Plain)
     }
@@ -80,6 +79,106 @@ impl fmt::Display for StyleLevel {
             Self::Plain => "plain",
             Self::Bare => "bare",
         })
+    }
+}
+
+/// Whether `NO_COLOR` vetoes colour: set and non-empty. An empty `NO_COLOR=`
+/// reads as unset -- the cross-ecosystem convention.
+///
+/// First implemented inline in `lookout::theme::Palette::detect`, which
+/// shipped before this module had any colour-facing code of its own. Moved
+/// here so [`Presentation::new`] and that method call the one copy instead
+/// of each restating the rule: `mod lookout` is `#[cfg(unix)]` and this
+/// module is not, so here is the one place both a unix-only binding and an
+/// unconditional one can reach.
+pub(crate) fn no_color_set(no_color: Option<&OsStr>) -> bool {
+    no_color.is_some_and(|value| !value.is_empty())
+}
+
+/// Whether the terminal supports the 256-colour tier: `$COLORTERM`
+/// containing `truecolor`/`24bit`, or `$TERM` containing `256color`.
+/// Anything else gets the 16-colour fallback -- erring narrow is the
+/// recoverable direction, the same reasoning `lookout::theme::Palette::detect`
+/// gives for the identical rule it used to restate here on its own.
+///
+/// Moved for the same reason [`no_color_set`] was: `output::paint`'s
+/// `anstyle` binding and `lookout::theme`'s `ratatui` binding both need the
+/// same yes/no answer to the same question, and only one of the two modules
+/// that binds it exists off unix.
+pub(crate) fn deep_colour_terminal(term: Option<&OsStr>, colorterm: Option<&OsStr>) -> bool {
+    colorterm.is_some_and(|value| {
+        let value = value.to_string_lossy();
+        value.contains("truecolor") || value.contains("24bit")
+    }) || term.is_some_and(|value| value.to_string_lossy().contains("256color"))
+}
+
+/// The level the operator chose, whether colour survived `NO_COLOR`, how
+/// deep the terminal's own colour support is, and whether the STATUS word
+/// is still on the table for this particular render attempt.
+///
+/// The first three are resolved once, at the seam ([`Presentation::new`],
+/// called from `run_argv`): `level` is a layout dial the operator sets,
+/// `colour` is a cross-ecosystem convention that vetoes colour without
+/// touching layout, and `deep_colour` is a fact about the terminal itself --
+/// none of the three implies another, so folding any two together would
+/// either lose information or synthesize an answer nobody gave. `Full` with
+/// colour vetoed still draws boxes and sheep, which is the whole reason
+/// `NO_COLOR` is honoured as its own axis rather than folded into the dial.
+///
+/// `status_word` is different in kind: it is never read from the
+/// environment, defaults `true`, and is the one field `table_of`
+/// (`output/mod.rs`) itself overrides, locally, for a second render attempt
+/// -- spec §2's rule that a STATUS word drops before any whole column does.
+/// It rides on this struct rather than growing `Render::rows_for` a second
+/// parameter because every other field already flows through here, and
+/// `FlockRows` is the only implementation that reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Presentation {
+    pub(crate) level: StyleLevel,
+    pub(crate) colour: bool,
+    pub(crate) deep_colour: bool,
+    pub(crate) status_word: bool,
+}
+
+impl Presentation {
+    /// `Bare`, no colour, no depth, word irrelevant either way: `Bare`
+    /// never reaches `Render::rows_for` at all ([`StyleLevel::boxes`] is
+    /// false, so `table_of` takes the plain `render_table` path instead).
+    /// The safe default for the 87 test fixtures in this crate that want
+    /// today's plain output and no more.
+    ///
+    /// Every real `Streams` a running `shep` builds carries the
+    /// `Presentation` `lib.rs`'s `run_argv` actually resolved, never this
+    /// constant, so only test fixtures ever name it — a plain (non-test)
+    /// build of this crate has no caller at all. `#[allow(dead_code)]` says
+    /// so explicitly rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
+    pub(crate) const BARE: Self = Self {
+        level: StyleLevel::Bare,
+        colour: false,
+        deep_colour: false,
+        status_word: true,
+    };
+
+    /// Resolves `colour` and `deep_colour` from already-read environment
+    /// values -- terminal-ness is always a parameter here, never a
+    /// `std::env` call inside the function that renders, the same idiom
+    /// `commands::daemon::ansi_enabled` and `lookout::theme::Palette::detect`
+    /// both follow. `status_word` starts `true`; `table_of` is the only
+    /// place that ever turns it off, and only for one retry of one render
+    /// that was already too wide.
+    pub(crate) fn new(
+        level: StyleLevel,
+        no_color: Option<&OsStr>,
+        term: Option<&OsStr>,
+        colorterm: Option<&OsStr>,
+    ) -> Self {
+        Self {
+            level,
+            colour: level.colour() && !no_color_set(no_color),
+            deep_colour: deep_colour_terminal(term, colorterm),
+            status_word: true,
+        }
     }
 }
 
@@ -201,5 +300,78 @@ mod tests {
             ),
             (false, false, false)
         );
+    }
+
+    /// The rule `lookout::theme::Palette::detect` used to restate on its
+    /// own: `NO_COLOR` unset or empty is not set. An operator who exports
+    /// `NO_COLOR=` with no value must not silently lose every colour this
+    /// crate draws, in the table or the dashboard alike.
+    #[test]
+    fn no_color_set_treats_an_empty_value_as_unset() {
+        assert!(!no_color_set(None));
+        assert!(!no_color_set(Some(OsStr::new(""))));
+        assert!(no_color_set(Some(OsStr::new("1"))));
+    }
+
+    /// The other rule moved out of `theme.rs`: a `COLORTERM` naming
+    /// truecolor/24bit, or a `TERM` naming 256color, is the 256-colour
+    /// tier; anything else, including nothing at all, is the 16-colour
+    /// fallback.
+    #[test]
+    fn deep_colour_terminal_reads_colorterm_then_term() {
+        assert!(!deep_colour_terminal(None, None));
+        assert!(!deep_colour_terminal(Some(OsStr::new("vt100")), None));
+        assert!(deep_colour_terminal(
+            Some(OsStr::new("xterm-256color")),
+            None
+        ));
+        assert!(deep_colour_terminal(None, Some(OsStr::new("truecolor"))));
+        assert!(deep_colour_terminal(
+            Some(OsStr::new("dumb")),
+            Some(OsStr::new("24bit"))
+        ));
+    }
+
+    /// `Presentation::new` folds `NO_COLOR` into `colour` and never lets it
+    /// switch colour ON for a level that did not ask for it in the first
+    /// place -- `Bare`'s own `colour()` is already `false`, so no env value
+    /// can override that.
+    #[test]
+    fn presentation_new_folds_no_color_into_the_levels_own_answer() {
+        let full_untouched = Presentation::new(StyleLevel::Full, None, None, None);
+        assert!(full_untouched.colour);
+
+        let full_vetoed = Presentation::new(StyleLevel::Full, Some(OsStr::new("1")), None, None);
+        assert!(!full_vetoed.colour);
+
+        let bare_with_no_color_unset = Presentation::new(
+            StyleLevel::Bare,
+            None,
+            Some(OsStr::new("xterm-256color")),
+            None,
+        );
+        assert!(
+            !bare_with_no_color_unset.colour,
+            "bare never asked for colour; NO_COLOR being unset does not grant it"
+        );
+    }
+
+    /// `deep_colour` follows the terminal, independent of `colour` --
+    /// `table_of` never reaches `output::paint::style_for` unless `colour`
+    /// is also true, so a `Presentation` with `deep_colour` set and
+    /// `colour` false is a harmless, never-read combination rather than an
+    /// invalid one.
+    #[test]
+    fn presentation_new_resolves_deep_colour_from_the_terminal() {
+        let deep = Presentation::new(
+            StyleLevel::Full,
+            None,
+            Some(OsStr::new("xterm-256color")),
+            None,
+        );
+        assert!(deep.deep_colour);
+
+        let shallow = Presentation::new(StyleLevel::Full, None, Some(OsStr::new("vt100")), None);
+        assert!(!shallow.deep_colour);
     }
 }

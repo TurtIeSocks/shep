@@ -162,7 +162,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             kill(client, &mut streams, Format::Table).await
         };
@@ -189,7 +189,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             kill_with_wait(
                 client,

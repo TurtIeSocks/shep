@@ -121,7 +121,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             whisper(&client, &mut streams, Format::Table, args).await
         };
@@ -214,7 +214,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             whisper(&client, &mut streams, Format::Table, &args("ghost", "gc")).await
         };

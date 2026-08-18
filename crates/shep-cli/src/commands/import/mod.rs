@@ -259,7 +259,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out_buf,
                 err: &mut err_buf,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             import(
                 &mut streams,
@@ -287,7 +287,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out_buf,
                 err: &mut err_buf,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             import(&mut streams, Format::Table, &args(&dump, &out, true, false))
         };
@@ -322,7 +322,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out_buf,
                 err: &mut err_buf,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             let _ = import(&mut streams, Format::Table, &args(&dump, &out, true, false));
         }
@@ -348,7 +348,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out_buf,
                 err: &mut err_buf,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             import(
                 &mut streams,
@@ -377,7 +377,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out_buf,
                 err: &mut err_buf,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             import(
                 &mut streams,

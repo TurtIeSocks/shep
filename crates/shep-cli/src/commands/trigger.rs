@@ -112,7 +112,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             trigger(
                 &client,
@@ -146,7 +146,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             trigger(
                 &client,
@@ -179,7 +179,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
         let _ = trigger(
             &client,
@@ -222,7 +222,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             trigger(
                 &client,

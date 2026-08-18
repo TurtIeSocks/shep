@@ -371,7 +371,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             let _ = reopen(&client, &mut streams, Format::Table, &args(input)).await;
             let sent = envelopes.recv().await.unwrap();
@@ -412,7 +412,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
 
         let _ = reopen(&client, &mut streams, Format::Table, &args("all")).await;
@@ -444,7 +444,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             reopen(&client, &mut streams, Format::Table, &args("/[/")).await
         };
@@ -469,7 +469,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
         let code = reopen(&client, &mut streams, Format::Table, &args("ghost")).await;
         assert_eq!(code, ExitCode::NotFound);
@@ -504,7 +504,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             let _ = flush(&client, &mut streams, Format::Table, &flush_args(input)).await;
             let sent = envelopes.recv().await.unwrap();
@@ -536,7 +536,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
 
         let _ = flush(&client, &mut streams, Format::Table, &flush_args("all")).await;
@@ -569,7 +569,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             flush(&client, &mut streams, Format::Table, &flush_args("/[/")).await
         };
@@ -607,7 +607,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
         let code = flush(&client, &mut streams, Format::Table, &flush_args("ghost")).await;
         assert_eq!(code, ExitCode::NotFound);
@@ -644,7 +644,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
 
         let code = flush_daemon(&mut streams, Format::Json, &paths);
@@ -682,7 +682,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
 
         let code = flush_daemon(&mut streams, Format::Json, &paths);
@@ -726,7 +726,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
 
         let code = flush_daemon(&mut streams, Format::Table, &paths);

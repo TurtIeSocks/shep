@@ -46,9 +46,14 @@ impl Palette {
     ///
     /// - `no_color` set and **non-empty** flattens everything. An empty
     ///   `NO_COLOR=` is an unset one — the cross-ecosystem convention, and the
-    ///   one already pinned for the shepherd's own log output.
+    ///   one already pinned for the shepherd's own log output. This method
+    ///   used to check that inline; it now calls [`crate::style::no_color_set`],
+    ///   the one copy of the rule both this binding and `output::paint`'s
+    ///   share, since `mod lookout` is `#[cfg(unix)]` and `crate::style` is
+    ///   not.
     /// - `colorterm` containing `truecolor` or `24bit`, or `term` containing
-    ///   `256color`, gets the 256-colour indices.
+    ///   `256color`, gets the 256-colour indices -- also
+    ///   [`crate::style::deep_colour_terminal`] now, for the same reason.
     /// - Anything else gets the 16 named colours. Erring narrow is the
     ///   recoverable direction: a deep terminal shown 16 colours looks
     ///   flatter, while a shallow one sent `\x1b[38;5;166m` can print the
@@ -59,7 +64,7 @@ impl Palette {
         term: Option<&OsStr>,
         colorterm: Option<&OsStr>,
     ) -> Self {
-        if no_color.is_some_and(|value| !value.is_empty()) {
+        if crate::style::no_color_set(no_color) {
             return Self {
                 meadow: None,
                 bark: None,
@@ -67,10 +72,7 @@ impl Palette {
                 ink3: None,
             };
         }
-        let deep = colorterm.is_some_and(|value| {
-            let value = value.to_string_lossy();
-            value.contains("truecolor") || value.contains("24bit")
-        }) || term.is_some_and(|value| value.to_string_lossy().contains("256color"));
+        let deep = crate::style::deep_colour_terminal(term, colorterm);
 
         if deep {
             // xterm-256 indices chosen as the nearest neighbours of the design
@@ -247,5 +249,92 @@ mod tests {
             );
         }
         assert_eq!(seen.len(), 6);
+    }
+
+    /// The design spec's own rule (§6, "the two renderings agree by
+    /// construction"): this binding and `output::paint`'s -- the CLI
+    /// table's own binding of the same roles -- must resolve every role to
+    /// the same underlying colour, at both tiers. Extracts the numeric
+    /// index or name from each side and compares those directly, rather
+    /// than re-hardcoding one shared literal in both this test and
+    /// `paint`'s own: a renumbering on one side that forgets the other
+    /// fails this, which two independently-chosen matching literals would
+    /// not catch.
+    #[test]
+    fn the_anstyle_binding_agrees_with_this_ones_colours() {
+        use crate::vocabulary::Role;
+
+        let deep = Palette::detect(None, Some(OsStr::new("xterm-256color")), None);
+        let shallow = Palette::detect(None, Some(OsStr::new("vt100")), None);
+
+        for (status, role) in [
+            (ProcStatus::Online, Role::Meadow),
+            (ProcStatus::WaitingRestart, Role::Butter),
+            (ProcStatus::Stopped, Role::Ink3),
+            (ProcStatus::Errored, Role::Bark),
+        ] {
+            let ratatui_deep = deep
+                .status(status)
+                .fg
+                .expect("the deep tier always sets a foreground");
+            let anstyle_deep = crate::output::paint::style_for(role, true)
+                .get_fg_color()
+                .expect("style_for always sets a foreground");
+            assert_eq!(
+                ansi256_index(ratatui_deep),
+                ansi256_index_anstyle(anstyle_deep),
+                "{role:?} disagrees at the 256-colour tier"
+            );
+
+            let ratatui_shallow = shallow
+                .status(status)
+                .fg
+                .expect("the shallow tier always sets a foreground");
+            let anstyle_shallow = crate::output::paint::style_for(role, false)
+                .get_fg_color()
+                .expect("style_for always sets a foreground");
+            assert_eq!(
+                named_colour(ratatui_shallow),
+                named_colour_anstyle(anstyle_shallow),
+                "{role:?} disagrees at the 16-colour tier"
+            );
+        }
+    }
+
+    fn ansi256_index(c: Color) -> u8 {
+        match c {
+            Color::Indexed(i) => i,
+            other => panic!("expected an indexed ratatui colour, got {other:?}"),
+        }
+    }
+
+    fn ansi256_index_anstyle(c: anstyle::Color) -> u8 {
+        match c {
+            anstyle::Color::Ansi256(indexed) => indexed.0,
+            other => panic!("expected an Ansi256 anstyle colour, got {other:?}"),
+        }
+    }
+
+    /// A colour-family name independent of either crate's own enum spelling,
+    /// so `ratatui::style::Color::DarkGray` and `anstyle::AnsiColor::BrightBlack`
+    /// -- the same ANSI code 90 under two different names -- compare equal.
+    fn named_colour(c: Color) -> &'static str {
+        match c {
+            Color::Green => "green",
+            Color::Red => "red",
+            Color::Yellow => "yellow",
+            Color::DarkGray => "bright-black",
+            other => panic!("no name recorded for {other:?}"),
+        }
+    }
+
+    fn named_colour_anstyle(c: anstyle::Color) -> &'static str {
+        match c {
+            anstyle::Color::Ansi(anstyle::AnsiColor::Green) => "green",
+            anstyle::Color::Ansi(anstyle::AnsiColor::Red) => "red",
+            anstyle::Color::Ansi(anstyle::AnsiColor::Yellow) => "yellow",
+            anstyle::Color::Ansi(anstyle::AnsiColor::BrightBlack) => "bright-black",
+            other => panic!("no name recorded for {other:?}"),
+        }
     }
 }

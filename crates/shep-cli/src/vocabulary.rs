@@ -50,10 +50,14 @@ pub(crate) const fn role_of(status: ProcStatus) -> Role {
 /// guesswork; distinct because a face that only differs by colour tells a
 /// `NO_COLOR` reader nothing.
 ///
-/// Not called outside this module's own tests yet: the renderer that reads
-/// it is Task 4. `#[allow(dead_code)]` says so explicitly rather than
-/// inventing a call site nothing needs yet.
-#[allow(dead_code)]
+/// Read by `output::rows::FlockRows`'s own STATUS cell, the box-drawn
+/// table's one face-bearing column. `lookout`'s own flock pane never grows
+/// a face of its own -- it colours the status word instead, and
+/// `lookout/theme.rs`'s own module doc explains why (colour is always
+/// redundant with the text beside it there, so a face would be a second
+/// decoration saying the same thing a second way). A face or a
+/// status-to-role mapping defined anywhere but here, in either renderer, is
+/// a review defect (this module's own top doc says so first).
 pub(crate) const fn face(status: ProcStatus) -> &'static str {
     match status {
         ProcStatus::Online => "(o.o)",

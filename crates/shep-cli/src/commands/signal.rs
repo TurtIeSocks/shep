@@ -120,7 +120,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             signal(&client, &mut streams, Format::Table, &args("/[/", "hup")).await
         };
@@ -144,7 +144,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             signal(
                 &client,
@@ -178,7 +178,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             signal(
                 &client,
@@ -207,7 +207,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
         let _ = signal(&client, &mut streams, Format::Table, &args("web", "hup")).await;
 
@@ -237,7 +237,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             signal(&client, &mut streams, Format::Table, &args("web", "hup")).await
         };

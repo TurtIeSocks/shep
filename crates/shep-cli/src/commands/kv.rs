@@ -176,7 +176,7 @@ mod tests {
         Streams {
             out,
             err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         }
     }
 

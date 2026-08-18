@@ -341,7 +341,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
         let _ = flock(&client, &mut streams, Format::Table).await;
         let sent = tokio::time::timeout(RECV_TIMEOUT, envelopes.recv())
@@ -374,7 +374,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             let args = SelectorArgs {
                 selectors: vec![input.into()],
@@ -409,7 +409,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             describe(
                 &client,
@@ -441,7 +441,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
         let _ = fold(
             &client,
@@ -486,7 +486,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             flock(&client, &mut streams, Format::Json).await
         };
@@ -518,7 +518,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             describe(
                 &client,

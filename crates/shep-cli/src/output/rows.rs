@@ -16,6 +16,10 @@ use shep_core::protocol::{
     ActionOutcome, ActionReply, DogSource, Lamb, LineOutcome, LineReply, ProcessInfo,
     SignalOutcome, SignalReply,
 };
+use shep_core::status::ProcStatus;
+
+use crate::style::Presentation;
+use crate::vocabulary;
 
 use super::Render;
 
@@ -68,6 +72,22 @@ impl Render for FlockRows {
             .collect()
     }
 
+    /// [`Self::rows`], with the STATUS cell (index 2, parallel to
+    /// `headers()`) dressed up per spec §2: the face always, when
+    /// `presentation.level.sheep()`; the word too, when
+    /// `presentation.status_word`; the whole cell coloured with
+    /// `output::paint::style_for` when `presentation.colour`. Reuses
+    /// [`Self::rows`] for the other eight columns rather than rebuilding
+    /// them, so the two never drift on anything but the one cell this
+    /// method exists to change.
+    fn rows_for(&self, presentation: Presentation) -> Vec<Vec<String>> {
+        let mut rows = self.rows();
+        for (row, p) in rows.iter_mut().zip(&self.0) {
+            row[2] = status_cell(p.status, presentation);
+        }
+        rows
+    }
+
     /// # Panics
     /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
@@ -114,6 +134,42 @@ impl Render for FlockRows {
     // these two arrays drift silently -- a header inserted without its
     // priority shifts every priority after it onto the wrong column.
     const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 5, 3, 1, 6];
+}
+
+/// One sheep's STATUS cell, per spec §2 -- the only place in this module a
+/// face or a colour belongs, and the only STATUS cell any `Render` impl in
+/// this crate dresses up: `DogRows`/`DogEnabledRow`/`DogDisabledRow` render
+/// their own STATUS text unchanged, because a dog is not a sheep and this
+/// feature was never about giving one a face.
+///
+/// - `presentation.level.sheep()` decides whether a face appears at all
+///   ([`vocabulary::face`], always exactly 5 columns).
+/// - `presentation.status_word` decides whether the plain status word rides
+///   beside it -- `table_of` (`output/mod.rs`) is the only caller that ever
+///   turns this off, on a retry once a first pass already needed to drop a
+///   whole column.
+/// - `presentation.colour` decides whether the whole cell (face, word, or
+///   both) is wrapped in one [`crate::output::paint::style_for`] span, keyed
+///   off [`vocabulary::role_of`] -- one span rather than two separately
+///   styled pieces, so there is exactly one ANSI boundary for
+///   [`crate::output::width::visible_width`] to discount, never two to keep
+///   straight.
+fn status_cell(status: ProcStatus, presentation: Presentation) -> String {
+    let mut text = if presentation.level.sheep() {
+        let face = vocabulary::face(status);
+        if presentation.status_word {
+            format!("{face} {status}")
+        } else {
+            face.to_string()
+        }
+    } else {
+        status.to_string()
+    };
+    if presentation.colour {
+        let style = super::paint::style_for(vocabulary::role_of(status), presentation.deep_colour);
+        text = format!("{style}{text}{style:#}");
+    }
+    text
 }
 
 /// The dogs half of a flock listing: the `ProcessInfo`s whose `dog` marker

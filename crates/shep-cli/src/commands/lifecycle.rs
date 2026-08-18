@@ -996,7 +996,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             let _ = start(
                 &client,
@@ -1287,7 +1287,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             start(
                 &client,
@@ -1335,7 +1335,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             start(
                 &client,
@@ -1367,7 +1367,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             start(
                 &client,
@@ -1440,7 +1440,7 @@ mod tests {
                 let mut streams = Streams {
                     out: &mut out,
                     err: &mut err,
-                    style: crate::style::StyleLevel::Bare,
+                    style: crate::style::Presentation::BARE,
                 };
                 let args = SelectorArgs {
                     selectors: vec![input.into()],
@@ -1489,7 +1489,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             stop(
                 &client,
@@ -1519,7 +1519,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
         let code = stop(
             &client,
@@ -1562,7 +1562,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
 
         let _ = start(
@@ -1612,7 +1612,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
         let mut args = start_args(srv.to_str().unwrap());
         args.fold = Some("backend".to_string());
@@ -1643,7 +1643,7 @@ mod tests {
         let mut streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
         let _ = stock(
             &client,
@@ -1685,7 +1685,7 @@ mod tests {
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             stock(
                 &client,

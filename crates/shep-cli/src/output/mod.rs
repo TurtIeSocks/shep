@@ -14,6 +14,12 @@
 //! Pure tier (spec §11): this module and its submodules name no shep-client
 //! type, compile on every target, and their unit tests run on Windows.
 
+// `pub(crate)`, not private like the other three: `lookout::theme`'s own
+// test module (`#[cfg(unix)]`) calls `paint::style_for` directly, to pin
+// the anstyle and ratatui colour bindings against each other. Neither
+// `lookout` nor `style` is a descendant of `output`, so this name has to be
+// reachable from outside it.
+pub(crate) mod paint;
 mod rows;
 mod table;
 mod width;
@@ -42,7 +48,7 @@ pub use rows::{
 pub use table::{human_bytes, human_duration, local_timestamp, render_table};
 
 use crate::cli::Format;
-use crate::style::StyleLevel;
+use crate::style::Presentation;
 
 /// Bumped only for a breaking change to any command's `data` shape.
 /// Additive fields do not bump it.
@@ -93,14 +99,14 @@ pub struct Streams<'a> {
     /// call inside the function that renders (`commands/daemon.rs`'s
     /// `ansi_enabled` follows the same rule for `NO_COLOR`).
     ///
-    /// `Bare` is the field's documented safe value for a construction that
-    /// wants today's plain output — every test fixture in the crate uses it
-    /// — so a construction that reaches for the wrong default renders
-    /// exactly what shep printed before this feature, the safe direction to
-    /// fail. There is no `Default` impl to enforce that automatically:
-    /// `Streams` holds `&mut dyn io::Write`, which is not `Default`, so
-    /// every field is always named at the call site regardless.
-    pub style: StyleLevel,
+    /// `Presentation::BARE` is the field's documented safe value for a
+    /// construction that wants today's plain output — every test fixture in
+    /// the crate uses it — so a construction that reaches for the wrong
+    /// default renders exactly what shep printed before this feature, the
+    /// safe direction to fail. There is no `Default` impl to enforce that
+    /// automatically: `Streams` holds `&mut dyn io::Write`, which is not
+    /// `Default`, so every field is always named at the call site regardless.
+    pub style: Presentation,
 }
 
 impl std::fmt::Debug for Streams<'_> {
@@ -128,6 +134,17 @@ pub trait Render: Serialize {
     fn headers() -> &'static [&'static str];
     /// One row per record, cells in `headers()` order.
     fn rows(&self) -> Vec<Vec<String>>;
+    /// The rows as this presentation wants them rendered.
+    ///
+    /// Defaults to [`Self::rows`]: most payloads have nothing to dress up.
+    /// [`rows::FlockRows`] overrides it because its STATUS cell is the one
+    /// place a face and a colour belong. Only ever called from `table_of`'s
+    /// boxed path — the plain path keeps calling [`render_table`], which
+    /// keeps calling [`Self::rows`], and that is what makes `bare` provably
+    /// byte-identical rather than merely intended to be.
+    fn rows_for(&self, _presentation: Presentation) -> Vec<Vec<String>> {
+        self.rows()
+    }
     /// Table header -> JSON key, the documented name mapping
     /// (`UPTIME` -> `uptime_ms`, and so on).
     ///
@@ -173,7 +190,7 @@ pub fn emit<T: Render>(
     fmt: Format,
     command: &str,
     data: T,
-    style: StyleLevel,
+    style: Presentation,
 ) -> io::Result<()> {
     match fmt {
         Format::Json => {
@@ -190,19 +207,48 @@ pub fn emit<T: Render>(
 }
 
 /// Renders one [`Render`] payload as [`render_table`] or [`table::render_boxed`],
-/// whichever `style` calls for.
+/// whichever `presentation.level` calls for.
 ///
 /// The one branch [`emit`], [`emit_flock`] and [`emit_described`] all make on
 /// every table they render, factored out here so those four call sites stay
 /// one decision instead of reimplementing it four times. [`table::render_boxed`]
 /// needs a terminal width; [`terminal_width`] is the same unconditional-
 /// fallback measurement every one of them would otherwise recompute.
-fn table_of<T: Render>(data: &T, style: StyleLevel) -> String {
-    if style.boxes() {
-        table::render_boxed(T::headers(), &data.rows(), T::PRIORITIES, terminal_width())
-    } else {
-        render_table(data)
+///
+/// The boxed path renders twice when the first pass drops a column. Spec §2:
+/// the STATUS word is the first thing dropped from that column, before any
+/// whole column is — so the first attempt asks [`Render::rows_for`] for
+/// everything, including the word, and only if [`table::render_boxed_ex`]
+/// says it had to hide a column does a second attempt ask again with
+/// [`Presentation::status_word`] turned off. Two render passes over one
+/// small table is nothing, and it keeps [`table::render_boxed`] exactly as
+/// ignorant of what a STATUS cell is as it was before this function existed
+/// — the retry is a second call with different row *data*, never a second
+/// code path in the renderer itself. For every payload but
+/// [`rows::FlockRows`] the two passes produce identical rows (the default
+/// [`Render::rows_for`] ignores `status_word` entirely), so the retry is a
+/// wasted-but-harmless no-op rather than a behaviour change.
+fn table_of<T: Render>(data: &T, presentation: Presentation) -> String {
+    if !presentation.level.boxes() {
+        return render_table(data);
     }
+    let headers = T::headers();
+    let width = terminal_width();
+    let wide = table::render_boxed_ex(headers, &data.rows_for(presentation), T::PRIORITIES, width);
+    if wide.dropped.is_empty() {
+        return wide.rendered;
+    }
+    let narrow_presentation = Presentation {
+        status_word: false,
+        ..presentation
+    };
+    table::render_boxed_ex(
+        headers,
+        &data.rows_for(narrow_presentation),
+        T::PRIORITIES,
+        width,
+    )
+    .rendered
 }
 
 /// The terminal's width, or 80 when there is not one.
@@ -214,10 +260,11 @@ fn table_of<T: Render>(data: &T, style: StyleLevel) -> String {
 /// the same as absent: `render_boxed` would otherwise read it as "drop every
 /// droppable column," for no reason a real terminal ever gave it.
 ///
-/// Only ever consulted when [`table_of`] has already decided `style.boxes()`
-/// is true, and `style` is forced to [`StyleLevel::Bare`]
-/// (`lib.rs`'s `run_argv`) whenever stdout is not a terminal — so a real
-/// call here always has a real terminal behind it.
+/// Only ever consulted when [`table_of`] has already decided
+/// `presentation.level.boxes()` is true, and the level is forced to
+/// [`crate::style::StyleLevel::Bare`] (`lib.rs`'s `run_argv`) whenever
+/// stdout is not a terminal — so a real call here always has a real
+/// terminal behind it.
 fn terminal_width() -> usize {
     #[cfg(unix)]
     {
@@ -263,7 +310,7 @@ pub fn emit_flock(
     fmt: Format,
     command: &str,
     listing: Vec<ProcessInfo>,
-    style: StyleLevel,
+    style: Presentation,
 ) -> io::Result<()> {
     match fmt {
         Format::Json => emit(out, fmt, command, FlockRows(listing), style),
@@ -320,7 +367,7 @@ pub fn emit_described(
     fmt: Format,
     command: &str,
     listing: Vec<ProcessInfo>,
-    style: StyleLevel,
+    style: Presentation,
 ) -> io::Result<()> {
     match fmt {
         Format::Json => emit(out, fmt, command, FlockRows(listing), style),
@@ -580,7 +627,7 @@ mod tests {
             Format::Json,
             "flock",
             sample_flock(),
-            StyleLevel::Bare,
+            Presentation::BARE,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&json_out).unwrap();
@@ -593,7 +640,7 @@ mod tests {
             Format::Table,
             "flock",
             sample_flock(),
-            StyleLevel::Bare,
+            Presentation::BARE,
         )
         .unwrap();
         let text = String::from_utf8(table_out).unwrap();
@@ -617,7 +664,7 @@ mod tests {
             Format::Table,
             "flock",
             mixed_listing(),
-            StyleLevel::Bare,
+            Presentation::BARE,
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
@@ -645,7 +692,7 @@ mod tests {
             Format::Json,
             "flock",
             mixed_listing(),
-            StyleLevel::Bare,
+            Presentation::BARE,
         )
         .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -667,7 +714,7 @@ mod tests {
             Format::Table,
             "flock",
             vec![sheep_info("web")],
-            StyleLevel::Bare,
+            Presentation::BARE,
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
@@ -691,7 +738,7 @@ mod tests {
             Format::Table,
             "describe",
             vec![info],
-            StyleLevel::Bare,
+            Presentation::BARE,
         )
         .unwrap();
         let rendered = String::from_utf8(out).unwrap();
@@ -728,7 +775,7 @@ mod tests {
                 Format::Table,
                 "describe",
                 vec![info.clone()],
-                StyleLevel::Bare,
+                Presentation::BARE,
             )
             .unwrap();
             let rendered = String::from_utf8(out).unwrap();
@@ -752,7 +799,7 @@ mod tests {
             Format::Json,
             "describe",
             vec![info],
-            StyleLevel::Bare,
+            Presentation::BARE,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -774,7 +821,7 @@ mod tests {
         let streams = Streams {
             out: &mut out,
             err: &mut err,
-            style: crate::style::StyleLevel::Bare,
+            style: crate::style::Presentation::BARE,
         };
         assert_eq!(format!("{streams:?}"), "Streams { .. }");
     }
@@ -841,5 +888,188 @@ mod tests {
         let text = String::from_utf8(err).unwrap();
         assert!(text.starts_with("notice[dropped]:"), "{text}");
         assert!(text.contains("the daemon dropped 3 events"));
+    }
+
+    // --- Task 5b: colour, and the face in the STATUS column ------------
+
+    use std::ffi::OsStr;
+
+    use crate::style::StyleLevel;
+
+    /// Spec §5: `NO_COLOR` removes colour at `full`, leaving sheep and
+    /// boxes alone. Asserted on the rendered STRING, not on the resolved
+    /// [`Presentation`]: the struct could fold `NO_COLOR` in correctly and
+    /// a bug in `rows::status_cell` could still emit an escape regardless.
+    #[test]
+    fn no_color_at_full_keeps_sheep_and_boxes_but_drops_colour() {
+        let presentation = Presentation::new(StyleLevel::Full, Some(OsStr::new("1")), None, None);
+        assert!(
+            !presentation.colour,
+            "NO_COLOR must veto colour even at full"
+        );
+
+        let flock = FlockRows(vec![
+            ProcessInfo::builder(1, "web", ProcStatus::Online).build(),
+        ]);
+        let rendered = table_of(&flock, presentation);
+
+        assert!(
+            rendered.contains("(o.o)"),
+            "full still draws the face: {rendered}"
+        );
+        assert!(rendered.contains('┌'), "full still draws boxes: {rendered}");
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "NO_COLOR must leave no escape byte: {rendered:?}"
+        );
+    }
+
+    /// The byte-identical rule, made mechanical: `bare` must never emit an
+    /// ANSI escape, regardless of status or how loud the environment's
+    /// colour support would otherwise be.
+    #[test]
+    fn bare_emits_no_escape_at_all() {
+        let flock = FlockRows(vec![
+            ProcessInfo::builder(1, "web", ProcStatus::Errored).build(),
+        ]);
+        let rendered = table_of(&flock, Presentation::BARE);
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert!(
+            rendered.contains("errored"),
+            "today's plain word survives: {rendered}"
+        );
+        assert!(!rendered.contains("(x.x)"), "no face at bare: {rendered}");
+    }
+
+    /// Spec §2: the face appears at `full`; at `plain` the plain word alone
+    /// does (`plain` is "no sheep", not "no colour" — colour still
+    /// survives); neither survives at `bare`.
+    ///
+    /// Also the demo this task's brief asks for: run with `-- --nocapture`
+    /// and read what each level actually looks like. An exact-string test
+    /// proves the code matches a string, not that the result is legible —
+    /// `welcome.rs` shipped a silently unaligned sheep past a passing one,
+    /// because the expected value was written with the same mistake this
+    /// printed output lets a human actually catch.
+    #[test]
+    fn the_three_levels_render_the_status_column_differently_and_look_right() {
+        let flock = FlockRows(vec![
+            ProcessInfo::builder(1, "web", ProcStatus::Online).build(),
+            ProcessInfo::builder(2, "worker", ProcStatus::Errored).build(),
+            ProcessInfo::builder(3, "cron", ProcStatus::Stopped).build(),
+        ]);
+
+        let full = table_of(
+            &flock,
+            Presentation::new(
+                StyleLevel::Full,
+                None,
+                Some(OsStr::new("xterm-256color")),
+                None,
+            ),
+        );
+        println!("--- full ---\n{full}");
+        assert!(full.contains("(o.o)"), "{full}");
+        assert!(full.contains("(x.x)"), "{full}");
+        assert!(full.contains("(-.-)"), "{full}");
+        assert!(
+            full.contains('\u{1b}'),
+            "full at a deep terminal colours the cell: {full:?}"
+        );
+
+        let plain = table_of(
+            &flock,
+            Presentation::new(
+                StyleLevel::Plain,
+                None,
+                Some(OsStr::new("xterm-256color")),
+                None,
+            ),
+        );
+        println!("--- plain ---\n{plain}");
+        assert!(!plain.contains("(o.o)"), "no face at plain: {plain}");
+        assert!(plain.contains("online"), "{plain}");
+        assert!(plain.contains('\u{1b}'), "plain still colours: {plain:?}");
+
+        let bare = table_of(&flock, Presentation::BARE);
+        println!("--- bare ---\n{bare}");
+        assert!(!bare.contains("(o.o)"), "{bare}");
+        assert!(!bare.contains('\u{1b}'), "{bare:?}");
+    }
+
+    /// Spec §2: the STATUS word is the first thing dropped from that
+    /// column, before any whole column is. `waiting-restart` (15
+    /// characters) is the longest status word, chosen so face-plus-word
+    /// alone forces `FOLD` past a width face-alone comfortably fits —
+    /// exercising `Render::rows_for` and `table::render_boxed_ex` directly,
+    /// the same two calls `table_of`'s own two-pass retry makes, since
+    /// `table_of` reads the real terminal width itself and so cannot be
+    /// driven at a chosen width from a unit test.
+    #[test]
+    fn the_word_drops_before_a_whole_column_does() {
+        let flock = FlockRows(vec![
+            ProcessInfo::builder(1, "a", ProcStatus::WaitingRestart).build(),
+        ]);
+        let presentation = Presentation::new(StyleLevel::Full, None, None, None);
+        let headers = FlockRows::headers();
+
+        let wide = table::render_boxed_ex(
+            headers,
+            &flock.rows_for(presentation),
+            FlockRows::PRIORITIES,
+            80,
+        );
+        assert!(
+            !wide.dropped.is_empty(),
+            "face-plus-word should already force a drop at 80: {}",
+            wide.rendered
+        );
+
+        let narrow_presentation = Presentation {
+            status_word: false,
+            ..presentation
+        };
+        let narrow = table::render_boxed_ex(
+            headers,
+            &flock.rows_for(narrow_presentation),
+            FlockRows::PRIORITIES,
+            80,
+        );
+        assert!(
+            narrow.dropped.is_empty(),
+            "face-alone should fit every column at 80: {}",
+            narrow.rendered
+        );
+        assert!(narrow.rendered.contains("FOLD"), "{}", narrow.rendered);
+        assert!(narrow.rendered.contains("(o~o)"), "{}", narrow.rendered);
+        assert!(
+            !narrow.rendered.contains("waiting-restart"),
+            "{}",
+            narrow.rendered
+        );
+    }
+
+    /// The JSON arms serialize the payload directly and never call
+    /// `rows`/`rows_for` — asserted rather than trusted, since a future
+    /// refactor that routed JSON through `rows_for` "for consistency" would
+    /// be exactly the byte-identical rule breaking silently.
+    #[test]
+    fn colour_never_reaches_format_json() {
+        let flock = FlockRows(vec![
+            ProcessInfo::builder(1, "web", ProcStatus::Errored).build(),
+        ]);
+        let presentation = Presentation::new(
+            StyleLevel::Full,
+            None,
+            Some(OsStr::new("xterm-256color")),
+            None,
+        );
+        let mut out = Vec::new();
+        emit(&mut out, Format::Json, "flock", flock, presentation).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains('\u{1b}'), "{text}");
+
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["data"][0]["status"], "errored");
     }
 }

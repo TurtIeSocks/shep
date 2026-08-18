@@ -202,7 +202,7 @@ Getting started
             let mut streams = Streams {
                 out: &mut out,
                 err: &mut err,
-                style: crate::style::StyleLevel::Bare,
+                style: crate::style::Presentation::BARE,
             };
             f(&mut streams);
         }
