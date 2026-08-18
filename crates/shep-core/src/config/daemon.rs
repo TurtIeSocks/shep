@@ -152,12 +152,26 @@ pub struct WhistleSection {
     pub allow_control: bool,
 }
 
+/// The `[style]` section: how much the CLI dresses up its output.
+///
+/// Read by the CLI only. The daemon has no opinion about how anyone likes
+/// their tables, and parses this solely so an unknown key is not an error.
+///
+/// `Debug` is derived rather than redacted (IR-41): one optional string, no
+/// secret, nothing a `{:?}` could leak.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StyleSection {
+    /// `full`, `plain` or `bare`. Absent means the CLI decides.
+    pub level: Option<String>,
+}
+
 /// Parsed daemon configuration with raw per-dog sections
 ///
 /// Dog sections stay untyped here: each dog deserializes its own
 /// `[dog.<name>]` table so dog config schemas live with the dog code.
 ///
-/// `#[non_exhaustive]`: this struct has grown a section per phase — `whistle`
+/// `#[non_exhaustive]`: this struct has grown a section per phase — `style`
 /// most recently — and each one would otherwise be a breaking change for an
 /// out-of-tree struct literal. That is IR-20's ordinary reasoning applied to
 /// a struct. **It is not a validation gate**, and this type is deliberately
@@ -197,6 +211,8 @@ pub struct DaemonConfig {
     pub daemon: DaemonSection,
     /// The `[whistle]` section
     pub whistle: WhistleSection,
+    /// The `[style]` section
+    pub style: StyleSection,
     /// Raw `[dog.<name>]` sections keyed by dog name
     pub dog: BTreeMap<String, toml::Table>,
 }
@@ -207,6 +223,7 @@ impl fmt::Debug for DaemonConfig {
         f.debug_struct("DaemonConfig")
             .field("daemon", &self.daemon)
             .field("whistle", &self.whistle)
+            .field("style", &self.style)
             .field("dog", &format_args!("<{} tables>", self.dog.len()))
             .finish()
     }
@@ -217,6 +234,7 @@ impl fmt::Debug for DaemonConfig {
 struct RawDaemonConfig {
     daemon: DaemonSection,
     whistle: WhistleSection,
+    style: StyleSection,
     dog: BTreeMap<String, toml::Table>,
 }
 
@@ -273,6 +291,7 @@ impl DaemonConfig {
         let mut cfg = Self {
             daemon: raw.daemon,
             whistle: raw.whistle,
+            style: raw.style,
             dog: raw.dog,
         };
         if let Some(v) = env("SHEP_LOG_JSON") {
@@ -936,7 +955,7 @@ otel = "/usr/local/bin/shep-otel"
         let cfg = DaemonConfig::load(Some("[dog.metrics]\nport = 9615"), &no_env).unwrap();
         assert_eq!(
             format!("{cfg:?}"),
-            "DaemonConfig { daemon: DaemonSection { log_json: false, log_level: Warn, socket: None, enabled_dogs: [], adopted_dogs: {}, max_cron_sleep: None }, whistle: WhistleSection { allow_control: false }, dog: <1 tables> }"
+            "DaemonConfig { daemon: DaemonSection { log_json: false, log_level: Warn, socket: None, enabled_dogs: [], adopted_dogs: {}, max_cron_sleep: None }, whistle: WhistleSection { allow_control: false }, style: StyleSection { level: None }, dog: <1 tables> }"
         );
     }
 }

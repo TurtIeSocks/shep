@@ -45,6 +45,7 @@ mod output;
 mod serve;
 #[cfg(unix)]
 mod status;
+mod style;
 mod welcome;
 #[cfg(unix)]
 mod whistle;
@@ -736,6 +737,16 @@ async fn run(cli: Cli) -> ExitCode {
                 let _ = writeln!(streams.err, "{}", status::one_line(&shepherd));
             }
             code
+        }
+        // `--style` and a `[style]` read out of `shep.toml` are not wired up
+        // yet -- both `None` here is deliberate for this task, and Task 5 is
+        // where the flag and the config file join `$SHEP_STYLE` below.
+        Commands::Style(_) => {
+            let (level, source) =
+                style::resolve(None, std::env::var("SHEP_STYLE").ok().as_deref(), None);
+            let message = format!("{level} (from {source})");
+            let _ = output::emit_notice(&mut *streams.out, fmt, "style", &message);
+            ExitCode::Success
         }
         // Bare `shep start` means the Flockfile in this directory, the way
         // `shep runtime` and `shep dev` already read one -- and when there is

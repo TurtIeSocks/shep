@@ -50,7 +50,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     ),
     ("Foreground runs", &["runtime", "dev"]),
     ("Coming from pm2", &["import"]),
-    ("Help", &["welcome", "help", "completions"]),
+    ("Help", &["welcome", "help", "completions", "style"]),
 ];
 
 /// `--help`'s shape.
@@ -79,7 +79,7 @@ The shepherd     ping kill reopen flush set get unset
 Dogs and agents  dogs enable disable adopt rehome whistle
 Foreground runs  runtime dev
 Coming from pm2  import
-Help             welcome help completions
+Help             welcome help completions style
 
 {options}{after-help}";
 
@@ -519,6 +519,12 @@ pub enum Commands {
     /// The same text a fresh `$SHEP_HOME` prints once on its own. Here it is
     /// the command's output rather than a diagnostic, so it goes to stdout.
     Welcome,
+    /// Show or set how much shep dresses up its output
+    ///
+    /// `full` is sheep, boxes and colour; `plain` drops the sheep; `bare` is
+    /// plain text. With no level, prints the one in force and where it came
+    /// from.
+    Style(StyleArgs),
     /// Graceful stop. Easter-egg alias for `stop`.
     #[command(hide = true)]
     Thatlldo(SelectorArgs),
@@ -965,6 +971,13 @@ pub struct CompletionArgs {
     /// Shell to generate a completion script for
     #[arg(value_enum)]
     pub shell: clap_complete::aot::Shell,
+}
+
+/// Arguments to `shep style`.
+#[derive(Debug, clap::Args)]
+pub struct StyleArgs {
+    /// `full`, `plain`, or `bare`. Omit to show the level in force.
+    pub level: Option<String>,
 }
 
 /// Arguments to the hidden `shep daemon` subcommand.

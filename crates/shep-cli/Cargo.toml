@@ -143,6 +143,15 @@ toml_edit = { version = "0.22.7", default-features = false, features = ["display
 # adds zero crates to the tree, since shep-core and shep-daemon both carry this
 # same workspace-pinned version already.
 tempfile.workspace = true
+# `style::StyleLevel::colour()`'s consumer: the boxed renderer picks its ANSI
+# escapes through `anstyle::Style`/`Color` rather than hand-rolled escape
+# sequences. Declared here in the task that adds `style.rs` even though that
+# module's own code does not call it yet — this crate's code starts using it
+# once the renderer that reads `StyleLevel` lands. Adds zero crates to the
+# tree: `Cargo.lock` already resolves exactly one `anstyle` (shep-core pulls
+# it into the lockfile through its own `cfg(any())` floor-forcing block), so
+# this is the first real use of an already-resolved version, not a new one.
+anstyle.workspace = true
 
 [dev-dependencies]
 # `test-util` for `#[tokio::test(start_paused = true)]` — `crate::http`'s own
