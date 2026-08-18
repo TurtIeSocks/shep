@@ -2,7 +2,10 @@
   "schema_version": 1,
   "command": "ping",
   "data": {
+    "shepherd": "online",
     "daemon_version": "0.1.0-alpha.1",
-    "pid": null
+    "pid": null,
+    "home": null,
+    "socket": null
   }
 }

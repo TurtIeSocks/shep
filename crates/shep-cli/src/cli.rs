@@ -540,7 +540,10 @@ pub enum Commands {
 #[derive(Debug, clap::Args)]
 pub struct StartArgs {
     /// A script path, a Flockfile, or `-` to read Flockfile JSON from stdin
-    pub target: String,
+    ///
+    /// Omit it to start the Flockfile in the current directory, or, when
+    /// there is none, to bring a shepherd up with nothing running yet.
+    pub target: Option<String>,
     /// Name for this sheep (script form only)
     #[arg(long)]
     pub name: Option<String>,

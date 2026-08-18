@@ -737,9 +737,25 @@ async fn run(cli: Cli) -> ExitCode {
             }
             code
         }
+        // Bare `shep start` means the Flockfile in this directory, the way
+        // `shep runtime` and `shep dev` already read one -- and when there is
+        // none, it means "bring a shepherd up", which is the only way to get
+        // one without also starting a process.
         Commands::Start(ref args) => {
+            let discovered = if args.target.is_none() {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| shep_core::config::flockfile::discover(&cwd))
+            } else {
+                None
+            };
+            if args.target.is_none() && discovered.is_none() {
+                return start_bare_shepherd(&mut streams, fmt, &paths).await;
+            }
             match connect_or_spawn_client(&mut streams, fmt, &paths).await {
-                Ok(client) => lifecycle::start(&client, &mut streams, fmt, args).await,
+                Ok(client) => {
+                    lifecycle::start(&client, &mut streams, fmt, args, discovered.as_deref()).await
+                }
                 Err(code) => code,
             }
         }
@@ -780,8 +796,20 @@ async fn run(cli: Cli) -> ExitCode {
         // Falls back to the muster roll rather than refusing: looking at
         // the flock must not be a dead end on a machine that has just
         // rebooted, which is exactly where someone most needs to look.
+        // The roll fallback is a table-format affordance only. Under
+        // `--format json` a failed invocation must leave stdout empty and put
+        // an error envelope on stderr -- `exit_codes_and_stream_discipline`
+        // enforces that, and it is right to: a consumer that asked for
+        // machine output should not have to tell a real listing apart from a
+        // consolation prize. So JSON keeps the refusal, humans get the roll.
         Commands::Flock => match Client::connect(&paths.socket).await {
             Ok(client) => query::flock(&client, &mut streams, fmt).await,
+            Err(_) if fmt == Format::Json => {
+                match connect_client(&mut streams, fmt, &paths).await {
+                    Ok(client) => query::flock(&client, &mut streams, fmt).await,
+                    Err(code) => code,
+                }
+            }
             Err(_) => query::flock_from_roll(&mut streams, fmt, &paths),
         },
         Commands::Dogs => match connect_client(&mut streams, fmt, &paths).await {
@@ -946,6 +974,45 @@ async fn connect_or_spawn_client(
             let _ = output::emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
             Err(code)
         }
+    }
+}
+
+/// `shep start` with no target and no Flockfile in sight: bring a shepherd up
+/// and stop there.
+///
+/// The only way to get a shepherd without also starting a process. Every
+/// other route either needs a target (`start <script>`) or a saved roll
+/// (`muster`), which left a fresh machine with no way to reach a running
+/// shepherd at all -- and 37 of 39 verbs need one.
+///
+/// Reports rather than re-boots when one is already up, because typing
+/// `shep start` twice should say what happened, not silently do nothing.
+#[cfg(unix)]
+async fn start_bare_shepherd(
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    paths: &ShepPaths,
+) -> ExitCode {
+    let before = status::ShepherdStatus::probe(paths).await;
+    if let Some(online) = &before.online {
+        let message = format!(
+            "shepherd already up (pid {}). `shep start <target>` adds a sheep.",
+            online.pid
+        );
+        let _ = output::emit_notice(&mut *streams.out, fmt, "start", &message);
+        return ExitCode::Success;
+    }
+    match connect_or_spawn_client(streams, fmt, paths).await {
+        Ok(_client) => {
+            let message = format!(
+                "shepherd up, flock at {}. Nothing running yet; \
+                 `shep start <target>` adds a sheep.",
+                paths.home.display()
+            );
+            let _ = output::emit_notice(&mut *streams.out, fmt, "start", &message);
+            ExitCode::Success
+        }
+        Err(code) => code,
     }
 }
 

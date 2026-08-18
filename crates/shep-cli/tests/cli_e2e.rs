@@ -1611,6 +1611,24 @@ fn json_format_matches_the_committed_fixtures() {
         "ping's pid must be the daemon's own pid"
     );
     ping_envelope["data"]["pid"] = serde_json::Value::Null;
+    // `home` and `socket` are the flock's own paths, which is the point of
+    // them being in the envelope at all, and they are a tempdir here. Assert
+    // they are right, then null them the same way `pid` is: a fixture cannot
+    // hold a path that changes every run.
+    assert_eq!(
+        ping_envelope["data"]["home"].as_str().unwrap(),
+        home.to_str().unwrap(),
+        "ping must name the home it probed"
+    );
+    assert!(
+        ping_envelope["data"]["socket"]
+            .as_str()
+            .unwrap()
+            .starts_with(home.to_str().unwrap()),
+        "ping's socket must sit under that home"
+    );
+    ping_envelope["data"]["home"] = serde_json::Value::Null;
+    ping_envelope["data"]["socket"] = serde_json::Value::Null;
     assert_eq!(
         ping_envelope,
         load_fixture("ping"),

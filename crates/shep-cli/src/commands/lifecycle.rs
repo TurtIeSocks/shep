@@ -392,8 +392,24 @@ pub async fn start(
     streams: &mut Streams<'_>,
     fmt: Format,
     args: &StartArgs,
+    discovered: Option<&Path>,
 ) -> ExitCode {
-    let stdin = if args.target == "-" {
+    // `args.target` is optional so bare `shep start` can mean "this
+    // directory's Flockfile". The caller does the discovery, because the
+    // no-target-and-no-Flockfile case never reaches here: it brings a
+    // shepherd up and stops.
+    let discovered = discovered.map(|p| p.to_string_lossy().into_owned());
+    let target: &str = match (args.target.as_deref(), discovered.as_deref()) {
+        (Some(target), _) => target,
+        (None, Some(found)) => found,
+        (None, None) => {
+            let message = "no target and no Flockfile in this directory";
+            let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), message);
+            return ExitCode::Usage;
+        }
+    };
+
+    let stdin = if target == "-" {
         let mut buf = Vec::new();
         if let Err(source) = std::io::stdin().lock().read_to_end(&mut buf) {
             return fail_target(streams, fmt, &TargetError::Stdin(source));
@@ -403,8 +419,7 @@ pub async fn start(
         Vec::new()
     };
 
-    let mut apps = match resolve_target(&args.target, args.name.as_deref(), &stdin, args.flockfile)
-    {
+    let mut apps = match resolve_target(target, args.name.as_deref(), &stdin, args.flockfile) {
         Ok(apps) => apps,
         Err(err) => return fail_target(streams, fmt, &err),
     };
@@ -582,9 +597,61 @@ mod tests {
     use shep_client::testing::{fake_client_capturing_envelopes, fake_client_replying_err};
     use shep_core::protocol::RpcErrorCode;
 
+    /// Bare `shep start` with a Flockfile discovered by the caller must
+    /// start that file. The no-target-and-no-Flockfile case never reaches
+    /// here -- it brings a shepherd up and stops -- so the remaining hole
+    /// this guards is a `start` that ignored the discovery and refused.
+    #[tokio::test]
+    async fn a_discovered_flockfile_is_started_when_no_target_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let flockfile = dir.path().join("Flockfile.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"demo\"\nscript = \"/bin/sleep\"\n",
+        )
+        .unwrap();
+
+        let sock = dir.path().join("s.sock");
+        let (client, mut envelopes) = fake_client_capturing_envelopes(&sock).await;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = StartArgs {
+            target: None,
+            name: None,
+            fold: None,
+            flockfile: false,
+        };
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            let _ = start(
+                &client,
+                &mut streams,
+                Format::Table,
+                &args,
+                Some(flockfile.as_path()),
+            )
+            .await;
+        }
+
+        let sent = tokio::time::timeout(Duration::from_secs(5), envelopes.recv())
+            .await
+            .expect("a discovered Flockfile must reach the wire")
+            .unwrap();
+        match sent.body {
+            Request::Start { apps } => {
+                assert_eq!(apps.len(), 1);
+                assert_eq!(apps[0].name, "demo");
+            }
+            other => panic!("expected a Start request, got {other:?}"),
+        }
+    }
+
     fn start_args(target: &str) -> StartArgs {
         StartArgs {
-            target: target.to_string(),
+            target: Some(target.to_string()),
             name: None,
             fold: None,
             flockfile: false,
@@ -786,6 +853,7 @@ mod tests {
                 &mut streams,
                 Format::Table,
                 &start_args("./does-not-exist"),
+                None,
             )
             .await
         };
@@ -969,6 +1037,7 @@ mod tests {
             &mut streams,
             Format::Table,
             &start_args(srv.to_str().unwrap()),
+            None,
         )
         .await;
 
@@ -1009,7 +1078,7 @@ mod tests {
         let mut args = start_args(srv.to_str().unwrap());
         args.fold = Some("backend".to_string());
 
-        let _ = start(&client, &mut streams, Format::Table, &args).await;
+        let _ = start(&client, &mut streams, Format::Table, &args, None).await;
 
         let sent = tokio::time::timeout(Duration::from_secs(5), envelopes.recv())
             .await
