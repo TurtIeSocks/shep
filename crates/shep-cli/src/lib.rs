@@ -223,7 +223,7 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
 /// A type rather than a bare [`ExitCode`] because two of the three carry the
 /// path they are about, and an operator cannot act on a refusal that does not
 /// name it.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg(unix)]
 #[derive(Debug)]
 enum HomeRefusal {
     /// None of `--home`, `$SHEP_HOME` or `$HOME` resolved a root directory.
@@ -241,6 +241,7 @@ enum HomeRefusal {
     },
 }
 
+#[cfg(unix)]
 impl core::fmt::Display for HomeRefusal {
     /// The operator-facing message, remedy included.
     ///
@@ -264,6 +265,7 @@ impl core::fmt::Display for HomeRefusal {
     }
 }
 
+#[cfg(unix)]
 impl core::error::Error for HomeRefusal {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
@@ -273,7 +275,7 @@ impl core::error::Error for HomeRefusal {
     }
 }
 
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg(unix)]
 impl HomeRefusal {
     /// The status the command ends with.
     ///
@@ -295,7 +297,7 @@ impl HomeRefusal {
 ///
 /// Every variant of [`HomeRefusal`]; see [`ensure_home_at`], which this wraps
 /// with the environment resolved.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg(unix)]
 fn ensure_home(global: &GlobalArgs) -> Result<(ShepPaths, bool), HomeRefusal> {
     let paths = resolve_paths(global).map_err(|_| HomeRefusal::Unresolved)?;
     ensure_home_at(paths, global.home.is_some())
@@ -321,11 +323,17 @@ fn ensure_home(global: &GlobalArgs) -> Result<(ShepPaths, bool), HomeRefusal> {
 /// reason; this follows that idiom one layer up. `explicit` is whether the
 /// operator named this home themselves, by either `--home` or `$SHEP_HOME`.
 ///
+/// `#[cfg(unix)]`, like [`UNRESOLVED_HOME`] which the `Display` impl reads:
+/// the Windows `run` refuses before any home is resolved, so none of this is
+/// reachable there. A `cfg_attr(windows, allow(dead_code))` compiled it on
+/// Windows instead and broke the build on a constant that does not exist
+/// there.
+///
 /// # Errors
 ///
 /// - [`HomeRefusal::Missing`] — `explicit`, and the directory is not there.
 /// - [`HomeRefusal::Io`] — the directory could not be created.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg(unix)]
 fn ensure_home_at(paths: ShepPaths, explicit: bool) -> Result<(ShepPaths, bool), HomeRefusal> {
     if paths.home.is_dir() {
         return Ok((paths, false));
