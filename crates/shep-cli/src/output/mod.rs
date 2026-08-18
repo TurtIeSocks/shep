@@ -142,7 +142,14 @@ pub trait Render: Serialize {
     /// boxed path — the plain path keeps calling [`render_table`], which
     /// keeps calling [`Self::rows`], and that is what makes `bare` provably
     /// byte-identical rather than merely intended to be.
-    fn rows_for(&self, _presentation: Presentation) -> Vec<Vec<String>> {
+    ///
+    /// `status_word` is a plain parameter rather than a field on
+    /// `Presentation`: it is `table_of`'s own per-attempt retry knob (spec
+    /// §2's word-drops-before-a-column rule), never a fact resolved once at
+    /// the seam the way every `Presentation` field is. Only
+    /// [`rows::FlockRows`] reads it; every other default impl ignores it,
+    /// so the retry `table_of` makes is a harmless no-op for anything else.
+    fn rows_for(&self, _presentation: Presentation, _status_word: bool) -> Vec<Vec<String>> {
         self.rows()
     }
     /// Table header -> JSON key, the documented name mapping
@@ -219,14 +226,14 @@ pub fn emit<T: Render>(
 /// the STATUS word is the first thing dropped from that column, before any
 /// whole column is — so the first attempt asks [`Render::rows_for`] for
 /// everything, including the word, and only if [`table::render_boxed_ex`]
-/// says it had to hide a column does a second attempt ask again with
-/// [`Presentation::status_word`] turned off. Two render passes over one
-/// small table is nothing, and it keeps [`table::render_boxed`] exactly as
-/// ignorant of what a STATUS cell is as it was before this function existed
-/// — the retry is a second call with different row *data*, never a second
-/// code path in the renderer itself. For every payload but
-/// [`rows::FlockRows`] the two passes produce identical rows (the default
-/// [`Render::rows_for`] ignores `status_word` entirely), so the retry is a
+/// says it had to hide a column does a second attempt ask again with the
+/// word turned off. Two render passes over one small table is nothing, and
+/// it keeps [`table::render_boxed`] exactly as ignorant of what a STATUS
+/// cell is as it was before this function existed — the retry is a second
+/// call with different row *data*, never a second code path in the
+/// renderer itself. For every payload but [`rows::FlockRows`] the two
+/// passes produce identical rows (the default [`Render::rows_for`] ignores
+/// its `status_word` parameter entirely), so the retry is a
 /// wasted-but-harmless no-op rather than a behaviour change.
 fn table_of<T: Render>(data: &T, presentation: Presentation) -> String {
     if !presentation.level.boxes() {
@@ -234,17 +241,18 @@ fn table_of<T: Render>(data: &T, presentation: Presentation) -> String {
     }
     let headers = T::headers();
     let width = terminal_width();
-    let wide = table::render_boxed_ex(headers, &data.rows_for(presentation), T::PRIORITIES, width);
+    let wide = table::render_boxed_ex(
+        headers,
+        &data.rows_for(presentation, true),
+        T::PRIORITIES,
+        width,
+    );
     if wide.dropped.is_empty() {
         return wide.rendered;
     }
-    let narrow_presentation = Presentation {
-        status_word: false,
-        ..presentation
-    };
     table::render_boxed_ex(
         headers,
-        &data.rows_for(narrow_presentation),
+        &data.rows_for(presentation, false),
         T::PRIORITIES,
         width,
     )
@@ -1015,7 +1023,7 @@ mod tests {
 
         let wide = table::render_boxed_ex(
             headers,
-            &flock.rows_for(presentation),
+            &flock.rows_for(presentation, true),
             FlockRows::PRIORITIES,
             80,
         );
@@ -1025,13 +1033,9 @@ mod tests {
             wide.rendered
         );
 
-        let narrow_presentation = Presentation {
-            status_word: false,
-            ..presentation
-        };
         let narrow = table::render_boxed_ex(
             headers,
-            &flock.rows_for(narrow_presentation),
+            &flock.rows_for(presentation, false),
             FlockRows::PRIORITIES,
             80,
         );

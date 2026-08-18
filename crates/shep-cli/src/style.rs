@@ -112,40 +112,44 @@ pub(crate) fn deep_colour_terminal(term: Option<&OsStr>, colorterm: Option<&OsSt
     }) || term.is_some_and(|value| value.to_string_lossy().contains("256color"))
 }
 
-/// The level the operator chose, whether colour survived `NO_COLOR`, how
-/// deep the terminal's own colour support is, and whether the STATUS word
-/// is still on the table for this particular render attempt.
+/// The level the operator chose, whether colour survived `NO_COLOR`, and
+/// how deep the terminal's own colour support is.
 ///
-/// The first three are resolved once, at the seam ([`Presentation::new`],
-/// called from `run_argv`): `level` is a layout dial the operator sets,
-/// `colour` is a cross-ecosystem convention that vetoes colour without
-/// touching layout, and `deep_colour` is a fact about the terminal itself --
-/// none of the three implies another, so folding any two together would
-/// either lose information or synthesize an answer nobody gave. `Full` with
+/// Two values rather than one because they are two axes: `level` is a
+/// layout dial the operator sets, and `colour` is a cross-ecosystem
+/// convention that vetoes colour without touching layout. `Full` with
 /// colour vetoed still draws boxes and sheep, which is the whole reason
 /// `NO_COLOR` is honoured as its own axis rather than folded into the dial.
+/// `deep_colour` is a third, independent fact about the terminal itself --
+/// none of the three implies another, so folding any two together would
+/// either lose information or synthesize an answer nobody gave.
 ///
-/// `status_word` is different in kind: it is never read from the
-/// environment, defaults `true`, and is the one field `table_of`
-/// (`output/mod.rs`) itself overrides, locally, for a second render attempt
-/// -- spec §2's rule that a STATUS word drops before any whole column does.
-/// It rides on this struct rather than growing `Render::rows_for` a second
-/// parameter because every other field already flows through here, and
-/// `FlockRows` is the only implementation that reads it.
+/// All three are resolved once, at the seam ([`Presentation::new`], called
+/// from `run_argv`) and never afterward: this is a fact about the operator
+/// and the terminal, not about any one render attempt. Contrast
+/// `table_of`'s (`output/mod.rs`) own STATUS-word retry, which is a
+/// per-attempt decision local to that function and its one caller
+/// (`FlockRows::rows_for`) -- it is threaded as a plain `bool` parameter on
+/// `Render::rows_for` rather than living here, precisely because it is not
+/// a fact resolved once at the seam the way these three are. A first
+/// revision of this task put it on this struct; review moved it, because
+/// nothing but `table_of` ever wrote it and nothing but
+/// `FlockRows::status_cell` ever read it -- a field whose only honest
+/// description was "irrelevant here" had leaked out of a function-local
+/// decision onto crate-wide state that ~100 sites construct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Presentation {
     pub(crate) level: StyleLevel,
     pub(crate) colour: bool,
     pub(crate) deep_colour: bool,
-    pub(crate) status_word: bool,
 }
 
 impl Presentation {
-    /// `Bare`, no colour, no depth, word irrelevant either way: `Bare`
-    /// never reaches `Render::rows_for` at all ([`StyleLevel::boxes`] is
-    /// false, so `table_of` takes the plain `render_table` path instead).
-    /// The safe default for the 87 test fixtures in this crate that want
-    /// today's plain output and no more.
+    /// `Bare`, no colour, no depth: `Bare` never reaches `Render::rows_for`
+    /// at all ([`StyleLevel::boxes`] is false, so `table_of` takes the
+    /// plain `render_table` path instead). The safe default for the many
+    /// test fixtures in this crate that want today's plain output and no
+    /// more.
     ///
     /// Every real `Streams` a running `shep` builds carries the
     /// `Presentation` `lib.rs`'s `run_argv` actually resolved, never this
@@ -157,16 +161,13 @@ impl Presentation {
         level: StyleLevel::Bare,
         colour: false,
         deep_colour: false,
-        status_word: true,
     };
 
     /// Resolves `colour` and `deep_colour` from already-read environment
     /// values -- terminal-ness is always a parameter here, never a
     /// `std::env` call inside the function that renders, the same idiom
     /// `commands::daemon::ansi_enabled` and `lookout::theme::Palette::detect`
-    /// both follow. `status_word` starts `true`; `table_of` is the only
-    /// place that ever turns it off, and only for one retry of one render
-    /// that was already too wide.
+    /// both follow.
     pub(crate) fn new(
         level: StyleLevel,
         no_color: Option<&OsStr>,
@@ -177,7 +178,6 @@ impl Presentation {
             level,
             colour: level.colour() && !no_color_set(no_color),
             deep_colour: deep_colour_terminal(term, colorterm),
-            status_word: true,
         }
     }
 }

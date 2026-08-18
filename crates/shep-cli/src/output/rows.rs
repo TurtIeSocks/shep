@@ -74,16 +74,22 @@ impl Render for FlockRows {
 
     /// [`Self::rows`], with the STATUS cell (index 2, parallel to
     /// `headers()`) dressed up per spec §2: the face always, when
-    /// `presentation.level.sheep()`; the word too, when
-    /// `presentation.status_word`; the whole cell coloured with
-    /// `output::paint::style_for` when `presentation.colour`. Reuses
-    /// [`Self::rows`] for the other eight columns rather than rebuilding
-    /// them, so the two never drift on anything but the one cell this
-    /// method exists to change.
-    fn rows_for(&self, presentation: Presentation) -> Vec<Vec<String>> {
+    /// `presentation.level.sheep()`; the word too, when `status_word`; the
+    /// whole cell coloured with `output::paint::style_for` when
+    /// `presentation.colour`. Reuses [`Self::rows`] for the other eight
+    /// columns rather than rebuilding them, so the two never drift on
+    /// anything but the one cell this method exists to change.
+    ///
+    /// `status_word` is a plain parameter, not part of `Presentation`,
+    /// because it is not a fact resolved once at the seam the way `level`/
+    /// `colour`/`deep_colour` are -- it is `table_of`'s (`output/mod.rs`)
+    /// own per-attempt decision, local to its two calls here, and putting
+    /// it on `Presentation` would have made it crate-wide state that ~100
+    /// call sites construct for a question only this one method ever asks.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
         let mut rows = self.rows();
         for (row, p) in rows.iter_mut().zip(&self.0) {
-            row[2] = status_cell(p.status, presentation);
+            row[2] = status_cell(p.status, presentation, status_word);
         }
         rows
     }
@@ -144,20 +150,20 @@ impl Render for FlockRows {
 ///
 /// - `presentation.level.sheep()` decides whether a face appears at all
 ///   ([`vocabulary::face`], always exactly 5 columns).
-/// - `presentation.status_word` decides whether the plain status word rides
-///   beside it -- `table_of` (`output/mod.rs`) is the only caller that ever
-///   turns this off, on a retry once a first pass already needed to drop a
-///   whole column.
+/// - `status_word` decides whether the plain status word rides beside it --
+///   `table_of` (`output/mod.rs`) is the only caller that ever passes
+///   `false`, on a retry once a first pass already needed to drop a whole
+///   column.
 /// - `presentation.colour` decides whether the whole cell (face, word, or
 ///   both) is wrapped in one [`crate::output::paint::style_for`] span, keyed
 ///   off [`vocabulary::role_of`] -- one span rather than two separately
 ///   styled pieces, so there is exactly one ANSI boundary for
 ///   [`crate::output::width::visible_width`] to discount, never two to keep
 ///   straight.
-fn status_cell(status: ProcStatus, presentation: Presentation) -> String {
+fn status_cell(status: ProcStatus, presentation: Presentation, status_word: bool) -> String {
     let mut text = if presentation.level.sheep() {
         let face = vocabulary::face(status);
-        if presentation.status_word {
+        if status_word {
             format!("{face} {status}")
         } else {
             face.to_string()
