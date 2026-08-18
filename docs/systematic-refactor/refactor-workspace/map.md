@@ -414,6 +414,20 @@ src/
              starting it again would leave a one-instance app running two and the next save
              would persist the pair. `RpcContext::save_roll_now` is the on-demand write
              `Request::SaveRoll` reaches, answering `Option<SavedRoll { path, apps }>` —
+      Drift (2026-08-18, recorded): membership survives everything but `delete`. `restorable`
+             used to return one list and select `instances_running > 0 && autostart`, which made
+             `shep stop` destructive across a daemon restart — the sheep left the flock entirely
+             and its config survived only in a roll nobody reads by hand. Rin hit exactly that
+             after a `stop`/`kill`/reinstall cycle and asked why stopping should mean
+             forgetting. It returns `members` + `to_start` now: every entry that still
+             normalizes is registered, and only the ones that were up and opt into `autostart`
+             are started. The old rule was right about what to START and wrong to conflate
+             running with belonging; `FlockRegistry::roll` never conflated them, keeping an app
+             whenever it appears in the listing and recording the count separately, so this is
+             the read side finally agreeing with the write side. `Supervisor::register_at_rest`
+             is the new admission path it needs — one `Stopped` entry at `instance: 0`, no
+             spawn, idempotent by name. Apps in `to_start` are excluded from it, or `start`
+             would allocate around the idle slot and list the sheep twice.
              `None` on an already-stopped supervisor engine, which the RPC arm turns into a
              refusal rather than a hollow success; `snapshot_now` (the debounced writer's own
              call site) is now a one-line wrapper over it.

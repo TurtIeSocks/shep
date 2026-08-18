@@ -273,22 +273,40 @@ pub fn read(path: &Path) -> Result<FlockSnapshot, SnapshotError> {
     Ok(snapshot)
 }
 
-/// Apps a `muster` should start, plus the ones the roll can no longer justify
+/// What a `muster` should put back: every member, which of them to start, and
+/// the ones the roll can no longer justify
 #[derive(Debug)]
 pub(crate) struct Restorable {
-    /// Apps that were running and still opt into `autostart`, re-validated
-    pub(crate) apps: Vec<ResolvedApp>,
+    /// Every entry that still normalizes, in roll order. The flock is a
+    /// membership list, so all of these are registered whether or not they
+    /// run.
+    pub(crate) members: Vec<ResolvedApp>,
+    /// The subset of [`Self::members`] that was up when the roll was written
+    /// and still opts into `autostart`.
+    pub(crate) to_start: Vec<ResolvedApp>,
     /// Sheep name + the reason its saved config no longer normalizes
     pub(crate) rejected: Vec<(String, NormalizeError)>,
 }
 
-/// Splits a loaded [`FlockSnapshot`] into apps to restart and apps rejected
-/// on re-validation.
+/// Splits a loaded [`FlockSnapshot`] into members, the subset to start, and
+/// the entries rejected on re-validation.
 ///
-/// Restore rule (assumption, this crate's judgment call): an app restores
-/// iff `instances_running > 0 && app.autostart`. "Was up when we saved" is
-/// the muster contract; `autostart = false` is the user's explicit opt-out
-/// of being brought back automatically.
+/// **Membership survives everything but `delete`.** A sheep that was stopped
+/// when the roll was written comes back registered and `Stopped`, not gone.
+/// The rule this replaces restored an app only when
+/// `instances_running > 0 && autostart`, which made `shep stop` silently
+/// destructive across a daemon restart: stop a sheep, restart the shepherd,
+/// and the sheep was no longer in the flock at all, with its config sitting
+/// in the roll where only `cat` would find it. Rin hit exactly that and asked
+/// why stopping something should mean forgetting it. It should not.
+///
+/// The old rule was not wrong about what to START -- "was up when we saved"
+/// is still the contract for that, and `autostart = false` is still the
+/// user's opt-out of coming back automatically. It was wrong to conflate
+/// running with belonging. [`FlockRegistry::roll`] never did: it keeps an
+/// app in the roll whenever it appears in the listing, running or not, and
+/// records the count separately. This is the read side finally agreeing with
+/// the write side.
 ///
 /// The roll is a file a human can edit, so every surviving entry is run back
 /// through [`normalize()`] exactly like peer input (spec §6's "the daemon
@@ -296,19 +314,28 @@ pub(crate) struct Restorable {
 /// instead of aborting the whole muster.
 #[must_use]
 pub(crate) fn restorable(snapshot: FlockSnapshot) -> Restorable {
-    let mut apps = Vec::new();
+    let mut members = Vec::new();
+    let mut to_start = Vec::new();
     let mut rejected = Vec::new();
     for saved in snapshot.apps {
-        if saved.instances_running == 0 || !saved.app.autostart {
-            continue;
-        }
         let name = saved.app.name.clone();
+        let was_up = saved.instances_running > 0;
+        let autostart = saved.app.autostart;
         match normalize(saved.app) {
-            Ok(resolved) => apps.push(resolved),
+            Ok(resolved) => {
+                if was_up && autostart {
+                    to_start.push(resolved.clone());
+                }
+                members.push(resolved);
+            }
             Err(err) => rejected.push((name, err)),
         }
     }
-    Restorable { apps, rejected }
+    Restorable {
+        members,
+        to_start,
+        rejected,
+    }
 }
 
 /// Reads the muster roll and starts every app it restores, returning the
@@ -360,11 +387,11 @@ pub(crate) async fn muster(
     for (name, err) in &restorable.rejected {
         tracing::warn!(name, %err, "muster roll entry rejected on restore");
     }
-    if restorable.apps.is_empty() {
+    if restorable.members.is_empty() {
         return Ok(Vec::new());
     }
     let restored: Vec<String> = restorable
-        .apps
+        .members
         .iter()
         .map(|app| app.config().name.clone())
         .collect();
@@ -373,10 +400,40 @@ pub(crate) async fn muster(
     // and the `start` below announces itself when it fails for that same
     // reason, so this needs no branch of its own.
     let running = supervisor.list_checked().await.unwrap_or_default();
+    let known = |app: &ResolvedApp| running.iter().any(|info| info.name == app.config().name);
+
+    // Membership for every surviving entry the `start` below will NOT bring
+    // up: the flock is a list of what belongs, and `delete` is the only thing
+    // that ends belonging. A sheep saved while stopped lands here and nowhere
+    // else, which is the whole point -- it comes back listed and restartable
+    // instead of vanishing.
+    //
+    // The ones being started are excluded deliberately. Registering them at
+    // rest first would leave an idle `instance: 0` entry for `start` to
+    // allocate around, and the sheep would show up twice: once stopped, once
+    // online.
+    let starting: Vec<&str> = restorable
+        .to_start
+        .iter()
+        .map(|app| app.config().name.as_str())
+        .collect();
+    let members: Vec<ResolvedApp> = restorable
+        .members
+        .iter()
+        .filter(|app| !known(app) && !starting.contains(&app.config().name.as_str()))
+        .cloned()
+        .collect();
+    if !members.is_empty() {
+        registry.record(&members);
+        if let Err(err) = supervisor.register_at_rest(members).await {
+            tracing::warn!(%err, "muster roll restore could not register one or more apps");
+        }
+    }
+
     let to_start: Vec<ResolvedApp> = restorable
-        .apps
+        .to_start
         .into_iter()
-        .filter(|app| !running.iter().any(|info| info.name == app.config().name))
+        .filter(|app| !known(app))
         .collect();
     if to_start.is_empty() {
         return Ok(restored);
@@ -620,8 +677,15 @@ mod tests {
         assert!(matches!(read(&path), Err(SnapshotError::Parse { .. })));
     }
 
+    /// Membership and running are different questions, and the roll answers
+    /// both. Every entry that still normalizes is a member; only the ones
+    /// that were up and opt into `autostart` are started.
+    ///
+    /// The old rule dropped the other two entirely, which made `shep stop`
+    /// destructive across a daemon restart: the sheep left the flock and its
+    /// config survived only in a file the operator had to `cat` to find.
     #[test]
-    fn restorable_takes_running_autostart_apps_only() {
+    fn restorable_keeps_every_member_and_starts_only_what_was_up() {
         let mut stopped = AppConfig::minimal("stopped", "./s");
         stopped.instances = 1;
         let mut opted_out = AppConfig::minimal("manual", "./m");
@@ -646,9 +710,51 @@ mod tests {
             ],
         };
         let restorable = restorable(roll);
-        assert_eq!(restorable.apps.len(), 1);
-        assert_eq!(restorable.apps[0].config().name, "web");
+
+        let members: Vec<&str> = restorable
+            .members
+            .iter()
+            .map(|a| a.config().name.as_str())
+            .collect();
+        assert_eq!(
+            members,
+            ["web", "stopped", "manual"],
+            "every entry that normalizes belongs to the flock, running or not"
+        );
+
+        let starting: Vec<&str> = restorable
+            .to_start
+            .iter()
+            .map(|a| a.config().name.as_str())
+            .collect();
+        assert_eq!(
+            starting,
+            ["web"],
+            "only the sheep that was up and opts into autostart is started"
+        );
         assert!(restorable.rejected.is_empty());
+    }
+
+    /// The bug this contract change exists for, at the unit level: a sheep
+    /// saved while stopped is still a member, so a later `restart` has
+    /// something to find.
+    #[test]
+    fn a_sheep_saved_while_stopped_is_still_a_member() {
+        let roll = FlockSnapshot {
+            version: SNAPSHOT_VERSION,
+            saved_at_ms: 0,
+            apps: vec![SavedApp {
+                app: AppConfig::minimal("zeus-auth", "./zeus-auth"),
+                instances_running: 0,
+            }],
+        };
+        let restorable = restorable(roll);
+        assert_eq!(restorable.members.len(), 1, "stopping is not forgetting");
+        assert_eq!(restorable.members[0].config().name, "zeus-auth");
+        assert!(
+            restorable.to_start.is_empty(),
+            "but it stays stopped: it was not running when the roll was written"
+        );
     }
 
     #[test]
@@ -671,7 +777,7 @@ mod tests {
         };
         let restorable = restorable(roll);
         assert_eq!(
-            restorable.apps.len(),
+            restorable.members.len(),
             1,
             "one bad entry must not sink the muster"
         );
@@ -703,11 +809,14 @@ mod tests {
         assert!(rendered.contains("<1 vars>"), "{rendered}");
     }
 
-    /// fails if `muster` starts an app the roll says was down, or skips one
-    /// it says was up. Both halves in one case, because a restore rule that
-    /// inverted would pass either half alone.
+    /// fails if `muster` starts an app the roll says was down, skips one it
+    /// says was up, or drops either from the flock. All three in one case,
+    /// because a restore rule that inverted would pass any one alone.
+    ///
+    /// Both entries come back as members -- membership ends only at
+    /// `delete` -- and exactly one of them is running.
     #[tokio::test(start_paused = true)]
-    async fn muster_starts_what_the_roll_recorded_running_and_nothing_else() {
+    async fn muster_restores_both_and_starts_only_the_one_that_was_up() {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         std::fs::create_dir_all(paths.snapshot.parent().unwrap()).unwrap();
@@ -736,10 +845,21 @@ mod tests {
         let registry = FlockRegistry::new();
 
         let restored = muster(&paths.snapshot, &registry, &handle).await.unwrap();
-        assert_eq!(restored, vec!["up".to_string()]);
-        let listed = handle.list().await;
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].name, "up");
+        assert_eq!(
+            restored,
+            vec!["up".to_string(), "down".to_string()],
+            "both are restored to the flock; only one of them runs"
+        );
+
+        let mut listed = handle.list().await;
+        listed.sort_by(|a, b| a.name.cmp(&b.name));
+        let seen: Vec<(&str, ProcStatus)> =
+            listed.iter().map(|i| (i.name.as_str(), i.status)).collect();
+        assert_eq!(
+            seen,
+            vec![("down", ProcStatus::Stopped), ("up", ProcStatus::Online)],
+            "the sheep that was down is listed and stopped, not missing"
+        );
         handle.shutdown().await;
     }
 

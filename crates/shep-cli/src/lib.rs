@@ -1003,12 +1003,32 @@ async fn start_bare_shepherd(
         return ExitCode::Success;
     }
     match connect_or_spawn_client(streams, fmt, paths).await {
-        Ok(_client) => {
-            let message = format!(
-                "shepherd up, flock at {}. Nothing running yet; \
-                 `shep start <target>` adds a sheep.",
-                paths.home.display()
-            );
+        Ok(client) => {
+            // Asked after the boot, not before: bringing the shepherd up
+            // restores the muster roll, so a flock that looked empty a
+            // moment ago may have members now -- and saying "nothing
+            // running yet" over a listed sheep is how this message would
+            // start lying the moment membership began surviving a restart.
+            let restored = client
+                .request(shep_core::protocol::Request::ListFlock)
+                .await;
+            let known = match &restored {
+                Ok(shep_core::protocol::Response::Flock(procs)) => procs.len(),
+                _ => 0,
+            };
+            let message = if known == 0 {
+                format!(
+                    "shepherd up, flock at {}. Nothing running yet; \
+                     `shep start <target>` adds a sheep.",
+                    paths.home.display()
+                )
+            } else {
+                format!(
+                    "shepherd up, flock at {}. {known} sheep restored from the roll; \
+                     `shep flock` lists them.",
+                    paths.home.display()
+                )
+            };
             let _ = output::emit_notice(&mut *streams.out, fmt, "start", &message);
             ExitCode::Success
         }

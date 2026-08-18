@@ -157,6 +157,18 @@ pub(crate) enum Command {
         /// Answers with every spawned instance, or the first spawn failure.
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     },
+    /// Registers each app as a flock member without spawning anything.
+    ///
+    /// Restoring a muster roll is the only caller. The roll records
+    /// membership and running counts separately, and this is the half that
+    /// puts membership back: a sheep saved while stopped returns stopped and
+    /// restartable rather than vanishing.
+    RegisterAtRest {
+        /// Already-validated app specs to register, one entry each.
+        apps: Vec<ResolvedApp>,
+        /// Answers with every entry now registered, in the order given.
+        reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
+    },
     /// Registers + spawns one dog, marked with where it came from.
     ///
     /// Separate from [`Self::Start`] only because of what it WRITES — the
@@ -545,6 +557,26 @@ impl SupervisorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Command(Command::Start { apps, reply }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
+    /// Registers each app as a flock member without starting it.
+    ///
+    /// Idempotent by name: an app already known is returned as it stands, so
+    /// restoring a roll over a live flock disturbs nothing.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    pub(crate) async fn register_at_rest(
+        &self,
+        apps: Vec<ResolvedApp>,
+    ) -> Result<Vec<ProcessInfo>, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::RegisterAtRest { apps, reply }))
             .await
             .map_err(|_| SupervisorError::EngineStopped)?;
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
@@ -1748,6 +1780,15 @@ impl<R: ProcessRunner> Actor<R> {
                 let _ = reply.send(result);
                 false
             }
+            // Not rejected while `shutting_down`, unlike Start: this
+            // spawns nothing, so it can leave no child outside the shutdown
+            // aggregation. It is still pointless during a shutdown, and
+            // nothing calls it there.
+            Command::RegisterAtRest { apps, reply } => {
+                let registered = apps.iter().map(|app| self.register_at_rest(app)).collect();
+                let _ = reply.send(Ok(registered));
+                false
+            }
             // Rejected while `shutting_down` under CRITICAL-1's rule, the one
             // Start follows and for the same reason: a dog spawned after the
             // shutdown aggregation was computed is a child nothing will kill.
@@ -1937,6 +1978,74 @@ impl<R: ProcessRunner> Actor<R> {
             }
         }
         Ok(results)
+    }
+
+    /// Registers one app as a member of the flock without spawning anything.
+    ///
+    /// The flock is a membership list, not a list of live processes. `stop`
+    /// leaves a sheep registered and `Stopped`; `delete` is what ends
+    /// membership. Restoring a roll has to be able to say the same thing, and
+    /// before this existed it could not: the only way into the flock was
+    /// [`Self::do_start`], so a sheep saved while stopped came back as
+    /// nothing at all and `shep restart <name>` could not find it.
+    ///
+    /// One entry per app rather than one per configured instance. A stopped
+    /// sheep has no instances running by definition, and `instance: 0` is the
+    /// slot `start` would fill first, so a later `restart` lands where it
+    /// would have.
+    ///
+    /// Idempotent by name, like [`Self::do_start_dog`]: an app already known
+    /// is left exactly as it is, so restoring a roll over a live flock never
+    /// disturbs what is already running.
+    fn register_at_rest(&mut self, app: &ResolvedApp) -> ProcessInfo {
+        let name = &app.config().name;
+        if let Some(slot) = self
+            .sheep
+            .values()
+            .find(|slot| &slot.entry.spec.config().name == name)
+        {
+            return to_info(&slot.entry);
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+        // Assembled for its log paths only: nothing is spawned here, but the
+        // entry has to name the files a later `restart` will append to, the
+        // same way the failure arm of `spawn_fresh` does.
+        let spec = assemble(app, 0, &self.paths, None);
+        let entry = ProcessEntry {
+            id,
+            spec: app.clone(),
+            instance: 0,
+            status: ProcStatus::Stopped,
+            pid: None,
+            restarts: 0,
+            started_at: None,
+            budget: RestartBudget::default(),
+            reload: ReloadState::None,
+            credentials: None,
+            out_file: spec.out_file.clone(),
+            err_file: spec.err_file.clone(),
+            dog: None,
+        };
+        let info = to_info(&entry);
+        self.sheep.insert(
+            id,
+            SheepSlot {
+                entry,
+                ctl: None,
+                log_ctl: None,
+                to_child: None,
+                signals: None,
+                to_stdin: None,
+                manual: None,
+                pending_delete: false,
+                epoch: 0,
+                ready_tx: None,
+                actions: ActionWaits::default(),
+            },
+        );
+        info
     }
 
     /// Registers + spawns one brand-new instance (a fresh id, `restarts: 0`).
