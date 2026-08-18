@@ -126,7 +126,7 @@ pub struct GlobalArgs {
     /// Suppress non-essential output
     ///
     /// Currently narrows `bleats`' own notices (a dropped-events count, a
-    /// daemon-shutdown notice, ...) — diagnostics distinct from a sheep's
+    /// daemon-shutdown notice, ...): diagnostics distinct from a sheep's
     /// own line or a real error, both of which still print regardless.
     #[arg(short, long, global = true)]
     pub quiet: bool,
