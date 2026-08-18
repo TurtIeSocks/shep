@@ -249,11 +249,21 @@ pub async fn describe(
     fmt: Format,
     args: &SelectorArgs,
 ) -> ExitCode {
-    let selector = match parse_selector(streams, fmt, &args.selector) {
-        Ok(selector) => SelectorSpec::from(&selector),
-        Err(code) => return code,
-    };
-    describe_selector(client, streams, fmt, "describe", selector).await
+    // One pass per target, each rendered as its own detail view: `describe`
+    // answers with a tree per sheep (its lambs), not a row, so merging several
+    // into one payload would lose the per-sheep shape the verb exists for.
+    let mut failure: Option<ExitCode> = None;
+    for raw in &args.selectors {
+        let selector = match parse_selector(streams, fmt, raw) {
+            Ok(selector) => SelectorSpec::from(&selector),
+            Err(code) => return code,
+        };
+        let code = describe_selector(client, streams, fmt, "describe", selector).await;
+        if code != ExitCode::Success {
+            failure = failure.or(Some(code));
+        }
+    }
+    failure.unwrap_or(ExitCode::Success)
 }
 
 /// Lists one fold (spec §5 / §9): `Request::Describe { selector:
@@ -345,7 +355,7 @@ mod tests {
                 err: &mut err,
             };
             let args = SelectorArgs {
-                selector: input.into(),
+                selectors: vec![input.into()],
             };
             let _ = describe(&client, &mut streams, Format::Table, &args).await;
             let sent = tokio::time::timeout(RECV_TIMEOUT, envelopes.recv())
@@ -383,7 +393,7 @@ mod tests {
                 &mut streams,
                 Format::Table,
                 &SelectorArgs {
-                    selector: "/[/".into(),
+                    selectors: vec!["/[/".into()],
                 },
             )
             .await
@@ -489,7 +499,7 @@ mod tests {
                 &mut streams,
                 Format::Json,
                 &SelectorArgs {
-                    selector: "all".into(),
+                    selectors: vec!["all".into()],
                 },
             )
             .await

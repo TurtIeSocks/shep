@@ -408,6 +408,81 @@ where
     }
 }
 
+/// Parses every selector the invocation named, refusing on the first bad one.
+///
+/// All-or-nothing on purpose: a typo in the third target should not be
+/// discovered after the first two have already been acted on.
+fn parse_selectors(
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    raw: &[String],
+) -> Result<Vec<SelectorSpec>, ExitCode> {
+    let mut parsed = Vec::with_capacity(raw.len());
+    for one in raw {
+        parsed.push(SelectorSpec::from(&parse_selector(streams, fmt, one)?));
+    }
+    Ok(parsed)
+}
+
+/// Sends one request per selector and collects what each returned.
+///
+/// The CLI loops rather than the wire carrying a list, which is a deliberate
+/// trade recorded here because it is invisible from the command line: the
+/// selectors are not applied atomically. `shep stop a b c` where `b` matches
+/// nothing still stops `a` and `c`, and says what happened to `b`. Swapping
+/// this for a batched request later changes no command and breaks no script,
+/// because the CLI surface does not encode which it is.
+///
+/// Every selector is attempted -- stopping at the first failure would leave
+/// the operator guessing which of their targets were touched -- and the
+/// returned code is the FIRST failure, so a partial success is never reported
+/// as a whole one. Errors are rendered as they happen, so the operator sees
+/// which target failed rather than a count.
+async fn request_each<I, B, F>(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    selectors: &[SelectorSpec],
+    deadline: Option<Duration>,
+    body: B,
+    extract: F,
+) -> (Vec<I>, Option<ExitCode>)
+where
+    B: Fn(SelectorSpec) -> Request,
+    F: Fn(Response) -> Option<Vec<I>>,
+{
+    let mut collected = Vec::new();
+    let mut failure: Option<ExitCode> = None;
+
+    for selector in selectors {
+        match client
+            .request_with_deadline(body(selector.clone()), deadline)
+            .await
+        {
+            Ok(response) => match extract(response) {
+                Some(mut rows) => collected.append(&mut rows),
+                None => {
+                    let message =
+                        "the daemon answered with a response this client does not understand";
+                    let _ = emit_error(
+                        &mut *streams.err,
+                        fmt,
+                        ExitCode::Internal.code_str(),
+                        message,
+                    );
+                    failure = failure.or(Some(ExitCode::Internal));
+                }
+            },
+            Err(err) => {
+                let code = ExitCode::from(&err);
+                let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
+                failure = failure.or(Some(code));
+            }
+        }
+    }
+    (collected, failure)
+}
+
 /// Renders `err` and returns the exit code `start` reports it as.
 fn fail_target(streams: &mut Streams<'_>, fmt: Format, err: &TargetError) -> ExitCode {
     let code = target_exit_code(err);
@@ -438,6 +513,7 @@ async fn resume(
     streams: &mut Streams<'_>,
     fmt: Format,
     existing: &shep_core::protocol::ProcessInfo,
+    started: &mut Vec<shep_core::protocol::ProcessInfo>,
 ) -> ExitCode {
     use shep_core::status::ProcStatus;
 
@@ -452,21 +528,21 @@ async fn resume(
         let _ = emit_notice(&mut *streams.err, fmt, "start", &message);
         return ExitCode::Success;
     }
-    request_and_render(
+    let (procs, failure) = request_each(
         client,
         streams,
         fmt,
-        "start",
-        Request::Restart {
-            selector: SelectorSpec::Name(existing.name.clone()),
-        },
+        &[SelectorSpec::Name(existing.name.clone())],
         None,
+        |selector| Request::Restart { selector },
         |response| match response {
-            Response::Restarted(procs) => Some(FlockRows(procs)),
+            Response::Restarted(procs) => Some(procs),
             _ => None,
         },
     )
-    .await
+    .await;
+    started.extend(procs);
+    failure.unwrap_or(ExitCode::Success)
 }
 
 /// The flock as it stands, for deciding whether a target names a sheep that
@@ -495,6 +571,66 @@ pub async fn start(
     args: &StartArgs,
     discovered: Option<&Path>,
 ) -> ExitCode {
+    // `--name` renames the sheep a target becomes, and a name is unique to
+    // one sheep, so it cannot mean anything across several targets.
+    if args.name.is_some() && args.targets.len() > 1 {
+        let message = "--name takes one target: a name belongs to one sheep";
+        let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), message);
+        return ExitCode::Usage;
+    }
+    if args.targets.is_empty() {
+        let mut started = Vec::new();
+        let code = start_one(client, streams, fmt, args, None, discovered, &mut started).await;
+        if !started.is_empty() {
+            let wrote = write_outcome(emit(&mut *streams.out, fmt, "start", FlockRows(started)));
+            if wrote != ExitCode::Success {
+                return wrote;
+            }
+        }
+        return code;
+    }
+    // In turn, not atomically: if the second target fails the first is
+    // already up. The exit code is the first failure, so a partial success
+    // is never reported as a whole one.
+    let mut failure: Option<ExitCode> = None;
+    let mut started = Vec::new();
+    for target in &args.targets {
+        let code = start_one(
+            client,
+            streams,
+            fmt,
+            args,
+            Some(target),
+            discovered,
+            &mut started,
+        )
+        .await;
+        if code != ExitCode::Success {
+            failure = failure.or(Some(code));
+        }
+    }
+    // One table for the whole invocation, matching `stop` and `restart`. A
+    // header per target would be the only place in the CLI where asking for
+    // three things prints three tables.
+    if !started.is_empty() {
+        let wrote = write_outcome(emit(&mut *streams.out, fmt, "start", FlockRows(started)));
+        if wrote != ExitCode::Success {
+            return wrote;
+        }
+    }
+    failure.unwrap_or(ExitCode::Success)
+}
+
+/// One target's worth of [`start`].
+async fn start_one(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    args: &StartArgs,
+    target: Option<&str>,
+    discovered: Option<&Path>,
+    started: &mut Vec<shep_core::protocol::ProcessInfo>,
+) -> ExitCode {
     // `args.target` is optional so bare `shep start` can mean "this
     // directory's Flockfile". The caller does the discovery, because the
     // no-target-and-no-Flockfile case never reaches here: it brings a
@@ -509,19 +645,19 @@ pub async fn start(
     // or Flockfile still means what it says, so `shep start ./server.js` is
     // never diverted by a coincidence of names.
     let mut listing: Option<Vec<shep_core::protocol::ProcessInfo>> = None;
-    if let Some(name) = args.target.as_deref() {
+    if let Some(name) = target {
         let is_path_like = name == "-" || args.flockfile || Path::new(name).exists();
         if !is_path_like {
             let flock = flock_now(client).await;
             if let Some(existing) = flock.iter().find(|info| info.name == name) {
-                return resume(client, streams, fmt, existing).await;
+                return resume(client, streams, fmt, existing, started).await;
             }
             listing = Some(flock);
         }
     }
 
     let discovered = discovered.map(|p| p.to_string_lossy().into_owned());
-    let target: &str = match (args.target.as_deref(), discovered.as_deref()) {
+    let target: &str = match (target, discovered.as_deref()) {
         (Some(target), _) => target,
         (None, Some(found)) => found,
         (None, None) => {
@@ -565,7 +701,7 @@ pub async fn start(
         }
     }
     for existing in &resumed {
-        let code = resume(client, streams, fmt, existing).await;
+        let code = resume(client, streams, fmt, existing, started).await;
         if code != ExitCode::Success {
             return code;
         }
@@ -588,19 +724,24 @@ pub async fn start(
         }
     }
 
-    request_and_render(
+    let (procs, failure) = request_each(
         client,
         streams,
         fmt,
-        "start",
-        Request::Start { apps },
+        // One request either way: `Start` carries the apps, so the "selector"
+        // here is a placeholder the body closure ignores. Reusing the looping
+        // helper keeps the collect-then-render shape in one place.
+        &[SelectorSpec::All],
         Some(START_DEADLINE),
+        |_| Request::Start { apps: apps.clone() },
         |response| match response {
-            Response::Started(procs) => Some(FlockRows(procs)),
+            Response::Started(procs) => Some(procs),
             _ => None,
         },
     )
-    .await
+    .await;
+    started.extend(procs);
+    failure.unwrap_or(ExitCode::Success)
 }
 
 /// Stops the sheep matching `args.selector`.
@@ -610,23 +751,30 @@ pub async fn stop(
     fmt: Format,
     args: &SelectorArgs,
 ) -> ExitCode {
-    let selector = match parse_selector(streams, fmt, &args.selector) {
-        Ok(selector) => SelectorSpec::from(&selector),
+    let selectors = match parse_selectors(streams, fmt, &args.selectors) {
+        Ok(selectors) => selectors,
         Err(code) => return code,
     };
-    request_and_render(
+    let (procs, failure) = request_each(
         client,
         streams,
         fmt,
-        "stop",
-        Request::Stop { selector },
+        &selectors,
         None,
+        |selector| Request::Stop { selector },
         |response| match response {
-            Response::Stopped(procs) => Some(FlockRows(procs)),
+            Response::Stopped(procs) => Some(procs),
             _ => None,
         },
     )
-    .await
+    .await;
+    if !procs.is_empty() {
+        let wrote = write_outcome(emit(&mut *streams.out, fmt, "stop", FlockRows(procs)));
+        if wrote != ExitCode::Success {
+            return wrote;
+        }
+    }
+    failure.unwrap_or(ExitCode::Success)
 }
 
 /// Restarts the sheep matching `args.selector`.
@@ -636,23 +784,30 @@ pub async fn restart(
     fmt: Format,
     args: &SelectorArgs,
 ) -> ExitCode {
-    let selector = match parse_selector(streams, fmt, &args.selector) {
-        Ok(selector) => SelectorSpec::from(&selector),
+    let selectors = match parse_selectors(streams, fmt, &args.selectors) {
+        Ok(selectors) => selectors,
         Err(code) => return code,
     };
-    request_and_render(
+    let (procs, failure) = request_each(
         client,
         streams,
         fmt,
-        "restart",
-        Request::Restart { selector },
+        &selectors,
         None,
+        |selector| Request::Restart { selector },
         |response| match response {
-            Response::Restarted(procs) => Some(FlockRows(procs)),
+            Response::Restarted(procs) => Some(procs),
             _ => None,
         },
     )
-    .await
+    .await;
+    if !procs.is_empty() {
+        let wrote = write_outcome(emit(&mut *streams.out, fmt, "restart", FlockRows(procs)));
+        if wrote != ExitCode::Success {
+            return wrote;
+        }
+    }
+    failure.unwrap_or(ExitCode::Success)
 }
 
 /// Reloads the sheep matching `args.selector`, replacing each instance with
@@ -671,23 +826,30 @@ pub async fn reload(
     fmt: Format,
     args: &SelectorArgs,
 ) -> ExitCode {
-    let selector = match parse_selector(streams, fmt, &args.selector) {
-        Ok(selector) => SelectorSpec::from(&selector),
+    let selectors = match parse_selectors(streams, fmt, &args.selectors) {
+        Ok(selectors) => selectors,
         Err(code) => return code,
     };
-    request_and_render(
+    let (procs, failure) = request_each(
         client,
         streams,
         fmt,
-        "reload",
-        Request::Reload { selector },
+        &selectors,
         None,
+        |selector| Request::Reload { selector },
         |response| match response {
-            Response::Reloading(procs) => Some(FlockRows(procs)),
+            Response::Reloading(procs) => Some(procs),
             _ => None,
         },
     )
-    .await
+    .await;
+    if !procs.is_empty() {
+        let wrote = write_outcome(emit(&mut *streams.out, fmt, "reload", FlockRows(procs)));
+        if wrote != ExitCode::Success {
+            return wrote;
+        }
+    }
+    failure.unwrap_or(ExitCode::Success)
 }
 
 /// Deletes (stops and deregisters) the sheep matching `args.selector`.
@@ -697,23 +859,30 @@ pub async fn delete(
     fmt: Format,
     args: &SelectorArgs,
 ) -> ExitCode {
-    let selector = match parse_selector(streams, fmt, &args.selector) {
-        Ok(selector) => SelectorSpec::from(&selector),
+    let selectors = match parse_selectors(streams, fmt, &args.selectors) {
+        Ok(selectors) => selectors,
         Err(code) => return code,
     };
-    request_and_render(
+    let (ids, failure) = request_each(
         client,
         streams,
         fmt,
-        "delete",
-        Request::Delete { selector },
+        &selectors,
         None,
+        |selector| Request::Delete { selector },
         |response| match response {
-            Response::Deleted(ids) => Some(DeletedIds(ids)),
+            Response::Deleted(ids) => Some(ids),
             _ => None,
         },
     )
-    .await
+    .await;
+    if !ids.is_empty() {
+        let wrote = write_outcome(emit(&mut *streams.out, fmt, "delete", DeletedIds(ids)));
+        if wrote != ExitCode::Success {
+            return wrote;
+        }
+    }
+    failure.unwrap_or(ExitCode::Success)
 }
 
 /// Sets `args.name`'s instance count (the stocking rate), and renders the
@@ -775,7 +944,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let args = StartArgs {
-            target: None,
+            targets: Vec::new(),
             name: None,
             fold: None,
             cwd: None,
@@ -863,7 +1032,7 @@ mod tests {
 
     fn start_args(target: &str) -> StartArgs {
         StartArgs {
-            target: Some(target.to_string()),
+            targets: vec![target.to_string()],
             name: None,
             fold: None,
             cwd: None,
@@ -1227,7 +1396,7 @@ mod tests {
                     err: &mut err,
                 };
                 let args = SelectorArgs {
-                    selector: input.into(),
+                    selectors: vec![input.into()],
                 };
                 let expected_body = match verb {
                     Verb::Stop => Request::Stop { selector: expected },
@@ -1279,7 +1448,7 @@ mod tests {
                 &mut streams,
                 Format::Table,
                 &SelectorArgs {
-                    selector: "/[/".into(),
+                    selectors: vec!["/[/".into()],
                 },
             )
             .await
@@ -1308,7 +1477,7 @@ mod tests {
             &mut streams,
             Format::Table,
             &SelectorArgs {
-                selector: "ghost".into(),
+                selectors: vec!["ghost".into()],
             },
         )
         .await;

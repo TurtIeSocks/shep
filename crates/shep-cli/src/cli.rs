@@ -539,11 +539,17 @@ pub enum Commands {
 /// Arguments to `shep start`.
 #[derive(Debug, clap::Args)]
 pub struct StartArgs {
-    /// A script path, a Flockfile, or `-` to read Flockfile JSON from stdin
+    /// Script paths, Flockfiles, names the flock already has, or `-` to read
+    /// Flockfile JSON from stdin
     ///
-    /// Omit it to start the Flockfile in the current directory, or, when
+    /// Omit them to start the Flockfile in the current directory, or, when
     /// there is none, to bring a shepherd up with nothing running yet.
-    pub target: Option<String>,
+    ///
+    /// Several are started in turn, not atomically: if the second fails the
+    /// first is already up, and the exit code is the first failure. `--name`
+    /// is refused with more than one, since a name is unique to one sheep.
+    #[arg(num_args = 0..)]
+    pub targets: Vec<String>,
     /// Name for this sheep (script form only)
     #[arg(long)]
     pub name: Option<String>,
@@ -635,8 +641,14 @@ pub struct ServeArgs {
 /// link to it does not resolve under `cargo doc`).
 #[derive(Debug, clap::Args)]
 pub struct SelectorArgs {
-    /// name, id, `all`, `/regex/`, or `fold:<name>`
-    pub selector: String,
+    /// One or more: name, id, `all`, `/regex/`, or `fold:<name>`
+    ///
+    /// Several are applied in turn, not atomically: `shep stop a b c` where
+    /// `b` matches nothing still stops `a` and `c`, and the exit code is the
+    /// first failure. A shell glob like `zeus-*` is expanded by the SHELL
+    /// against filenames before shep sees it, so quote it or use `/^zeus-/`.
+    #[arg(required = true, num_args = 1..)]
+    pub selectors: Vec<String>,
 }
 
 /// Arguments to `shep stock`.

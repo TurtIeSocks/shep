@@ -742,14 +742,14 @@ async fn run(cli: Cli) -> ExitCode {
         // none, it means "bring a shepherd up", which is the only way to get
         // one without also starting a process.
         Commands::Start(ref args) => {
-            let discovered = if args.target.is_none() {
+            let discovered = if args.targets.is_empty() {
                 std::env::current_dir()
                     .ok()
                     .and_then(|cwd| shep_core::config::flockfile::discover(&cwd))
             } else {
                 None
             };
-            if args.target.is_none() && discovered.is_none() {
+            if args.targets.is_empty() && discovered.is_none() {
                 return start_bare_shepherd(&mut streams, fmt, &paths).await;
             }
             match connect_or_spawn_client(&mut streams, fmt, &paths).await {
