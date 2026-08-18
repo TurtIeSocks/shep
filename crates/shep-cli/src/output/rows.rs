@@ -683,6 +683,55 @@ impl Render for KillRow {
     const JSON_ONLY: &'static [&'static str] = &[];
 }
 
+/// One sheep as the muster roll remembers it, for `shep flock` when no
+/// shepherd is running.
+///
+/// `status` is always `"stopped"`: a roll records what *was* registered, and
+/// with no shepherd answering, nothing from it is up. Stating it in a column
+/// rather than leaving the reader to infer it from context, because the
+/// whole point of this rendering is that "no shepherd" and "no processes"
+/// look identical if you do not say which one you mean.
+#[derive(Debug, Serialize)]
+pub struct RolledSheep {
+    /// The sheep's name, as saved.
+    pub name: String,
+    /// How many instances were running when the roll was written.
+    pub instances: u32,
+    /// Always `"stopped"`.
+    pub status: &'static str,
+}
+
+/// Every sheep in a muster roll.
+#[derive(Debug, Serialize)]
+pub struct RolledSheepRows(pub Vec<RolledSheep>);
+
+impl Render for RolledSheepRows {
+    fn headers() -> &'static [&'static str] {
+        &["NAME", "INSTANCES", "STATUS"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|s| vec![s.name.clone(), s.instances.to_string(), s.status.to_owned()])
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of [`Self::headers`]'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "NAME" => "name",
+            "INSTANCES" => "instances",
+            "STATUS" => "status",
+            other => panic!("RolledSheepRows has no column {other}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+}
+
 /// `Response::RollSaved` — where the muster roll landed, and what it
 /// recorded.
 ///

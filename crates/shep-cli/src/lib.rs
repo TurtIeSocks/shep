@@ -777,9 +777,12 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => whisper::whisper(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
-        Commands::Flock => match connect_client(&mut streams, fmt, &paths).await {
+        // Falls back to the muster roll rather than refusing: looking at
+        // the flock must not be a dead end on a machine that has just
+        // rebooted, which is exactly where someone most needs to look.
+        Commands::Flock => match Client::connect(&paths.socket).await {
             Ok(client) => query::flock(&client, &mut streams, fmt).await,
-            Err(code) => code,
+            Err(_) => query::flock_from_roll(&mut streams, fmt, &paths),
         },
         Commands::Dogs => match connect_client(&mut streams, fmt, &paths).await {
             Ok(client) => query::dogs(&client, &mut streams, fmt).await,

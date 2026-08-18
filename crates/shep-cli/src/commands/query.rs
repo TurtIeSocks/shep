@@ -16,13 +16,16 @@
 //! verb exists for.
 
 use shep_client::Client;
+use shep_core::paths::ShepPaths;
 use shep_core::protocol::{Request, Response, SelectorSpec};
+use shep_daemon::snapshot::FlockSnapshot;
 
 use crate::cli::{FoldArgs, Format, SelectorArgs};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
 use crate::output::{
-    DogRows, Render, Streams, emit, emit_described, emit_error, emit_flock, write_outcome,
+    DogRows, Render, RolledSheep, RolledSheepRows, Streams, emit, emit_described, emit_error,
+    emit_flock, write_outcome,
 };
 
 /// Sends `body`, renders whatever the daemon answers through [`emit`], and
@@ -107,6 +110,72 @@ async fn describe_selector(
             code
         }
     }
+}
+
+/// `shep flock` when no shepherd answers: the muster roll, marked stopped.
+///
+/// "Nothing is running" is a perfectly good answer to "what is running", and
+/// turning it into `error[daemon_unreachable]` made looking at the flock a
+/// dead end on exactly the machine where someone most needs to look -- one
+/// that has just rebooted. The roll on disk holds everything needed to
+/// answer, and `shep muster` is the way back, so both are stated.
+///
+/// The exit code stays [`ExitCode::DaemonUnreachable`] even though this
+/// prints a successful-looking table, and that is the important part: a
+/// monitoring script running `shep flock` must not read a dead supervisor as
+/// a healthy empty flock. The output is for the human, the code is for the
+/// script, and they are telling the truth about different things.
+///
+/// A missing or unreadable roll is not an error either -- a machine that has
+/// never run `shep save` has nothing to show, which is itself the answer.
+pub fn flock_from_roll(streams: &mut Streams<'_>, fmt: Format, paths: &ShepPaths) -> ExitCode {
+    let saved = std::fs::read(&paths.snapshot)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<FlockSnapshot>(&bytes).ok());
+
+    let sheep: Vec<RolledSheep> = saved
+        .map(|roll| {
+            roll.apps
+                .into_iter()
+                .map(|entry| RolledSheep {
+                    name: entry.app.name.clone(),
+                    instances: entry.instances_running,
+                    status: "stopped",
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if fmt == Format::Table {
+        let _ = writeln!(
+            streams.err,
+            "no shepherd running. {}",
+            if sheep.is_empty() {
+                "nothing in the saved roll either.".to_owned()
+            } else {
+                format!(
+                    "{} in the saved roll at {}:",
+                    match sheep.len() {
+                        1 => "1 sheep".to_owned(),
+                        n => format!("{n} sheep"),
+                    },
+                    paths.snapshot.display()
+                )
+            }
+        );
+    }
+    let empty = sheep.is_empty();
+    // An empty roll renders no table at all in table form: bare column
+    // headers over nothing read as a glitch, and the line above already said
+    // there is nothing. JSON still gets the empty array, because a script
+    // parsing this wants one shape, not two.
+    if !(empty && fmt == Format::Table) {
+        let _ = emit(&mut *streams.out, fmt, "flock", RolledSheepRows(sheep));
+    }
+    if fmt == Format::Table && !empty {
+        let _ = writeln!(streams.err, "`shep muster` brings them back.");
+    }
+    ExitCode::DaemonUnreachable
 }
 
 /// Lists the whole flock: the sheep table, then the dogs table beneath it
