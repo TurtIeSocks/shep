@@ -133,9 +133,10 @@ pub struct GlobalArgs {
     /// How much this invocation dresses up its output: `full`, `plain`, or
     /// `bare`
     ///
-    /// Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`, which is
-    /// [`crate::style::resolve`]'s whole precedence order — `shep style`
-    /// reports which of the three answered. Omit to let those decide.
+    /// Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to
+    /// let those decide; `shep style` reports which one answered.
+    // The precedence order above is `style::resolve`'s; this field is only
+    // the flag's own place in it.
     #[arg(long, global = true, value_enum)]
     pub style: Option<crate::style::StyleLevel>,
     /// Talk to a different shepherd
@@ -1196,6 +1197,32 @@ mod tests {
                 "`shep --help` still contains the internal note {leak:?}:\n{help}"
             );
         }
+    }
+
+    /// `--help` is the largest body of user-facing copy in the product, and
+    /// `welcome.rs`, `status.rs` and `output/table.rs` each pin "no em or en
+    /// dashes in copy a user reads" for their own copy while nothing pinned
+    /// this one -- exactly how an em dash on `--quiet`'s help text and Rust
+    /// intra-doc-link syntax on `--style`'s both reached a real terminal
+    /// before anyone ran the binary and read the rendered output rather
+    /// than the doc comment that produced it.
+    #[test]
+    fn the_top_level_help_has_no_dashes_or_doc_link_syntax() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            !help.contains('\u{2014}'),
+            "an em dash reached --help, which this project's copy rules forbid:\n{help}"
+        );
+        assert!(
+            !help.contains('\u{2013}'),
+            "an en dash reached --help, which this project's copy rules forbid:\n{help}"
+        );
+        assert!(
+            !help.contains("[`"),
+            "Rust intra-doc-link syntax reached --help -- an aside meant for a reader of the \
+             source, not the terminal, belongs on a `//` comment rather than a `///` one:\n{help}"
+        );
     }
 
     #[test]
