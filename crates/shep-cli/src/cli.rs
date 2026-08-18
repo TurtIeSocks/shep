@@ -550,6 +550,9 @@ pub struct StartArgs {
     /// Fold to place this sheep in
     #[arg(long)]
     pub fold: Option<String>,
+    /// Working directory to run in (default: where you ran `shep start`)
+    #[arg(long)]
+    pub cwd: Option<String>,
     /// Read TARGET as a Flockfile rather than as a script path.
     ///
     /// Required for a `.js` Flockfile and the only way to reach one: shep

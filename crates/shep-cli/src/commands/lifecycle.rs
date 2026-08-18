@@ -341,7 +341,21 @@ pub fn resolve_target(
                     .map(|abs| abs.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| target.to_string())
             };
-            Ok(vec![AppConfig::minimal(name.unwrap_or(stem), &script)])
+            let mut app = AppConfig::minimal(name.unwrap_or(stem), &script);
+            // Where the operator ran `shep start`, not where the shepherd
+            // happens to live. An unset `cwd` leaves the child inheriting the
+            // daemon's directory, which is invisible from the command line
+            // and is whatever the shepherd was spawned from -- so a service
+            // that reads a config file beside itself breaks in a quieter way
+            // than a missing binary does. `normalize` already refuses `watch`
+            // for this exact reason (`WatchWithoutCwd`: defaulting to the
+            // daemon's cwd "risks watching the whole filesystem under a
+            // systemd unit"); this generalises that caution to every app
+            // started by path.
+            app.cwd = std::env::current_dir()
+                .ok()
+                .map(|dir| dir.to_string_lossy().into_owned());
+            Ok(vec![app])
         }
         _ => Err(TargetError::Unresolvable {
             target: target.to_string(),
@@ -445,6 +459,13 @@ pub async fn start(
     if let Some(fold) = &args.fold {
         for app in &mut apps {
             app.fold = Some(fold.clone());
+        }
+    }
+    // After the per-app defaults above, so an explicit flag wins over both
+    // the script form's "where you are" default and a Flockfile's own value.
+    if let Some(cwd) = &args.cwd {
+        for app in &mut apps {
+            app.cwd = Some(cwd.clone());
         }
     }
 
@@ -638,6 +659,7 @@ mod tests {
             target: None,
             name: None,
             fold: None,
+            cwd: None,
             flockfile: false,
         };
         {
@@ -708,6 +730,7 @@ mod tests {
             target: Some(target.to_string()),
             name: None,
             fold: None,
+            cwd: None,
             flockfile: false,
         }
     }
@@ -1103,10 +1126,18 @@ mod tests {
             sent.deadline_ms,
             Some(u64::try_from(START_DEADLINE.as_millis()).unwrap())
         );
+        // `cwd` comes along now: a script started by path runs where the
+        // operator stood, not where the shepherd was spawned. The redacted
+        // `Debug` does not print it, so a mismatch here reads as two
+        // identical-looking values.
+        let mut expected = AppConfig::minimal("srv", srv.to_str().unwrap());
+        expected.cwd = std::env::current_dir()
+            .ok()
+            .map(|dir| dir.to_string_lossy().into_owned());
         assert_eq!(
             sent.body,
             Request::Start {
-                apps: vec![AppConfig::minimal("srv", srv.to_str().unwrap())]
+                apps: vec![expected]
             }
         );
     }
