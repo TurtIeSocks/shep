@@ -895,15 +895,16 @@ async fn run(cli: Cli, style: style::StyleLevel) -> ExitCode {
             // uses for its own four verbs -- so a failed report can never
             // claim a write that did not happen.
             Some(level) => {
-                // `.and_then(|result| result)` flattens `set_style_level`'s
-                // own `Result` out of the `Result<T, ShepTomlError>` `edit`
-                // wraps every closure's return value in -- the write
-                // itself (the lock, the read, the rename) and the shape
-                // check inside the closure share one error type, but they
-                // are still two different failures nested one turn deep.
+                // `try_edit`, not `edit`: the closure itself can refuse
+                // (`set_style_level`'s own `Result`, when `style` is
+                // already there as something other than a table), and
+                // that refusal must never reach `ShepToml::save` -- `edit`
+                // always saves after its closure runs regardless of what
+                // the closure returned, which would rewrite (new inode,
+                // mode forced to `CONFIG_FILE_MODE`) a file this call is
+                // reporting as untouched.
                 if let Err(err) =
-                    ShepToml::edit(&paths.daemon_config, |cfg| cfg.set_style_level(level))
-                        .and_then(|result| result)
+                    ShepToml::try_edit(&paths.daemon_config, |cfg| cfg.set_style_level(level))
                 {
                     let code = match err {
                         ShepTomlError::Io { .. } => ExitCode::Failure,

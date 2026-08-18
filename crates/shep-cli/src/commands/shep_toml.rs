@@ -10,14 +10,17 @@
 //! like); this module only ever adds or removes the handful of keys each
 //! verb owns, leaving everything else exactly as it was read.
 //!
-//! Every edit goes through [`ShepToml::edit`], which is the whole write
+//! Every edit goes through [`ShepToml::edit`] or [`ShepToml::try_edit`] (for
+//! a closure that can itself refuse), which together are the whole write
 //! path: `$SHEP_HOME` created at `0700`, an exclusive advisory lock on a
 //! sibling `shep.toml.lock` held across the read-modify-write, and the new
 //! document staged in a `0600` temp file, `fsync`ed and `rename`d over the
-//! original. Each of those three is the same shape `shep-core`'s
-//! `barks::append` already uses, for the same reasons and after the same
-//! bug: two writers racing on `barks.jsonl` silently lost half of each
-//! other's records until an advisory lock landed there.
+//! original -- but only when the closure actually produced a value to
+//! save; a `try_edit` closure's own `Err` leaves `path` untouched, not
+//! merely unchanged. Each of the write's three steps is the same shape
+//! `shep-core`'s `barks::append` already uses, for the same reasons and
+//! after the same bug: two writers racing on `barks.jsonl` silently lost
+//! half of each other's records until an advisory lock landed there.
 //!
 //! `#[cfg(unix)]` wholesale, at `commands`' own declaration in `main.rs` —
 //! `flock(2)` and unix mode bits are both Unix-only, and Windows is shep's
@@ -94,6 +97,9 @@ impl ShepToml {
     /// half its records to the identical shape before it grew the same
     /// lock.
     ///
+    /// `f` here is infallible; see [`Self::try_edit`] for a closure that
+    /// can itself refuse the edit before anything is written.
+    ///
     /// # Errors
     /// - [`ShepTomlError::Io`] — `$SHEP_HOME` could not be created, the
     ///   lock beside the file could not be taken, or the file could not
@@ -101,24 +107,75 @@ impl ShepToml {
     /// - [`ShepTomlError::Parse`] — the file exists and is not valid
     ///   TOML. Refused rather than overwritten, and `f` never runs.
     pub fn edit<T>(path: &Path, f: impl FnOnce(&mut Self) -> T) -> Result<T, ShepTomlError> {
+        let (mut doc, _lock) = Self::open_locked(path)?;
+        let value = f(&mut doc);
+        doc.save()?;
+        Ok(value)
+    }
+
+    /// Like [`Self::edit`], but for a closure that can itself refuse the
+    /// edit: `f`'s own `Err` skips [`Self::save`] entirely, the same way a
+    /// [`Self::open`] failure already does. A setter whose key can already
+    /// be occupied by a shape it cannot write into (an operator's
+    /// hand-written `style = "full"` where [`Self::set_style_level`] needs
+    /// a table, say) must be able to say so without the read-modify-
+    /// write underneath it staging and renaming a byte-identical copy of
+    /// the file back over itself anyway — that rename still lands a fresh
+    /// inode and forces [`CONFIG_FILE_MODE`] on a file that a refused edit
+    /// never actually touched, and for a symlinked `path` it is what
+    /// replaces the link with a plain file. [`Self::edit`]'s `f` cannot
+    /// refuse at all, so that failure mode did not exist before this
+    /// method's first caller needed to fail from inside the closure.
+    ///
+    /// Generic over the closure's own error `E` rather than fixed to
+    /// [`ShepTomlError`], so a caller whose own failure is its own type
+    /// does not have to wrap this module's error a second time;
+    /// `E: From<ShepTomlError>` is what lets `?` cover this method's own
+    /// setup failures (home dir, lock, parse) the same way it already
+    /// covers `f`'s.
+    ///
+    /// # Errors
+    /// Everything [`Self::edit`] can fail with, converted through
+    /// `E::from`, plus whatever `f` itself returns as `Err` -- in either
+    /// case, `path` is left exactly as [`Self::open`] found it.
+    pub fn try_edit<T, E: From<ShepTomlError>>(
+        path: &Path,
+        f: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let (mut doc, _lock) = Self::open_locked(path)?;
+        let value = f(&mut doc)?;
+        doc.save()?;
+        Ok(value)
+    }
+
+    /// Creates `$SHEP_HOME` if missing, takes `path`'s exclusive lock, and
+    /// opens the document -- the setup [`Self::edit`] and [`Self::try_edit`]
+    /// share; only what happens with the open document, and whether a
+    /// failure from it still reaches [`Self::save`], differs between the
+    /// two.
+    ///
+    /// The returned [`ConfigLock`] must outlive every use of the returned
+    /// `Self` -- it is what makes the read this function just did and the
+    /// caller's eventual `save` one transaction as far as any other editor
+    /// is concerned, the same guarantee [`Self::edit`]'s own doc describes.
+    fn open_locked(path: &Path) -> Result<(Self, ConfigLock), ShepTomlError> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         create_home_dir(parent).map_err(|source| ShepTomlError::Io {
             path: parent.to_path_buf(),
             source,
         })?;
 
-        // Held until this function returns, so the read below and the
-        // rename inside `save` are one transaction as far as any other
-        // editor is concerned.
-        let _lock = ConfigLock::acquire(path).map_err(|source| ShepTomlError::Io {
+        // Held until the caller's `Self`/`ConfigLock` pair both drop, so
+        // the read just below and the caller's eventual rename inside
+        // `save` are one transaction as far as any other editor is
+        // concerned.
+        let lock = ConfigLock::acquire(path).map_err(|source| ShepTomlError::Io {
             path: path.to_path_buf(),
             source,
         })?;
 
-        let mut doc = Self::open(path)?;
-        let value = f(&mut doc);
-        doc.save()?;
-        Ok(value)
+        let doc = Self::open(path)?;
+        Ok((doc, lock))
     }
 
     /// Reads `path`, treating a missing file as an empty document.
@@ -715,7 +772,7 @@ mod tests {
         for level in [StyleLevel::Full, StyleLevel::Plain, StyleLevel::Bare] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("shep.toml");
-            ShepToml::edit(&path, |doc| doc.set_style_level(level).unwrap()).unwrap();
+            ShepToml::try_edit(&path, |doc| doc.set_style_level(level)).unwrap();
             let written = std::fs::read_to_string(&path).unwrap();
             let cfg = DaemonConfig::load(Some(&written), &|_| None).unwrap();
             assert_eq!(cfg.style.level.as_deref(), Some(level.to_string().as_str()));
@@ -734,7 +791,7 @@ mod tests {
         let original = "# the shepherd's own knobs\n[daemon]\nlog_level = \"info\"  # chatty\nlog_json = false\n";
         std::fs::write(&path, original).unwrap();
 
-        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Plain).unwrap()).unwrap();
+        ShepToml::try_edit(&path, |doc| doc.set_style_level(StyleLevel::Plain)).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("# the shepherd's own knobs"));
@@ -758,8 +815,8 @@ mod tests {
     fn setting_a_style_level_twice_replaces_rather_than_appends() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shep.toml");
-        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Full).unwrap()).unwrap();
-        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Bare).unwrap()).unwrap();
+        ShepToml::try_edit(&path, |doc| doc.set_style_level(StyleLevel::Full)).unwrap();
+        ShepToml::try_edit(&path, |doc| doc.set_style_level(StyleLevel::Bare)).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert_eq!(written.matches("level").count(), 1, "one key, not appended");
@@ -777,7 +834,7 @@ mod tests {
         let path = dir.path().join("shep.toml");
         assert!(!path.exists());
 
-        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Bare).unwrap()).unwrap();
+        ShepToml::try_edit(&path, |doc| doc.set_style_level(StyleLevel::Bare)).unwrap();
 
         assert!(path.exists());
         let cfg =
@@ -791,19 +848,31 @@ mod tests {
     /// `style = "full"` at the top level (legal TOML, and a natural
     /// guess) used to abort the whole process with an internal
     /// assertion, exit 101, from inside this setter's old `.expect(..)`.
-    /// A clean [`ShepTomlError::WrongShape`] is required instead, and the
-    /// file the operator wrote must survive untouched: the panic used to
-    /// fire before `save()`, so there was never data loss, but there was
-    /// still a crash on input this process does not control.
+    /// A clean [`ShepTomlError::WrongShape`] is required instead.
+    ///
+    /// Also fails if a refused write still replaces the file. The first
+    /// version of this fix routed the setter through [`ShepToml::edit`],
+    /// which always calls `save()` after the closure runs regardless of
+    /// what the closure returned -- so a refused write still staged a
+    /// fresh file and renamed it over the original: identical bytes, but
+    /// a new inode, and the mode forced to [`CONFIG_FILE_MODE`] even
+    /// though the original here is `0644`. Content equality alone hid
+    /// that, which is why this checks the file's metadata rather than
+    /// only what is in it. [`ShepToml::try_edit`] is what actually
+    /// prevents it: it never reaches `save` when the closure returns
+    /// `Err`.
     #[test]
-    fn a_style_key_that_is_not_a_table_is_reported_not_panicked_on() {
+    fn a_style_key_that_is_not_a_table_is_reported_and_the_file_is_never_rewritten() {
+        use std::os::unix::fs::MetadataExt as _;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shep.toml");
         let original = "style = \"full\"\n";
         std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
 
-        let err = ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Bare))
-            .unwrap()
+        let err = ShepToml::try_edit(&path, |doc| doc.set_style_level(StyleLevel::Bare))
             .expect_err("style is a string here, not a table");
         assert!(
             matches!(
@@ -825,6 +894,17 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             original,
             "a refused write must leave the operator's file exactly as it was"
+        );
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            before.ino(),
+            after.ino(),
+            "a refused write must not replace the file -- same inode, not just same bytes"
+        );
+        assert_eq!(
+            before.mode() & 0o777,
+            after.mode() & 0o777,
+            "a refused write must not touch the file's mode"
         );
     }
 
