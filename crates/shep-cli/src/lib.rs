@@ -46,6 +46,7 @@ mod serve;
 #[cfg(unix)]
 mod status;
 mod style;
+mod vocabulary;
 mod welcome;
 #[cfg(unix)]
 mod whistle;

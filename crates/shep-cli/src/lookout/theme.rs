@@ -101,13 +101,15 @@ impl Palette {
     /// go and went is not a problem.
     #[must_use]
     pub fn status(self, status: ProcStatus) -> Style {
-        let colour = match status {
-            ProcStatus::Online => self.meadow,
-            ProcStatus::Starting | ProcStatus::WaitingRestart => self.butter,
-            ProcStatus::Errored => self.bark,
-            ProcStatus::Stopping | ProcStatus::Stopped => self.ink3,
-        };
-        Self::fg(colour)
+        // The mapping lives in `crate::vocabulary`, so the CLI's table and
+        // this pane cannot drift. This method is now the ratatui BINDING of
+        // it, and nothing more.
+        Self::fg(match crate::vocabulary::role_of(status) {
+            crate::vocabulary::Role::Meadow => self.meadow,
+            crate::vocabulary::Role::Butter => self.butter,
+            crate::vocabulary::Role::Bark => self.bark,
+            crate::vocabulary::Role::Ink3 => self.ink3,
+        })
     }
 
     /// Muted: column headers, the home path in the title, key hints.
