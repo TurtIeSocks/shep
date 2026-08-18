@@ -320,9 +320,28 @@ pub fn resolve_target(
                 .map(|flockfile| flockfile.apps)
                 .map_err(TargetError::Flockfile)
         }
+        // Absolutised against the CLI's cwd, which is the cwd the `exists`
+        // check just above was answered from. Without this the check and the
+        // use disagree: the CLI confirms `./bin/thing` is there, the daemon
+        // resolves the same string against ITS cwd -- wherever it happened
+        // to be spawned -- and reports `No such file or directory` for a
+        // path the operator can see with their own eyes. The check passing
+        // is what makes that error baffling.
         _ if path.exists() => {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(target);
-            Ok(vec![AppConfig::minimal(name.unwrap_or(stem), target)])
+            // Only a RELATIVE path is rewritten. An absolute one is left
+            // exactly as typed: `canonicalize` also resolves symlinks, so on
+            // macOS it turns the `/var/...` an operator wrote into
+            // `/private/var/...`, and a listing that echoes back a path
+            // nobody typed is the same species of surprise this is fixing.
+            let script = if path.is_absolute() {
+                target.to_string()
+            } else {
+                std::fs::canonicalize(path)
+                    .map(|abs| abs.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| target.to_string())
+            };
+            Ok(vec![AppConfig::minimal(name.unwrap_or(stem), &script)])
         }
         _ => Err(TargetError::Unresolvable {
             target: target.to_string(),
@@ -647,6 +666,41 @@ mod tests {
             }
             other => panic!("expected a Start request, got {other:?}"),
         }
+    }
+
+    /// The CLI answers `exists` from its own cwd and the daemon spawns from
+    /// a different one, so a relative script has to be absolutised before it
+    /// crosses. Rin hit this from `~`: `shep start ./GitHub/zeus/...` where
+    /// the file plainly existed, refused with `No such file or directory`
+    /// because the shepherd's cwd was a checkout elsewhere.
+    #[test]
+    fn a_relative_script_is_resolved_against_the_callers_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("bin");
+        std::fs::create_dir_all(&nested).unwrap();
+        let script = nested.join("thing");
+        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+
+        // Resolved from the tempdir, the way the CLI resolves from wherever
+        // the operator is standing.
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let apps = resolve_target("./bin/thing", None, &[], false);
+        std::env::set_current_dir(previous).unwrap();
+
+        let apps = apps.expect("a script that exists must resolve");
+        assert_eq!(apps.len(), 1);
+        let sent = &apps[0].script;
+        assert!(
+            std::path::Path::new(sent).is_absolute(),
+            "the daemon resolves against its own cwd, so what crosses must be \
+             absolute: {sent}"
+        );
+        assert!(
+            std::path::Path::new(sent).exists(),
+            "and it must still name the real file: {sent}"
+        );
+        assert_eq!(apps[0].name, "thing", "the name still comes from the stem");
     }
 
     fn start_args(target: &str) -> StartArgs {
