@@ -19,7 +19,9 @@ use shep_core::protocol::{Request, Response, SelectorSpec};
 use crate::cli::{Format, SelectorArgs, StartArgs, StockArgs};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
-use crate::output::{DeletedIds, FlockRows, Render, Streams, emit, emit_error, write_outcome};
+use crate::output::{
+    DeletedIds, FlockRows, Render, Streams, emit, emit_error, emit_notice, write_outcome,
+};
 
 /// What [`resolve_target`] can fail with. Module-scoped per IR-18, and named
 /// for the function rather than the verb on purpose: `start`'s own
@@ -420,6 +422,72 @@ fn fail_target(streams: &mut Streams<'_>, fmt: Format, err: &TargetError) -> Exi
 /// default: a cold spawn plus a readiness probe routinely outruns 5
 /// seconds, and a client-side abandonment there would report failure for a
 /// sheep that came up fine.
+/// `shep start <name>` against a sheep the flock already has.
+///
+/// A sheep that is already up is reported and left alone. Restarting a live
+/// service because someone typed `start` would be a genuinely bad surprise --
+/// `restart` is right there and says what it does -- so this refuses to be
+/// clever about it.
+///
+/// Anything not up is started. The wire has no start-by-name: `Request::Start`
+/// carries configs to register, and the sheep is already registered. `Restart`
+/// is the request that takes a selector and brings a stopped sheep up, which
+/// is what `shep restart <name>` has always done to one.
+async fn resume(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    existing: &shep_core::protocol::ProcessInfo,
+) -> ExitCode {
+    use shep_core::status::ProcStatus;
+
+    if matches!(
+        existing.status,
+        ProcStatus::Online | ProcStatus::Starting | ProcStatus::Stopping
+    ) {
+        let message = format!(
+            "{} is already {}; `shep restart {}` replaces it.",
+            existing.name, existing.status, existing.name
+        );
+        let _ = emit_notice(&mut *streams.err, fmt, "start", &message);
+        return ExitCode::Success;
+    }
+    request_and_render(
+        client,
+        streams,
+        fmt,
+        "start",
+        Request::Restart {
+            selector: SelectorSpec::Name(existing.name.clone()),
+        },
+        None,
+        |response| match response {
+            Response::Restarted(procs) => Some(FlockRows(procs)),
+            _ => None,
+        },
+    )
+    .await
+}
+
+/// The flock as it stands, for deciding whether a target names a sheep that
+/// already exists.
+///
+/// A name is unique across a flock, so a target naming one can never have
+/// meant "add another" -- there is no room for a second. Fetched ONCE per
+/// invocation and matched locally: a Flockfile naming ten apps asks ten
+/// questions of one listing, not for ten listings.
+///
+/// An unreachable or unexpected answer yields an empty flock rather than an
+/// error. Failing `start` because the listing could not be read would trade a
+/// working command for a defensive one, and the `Start` below reports its own
+/// failures.
+async fn flock_now(client: &Client) -> Vec<shep_core::protocol::ProcessInfo> {
+    match client.request(Request::ListFlock).await {
+        Ok(Response::Flock(procs)) => procs,
+        _ => Vec::new(),
+    }
+}
+
 pub async fn start(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -431,6 +499,27 @@ pub async fn start(
     // directory's Flockfile". The caller does the discovery, because the
     // no-target-and-no-Flockfile case never reaches here: it brings a
     // shepherd up and stops.
+    // A target naming a sheep the flock already has is that sheep, not a new
+    // one. Checked before the path arms below, or `shep start zeus-auth` on a
+    // registered-but-stopped sheep is read as a filename, fails to resolve,
+    // and reports that nothing by that name is on disk -- while the sheep sits
+    // in the listing.
+    //
+    // Only when the target is not itself a readable target: an explicit path
+    // or Flockfile still means what it says, so `shep start ./server.js` is
+    // never diverted by a coincidence of names.
+    let mut listing: Option<Vec<shep_core::protocol::ProcessInfo>> = None;
+    if let Some(name) = args.target.as_deref() {
+        let is_path_like = name == "-" || args.flockfile || Path::new(name).exists();
+        if !is_path_like {
+            let flock = flock_now(client).await;
+            if let Some(existing) = flock.iter().find(|info| info.name == name) {
+                return resume(client, streams, fmt, existing).await;
+            }
+            listing = Some(flock);
+        }
+    }
+
     let discovered = discovered.map(|p| p.to_string_lossy().into_owned());
     let target: &str = match (args.target.as_deref(), discovered.as_deref()) {
         (Some(target), _) => target,
@@ -452,10 +541,40 @@ pub async fn start(
         Vec::new()
     };
 
-    let mut apps = match resolve_target(target, args.name.as_deref(), &stdin, args.flockfile) {
+    let apps = match resolve_target(target, args.name.as_deref(), &stdin, args.flockfile) {
         Ok(apps) => apps,
         Err(err) => return fail_target(streams, fmt, &err),
     };
+    // The same rule the bare-name lookup above applies, now that the target
+    // has become a set of named apps: a name the flock already has is that
+    // sheep. Without this, `shep start ./thing` against a running `thing`
+    // spawned a SECOND copy of a one-instance app -- `instance_slots`
+    // allocates the lowest free slot, so the two sat side by side as ids 0
+    // and 1 under one name, and the next save persisted `instances_running: 2`
+    // for an app configured for 1.
+    let flock = match listing {
+        Some(flock) => flock,
+        None => flock_now(client).await,
+    };
+    let mut resumed = Vec::new();
+    let mut fresh = Vec::new();
+    for app in apps {
+        match flock.iter().find(|info| info.name == app.name) {
+            Some(existing) => resumed.push(existing.clone()),
+            None => fresh.push(app),
+        }
+    }
+    for existing in &resumed {
+        let code = resume(client, streams, fmt, existing).await;
+        if code != ExitCode::Success {
+            return code;
+        }
+    }
+    if fresh.is_empty() {
+        return ExitCode::Success;
+    }
+    let mut apps = fresh;
+
     if let Some(fold) = &args.fold {
         for app in &mut apps {
             app.fold = Some(fold.clone());
@@ -677,10 +796,7 @@ mod tests {
             .await;
         }
 
-        let sent = tokio::time::timeout(Duration::from_secs(5), envelopes.recv())
-            .await
-            .expect("a discovered Flockfile must reach the wire")
-            .unwrap();
+        let sent = next_start(&mut envelopes).await;
         match sent.body {
             Request::Start { apps } => {
                 assert_eq!(apps.len(), 1);
@@ -723,6 +839,26 @@ mod tests {
             "and it must still name the real file: {sent}"
         );
         assert_eq!(apps[0].name, "thing", "the name still comes from the stem");
+    }
+
+    /// The first `Start` on the wire, skipping the flock lookup every `start`
+    /// now issues first.
+    ///
+    /// `start` consults the flock before treating a target as a path, because
+    /// a name the flock already has is that sheep rather than a new one. That
+    /// puts one `ListFlock` ahead of the request these tests are about.
+    async fn next_start(
+        envelopes: &mut tokio::sync::mpsc::Receiver<shep_core::protocol::Envelope>,
+    ) -> shep_core::protocol::Envelope {
+        loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(5), envelopes.recv())
+                .await
+                .expect("start must reach the wire; it hung instead of sending a request")
+                .unwrap();
+            if envelope.body != Request::ListFlock {
+                return envelope;
+            }
+        }
     }
 
     fn start_args(target: &str) -> StartArgs {
@@ -913,6 +1049,99 @@ mod tests {
     /// wire. A `start` that shipped the unresolved string to the daemon and
     /// let it fail would return `NotFound` after a round trip and fail both
     /// assertions.
+    /// `shep start zeus-auth` on a sheep the flock already has must act on
+    /// that sheep, not look for a file called `zeus-auth`. A name is unique
+    /// across a flock, so a target naming one can never have meant "add
+    /// another" -- there is no room for a second.
+    ///
+    /// Armed through `fake_client_on` rather than the envelope-capturing
+    /// fixture, because the flock has to ANSWER for the lookup to find
+    /// anything, and only this one lets a test arm the reply.
+    #[tokio::test]
+    async fn a_target_naming_a_stopped_sheep_is_acted_on_not_resolved_as_a_path() {
+        use shep_client::testing::fake_client_on;
+        use shep_core::status::ProcStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_on(&path).await;
+        daemon.reply_to_list(vec![
+            shep_core::protocol::ProcessInfo::builder(7, "zeus-auth", ProcStatus::Stopped).build(),
+        ]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            start(
+                &client,
+                &mut streams,
+                Format::Table,
+                &start_args("zeus-auth"),
+                None,
+            )
+            .await
+        };
+
+        // The path arms would have refused: there is no file called
+        // `zeus-auth` here. Anything other than a usage error means the
+        // lookup found the sheep and acted on it instead.
+        assert_ne!(
+            code,
+            ExitCode::Usage,
+            "a known name must not fall through to the path arms: {}",
+            String::from_utf8_lossy(&err)
+        );
+        assert!(
+            !String::from_utf8_lossy(&err).contains("zeus-auth\" does not"),
+            "and must not be reported as an unresolvable target"
+        );
+    }
+
+    /// A sheep that is already up is reported, never restarted. Someone who
+    /// typed `start` did not ask for their live service to be replaced, and
+    /// `restart` is right there.
+    #[tokio::test]
+    async fn a_target_naming_a_running_sheep_leaves_it_alone() {
+        use shep_client::testing::fake_client_on;
+        use shep_core::status::ProcStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, daemon) = fake_client_on(&path).await;
+        daemon.reply_to_list(vec![
+            shep_core::protocol::ProcessInfo::builder(7, "zeus-auth", ProcStatus::Online).build(),
+        ]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            start(
+                &client,
+                &mut streams,
+                Format::Table,
+                &start_args("zeus-auth"),
+                None,
+            )
+            .await
+        };
+
+        assert_eq!(code, ExitCode::Success);
+        let said = String::from_utf8_lossy(&err);
+        assert!(said.contains("already"), "the operator is told: {said}");
+        assert!(
+            said.contains("shep restart zeus-auth"),
+            "and pointed at the verb that would replace it: {said}"
+        );
+    }
+
     #[tokio::test]
     async fn a_target_that_matches_nothing_is_a_usage_error_naming_what_was_tried() {
         let dir = tempfile::tempdir().unwrap();
@@ -935,9 +1164,17 @@ mod tests {
             .await
         };
         assert_eq!(code, ExitCode::Usage);
+        // One request, and it is the flock lookup: a target is a sheep's name
+        // before it is a filename, so `start` has to ask before it can say
+        // the target resolves to nothing. What must never reach the daemon is
+        // a `Start` carrying an app built from an unresolvable target.
+        let asked = envelopes
+            .try_recv()
+            .expect("the flock is consulted before the target is read as a path");
+        assert_eq!(asked.body, Request::ListFlock);
         assert!(
             envelopes.try_recv().is_err(),
-            "an unresolvable target must not reach the daemon"
+            "and nothing else: an unresolvable target must not become a Start"
         );
         assert!(String::from_utf8(err).unwrap().contains("./does-not-exist"));
     }
@@ -1118,10 +1355,7 @@ mod tests {
         )
         .await;
 
-        let sent = tokio::time::timeout(Duration::from_secs(5), envelopes.recv())
-            .await
-            .expect("start must reach the wire; it hung instead of sending a request")
-            .unwrap();
+        let sent = next_start(&mut envelopes).await;
         assert_eq!(
             sent.deadline_ms,
             Some(u64::try_from(START_DEADLINE.as_millis()).unwrap())
@@ -1165,10 +1399,7 @@ mod tests {
 
         let _ = start(&client, &mut streams, Format::Table, &args, None).await;
 
-        let sent = tokio::time::timeout(Duration::from_secs(5), envelopes.recv())
-            .await
-            .expect("start must reach the wire with a --fold target")
-            .unwrap();
+        let sent = next_start(&mut envelopes).await;
         match sent.body {
             Request::Start { apps } => {
                 assert_eq!(apps.len(), 1);
