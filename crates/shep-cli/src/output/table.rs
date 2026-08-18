@@ -168,6 +168,142 @@ pub fn human_bytes(bytes: u64) -> String {
     format!("{bytes}B")
 }
 
+/// Columns that identify a sheep, and so are never dropped -- which three
+/// survive is entirely the caller's own choice (leave them at priority 0);
+/// this is only the floor below which [`render_boxed`] refuses to go.
+const FLOOR_COLUMNS: usize = 3;
+
+/// Renders `rows` as a box-drawn table that fits `term_width`.
+///
+/// Columns are dropped by descending priority until the table fits, never
+/// below [`FLOOR_COLUMNS`] -- a table that cannot say which sheep a row is
+/// about has stopped being a table. What was dropped is named in a footer,
+/// because a column that vanishes silently is worse than one that is
+/// missing loudly.
+///
+/// Every width is computed with [`crate::output::width::visible_width`], so
+/// a styled cell pads by what it shows rather than by what it stores. This
+/// module's own property test is the real specification: any rows, any
+/// terminal width, any mix of styled and plain cells, every line of the
+/// table the same width, and that width inside the terminal unless the
+/// floor itself does not fit.
+///
+/// Not called outside this module's own tests yet: the CLI surface that
+/// wires this into a real command is Task 5. `#[allow(dead_code)]` says so
+/// explicitly rather than inventing a call site nothing needs yet.
+#[allow(dead_code)]
+pub(crate) fn render_boxed(
+    headers: &[&str],
+    rows: &[Vec<String>],
+    priorities: &[u8],
+    term_width: usize,
+) -> String {
+    let mut keep: Vec<usize> = (0..headers.len()).collect();
+    let mut dropped: Vec<&str> = Vec::new();
+
+    loop {
+        let widths = column_widths(headers, rows, &keep);
+        let total: usize = widths.iter().map(|w| w + 3).sum::<usize>() + 1;
+        if total <= term_width || keep.len() <= FLOOR_COLUMNS {
+            break;
+        }
+        // The kept column with the highest priority number goes first --
+        // priority 0 is the caller's way of saying "never", so a priority-0
+        // column reaching this point means nothing droppable is left, and
+        // the table stays wider than the terminal rather than losing an
+        // identity column.
+        let worst = keep
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &col)| priorities.get(col).copied().unwrap_or(0))
+            .map(|(at, _)| at);
+        let Some(at) = worst else { break };
+        if priorities.get(keep[at]).copied().unwrap_or(0) == 0 {
+            break;
+        }
+        dropped.push(headers[keep[at]]);
+        keep.remove(at);
+    }
+
+    let widths = column_widths(headers, rows, &keep);
+    let rule = |left: &str, mid: &str, right: &str| {
+        let mut line = String::from(left);
+        for (i, w) in widths.iter().enumerate() {
+            if i > 0 {
+                line.push_str(mid);
+            }
+            line.push_str(&"─".repeat(w + 2));
+        }
+        line.push_str(right);
+        line.push('\n');
+        line
+    };
+
+    let mut out = rule("┌", "┬", "┐");
+    out.push_str(&boxed_row(
+        &keep
+            .iter()
+            .map(|&c| headers[c].to_string())
+            .collect::<Vec<_>>(),
+        &widths,
+    ));
+    out.push_str(&rule("├", "┼", "┤"));
+    for row in rows {
+        out.push_str(&boxed_row(
+            &keep
+                .iter()
+                .map(|&c| row.get(c).cloned().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            &widths,
+        ));
+    }
+    out.push_str(&rule("└", "┴", "┘"));
+
+    if !dropped.is_empty() {
+        dropped.sort_unstable();
+        out.push_str(&format!(
+            "  {} hidden. Widen the window, or use --format json.\n",
+            dropped.join(", ")
+        ));
+    }
+    out
+}
+
+/// The visible width each kept column needs: the widest of its header and
+/// every cell in it, measured by [`crate::output::width::visible_width`]
+/// rather than by length or byte count -- a styled cell must pad by what it
+/// shows, the same reason [`boxed_row`] measures it the same way.
+fn column_widths(headers: &[&str], rows: &[Vec<String>], keep: &[usize]) -> Vec<usize> {
+    keep.iter()
+        .map(|&col| {
+            let mut w = crate::output::width::visible_width(headers[col]);
+            for row in rows {
+                if let Some(cell) = row.get(col) {
+                    w = w.max(crate::output::width::visible_width(cell));
+                }
+            }
+            w
+        })
+        .collect()
+}
+
+/// One `│ a │ b │` row. Padding is computed from
+/// [`crate::output::width::visible_width`] rather than `cell.len()`, so an
+/// ANSI-styled cell lines its border up with a plain cell beside it instead
+/// of pushing every border after it to the right.
+fn boxed_row(cells: &[String], widths: &[usize]) -> String {
+    let mut line = String::from("│");
+    for (cell, w) in cells.iter().zip(widths) {
+        let pad = w.saturating_sub(crate::output::width::visible_width(cell));
+        line.push(' ');
+        line.push_str(cell);
+        line.push_str(&" ".repeat(pad));
+        line.push_str(" │");
+    }
+    line.push('\n');
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +495,162 @@ mod tests {
             "two names with equal character counts must produce equal-width rendered rows, \
              regardless of how many UTF-8 bytes either one takes"
         );
+    }
+
+    /// The lines that make up the table itself -- top rule, header, the
+    /// separator, each row, bottom rule -- rather than every line
+    /// `render_boxed` returns. The footer's width has nothing to do with
+    /// the table's (it is prose, not a box), so a same-width check over the
+    /// raw output would fail the moment any column drops. Every box-drawn
+    /// line starts with one of these four characters and nothing else does.
+    fn table_lines(out: &str) -> Vec<&str> {
+        out.lines()
+            .filter(|l| l.starts_with(['┌', '├', '│', '└']))
+            .collect()
+    }
+
+    /// The invariant the whole feature rests on. Any rows, any width, any
+    /// mix of styled and plain cells: every line of the table itself is the
+    /// same visible width, and that width is either inside the terminal or
+    /// the table has already been reduced to the floor of three columns --
+    /// below that width the floor wins over fitting (spec assumption 2:
+    /// three columns of worst-case cells cannot always fit a 20-column
+    /// terminal, and dropping an identity column is not the answer).
+    #[test]
+    fn every_line_of_a_boxed_table_has_the_same_visible_width() {
+        use proptest::prelude::*;
+
+        proptest!(|(
+            cells in proptest::collection::vec(
+                proptest::collection::vec(
+                    ("[a-z(). -]{0,12}", any::<bool>()).prop_map(|(s, styled)| {
+                        if styled {
+                            format!("\u{1b}[32m{s}\u{1b}[0m")
+                        } else {
+                            s
+                        }
+                    }),
+                    3..6),
+                0..5),
+            term in 20usize..200,
+        )| {
+            let headers = ["ID", "NAME", "STATUS", "PID", "MEM"];
+            let n = cells.first().map_or(3, Vec::len);
+            let headers = &headers[..n];
+            let priorities: Vec<u8> = (0..n).map(|i| u8::try_from(i).unwrap_or(u8::MAX)).collect();
+            let out = render_boxed(headers, &cells, &priorities, term);
+
+            let lines = table_lines(&out);
+            let widths: Vec<usize> = lines
+                .iter()
+                .map(|l| crate::output::width::visible_width(l))
+                .collect();
+            if let Some(&first) = widths.first() {
+                prop_assert!(
+                    widths.iter().all(|&w| w == first),
+                    "ragged table at term={term}: widths {widths:?}\n{out}"
+                );
+
+                let columns_kept = lines
+                    .first()
+                    .map_or(0, |top_rule| top_rule.matches('┬').count() + 1);
+                prop_assert!(
+                    first <= term || columns_kept == FLOOR_COLUMNS,
+                    "table {first} columns wide exceeds term={term} with {columns_kept} kept \
+                     (floor is {FLOOR_COLUMNS}):\n{out}"
+                );
+            }
+        });
+    }
+
+    /// Columns drop by priority until the table fits, and the floor is the
+    /// three that identify a sheep.
+    #[test]
+    fn columns_drop_by_priority_and_never_below_three() {
+        let headers = ["ID", "NAME", "STATUS", "PID", "FOLD"];
+        let rows = vec![vec![
+            "0".into(),
+            "zeus-auth".into(),
+            "(o.o) online".into(),
+            "24963".into(),
+            "backend".into(),
+        ]];
+        let priorities = [0, 0, 0, 2, 6];
+
+        let wide = render_boxed(&headers, &rows, &priorities, 200);
+        assert!(wide.contains("FOLD"), "everything fits at 200:\n{wide}");
+
+        let narrow = render_boxed(&headers, &rows, &priorities, 46);
+        // The footer legitimately names a dropped column by its header text
+        // (`the_footer_names_every_column_it_hid` below pins that), so a
+        // `narrow.contains("FOLD")` check over the whole render would fail
+        // on the footer's own announcement. What this assertion needs is
+        // that the *column* is gone from the table itself.
+        let narrow_table = table_lines(&narrow).join("\n");
+        assert!(
+            !narrow_table.contains("FOLD"),
+            "FOLD drops first:\n{narrow}"
+        );
+        assert!(
+            narrow.contains("NAME"),
+            "identity columns survive:\n{narrow}"
+        );
+        assert!(
+            narrow.contains("hidden"),
+            "and the footer says so:\n{narrow}"
+        );
+
+        let tiny = render_boxed(&headers, &rows, &priorities, 10);
+        for keep in ["ID", "NAME", "STATUS"] {
+            assert!(tiny.contains(keep), "{keep} is a floor column:\n{tiny}");
+        }
+    }
+
+    /// A dropped column is named, so nothing vanishes silently.
+    ///
+    /// `term_width = 20`, not 30: at 30 the arithmetic (ID 5 + NAME 7 +
+    /// STATUS 9 + CPU 6 + FOLD 7 + 1 = 35) only needs FOLD's drop to fit
+    /// (35 -> 28 <= 30), so CPU would never reach the footer. At 20, FOLD's
+    /// drop (35 -> 28) still does not fit, CPU's drop (28 -> 22) still does
+    /// not fit either, and the floor of three stops the loop there -- both
+    /// names reach the footer.
+    #[test]
+    fn the_footer_names_every_column_it_hid() {
+        let headers = ["ID", "NAME", "STATUS", "CPU", "FOLD"];
+        let rows = vec![vec![
+            "0".into(),
+            "a".into(),
+            "(o.o)".into(),
+            "0%".into(),
+            "b".into(),
+        ]];
+        let out = render_boxed(&headers, &rows, &[0, 0, 0, 5, 6], 20);
+        let footer = out.lines().last().unwrap();
+        assert!(footer.contains("CPU"), "{footer}");
+        assert!(footer.contains("FOLD"), "{footer}");
+        assert!(
+            footer.contains("--format json"),
+            "and the way to see them: {footer}"
+        );
+    }
+
+    /// No em dashes in copy a user reads -- the dropped-column footer is
+    /// prose, same discipline `welcome.rs`'s
+    /// `the_welcome_copy_has_no_em_dashes` and `status.rs`'s
+    /// `the_status_lines_have_no_em_dashes` already pin for their own copy.
+    #[test]
+    fn the_dropped_column_footer_has_no_em_dashes() {
+        let headers = ["ID", "NAME", "STATUS", "CPU", "FOLD"];
+        let rows = vec![vec![
+            "0".into(),
+            "a".into(),
+            "(o.o)".into(),
+            "0%".into(),
+            "b".into(),
+        ]];
+        let out = render_boxed(&headers, &rows, &[0, 0, 0, 5, 6], 20);
+        let footer = out.lines().last().unwrap();
+        assert!(!footer.contains('\u{2014}'), "em dash in footer: {footer}");
+        assert!(!footer.contains('\u{2013}'), "en dash in footer: {footer}");
     }
 }
