@@ -13,17 +13,20 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 /// The `shep` command line.
-///
-/// **`bin_name = "shep"` is load-bearing, not decoration.** Without it,
-/// clap renders every `Usage:` line from `argv[0]` rather than from `name`
-/// above — so `shep-runtime --help` prints `Usage: shep-runtime runtime
-/// ...` and `shep-dev --help` prints `Usage: shep-dev dev ...` (verified
-/// empirically: both alias binaries built and run with no override, Phase
-/// 15 Task 11). Pinned so every rendering of a verb's own usage line reads
-/// `shep <verb>` regardless of which of the three `[[bin]]` targets
-/// produced it — the alias binaries are convenience entrypoints for exactly
-/// that invocation, not commands in their own right, and their own
-/// `--help` should say so.
+// `bin_name = "shep"` below is load-bearing, not decoration. Without it, clap
+// renders every `Usage:` line from `argv[0]` rather than from `name` — so
+// `shep-runtime --help` prints `Usage: shep-runtime runtime ...` and
+// `shep-dev --help` prints `Usage: shep-dev dev ...` (verified empirically:
+// both alias binaries built and run with no override, Phase 15 Task 11).
+// Pinned so every rendering of a verb's own usage line reads `shep <verb>`
+// regardless of which of the three `[[bin]]` targets produced it — the alias
+// binaries are convenience entrypoints for exactly that invocation, not
+// commands in their own right, and their own `--help` should say so.
+//
+// A `//` comment, not `///`, deliberately: clap renders a doc comment as
+// `long_about`, so as a doc comment this paragraph WAS the opening of
+// `shep --help` for three phases. See the test
+// `the_top_level_help_carries_no_implementation_notes`.
 #[derive(Debug, clap::Parser)]
 #[command(
     name = "shep",
@@ -948,6 +951,22 @@ mod tests {
     fn the_command_tree_parses_and_is_internally_consistent() {
         use clap::CommandFactory;
         Cli::command().debug_assert(); // clap's own structural self-check
+    }
+
+    /// `--help` is the first thing a stranger reads, and for three phases it
+    /// opened with this crate's own reasoning about clap's `bin_name`.
+    /// clap turns a doc comment into `long_about`, and nobody ran the
+    /// command after writing the comment.
+    #[test]
+    fn the_top_level_help_carries_no_implementation_notes() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        for leak in ["bin_name", "Phase 15", "load-bearing", "argv[0]"] {
+            assert!(
+                !help.contains(leak),
+                "`shep --help` still contains the internal note {leak:?}:\n{help}"
+            );
+        }
     }
 
     #[test]
