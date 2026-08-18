@@ -648,41 +648,6 @@ impl Render for DeletedIds {
     const JSON_ONLY: &'static [&'static str] = &[];
 }
 
-/// `ping`: the daemon identity the handshake already told us.
-///
-/// Constructed by `commands/query.rs`'s `ping`, from the real `HelloAck`
-/// `Client::daemon` holds.
-#[derive(Debug, Serialize)]
-pub struct PingRow {
-    /// Daemon crate version, read off the handshake `HelloAck`.
-    pub daemon_version: String,
-    /// Daemon pid, from the same handshake.
-    pub pid: u32,
-}
-
-impl Render for PingRow {
-    fn headers() -> &'static [&'static str] {
-        &["DAEMON_VERSION", "PID"]
-    }
-
-    fn rows(&self) -> Vec<Vec<String>> {
-        vec![vec![self.daemon_version.clone(), self.pid.to_string()]]
-    }
-
-    /// # Panics
-    /// If `header` is not one of `Self::headers()`'s own values.
-    #[track_caller]
-    fn json_key_for(header: &str) -> &'static str {
-        match header {
-            "DAEMON_VERSION" => "daemon_version",
-            "PID" => "pid",
-            other => panic!("PingRow::headers() does not include {other:?}"),
-        }
-    }
-
-    const JSON_ONLY: &'static [&'static str] = &[];
-}
-
 /// `kill`: what teardown actually achieved.
 ///
 /// Constructed by `commands/admin.rs`'s `kill`, after tearing the daemon
@@ -1668,18 +1633,6 @@ pub(crate) mod tests {
         let mem = cells[headers.iter().position(|h| *h == "MEM").unwrap()].clone();
         assert_eq!(cpu, "-");
         assert_eq!(mem, "-");
-    }
-
-    #[test]
-    fn ping_row_does_not_drift() {
-        assert_no_drift(
-            &PingRow {
-                daemon_version: "9.9.9".into(),
-                pid: 4242,
-            },
-            |j| j,
-            &[],
-        );
     }
 
     /// Fails if a `ProcessInfo` field goes missing from both the columns and

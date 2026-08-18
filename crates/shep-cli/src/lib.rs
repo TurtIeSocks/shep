@@ -43,6 +43,8 @@ mod launch;
 mod lookout;
 mod output;
 mod serve;
+#[cfg(unix)]
+mod status;
 mod welcome;
 #[cfg(unix)]
 mod whistle;
@@ -751,10 +753,14 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(client) => query::fold(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
-        Commands::Ping => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => query::ping(&client, &mut streams, fmt).await,
-            Err(code) => code,
-        },
+        // Not `connect_client`: a verb whose whole job is reporting whether
+        // a shepherd answers must not fail because the answer is "no". It
+        // probes and reports, keeping `DaemonUnreachable` as the exit code so
+        // `shep ping && echo up` still works.
+        Commands::Ping => {
+            let status = status::ShepherdStatus::probe(&paths).await;
+            status::render_ping(&mut streams, fmt, &status)
+        }
         // `connect_client`, not `connect_or_spawn_client`: saving the roll
         // of a daemon that is not running is not a thing, and autostarting
         // one to save an empty flock would overwrite a good roll with an

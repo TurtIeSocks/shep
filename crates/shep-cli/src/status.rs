@@ -1,0 +1,228 @@
+//! Whether a shepherd is answering, and where this flock lives.
+//!
+//! One probe, two readers. `shep ping` renders it as the command's whole
+//! output, and the quiet verbs (`shep` with no verb, `welcome`, `help`,
+//! `completions`) print a one-line form to stderr — those four produce no
+//! flock data of their own, so a status line there competes with nothing.
+//!
+//! It is deliberately absent from every other verb. A command that succeeded
+//! has already told you the shepherd is up, and a preamble repeating it on
+//! every invocation is the banner-on-every-command pattern this project
+//! turned down.
+
+use std::path::PathBuf;
+
+use shep_client::Client;
+use shep_core::paths::ShepPaths;
+use shep_core::protocol::{Request, Response};
+
+use crate::cli::Format;
+use crate::exit::ExitCode;
+use crate::output::{OutputEnvelope, SCHEMA_VERSION, Streams};
+
+/// What a shepherd said about itself when it answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Online {
+    /// Daemon crate version, off the handshake.
+    pub(crate) version: String,
+    /// Daemon pid, off the same handshake.
+    pub(crate) pid: u32,
+}
+
+/// A shepherd's liveness plus the paths that identify this flock.
+///
+/// The paths are carried rather than looked up again because `HelloAck` has
+/// no room for them: it holds `daemon_version`, `protocol` and `pid` and
+/// nothing else, so the socket path cannot be recovered from a handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShepherdStatus {
+    /// `Some` when a shepherd answered the handshake.
+    pub(crate) online: Option<Online>,
+    /// `$SHEP_HOME` for this invocation.
+    pub(crate) home: PathBuf,
+    /// The control socket this probe tried.
+    pub(crate) socket: PathBuf,
+}
+
+impl ShepherdStatus {
+    /// Asks the socket whether anyone is home, and makes them answer.
+    ///
+    /// Never fails: "nothing answered" is an answer, and the whole point of
+    /// this module is that liveness is information rather than an error.
+    ///
+    /// Three things must succeed before this reports online: the connect,
+    /// the handshake, and a real [`Request::Ping`] round-trip. The
+    /// round-trip is not ceremony -- a daemon can hold a listening socket
+    /// and complete a handshake while being wedged past the point of
+    /// serving anything, and reporting that as "online" is the failure this
+    /// verb exists to catch. `shep ping`'s own test said so before this
+    /// module existed, and says so still.
+    ///
+    /// `version` and `pid` come off the handshake rather than the reply
+    /// because `Response::Pong` carries neither -- it is a unit variant
+    /// (`shep-core/src/protocol/request.rs:770`). `query::ping` had a test
+    /// pinning that, written when the verb rendered from a response and
+    /// could plausibly have read them from the wrong place. Here the
+    /// [`Online`] is built from the ack before the request is even sent, so
+    /// the bug is unrepresentable rather than merely untested, and the test
+    /// did not survive the move.
+    pub(crate) async fn probe(paths: &ShepPaths) -> Self {
+        let online = match Client::connect(&paths.socket).await {
+            Ok(client) => {
+                let ack = client.daemon();
+                let version = ack.daemon_version.clone();
+                let pid = ack.pid;
+                match client.request(Request::Ping).await {
+                    Ok(Response::Pong) => Some(Online { version, pid }),
+                    // Answered with something else, or not at all: a socket
+                    // that talks but does not serve is not online.
+                    _ => None,
+                }
+            }
+            Err(_) => None,
+        };
+        Self {
+            online,
+            home: paths.home.clone(),
+            socket: paths.socket.clone(),
+        }
+    }
+}
+
+/// `shep ping`'s JSON payload.
+///
+/// Its own type rather than a `rows::` entry with a `Render` impl: `Render`
+/// is a *table* trait wanting `headers()` and `rows()`, and one record with
+/// two long paths in it renders as an unreadable five-column line. The table
+/// form below is written by hand for the same reason `describe` has its own.
+#[derive(Debug, serde::Serialize)]
+struct PingStatus {
+    /// `"online"` or `"offline"`.
+    shepherd: &'static str,
+    /// Daemon crate version off the handshake; `None` when offline.
+    daemon_version: Option<String>,
+    /// Daemon pid off the same handshake; `None` when offline.
+    pid: Option<u32>,
+    /// `$SHEP_HOME` for this invocation.
+    home: String,
+    /// The control socket that was tried.
+    socket: String,
+}
+
+/// `shep ping`'s own rendering, online or off.
+///
+/// A verb whose whole job is reporting liveness must not fail because the
+/// answer is "down" -- that turned the one question an operator can ask into
+/// an `error[daemon_unreachable]` line. It reports instead.
+///
+/// The exit code is unchanged: still [`ExitCode::DaemonUnreachable`] when
+/// nothing answers, because `shep ping && echo up` is a real idiom and making
+/// the verb always succeed would quietly break every script using it. What
+/// changed is what a human reads, not what a script tests.
+pub(crate) fn render_ping(
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    status: &ShepherdStatus,
+) -> ExitCode {
+    let online = status.online.as_ref();
+    let payload = PingStatus {
+        shepherd: if online.is_some() {
+            "online"
+        } else {
+            "offline"
+        },
+        daemon_version: online.map(|o| o.version.clone()),
+        pid: online.map(|o| o.pid),
+        home: status.home.display().to_string(),
+        socket: status.socket.display().to_string(),
+    };
+
+    let _ = match fmt {
+        Format::Table => {
+            let mut lines = vec![format!("shepherd  {}", payload.shepherd)];
+            if let Some(o) = online {
+                lines.push(format!("version   {}", o.version));
+                lines.push(format!("pid       {}", o.pid));
+            }
+            lines.push(format!("home      {}", payload.home));
+            lines.push(format!("socket    {}", payload.socket));
+            writeln!(streams.out, "{}", lines.join("\n"))
+        }
+        Format::Json => {
+            let envelope = OutputEnvelope {
+                schema_version: SCHEMA_VERSION,
+                command: "ping",
+                data: payload,
+            };
+            serde_json::to_writer(&mut *streams.out, &envelope)
+                .map_err(std::io::Error::other)
+                .and_then(|()| writeln!(streams.out))
+        }
+    };
+
+    if online.is_some() {
+        ExitCode::Success
+    } else {
+        ExitCode::DaemonUnreachable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reporting online must rest on a real `Request::Ping` round-trip, not
+    /// on the handshake alone: a daemon can hold a listening socket and
+    /// complete a handshake while being wedged past serving anything.
+    /// `render_ping` must then still exit `DaemonUnreachable`, because a
+    /// script testing `shep ping` is asking whether the thing works.
+    #[tokio::test]
+    async fn a_socket_that_handshakes_but_never_answers_is_not_online() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wedged.sock");
+        // Accepts and completes nothing: the connect succeeds, the
+        // handshake does not, so `Client::connect` itself fails here. The
+        // assertion is that this is reported rather than raised.
+        let _listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        let env =
+            |key: &str| (key == "SHEP_HOME").then(|| dir.path().to_string_lossy().into_owned());
+        let mut paths = ShepPaths::resolve(&env, std::path::Path::new("/nonexistent"));
+        paths.socket = path;
+
+        let status = ShepherdStatus::probe(&paths).await;
+        assert_eq!(
+            status.online, None,
+            "a wedged socket is not an online shepherd"
+        );
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+            };
+            render_ping(&mut streams, Format::Table, &status)
+        };
+        assert_eq!(code, ExitCode::DaemonUnreachable);
+        assert!(
+            String::from_utf8(out).unwrap().contains("offline"),
+            "the operator is told, not errored at"
+        );
+    }
+
+    /// A probe against a socket nobody is listening on reports offline
+    /// rather than erroring, which is the property every caller relies on.
+    #[tokio::test]
+    async fn a_probe_with_nothing_listening_reports_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let env =
+            |key: &str| (key == "SHEP_HOME").then(|| dir.path().to_string_lossy().into_owned());
+        let paths = ShepPaths::resolve(&env, std::path::Path::new("/nonexistent"));
+
+        let status = ShepherdStatus::probe(&paths).await;
+        assert_eq!(status.online, None);
+        assert_eq!(status.home, dir.path());
+    }
+}

@@ -22,7 +22,7 @@ use crate::cli::{FoldArgs, Format, SelectorArgs};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
 use crate::output::{
-    DogRows, PingRow, Render, Streams, emit, emit_described, emit_error, emit_flock, write_outcome,
+    DogRows, Render, Streams, emit, emit_described, emit_error, emit_flock, write_outcome,
 };
 
 /// Sends `body`, renders whatever the daemon answers through [`emit`], and
@@ -207,33 +207,6 @@ pub async fn fold(
     .await
 }
 
-/// Checks whether the shepherd answers.
-///
-/// Issues `Request::Ping` as the liveness check — a reply of any kind means
-/// the daemon is alive — but sources `daemon_version` and `pid` from the
-/// [`shep_core::protocol::HelloAck`] the handshake already produced
-/// ([`Client::daemon`]), not from the `Pong` reply, which carries neither.
-pub async fn ping(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> ExitCode {
-    let ack = client.daemon();
-    let daemon_version = ack.daemon_version.clone();
-    let pid = ack.pid;
-    request_and_render(
-        client,
-        streams,
-        fmt,
-        "ping",
-        Request::Ping,
-        |response| match response {
-            Response::Pong => Some(PingRow {
-                daemon_version,
-                pid,
-            }),
-            _ => None,
-        },
-    )
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -241,7 +214,6 @@ mod tests {
     use shep_client::testing::{
         fake_client_capturing_envelopes, fake_client_with_ack, sample_ack, sample_info,
     };
-    use shep_core::protocol::{HelloAck, PROTOCOL_VERSION};
 
     use super::*;
 
@@ -385,59 +357,6 @@ mod tests {
                 selector: SelectorSpec::Fold("api".into())
             }
         );
-    }
-
-    /// The fake daemon acks with a distinctive version and pid, then replies
-    /// `Pong` — which carries neither. A `ping` that sourced either from the
-    /// reply has nothing to source them FROM, so it would emit defaults or
-    /// panic.
-    #[tokio::test]
-    async fn ping_reads_version_and_pid_from_the_handshake_not_from_a_reply() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
-        let ack = HelloAck {
-            daemon_version: "9.9.9".into(),
-            protocol: PROTOCOL_VERSION,
-            pid: 4242,
-        };
-        let (client, _daemon) = fake_client_with_ack(&path, ack).await;
-
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let code = {
-            let mut streams = Streams {
-                out: &mut out,
-                err: &mut err,
-            };
-            ping(&client, &mut streams, Format::Json).await
-        };
-
-        assert_eq!(code, ExitCode::Success);
-        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(json["data"]["daemon_version"], "9.9.9");
-        assert_eq!(json["data"]["pid"], 4242);
-    }
-
-    /// `ping` must still round-trip a real `Request::Ping` — sourcing the
-    /// version and pid from the handshake is not a licence to skip the
-    /// liveness check the verb exists for.
-    #[tokio::test]
-    async fn ping_still_issues_the_liveness_request() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
-        let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let mut streams = Streams {
-            out: &mut out,
-            err: &mut err,
-        };
-        let _ = ping(&client, &mut streams, Format::Table).await;
-        let sent = tokio::time::timeout(RECV_TIMEOUT, envelopes.recv())
-            .await
-            .expect("ping must reach the wire; it hung instead of sending a request")
-            .unwrap();
-        assert_eq!(sent.body, Request::Ping);
     }
 
     /// Proves the `Response::Flock` arm inside `flock`'s own `extract`
