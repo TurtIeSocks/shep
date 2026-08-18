@@ -168,6 +168,11 @@ insta.workspace = true
 # The real-binary e2e tier (`tests/cli_e2e.rs`).
 assert_cmd.workspace = true
 predicates.workspace = true
+# Task 4's property test for `output::table`, that any cell's rendered width
+# matches its declared column width regardless of ANSI styling. Declared here
+# in the task that adds `output::width` even though this crate's own code
+# does not call it yet, same pattern as `anstyle` above.
+proptest.workspace = true
 
 # `geteuid` (the privilege gate `shep startup` refuses on) and
 # `User::from_name`/`User::from_uid` (the target user's own passwd home, which

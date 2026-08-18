@@ -16,6 +16,7 @@
 
 mod rows;
 mod table;
+mod width;
 
 use std::io;
 
