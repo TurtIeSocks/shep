@@ -17,12 +17,14 @@
 
 use shep_client::Client;
 use shep_core::paths::ShepPaths;
-use shep_core::protocol::{Request, Response, SelectorSpec};
+use shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec};
+use shep_core::status::ProcStatus;
 use shep_daemon::snapshot::FlockSnapshot;
 
 use crate::cli::{FoldArgs, Format, SelectorArgs};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
+use crate::flourish;
 use crate::output::{
     DogRows, Render, RolledSheep, RolledSheepRows, Streams, emit, emit_described, emit_error,
     emit_flock, write_outcome,
@@ -195,7 +197,18 @@ pub fn flock_from_roll(streams: &mut Streams<'_>, fmt: Format, paths: &ShepPaths
 }
 
 /// Lists the whole flock: the sheep table, then the dogs table beneath it
-/// whenever any dog is registered — [`emit_flock`]'s own job.
+/// whenever any dog is registered — [`emit_flock`]'s own job — with a
+/// flourish ahead of the sheep table when the sheep have nothing else to
+/// look at: none registered, or every one of them at rest. See
+/// [`sheep_flourish`] for exactly what qualifies and why dogs are excluded
+/// from the check.
+///
+/// The flourish is gated on `Format::Table` and
+/// `streams.style.level.sheep()` and nothing else, matching every other
+/// STATUS-column face — `--format json` and a piped `Format::Table` (which
+/// `run_argv` already forces to [`crate::style::StyleLevel::Bare`], whose
+/// `sheep()` is `false`) render exactly what they did before this flourish
+/// existed.
 ///
 /// Not routed through [`request_and_render`]: that helper renders exactly
 /// one [`Render`] type per verb, through [`emit`]. A flock listing renders
@@ -206,13 +219,25 @@ pub fn flock_from_roll(streams: &mut Streams<'_>, fmt: Format, paths: &ShepPaths
 /// here has.
 pub async fn flock(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> ExitCode {
     match client.request(Request::ListFlock).await {
-        Ok(Response::Flock(procs)) => write_outcome(emit_flock(
-            &mut *streams.out,
-            fmt,
-            "flock",
-            procs,
-            streams.style,
-        )),
+        Ok(Response::Flock(procs)) => {
+            // Read before `procs` moves into `emit_flock`, and printed
+            // ahead of the table it describes: "no sheep in the flock yet"
+            // reads as the answer, with the table underneath as the
+            // receipt, rather than a mascot bolted onto the end.
+            let art = (fmt == Format::Table && streams.style.level.sheep())
+                .then(|| sheep_flourish(&procs))
+                .flatten();
+            if let Some(art) = &art {
+                let _ = write!(streams.out, "{art}");
+            }
+            write_outcome(emit_flock(
+                &mut *streams.out,
+                fmt,
+                "flock",
+                procs,
+                streams.style,
+            ))
+        }
         Ok(_) => {
             let message = "the daemon answered with a response this client does not understand";
             let _ = emit_error(
@@ -229,6 +254,33 @@ pub async fn flock(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> E
             code
         }
     }
+}
+
+/// The flourish for one flock listing, or `None` when neither the
+/// empty-flock nor the all-asleep state applies.
+///
+/// Dogs are excluded from both checks (`ProcessInfo::dog`), deliberately:
+/// the flourish sits beside the sheep table, so it is a claim about the
+/// sheep, and a metrics or bark dog left running answers a different
+/// question than whether the flock is at rest — the dogs table beneath
+/// already renders that fact on its own. A flock whose sheep are all
+/// stopped but whose dog is still up is exactly the case a reader looking
+/// at two tables, one with something alive in it, would find a cheerful
+/// "all asleep" line wrong beside.
+///
+/// [`ProcStatus::Stopping`] does not count as asleep. It is reload's
+/// transient for the instance being replaced, not rest (`ProcStatus`'s own
+/// doc), so a flock with one sheep mid-shutdown does not flip this on
+/// merely because nothing else is `Online`.
+fn sheep_flourish(listing: &[ProcessInfo]) -> Option<String> {
+    let sheep: Vec<&ProcessInfo> = listing.iter().filter(|p| p.dog.is_none()).collect();
+    if sheep.is_empty() {
+        return Some(flourish::empty_flock());
+    }
+    sheep
+        .iter()
+        .all(|p| p.status == ProcStatus::Stopped)
+        .then(|| flourish::all_asleep(sheep.len()))
 }
 
 /// Lists the dogs, and nothing else: the same `Request::ListFlock` `flock`

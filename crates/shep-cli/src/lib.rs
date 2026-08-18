@@ -36,6 +36,7 @@ mod completions;
 #[cfg(unix)]
 mod dog;
 mod exit;
+mod flourish;
 mod http;
 #[cfg(unix)]
 mod launch;

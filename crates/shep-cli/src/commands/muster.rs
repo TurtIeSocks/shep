@@ -16,6 +16,7 @@ use shep_core::protocol::{Request, Response};
 
 use crate::cli::Format;
 use crate::exit::ExitCode;
+use crate::flourish;
 use crate::output::{
     FlockRows, SavedRollRow, Streams, emit, emit_error, emit_notice, write_outcome,
 };
@@ -78,6 +79,17 @@ pub async fn save(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> Ex
 /// notice on stderr in addition to the (empty) table: "the roll restored
 /// nothing" is the answer an operator needs most, and the one a quiet exit
 /// 0 hides.
+///
+/// A non-empty `Mustered` gets [`flourish::mustered`] after the table
+/// instead: unlike `query::flock`'s empty/all-asleep flourishes, which
+/// answer "what now" before the receipt, this one is a milestone reached
+/// after a restore that just happened, so it reads as the last line of the
+/// story rather than the first. `Response::Mustered` carries no dogs of its
+/// own to filter — it is the roll's own apps, filtered by name in
+/// `rpc.rs`'s handler — so, unlike `query::sheep_flourish`, there is no
+/// dog/sheep split to make here. Gated the same way every other flourish
+/// is: `Format::Table` and `streams.style.level.sheep()` only, so
+/// `--format json` and a piped table are unchanged.
 pub async fn muster(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> ExitCode {
     match client
         .request_with_deadline(Request::Muster, Some(START_DEADLINE))
@@ -92,13 +104,18 @@ pub async fn muster(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> 
                     "the muster roll restored nothing",
                 );
             }
-            write_outcome(emit(
+            let count = procs.len();
+            let outcome = write_outcome(emit(
                 &mut *streams.out,
                 fmt,
                 "muster",
                 FlockRows(procs),
                 streams.style,
-            ))
+            ));
+            if fmt == Format::Table && count > 0 && streams.style.level.sheep() {
+                let _ = write!(streams.out, "{}", flourish::mustered(count));
+            }
+            outcome
         }
         Ok(_unrecognised) => {
             let message = "the daemon answered with a response this client does not understand";
