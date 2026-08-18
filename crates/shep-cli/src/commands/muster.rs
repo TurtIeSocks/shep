@@ -13,6 +13,7 @@
 
 use shep_client::{Client, START_DEADLINE};
 use shep_core::protocol::{Request, Response};
+use shep_core::status::ProcStatus;
 
 use crate::cli::Format;
 use crate::exit::ExitCode;
@@ -81,15 +82,21 @@ pub async fn save(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> Ex
 /// 0 hides.
 ///
 /// A non-empty `Mustered` gets [`flourish::mustered`] after the table
-/// instead: unlike `query::flock`'s empty/all-asleep flourishes, which
-/// answer "what now" before the receipt, this one is a milestone reached
-/// after a restore that just happened, so it reads as the last line of the
-/// story rather than the first. `Response::Mustered` carries no dogs of its
-/// own to filter — it is the roll's own apps, filtered by name in
-/// `rpc.rs`'s handler — so, unlike `query::sheep_flourish`, there is no
-/// dog/sheep split to make here. Gated the same way every other flourish
-/// is: `Format::Table` and `streams.style.level.sheep()` only, so
-/// `--format json` and a piped table are unchanged.
+/// instead, built from every restored sheep's real status
+/// (`procs.iter().map(|p| p.status)`), never from a bare count: a stopped
+/// sheep stays a member of the flock across a restart, so mustering an
+/// already-stopped roll restores it without starting it, and the table
+/// says `stopped` right above where the flourish prints -- the two must
+/// never disagree (fix round 1). Unlike `query::flock`'s empty/all-asleep
+/// flourishes, which answer "what now" before the receipt, this one is a
+/// milestone reached after a restore that just happened, so it reads as
+/// the last line of the story rather than the first. `Response::Mustered`
+/// carries no dogs of its own to filter — it is the roll's own apps,
+/// filtered by name in `rpc.rs`'s handler — so, unlike
+/// `query::sheep_flourish`, there is no dog/sheep split to make here.
+/// Gated the same way every other flourish is: `Format::Table` and
+/// `streams.style.level.sheep()` only, so `--format json` and a piped
+/// table are unchanged.
 pub async fn muster(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> ExitCode {
     match client
         .request_with_deadline(Request::Muster, Some(START_DEADLINE))
@@ -104,7 +111,12 @@ pub async fn muster(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> 
                     "the muster roll restored nothing",
                 );
             }
-            let count = procs.len();
+            // Read before `procs` moves into `FlockRows`: the flourish is
+            // built from every restored sheep's real status, never from a
+            // bare count, so it can never disagree with the table it sits
+            // beneath (fix round 1 -- an earlier version rendered
+            // `ProcStatus::Online` regardless of what actually came back).
+            let statuses: Vec<ProcStatus> = procs.iter().map(|p| p.status).collect();
             let outcome = write_outcome(emit(
                 &mut *streams.out,
                 fmt,
@@ -112,8 +124,8 @@ pub async fn muster(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> 
                 FlockRows(procs),
                 streams.style,
             ));
-            if fmt == Format::Table && count > 0 && streams.style.level.sheep() {
-                let _ = write!(streams.out, "{}", flourish::mustered(count));
+            if fmt == Format::Table && !statuses.is_empty() && streams.style.level.sheep() {
+                let _ = write!(streams.out, "{}", flourish::mustered(&statuses));
             }
             outcome
         }
