@@ -895,12 +895,21 @@ async fn run(cli: Cli, style: style::StyleLevel) -> ExitCode {
             // uses for its own four verbs -- so a failed report can never
             // claim a write that did not happen.
             Some(level) => {
+                // `.and_then(|result| result)` flattens `set_style_level`'s
+                // own `Result` out of the `Result<T, ShepTomlError>` `edit`
+                // wraps every closure's return value in -- the write
+                // itself (the lock, the read, the rename) and the shape
+                // check inside the closure share one error type, but they
+                // are still two different failures nested one turn deep.
                 if let Err(err) =
                     ShepToml::edit(&paths.daemon_config, |cfg| cfg.set_style_level(level))
+                        .and_then(|result| result)
                 {
                     let code = match err {
                         ShepTomlError::Io { .. } => ExitCode::Failure,
-                        ShepTomlError::Parse { .. } => ExitCode::InvalidConfig,
+                        ShepTomlError::Parse { .. } | ShepTomlError::WrongShape { .. } => {
+                            ExitCode::InvalidConfig
+                        }
                     };
                     let _ = output::emit_error(
                         &mut *streams.err,

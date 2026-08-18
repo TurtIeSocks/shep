@@ -254,14 +254,36 @@ impl ShepToml {
     /// than a writer and a reader that merely happen to agree today.
     ///
     /// Called by `shep style <level>` (`Commands::Style`'s set form).
-    pub fn set_style_level(&mut self, level: StyleLevel) {
-        let style = self
+    ///
+    /// # Errors
+    /// [`ShepTomlError::WrongShape`] -- `style` is already there as
+    /// something other than a table, e.g. an operator hand-wrote
+    /// `style = "full"` at the top level. Reported rather than forced:
+    /// `.as_table_mut().expect(..)` on `entry().or_insert_with(..)` is
+    /// this module's usual idiom (`enable_dog`/`disable_dog`/`adopt_dog`/
+    /// `rehome_dog` all still use it), but it is sound there only because
+    /// nothing else in this file ever writes those keys as anything but
+    /// a table, so the `expect` never actually fires on real input. This
+    /// setter's key can be hand-written by an operator who reasonably
+    /// guessed `style = "full"` instead of the `[style]` header, so the
+    /// same `expect` here is reachable from data this process does not
+    /// control -- exactly the panicking-constructor shape IR-21 rules
+    /// out. The four sibling setters above still carry the shape this one
+    /// used to; that is a tracked follow-up, not this fix's scope.
+    pub fn set_style_level(&mut self, level: StyleLevel) -> Result<(), ShepTomlError> {
+        let item = self
             .doc
             .entry("style")
-            .or_insert_with(|| Item::Table(Table::new()))
-            .as_table_mut()
-            .expect("style is only ever written as a table");
+            .or_insert_with(|| Item::Table(Table::new()));
+        let Some(style) = item.as_table_mut() else {
+            return Err(ShepTomlError::WrongShape {
+                path: self.path.clone(),
+                key: "style",
+                found: item.type_name(),
+            });
+        };
         style.insert("level", Item::Value(level.to_string().into()));
+        Ok(())
     }
 
     /// Writes the document back: staged in a sibling temp file at
@@ -457,6 +479,23 @@ pub enum ShepTomlError {
         /// The parser's own complaint.
         source: toml_edit::TomlError,
     },
+    /// `path` parses, but `key` is already there as something other than
+    /// a table -- e.g. an operator writing `style = "full"` at the top
+    /// level instead of `[style]` / `level = "full"`. Legal TOML, but not
+    /// a shape any setter in this module can write a sub-key into:
+    /// forcing it to a table would silently discard whatever the
+    /// operator actually wrote there.
+    WrongShape {
+        /// The file that holds the wrongly-shaped value.
+        path: PathBuf,
+        /// The table key that was expected -- `"style"` for
+        /// [`ShepToml::set_style_level`], the only caller today.
+        key: &'static str,
+        /// What TOML actually found there ([`Item::type_name`]) --
+        /// `"string"`, `"array"`, and so on; never `"table"`, since that
+        /// is the one shape this variant is never raised for.
+        found: &'static str,
+    },
 }
 
 /// Manual, not derived: `toml_edit::TomlError` carries the ENTIRE source
@@ -483,6 +522,12 @@ impl std::fmt::Debug for ShepTomlError {
                 .field("path", path)
                 .field("message", &source.message())
                 .finish(),
+            Self::WrongShape { path, key, found } => f
+                .debug_struct("WrongShape")
+                .field("path", path)
+                .field("key", key)
+                .field("found", found)
+                .finish(),
         }
     }
 }
@@ -492,6 +537,11 @@ impl std::fmt::Display for ShepTomlError {
         match self {
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
             Self::Parse { path, source } => write!(f, "{}: {source}", path.display()),
+            Self::WrongShape { path, key, found } => write!(
+                f,
+                "{}: [{key}] must be a table, found a {found}",
+                path.display()
+            ),
         }
     }
 }
@@ -501,6 +551,7 @@ impl core::error::Error for ShepTomlError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
+            Self::WrongShape { .. } => None,
         }
     }
 }
@@ -664,7 +715,7 @@ mod tests {
         for level in [StyleLevel::Full, StyleLevel::Plain, StyleLevel::Bare] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("shep.toml");
-            ShepToml::edit(&path, |doc| doc.set_style_level(level)).unwrap();
+            ShepToml::edit(&path, |doc| doc.set_style_level(level).unwrap()).unwrap();
             let written = std::fs::read_to_string(&path).unwrap();
             let cfg = DaemonConfig::load(Some(&written), &|_| None).unwrap();
             assert_eq!(cfg.style.level.as_deref(), Some(level.to_string().as_str()));
@@ -683,7 +734,7 @@ mod tests {
         let original = "# the shepherd's own knobs\n[daemon]\nlog_level = \"info\"  # chatty\nlog_json = false\n";
         std::fs::write(&path, original).unwrap();
 
-        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Plain)).unwrap();
+        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Plain).unwrap()).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("# the shepherd's own knobs"));
@@ -707,8 +758,8 @@ mod tests {
     fn setting_a_style_level_twice_replaces_rather_than_appends() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shep.toml");
-        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Full)).unwrap();
-        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Bare)).unwrap();
+        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Full).unwrap()).unwrap();
+        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Bare).unwrap()).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert_eq!(written.matches("level").count(), 1, "one key, not appended");
@@ -726,12 +777,55 @@ mod tests {
         let path = dir.path().join("shep.toml");
         assert!(!path.exists());
 
-        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Bare)).unwrap();
+        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Bare).unwrap()).unwrap();
 
         assert!(path.exists());
         let cfg =
             DaemonConfig::load(Some(&std::fs::read_to_string(&path).unwrap()), &|_| None).unwrap();
         assert_eq!(cfg.style.level.as_deref(), Some("bare"));
+    }
+
+    /// fails if `set_style_level` panics instead of reporting when
+    /// `style` already exists as something other than a table -- the
+    /// reviewer's live repro for this task: an operator writing
+    /// `style = "full"` at the top level (legal TOML, and a natural
+    /// guess) used to abort the whole process with an internal
+    /// assertion, exit 101, from inside this setter's old `.expect(..)`.
+    /// A clean [`ShepTomlError::WrongShape`] is required instead, and the
+    /// file the operator wrote must survive untouched: the panic used to
+    /// fire before `save()`, so there was never data loss, but there was
+    /// still a crash on input this process does not control.
+    #[test]
+    fn a_style_key_that_is_not_a_table_is_reported_not_panicked_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        let original = "style = \"full\"\n";
+        std::fs::write(&path, original).unwrap();
+
+        let err = ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Bare))
+            .unwrap()
+            .expect_err("style is a string here, not a table");
+        assert!(
+            matches!(
+                &err,
+                ShepTomlError::WrongShape { key, found, .. }
+                    if *key == "style" && *found == "string"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{}: [style] must be a table, found a string",
+                path.display()
+            )
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "a refused write must leave the operator's file exactly as it was"
+        );
     }
 
     /// fails if the first `shep enable` on a host that has never booted a

@@ -61,15 +61,21 @@ const DISABLED_STATUS: &str = "stopped";
 
 /// Renders `err` and returns the exit code a config-write failure reports.
 ///
-/// [`ShepTomlError::Parse`] is a config-validation failure — the same
-/// category [`ExitCode::InvalidConfig`] names for a bad Flockfile
-/// (`commands::lifecycle::target_exit_code`) — while
-/// [`ShepTomlError::Io`] has no more specific code than
-/// [`ExitCode::Failure`].
+/// [`ShepTomlError::Parse`] and [`ShepTomlError::WrongShape`] are both
+/// config-validation failures — the same category [`ExitCode::InvalidConfig`]
+/// names for a bad Flockfile (`commands::lifecycle::target_exit_code`) —
+/// while [`ShepTomlError::Io`] has no more specific code than
+/// [`ExitCode::Failure`]. `WrongShape` is unreachable from every call site
+/// in this file today (`enable_dog`/`disable_dog`/`adopt_dog`/`rehome_dog`
+/// still panic on the shape that produces it — a tracked follow-up, not
+/// this match's problem); it is handled here only because `ShepTomlError`
+/// is deliberately not `#[non_exhaustive]`, so this match must cover
+/// every variant the type has, not just the ones this file's own callers
+/// can currently produce.
 fn fail_config(streams: &mut Streams<'_>, fmt: Format, err: &ShepTomlError) -> ExitCode {
     let code = match err {
         ShepTomlError::Io { .. } => ExitCode::Failure,
-        ShepTomlError::Parse { .. } => ExitCode::InvalidConfig,
+        ShepTomlError::Parse { .. } | ShepTomlError::WrongShape { .. } => ExitCode::InvalidConfig,
     };
     let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
     code
