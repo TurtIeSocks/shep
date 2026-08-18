@@ -985,8 +985,15 @@ pub struct CompletionArgs {
 /// Arguments to `shep style`.
 #[derive(Debug, clap::Args)]
 pub struct StyleArgs {
-    /// `full`, `plain`, or `bare`. Omit to show the level in force.
-    pub level: Option<String>,
+    /// `full`, `plain`, or `bare`
+    ///
+    /// Sets `shep.toml`'s `[style] level`. Omit to report the level
+    /// currently in force instead of changing it.
+    // The same `StyleLevel` grammar `--style` parses, so `shep style loud`
+    // and `shep --style loud` are rejected identically -- see
+    // `style_verb_parses_the_same_grammar_as_the_style_flag` below.
+    #[arg(value_enum)]
+    pub level: Option<crate::style::StyleLevel>,
 }
 
 /// Arguments to the hidden `shep daemon` subcommand.
@@ -1635,6 +1642,45 @@ mod tests {
         }
 
         assert!(Cli::try_parse_from(["shep", "--style", "loud", "flock"]).is_err());
+    }
+
+    /// fails if `StyleArgs::level` reverts to `Option<String>` (the
+    /// original defect: a value that parsed but was read by nothing), or
+    /// if the verb's grammar ever drifts from `--style`'s -- a value
+    /// clap accepts on one spelling and rejects on the other would leave
+    /// an operator unable to guess which one is broken.
+    #[test]
+    fn style_verb_parses_the_same_grammar_as_the_style_flag() {
+        use crate::style::StyleLevel;
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["shep", "style"]).unwrap();
+        match cli.command {
+            Commands::Style(args) => {
+                assert_eq!(args.level, None, "bare `shep style` still reports")
+            }
+            other => panic!("expected Style, got {other:?}"),
+        }
+
+        for (raw, expected) in [
+            ("full", StyleLevel::Full),
+            ("plain", StyleLevel::Plain),
+            ("bare", StyleLevel::Bare),
+        ] {
+            let cli = Cli::try_parse_from(["shep", "style", raw]).unwrap();
+            match cli.command {
+                Commands::Style(args) => assert_eq!(args.level, Some(expected), "style {raw}"),
+                other => panic!("expected Style, got {other:?}"),
+            }
+        }
+
+        let bad_flag = Cli::try_parse_from(["shep", "--style", "loud", "flock"]).unwrap_err();
+        let bad_verb = Cli::try_parse_from(["shep", "style", "loud"]).unwrap_err();
+        assert_eq!(
+            bad_flag.kind(),
+            bad_verb.kind(),
+            "a bad value fails the same way through either spelling"
+        );
     }
 
     /// `std::env::set_var` is `unsafe` in edition 2024 and this crate is

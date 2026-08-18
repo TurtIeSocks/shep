@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
+use crate::style::StyleLevel;
+
 /// Mode `shep.toml` — and the sibling lock file and staging file it is
 /// written through — is created with: owner read/write, nobody else.
 ///
@@ -239,6 +241,27 @@ impl ShepToml {
         if let Some(dog) = self.doc.get_mut("dog").and_then(Item::as_table_mut) {
             dog.remove(name);
         }
+    }
+
+    /// Writes `[style] level = "<level>"`, creating the `[style]` table
+    /// when this document has none yet, and replacing the value when one
+    /// is already there.
+    ///
+    /// The value written is `level`'s own `Display` spelling --
+    /// `full`/`plain`/`bare` -- the same string `style_from_config`
+    /// (`lib.rs`) parses back through `clap::ValueEnum::from_str`, so a
+    /// round trip through this setter and back stays one grammar rather
+    /// than a writer and a reader that merely happen to agree today.
+    ///
+    /// Called by `shep style <level>` (`Commands::Style`'s set form).
+    pub fn set_style_level(&mut self, level: StyleLevel) {
+        let style = self
+            .doc
+            .entry("style")
+            .or_insert_with(|| Item::Table(Table::new()))
+            .as_table_mut()
+            .expect("style is only ever written as a table");
+        style.insert("level", Item::Value(level.to_string().into()));
     }
 
     /// Writes the document back: staged in a sibling temp file at
@@ -630,6 +653,85 @@ mod tests {
         let path = dir.path().join("nested").join("shep.toml");
         ShepToml::edit(&path, |doc| doc.enable_dog("metrics")).unwrap();
         assert!(path.exists());
+    }
+
+    /// fails if `set_style_level` writes a spelling `DaemonConfig::load`'s
+    /// own `[style]` reader can't parse back for any of the three levels —
+    /// the whole point of writing `level`'s own `Display` string is that
+    /// the round trip needs no hand-written expectation to agree with.
+    #[test]
+    fn setting_a_style_level_round_trips_through_daemon_config() {
+        for level in [StyleLevel::Full, StyleLevel::Plain, StyleLevel::Bare] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("shep.toml");
+            ShepToml::edit(&path, |doc| doc.set_style_level(level)).unwrap();
+            let written = std::fs::read_to_string(&path).unwrap();
+            let cfg = DaemonConfig::load(Some(&written), &|_| None).unwrap();
+            assert_eq!(cfg.style.level.as_deref(), Some(level.to_string().as_str()));
+        }
+    }
+
+    /// fails if setting a style level round-trips through a plain
+    /// `toml::Table` the way `enabling_a_dog_leaves_the_rest_of_the_file_
+    /// exactly_as_it_was` guards against for dogs — an operator's
+    /// `shep.toml` is hand-written, and `shep style` touching only
+    /// `[style]` is the whole point of `ShepToml` over `toml::to_string`.
+    #[test]
+    fn setting_a_style_level_leaves_the_rest_of_the_file_exactly_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        let original = "# the shepherd's own knobs\n[daemon]\nlog_level = \"info\"  # chatty\nlog_json = false\n";
+        std::fs::write(&path, original).unwrap();
+
+        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Plain)).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# the shepherd's own knobs"));
+        assert!(written.contains("# chatty"));
+        assert!(
+            written.find("log_level").unwrap() < written.find("log_json").unwrap(),
+            "key order survives"
+        );
+
+        let cfg = DaemonConfig::load(Some(&written), &|_| None).unwrap();
+        assert_eq!(cfg.style.level.as_deref(), Some("plain"));
+    }
+
+    /// fails if a second `shep style` appends a second `level` key rather
+    /// than replacing the first — `toml_edit::Table::insert` on an
+    /// existing key is supposed to do the latter, but nothing pinned that
+    /// this setter actually relies on that rather than, say, always going
+    /// through `entry().or_insert_with()`, which would leave the first
+    /// value in place forever.
+    #[test]
+    fn setting_a_style_level_twice_replaces_rather_than_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Full)).unwrap();
+        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Bare)).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written.matches("level").count(), 1, "one key, not appended");
+        let cfg = DaemonConfig::load(Some(&written), &|_| None).unwrap();
+        assert_eq!(cfg.style.level.as_deref(), Some("bare"));
+    }
+
+    /// A `$SHEP_HOME` with no `shep.toml` at all is the common case for a
+    /// first `shep style <level>`, and it must create one rather than
+    /// refusing — the same behaviour `a_missing_file_opens_empty_and_edit_
+    /// creates_it` pins for `enable_dog`.
+    #[test]
+    fn setting_a_style_level_into_a_home_with_no_shep_toml_creates_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        assert!(!path.exists());
+
+        ShepToml::edit(&path, |doc| doc.set_style_level(StyleLevel::Bare)).unwrap();
+
+        assert!(path.exists());
+        let cfg =
+            DaemonConfig::load(Some(&std::fs::read_to_string(&path).unwrap()), &|_| None).unwrap();
+        assert_eq!(cfg.style.level.as_deref(), Some("bare"));
     }
 
     /// fails if the first `shep enable` on a host that has never booted a

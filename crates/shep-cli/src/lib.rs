@@ -92,6 +92,8 @@ use commands::schema;
 #[cfg(unix)]
 use commands::serve::serve as serve_command;
 #[cfg(unix)]
+use commands::shep_toml::{ShepToml, ShepTomlError};
+#[cfg(unix)]
 use commands::signal;
 #[cfg(unix)]
 use commands::startup;
@@ -344,6 +346,27 @@ fn resolve_style(global: &GlobalArgs) -> (style::StyleLevel, style::StyleSource)
     )
 }
 
+/// Whether a level [`Commands::Style`]'s set form just wrote to
+/// `shep.toml` is actually the level that will run, given which layer
+/// [`resolve_style`] reports the moment after that write.
+///
+/// Only `Flag` and `Env` can say no: those are the two layers
+/// [`style::resolve`]'s precedence puts above `shep.toml`, so they are the
+/// two spellings an operator needs named when the write they just asked
+/// for will keep being overridden. `Config` is the value this call just
+/// wrote, and `Default` cannot follow a successful write to it -- an
+/// unwritten `[style] level` is exactly what a successful write just
+/// stopped being true.
+///
+/// A pure decision over [`style::StyleSource`] rather than reading
+/// `$SHEP_STYLE`/`--style` again here, matching [`must_render_bare`]'s own
+/// idiom below: the real call happens once, at the call site in `run`, and
+/// this stays testable without the environment mutation this crate's
+/// `#![forbid(unsafe_code)]` rules out in a test.
+fn style_write_is_overridden(source: style::StyleSource) -> bool {
+    matches!(source, style::StyleSource::Flag | style::StyleSource::Env)
+}
+
 /// Whether output must render exactly as it always has: no boxes, no
 /// colour, no sheep, regardless of what `--style`/`$SHEP_STYLE`/`shep.toml`
 /// asked for.
@@ -559,10 +582,14 @@ fn ensure_home_at(paths: ShepPaths, explicit: bool) -> Result<(ShepPaths, bool),
 /// `style` is [`run_argv`]'s resolved level, already forced to
 /// [`style::StyleLevel::Bare`] there if the hard rule applies — every
 /// `Streams` this function builds carries it unchanged. `Commands::Style`
-/// is the one exception: its own report reads [`resolve_style`] again,
-/// unforced, because it answers a different question ("what is
-/// configured") than every other arm's `style` field does ("how do I
-/// render this table").
+/// is the one exception: with no level to set, its report reads
+/// [`resolve_style`] again, unforced, because it answers a different
+/// question ("what is configured") than every other arm's `style` field
+/// does ("how do I render this table"). With a level, it writes
+/// `shep.toml` through [`ShepToml::set_style_level`] and then re-resolves
+/// the same way, so it can tell the operator whether the value it just
+/// wrote is what will actually run or whether `--style`/`$SHEP_STYLE`
+/// still outranks it.
 #[cfg(unix)]
 async fn run(cli: Cli, style: style::StyleLevel) -> ExitCode {
     let fmt = cli.global.format;
@@ -849,18 +876,61 @@ async fn run(cli: Cli, style: style::StyleLevel) -> ExitCode {
             }
             code
         }
-        // Deliberately re-resolves rather than reading `style` (this
-        // function's own parameter): that value is already forced to
-        // `Bare` under the hard rule (piped stdout, `--format json`), and
-        // this report's whole job is telling an operator what is
-        // configured -- reporting `bare` every time it was piped would
-        // hide the answer `shep style` exists to give. See `resolve_style`.
-        Commands::Style(_) => {
-            let (level, source) = resolve_style(&cli.global);
-            let message = format!("{level} (from {source})");
-            let _ = output::emit_notice(&mut *streams.out, fmt, "style", &message);
-            ExitCode::Success
-        }
+        Commands::Style(args) => match args.level {
+            // Deliberately re-resolves rather than reading `style` (this
+            // function's own parameter): that value is already forced to
+            // `Bare` under the hard rule (piped stdout, `--format json`),
+            // and this report's whole job is telling an operator what is
+            // configured -- reporting `bare` every time it was piped
+            // would hide the answer `shep style` exists to give. See
+            // `resolve_style`.
+            None => {
+                let (level, source) = resolve_style(&cli.global);
+                let message = format!("{level} (from {source})");
+                let _ = output::emit_notice(&mut *streams.out, fmt, "style", &message);
+                ExitCode::Success
+            }
+            // A level turns this from a report into a write. Config
+            // first, report second -- the same order `commands::dogs`
+            // uses for its own four verbs -- so a failed report can never
+            // claim a write that did not happen.
+            Some(level) => {
+                if let Err(err) =
+                    ShepToml::edit(&paths.daemon_config, |cfg| cfg.set_style_level(level))
+                {
+                    let code = match err {
+                        ShepTomlError::Io { .. } => ExitCode::Failure,
+                        ShepTomlError::Parse { .. } => ExitCode::InvalidConfig,
+                    };
+                    let _ = output::emit_error(
+                        &mut *streams.err,
+                        fmt,
+                        code.code_str(),
+                        &err.to_string(),
+                    );
+                    return code;
+                }
+                // Re-resolves for the same reason the no-arg branch does:
+                // this is what tells the operator whether the value just
+                // written is what will actually run, or whether
+                // `--style`/`$SHEP_STYLE` still outranks the `shep.toml`
+                // this call just edited -- the exact "edited shep.toml
+                // and saw nothing change" confusion `StyleSource`'s own
+                // doc says this command exists to prevent.
+                let (effective, source) = resolve_style(&cli.global);
+                let path = paths.daemon_config.display();
+                let message = if style_write_is_overridden(source) {
+                    format!(
+                        "wrote {level} to {path}, but {source} still governs; \
+                         shep runs at {effective}"
+                    )
+                } else {
+                    format!("wrote {level} to {path}")
+                };
+                let _ = output::emit_notice(&mut *streams.out, fmt, "style", &message);
+                ExitCode::Success
+            }
+        },
         // Bare `shep start` means the Flockfile in this directory, the way
         // `shep runtime` and `shep dev` already read one -- and when there is
         // none, it means "bring a shepherd up", which is the only way to get
@@ -1880,6 +1950,71 @@ mod tests {
             resolve_style(&global),
             (style::StyleLevel::Bare, style::StyleSource::Flag),
             "the flag wins over the very shep.toml that set plain above"
+        );
+    }
+
+    /// fails if the override warning stops firing for the two layers that
+    /// actually outrank `shep.toml` (`--style`, `$SHEP_STYLE`), or starts
+    /// firing for `Config` (the value a write just produced) or `Default`
+    /// (impossible right after a successful write) -- either direction
+    /// would leave `Commands::Style`'s set form either silent about a
+    /// write that will not take effect, or crying wolf about one that
+    /// will.
+    #[test]
+    fn style_write_is_overridden_only_by_flag_or_env() {
+        assert!(style_write_is_overridden(style::StyleSource::Flag));
+        assert!(style_write_is_overridden(style::StyleSource::Env));
+        assert!(!style_write_is_overridden(style::StyleSource::Config));
+        assert!(!style_write_is_overridden(style::StyleSource::Default));
+    }
+
+    /// fails if `shep style <level>` stops actually writing `shep.toml` --
+    /// the defect this task exists to fix -- for any of the three levels,
+    /// or if what it writes is not what `style_from_config` (the same
+    /// reader `resolve_style` uses) reads back.
+    #[tokio::test]
+    async fn style_with_a_level_writes_shep_toml_and_the_config_reads_it_back() {
+        use clap::Parser;
+
+        for (raw, expected) in [
+            ("full", style::StyleLevel::Full),
+            ("plain", style::StyleLevel::Plain),
+            ("bare", style::StyleLevel::Bare),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().to_str().unwrap();
+            let cli = Cli::try_parse_from(["shep", "--home", home, "style", raw]).unwrap();
+            assert_eq!(
+                run(cli, style::StyleLevel::Bare).await,
+                ExitCode::Success,
+                "style {raw}"
+            );
+
+            let written = std::fs::read_to_string(dir.path().join("shep.toml")).unwrap();
+            assert_eq!(
+                style_from_config(Some(&written)),
+                Some(expected),
+                "style {raw}"
+            );
+        }
+    }
+
+    /// fails if `shep style` with no level ever writes `shep.toml` -- the
+    /// no-arg form is a report, and only a report, the same guarantee
+    /// `resolve_style_reads_the_flag_and_the_real_shep_toml_it_names`
+    /// above pins for what it *reads*.
+    #[tokio::test]
+    async fn style_with_no_level_reports_and_writes_nothing() {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        let cli = Cli::try_parse_from(["shep", "--home", home, "style"]).unwrap();
+        assert_eq!(run(cli, style::StyleLevel::Bare).await, ExitCode::Success);
+
+        assert!(
+            !dir.path().join("shep.toml").exists(),
+            "the no-arg form must not create a shep.toml that was not there"
         );
     }
 
