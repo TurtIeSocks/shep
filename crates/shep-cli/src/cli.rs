@@ -12,6 +12,77 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+/// The verb groups [`HELP_TEMPLATE`] renders, and the source of truth the
+/// drift test checks the real command tree against.
+///
+/// clap 4.6 has no subcommand grouping -- `#[command(help_heading = ..)]` on
+/// a subcommand variant does not compile, checked against 4.6.6 -- so the
+/// section is hand-written and this table is what keeps it from rotting. Add
+/// a verb without filing it here and
+/// `every_visible_verb_appears_in_exactly_one_help_group` fails.
+///
+/// `#[cfg(test)]` because it is exactly that: the assertions' structured copy
+/// of what [`HELP_TEMPLATE`] states in prose. The template is what ships.
+#[cfg(test)]
+const HELP_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Run things",
+        &[
+            "start", "serve", "stop", "restart", "reload", "delete", "stock",
+        ],
+    ),
+    (
+        "See what's up",
+        &["flock", "describe", "bleats", "lookout", "fold", "barks"],
+    ),
+    (
+        "Survive reboots",
+        &["save", "muster", "startup", "unstartup"],
+    ),
+    ("Talk to a sheep", &["trigger", "signal", "whisper"]),
+    (
+        "The shepherd",
+        &["ping", "kill", "reopen", "flush", "set", "get", "unset"],
+    ),
+    (
+        "Dogs and agents",
+        &["dogs", "enable", "disable", "adopt", "rehome", "whistle"],
+    ),
+    ("Foreground runs", &["runtime", "dev"]),
+    ("Coming from pm2", &["import"]),
+    ("Help", &["welcome", "help", "completions"]),
+];
+
+/// `--help`'s shape.
+///
+/// `{options}`, not `{all-args}`: the latter re-emits clap's own
+/// alphabetical `Commands:` list underneath the grouped one, which is the
+/// wall this replaces. The options section stays generated, so `--home`'s
+/// `Less common` heading is still clap's work.
+const HELP_TEMPLATE: &str = "\
+{about}
+
+{usage-heading} {usage}
+
+Getting started
+  shep start server.js    start it and keep it alive
+  shep flock              see what's running
+  shep bleats server      follow its output
+  shep save               remember this flock across reboots
+  shep startup            bring it back after a reboot
+
+Run things       start serve stop restart reload delete stock
+See what's up    flock describe bleats lookout fold barks
+Survive reboots  save muster startup unstartup
+Talk to a sheep  trigger signal whisper
+The shepherd     ping kill reopen flush set get unset
+Dogs and agents  dogs enable disable adopt rehome whistle
+Foreground runs  runtime dev
+Coming from pm2  import
+Help             welcome help completions
+
+{options}{after-help}";
+
 /// The `shep` command line.
 // `bin_name = "shep"` below is load-bearing, not decoration. Without it, clap
 // renders every `Usage:` line from `argv[0]` rather than from `name` — so
@@ -33,7 +104,9 @@ use std::path::PathBuf;
     bin_name = "shep",
     version,
     about = "A process manager for your flock",
-    propagate_version = true
+    propagate_version = true,
+    help_template = HELP_TEMPLATE,
+    after_help = "Run `shep help <command>` for one command, or `shep welcome` for the tour."
 )]
 pub struct Cli {
     /// Flags valid on every subcommand.
@@ -47,9 +120,6 @@ pub struct Cli {
 /// Flags valid on every subcommand, folded into [`Cli`] via `#[command(flatten)]`.
 #[derive(Debug, clap::Args)]
 pub struct GlobalArgs {
-    /// Override $SHEP_HOME for this invocation
-    #[arg(long, global = true, env = "SHEP_HOME")]
-    pub home: Option<PathBuf>,
     /// Output format
     #[arg(long, global = true, value_enum, default_value_t = Format::Table)]
     pub format: Format,
@@ -60,6 +130,22 @@ pub struct GlobalArgs {
     /// own line or a real error, both of which still print regardless.
     #[arg(short, long, global = true)]
     pub quiet: bool,
+    /// Talk to a different shepherd
+    ///
+    /// Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You
+    /// almost certainly want the default, ~/.shep.
+    // Declared last on purpose. It was the first global option anyone read,
+    // which announced it as a choice when it is really the daemon's
+    // data-root. `{options}` renders in declaration order and ignores
+    // `help_heading`, so position is the only lever available here: a `Less
+    // common` section would need `{all-args}`, which re-emits the
+    // alphabetical command wall this template exists to replace.
+    //
+    // `//`, not `///`, for the same reason the note above `Cli` is one. This
+    // paragraph shipped in `shep --help` for exactly one build before the
+    // render was read.
+    #[arg(long, global = true, env = "SHEP_HOME")]
+    pub home: Option<PathBuf>,
 }
 
 /// `--format`'s two shapes.
@@ -958,6 +1044,90 @@ mod tests {
         Cli::command().debug_assert(); // clap's own structural self-check
     }
 
+    /// Every visible verb is filed under exactly one heading, and every name
+    /// under a heading is a real verb. A hand-written list rots the first
+    /// time somebody adds a command; this is what stops it, the way
+    /// `docs/whistle/tools.md`'s catalogue test stops that list rotting.
+    #[test]
+    fn every_visible_verb_appears_in_exactly_one_help_group() {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let visible: Vec<String> = command
+            .get_subcommands()
+            .filter(|s| !s.is_hide_set())
+            .map(|s| s.get_name().to_string())
+            .collect();
+        let filed: Vec<&str> = HELP_GROUPS
+            .iter()
+            .flat_map(|(_, verbs)| verbs.iter().copied())
+            .collect();
+
+        for verb in &visible {
+            let times = filed.iter().filter(|f| *f == verb).count();
+            assert_eq!(
+                times, 1,
+                "`{verb}` appears in {times} help groups; it must appear in exactly one"
+            );
+        }
+        for name in &filed {
+            // `help` is clap's own, generated rather than declared, so it is
+            // the one filed name with no matching subcommand to find.
+            assert!(
+                *name == "help" || visible.iter().any(|v| v == name),
+                "a help group names `{name}`, which is not a visible verb"
+            );
+        }
+    }
+
+    /// `HELP_TEMPLATE` is a literal and `HELP_GROUPS` is structured data, so
+    /// the two can disagree. They may not: the template is what users read
+    /// and the table is what the drift test above checks.
+    #[test]
+    fn the_help_template_and_the_group_table_agree() {
+        for (heading, verbs) in HELP_GROUPS {
+            let line = HELP_TEMPLATE
+                .lines()
+                .find(|l| l.starts_with(heading))
+                .unwrap_or_else(|| panic!("`{heading}` is missing from HELP_TEMPLATE"));
+            for verb in *verbs {
+                assert!(
+                    line.split_whitespace().any(|w| w == *verb),
+                    "`{verb}` is filed under `{heading}` but is not on that line: {line}"
+                );
+            }
+        }
+    }
+
+    /// The five commands that get someone to a reboot-surviving process.
+    #[test]
+    fn the_help_opens_with_a_worked_example() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            help.contains("Getting started"),
+            "no getting-started block:\n{help}"
+        );
+        assert!(
+            help.contains("shep start server.js"),
+            "no worked example:\n{help}"
+        );
+    }
+
+    /// `--home` is plumbing, not a choice, and it was the first global option
+    /// anyone read.
+    #[test]
+    fn home_is_the_last_global_option_a_reader_meets() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        let home = help.find("--home").expect("--home is still documented");
+        let format = help.find("--format").expect("--format is documented");
+        let quiet = help.find("--quiet").expect("--quiet is documented");
+        assert!(
+            home > format && home > quiet,
+            "--home must come after the options people actually choose:\n{help}"
+        );
+    }
+
     /// `--help` is the first thing a stranger reads, and for three phases it
     /// opened with this crate's own reasoning about clap's `bin_name`.
     /// clap turns a doc comment into `long_about`, and nobody ran the
@@ -966,7 +1136,17 @@ mod tests {
     fn the_top_level_help_carries_no_implementation_notes() {
         use clap::CommandFactory;
         let help = Cli::command().render_long_help().to_string();
-        for leak in ["bin_name", "Phase 15", "load-bearing", "argv[0]"] {
+        for leak in [
+            "bin_name",
+            "Phase 15",
+            "load-bearing",
+            "argv[0]",
+            // A clap template placeholder reaching the render means a doc
+            // comment is discussing the template rather than the command.
+            "{options}",
+            "{all-args}",
+            "help_heading",
+        ] {
             assert!(
                 !help.contains(leak),
                 "`shep --help` still contains the internal note {leak:?}:\n{help}"
