@@ -219,8 +219,11 @@ pub fn emit<T: Render>(
 /// The one branch [`emit`], [`emit_flock`] and [`emit_described`] all make on
 /// every table they render, factored out here so those four call sites stay
 /// one decision instead of reimplementing it four times. [`table::render_boxed`]
-/// needs a terminal width; [`terminal_width`] is the same unconditional-
-/// fallback measurement every one of them would otherwise recompute.
+/// needs a terminal width; `presentation.width` is [`terminal_width`] already
+/// resolved once at the seam (`lib.rs`'s `run_argv`) rather than re-measured
+/// by this function itself -- see [`crate::style::Presentation`]'s own doc
+/// for why a value injected here, not a call made here, is what keeps this
+/// function testable at any width a test chooses.
 ///
 /// The boxed path renders twice when the first pass drops a column. Spec §2:
 /// the STATUS word is the first thing dropped from that column, before any
@@ -240,7 +243,7 @@ fn table_of<T: Render>(data: &T, presentation: Presentation) -> String {
         return render_table(data);
     }
     let headers = T::headers();
-    let width = terminal_width();
+    let width = presentation.width;
     let wide = table::render_boxed_ex(
         headers,
         &data.rows_for(presentation, true),
@@ -268,12 +271,19 @@ fn table_of<T: Render>(data: &T, presentation: Presentation) -> String {
 /// the same as absent: `render_boxed` would otherwise read it as "drop every
 /// droppable column," for no reason a real terminal ever gave it.
 ///
-/// Only ever consulted when [`table_of`] has already decided
-/// `presentation.level.boxes()` is true, and the level is forced to
-/// [`crate::style::StyleLevel::Bare`] (`lib.rs`'s `run_argv`) whenever
-/// stdout is not a terminal — so a real call here always has a real
-/// terminal behind it.
-fn terminal_width() -> usize {
+/// `pub(crate)` rather than private: its one real caller is `lib.rs`'s
+/// `run_argv`, which resolves [`crate::style::Presentation::width`] once,
+/// at the same seam that resolves the style level and forces
+/// [`crate::style::StyleLevel::Bare`] for a pipe -- never [`table_of`]
+/// itself, which used to call this directly and, in doing so, read the
+/// *real* controlling terminal on every render, including under
+/// `cargo test`: a test binary launched from an interactive shell has one
+/// too, so only a harness with none ever made that pass by accident. A
+/// developer's own shell does not, and every `table_of` test failed there.
+/// Injecting the already-resolved value through `Presentation` instead is
+/// what makes `table_of` provable at any width a test chooses, this
+/// module's own tests included.
+pub(crate) fn terminal_width() -> usize {
     #[cfg(unix)]
     {
         crossterm::terminal::size().map_or(80, |(w, _)| match w {
@@ -910,7 +920,8 @@ mod tests {
     /// a bug in `rows::status_cell` could still emit an escape regardless.
     #[test]
     fn no_color_at_full_keeps_sheep_and_boxes_but_drops_colour() {
-        let presentation = Presentation::new(StyleLevel::Full, Some(OsStr::new("1")), None, None);
+        let presentation =
+            Presentation::new(StyleLevel::Full, Some(OsStr::new("1")), None, None, 80);
         assert!(
             !presentation.colour,
             "NO_COLOR must veto colour even at full"
@@ -974,6 +985,7 @@ mod tests {
                 None,
                 Some(OsStr::new("xterm-256color")),
                 None,
+                80,
             ),
         );
         println!("--- full ---\n{full}");
@@ -992,6 +1004,7 @@ mod tests {
                 None,
                 Some(OsStr::new("xterm-256color")),
                 None,
+                80,
             ),
         );
         println!("--- plain ---\n{plain}");
@@ -1010,15 +1023,17 @@ mod tests {
     /// characters) is the longest status word, chosen so face-plus-word
     /// alone forces `FOLD` past a width face-alone comfortably fits —
     /// exercising `Render::rows_for` and `table::render_boxed_ex` directly,
-    /// the same two calls `table_of`'s own two-pass retry makes, since
-    /// `table_of` reads the real terminal width itself and so cannot be
-    /// driven at a chosen width from a unit test.
+    /// the same two calls `table_of`'s own two-pass retry makes -- `table_of`
+    /// could be driven at this same chosen width too now that width is an
+    /// injected `Presentation` field rather than a real-terminal read, but
+    /// this test stays at the lower level anyway, to pin the exact retry
+    /// mechanics rather than `table_of`'s outer wrapping around them.
     #[test]
     fn the_word_drops_before_a_whole_column_does() {
         let flock = FlockRows(vec![
             ProcessInfo::builder(1, "a", ProcStatus::WaitingRestart).build(),
         ]);
-        let presentation = Presentation::new(StyleLevel::Full, None, None, None);
+        let presentation = Presentation::new(StyleLevel::Full, None, None, None, 80);
         let headers = FlockRows::headers();
 
         let wide = table::render_boxed_ex(
@@ -1067,6 +1082,7 @@ mod tests {
             None,
             Some(OsStr::new("xterm-256color")),
             None,
+            80,
         );
         let mut out = Vec::new();
         emit(&mut out, Format::Json, "flock", flock, presentation).unwrap();

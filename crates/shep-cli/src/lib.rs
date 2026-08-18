@@ -216,19 +216,27 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
     } else {
         configured
     };
-    // `NO_COLOR`/`$TERM`/`$COLORTERM` read here, once, and nowhere else --
-    // the same reason `level` itself is resolved here rather than inside
-    // `run`: every `Streams` construction downstream gets a value, never a
-    // call. `must_render_bare`'s hard rule already forced `level` to `Bare`
-    // above when it applies, and `Presentation::new`'s own `colour` folding
-    // (`level.colour() && !no_color_set(..)`) is `false` for `Bare`
-    // regardless of what the environment says, so the hard rule holds
-    // either way.
+    // `NO_COLOR`/`$TERM`/`$COLORTERM`/the terminal width read here, once, and
+    // nowhere else -- the same reason `level` itself is resolved here rather
+    // than inside `run`: every `Streams` construction downstream gets a
+    // value, never a call. `must_render_bare`'s hard rule already forced
+    // `level` to `Bare` above when it applies, and `Presentation::new`'s own
+    // `colour` folding (`level.colour() && !no_color_set(..)`) is `false`
+    // for `Bare` regardless of what the environment says, so the hard rule
+    // holds either way. `output::terminal_width()` used to be called from
+    // inside `output::table_of` itself instead of here, which meant every
+    // table render read the process's real controlling terminal -- `cargo
+    // test` included, since a test binary launched from an interactive
+    // shell has one too. Resolving it here, once, and carrying it on
+    // `Presentation` like every other terminal fact, is what makes
+    // `table_of` a pure function of its inputs rather than of whatever
+    // terminal happened to be behind the process that ran it.
     let style = style::Presentation::new(
         level,
         std::env::var_os("NO_COLOR").as_deref(),
         std::env::var_os("TERM").as_deref(),
         std::env::var_os("COLORTERM").as_deref(),
+        output::terminal_width(),
     );
     std::process::ExitCode::from(runtime.block_on(run(cli, style)) as u8)
 }

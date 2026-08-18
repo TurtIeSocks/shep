@@ -761,12 +761,13 @@ mod tests {
     /// the longest status word -- see that test's own doc for the width
     /// arithmetic this difference drives.
     ///
-    /// Every other column is sized to fit `output::terminal_width`'s own
-    /// fallback of 80: `cargo test` gives `table_of` no real terminal behind
-    /// stdout (output is captured), so `crossterm::terminal::size()` errors
-    /// and every real call in this module lands on that fallback -- the same
-    /// assumption `the_word_drops_before_a_whole_column_does` above already
-    /// relies on for its own single-row fixture.
+    /// Every other column is sized to fit a width of 80 -- the value every
+    /// `Presentation::new` call in this module's tests below passes
+    /// explicitly as `width`, injected rather than measured. `table_of`
+    /// reads `presentation.width`, never the process's own controlling
+    /// terminal, so this arithmetic holds on any machine this suite runs
+    /// on, a real developer's tty included (see [`crate::style::Presentation`]'s
+    /// own doc for why the field exists).
     fn mixed_flock(butter: ProcStatus) -> FlockRows {
         FlockRows(vec![
             ProcessInfo::builder(0, "web", ProcStatus::Online)
@@ -796,7 +797,7 @@ mod tests {
     /// fallback with every column and the word both in play.
     #[test]
     fn full_wide_pins_face_word_and_colour_for_a_mixed_flock() {
-        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None);
+        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None, 80);
         let rendered = table_of(&mixed_flock(ProcStatus::Starting), presentation);
         assert!(
             !rendered.contains("hidden"),
@@ -825,7 +826,7 @@ mod tests {
     /// FOLD back, no footer.
     #[test]
     fn full_narrow_drops_the_status_word_before_a_whole_column() {
-        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None);
+        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None, 80);
         let rendered = table_of(&mixed_flock(ProcStatus::WaitingRestart), presentation);
         assert!(
             !rendered.contains("waiting-restart"),
@@ -844,7 +845,7 @@ mod tests {
     /// asserts the same thing without pinning the exact render).
     #[test]
     fn plain_pins_the_boxed_table_with_words_and_colour_but_no_face() {
-        let presentation = Presentation::new(StyleLevel::Plain, None, deep_terminal(), None);
+        let presentation = Presentation::new(StyleLevel::Plain, None, deep_terminal(), None, 80);
         let rendered = table_of(&mixed_flock(ProcStatus::Starting), presentation);
         assert!(!rendered.contains("(o.o)"), "no face at plain: {rendered}");
         insta::assert_snapshot!(rendered);
@@ -882,6 +883,7 @@ mod tests {
             Some(OsStr::new("1")),
             deep_terminal(),
             None,
+            80,
         );
         let rendered = table_of(&mixed_flock(ProcStatus::Starting), presentation);
         assert!(

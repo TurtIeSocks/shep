@@ -120,36 +120,55 @@ pub(crate) fn deep_colour_terminal(term: Option<&OsStr>, colorterm: Option<&OsSt
 /// convention that vetoes colour without touching layout. `Full` with
 /// colour vetoed still draws boxes and sheep, which is the whole reason
 /// `NO_COLOR` is honoured as its own axis rather than folded into the dial.
-/// `deep_colour` is a third, independent fact about the terminal itself --
-/// none of the three implies another, so folding any two together would
-/// either lose information or synthesize an answer nobody gave.
+/// `deep_colour` is a third, independent fact about the terminal itself,
+/// and `width` a fourth -- none of the four implies another, so folding
+/// any two together would either lose information or synthesize an answer
+/// nobody gave.
 ///
-/// All three are resolved once, at the seam ([`Presentation::new`], called
+/// All four are resolved once, at the seam ([`Presentation::new`], called
 /// from `run_argv`) and never afterward: this is a fact about the operator
 /// and the terminal, not about any one render attempt. Contrast
 /// `table_of`'s (`output/mod.rs`) own STATUS-word retry, which is a
 /// per-attempt decision local to that function and its one caller
 /// (`FlockRows::rows_for`) -- it is threaded as a plain `bool` parameter on
 /// `Render::rows_for` rather than living here, precisely because it is not
-/// a fact resolved once at the seam the way these three are. A first
-/// revision of this task put it on this struct; review moved it, because
-/// nothing but `table_of` ever wrote it and nothing but
+/// a fact resolved once at the seam the way these four are. A first
+/// revision of this task put `status_word` on this struct; review moved
+/// it, because nothing but `table_of` ever wrote it and nothing but
 /// `FlockRows::status_cell` ever read it -- a field whose only honest
 /// description was "irrelevant here" had leaked out of a function-local
-/// decision onto crate-wide state that ~100 sites construct.
+/// decision onto crate-wide state that ~100 sites construct. `width`
+/// belongs here for the opposite reason: `table_of` used to call
+/// `crossterm::terminal::size()` itself, which reads the process's real
+/// controlling terminal -- including under `cargo test`, since a test
+/// binary launched from an interactive shell has one too. Only a harness
+/// with no controlling terminal ever made those tests pass by accident;
+/// a developer's own shell does not, and `table_of` read it anyway. `width`
+/// fixes that the same way `colour`/`deep_colour` already were fixed: a
+/// fact resolved once here and injected everywhere else, so the function
+/// that renders is pure in its inputs and provable at any width a test
+/// chooses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Presentation {
     pub(crate) level: StyleLevel,
     pub(crate) colour: bool,
     pub(crate) deep_colour: bool,
+    /// The terminal's width in columns, or `80` when there is none to
+    /// measure -- `output::terminal_width`'s own fallback, folded in once
+    /// here instead of read again by every table `table_of` renders in one
+    /// invocation.
+    pub(crate) width: usize,
 }
 
 impl Presentation {
-    /// `Bare`, no colour, no depth: `Bare` never reaches `Render::rows_for`
-    /// at all ([`StyleLevel::boxes`] is false, so `table_of` takes the
-    /// plain `render_table` path instead). The safe default for the many
-    /// test fixtures in this crate that want today's plain output and no
-    /// more.
+    /// `Bare`, no colour, no depth, and an unused `width`: `Bare` never
+    /// reaches `Render::rows_for` at all ([`StyleLevel::boxes`] is false,
+    /// so `table_of` takes the plain `render_table` path instead), and
+    /// `render_table` never reads `width` -- so `80` here is a placeholder,
+    /// not a real fallback, chosen only to match `output::terminal_width`'s
+    /// own so a reader does not have to ask why it differs. The safe
+    /// default for the many test fixtures in this crate that want today's
+    /// plain output and no more.
     ///
     /// Every real `Streams` a running `shep` builds carries the
     /// `Presentation` `lib.rs`'s `run_argv` actually resolved, never this
@@ -161,11 +180,13 @@ impl Presentation {
         level: StyleLevel::Bare,
         colour: false,
         deep_colour: false,
+        width: 80,
     };
 
     /// Resolves `colour` and `deep_colour` from already-read environment
-    /// values -- terminal-ness is always a parameter here, never a
-    /// `std::env` call inside the function that renders, the same idiom
+    /// values, and carries `width` through unchanged -- terminal-ness and
+    /// terminal width are always parameters here, never a `std::env`/
+    /// `crossterm` call inside the function that renders, the same idiom
     /// `commands::daemon::ansi_enabled` and `lookout::theme::Palette::detect`
     /// both follow.
     pub(crate) fn new(
@@ -173,11 +194,13 @@ impl Presentation {
         no_color: Option<&OsStr>,
         term: Option<&OsStr>,
         colorterm: Option<&OsStr>,
+        width: usize,
     ) -> Self {
         Self {
             level,
             colour: level.colour() && !no_color_set(no_color),
             deep_colour: deep_colour_terminal(term, colorterm),
+            width,
         }
     }
 }
@@ -338,10 +361,11 @@ mod tests {
     /// can override that.
     #[test]
     fn presentation_new_folds_no_color_into_the_levels_own_answer() {
-        let full_untouched = Presentation::new(StyleLevel::Full, None, None, None);
+        let full_untouched = Presentation::new(StyleLevel::Full, None, None, None, 80);
         assert!(full_untouched.colour);
 
-        let full_vetoed = Presentation::new(StyleLevel::Full, Some(OsStr::new("1")), None, None);
+        let full_vetoed =
+            Presentation::new(StyleLevel::Full, Some(OsStr::new("1")), None, None, 80);
         assert!(!full_vetoed.colour);
 
         let bare_with_no_color_unset = Presentation::new(
@@ -349,6 +373,7 @@ mod tests {
             None,
             Some(OsStr::new("xterm-256color")),
             None,
+            80,
         );
         assert!(
             !bare_with_no_color_unset.colour,
@@ -368,10 +393,12 @@ mod tests {
             None,
             Some(OsStr::new("xterm-256color")),
             None,
+            80,
         );
         assert!(deep.deep_colour);
 
-        let shallow = Presentation::new(StyleLevel::Full, None, Some(OsStr::new("vt100")), None);
+        let shallow =
+            Presentation::new(StyleLevel::Full, None, Some(OsStr::new("vt100")), None, 80);
         assert!(!shallow.deep_colour);
     }
 }
