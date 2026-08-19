@@ -254,7 +254,7 @@ impl Scene {
                 "All three panes at 120x30: the host strip under the title, the detail pane and the bleats feed under the table. `>` marks the selected sheep, and every pane below the table describes it."
             }
             Self::Errored => {
-                "One errored, one waiting to restart, one stopped, with the selection parked on the errored sheep. Each row's own STATUS cell is the only coloured cell in that row."
+                "One errored, one waiting to restart, one stopped, with the selection parked on the errored sheep. Each row's own STATUS cell is the only coloured cell in that row, and EXIT carries why each of the three stopped: a code for the two that crashed, a signal name for the one shep stopped itself."
             }
             Self::Empty => {
                 "No sheep registered. Each of the three panes says why it is empty, and the three sentences are different because the three reasons are."
@@ -1238,7 +1238,9 @@ mod tests {
 
         // "One errored, one waiting to restart, one stopped, with the
         //  selection parked on the errored sheep. Each row's own STATUS cell
-        //  is the only coloured cell in that row."
+        //  is the only coloured cell in that row, and EXIT carries why each
+        //  of the three stopped: a code for the two that crashed, a signal
+        //  name for the one shep stopped itself."
         let errored = render_text(&scene(Scene::Errored).1);
         assert!(errored.contains("errored"));
         assert!(
@@ -1255,6 +1257,34 @@ mod tests {
         // status colour, and `stopped` happens to share the chrome's muted
         // grey rather than standing out from it. Only the ANSI rendering
         // carries colour to check this against.
+        // EXIT carries why each of the three stopped. Asserted on the ROWS
+        // rather than on the whole frame, because `errored.contains("1")`
+        // would pass on any digit anywhere -- a restart count, a pid, a
+        // timestamp -- and pass just as happily if the column were blank.
+        let row_of = |name: &str| {
+            errored
+                .lines()
+                .find(|line| line.contains(name))
+                .unwrap_or_else(|| panic!("no row for {name}:\n{errored}"))
+                .to_string()
+        };
+        for (name, want) in [
+            ("api", "1"),
+            ("billing-reconciliation-w", "1"),
+            ("cron", "SIGTERM"),
+        ] {
+            let row = row_of(name);
+            assert!(
+                row.contains(want),
+                "{name}'s EXIT cell must read {want}, not a dash: {row}"
+            );
+        }
+        assert!(
+            row_of("metrics").contains(" -   "),
+            "a running sheep has no exit to report: {}",
+            row_of("metrics")
+        );
+
         let errored_ansi = render_ansi(&scene(Scene::Errored).1);
         assert!(
             errored_ansi.contains("\u{1b}[38;5;29monline"),

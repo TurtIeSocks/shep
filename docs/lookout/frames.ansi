@@ -61,7 +61,7 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m
 
 
 === errored  (120x30) ===
-One errored, one waiting to restart, one stopped, with the selection parked on the errored sheep. Each row's own STATUS cell is the only coloured cell in that row.
+One errored, one waiting to restart, one stopped, with the selection parked on the errored sheep. Each row's own STATUS cell is the only coloured cell in that row, and EXIT carries why each of the three stopped: a code for the two that crashed, a signal name for the one shep stopped itself.
 
 shep lookout   /home/rin/.shep                                                                           [0m[38;5;245m 6 in the flock[0m
 [0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%   flock mem 371.0M   up 6d 3h            [0m
