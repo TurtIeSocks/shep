@@ -235,6 +235,25 @@ pub(crate) fn render_boxed_ex(
     priorities: &[u8],
     term_width: usize,
 ) -> BoxedTable {
+    // Sanitised once, here, rather than inside `column_widths` and
+    // `boxed_row` separately: a cell born from operator-chosen data (a
+    // sheep name, a bark message, an adopted dog's path) reaches this
+    // function raw, and `crate::output::width::visible_width`'s own doc
+    // names this as the box-drawn renderer's job, not its own. Sanitising
+    // once and reusing the result for both the width pass below and the
+    // print pass is also what keeps the two in agreement -- see
+    // `width::sanitize_cell`'s own doc for why sanitising twice risked
+    // drifting.
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| crate::output::width::sanitize_cell(cell))
+                .collect()
+        })
+        .collect();
+    let rows = &rows;
+
     let mut keep: Vec<usize> = (0..headers.len()).collect();
     let mut dropped: Vec<&str> = Vec::new();
 
@@ -552,6 +571,32 @@ mod tests {
             .collect()
     }
 
+    /// One cell's raw text before the `styled` wrapper below decides whether
+    /// to also wrap it in a colour span: plain words most of the time, and
+    /// -- whole-branch review item 3 -- occasionally a control character
+    /// (`\n`/`\r`/`\t`, the exact class `sanitize_cell` exists to escape) or
+    /// an unterminated CSI introducer with no final byte, the exact class it
+    /// exists to drop. Before this task the strategy only ever generated
+    /// `[a-z(). -]`, so this property test could hold even though the
+    /// renderer had never actually been asked to sanitise a cell -- it
+    /// stepped around the reachable case (`normalize()` rejects only `/`,
+    /// `\`, `.` and `..` in a name) rather than covering it.
+    fn dirty_cell_text() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+
+        prop_oneof![
+            3 => "[a-z(). -]{0,12}".prop_map(String::from),
+            1 => ("[a-z]{0,4}", prop_oneof![Just('\n'), Just('\r'), Just('\t')], "[a-z]{0,4}")
+                .prop_map(|(a, c, b)| format!("{a}{c}{b}")),
+            // Digits and `;` only after the introducer, never a letter --
+            // the same trap `an_unterminated_or_bare_escape_is_dropped_whole`
+            // (`width.rs`'s own test module) avoids for the same reason: a
+            // letter here is itself a valid final byte and would close the
+            // sequence the case means to leave open.
+            1 => "[a-z]{0,4}".prop_map(|a| format!("{a}\u{1b}[3;1")),
+        ]
+    }
+
     /// The invariant the whole feature rests on. Any rows, any width, any
     /// mix of styled and plain cells: every line of the table itself is the
     /// same visible width, and that width is either inside the terminal or
@@ -566,7 +611,7 @@ mod tests {
         proptest!(|(
             cells in proptest::collection::vec(
                 proptest::collection::vec(
-                    ("[a-z(). -]{0,12}", any::<bool>()).prop_map(|(s, styled)| {
+                    (dirty_cell_text(), any::<bool>()).prop_map(|(s, styled)| {
                         if styled {
                             format!("\u{1b}[32m{s}\u{1b}[0m")
                         } else {
@@ -726,6 +771,30 @@ mod tests {
             narrow.rendered,
             render_boxed(&headers, &rows, &priorities, 20)
         );
+    }
+
+    /// The concrete bug whole-branch review item 3 named: `shep-core`'s
+    /// `normalize()` rejects only `/`, `\`, `.` and `..` in a name, so a
+    /// name carrying an embedded newline reaches this renderer -- reachable,
+    /// not theoretical. Before `render_boxed_ex` sanitised every cell, a
+    /// literal `\n` inside `boxed_row`'s output split that one row across
+    /// two printed lines and misaligned every border beneath it.
+    #[test]
+    fn a_name_with_an_embedded_newline_does_not_split_its_own_row() {
+        let headers = ["ID", "NAME", "STATUS"];
+        let rows = vec![vec!["0".into(), "web\nworker".into(), "online".into()]];
+        let out = render_boxed(&headers, &rows, &[0, 0, 0], 80);
+
+        let box_lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with(['┌', '├', '│', '└']))
+            .collect();
+        // Top rule, header, separator, exactly one data row, bottom rule --
+        // five lines. A literal newline surviving into the cell would have
+        // split that one data row into two, making it six.
+        assert_eq!(box_lines.len(), 5, "{out}");
+        assert!(out.contains("web\\nworker"), "escaped, visible: {out}");
+        assert!(!out.contains("web\nworker"), "no literal newline: {out:?}");
     }
 
     // --- Task 7: pin every level, through the real rendering seam ---------
