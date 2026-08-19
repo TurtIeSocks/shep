@@ -361,6 +361,52 @@ feature so it never reaches docs.rs. What would force it: a panic from one of
 those accessors pointing at the accessor rather than at the caller that passed
 the bad index, which is exactly the debugging cost IR-21 exists to avoid.
 
+### A Flockfile's relative `script` resolves against the daemon's cwd
+
+Found 2026-08-19 by Rin, asking what `cwd` does while writing `shep init`'s
+skeleton. Measured with three distinct directories so nothing could be
+confused for anything else.
+
+A Flockfile app whose `script` is relative and which sets no `cwd` does NOT
+resolve that script against the Flockfile's own directory. It resolves against
+**the daemon's** working directory, which is whatever directory the shepherd
+happened to be autostarted from and is invisible from the command line.
+
+```
+daemon cwd = /home    Flockfile = /proj    invoked from = /caller
+[[app]] name = "x", script = "./sub/prog"
+-> error[spawn_failed]: No such file or directory (os error 2)
+```
+
+Invoking from the Flockfile's own directory changes nothing; the caller's cwd
+is not consulted either. Adding `cwd = "/proj"` to the entry fixes it at once.
+The ad-hoc path is unaffected and behaves sensibly: `shep start ./x`
+canonicalises the script and sets `cwd` to the caller's directory
+(`lifecycle.rs:358`), which is exactly what `6cf7124` established.
+
+**Why this is worse than it first looks.** A Flockfile is a file you commit
+and share. Its behaviour here depends on invisible daemon state, so the same
+committed file works on the machine where the shepherd was started in the
+right place and fails on the one where it was not, with an error naming
+neither cause. `normalize()` already refuses `watch` without a `cwd` for a
+closely related reason (`WatchWithoutCwd`: defaulting to the daemon's cwd
+"risks watching the whole filesystem under a systemd unit"), so the hazard is
+recognised in one place and not the other.
+
+**Options, none chosen yet.** Resolve a relative `script` against the
+Flockfile's directory, which is what a reader expects and what makes a
+committed file portable, at the cost of changing behaviour for anyone relying
+on today's. Or default `cwd` to the Flockfile's directory when unset, which is
+the same fix expressed where an operator can see it. Or refuse a relative
+`script` with no `cwd`, mirroring `WatchWithoutCwd` exactly, which is the
+smallest change and turns a silent misfire into a message. **The middle option
+also fixes the documentation problem it caused:** `shep init`'s skeleton wants
+to say something true about `cwd`, and today the honest sentence is awkward
+because the answer differs between the ad-hoc and Flockfile paths.
+
+Deferred only because Rin chose to finish `shep init` first; nothing about it
+is hard.
+
 ### The license files are not inside the published tarballs
 
 `cargo package` does not include `LICENSE-MIT` or `LICENSE-APACHE`, so the
