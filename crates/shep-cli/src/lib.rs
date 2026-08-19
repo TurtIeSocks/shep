@@ -2114,6 +2114,14 @@ mod tests {
     /// the defect this task exists to fix -- for any of the three levels,
     /// or if what it writes is not what `style_from_config` (the same
     /// reader `resolve_style` uses) reads back.
+    ///
+    /// `#[cfg(unix)]` because every verb refuses on Windows with "shep does
+    /// not yet support Windows", so there is no write to observe there. This
+    /// gate was missing when the test landed and turned CI's two Windows legs
+    /// red; the local gate could not see it, because a macOS `cargo test`
+    /// never compiles a Windows arm and the windows-gnu cross-check is
+    /// `cargo check`, which does not run anything.
+    #[cfg(unix)]
     #[tokio::test]
     async fn style_with_a_level_writes_shep_toml_and_the_config_reads_it_back() {
         use clap::Parser;
@@ -2145,6 +2153,9 @@ mod tests {
     /// no-arg form is a report, and only a report, the same guarantee
     /// `resolve_style_reads_the_flag_and_the_real_shep_toml_it_names`
     /// above pins for what it *reads*.
+    /// `#[cfg(unix)]` for the same reason as the test above: the verb
+    /// refuses on Windows before it can report anything.
+    #[cfg(unix)]
     #[tokio::test]
     async fn style_with_no_level_reports_and_writes_nothing() {
         use clap::Parser;
