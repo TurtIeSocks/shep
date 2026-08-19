@@ -336,6 +336,26 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
 /// (`from_str` does not trim), so `SHEP_STYLE=" full "` resolved while
 /// `level = " full "` silently did not; `style_from_config_trims_the_same_way_shep_style_does`
 /// (below) pins that they now agree.
+/// Parses `shep.toml`'s `[interpreters]` table into shep-cli's own
+/// extension -> interpreter map, for `lifecycle::start` to fold onto every
+/// resolved app whose own `interpreter` is still unset (task 47's
+/// precedence: shep.toml, then a Flockfile's own field, then
+/// `--interpreter`).
+///
+/// Empty covers every way this layer can say nothing -- the same set
+/// [`style_from_config`] enumerates for itself just below: no file, a file
+/// that will not parse, or simply no `[interpreters]` table. Reading a
+/// broken `shep.toml` as "no mapping" rather than a hard error is
+/// deliberate for the same reason it is there: `shep start` must still be
+/// able to start a plain script by path, or honour an explicit
+/// `--interpreter`, even when the file an operator is mid-edit on happens
+/// not to parse this moment.
+fn interpreters_from_config(shep_toml: Option<&str>) -> std::collections::BTreeMap<String, String> {
+    shep_core::config::DaemonConfig::load(shep_toml, &|_| None)
+        .map(|cfg| cfg.interpreters)
+        .unwrap_or_default()
+}
+
 fn style_from_config(shep_toml: Option<&str>) -> Option<style::StyleLevel> {
     shep_core::config::DaemonConfig::load(shep_toml, &|_| None)
         .ok()?
@@ -992,9 +1012,19 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             if args.targets.is_empty() && discovered.is_none() {
                 return start_bare_shepherd(&mut streams, fmt, &paths).await;
             }
+            let shep_toml_text = std::fs::read_to_string(&paths.daemon_config).ok();
+            let interpreters = interpreters_from_config(shep_toml_text.as_deref());
             match connect_or_spawn_client(&mut streams, fmt, &paths).await {
                 Ok(client) => {
-                    lifecycle::start(&client, &mut streams, fmt, args, discovered.as_deref()).await
+                    lifecycle::start(
+                        &client,
+                        &mut streams,
+                        fmt,
+                        args,
+                        discovered.as_deref(),
+                        &interpreters,
+                    )
+                    .await
                 }
                 Err(code) => code,
             }

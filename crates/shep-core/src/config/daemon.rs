@@ -213,6 +213,28 @@ pub struct DaemonConfig {
     pub whistle: WhistleSection,
     /// The `[style]` section
     pub style: StyleSection,
+    /// The `[interpreters]` section: a script extension (no leading dot,
+    /// `"js"` not `".js"`) mapped to the interpreter that runs it.
+    ///
+    /// Read by the CLI only, and applied before a request ever reaches the
+    /// wire: `shep start`'s target resolution folds a match into an app's
+    /// own [`AppConfig::interpreter`](crate::config::AppConfig::interpreter)
+    /// exactly when that field is still unset, the same way `--cwd` and
+    /// `--fold` are folded in there. An app that already names an
+    /// interpreter -- explicitly in a Flockfile, including the literal
+    /// `"none"` -- is never touched by this map, and `--interpreter` on the
+    /// command line outranks both. The daemon itself never reads this
+    /// field; by the time an app reaches it, the CLI has already resolved
+    /// the question.
+    ///
+    /// Lives in this daemon-config grammar for the reason
+    /// [`StyleSection`]'s own doc gives for itself: `RawDaemonConfig`
+    /// denies unknown top-level keys, so a section this type does not know
+    /// about is a hard parse error for every `shep.toml` carrying one --
+    /// registering it here is what keeps `[interpreters]` from breaking
+    /// every daemon boot the moment an operator, or `shep`'s own first-run
+    /// scaffold, writes one.
+    pub interpreters: BTreeMap<String, String>,
     /// Raw `[dog.<name>]` sections keyed by dog name
     pub dog: BTreeMap<String, toml::Table>,
 }
@@ -224,6 +246,7 @@ impl fmt::Debug for DaemonConfig {
             .field("daemon", &self.daemon)
             .field("whistle", &self.whistle)
             .field("style", &self.style)
+            .field("interpreters", &self.interpreters)
             .field("dog", &format_args!("<{} tables>", self.dog.len()))
             .finish()
     }
@@ -235,6 +258,7 @@ struct RawDaemonConfig {
     daemon: DaemonSection,
     whistle: WhistleSection,
     style: StyleSection,
+    interpreters: BTreeMap<String, String>,
     dog: BTreeMap<String, toml::Table>,
 }
 
@@ -292,6 +316,7 @@ impl DaemonConfig {
             daemon: raw.daemon,
             whistle: raw.whistle,
             style: raw.style,
+            interpreters: raw.interpreters,
             dog: raw.dog,
         };
         if let Some(v) = env("SHEP_LOG_JSON") {
@@ -947,6 +972,64 @@ otel = "/usr/local/bin/shep-otel"
         }
     }
 
+    // fails if `[interpreters]` stops parsing as a plain extension ->
+    // interpreter map, or if a value written as a bare word (no quotes
+    // needed, since these are ordinary TOML strings) fails to round-trip.
+    #[test]
+    fn interpreters_parses_as_an_extension_map() {
+        let cfg = DaemonConfig::load(
+            Some("[interpreters]\njs = \"node\"\npy = \"python3\"\n"),
+            &no_env,
+        )
+        .unwrap();
+        assert_eq!(cfg.interpreters.get("js").map(String::as_str), Some("node"));
+        assert_eq!(
+            cfg.interpreters.get("py").map(String::as_str),
+            Some("python3")
+        );
+        assert_eq!(cfg.interpreters.len(), 2);
+    }
+
+    // An empty/absent `[interpreters]` must not fail a `shep.toml` that
+    // never mentions the section at all -- most of them, until an operator
+    // (or the first-run scaffold) writes one.
+    #[test]
+    fn interpreters_defaults_to_empty() {
+        assert!(
+            DaemonConfig::load(None, &no_env)
+                .unwrap()
+                .interpreters
+                .is_empty()
+        );
+        assert!(
+            DaemonConfig::load(Some("[daemon]\nlog_json = true\n"), &no_env)
+                .unwrap()
+                .interpreters
+                .is_empty()
+        );
+    }
+
+    // `[interpreters]` values are arbitrary extension keys, not a fixed
+    // field set, so `deny_unknown_fields` (which governs *struct* fields)
+    // must not reject an extension this build has never heard of -- that
+    // would defeat the whole point of an operator-editable map.
+    #[test]
+    fn an_unrecognised_extension_is_not_an_unknown_field() {
+        let cfg = DaemonConfig::load(Some("[interpreters]\nlua = \"lua5.4\"\n"), &no_env).unwrap();
+        assert_eq!(
+            cfg.interpreters.get("lua").map(String::as_str),
+            Some("lua5.4")
+        );
+    }
+
+    // A value that is not a string (an operator's `js = 5`, say) is still a
+    // parse error -- shep-core's usual "fail loudly at parse time" rule for
+    // a bad shape, same as every other typed field in this file.
+    #[test]
+    fn a_non_string_interpreter_value_is_a_parse_error() {
+        assert!(DaemonConfig::load(Some("[interpreters]\njs = 5\n"), &no_env).is_err());
+    }
+
     #[test]
     fn debug_redacts_dog_values() {
         // Dog tables carry things like webhook URLs; a lazy derive(Debug)
@@ -955,7 +1038,7 @@ otel = "/usr/local/bin/shep-otel"
         let cfg = DaemonConfig::load(Some("[dog.metrics]\nport = 9615"), &no_env).unwrap();
         assert_eq!(
             format!("{cfg:?}"),
-            "DaemonConfig { daemon: DaemonSection { log_json: false, log_level: Warn, socket: None, enabled_dogs: [], adopted_dogs: {}, max_cron_sleep: None }, whistle: WhistleSection { allow_control: false }, style: StyleSection { level: None }, dog: <1 tables> }"
+            "DaemonConfig { daemon: DaemonSection { log_json: false, log_level: Warn, socket: None, enabled_dogs: [], adopted_dogs: {}, max_cron_sleep: None }, whistle: WhistleSection { allow_control: false }, style: StyleSection { level: None }, interpreters: {}, dog: <1 tables> }"
         );
     }
 }

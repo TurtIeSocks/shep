@@ -8,6 +8,7 @@
 //! wire; [`resolve_target`] is that resolution, kept pure and separate from
 //! the RPC so it stays fast and hermetic to test.
 
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -570,12 +571,59 @@ async fn flock_now(client: &Client) -> Vec<shep_core::protocol::ProcessInfo> {
     }
 }
 
+/// `shep.toml`'s `[interpreters]` entry for `script`'s own extension, if it
+/// has one and the map names it.
+///
+/// `Path::extension` already answers "no extension" the way this needs to:
+/// a dotfile with nothing before its one dot (`.bashrc`) has none, so a
+/// `[interpreters]` entry keyed `""` (nobody would write one, but nothing
+/// stops them) can never match here either.
+fn mapped_interpreter(script: &str, interpreters: &BTreeMap<String, String>) -> Option<String> {
+    let extension = Path::new(script).extension()?.to_str()?;
+    interpreters.get(extension).cloned()
+}
+
+/// Folds `shep.toml`'s `[interpreters]` mapping and `--interpreter` onto
+/// `apps`, in the precedence Rin fixed for task 47: shep.toml, then a
+/// Flockfile's own `interpreter` field, then the flag -- last one to touch
+/// an app wins.
+///
+/// The Flockfile layer needs no code of its own here: [`resolve_target`]
+/// already left an app's `interpreter` at whatever its source said, `None`
+/// for anything that named none, so only filling `None` slots from
+/// `interpreters` is what makes an app's own explicit value (including the
+/// literal `"none"`, which is `Some("none")`, not `None`) outrank the map.
+/// `flag`, when given, then overwrites every app unconditionally -- the top
+/// layer, matching `--cwd`/`--fold` immediately above this function's own
+/// call site.
+fn apply_interpreters(
+    apps: &mut [AppConfig],
+    interpreters: &BTreeMap<String, String>,
+    flag: Option<&str>,
+) {
+    if !interpreters.is_empty() {
+        for app in apps.iter_mut() {
+            if app.interpreter.is_none()
+                && let Some(mapped) = mapped_interpreter(&app.script, interpreters)
+            {
+                app.interpreter = Some(mapped);
+            }
+        }
+    }
+    if let Some(interpreter) = flag {
+        for app in apps.iter_mut() {
+            app.interpreter = Some(interpreter.to_string());
+        }
+    }
+}
+
 pub async fn start(
     client: &Client,
     streams: &mut Streams<'_>,
     fmt: Format,
     args: &StartArgs,
     discovered: Option<&Path>,
+    interpreters: &BTreeMap<String, String>,
 ) -> ExitCode {
     // `--name` renames the sheep a target becomes, and a name is unique to
     // one sheep, so it cannot mean anything across several targets.
@@ -586,7 +634,17 @@ pub async fn start(
     }
     if args.targets.is_empty() {
         let mut started = Vec::new();
-        let code = start_one(client, streams, fmt, args, None, discovered, &mut started).await;
+        let code = start_one(
+            client,
+            streams,
+            fmt,
+            args,
+            None,
+            discovered,
+            interpreters,
+            &mut started,
+        )
+        .await;
         if !started.is_empty() {
             let wrote = write_outcome(emit(
                 &mut *streams.out,
@@ -614,6 +672,7 @@ pub async fn start(
             args,
             Some(target),
             discovered,
+            interpreters,
             &mut started,
         )
         .await;
@@ -640,6 +699,18 @@ pub async fn start(
 }
 
 /// One target's worth of [`start`].
+///
+/// Eight parameters, the same growth `lookout::frames::sheep`'s own
+/// `#[allow(clippy::too_many_arguments)]` already accepted for itself:
+/// `client`, `streams` and `fmt` are the RPC/rendering plumbing every verb
+/// in this file threads through; `args`, `target` and `discovered` are the
+/// three ways one invocation names what to start; `interpreters` is task
+/// 47's `shep.toml` mapping, read once by the caller rather than
+/// re-reading the file per target; and `started` is the caller's own
+/// accumulator. None of the eight groups naturally into a struct without
+/// inventing one used nowhere else, the same call that function's own doc
+/// makes.
+#[allow(clippy::too_many_arguments)]
 async fn start_one(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -647,6 +718,7 @@ async fn start_one(
     args: &StartArgs,
     target: Option<&str>,
     discovered: Option<&Path>,
+    interpreters: &BTreeMap<String, String>,
     started: &mut Vec<shep_core::protocol::ProcessInfo>,
 ) -> ExitCode {
     // `args.target` is optional so bare `shep start` can mean "this
@@ -741,6 +813,7 @@ async fn start_one(
             app.cwd = Some(cwd.clone());
         }
     }
+    apply_interpreters(&mut apps, interpreters, args.interpreter.as_deref());
 
     let (procs, failure) = request_each(
         client,
@@ -990,6 +1063,7 @@ mod tests {
             name: None,
             fold: None,
             cwd: None,
+            interpreter: None,
             flockfile: false,
         };
         {
@@ -1004,6 +1078,7 @@ mod tests {
                 Format::Table,
                 &args,
                 Some(flockfile.as_path()),
+                &BTreeMap::new(),
             )
             .await;
         }
@@ -1079,6 +1154,7 @@ mod tests {
             name: None,
             fold: None,
             cwd: None,
+            interpreter: None,
             flockfile: false,
         }
     }
@@ -1295,6 +1371,7 @@ mod tests {
                 Format::Table,
                 &start_args("zeus-auth"),
                 None,
+                &BTreeMap::new(),
             )
             .await
         };
@@ -1343,6 +1420,7 @@ mod tests {
                 Format::Table,
                 &start_args("zeus-auth"),
                 None,
+                &BTreeMap::new(),
             )
             .await
         };
@@ -1375,6 +1453,7 @@ mod tests {
                 Format::Table,
                 &start_args("./does-not-exist"),
                 None,
+                &BTreeMap::new(),
             )
             .await
         };
@@ -1571,6 +1650,7 @@ mod tests {
             Format::Table,
             &start_args(srv.to_str().unwrap()),
             None,
+            &BTreeMap::new(),
         )
         .await;
 
@@ -1617,13 +1697,176 @@ mod tests {
         let mut args = start_args(srv.to_str().unwrap());
         args.fold = Some("backend".to_string());
 
-        let _ = start(&client, &mut streams, Format::Table, &args, None).await;
+        let _ = start(
+            &client,
+            &mut streams,
+            Format::Table,
+            &args,
+            None,
+            &BTreeMap::new(),
+        )
+        .await;
 
         let sent = next_start(&mut envelopes).await;
         match sent.body {
             Request::Start { apps } => {
                 assert_eq!(apps.len(), 1);
                 assert_eq!(apps[0].fold.as_deref(), Some("backend"));
+            }
+            other => panic!("expected Request::Start, got {other:?}"),
+        }
+    }
+
+    /// [`mapped_interpreter`]'s own extension grammar: matched with the
+    /// dot stripped, absent for a name with no extension, and absent for a
+    /// dotfile whose one dot leads rather than separates -- `Path::extension`
+    /// already reads `.bashrc` as extensionless, so a `[interpreters]` entry
+    /// keyed `""` (nobody would write one, but nothing stops them) still
+    /// cannot fire from here.
+    #[test]
+    fn mapped_interpreter_reads_the_extension_without_its_dot() {
+        let mut interpreters = BTreeMap::new();
+        interpreters.insert("js".to_string(), "node".to_string());
+
+        assert_eq!(
+            mapped_interpreter("server.js", &interpreters),
+            Some("node".to_string())
+        );
+        assert_eq!(mapped_interpreter("server", &interpreters), None);
+        assert_eq!(mapped_interpreter(".bashrc", &interpreters), None);
+        assert_eq!(mapped_interpreter("server.py", &interpreters), None);
+    }
+
+    /// Task 47's precedence, layer 1: `shep.toml`'s `[interpreters]` mapping
+    /// fills a script's interpreter when nothing else already named one --
+    /// the exact gap that made `shep start server.js` fail with
+    /// `spawn_failed` before this task, the quick start `welcome.rs` and
+    /// `--help` both advertise.
+    #[tokio::test]
+    async fn a_shep_toml_mapping_fills_an_unset_interpreter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
+        let srv = dir.path().join("srv.js");
+        std::fs::write(&srv, "").unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+            style: crate::style::Presentation::BARE,
+        };
+        let mut interpreters = BTreeMap::new();
+        interpreters.insert("js".to_string(), "node".to_string());
+
+        let _ = start(
+            &client,
+            &mut streams,
+            Format::Table,
+            &start_args(srv.to_str().unwrap()),
+            None,
+            &interpreters,
+        )
+        .await;
+
+        let sent = next_start(&mut envelopes).await;
+        match sent.body {
+            Request::Start { apps } => {
+                assert_eq!(apps.len(), 1);
+                assert_eq!(apps[0].interpreter.as_deref(), Some("node"));
+            }
+            other => panic!("expected Request::Start, got {other:?}"),
+        }
+    }
+
+    /// Task 47's precedence, layer 2: a Flockfile app's own `interpreter`
+    /// outranks the mapping, since it is the more specific statement about
+    /// this one app. Without this, an operator naming `bun` for one app in
+    /// a Flockfile would find shep.toml's `js -> node` overruling it, which
+    /// is exactly backwards for a mapping that is supposed to be a
+    /// fallback, not a policy.
+    #[tokio::test]
+    async fn a_flockfile_interpreter_outranks_the_shep_toml_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
+        let flockfile = dir.path().join("Flockfile.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"demo\"\nscript = \"server.js\"\ninterpreter = \"bun\"\n",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+            style: crate::style::Presentation::BARE,
+        };
+        let mut interpreters = BTreeMap::new();
+        interpreters.insert("js".to_string(), "node".to_string());
+
+        let _ = start(
+            &client,
+            &mut streams,
+            Format::Table,
+            &start_args(flockfile.to_str().unwrap()),
+            None,
+            &interpreters,
+        )
+        .await;
+
+        let sent = next_start(&mut envelopes).await;
+        match sent.body {
+            Request::Start { apps } => {
+                assert_eq!(apps.len(), 1);
+                assert_eq!(apps[0].interpreter.as_deref(), Some("bun"));
+            }
+            other => panic!("expected Request::Start, got {other:?}"),
+        }
+    }
+
+    /// Task 47's precedence, layer 3: `--interpreter` outranks both the
+    /// mapping and a Flockfile's own field -- the top layer, for the
+    /// one-off override an operator types on the command line.
+    #[tokio::test]
+    async fn the_interpreter_flag_outranks_a_flockfiles_own_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
+        let flockfile = dir.path().join("Flockfile.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"demo\"\nscript = \"server.js\"\ninterpreter = \"bun\"\n",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+            style: crate::style::Presentation::BARE,
+        };
+        let mut args = start_args(flockfile.to_str().unwrap());
+        args.interpreter = Some("deno".to_string());
+        let mut interpreters = BTreeMap::new();
+        interpreters.insert("js".to_string(), "node".to_string());
+
+        let _ = start(
+            &client,
+            &mut streams,
+            Format::Table,
+            &args,
+            None,
+            &interpreters,
+        )
+        .await;
+
+        let sent = next_start(&mut envelopes).await;
+        match sent.body {
+            Request::Start { apps } => {
+                assert_eq!(apps.len(), 1);
+                assert_eq!(apps[0].interpreter.as_deref(), Some("deno"));
             }
             other => panic!("expected Request::Start, got {other:?}"),
         }

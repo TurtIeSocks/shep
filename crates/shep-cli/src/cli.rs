@@ -574,6 +574,17 @@ pub struct StartArgs {
     /// Working directory to run in (default: where you ran `shep start`)
     #[arg(long)]
     pub cwd: Option<String>,
+    /// Interpreter to run the script with, overriding both shep.toml's
+    /// extension mapping and a Flockfile app's own interpreter field.
+    ///
+    /// The precedence, lowest to highest: shep.toml's interpreters table
+    /// (matched against the script's extension), then a Flockfile's own
+    /// interpreter for that app, then this flag. shep never guesses an
+    /// interpreter on its own; every one of those three is something an
+    /// operator wrote down. Pass "none" to run the script directly,
+    /// overriding a mapping or a Flockfile that would otherwise pick one.
+    #[arg(long)]
+    pub interpreter: Option<String>,
     /// Read TARGET as a Flockfile rather than as a script path.
     ///
     /// Required for a `.js` Flockfile and the only way to reach one: shep
