@@ -3260,6 +3260,65 @@ fn starting_an_errored_sheep_by_name_reports_the_same_failure_as_by_path() {
     graceful_kill(dir.path());
 }
 
+/// `shep restart <name>` must report a respawn that cannot spawn, the same
+/// way `shep start` does in both its forms.
+///
+/// The sibling test above fixed `start <name>`; `restart` reached the same
+/// daemon reply through its own handler and kept exiting 0 in silence. The
+/// cause is shared: `Response::Restarted` has no per-id error slot, so a
+/// spawn that failed comes back as an ordinary `errored` row inside an `Ok`
+/// (`shep-daemon/src/supervisor.rs`'s `respawn`, `Err` arm), and a caller
+/// that trusts the `Ok` reports success.
+///
+/// Unlike `start <name>`, `restart` still prints its table: it is a
+/// multi-target verb, and an operator restarting a flock wants to see which
+/// members came back. What changes is the exit code and the line on stderr.
+///
+/// The script is valid shell at `0o644`, so every spawn fails `EACCES`. It
+/// deliberately has NO extension: `.sh` now maps to `sh` through the
+/// starter interpreter mapping, which would run a non-executable file
+/// perfectly well and quietly delete this test's whole premise.
+#[test]
+fn restarting_a_sheep_that_cannot_spawn_reports_it_rather_than_exiting_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("noexec");
+    std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&script, perms).unwrap();
+    let mut guard = DaemonGuard::default();
+
+    let by_path = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&script)
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_json_error(&by_path, 7, "spawn_failed");
+
+    // Must be registered and errored, or the restart below is not
+    // exercising the reply shape this test is about.
+    let flock = poll_flock(dir.path(), |info| info["status"] == "errored");
+    assert_eq!(
+        flock["status"], "errored",
+        "the by-path failure must leave the sheep registered as errored: {flock}"
+    );
+
+    let name = script.file_stem().unwrap().to_str().unwrap();
+    let restarted = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("restart")
+        .arg(name)
+        .output()
+        .unwrap();
+    assert_json_error(&restarted, 7, "spawn_failed");
+
+    graceful_kill(dir.path());
+}
+
 // --- Reload ---------------------------------------------------------------
 
 /// `shep reload` reaches the reload verb, and the swap it starts really

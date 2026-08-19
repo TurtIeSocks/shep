@@ -940,7 +940,27 @@ pub async fn restart(
         },
     )
     .await;
-    if !procs.is_empty() {
+    // Named before `procs` is moved into the table below. A failed respawn
+    // reaches here as an ordinary `errored` row inside an `Ok`, because the
+    // daemon's aggregation reply for `Restart` has no per-id error slot
+    // (`shep-daemon/src/supervisor.rs`'s `respawn`, `Err` arm) -- the same
+    // gap that let `shep start <name>` exit 0 in silence.
+    let failed: Vec<String> = procs
+        .iter()
+        .filter(|info| info.status == shep_core::status::ProcStatus::Errored)
+        .map(|info| info.name.clone())
+        .collect();
+
+    // Stdout stays empty on a failure, exactly as `start`'s own failure path
+    // and every other verb's do -- `cli_e2e`'s `assert_json_error` pins that
+    // discipline crate-wide, and under `--format json` printing a data
+    // envelope AND an error envelope would hand a consumer two answers to
+    // one question. The cost is real and taken deliberately: a `restart all`
+    // where one of ten fails no longer lists the nine that came back, and
+    // the operator reads them from `shep flock`. Consistency across verbs is
+    // worth more here than this verb keeping its table on the one path where
+    // it has bad news to deliver.
+    if !procs.is_empty() && failed.is_empty() {
         let wrote = write_outcome(emit(
             &mut *streams.out,
             fmt,
@@ -952,6 +972,22 @@ pub async fn restart(
             return wrote;
         }
     }
+
+    if !failed.is_empty() {
+        let names = failed.join(", ");
+        let message = format!(
+            "{names} did not come back up; see `shep bleats {}` or its log files for why",
+            failed[0]
+        );
+        let _ = emit_error(
+            &mut *streams.err,
+            fmt,
+            ExitCode::SpawnFailed.code_str(),
+            &message,
+        );
+        return ExitCode::SpawnFailed;
+    }
+
     failure.unwrap_or(ExitCode::Success)
 }
 
