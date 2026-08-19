@@ -18,3 +18,4 @@
 # while a phase is running, noise in the history afterwards. Nine of these
 # were committed by accident when Phase 14 merged.
 .superpowers/
+docs/teach

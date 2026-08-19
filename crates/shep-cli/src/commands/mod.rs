@@ -10,6 +10,7 @@ pub mod dogs;
 pub(crate) mod empty;
 pub(crate) mod foreground;
 pub mod import;
+pub(crate) mod init;
 pub mod kv;
 pub mod lifecycle;
 pub mod logs;
