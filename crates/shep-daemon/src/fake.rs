@@ -429,6 +429,7 @@ impl ScriptedRunner {
     ///
     /// If `spawn_index` is out of range.
     #[must_use]
+    #[track_caller]
     pub fn signals(&self, spawn_index: usize) -> Vec<i32> {
         self.spawned.lock().unwrap()[spawn_index]
             .state
@@ -450,6 +451,7 @@ impl ScriptedRunner {
     ///
     /// If `spawn_index` is out of range.
     #[must_use]
+    #[track_caller]
     pub fn process_signals(&self, spawn_index: usize) -> Vec<OperatorSignal> {
         self.spawned.lock().unwrap()[spawn_index]
             .state
@@ -474,6 +476,7 @@ impl ScriptedRunner {
     ///
     /// If `spawn_index` is out of range.
     #[must_use]
+    #[track_caller]
     pub fn log_ctl_live(&self, spawn_index: usize) -> bool {
         self.spawned.lock().unwrap()[spawn_index]
             .log_ctl_live
@@ -492,6 +495,7 @@ impl ScriptedRunner {
     ///
     /// If `spawn_index` is out of range.
     #[must_use]
+    #[track_caller]
     pub fn reopens(&self, spawn_index: usize) -> u32 {
         self.spawned.lock().unwrap()[spawn_index]
             .reopens
@@ -518,6 +522,7 @@ impl ScriptedRunner {
     ///
     /// If `spawn_index` is out of range.
     #[must_use]
+    #[track_caller]
     pub fn flushes(&self, spawn_index: usize) -> u32 {
         self.spawned.lock().unwrap()[spawn_index]
             .flushes
@@ -536,6 +541,7 @@ impl ScriptedRunner {
     ///
     /// If `spawn_index` is out of range.
     #[must_use]
+    #[track_caller]
     pub fn stdin_lines(&self, spawn_index: usize) -> Vec<String> {
         self.spawned.lock().unwrap()[spawn_index]
             .stdin_lines
@@ -550,6 +556,7 @@ impl ScriptedRunner {
     ///
     /// If `spawn_index` is out of range or its `FakeIo` was already taken.
     #[must_use]
+    #[track_caller]
     pub fn io_handles(&self, spawn_index: usize) -> FakeIo {
         self.spawned
             .lock()

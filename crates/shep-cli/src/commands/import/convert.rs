@@ -184,7 +184,13 @@ fn convert_group(name: &str, rows: &[DumpRow]) -> (AppConfig, Vec<ImportNote>) {
     app.instances = instances;
 
     if first.exec_mode.as_deref() == Some("cluster_mode") {
-        app.reuse_port = true;
+        // No `reuse_port = true` here any more. It was set for several
+        // phases as though it were the mitigation, while nothing in shep
+        // ever read the field -- so the flag did nothing and the note below
+        // was already carrying the whole truth: shep binds no shared listen
+        // socket, so the APP has to set SO_REUSEPORT itself. `normalize`
+        // refuses the field outright as of 2026-08-19, which would have made
+        // every imported cluster-mode Flockfile fail to load.
         notes.push(ImportNote::ClusterMode {
             app: name.to_string(),
             instances,
@@ -289,22 +295,34 @@ mod tests {
         assert_eq!(migrate.script, "/srv/migrate/bin/migrate");
     }
 
-    /// fails if a cluster-mode app comes across without `reuse_port`, or
-    /// without the note. Both halves are the same cutover blocker: shep
-    /// binds nothing, so four instances on one port is EADDRINUSE, and the
-    /// operator has to hear it at import time rather than at first start.
+    /// fails if a cluster-mode app comes across without the note, or if the
+    /// importer starts setting `reuse_port` again.
+    ///
+    /// The note is the whole mitigation and always was: shep binds no shared
+    /// listen socket, so N instances on one port is EADDRINUSE unless the app
+    /// sets `SO_REUSEPORT` itself, and the operator has to hear that at
+    /// import time rather than at first start.
+    ///
+    /// This test used to assert `reuse_port == true` on the cluster app, on
+    /// the belief that the field did something. Nothing in shep ever read it
+    /// (`deferred.md`), so it was decoration on top of a note that already
+    /// told the truth. `normalize` refuses the field outright as of
+    /// 2026-08-19, which would have made every imported cluster-mode
+    /// Flockfile fail to load.
     #[test]
-    fn cluster_mode_sets_reuse_port_and_says_so() {
+    fn cluster_mode_says_so_without_setting_a_field_nothing_reads() {
         let imported = imported();
-        assert!(imported.apps[0].reuse_port, "api ran in cluster mode");
-        assert!(
-            !imported.apps[1].reuse_port,
-            "fork mode must not assert an option the app never set"
-        );
         assert!(imported.notes.contains(&ImportNote::ClusterMode {
             app: "api".to_string(),
             instances: 2,
         }));
+        for app in &imported.apps {
+            assert!(
+                !app.reuse_port,
+                "`{}`: the importer must not emit a field normalize refuses",
+                app.name
+            );
+        }
     }
 
     /// fails if `NODE_APP_INSTANCE` is copied into the app env as a value.
