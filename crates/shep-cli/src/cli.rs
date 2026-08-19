@@ -888,6 +888,14 @@ pub struct AdoptArgs {
 /// would leave one of them quietly targeting something else.
 const DEFAULT_SELECTOR: &str = "all";
 
+/// How much history `shep bleats` prints before it starts following.
+///
+/// Fifteen because that is what pm2 has trained every operator to expect,
+/// and because the number only has to be large enough to carry the reason a
+/// sheep died. It is small enough that following a healthy flock still
+/// starts nearly empty.
+pub const DEFAULT_BLEAT_LINES: usize = 15;
+
 /// Arguments to `shep bleats` (alias `logs`).
 #[derive(Debug, clap::Args)]
 pub struct BleatsArgs {
@@ -897,6 +905,19 @@ pub struct BleatsArgs {
     /// Print the tail of each sheep's log file and exit, instead of following
     #[arg(long)]
     pub no_follow: bool,
+    /// How many existing lines of each stream to print before following
+    ///
+    /// A sheep that already crashed has said everything it is going to say,
+    /// so following alone shows an empty screen while the reason sits in the
+    /// file. This prints that much history first, then follows.
+    ///
+    /// Counted per stream, so the default prints up to this many lines of
+    /// stdout and up to this many of stderr for each matched sheep. Narrow
+    /// it with `--out` or `--err`.
+    ///
+    /// `0` prints no history at all, following only what arrives next.
+    #[arg(long, default_value_t = DEFAULT_BLEAT_LINES, value_name = "N")]
+    pub lines: usize,
     /// Only stderr
     #[arg(long, conflicts_with = "out")]
     pub err: bool,

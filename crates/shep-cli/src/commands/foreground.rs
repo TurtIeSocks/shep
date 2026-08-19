@@ -184,6 +184,11 @@ pub async fn run(
             &BleatsArgs {
                 selector: "all".to_string(),
                 no_follow: false,
+                // No backlog: this process started the flock a moment ago,
+                // so any older lines in those files belong to a previous
+                // run and replaying them here would read as this run's
+                // output.
+                lines: 0,
                 err: false,
                 out: false,
             },

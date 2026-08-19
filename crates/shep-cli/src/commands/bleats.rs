@@ -31,9 +31,15 @@
 //! tail of each matched sheep's log file and exits — `tail` to `--follow`'s
 //! `tail -f`. It never subscribes, so there is no stream, no `Lagged`, no
 //! shutdown notice, and no extra round trip. A file's tail is bounded
-//! twice ([`TAIL_LINES`] lines, found within the last [`TAIL_WINDOW_BYTES`]
+//! twice (`--lines` lines, found within the last [`TAIL_WINDOW_BYTES`]
 //! of the file), and files are read one at a time, so peak memory for this
 //! path is one window regardless of flock size.
+//!
+//! **Following prints that same tail first, then subscribes.** A sheep that
+//! already crashed has said everything it is going to say, so a follow that
+//! showed only new lines showed an empty screen while the reason sat in the
+//! file — which is exactly how a boot-looping sheep came to look like it had
+//! logged nothing at all.
 //!
 //! **The ordering limitation is real and is stated, not hidden.** Within one
 //! file, lines print in file order (append order, chronological). Across a
@@ -213,21 +219,12 @@ fn write_notice(streams: &mut Streams<'_>, fmt: Format, quiet: bool, code: &str,
     let _ = output::emit_notice(&mut *streams.err, fmt, code, message);
 }
 
-/// How many lines of each log file `--no-follow` prints.
+/// The most of one log file a tail will read to find the lines it wants.
 ///
-/// A default, not a limit the user can lift — `--lines` is not in this
-/// phase's CLI surface. Fifty keeps `shep bleats --no-follow` against a
-/// whole flock readable at a terminal while still carrying the tail of a
-/// crash, which is what people run this for.
-const TAIL_LINES: usize = 50;
-
-/// The most of one log file `--no-follow` will read to find those
-/// [`TAIL_LINES`] lines.
-///
-/// Binds only when lines average over 5 KiB, so in ordinary use
-/// [`TAIL_LINES`] is the bound that decides. A line count alone cannot
-/// bound memory on its own — one arbitrarily long line with no newline
-/// would defeat it — hence both bounds.
+/// Binds only when lines average over 5 KiB, so in ordinary use the caller's
+/// line count is the bound that decides. A line count alone cannot bound
+/// memory on its own — one arbitrarily long line with no newline would
+/// defeat it — hence both bounds.
 const TAIL_WINDOW_BYTES: u64 = 256 * 1024;
 
 /// The last `limit` lines of one log file, bounded twice over: a
@@ -244,9 +241,8 @@ const TAIL_WINDOW_BYTES: u64 = 256 * 1024;
 /// a caller that only asked the line cap would report `false` on a tail
 /// that is, in fact, not the whole story.
 ///
-/// `limit` is a parameter rather than a constant because there are now two
-/// callers with two answers: [`tail_log_files`] passes [`TAIL_LINES`], which
-/// is what keeps `shep bleats --no-follow` byte-identical, and `whistle`
+/// `limit` is a parameter rather than a constant because the callers each
+/// have their own answer: [`tail_log_files`] passes `--lines`, and `whistle`
 /// passes its own clamped `lines`.
 ///
 /// `std::fs`, not `tokio::fs`: shep-cli's tokio does not carry the `fs`
@@ -352,7 +348,7 @@ fn tail_log_files(
                     "log_path_unknown",
                     &format!("{name}: the daemon did not report a {stream_name} log path"),
                 ),
-                Some(path) => match read_tail(Path::new(path), TAIL_LINES) {
+                Some(path) => match read_tail(Path::new(path), args.lines) {
                     Ok((lines, _truncated)) => {
                         for line in lines {
                             if let Err(write_err) =
@@ -533,6 +529,25 @@ pub async fn bleats_with_signal(
         return tail_log_files(streams, fmt, quiet, &cache, &selector, args);
     }
 
+    // The backlog first, then the stream. Following alone shows only what
+    // arrives next, so a sheep that already died printed an empty screen
+    // while the reason sat in its log file -- which is how a boot-looping
+    // sheep came to look like it had logged nothing at all.
+    //
+    // Read before subscribing rather than after, so a line written in the
+    // gap between the two is missed rather than printed twice. Neither is
+    // free; a duplicate is the one a reader would notice and mistrust. The
+    // same trade is already made just above, where the id/name cache is
+    // built from a listing taken before the subscription.
+    //
+    // The tail's own exit code is deliberately discarded: an unreadable log
+    // for one sheep must not stop a follow over the whole flock, and a
+    // failed write to stdout will fail again in the loop below, where it is
+    // handled properly.
+    if args.lines > 0 {
+        let _ = tail_log_files(streams, fmt, quiet, &cache, &selector, args);
+    }
+
     let mut stream = match subscribe(client, streams, fmt).await {
         Ok(stream) => stream,
         Err(code) => return code,
@@ -600,13 +615,21 @@ mod tests {
         BleatsArgs {
             selector: selector.to_string(),
             no_follow,
+            // The tail default is exercised by its own tests below. The
+            // follow tests here predate the backlog and assert on what the
+            // BUS delivers, so they ask for no history and keep testing
+            // exactly what they were written to test.
+            lines: crate::cli::DEFAULT_BLEAT_LINES,
             err,
             out,
         }
     }
 
     fn follow_args(selector: &str) -> BleatsArgs {
-        bleats_args(selector, false, false, false)
+        BleatsArgs {
+            lines: 0,
+            ..bleats_args(selector, false, false, false)
+        }
     }
 
     fn follow_args_err(selector: &str) -> BleatsArgs {
@@ -1393,12 +1416,102 @@ mod tests {
         );
     }
 
+    /// The bug Rin hit: a sheep crashes, `shep bleats <name>` is run after
+    /// the fact, and following alone prints an empty screen while the reason
+    /// sits in the log file. The backlog is what makes the reason reachable
+    /// without having to start the sheep again in a second window.
+    #[tokio::test]
+    async fn following_prints_the_existing_log_before_it_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let out_path = write_log(
+            dir.path(),
+            "web-out.log",
+            "boot: reading config\nFATAL: port 19999 already in use\n",
+        );
+
+        let (client, daemon) = fake_client_with_push(&sock).await;
+        let mut sheep = info(1, "web");
+        sheep.out_file = Some(out_path);
+        daemon.reply_to_list(vec![sheep]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+            };
+            let _ = tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &follow_args_out("all"),
+                ),
+            )
+            .await;
+        }
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("FATAL: port 19999 already in use"),
+            "a follow must carry the reason a dead sheep died: {rendered}"
+        );
+    }
+
+    /// `--lines 0` is the escape hatch for someone who genuinely wants only
+    /// what arrives next, and it is what the foreground runner passes.
+    #[tokio::test]
+    async fn lines_zero_follows_without_replaying_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let out_path = write_log(dir.path(), "web-out.log", "OLD-HISTORY\n");
+
+        let (client, daemon) = fake_client_with_push(&sock).await;
+        let mut sheep = info(1, "web");
+        sheep.out_file = Some(out_path);
+        daemon.reply_to_list(vec![sheep]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+            };
+            let _ = tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(
+                    &client,
+                    &mut streams,
+                    Format::Table,
+                    false,
+                    &BleatsArgs {
+                        lines: 0,
+                        ..follow_args_out("all")
+                    },
+                ),
+            )
+            .await;
+        }
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            !rendered.contains("OLD-HISTORY"),
+            "--lines 0 must replay nothing: {rendered}"
+        );
+    }
+
     /// A `read_to_string`-style implementation prints line 1 and fails this.
     #[tokio::test]
     async fn the_tail_is_bounded_by_lines() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("s.sock");
-        let total = TAIL_LINES + 20;
+        const CAP: usize = 50;
+        let total = CAP + 20;
         let content: String = (1..=total).map(|n| format!("line-{n}\n")).collect();
         let out_path = write_log(dir.path(), "web-out.log", &content);
 
@@ -1422,7 +1535,10 @@ mod tests {
                     &mut streams,
                     Format::Table,
                     false,
-                    &no_follow_args_out("all"),
+                    &BleatsArgs {
+                        lines: CAP,
+                        ..no_follow_args_out("all")
+                    },
                 ),
             )
             .await
@@ -1442,8 +1558,8 @@ mod tests {
         );
         assert_eq!(
             rendered.lines().count(),
-            TAIL_LINES,
-            "exactly TAIL_LINES lines must reach stdout: {rendered}"
+            CAP,
+            "exactly CAP lines must reach stdout: {rendered}"
         );
     }
 
@@ -1508,7 +1624,7 @@ mod tests {
         let path = dir.path().join("web-out.log");
         std::fs::write(&path, &content).unwrap();
 
-        let (lines, truncated) = read_tail(&path, TAIL_LINES).unwrap();
+        let (lines, truncated) = read_tail(&path, 50).unwrap();
 
         assert_eq!(lines, vec!["short".to_string()]);
         assert!(
