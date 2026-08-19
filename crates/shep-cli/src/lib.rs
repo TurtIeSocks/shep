@@ -597,6 +597,36 @@ fn ensure_home_at(paths: ShepPaths, explicit: bool) -> Result<(ShepPaths, bool),
     }
 }
 
+/// Writes `shep.toml`'s starter `[interpreters]` mapping the moment
+/// `$SHEP_HOME` is first created (task 47) -- see
+/// [`ShepToml::write_starter_interpreters`] for what it writes and why.
+///
+/// Called from every `home_is_new` site alongside [`welcome::on_first_run`],
+/// but not folded into that function: the welcome banner is suppressed
+/// under `--format json` and a piped stderr (a fresh machine is exactly
+/// where a provisioning script runs first), and the scaffold this writes
+/// must happen regardless -- the mapping is what lets that very script's
+/// `shep start server.js` work without also passing `--interpreter`.
+///
+/// Best-effort: a failure here (a full disk, a permissions problem) must
+/// not turn "shep created your home directory" into a failed command, so
+/// this only ever reports to stderr and continues. [`ShepToml::edit`]
+/// creates `$SHEP_HOME` itself if this runs before [`ensure_home_at`]'s own
+/// directory creation is visible to it, so ordering between the two does
+/// not matter; this is called after it regardless, for a `paths.home` that
+/// is already known to exist.
+#[cfg(unix)]
+fn scaffold_first_run_interpreters(paths: &ShepPaths) {
+    if let Err(err) = ShepToml::edit(&paths.daemon_config, ShepToml::write_starter_interpreters) {
+        let mut err_stream = std::io::stderr();
+        let _ = writeln!(
+            err_stream,
+            "could not write a starter interpreter mapping to {}: {err}",
+            paths.daemon_config.display()
+        );
+    }
+}
+
 /// Parses, resolves `$SHEP_HOME` for the verbs that need it, and dispatches
 /// to the verb's own module.
 ///
@@ -720,6 +750,7 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                 }
             };
             if home_is_new {
+                scaffold_first_run_interpreters(&paths);
                 let mut err = std::io::stderr();
                 let mut sink = std::io::sink();
                 let mut streams = Streams {
@@ -803,6 +834,15 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             return code;
         }
     };
+    if home_is_new {
+        // Unconditional, unlike the welcome banner just below: this must
+        // run for `shep welcome` too, which also creates a fresh home but
+        // is excluded from the banner call (its own arm prints the same
+        // text a moment later). The banner's exclusion is about not
+        // printing twice; there is no equivalent reason to skip the
+        // scaffold that makes `shep start server.js` work afterward.
+        scaffold_first_run_interpreters(&paths);
+    }
     // `Welcome` is excluded because its own arm prints the same text to
     // stdout a moment later, and a `shep welcome` that created the home
     // should print once, not twice.

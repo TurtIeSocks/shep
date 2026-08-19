@@ -45,6 +45,49 @@ use crate::style::StyleLevel;
 /// out with the file, somewhere no directory mode follows it.
 const CONFIG_FILE_MODE: u32 = 0o600;
 
+/// Extensions [`ShepToml::write_starter_interpreters`] maps, in the order
+/// they land in `shep.toml`.
+///
+/// `js`/`mjs`/`cjs` cover the three ways a Node script is named; `py` maps
+/// to `python3` rather than bare `python`, which is absent or still points
+/// at Python 2 on plenty of hosts shep runs on; `rb` and `sh` round out the
+/// four families Rin named directly. Two more chosen with judgement:
+/// `pl` for Perl and `php` for PHP, both single, unambiguous interpreters
+/// that ship alongside node/python3/ruby/sh on most of the same hosts.
+/// Left out on purpose: `ts` (no single safe default exists; ts-node, tsx
+/// and deno all disagree about how to run one, and picking the wrong one
+/// silently is worse than making the operator say so), and anything
+/// Windows-only such as `ps1`, since shep's Windows tier is 0 percent as
+/// of this writing.
+const STARTER_INTERPRETERS: &[(&str, &str)] = &[
+    ("js", "node"),
+    ("mjs", "node"),
+    ("cjs", "node"),
+    ("py", "python3"),
+    ("rb", "ruby"),
+    ("sh", "sh"),
+    ("pl", "perl"),
+    ("php", "php"),
+];
+
+/// The comment [`ShepToml::write_starter_interpreters`] writes directly
+/// above the `[interpreters]` table it scaffolds, so the mapping reads as
+/// something an operator can see and edit rather than as hidden shep
+/// behaviour.
+///
+/// Plain `#` TOML comment lines, not `///` Rust doc syntax: this text
+/// lands inside `shep.toml` itself, for an operator to read there, so the
+/// project's "no dashes in anything a user reads" rule governs it exactly
+/// as it governs `welcome.rs`'s copy.
+const INTERPRETERS_STARTER_COMMENT: &str = "\
+# Extension -> interpreter mapping. shep applies one of these to a script
+# when nothing more specific already named an interpreter: not this app's
+# own Flockfile entry, and not --interpreter on the command line, both of
+# which win over anything here. shep never guesses beyond what is written
+# below, so edit freely: change an interpreter, add an extension, or
+# delete an entry (or this whole table) to turn the mapping off for it.
+";
+
 /// The one writer of `$SHEP_HOME/shep.toml` in this binary.
 ///
 /// A missing file is created (as an empty document — [`Self::edit`] makes
@@ -341,6 +384,35 @@ impl ShepToml {
         };
         style.insert("level", Item::Value(level.to_string().into()));
         Ok(())
+    }
+
+    /// Writes the starter `[interpreters]` mapping (task 47) -- a script
+    /// extension to the interpreter shep runs it with, active from the
+    /// moment it lands rather than commented into inertness, with an
+    /// explanatory comment above the table so it reads as something an
+    /// operator wrote and can freely edit rather than as hidden behaviour.
+    /// Active is the point: shep never infers an interpreter on its own,
+    /// but a fresh `$SHEP_HOME` still has to be able to run the
+    /// `shep start server.js` `welcome.rs` and `--help` both advertise as
+    /// the quick start, and a mapping nobody has uncommented yet cannot do
+    /// that.
+    ///
+    /// A no-op when `[interpreters]` already exists. Called once per home
+    /// from `lib.rs`'s first-run scaffold, but idempotent by construction
+    /// rather than by that single call site -- the same reasoning
+    /// [`Self::enable_dog`] gives for its own idempotence -- so a caller
+    /// that runs this twice, or a `shep.toml` an operator has since hand-
+    /// edited, is never clobbered or duplicated.
+    pub fn write_starter_interpreters(&mut self) {
+        if self.doc.contains_key("interpreters") {
+            return;
+        }
+        let mut table = Table::new();
+        for (extension, interpreter) in STARTER_INTERPRETERS {
+            table.insert(extension, Item::Value((*interpreter).into()));
+        }
+        table.decor_mut().set_prefix(INTERPRETERS_STARTER_COMMENT);
+        self.doc.insert("interpreters", Item::Table(table));
     }
 
     /// Writes the document back: staged in a sibling temp file at
@@ -840,6 +912,94 @@ mod tests {
         let cfg =
             DaemonConfig::load(Some(&std::fs::read_to_string(&path).unwrap()), &|_| None).unwrap();
         assert_eq!(cfg.style.level.as_deref(), Some("bare"));
+    }
+
+    /// The starter mapping is active, not commented into inertness: task
+    /// 47's whole point is that a fresh `$SHEP_HOME` can run `shep start
+    /// server.js` without any further setup, and a mapping nobody has
+    /// uncommented cannot do that.
+    #[test]
+    fn the_starter_interpreters_are_written_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+
+        ShepToml::edit(&path, |doc| doc.write_starter_interpreters()).unwrap();
+
+        let cfg =
+            DaemonConfig::load(Some(&std::fs::read_to_string(&path).unwrap()), &|_| None).unwrap();
+        assert_eq!(cfg.interpreters.get("js").map(String::as_str), Some("node"));
+        assert_eq!(
+            cfg.interpreters.get("mjs").map(String::as_str),
+            Some("node")
+        );
+        assert_eq!(
+            cfg.interpreters.get("cjs").map(String::as_str),
+            Some("node")
+        );
+        assert_eq!(
+            cfg.interpreters.get("py").map(String::as_str),
+            Some("python3")
+        );
+        assert_eq!(cfg.interpreters.get("rb").map(String::as_str), Some("ruby"));
+        assert_eq!(cfg.interpreters.get("sh").map(String::as_str), Some("sh"));
+    }
+
+    /// The mapping is visible and editable, not hidden magic: an
+    /// explanatory comment sits right above the table it writes, in the
+    /// same file an operator already has open.
+    #[test]
+    fn the_starter_interpreters_carry_an_explanatory_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+
+        ShepToml::edit(&path, |doc| doc.write_starter_interpreters()).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("# Extension -> interpreter mapping"),
+            "no explanatory comment above [interpreters]:\n{written}"
+        );
+        assert!(
+            written.find("# Extension -> interpreter mapping").unwrap()
+                < written.find("[interpreters]").unwrap(),
+            "the comment must precede the table it explains:\n{written}"
+        );
+        assert!(
+            !written.contains('\u{2014}') && !written.contains('\u{2013}'),
+            "no em or en dashes in copy an operator reads:\n{written}"
+        );
+    }
+
+    /// fails if a second scaffold (a second `ensure_home_at` for whatever
+    /// reason, or a caller re-running the first-run hook) appends a
+    /// duplicate `[interpreters]` table, or overwrites one an operator has
+    /// since edited to their own taste.
+    #[test]
+    fn writing_the_starter_interpreters_twice_does_not_duplicate_or_clobber() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+
+        ShepToml::edit(&path, |doc| doc.write_starter_interpreters()).unwrap();
+        // An operator's own edit to the mapping this scaffold wrote.
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("js = \"node\"", "js = \"bun\"");
+        std::fs::write(&path, &edited).unwrap();
+
+        ShepToml::edit(&path, |doc| doc.write_starter_interpreters()).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written.matches("[interpreters]").count(),
+            1,
+            "one table, not appended:\n{written}"
+        );
+        let cfg = DaemonConfig::load(Some(&written), &|_| None).unwrap();
+        assert_eq!(
+            cfg.interpreters.get("js").map(String::as_str),
+            Some("bun"),
+            "the operator's own edit must survive a second scaffold call"
+        );
     }
 
     /// fails if `set_style_level` panics instead of reporting when
