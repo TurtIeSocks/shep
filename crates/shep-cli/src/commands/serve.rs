@@ -313,6 +313,7 @@ pub async fn serve(
             hidden: args.hidden,
             auth: auth.map(|(_, credentials)| credentials),
             follow_symlinks: args.follow_symlinks,
+            connection_deadline: worker::CONNECTION_DEADLINE,
         };
         return worker::run(cfg).await;
     }

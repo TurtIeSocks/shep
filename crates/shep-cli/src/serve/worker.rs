@@ -52,12 +52,18 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// `RLIMIT_NOFILE`.
 const MAX_CONNECTIONS: usize = 512;
 
-/// The whole-connection deadline: read, resolve, respond and copy together.
+/// The whole-connection deadline every real `shep serve` runs with: read,
+/// resolve, respond and copy together.
 ///
 /// `READ_TIMEOUT` bounds the read phase only. A static file server has no
 /// legitimate minute-long request, and the alternative to a deadline is a
 /// slow-read client holding a permit until the process exits.
-const CONNECTION_DEADLINE: Duration = Duration::from_secs(60);
+///
+/// Carried on [`ServeConfig`] rather than read directly, so a test can ask
+/// for a deadline it can wait out on a real clock. The test that covers this
+/// used to force sixty virtual seconds on a paused clock and raced tokio's
+/// auto-advance against real socket IO, failing about one run in three.
+pub const CONNECTION_DEADLINE: Duration = Duration::from_secs(60);
 
 /// What a running `serve` worker was told to do. Built by the verb (Task 7)
 /// from its flags, and by nothing else.
@@ -89,6 +95,13 @@ pub struct ServeConfig {
     /// (decision 5); `--follow-symlinks` on `ServeArgs` is the only place
     /// this is ever set true. Passed straight through to `fs::contain`.
     pub follow_symlinks: bool,
+    /// How long one connection may live, start to finish.
+    ///
+    /// [`CONNECTION_DEADLINE`] everywhere outside tests. A parameter rather
+    /// than a constant read at the use site so the test covering it can pick
+    /// a duration it can wait out for real, instead of pausing the clock and
+    /// racing tokio's auto-advance against live socket IO.
+    pub connection_deadline: Duration,
 }
 
 /// Runs `shep serve`'s worker until it is signalled: binds `cfg.bind` and
@@ -155,9 +168,8 @@ async fn accept_forever(listener: TcpListener, cfg: Arc<ServeConfig>, semaphore:
                 let cfg = Arc::clone(&cfg);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ =
-                        tokio::time::timeout(CONNECTION_DEADLINE, handle_connection(stream, cfg))
-                            .await;
+                    let deadline = cfg.connection_deadline;
+                    let _ = tokio::time::timeout(deadline, handle_connection(stream, cfg)).await;
                 });
             }
             Err(err) => {
@@ -611,6 +623,7 @@ mod tests {
             hidden: false,
             auth: None,
             follow_symlinks: false,
+            connection_deadline: CONNECTION_DEADLINE,
         }
     }
 
@@ -1178,10 +1191,21 @@ mod tests {
     }
 
     /// fails if a connection that stops reading mid-body is held for the
-    /// life of the process. On a paused clock, so the forcing mechanism is
-    /// the test's own auto-advance past `CONNECTION_DEADLINE` and not sixty
-    /// real seconds (IR-46).
-    #[tokio::test(start_paused = true)]
+    /// life of the process.
+    ///
+    /// On a REAL clock with a deliberately tiny deadline, not a paused one.
+    /// The paused-clock version of this test failed about one run in three:
+    /// tokio auto-advances a paused clock to the earliest pending timer
+    /// whenever the runtime goes idle, so the assertion held only if the
+    /// server task had already registered its own deadline timer by the
+    /// time the runtime first idled. That was a race against real socket
+    /// IO -- a connect, a write, and an 8 MiB body -- and when it lost, the
+    /// test's own guard was the earliest timer and fired instead. An
+    /// earlier attempt to fix it removed a bounded read for the same
+    /// reason and left the underlying race in place.
+    ///
+    /// Nothing here waits on virtual time, so there is no ordering to race.
+    #[tokio::test]
     async fn a_connection_that_stops_reading_is_dropped_at_the_deadline() {
         let outer = tempfile::tempdir().unwrap();
         let root = outer.path().join("www");
@@ -1190,7 +1214,12 @@ mod tests {
         // rather than completing into the buffer regardless.
         let big = "a".repeat(8 * 1024 * 1024);
         write_tree(&root, &[("big.txt", &big)]);
-        let server = serve_on_free_port(config(&root)).await;
+        let mut cfg = config(&root);
+        // Short enough to wait out in a test, long enough that a loaded
+        // machine still gets the connection established and the write
+        // started before it fires.
+        cfg.connection_deadline = Duration::from_millis(300);
+        let server = serve_on_free_port(cfg).await;
 
         let mut stream = TcpStream::connect(server.addr()).await.unwrap();
         stream
@@ -1198,21 +1227,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Never read anything at all — connect and send only. Wrapping an
-        // earlier, short bounded read here (to "prove the response
-        // started") raced the paused clock's auto-advance against the real
-        // IO event of the head actually arriving and was observed to fail
-        // intermittently; the connect and the write above are real IO with
-        // no timer of their own to race, so they are left unguarded and
-        // this is the only timeout in the test.
-        //
-        // The guard here is deliberately longer than `CONNECTION_DEADLINE`:
-        // with the clock paused, auto-advance always reaches the earliest
-        // pending timer first, so the deadline (60s) closing the connection
-        // — which the client sees as EOF — fires before this guard's own
-        // 90-second timer ever could.
+        // Never read anything: connect and send only. The deadline must
+        // close the connection, which the client sees as EOF. The guard is
+        // generous because it exists to turn a hang into a failure, not to
+        // measure the deadline.
         let mut rest = Vec::new();
-        tokio::time::timeout(Duration::from_secs(90), stream.read_to_end(&mut rest))
+        tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut rest))
             .await
             .expect("the deadline must close the connection rather than hang forever")
             .unwrap();
