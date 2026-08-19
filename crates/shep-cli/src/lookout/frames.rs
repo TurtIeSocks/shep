@@ -260,7 +260,7 @@ impl Scene {
                 "No sheep registered. Each of the three panes says why it is empty, and the three sentences are different because the three reasons are."
             }
             Self::Narrow => {
-                "51 columns: FOLD, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY. The host strip fits; the detail pane and the feed do not, at 14 rows."
+                "51 columns: FOLD, EXIT, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY a RUNNING sheep is behaving badly, a question EXIT cannot even ask. The host strip fits; the detail pane and the feed do not, at 14 rows."
             }
             Self::TooNarrow => {
                 "28 columns: below the floor, the pane refuses rather than drawing overlapping garbage. Two short lines, so the refusal still fits the terminal it is refusing about."
@@ -1049,7 +1049,10 @@ mod tests {
         //  detail pane and the bleats feed under the table. `>` marks the
         //  selected sheep, and every pane below the table describes it."
         let wide = render_text(&scene(Scene::HealthyWide).1);
-        assert!(wide.contains("FOLD"), "every column fits at 120 columns");
+        assert!(
+            wide.contains("FOLD") && wide.contains("EXIT"),
+            "every column fits at 120 columns"
+        );
         assert!(
             wide.contains("host  load 2.31 4.10 3.88 / 10 cores"),
             "the host strip"
@@ -1086,12 +1089,14 @@ mod tests {
             "and the strip shows no reading, not zero"
         );
 
-        // "51 columns: FOLD, RESTARTS, PID and MEM are gone, in that order.
-        //  CPU and UPTIME survive because they explain WHY. The host strip
-        //  fits; the detail pane and the feed do not, at 14 rows."
+        // "51 columns: FOLD, EXIT, RESTARTS, PID and MEM are gone, in that
+        //  order. CPU and UPTIME survive because they explain WHY a RUNNING
+        //  sheep is behaving badly, a question EXIT cannot even ask. The
+        //  host strip fits; the detail pane and the feed do not, at 14
+        //  rows."
         let narrow = render_text(&scene(Scene::Narrow).1);
         assert!(narrow.contains("CPU") && narrow.contains("UPTIME"));
-        for gone in ["FOLD", "RESTARTS", "PID", "MEM"] {
+        for gone in ["FOLD", "EXIT", "RESTARTS", "PID", "MEM"] {
             assert!(!narrow.contains(gone), "the narrow tier dropped {gone}");
         }
         assert!(narrow.contains("host  load"), "the strip is up at 14 rows");

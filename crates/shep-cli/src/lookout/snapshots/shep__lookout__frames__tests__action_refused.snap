@@ -1,17 +1,16 @@
 ---
 source: crates/shep-cli/src/lookout/frames.rs
-assertion_line: 1496
 expression: render_text(&buffer)
 ---
 shep lookout   /home/rin/.shep                                                        5 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 7.6%   flock mem 475.0M  …
-  ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD      
+  ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web               online           48211    0         3.4%    182.0M    1h 25m    edge      
-  1     web               online           48212    0         2.9%    178.0M    1h 26m    edge      
-> 3     billing-reconci…  online           48230    0         0.8%    96.0M     1h 29m    -         
-  4     cron              online           48233    0         0.1%    8.0M      1h 31m    -         
-  5     metrics           online           48240    0         0.4%    11.0M     1h 32m    -         
+  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
+  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
+> 3     billing-reconcil…  online           48230    0         -          0.8%    96.0M     1h 29m  
+  4     cron               online           48233    0         -          0.1%    8.0M      1h 31m  
+  5     metrics            online           48240    0         -          0.4%    11.0M     1h 32m  
                                                                                                     
                                                                                                     
                                                                                                     
