@@ -9,6 +9,8 @@ use core::fmt;
 
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "schema")]
+use schemars::Schema;
 use serde::Deserialize;
 
 use crate::config::AppConfig;
@@ -72,8 +74,7 @@ struct RawFlockfile {
 /// property this constant exists for: living outside `#[cfg(test)]` is what
 /// makes deleting the file fail every build, not just `cargo test`.
 #[cfg(feature = "schema")]
-#[allow(dead_code)]
-const COMMITTED: &str = include_str!("../../assets/flockfile.schema.json");
+pub const COMMITTED: &str = include_str!("../../assets/flockfile.schema.json");
 
 /// How to regenerate the committed copy. Named in the drift test's own
 /// failure message, so a red test is self-service.
@@ -83,10 +84,35 @@ const COMMITTED: &str = include_str!("../../assets/flockfile.schema.json");
 #[cfg(feature = "schema")]
 #[allow(dead_code)]
 const REGENERATE: &str =
-    "cargo run -p shep-cli -- schema > crates/shep-core/assets/flockfile.schema.json";
+    "cargo run --bin shep -- schema > crates/shep-core/assets/flockfile.schema.json";
 
 /// Renders the Flockfile JSON Schema: the document grammar, pretty-printed
 /// with a trailing newline so the committed file is a well-formed text file.
+///
+/// Generated from `RawFlockfile` — the type serde actually deserializes a
+/// Flockfile into — so the schema and the parser cannot drift: they are the
+/// same declaration. `AppConfig` supplies the per-app half and lands in
+/// `$defs`.
+///
+/// The schema describes the **deserializer**, not the normalizer.
+/// `AppConfig::kill_signal` is `Option<String>` here and stays a plain string
+/// in the schema, even though `config::normalize` accepts only four
+/// spellings: the schema's job is to describe what serde will parse, and a
+/// schema that described a validation step running elsewhere at another time
+/// would be wrong the moment those two diverged, in a way no test could
+/// catch.
+#[cfg(feature = "schema")]
+#[track_caller]
+#[must_use]
+pub fn flockfile_schema_string() -> String {
+    let schema = flockfile_schema_json();
+    let mut rendered =
+        serde_json::to_string_pretty(&schema).expect("a schemars Schema always serializes");
+    rendered.push('\n');
+    rendered
+}
+
+/// Returns the Flockfile JSON Schema.
 ///
 /// Generated from `RawFlockfile` — the type serde actually deserializes a
 /// Flockfile into — so the schema and the parser cannot drift: they are the
@@ -109,12 +135,8 @@ const REGENERATE: &str =
 #[cfg(feature = "schema")]
 #[track_caller]
 #[must_use]
-pub fn flockfile_schema_json() -> String {
-    let schema = schemars::schema_for!(RawFlockfile);
-    let mut rendered =
-        serde_json::to_string_pretty(&schema).expect("a schemars Schema always serializes");
-    rendered.push('\n');
-    rendered
+pub fn flockfile_schema_json() -> Schema {
+    schemars::schema_for!(RawFlockfile)
 }
 
 /// Input format of a Flockfile
@@ -582,7 +604,7 @@ args = ["job.py"]
     #[test]
     fn the_committed_schema_is_current() {
         assert_eq!(
-            flockfile_schema_json(),
+            flockfile_schema_string(),
             COMMITTED,
             "crates/shep-core/assets/flockfile.schema.json is stale. Regenerate it:\n    {REGENERATE}\n\
              A doc-comment edit on AppConfig counts; schemars puts doc comments \
@@ -597,7 +619,7 @@ args = ["job.py"]
     #[cfg(feature = "schema")]
     #[test]
     fn the_schema_describes_a_document_not_one_app() {
-        let schema: serde_json::Value = serde_json::from_str(&flockfile_schema_json()).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&flockfile_schema_string()).unwrap();
         assert!(schema["properties"]["app"].is_object(), "{schema}");
         assert_eq!(schema["properties"]["app"]["type"], "array", "{schema}");
         assert!(
@@ -613,7 +635,7 @@ args = ["job.py"]
     #[cfg(feature = "schema")]
     #[test]
     fn kill_signal_stays_an_unconstrained_string() {
-        let schema: serde_json::Value = serde_json::from_str(&flockfile_schema_json()).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&flockfile_schema_string()).unwrap();
         let field = resolved(
             &schema,
             &schema["$defs"]["AppConfig"]["properties"]["kill_signal"],
@@ -641,7 +663,7 @@ args = ["job.py"]
     #[cfg(feature = "schema")]
     #[test]
     fn duration_and_memory_fields_are_string_shaped() {
-        let schema: serde_json::Value = serde_json::from_str(&flockfile_schema_json()).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&flockfile_schema_string()).unwrap();
         let app = &schema["$defs"]["AppConfig"]["properties"];
 
         // `min_uptime: UpDuration` (not `Option`) is a bare `$ref`.

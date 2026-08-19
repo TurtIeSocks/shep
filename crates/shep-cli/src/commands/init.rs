@@ -5,6 +5,8 @@
 //! This module is being built lesson by lesson. Right now it owns exactly one
 //! thing: the commented skeleton a bare `shep init` writes.
 
+use shep_core::config;
+
 /// The commented Flockfile a bare `shep init` writes.
 ///
 /// Rin's call on the design's first open question: not an empty `app = []`,
@@ -48,17 +50,9 @@ pub(crate) enum Depth {
     All,
 }
 
-#[allow(dead_code)]
-pub(crate) fn skeleton(depth: Depth) -> String {
-    match depth {
-        Depth::All => todo!("lesson 2: every option the schema knows about"),
-        Depth::Curated => curated(),
-    }
-}
-
-/// The day-one file. Rin's, from lesson 1.
-fn curated() -> String {
-    r#"# Manage your app in a Flockfile
+impl Depth {
+    pub(crate) fn curated() -> String {
+        r#"# Manage your app in a Flockfile
 # Add as many apps as you would like using TOML syntax
 
 #[[app]]
@@ -71,13 +65,84 @@ fn curated() -> String {
 # Falls back to the cwd of the shep daemon if omitted
 #cwd = "/srv/web-server"
 "#
-    .to_string()
+        .to_string()
+    }
+
+    pub(crate) fn all() -> String {
+        let schema = config::flockfile_schema_json();
+        let props = schema
+            .pointer("#/$defs/AppConfig/properties")
+            .expect("app config properties must exist")
+            .as_object()
+            .expect("props must be an object");
+
+        let prop_rows = props
+            .iter()
+            .map(|(k, v)| {
+                let mut desc_row = String::new();
+                if let Some(init_vals) = v["init"].as_object()
+                    && let Some(blurb) = init_vals.get("blurb")
+                {
+                    desc_row = blurb.as_str().map(|s| format!("# {s}")).unwrap_or_default();
+                }
+
+                if desc_row.is_empty() {
+                    desc_row = v["description"]
+                        .as_str()
+                        .expect("description must be present")
+                        .split("\n")
+                        .map(|row| {
+                            if row.is_empty() {
+                                "\n".to_string()
+                            } else {
+                                format!("\n# {row}")
+                            }
+                        })
+                        .collect::<String>();
+                }
+
+                // A field's schema `default` is only a usable placeholder when
+                // it is both present and non-empty: `Option<T>` fields with no
+                // value serialize their `None` as `null`, but a *required*
+                // `String` field (`name`, `script`) still gets a `default` key
+                // from `#[serde(default)]` at the struct level, holding
+                // `String::new()`. That empty string is not a value anyone
+                // would want uncommented into a Flockfile, so it is treated the
+                // same as no default at all: both fall through to `init.example`.
+                let has_no_real_default =
+                    v["default"].is_null() || v["default"].as_str() == Some("");
+                let default_value = if has_no_real_default {
+                    v["init"]
+                        .as_object()
+                        .and_then(|init_vals| init_vals.get("example"))
+                        .map(|val| toml::Value::try_from(val).expect("must convert"))
+                        .unwrap_or(toml::Value::String(String::new()))
+                } else {
+                    toml::Value::try_from(&v["default"]).expect("must convert")
+                };
+                format!("{desc_row}\n#{k} = {default_value}")
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        format!("#[[app]]{prop_rows}")
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn skeleton(depth: Depth) -> String {
+    match depth {
+        Depth::All => Depth::all(),
+        Depth::Curated => Depth::curated(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use shep_core::config::{FlockFormat, Flockfile, FlockfileError};
+
+    const VARIANTS: [Depth; 2] = [Depth::Curated, Depth::All];
 
     /// Uncomments the skeleton per the convention on [`skeleton`]: a leading
     /// `#` is stripped only where the character after it is not a space, so
@@ -108,7 +173,7 @@ mod tests {
     /// skeleton cannot drift into a shape the daemon would reject.
     #[test]
     fn the_skeleton_uncomments_into_a_working_flockfile() {
-        for depth in [Depth::Curated, Depth::All] {
+        for depth in VARIANTS {
             let live = uncomment(&skeleton(depth));
 
             let parsed = Flockfile::parse(&live, FlockFormat::Toml).unwrap_or_else(|err| {
@@ -131,6 +196,19 @@ mod tests {
                 !app.script.is_empty(),
                 "the example app needs a script, the other required field"
             );
+
+            // Parsing is not enough, and this test only checked that until
+            // 2026-08-19. The design says a scaffold must "parse AND
+            // normalize cleanly, so a template can never ship in a shape the
+            // daemon would reject" -- and the gap between the two is exactly
+            // where a placeholder hides. `cron_timezone = ""` is valid TOML
+            // and not a timezone; `cwd = ""` is valid TOML and not a
+            // directory. Absence is how TOML says "unset", so a field with
+            // no default has no value to show: it needs an EXAMPLE, or no
+            // line at all.
+            shep_core::config::normalize_all(parsed.apps).unwrap_or_else(|err| {
+                panic!("the uncommented {depth:?} scaffold must also normalize, or it teaches config the daemon would refuse: {err}")
+            });
         }
     }
 
@@ -153,7 +231,7 @@ mod tests {
     /// about what the parser would say.
     #[test]
     fn the_skeleton_as_written_declares_no_apps() {
-        for depth in [Depth::Curated, Depth::All] {
+        for depth in VARIANTS {
             let err = Flockfile::parse(&skeleton(depth), FlockFormat::Toml).expect_err(
                 "shep init must not drop a live app into a fresh Flockfile; \
              everything starts commented out, so the parser must find none",
@@ -172,7 +250,7 @@ mod tests {
     /// about as user-facing as a file gets: it is written into their repo.
     #[test]
     fn the_skeleton_carries_no_em_dashes() {
-        for depth in [Depth::Curated, Depth::All] {
+        for depth in VARIANTS {
             let text = skeleton(depth);
             assert!(!text.contains('\u{2014}'), "em dash in the skeleton");
             assert!(!text.contains('\u{2013}'), "en dash in the skeleton");
@@ -253,6 +331,45 @@ mod tests {
         assert!(
             in_curated.len() < in_all.len(),
             "the curated scaffold must be smaller than the full one, or the              depth axis is not earning its flag"
+        );
+    }
+
+    /// The forcing function the `init.example` attribute exists for: a field
+    /// with no real default (an `Option<T>` left `None`) has no value the
+    /// schema can offer on its own, so [`Depth::all`] falls back to an empty
+    /// string when it has nothing else to show. `""` is valid TOML but not a
+    /// valid `ProbeConfig`, IANA timezone, or most anything else -- so that
+    /// fallback is exactly the shape of bug
+    /// [`the_skeleton_uncomments_into_a_working_flockfile`] exists to catch,
+    /// just discovered late and by a normalize error instead of by name.
+    ///
+    /// This test catches it at the source instead: adding a field to
+    /// `AppConfig` with a null default now fails the build immediately, and
+    /// names the field, until someone decides what its scaffold line should
+    /// say.
+    #[test]
+    fn every_null_default_field_has_an_init_example() {
+        let raw = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../shep-core/assets/flockfile.schema.json"
+        ));
+        let schema: serde_json::Value =
+            serde_json::from_str(raw).expect("the schema is valid JSON");
+        let properties = schema["$defs"]["AppConfig"]["properties"]
+            .as_object()
+            .expect("AppConfig declares properties in the schema");
+
+        let missing: Vec<&String> = properties
+            .iter()
+            .filter(|(_, v)| v["default"].is_null() && v["init"]["example"].is_null())
+            .map(|(field, _)| field)
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "every AppConfig field with a null default needs `init.example`, or \
+             `--all` shows it as an empty string that fails to normalize; \
+             missing on: {missing:?}"
         );
     }
 }

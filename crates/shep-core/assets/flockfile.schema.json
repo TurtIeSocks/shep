@@ -22,11 +22,11 @@
   "additionalProperties": false,
   "$defs": {
     "AppConfig": {
-      "description": "Per-app configuration — one sheep's entry in a Flockfile\n\nField names are the Flockfile contract (sheep-native; pm2 spellings are\nrejected — the importer translates them). Unknown fields are errors so\ntypos fail loudly at parse time.\n\n# Example\n```\nuse shep_core::config::AppConfig;\n\nlet app: AppConfig = toml::from_str(\"name = \\\"web\\\"\\nscript = \\\"./srv\\\"\").unwrap();\nassert!(app.autorestart); // spec default\n```",
+      "description": "Per-app configuration - one sheep's entry in a Flockfile\n\nField names are the Flockfile contract (sheep-native; pm2 spellings are\nrejected - the importer translates them). Unknown fields are errors so\ntypos fail loudly at parse time.\n\n# Example\n```\nuse shep_core::config::AppConfig;\n\nlet app: AppConfig = toml::from_str(\"name = \\\"web\\\"\\nscript = \\\"./srv\\\"\").unwrap();\nassert!(app.autorestart); // spec default\n```",
       "type": "object",
       "properties": {
         "action_timeout": {
-          "description": "How long a triggered action gets to answer on the shepherd channel\nbefore its row becomes `ActionOutcome::TimedOut`.\n\nDefaults to 3s — comfortably under the 5s an RPC caller gets when it\nsends no deadline of its own (`shep-client`'s `DEFAULT_DEADLINE`,\nmirrored daemon-side as `rpc`'s `DEFAULT_DEADLINE_MS`). The margin\nmatters more than the number: push this past that budget and a caller\nusing the plain default gives up with `DeadlineExceeded` before the\ndaemon's own honest `TimedOut` row ever reaches it. A legitimately\nslow action (a cache flush, say) can still ask for longer, but its\ncaller has to ask for a longer deadline in step —\n`Client::request_with_deadline`, the way `shep logs -f` already asks\nfor `LOG_PLANE_DEADLINE` rather than the client's default. `normalize`\nrefuses a value no caller could ever satisfy, however long a deadline\nit asks for; a value merely above the *default* budget is a caller's\nchoice to widen its own deadline, not a config error this crate can\nsee.",
+          "description": "How long a triggered action gets to answer on the shepherd channel\nbefore its row becomes `ActionOutcome::TimedOut`.\n\nDefaults to 3s - comfortably under the 5s an RPC caller gets when it\nsends no deadline of its own (`shep-client`'s `DEFAULT_DEADLINE`,\nmirrored daemon-side as `rpc`'s `DEFAULT_DEADLINE_MS`). The margin\nmatters more than the number: push this past that budget and a caller\nusing the plain default gives up with `DeadlineExceeded` before the\ndaemon's own honest `TimedOut` row ever reaches it. A legitimately\nslow action (a cache flush, say) can still ask for longer, but its\ncaller has to ask for a longer deadline in step -\n`Client::request_with_deadline`, the way `shep logs -f` already asks\nfor `LOG_PLANE_DEADLINE` rather than the client's default. `normalize`\nrefuses a value no caller could ever satisfy, however long a deadline\nit asks for; a value merely above the *default* budget is a caller's\nchoice to widen its own deadline, not a config error this crate can\nsee.",
           "$ref": "#/$defs/UpDuration",
           "default": "3s"
         },
@@ -59,7 +59,11 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "example": "* * * * *",
+            "group": "inputs"
+          }
         },
         "cron_timezone": {
           "description": "Timezone for `cron_restart` (IANA name)",
@@ -67,7 +71,11 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "example": "US/Eastern",
+            "group": "cron"
+          }
         },
         "cwd": {
           "description": "Working directory (default: daemon's cwd at spawn registration)",
@@ -75,7 +83,12 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "blurb": "Where the process runs. Without it, the daemon's own directory",
+            "example": "/srv/app",
+            "group": "process"
+          }
         },
         "env": {
           "description": "Environment for the sheep (merged over the daemon's filtered env)",
@@ -83,7 +96,11 @@
           "additionalProperties": {
             "type": "string"
           },
-          "default": {}
+          "default": {},
+          "init": {
+            "example": "{ NODE_ENV = 'production' }",
+            "group": "inputs"
+          }
         },
         "err_file": {
           "description": "Stderr log file (default: `$SHEP_HOME/logs/<name>-<instance>-err.log`; `merge_logs` collapses to `<name>-err.log`)",
@@ -91,7 +108,11 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "example": "/var/log/my-first-sheep/err.log",
+            "group": "process"
+          }
         },
         "exp_backoff_restart_delay": {
           "description": "Initial backoff delay; grows ×1.5 capped at 15s (spec §4)",
@@ -103,7 +124,11 @@
               "type": "null"
             }
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "example": "5s",
+            "group": "control"
+          }
         },
         "fold": {
           "description": "Fold (group) this sheep belongs to",
@@ -111,7 +136,11 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "example": "backend",
+            "group": "process"
+          }
         },
         "graceful_timeout": {
           "description": "Drain window for the old instance during reload",
@@ -124,7 +153,11 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "example": "www-data",
+            "group": "process"
+          }
         },
         "ignore_watch": {
           "description": "Watch ignore globs (defaults added daemon-side: dot-entries, node_modules)",
@@ -140,7 +173,11 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "example": "INSTANCE_ID",
+            "group": "inputs"
+          }
         },
         "instances": {
           "description": "Instance count (\"cluster\" = N fork instances; spec §4)",
@@ -155,7 +192,11 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "example": "none",
+            "group": "process"
+          }
         },
         "kill_signal": {
           "description": "Stop signal, one of `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGUSR2` (the `SIG`\nprefix and the case are both optional). Unset means `SIGTERM`.\n\nA `String` rather than a [`KillSignal`](crate::config::KillSignal) so\nthe Flockfile schema and this struct's wire form stay plain text;\n`normalize` is what refuses a name outside that set, the same split\n`cron_restart` and the watch globs already use.",
@@ -163,7 +204,11 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "example": "SIGTERM",
+            "group": "process"
+          }
         },
         "kill_timeout": {
           "description": "Grace period between stop signal and SIGKILL",
@@ -176,7 +221,7 @@
           "default": "3s"
         },
         "liveness_probe": {
-          "description": "Liveness probe — failures feed the restart policy (spec §7)",
+          "description": "Liveness probe - failures feed the restart policy (spec §7)",
           "anyOf": [
             {
               "$ref": "#/$defs/ProbeConfig"
@@ -185,10 +230,18 @@
               "type": "null"
             }
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "blurb": "A health check that triggers a restart when it keeps failing",
+            "example": {
+              "kind": "http",
+              "target": "http://127.0.0.1:8080/healthz"
+            },
+            "group": "control"
+          }
         },
         "max_memory": {
-          "description": "Memory ceiling — polling enforcer restarts above this",
+          "description": "Memory ceiling - polling enforcer restarts above this",
           "anyOf": [
             {
               "$ref": "#/$defs/MemSize"
@@ -197,7 +250,11 @@
               "type": "null"
             }
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "example": "512M",
+            "group": "control"
+          }
         },
         "max_restarts": {
           "description": "Consecutive unstable exits before `errored`",
@@ -219,7 +276,12 @@
         "name": {
           "description": "Unique sheep name (required)",
           "type": "string",
-          "default": ""
+          "default": "",
+          "init": {
+            "blurb": "A convenient and unique name for shep to display",
+            "example": "my-first-sheep",
+            "group": "process"
+          }
         },
         "out_file": {
           "description": "Stdout log file (default: `$SHEP_HOME/logs/<name>-<instance>-out.log`; `merge_logs` collapses to `<name>-out.log`)",
@@ -227,10 +289,14 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "example": "/var/log/my-first-sheep/out.log",
+            "group": "process"
+          }
         },
         "readiness_probe": {
-          "description": "Readiness probe — gates reload's AwaitReady (spec §7)",
+          "description": "Readiness probe - gates reload's AwaitReady (spec §7)",
           "anyOf": [
             {
               "$ref": "#/$defs/ProbeConfig"
@@ -239,7 +305,15 @@
               "type": "null"
             }
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "blurb": "A health check shep waits on before it treats a reload as finished",
+            "example": {
+              "kind": "http",
+              "target": "http://127.0.0.1:8080/ready"
+            },
+            "group": "control"
+          }
         },
         "restart_delay": {
           "description": "Fixed delay before every restart (alternative to backoff)",
@@ -251,17 +325,26 @@
               "type": "null"
             }
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "example": "3s",
+            "group": "control"
+          }
         },
         "reuse_port": {
-          "description": "Asserts that the app itself sets `SO_REUSEPORT` before it binds —\nshep binds nothing, so it cannot set the option on the app's behalf.\nThe child process owns the mechanism (Node ≥22's `reusePort`, Go's\n`net.ListenConfig.Control`, nginx's `reuseport`); shep's contribution\nis permission for the old and new instance to overlap during reload,\nnot the socket option itself.\n\n**This field is inert today.** shep never reads it: reload overlap\nalready happens unconditionally, so setting it changes nothing and\nleaving it unset costs nothing. It is kept because `shep import`\nwrites it for a cluster-mode pm2 app and `shep flock` displays it, so\ndropping it would silently discard a value out of an imported config.\nIt becomes load-bearing the day shep gains a reload mode that does NOT\noverlap by default, which is when the permission it describes stops\nbeing free — see `docs/specs/deferred.md`.",
+          "description": "Asserts that the app itself sets `SO_REUSEPORT` before it binds -\nshep binds nothing, so it cannot set the option on the app's behalf.\nThe child process owns the mechanism (Node ≥22's `reusePort`, Go's\n`net.ListenConfig.Control`, nginx's `reuseport`); shep's contribution\nis permission for the old and new instance to overlap during reload,\nnot the socket option itself.\n\n**This field is inert today.** shep never reads it: reload overlap\nalready happens unconditionally, so setting it changes nothing and\nleaving it unset costs nothing. It is kept because `shep import`\nwrites it for a cluster-mode pm2 app and `shep flock` displays it, so\ndropping it would silently discard a value out of an imported config.\nIt becomes load-bearing the day shep gains a reload mode that does NOT\noverlap by default, which is when the permission it describes stops\nbeing free - see `docs/specs/deferred.md`.",
           "type": "boolean",
           "default": false
         },
         "script": {
           "description": "Executable or script path (required)",
           "type": "string",
-          "default": ""
+          "default": "",
+          "init": {
+            "blurb": "The script that shep should use to launch your app",
+            "example": "./index.js",
+            "group": "process"
+          }
         },
         "shutdown_with_message": {
           "description": "Send `{\"kind\":\"shutdown\"}` on the shepherd channel instead of a signal",
@@ -269,7 +352,7 @@
           "default": false
         },
         "stdin": {
-          "description": "Open a pipe on this sheep's stdin, so `shep whisper` can write to it.\n\nDefaults to `false`, and the default is the decision rather than a\nconvenience. Without it a sheep gets `/dev/null` on fd 0, which is what\nevery sheep has had until now, and three things argue for keeping it\nthat way unless an app asks otherwise:\n\n- Flipping it for the whole flock is a behaviour change to processes\n  nobody asked to change.\n- **Programs detect stdin.** A closed or null fd 0 is how a great many\n  programs decide they are non-interactive — no prompt, no pager, no\n  readline, no colour. Handing them a pipe silently moves them to the\n  other branch.\n- It costs a descriptor and a pump task per sheep for the whole life of\n  the process, against spec §14.11's single-digit-MB idle-RSS goal — the\n  same budget [`Self::channel`]'s own default is protecting.\n\nUnlike `channel`, nothing implies this: `wait_ready` and\n`shutdown_with_message` both need fd 3 and so turn `channel` on for you,\nwhile nothing in shep needs a sheep's stdin except an operator typing\n`shep whisper`. A sheep without it answers a `no_stdin` row and names\nthis field.\n\nThe pipe's write end lives as long as the sheep does, so the app sees\nEOF on stdin when the process is on its way out, never before.",
+          "description": "Open a pipe on this sheep's stdin, so `shep whisper` can write to it.\n\nDefaults to `false`, and the default is the decision rather than a\nconvenience. Without it a sheep gets `/dev/null` on fd 0, which is what\nevery sheep has had until now, and three things argue for keeping it\nthat way unless an app asks otherwise:\n\n- Flipping it for the whole flock is a behaviour change to processes\n  nobody asked to change.\n- **Programs detect stdin.** A closed or null fd 0 is how a great many\n  programs decide they are non-interactive - no prompt, no pager, no\n  readline, no colour. Handing them a pipe silently moves them to the\n  other branch.\n- It costs a descriptor and a pump task per sheep for the whole life of\n  the process, against spec §14.11's single-digit-MB idle-RSS goal - the\n  same budget [`Self::channel`]'s own default is protecting.\n\nUnlike `channel`, nothing implies this: `wait_ready` and\n`shutdown_with_message` both need fd 3 and so turn `channel` on for you,\nwhile nothing in shep needs a sheep's stdin except an operator typing\n`shep whisper`. A sheep without it answers a `no_stdin` row and names\nthis field.\n\nThe pipe's write end lives as long as the sheep does, so the app sees\nEOF on stdin when the process is on its way out, never before.",
           "type": "boolean",
           "default": false
         },
@@ -288,7 +371,11 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "example": "www-data",
+            "group": "process"
+          }
         },
         "wait_ready": {
           "description": "Expect `{\"kind\":\"ready\"}` on the shepherd channel",
@@ -310,7 +397,11 @@
               "type": "null"
             }
           ],
-          "default": null
+          "default": null,
+          "init": {
+            "example": "500",
+            "group": "control"
+          }
         },
         "watch_options": {
           "description": "Watch include globs (empty = watch cwd)",

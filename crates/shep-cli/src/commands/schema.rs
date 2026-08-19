@@ -6,7 +6,7 @@
 //! nothing else, so the string the operator gets and the string the drift
 //! test compares are produced by one function.
 
-use shep_core::config::flockfile_schema_json;
+use shep_core::config::flockfile_schema_string;
 
 use crate::cli::Format;
 use crate::exit::ExitCode;
@@ -18,5 +18,5 @@ use crate::output::{Streams, write_outcome};
 /// wrapping a schema in the CLI's envelope would produce a file no editor
 /// could read.
 pub fn schema(streams: &mut Streams<'_>, _fmt: Format) -> ExitCode {
-    write_outcome(streams.out.write_all(flockfile_schema_json().as_bytes()))
+    write_outcome(streams.out.write_all(flockfile_schema_string().as_bytes()))
 }

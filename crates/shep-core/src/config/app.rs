@@ -1,9 +1,10 @@
-//! Per-app configuration schema — one sheep's Flockfile entry
+//! Per-app configuration schema - one sheep's Flockfile entry
 
 use core::fmt;
 
 use std::collections::BTreeMap;
 
+// use schemars::generate
 use serde::{Deserialize, Serialize};
 
 use crate::values::{MemSize, UpDuration};
@@ -53,10 +54,10 @@ fn default_failure_threshold() -> u32 {
     3
 }
 
-/// Per-app configuration — one sheep's entry in a Flockfile
+/// Per-app configuration - one sheep's entry in a Flockfile
 ///
 /// Field names are the Flockfile contract (sheep-native; pm2 spellings are
-/// rejected — the importer translates them). Unknown fields are errors so
+/// rejected - the importer translates them). Unknown fields are errors so
 /// typos fail loudly at parse time.
 ///
 /// # Example
@@ -72,16 +73,39 @@ fn default_failure_threshold() -> u32 {
 #[serde(deny_unknown_fields, default)]
 pub struct AppConfig {
     /// Unique sheep name (required)
+    #[schemars(extend("init" = {
+        "example": "my-first-sheep",
+        "group": "process",
+        "blurb": "A convenient and unique name for shep to display"
+    }))]
     pub name: String,
     /// Executable or script path (required)
+    #[schemars(extend("init" = {
+        "example": "./index.js",
+        "group": "process",
+        "blurb": "The script that shep should use to launch your app"
+    }))]
     pub script: String,
     /// Arguments passed to the script
     pub args: Vec<String>,
     /// Working directory (default: daemon's cwd at spawn registration)
+    #[schemars(extend("init" = {
+        "example": "/srv/app",
+        "group": "process",
+        "blurb": "Where the process runs. Without it, the daemon's own directory"
+    }))]
     pub cwd: Option<String>,
     /// Interpreter override (`"none"` = run script directly)
+    #[schemars(extend("init" = {
+        "example": "none",
+        "group": "process",
+    }))]
     pub interpreter: Option<String>,
     /// Environment for the sheep (merged over the daemon's filtered env)
+    #[schemars(extend("init" = {
+        "example": "{ NODE_ENV = 'production' }",
+        "group": "inputs",
+    }))]
     pub env: BTreeMap<String, String>,
     /// Instance count ("cluster" = N fork instances; spec §4)
     pub instances: u32,
@@ -96,8 +120,16 @@ pub struct AppConfig {
     /// Consecutive unstable exits before `errored`
     pub max_restarts: u32,
     /// Fixed delay before every restart (alternative to backoff)
+    #[schemars(extend("init" = {
+        "example": "3s",
+        "group": "control",
+    }))]
     pub restart_delay: Option<UpDuration>,
     /// Initial backoff delay; grows ×1.5 capped at 15s (spec §4)
+    #[schemars(extend("init" = {
+        "example": "5s",
+        "group": "control",
+    }))]
     pub exp_backoff_restart_delay: Option<UpDuration>,
     /// Stop signal, one of `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGUSR2` (the `SIG`
     /// prefix and the case are both optional). Unset means `SIGTERM`.
@@ -106,6 +138,10 @@ pub struct AppConfig {
     /// the Flockfile schema and this struct's wire form stay plain text;
     /// `normalize` is what refuses a name outside that set, the same split
     /// `cron_restart` and the watch globs already use.
+    #[schemars(extend("init" = {
+        "example": "SIGTERM",
+        "group": "process",
+    }))]
     pub kill_signal: Option<String>,
     /// Grace period between stop signal and SIGKILL
     pub kill_timeout: UpDuration,
@@ -118,14 +154,14 @@ pub struct AppConfig {
     /// How long a triggered action gets to answer on the shepherd channel
     /// before its row becomes `ActionOutcome::TimedOut`.
     ///
-    /// Defaults to 3s — comfortably under the 5s an RPC caller gets when it
+    /// Defaults to 3s - comfortably under the 5s an RPC caller gets when it
     /// sends no deadline of its own (`shep-client`'s `DEFAULT_DEADLINE`,
     /// mirrored daemon-side as `rpc`'s `DEFAULT_DEADLINE_MS`). The margin
     /// matters more than the number: push this past that budget and a caller
     /// using the plain default gives up with `DeadlineExceeded` before the
     /// daemon's own honest `TimedOut` row ever reaches it. A legitimately
     /// slow action (a cache flush, say) can still ask for longer, but its
-    /// caller has to ask for a longer deadline in step —
+    /// caller has to ask for a longer deadline in step -
     /// `Client::request_with_deadline`, the way `shep logs -f` already asks
     /// for `LOG_PLANE_DEADLINE` rather than the client's default. `normalize`
     /// refuses a value no caller could ever satisfy, however long a deadline
@@ -133,25 +169,57 @@ pub struct AppConfig {
     /// choice to widen its own deadline, not a config error this crate can
     /// see.
     pub action_timeout: UpDuration,
-    /// Memory ceiling — polling enforcer restarts above this
+    /// Memory ceiling - polling enforcer restarts above this
+    #[schemars(extend("init" = {
+        "example": "512M",
+        "group": "control",
+    }))]
     pub max_memory: Option<MemSize>,
     /// Watch files and restart on change
     pub watch: bool,
     /// Watch ignore globs (defaults added daemon-side: dot-entries, node_modules)
     pub ignore_watch: Vec<String>,
     /// Watch debounce window (default 500ms, applied daemon-side)
+    #[schemars(extend("init" = {
+        "example": "500",
+        "group": "control",
+    }))]
     pub watch_delay: Option<UpDuration>,
     /// Cron pattern for scheduled restarts (croner dialect)
+    #[schemars(extend("init" = {
+        "example": "* * * * *",
+        "group": "inputs",
+    }))]
     pub cron_restart: Option<String>,
     /// Fold (group) this sheep belongs to
+    #[schemars(extend("init" = {
+        "example": "backend",
+        "group": "process",
+    }))]
     pub fold: Option<String>,
     /// Run as this user (unix)
+    #[schemars(extend("init" = {
+        "example": "www-data",
+        "group": "process",
+    }))]
     pub user: Option<String>,
     /// Run as this group (unix)
+    #[schemars(extend("init" = {
+        "example": "www-data",
+        "group": "process",
+    }))]
     pub group: Option<String>,
     /// Stdout log file (default: `$SHEP_HOME/logs/<name>-<instance>-out.log`; `merge_logs` collapses to `<name>-out.log`)
+    #[schemars(extend("init" = {
+        "example": "/var/log/my-first-sheep/out.log",
+        "group": "process",
+    }))]
     pub out_file: Option<String>,
     /// Stderr log file (default: `$SHEP_HOME/logs/<name>-<instance>-err.log`; `merge_logs` collapses to `<name>-err.log`)
+    #[schemars(extend("init" = {
+        "example": "/var/log/my-first-sheep/err.log",
+        "group": "process",
+    }))]
     pub err_file: Option<String>,
     /// Merge instance logs into one file pair
     pub merge_logs: bool,
@@ -172,11 +240,11 @@ pub struct AppConfig {
     /// - Flipping it for the whole flock is a behaviour change to processes
     ///   nobody asked to change.
     /// - **Programs detect stdin.** A closed or null fd 0 is how a great many
-    ///   programs decide they are non-interactive — no prompt, no pager, no
+    ///   programs decide they are non-interactive - no prompt, no pager, no
     ///   readline, no colour. Handing them a pipe silently moves them to the
     ///   other branch.
     /// - It costs a descriptor and a pump task per sheep for the whole life of
-    ///   the process, against spec §14.11's single-digit-MB idle-RSS goal — the
+    ///   the process, against spec §14.11's single-digit-MB idle-RSS goal - the
     ///   same budget [`Self::channel`]'s own default is protecting.
     ///
     /// Unlike `channel`, nothing implies this: `wait_ready` and
@@ -190,7 +258,7 @@ pub struct AppConfig {
     pub stdin: bool,
     /// Expect `{"kind":"ready"}` on the shepherd channel
     pub wait_ready: bool,
-    /// Asserts that the app itself sets `SO_REUSEPORT` before it binds —
+    /// Asserts that the app itself sets `SO_REUSEPORT` before it binds -
     /// shep binds nothing, so it cannot set the option on the app's behalf.
     /// The child process owns the mechanism (Node ≥22's `reusePort`, Go's
     /// `net.ListenConfig.Control`, nginx's `reuseport`); shep's contribution
@@ -204,17 +272,35 @@ pub struct AppConfig {
     /// dropping it would silently discard a value out of an imported config.
     /// It becomes load-bearing the day shep gains a reload mode that does NOT
     /// overlap by default, which is when the permission it describes stops
-    /// being free — see `docs/specs/deferred.md`.
+    /// being free - see `docs/specs/deferred.md`.
     pub reuse_port: bool,
-    /// Readiness probe — gates reload's AwaitReady (spec §7)
+    /// Readiness probe - gates reload's AwaitReady (spec §7)
+    #[schemars(extend("init" = {
+        "example": { "kind": "http", "target": "http://127.0.0.1:8080/ready" },
+        "group": "control",
+        "blurb": "A health check shep waits on before it treats a reload as finished"
+    }))]
     pub readiness_probe: Option<ProbeConfig>,
-    /// Liveness probe — failures feed the restart policy (spec §7)
+    /// Liveness probe - failures feed the restart policy (spec §7)
+    #[schemars(extend("init" = {
+        "example": { "kind": "http", "target": "http://127.0.0.1:8080/healthz" },
+        "group": "control",
+        "blurb": "A health check that triggers a restart when it keeps failing"
+    }))]
     pub liveness_probe: Option<ProbeConfig>,
     /// Watch include globs (empty = watch cwd)
     pub watch_options: Vec<String>,
     /// Timezone for `cron_restart` (IANA name)
+    #[schemars(extend("init" = {
+        "example": "US/Eastern",
+        "group": "cron",
+    }))]
     pub cron_timezone: Option<String>,
     /// Env var receiving the instance slot (default `SHEP_INSTANCE`)
+    #[schemars(extend("init" = {
+        "example": "INSTANCE_ID",
+        "group": "inputs",
+    }))]
     pub increment_var: Option<String>,
 }
 
@@ -277,7 +363,7 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// A minimal config with spec defaults — the programmatic entry point
+    /// A minimal config with spec defaults - the programmatic entry point
     #[must_use]
     pub fn minimal(name: &str, script: &str) -> Self {
         Self {
