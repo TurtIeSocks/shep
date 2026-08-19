@@ -42,7 +42,7 @@ use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 
 use shep_client::RequestError;
-use shep_core::protocol::{Lamb, ProcessInfo, Response, RpcError, RpcErrorCode};
+use shep_core::protocol::{ExitInfo, Lamb, ProcessInfo, Response, RpcError, RpcErrorCode};
 use shep_core::status::ProcStatus;
 
 use super::app::{ActionVerb, App, Control, KeyPress, Msg, Sent};
@@ -845,6 +845,28 @@ fn sheep(
         .fold(fold.map(str::to_string))
         .out_file(Some(format!("/home/rin/.shep/logs/{name}-{id}-out.log")))
         .err_file(Some(format!("/home/rin/.shep/logs/{name}-{id}-err.log")))
+        // Derived from `status` rather than taken as a ninth parameter, and
+        // not just to keep the argument count down: a sheep that is not
+        // running always has a reason it stopped, and deriving it means no
+        // scene can accidentally depict an errored sheep with nothing in its
+        // EXIT column. Before this, every pinned frame showed `-` there,
+        // including the errored scene -- so the frames documented none of
+        // what that column is for, and a regression blanking it entirely
+        // would have passed all of them.
+        .last_exit(match status {
+            // Crashed on its own, and a restart is either pending or spent.
+            ProcStatus::Errored | ProcStatus::WaitingRestart => Some(ExitInfo {
+                code: Some(1),
+                signal: None,
+            }),
+            // Stopped because shep asked it to, which is a signal.
+            ProcStatus::Stopped => Some(ExitInfo {
+                code: None,
+                signal: Some(15),
+            }),
+            // Running, or on its way in or out: nothing has exited yet.
+            ProcStatus::Online | ProcStatus::Starting | ProcStatus::Stopping => None,
+        })
         .build()
 }
 

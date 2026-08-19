@@ -69,9 +69,9 @@ shep lookout   /home/rin/.shep                                                  
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
   0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge      [0m
   1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge      [0m
-> 2     api                        [0m[38;5;166merrored        [0m  -        14        -          -       -         1h 18m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;221mwaiting-restart[0m  -        3         -          -       -         1h 19m    -         [0m
-  4     cron                       [0m[38;5;245mstopped        [0m  -        0         -          -       -         1h 21m    -         [0m
+> 2     api                        [0m[38;5;166merrored        [0m  -        14        1          -       -         1h 18m    edge      [0m
+  3     billing-reconciliation-w…  [0m[38;5;221mwaiting-restart[0m  -        3         1          -       -         1h 19m    -         [0m
+  4     cron                       [0m[38;5;245mstopped        [0m  -        0         SIGTERM    -       -         1h 21m    -         [0m
   5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -205,9 +205,9 @@ shep lookout   /home/rin/.shep                                                  
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
   0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 15m    edge      [0m
   1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 16m    edge      [0m
-> 2     api                        [0m[38;5;166merrored        [0m  -        14        -          -       -         1h 18m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;221mwaiting-restart[0m  -        3         -          -       -         1h 19m    -         [0m
-  4     cron                       [0m[38;5;245mstopped        [0m  -        0         -          -       -         1h 21m    -         [0m
+> 2     api                        [0m[38;5;166merrored        [0m  -        14        1          -       -         1h 18m    edge      [0m
+  3     billing-reconciliation-w…  [0m[38;5;221mwaiting-restart[0m  -        3         1          -       -         1h 19m    -         [0m
+  4     cron                       [0m[38;5;245mstopped        [0m  -        0         SIGTERM    -       -         1h 21m    -         [0m
   5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 22m    -         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -544,9 +544,9 @@ shep lookout   /home/rin/.shep                                                  
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
   0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge      [0m
   1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge      [0m
-  2     api                        [0m[38;5;166merrored        [0m  -        14        -          -       -         1h 18m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;221mwaiting-restart[0m  -        3         -          -       -         1h 19m    -         [0m
-> 4     cron                       [0m[38;5;245mstopped        [0m  -        0         -          -       -         1h 21m    -         [0m
+  2     api                        [0m[38;5;166merrored        [0m  -        14        1          -       -         1h 18m    edge      [0m
+  3     billing-reconciliation-w…  [0m[38;5;221mwaiting-restart[0m  -        3         1          -       -         1h 19m    -         [0m
+> 4     cron                       [0m[38;5;245mstopped        [0m  -        0         SIGTERM    -       -         1h 21m    -         [0m
   5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -         [0m
                                                                                                                         [0m
                                                                                                                         [0m
