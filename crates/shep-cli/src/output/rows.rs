@@ -397,6 +397,21 @@ impl Render for DogEnabledRow {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Parallel to `headers()` above: `["NAME", "SOURCE", "SHEPHERD",
+    // "STATUS"]`. NAME and STATUS are the floor, the same role they play in
+    // `DogRows`. SOURCE and SHEPHERD are this type's own two extras (see
+    // `Render::PRIORITIES`'s own doc for the `6`-and-up rule); SOURCE drops
+    // first, one round before SHEPHERD -- the same "least essential" role
+    // `DogRows` already gives it (where the binary came from, not whether
+    // the dog is healthy), and `render_boxed`'s floor of three means a
+    // 4-column table like this one only ever gets to drop the single
+    // highest-priority extra, so this ordering also decides which of the two
+    // an operator actually loses at a narrow width.
+    // `priorities_line_up_with_headers_for_every_render_impl` (this module's
+    // test section) pins the length and the floor for every impl, this one
+    // included.
+    const PRIORITIES: &'static [u8] = &[0, 7, 6, 0];
 }
 
 /// `shep disable <name>`: what the config edit and, if a shepherd is
@@ -448,6 +463,10 @@ impl Render for DogDisabledRow {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Same shape, same reasoning, as `DogEnabledRow::PRIORITIES` -- this
+    // type shares its headers exactly.
+    const PRIORITIES: &'static [u8] = &[0, 7, 6, 0];
 }
 
 /// `shep adopt <name> <path>`: what the config edit and, if a shepherd is
@@ -502,6 +521,10 @@ impl Render for DogAdoptedRow {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Same shape, same reasoning, as `DogEnabledRow::PRIORITIES` -- this
+    // type shares its headers exactly.
+    const PRIORITIES: &'static [u8] = &[0, 7, 6, 0];
 }
 
 /// `shep rehome <name>`: what the config edit and, if a shepherd is
@@ -564,6 +587,10 @@ impl Render for DogRehomedRow {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Same shape, same reasoning, as `DogEnabledRow::PRIORITIES` -- this
+    // type shares its headers exactly.
+    const PRIORITIES: &'static [u8] = &[0, 7, 6, 0];
 }
 
 /// `Response::Flushed(Vec<ProcessInfo>)` — the sheep a `shep flush` matched,
@@ -657,6 +684,21 @@ impl Render for FlushedRows {
         // this list.
         "lambs",
     ];
+
+    // Parallel to `headers()` above: `["ID", "NAME", "OUT_FILE",
+    // "ERR_FILE"]`. ID and NAME are the floor -- the same two `FlockRows`
+    // uses for its own row identity. OUT_FILE and ERR_FILE are this table's
+    // whole reason for existing (this type's own doc), so unlike most
+    // extras neither is a minor detail -- but they are still the two
+    // longest, most unbounded cells this table ever renders (this type's
+    // own doc: "an absolute path... often longer than every other column
+    // put together"), so both sit at `Render::PRIORITIES`'s `6`-and-up tier
+    // rather than at the floor. ERR_FILE survives one round longer than
+    // OUT_FILE: an operator chasing a crash reads stderr first, and
+    // `render_boxed`'s floor of three means a 4-column table like this one
+    // only ever drops the single highest-priority extra, so this ordering
+    // decides which path an operator actually loses at a narrow width.
+    const PRIORITIES: &'static [u8] = &[0, 0, 7, 6];
 }
 
 /// One of the shepherd's own log files, and what `shep flush --daemon` made
@@ -716,6 +758,17 @@ impl Render for EmptiedFiles {
     // the path IS the answer: a verb that emptied a file and would not say
     // which one has reported nothing.
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Parallel to `headers()` above: `["STREAM", "FILE", "RESULT"]`. STREAM
+    // (which of the shepherd's own two files) and RESULT (what happened to
+    // it) are the floor -- the same STATUS-shaped role `FlockRows`/`DogRows`
+    // give their own outcome column. FILE, the one extra, is the absolute
+    // path -- the single `6`-and-up column here. Three columns is already
+    // `render_boxed`'s own floor, so this table never actually narrows
+    // regardless of what the array says (the same case `LambRows::PRIORITIES`
+    // documents); still spelled out explicitly so a header added here later
+    // does not silently inherit "never drops" by omission.
+    const PRIORITIES: &'static [u8] = &[0, 6, 0];
 }
 
 /// `Response::Deleted(Vec<u32>)` — the ids that were removed.
@@ -746,6 +799,11 @@ impl Render for DeletedIds {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // One column, and it is the row's whole identity -- nothing to
+    // designate droppable, the same `LambRows::PRIORITIES` reasoning for a
+    // type with nothing left over.
+    const PRIORITIES: &'static [u8] = &[0];
 }
 
 /// `kill`: what teardown actually achieved.
@@ -781,6 +839,12 @@ impl Render for KillRow {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Two columns, both the whole point of this report -- the same
+    // `LambRows::PRIORITIES` reasoning: nothing here is less essential than
+    // anything else, so both sit at the floor rather than one drop order
+    // nobody chose.
+    const PRIORITIES: &'static [u8] = &[0, 0];
 }
 
 /// One sheep as the muster roll remembers it, for `shep flock` when no
@@ -830,6 +894,17 @@ impl Render for RolledSheepRows {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Parallel to `headers()` above: `["NAME", "INSTANCES", "STATUS"]`.
+    // NAME and STATUS are the floor, the same STATUS-shaped role
+    // `FlockRows`/`DogRows` give their own outcome column -- even though
+    // this one is always `"stopped"`, it is still the fact this whole
+    // rendering exists to state (this type's own doc). INSTANCES is the one
+    // `6`-and-up extra. Three columns is already `render_boxed`'s own floor,
+    // so this table never actually narrows regardless (the same case
+    // `LambRows::PRIORITIES` documents); still spelled out for the reason
+    // that one gives.
+    const PRIORITIES: &'static [u8] = &[0, 6, 0];
 }
 
 /// `Response::RollSaved` — where the muster roll landed, and what it
@@ -868,6 +943,11 @@ impl Render for SavedRollRow {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Two columns, both the whole point of this report (this type's own
+    // doc) -- the same `LambRows::PRIORITIES` reasoning: nothing here is
+    // less essential than anything else.
+    const PRIORITIES: &'static [u8] = &[0, 0];
 }
 
 /// One app `shep import` read out of a pm2 dump.
@@ -931,6 +1011,18 @@ impl Render for ImportRows {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Parallel to `headers()` above: `["NAME", "SCRIPT", "INSTANCES",
+    // "REUSE_PORT"]`. NAME is the floor -- the one column that says which
+    // app a row is about. SCRIPT, INSTANCES and REUSE_PORT are this table's
+    // three `6`-and-up extras, ranked by how genuinely droppable each is:
+    // SCRIPT is an unbounded path (the same reason `FlushedRows` keeps its
+    // own paths off the floor) and drops first; REUSE_PORT is the one column
+    // this type's own doc says "an operator scans for at a glance", so it
+    // survives longest. `render_boxed`'s floor of three means a 4-column
+    // table like this one only ever drops the single highest-priority
+    // extra, so in practice only SCRIPT is ever lost to a narrow terminal.
+    const PRIORITIES: &'static [u8] = &[0, 8, 7, 6];
 }
 
 /// One step `shep startup` or `shep unstartup` took.
@@ -997,6 +1089,17 @@ impl Render for StartupSteps {
     // wrote or removed a system file and would not say which one has
     // reported nothing.
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Parallel to `headers()` above: `["ACTION", "TARGET", "RESULT"]`.
+    // TARGET (the file or command a step acted on) and RESULT (what
+    // happened) are the floor -- the same STATUS-shaped role
+    // `FlockRows`/`DogRows` give their own outcome column, generalized to
+    // "what a step did, and to what". ACTION is the one `6`-and-up extra.
+    // Three columns is already `render_boxed`'s own floor, so this table
+    // never actually narrows regardless (the same case
+    // `LambRows::PRIORITIES` documents); still spelled out for the reason
+    // that one gives.
+    const PRIORITIES: &'static [u8] = &[6, 0, 0];
 }
 
 /// `Response::Triggered(Vec<ActionReply>)` — one row per matched sheep, each
@@ -1086,6 +1189,19 @@ impl Render for TriggeredRows {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Parallel to `headers()` above: `["ID", "NAME", "OUTCOME", "DETAIL"]`.
+    // ID and NAME are the floor `FlockRows` itself uses for row identity;
+    // OUTCOME joins them for the same STATUS-shaped reason `FlockRows`/
+    // `DogRows` give their own outcome column -- an operator needs to know
+    // whether the trigger succeeded even more than the free-text detail
+    // explaining why. DETAIL, this table's one unbounded free-text column
+    // (`Self::rows`'s own doc: capped at 80 chars, still the longest cell
+    // this table renders), is the sole `6`-and-up extra, and `render_boxed`'s
+    // floor of three means dropping it is the only narrowing this table ever
+    // does -- exactly the three-essential-columns shape `FlockRows` itself
+    // has.
+    const PRIORITIES: &'static [u8] = &[0, 0, 0, 6];
 }
 
 /// [`TriggeredRows::rows`]'s per-outcome split: the short, stable `OUTCOME`
@@ -1196,6 +1312,10 @@ impl Render for SignalledRows {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Same shape, same reasoning, as `TriggeredRows::PRIORITIES` -- this
+    // type shares its headers exactly.
+    const PRIORITIES: &'static [u8] = &[0, 0, 0, 6];
 }
 
 /// [`SignalledRows::rows`]'s per-outcome split: the short, stable `OUTCOME`
@@ -1264,6 +1384,10 @@ impl Render for SentLineRows {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Same shape, same reasoning, as `TriggeredRows::PRIORITIES` -- this
+    // type shares its headers exactly.
+    const PRIORITIES: &'static [u8] = &[0, 0, 0, 6];
 }
 
 /// [`SentLineRows::rows`]'s per-outcome split: the short, stable `OUTCOME`
@@ -1336,6 +1460,19 @@ impl Render for BarkRows {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Parallel to `headers()` above: `["WHEN", "RULE", "SUBJECT", "MESSAGE",
+    // "SINKS"]`. WHEN, RULE and SUBJECT are the floor -- when a bark fired,
+    // which rule fired it, and which sheep it is about, the three facts that
+    // identify a record an operator is scanning an alert feed for. MESSAGE
+    // and SINKS are this table's two `6`-and-up extras: MESSAGE is
+    // free-form, app-or-rule-chosen text of unbounded length (the same
+    // reason `TriggeredRows` keeps its own DETAIL column droppable) and
+    // drops first; SINKS, a short delivered/failed summary
+    // ([`sinks_cell`]'s own doc), survives one round longer. `render_boxed`'s
+    // floor of three means both can be lost to a narrow terminal, landing
+    // back on exactly WHEN/RULE/SUBJECT.
+    const PRIORITIES: &'static [u8] = &[0, 0, 0, 7, 6];
 }
 
 /// Renders one [`Bark::sinks`] list for the `SINKS` column: a delivered sink
@@ -1424,6 +1561,11 @@ impl Render for KvRows {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Two columns, both the whole point of a KV entry -- the same
+    // `LambRows::PRIORITIES` reasoning: a key with no value, or a value with
+    // no key, is not a row at all.
+    const PRIORITIES: &'static [u8] = &[0, 0];
 }
 
 /// `shep unset`'s own report: how many keys the store lost.
@@ -1464,6 +1606,11 @@ impl Render for KvUnsetRow {
     }
 
     const JSON_ONLY: &'static [&'static str] = &[];
+
+    // One column, and it is the row's whole identity -- nothing to
+    // designate droppable, the same `LambRows::PRIORITIES` reasoning for a
+    // type with nothing left over.
+    const PRIORITIES: &'static [u8] = &[0];
 }
 
 #[cfg(test)]
@@ -1628,37 +1775,6 @@ pub(crate) mod tests {
         assert_no_drift(&sample_flock(), |j| &j[0], &["UPTIME", "CPU", "MEM"]);
     }
 
-    /// fails if `FlockRows::headers()` and `FlockRows::PRIORITIES` drift
-    /// apart. The two are parallel arrays edited by hand in two different
-    /// places, and nothing but this test notices a header inserted (or
-    /// reordered) without its priority: every priority after the gap would
-    /// silently point at the wrong column, and `render_boxed` would start
-    /// dropping the wrong one under a narrow terminal.
-    #[test]
-    fn flock_priorities_line_up_with_flock_headers() {
-        let headers = FlockRows::headers();
-        let priorities = FlockRows::PRIORITIES;
-        assert_eq!(
-            headers.len(),
-            priorities.len(),
-            "headers() has {} columns but PRIORITIES has {} — they must move together",
-            headers.len(),
-            priorities.len(),
-        );
-
-        // ID/NAME/STATUS are the floor `render_boxed` refuses to drop below
-        // -- a table that cannot say which sheep a row is about has stopped
-        // being a table -- so they are exactly the three columns priority
-        // `0` must name, in this order.
-        let floor: Vec<&str> = headers
-            .iter()
-            .zip(priorities)
-            .filter(|&(_, &p)| p == 0)
-            .map(|(&h, _)| h)
-            .collect();
-        assert_eq!(floor, vec!["ID", "NAME", "STATUS"]);
-    }
-
     /// fails if `LambRows` grows a field that never reaches the table, or
     /// swaps PID and NAME between its two columns.
     #[test]
@@ -1668,30 +1784,6 @@ pub(crate) mod tests {
             |j| &j[0],
             &[],
         );
-    }
-
-    /// fails if `LambRows::headers()` and `LambRows::PRIORITIES` drift
-    /// apart -- the same drift `flock_priorities_line_up_with_flock_headers`
-    /// guards for `FlockRows`. Both columns are floor: a lamb has exactly
-    /// PID and NAME, and neither is less essential than the other.
-    #[test]
-    fn lamb_priorities_line_up_with_lamb_headers() {
-        let headers = LambRows::headers();
-        let priorities = LambRows::PRIORITIES;
-        assert_eq!(
-            headers.len(),
-            priorities.len(),
-            "headers() has {} columns but PRIORITIES has {} — they must move together",
-            headers.len(),
-            priorities.len(),
-        );
-        let floor: Vec<&str> = headers
-            .iter()
-            .zip(priorities)
-            .filter(|&(_, &p)| p == 0)
-            .map(|(&h, _)| h)
-            .collect();
-        assert_eq!(floor, vec!["PID", "NAME"]);
     }
 
     /// fails if `SOURCE` renders the adopted binary's path into the table.
@@ -1736,36 +1828,6 @@ pub(crate) mod tests {
             |j| &j[0],
             &["UPTIME", "CPU", "MEM", "SOURCE"],
         );
-    }
-
-    /// fails if `DogRows::headers()` and `DogRows::PRIORITIES` drift apart
-    /// -- the same drift `flock_priorities_line_up_with_flock_headers`
-    /// guards for `FlockRows`. NAME and STATUS are the floor: they are what
-    /// identify which dog a row is about, the same role ID/NAME/STATUS play
-    /// for a sheep. Before this test existed the type carried no
-    /// `PRIORITIES` override at all (the trait default, all zeros), which
-    /// meant this table never narrowed under a real terminal while the
-    /// sheep table directly above it did -- the dogs table wrapped and its
-    /// own borders broke at any width under about 75 columns. Reversed in
-    /// review; see this task's report for the fuller account.
-    #[test]
-    fn dog_priorities_line_up_with_dog_headers() {
-        let headers = DogRows::headers();
-        let priorities = DogRows::PRIORITIES;
-        assert_eq!(
-            headers.len(),
-            priorities.len(),
-            "headers() has {} columns but PRIORITIES has {} — they must move together",
-            headers.len(),
-            priorities.len(),
-        );
-        let floor: Vec<&str> = headers
-            .iter()
-            .zip(priorities)
-            .filter(|&(_, &p)| p == 0)
-            .map(|(&h, _)| h)
-            .collect();
-        assert_eq!(floor, vec!["NAME", "STATUS"]);
     }
 
     /// fails if `DogEnabledRow` grows a field that never reaches the table —
@@ -2403,5 +2465,91 @@ pub(crate) mod tests {
     #[test]
     fn kv_unset_row_does_not_drift() {
         assert_no_drift(&KvUnsetRow { removed: 2 }, |j| j, &[]);
+    }
+
+    // --- Whole-branch review item 2: every `Render` impl gets a real
+    // `PRIORITIES` --------------------------------------------------------
+
+    /// One `Render` impl's own check, called once per type below by
+    /// [`priorities_line_up_with_headers_for_every_render_impl`]. Generic
+    /// over `T` alone, no instance needed -- `headers()` and `PRIORITIES`
+    /// are both associated items with no `&self`, so there is nothing to
+    /// construct just to read them.
+    ///
+    /// Two failure modes, both real: `headers()` and `PRIORITIES` are
+    /// parallel arrays edited by hand in two different places, so a header
+    /// inserted or reordered without its priority shifts every priority
+    /// after the gap onto the wrong column, and `render_boxed` starts
+    /// dropping the wrong one under a narrow terminal -- caught by the
+    /// length check. And a type whose `PRIORITIES` marks the wrong columns
+    /// `0` (too many, too few, or the wrong ones) either pins a column open
+    /// that should narrow, or lets an identity column vanish first -- caught
+    /// by the floor check.
+    fn assert_priorities_match_headers<T: Render>(floor: &[&str]) {
+        let headers = T::headers();
+        let priorities = T::PRIORITIES;
+        assert_eq!(
+            headers.len(),
+            priorities.len(),
+            "{}: headers() has {} columns but PRIORITIES has {} — they must move together",
+            std::any::type_name::<T>(),
+            headers.len(),
+            priorities.len(),
+        );
+        let actual_floor: Vec<&str> = headers
+            .iter()
+            .zip(priorities)
+            .filter(|&(_, &p)| p == 0)
+            .map(|(&h, _)| h)
+            .collect();
+        assert_eq!(
+            actual_floor,
+            floor,
+            "{}: the columns at priority 0 do not match this type's own intended floor",
+            std::any::type_name::<T>(),
+        );
+    }
+
+    /// The anti-drift gate for [`Render::PRIORITIES`] across every payload
+    /// type this crate defines, not one test per type: Task 5b gave
+    /// `DogRows`/`LambRows` a real array after the empirical reviewer caught
+    /// `DogRows` wrapping and breaking its own borders under a real
+    /// terminal, directly beneath a sheep table narrowing gracefully above
+    /// it -- but the reasoning was never carried past those two, and the
+    /// other eighteen `Render` impls in this module carried the trait's
+    /// all-zero default (silent "never narrows") until this task. A single
+    /// test that walks every impl, rather than one bespoke test per type,
+    /// is what makes a table added later without a real `PRIORITIES` fail
+    /// here instead of shipping the same defect a fourth time.
+    ///
+    /// Each `floor` list is this type's own intended set of never-drop
+    /// columns -- see [`Render::PRIORITIES`]'s own doc for the rule that
+    /// produced it (`0` for identity, `1`-`5` reserved for the five
+    /// `FlockRows` columns, `6` and up for everything else), and the
+    /// `PRIORITIES` array beside each impl above for the reasoning specific
+    /// to that table.
+    #[test]
+    fn priorities_line_up_with_headers_for_every_render_impl() {
+        assert_priorities_match_headers::<FlockRows>(&["ID", "NAME", "STATUS"]);
+        assert_priorities_match_headers::<DogRows>(&["NAME", "STATUS"]);
+        assert_priorities_match_headers::<LambRows>(&["PID", "NAME"]);
+        assert_priorities_match_headers::<DogEnabledRow>(&["NAME", "STATUS"]);
+        assert_priorities_match_headers::<DogDisabledRow>(&["NAME", "STATUS"]);
+        assert_priorities_match_headers::<DogAdoptedRow>(&["NAME", "STATUS"]);
+        assert_priorities_match_headers::<DogRehomedRow>(&["NAME", "STATUS"]);
+        assert_priorities_match_headers::<FlushedRows>(&["ID", "NAME"]);
+        assert_priorities_match_headers::<EmptiedFiles>(&["STREAM", "RESULT"]);
+        assert_priorities_match_headers::<DeletedIds>(&["ID"]);
+        assert_priorities_match_headers::<KillRow>(&["PID", "SOCKET_REMOVED"]);
+        assert_priorities_match_headers::<RolledSheepRows>(&["NAME", "STATUS"]);
+        assert_priorities_match_headers::<SavedRollRow>(&["FILE", "APPS"]);
+        assert_priorities_match_headers::<ImportRows>(&["NAME"]);
+        assert_priorities_match_headers::<StartupSteps>(&["TARGET", "RESULT"]);
+        assert_priorities_match_headers::<TriggeredRows>(&["ID", "NAME", "OUTCOME"]);
+        assert_priorities_match_headers::<SignalledRows>(&["ID", "NAME", "OUTCOME"]);
+        assert_priorities_match_headers::<SentLineRows>(&["ID", "NAME", "OUTCOME"]);
+        assert_priorities_match_headers::<BarkRows>(&["WHEN", "RULE", "SUBJECT"]);
+        assert_priorities_match_headers::<KvRows>(&["KEY", "VALUE"]);
+        assert_priorities_match_headers::<KvUnsetRow>(&["REMOVED"]);
     }
 }

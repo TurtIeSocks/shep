@@ -176,11 +176,39 @@ pub trait Render: Serialize {
 
     /// Per-column drop priority for [`table::render_boxed`], parallel to
     /// [`Self::headers`]: index `i` here is the priority of column `i` there.
-    /// `0` never drops — [`table::render_boxed`]'s own floor. The default is all
-    /// zeros, so a payload type that does not implement this opts out of
-    /// adaptive dropping entirely rather than dropping in an order nobody
-    /// chose; [`rows::FlockRows`] is the one type that overrides it, per the
-    /// spec's own priority table.
+    /// `0` never drops — [`table::render_boxed`]'s own floor. The default is
+    /// all zeros, kept for a hypothetical future payload with genuinely
+    /// nothing to say about droppability -- leaving a real impl at the
+    /// default silently opts it out of narrowing rather than narrowing in an
+    /// order nobody chose, which is exactly what happened here: every impl
+    /// in [`rows`] but [`rows::FlockRows`] carried the default for a full
+    /// task, until the empirical reviewer caught [`rows::DogRows`] wrapping
+    /// and breaking its own borders under a real terminal, right beneath a
+    /// sheep table narrowing gracefully above it. The other eighteen impls
+    /// carried the same defect, unnoticed because nothing had looked.
+    ///
+    /// The one rule every impl in [`rows`] now follows, so a reader who
+    /// learns one table is not surprised by the next:
+    /// - `0`: the columns that identify a row -- what names the record,
+    ///   plus a STATUS/OUTCOME/RESULT-shaped column stating what happened to
+    ///   it, when the table has one ([`rows::FlockRows`]/[`rows::DogRows`]'s
+    ///   own STATUS is the precedent this generalizes).
+    /// - `1`-`5`: reserved for the five columns [`rows::FlockRows`] itself
+    ///   has (`UPTIME` 1, `PID` 2, `MEM` 3, `RESTARTS` 4, `CPU` 5), used only
+    ///   when that exact concept is a column in this table -- never borrowed
+    ///   for an unrelated field just because a number happens to be free,
+    ///   which is what would stop the number meaning one thing crate-wide.
+    /// - `6` and up: every other column, the most droppable of all --
+    ///   assigned per table by how genuinely droppable each one is (a long,
+    ///   unbounded free-text field before a short, glanceable one), with a
+    ///   comment at the array whenever more than one column shares this
+    ///   tier.
+    ///
+    /// `priorities_line_up_with_headers_for_every_render_impl` (`rows.rs`'s
+    /// own test module) is the anti-drift gate: it checks every `Render`
+    /// impl this crate defines against its own expected floor, so a table
+    /// added later without a real `PRIORITIES` fails that test rather than
+    /// shipping unable to narrow.
     const PRIORITIES: &'static [u8] = &[];
 }
 
