@@ -3187,6 +3187,79 @@ fn shep_log_level_decides_which_of_the_daemons_records_survive() {
     );
 }
 
+// --- Interpreter / spawn-failure parity -----------------------------------
+
+/// `shep start <name>` on a sheep that cannot spawn must report the failure
+/// the same way `shep start <path>` against the identical broken script
+/// does, rather than exiting 0 with nothing on either stream.
+///
+/// Reproduces the gap Rin found live 2026-08-19: the daemon's
+/// `Response::Restarted` (what `shep start <name>` sends once the sheep is
+/// already registered — see `lifecycle::resume`) has no per-id error slot,
+/// so a respawn that fails to spawn still answers `Ok` with an `errored`
+/// row rather than an RPC error (`shep-daemon/src/supervisor.rs`'s
+/// `respawn`, `Err` arm). `shep start <path>`'s own `Request::Start` does
+/// not share that gap — `do_start` returns `Err(SpawnFailed)` from the
+/// identical failure — which is what let the by-name form exit 0 and print
+/// nothing while the by-path form against the same script reported
+/// `error[spawn_failed]`.
+///
+/// The script is valid shell but not executable (`0o644`), so every spawn
+/// of it fails with `EACCES` regardless of which request registered or
+/// restarted it — the same shape Rin's own repro used.
+///
+/// What a broken implementation would let through: reverting `resume`'s
+/// `any_restart_failed` check (`lifecycle.rs`) makes the second `start`
+/// below exit `Success` with an empty stderr again, exactly the bug this
+/// pins.
+#[test]
+fn starting_an_errored_sheep_by_name_reports_the_same_failure_as_by_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("broken.sh");
+    std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&script, perms).unwrap();
+    let mut guard = DaemonGuard::default();
+
+    // By path: exit 7 (spawn_failed), stderr names the reason, stdout
+    // empty. Also autostarts the daemon the second command below reuses,
+    // and registers the sheep this test's second half restarts by name.
+    let by_path = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&script)
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_json_error(&by_path, 7, "spawn_failed");
+
+    // The sheep must actually be sitting in the flock as `errored`, or the
+    // second command below is not exercising `resume`'s `Request::Restart`
+    // path at all — it would fall through to `resolve_target`'s path arm
+    // instead, which is the already-working case this test is not about.
+    let flock = poll_flock(dir.path(), |info| info["status"] == "errored");
+    assert_eq!(
+        flock["status"], "errored",
+        "the by-path failure must leave the sheep registered as errored: {flock}"
+    );
+
+    // By name, same broken script, same failure: must report it exactly
+    // like the by-path command above did, not silently succeed.
+    let name = script.file_stem().unwrap().to_str().unwrap();
+    let by_name = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(name)
+        .output()
+        .unwrap();
+    assert_json_error(&by_name, 7, "spawn_failed");
+
+    graceful_kill(dir.path());
+}
+
 // --- Reload ---------------------------------------------------------------
 
 /// `shep reload` reaches the reload verb, and the swap it starts really

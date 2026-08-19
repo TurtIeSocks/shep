@@ -515,6 +515,18 @@ fn fail_target(streams: &mut Streams<'_>, fmt: Format, err: &TargetError) -> Exi
 /// carries configs to register, and the sheep is already registered. `Restart`
 /// is the request that takes a selector and brings a stopped sheep up, which
 /// is what `shep restart <name>` has always done to one.
+///
+/// A respawn that fails to spawn still answers `Response::Restarted` with an
+/// `Ok` -- the daemon's aggregation reply for `Restart` has no per-id error
+/// slot (`shep-daemon/src/supervisor.rs`'s `respawn`, `Err` arm), so a
+/// failed spawn comes back as an ordinary `errored` row rather than an RPC
+/// error. `shep start <path>`'s own `Request::Start` does not share that
+/// gap (`do_start` returns `Err(SpawnFailed)` straight from the same
+/// failure), which is what let `shep start <name>` against a sheep that
+/// cannot spawn exit 0 and print nothing, while `shep start <path>` against
+/// the identical broken script reported `error[spawn_failed]` -- reproduced
+/// live and fixed here, since this is the one place that turns a `Restart`
+/// answer into `start`'s own exit code.
 async fn resume(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -548,8 +560,38 @@ async fn resume(
         },
     )
     .await;
+    // See this function's own doc: an `Ok` reply can still carry a sheep
+    // that came back `errored`, and that is a `start` failure by any
+    // definition an operator would recognise. Reported and returned WITHOUT
+    // extending `started` -- `shep start <path>`'s own failure leaves
+    // `started` empty too (its `Request::Start` never reaches the `Ok` arm
+    // `request_each` collects from), and `start`'s caller only prints a
+    // table when `started` is non-empty. Populating it here would print a
+    // table on a path that is supposed to fail exactly like the by-path one
+    // does: an error on stderr and nothing on stdout.
+    if any_restart_failed(&procs) {
+        let message = format!(
+            "{} could not be started; see `shep bleats {}` or its log files for why",
+            existing.name, existing.name
+        );
+        let _ = emit_error(
+            &mut *streams.err,
+            fmt,
+            ExitCode::SpawnFailed.code_str(),
+            &message,
+        );
+        return ExitCode::SpawnFailed;
+    }
     started.extend(procs);
     failure.unwrap_or(ExitCode::Success)
+}
+
+/// Whether any row in a `Request::Restart` reply came back `errored` -- see
+/// [`resume`]'s own doc for why that can happen inside an `Ok` reply.
+fn any_restart_failed(procs: &[shep_core::protocol::ProcessInfo]) -> bool {
+    procs
+        .iter()
+        .any(|info| info.status == shep_core::status::ProcStatus::Errored)
 }
 
 /// The flock as it stands, for deciding whether a target names a sheep that
@@ -1870,6 +1912,20 @@ mod tests {
             }
             other => panic!("expected Request::Start, got {other:?}"),
         }
+    }
+
+    /// [`any_restart_failed`]'s own logic, isolated from the wire: `true`
+    /// only when at least one row is `errored`, matching
+    /// [`resume`]'s own doc for why an `Ok` reply can still mean failure.
+    #[test]
+    fn any_restart_failed_is_true_only_for_an_errored_row() {
+        use shep_core::protocol::ProcessInfo;
+        use shep_core::status::ProcStatus;
+
+        let online = ProcessInfo::builder(1, "web", ProcStatus::Online).build();
+        let errored = ProcessInfo::builder(2, "worker", ProcStatus::Errored).build();
+        assert!(!any_restart_failed(std::slice::from_ref(&online)));
+        assert!(any_restart_failed(&[online, errored]));
     }
 
     /// fails if the envelope carries anything but the name and the count. `stock`
