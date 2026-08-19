@@ -823,20 +823,32 @@ mod tests {
     /// nothing about the other three (this task's own brief's Correction 2).
     ///
     /// `butter` is a parameter rather than fixed at `Starting`, because the
-    /// two snapshots below need two different Butter-role words at the same
-    /// fallback terminal width: `full_wide` wants `Starting` (`"starting"`,
-    /// 8 characters) so nothing needs to drop, and the narrow snapshot wants
+    /// two narrower snapshots below need two different Butter-role words at
+    /// the same fallback terminal width: the narrow one wants
     /// `WaitingRestart` (`"waiting-restart"`, 15) specifically because it is
     /// the longest status word -- see that test's own doc for the width
-    /// arithmetic this difference drives.
+    /// arithmetic this drives -- and the two `full_under_no_color`/`plain`
+    /// snapshots want `Starting` for no reason narrower than "some Butter
+    /// row has to exist and this one's doc comments already describe it".
     ///
     /// Every other column is sized to fit a width of 80 -- the value every
-    /// `Presentation::new` call in this module's tests below passes
+    /// `Presentation::new` call in this module's narrower tests passes
     /// explicitly as `width`, injected rather than measured. `table_of`
     /// reads `presentation.width`, never the process's own controlling
     /// terminal, so this arithmetic holds on any machine this suite runs
     /// on, a real developer's tty included (see [`crate::style::Presentation`]'s
     /// own doc for why the field exists).
+    ///
+    /// One exception: `full_wide_pins_face_word_and_colour_for_a_mixed_flock`
+    /// stopped fitting at 80 the moment task 49 added an `EXIT` column (a
+    /// 4-wide column costs 7 -- its own width plus the renderer's 3-per-column
+    /// padding), and there was no free width left to give it. `EXIT` reads
+    /// `-` on every row here (none of these four sheep carries a real
+    /// `last_exit`), so the column itself is header-bound, not content-bound,
+    /// and there is nothing left to shrink in `NAME`/`PID` that would recover
+    /// seven columns without resorting to cryptic abbreviations. That test
+    /// widens its own `Presentation` instead -- see its own doc for the
+    /// number and the reasoning.
     fn mixed_flock(butter: ProcStatus) -> FlockRows {
         FlockRows(vec![
             ProcessInfo::builder(0, "web", ProcStatus::Online)
@@ -860,17 +872,29 @@ mod tests {
         Some(OsStr::new("xterm-256color"))
     }
 
-    /// `full`, comfortably inside 80 columns: face, word and colour all
-    /// present, nothing dropped. `mixed_flock`'s own doc has the width
-    /// arithmetic (78 of 80 columns used) that keeps this one under the
-    /// fallback with every column and the word both in play.
+    /// `full`, comfortably wide enough: face, word and colour all present,
+    /// nothing dropped.
+    ///
+    /// Width 90, not this module's usual 80 (`mixed_flock`'s own doc has the
+    /// exception and the arithmetic): task 49's `EXIT` column costs the
+    /// fixture seven columns it had no slack left to give up, so 80 no
+    /// longer fits `Starting`'s word (`"starting"`, the second-longest
+    /// Butter-role word after `WaitingRestart`) alongside it. This test's
+    /// own job was never "prove it fits at exactly the realistic fallback"
+    /// -- that boundary belongs to the narrow snapshot below, which still
+    /// runs at 80 -- it is "prove nothing drops when there is room", and 90
+    /// is still an ordinary terminal width, comfortably proving that.
     #[test]
     fn full_wide_pins_face_word_and_colour_for_a_mixed_flock() {
-        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None, 80);
+        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None, 90);
         let rendered = table_of(&mixed_flock(ProcStatus::Starting), presentation);
         assert!(
             !rendered.contains("hidden"),
             "this fixture must fit without dropping a column: {rendered}"
+        );
+        assert!(
+            rendered.contains("starting"),
+            "the word must survive at a width with room to spare: {rendered}"
         );
         insta::assert_snapshot!(rendered);
     }

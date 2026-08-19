@@ -10,6 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Additions
+
+- Add `ExitInfo` and `ProcessInfo::last_exit` — why a sheep's process most
+  recently stopped existing under this daemon: an exit code, a raw unix
+  signal number, or `None` while it has never exited under this daemon (or
+  the peer daemon predates the field). Answers the operator question a
+  boot-looping sheep left unanswered before this: `flock`/`describe` could
+  say a sheep was `errored` with a restart count, never why. `ExitInfo` is a
+  small struct rather than two flat `Option<i32>` fields directly on
+  `ProcessInfo`, so "never exited" and "exited by an unnamed signal" stay
+  distinguishable — both flat fields would be `None` for either. `last_exit`
+  is sticky across a respawn: it answers "why did it last stop", not "is it
+  stopped right now" (`status`/`pid` already do that), so a sheep back
+  `Online` after a crash keeps a true answer about the crash that restarted
+  it until its next exit. Additive under `Option` on the same terms as every
+  other field this struct has grown since Phase 3 — `PROTOCOL_VERSION` stays
+  **1**, and a peer that predates the field neither sends nor expects the
+  key.
+
 ## [0.1.0-alpha.1] - 2026-08-16
 
 ### Additions

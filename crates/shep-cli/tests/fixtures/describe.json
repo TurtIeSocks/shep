@@ -20,7 +20,8 @@
           "pid": null,
           "name": "sleep"
         }
-      ]
+      ],
+      "last_exit": null
     }
   ]
 }

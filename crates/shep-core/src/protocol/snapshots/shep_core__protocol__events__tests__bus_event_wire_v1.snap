@@ -20,7 +20,11 @@ expression: events
         "cpu_percent": null,
         "memory_bytes": null,
         "dog": null,
-        "lambs": null
+        "lambs": null,
+        "last_exit": {
+          "code": 1,
+          "signal": null
+        }
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -56,7 +60,11 @@ expression: events
         "cpu_percent": null,
         "memory_bytes": null,
         "dog": null,
-        "lambs": null
+        "lambs": null,
+        "last_exit": {
+          "code": 1,
+          "signal": null
+        }
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -79,7 +87,11 @@ expression: events
         "cpu_percent": null,
         "memory_bytes": null,
         "dog": null,
-        "lambs": null
+        "lambs": null,
+        "last_exit": {
+          "code": 1,
+          "signal": null
+        }
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -102,7 +114,11 @@ expression: events
         "cpu_percent": null,
         "memory_bytes": null,
         "dog": null,
-        "lambs": null
+        "lambs": null,
+        "last_exit": {
+          "code": 1,
+          "signal": null
+        }
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -125,7 +141,11 @@ expression: events
         "cpu_percent": null,
         "memory_bytes": null,
         "dog": null,
-        "lambs": null
+        "lambs": null,
+        "last_exit": {
+          "code": 1,
+          "signal": null
+        }
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -148,7 +168,11 @@ expression: events
         "cpu_percent": null,
         "memory_bytes": null,
         "dog": null,
-        "lambs": null
+        "lambs": null,
+        "last_exit": {
+          "code": 1,
+          "signal": null
+        }
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -171,7 +195,11 @@ expression: events
         "cpu_percent": null,
         "memory_bytes": null,
         "dog": null,
-        "lambs": null
+        "lambs": null,
+        "last_exit": {
+          "code": 1,
+          "signal": null
+        }
       },
       "manually": false,
       "at_ms": 1700000000000

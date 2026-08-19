@@ -23,7 +23,7 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 use shep_core::barks::{Bark, SinkOutcome};
-use shep_core::protocol::{DogSource, Lamb, ProcessInfo};
+use shep_core::protocol::{DogSource, ExitInfo, Lamb, ProcessInfo};
 
 use crate::dog::metrics::HostReading;
 
@@ -84,6 +84,9 @@ pub struct SheepRow {
     /// Process-tree members, when the reply walked for them (`describe`
     /// does, `list` does not).
     pub lambs: Option<Vec<LambRow>>,
+    /// How this sheep's process most recently stopped; absent while it has
+    /// never exited under this daemon.
+    pub last_exit: Option<ExitInfoRow>,
 }
 
 /// Where a dog came from. Mirrors `DogSource`'s tagged wire shape exactly.
@@ -116,6 +119,17 @@ pub struct LambRow {
     pub name: String,
 }
 
+/// Why a sheep's process most recently stopped. Mirrors `ExitInfo`'s wire
+/// shape exactly.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ExitInfoRow {
+    /// The process's own exit code, on a normal exit.
+    pub code: Option<i32>,
+    /// The raw unix signal number that ended it, when it did not exit on
+    /// its own.
+    pub signal: Option<i32>,
+}
+
 impl From<&ProcessInfo> for SheepRow {
     fn from(info: &ProcessInfo) -> Self {
         Self {
@@ -135,6 +149,16 @@ impl From<&ProcessInfo> for SheepRow {
                 .lambs
                 .as_ref()
                 .map(|lambs| lambs.iter().map(LambRow::from).collect()),
+            last_exit: info.last_exit.as_ref().map(ExitInfoRow::from),
+        }
+    }
+}
+
+impl From<&ExitInfo> for ExitInfoRow {
+    fn from(exit: &ExitInfo) -> Self {
+        Self {
+            code: exit.code,
+            signal: exit.signal,
         }
     }
 }

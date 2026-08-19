@@ -46,8 +46,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use shep_core::config::{AppConfig, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
-    ActionOutcome, ActionReply, BusEvent, DogSource, LineOutcome, LineReply, ProcessEventKind,
-    ProcessInfo, SignalOutcome, SignalReply,
+    ActionOutcome, ActionReply, BusEvent, DogSource, ExitInfo, LineOutcome, LineReply,
+    ProcessEventKind, ProcessInfo, SignalOutcome, SignalReply,
 };
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
@@ -2027,6 +2027,8 @@ impl<R: ProcessRunner> Actor<R> {
             out_file: spec.out_file.clone(),
             err_file: spec.err_file.clone(),
             dog: None,
+            // A fresh registration, never spawned: nothing has exited yet.
+            last_exit: None,
         };
         let info = to_info(&entry);
         self.sheep.insert(
@@ -2109,6 +2111,9 @@ impl<R: ProcessRunner> Actor<R> {
                     out_file,
                     err_file,
                     dog,
+                    // A fresh spawn, `id` newly allocated: nothing has
+                    // exited yet under it.
+                    last_exit: None,
                 };
                 let info = to_info(&entry);
                 let log_ctl = io.log_ctl.clone();
@@ -2180,6 +2185,8 @@ impl<R: ProcessRunner> Actor<R> {
                     out_file,
                     err_file,
                     dog,
+                    // Spawn itself failed: no process ever existed to exit.
+                    last_exit: None,
                 };
                 let info = to_info(&entry);
                 self.sheep.insert(
@@ -3168,6 +3175,13 @@ impl<R: ProcessRunner> Actor<R> {
         // the drainee rather than re-derived, because nothing here could
         // re-derive it.
         let dog = drainee.dog.clone();
+        // Carried across the swap for the same reason `restarts`/`dog` are:
+        // a reload is not an exit, so the replacement's honest answer to
+        // "why did this instance last stop" is still whatever the drainee's
+        // was, not `None` — `None` here would read as "this instance has
+        // never exited", which is only true the first time an app is ever
+        // reloaded.
+        let last_exit = drainee.last_exit;
 
         let new_id = self.next_id;
         self.next_id += 1;
@@ -3202,6 +3216,7 @@ impl<R: ProcessRunner> Actor<R> {
                     out_file,
                     err_file,
                     dog,
+                    last_exit,
                 };
                 let info = to_info(&entry);
                 let log_ctl = io.log_ctl.clone();
@@ -4028,6 +4043,18 @@ impl<R: ProcessRunner> Actor<R> {
         // wait cannot survive into a second process's life by any route.
         slot.actions.abandon_all();
         slot.entry.pid = None;
+        // Set here, before any branch below decides what this exit BECOMES
+        // (a respawn, an error, a clean stop, a deregistration): this is the
+        // one place a process under a registered id stops existing, so it is
+        // the one place that can record what it stopped WITH. Unconditional
+        // — an operator's own `stop`/`delete` reaches this line exactly like
+        // a crash does, and the process genuinely still exited by whatever
+        // signal ended it, which stays true and stays worth showing
+        // regardless of who asked for it. A branch that goes on to remove
+        // this entry entirely (`Delete`, or a committed reload's drainee)
+        // takes this value with it into the `ProcessInfo` its own removal
+        // emits, rather than losing it a line before that snapshot is taken.
+        slot.entry.last_exit = Some(outcome.into());
         // Split the moment the marker is taken, because the two halves answer
         // different questions. `kind` decides what this exit BECOMES, and
         // every branch below reads it exactly as it did before origins
@@ -5057,7 +5084,29 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
         .cpu_percent(None)
         .memory_bytes(None)
         .dog(entry.dog.clone())
+        .last_exit(entry.last_exit)
         .build()
+}
+
+/// Converts the spawn-runner's own exit observation into the wire-facing
+/// shape this crate's `ProcessEntry::last_exit` stores and its own `to_info`
+/// reads back (both private to this crate, so named in code font rather
+/// than linked).
+///
+/// A separate `From` rather than reusing [`ExitOutcome`] on the wire
+/// directly: that type lives behind the [`ProcessRunner`] seam and is free
+/// to grow with whatever the real runner needs to observe next (its own
+/// module doc says so) without dragging a breaking wire change behind it.
+/// The two share a shape today because the runner's own observation IS the
+/// honest exit outcome — this is that fact stated once, at the one point it
+/// crosses from the runner's vocabulary into the wire's.
+impl From<ExitOutcome> for ExitInfo {
+    fn from(outcome: ExitOutcome) -> Self {
+        Self {
+            code: outcome.code,
+            signal: outcome.signal,
+        }
+    }
 }
 
 /// The prober a gated readiness task — or a sheep's liveness loop — probes
@@ -6358,6 +6407,17 @@ mod tests {
         let list = handle.list().await;
         assert_eq!(list[0].status, ProcStatus::Errored);
         assert_eq!(list[0].restarts, 15); // respawns performed, not exits
+        // Task 49: an operator staring at `errored, restarts: 15` with no
+        // way to tell a boot loop from a spawn failure is the exact gap
+        // `last_exit` closes. The script's constant `code: 1` on its final,
+        // budget-exhausting exit must still be readable here.
+        assert_eq!(
+            list[0].last_exit,
+            Some(ExitInfo {
+                code: Some(1),
+                signal: None,
+            })
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -7348,6 +7408,35 @@ mod tests {
             handle.list().await.is_empty(),
             "a delete that raced an automatic restart must still deregister \
              the sheep, not leave one behind for the restart to bring back"
+        );
+    }
+
+    /// Task 49, Rin's own call on the open question in `handle_exited`'s own
+    /// doc: an operator's `shep stop` still ends the process by a real
+    /// signal, and `last_exit` must say so rather than going back to `None`
+    /// because shep, not a crash, asked for it. `never_exits` obeys the
+    /// ladder's first (`SIGTERM`) rung, so the wait resolves on that signal
+    /// rather than on `kill_tree`'s `SIGKILL` -- the raw number this test
+    /// pins is 15, the same constant `ExitOutcome`'s own doc names.
+    #[tokio::test(start_paused = true)]
+    async fn an_operators_stop_still_shows_its_signal_as_the_last_exit() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let app = AppConfig::minimal("svc", "./svc");
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+        let stopped = handle.stop(ProcessSelector::All).await.unwrap();
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].status, ProcStatus::Stopped);
+        assert_eq!(
+            stopped[0].last_exit,
+            Some(ExitInfo {
+                code: None,
+                signal: Some(15),
+            }),
+            "an operator's own stop must still show up as a last exit: {stopped:?}"
         );
     }
 
@@ -9543,6 +9632,48 @@ mod tests {
         let after = handle.list().await;
         assert_eq!(after[0].id, 1);
         assert_eq!(after[0].restarts, 1);
+    }
+
+    /// Task 49's sibling claim to the restart-count test above, same
+    /// fixture, same reasoning: `spawn_replacement` reads the drainee's
+    /// `last_exit` before the drainee itself has exited again for the
+    /// reload, so the replacement's answer to "why did this instance last
+    /// stop" must still be the manual restart's kill, not `None` reset by
+    /// the swap.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_carries_the_drainees_last_exit_to_its_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _runner, mut rx) = started(
+            &dir,
+            AppConfig::minimal("web", "./srv"),
+            vec![ProcScript::never_exits(); 3],
+        )
+        .await;
+        handle
+            .restart(ProcessSelector::Name("web".to_string()))
+            .await
+            .unwrap();
+        let restarted = handle.list().await;
+        let last_exit = restarted[0].last_exit;
+        assert!(
+            last_exit.is_some(),
+            "a manual restart is itself an exit, so this must not be None: {restarted:?}"
+        );
+
+        handle
+            .reload(ProcessSelector::Name("web".to_string()))
+            .await
+            .expect("the reload is accepted");
+        expect_event(&mut rx, 1, ProcessEventKind::Online).await;
+        expect_event(&mut rx, 0, ProcessEventKind::Delete).await;
+
+        let after = handle.list().await;
+        assert_eq!(after[0].id, 1);
+        assert_eq!(
+            after[0].last_exit, last_exit,
+            "a reload is not an exit -- the replacement must inherit the drainee's \
+             last_exit rather than reset it to None"
+        );
     }
 
     /// One process event, flattened to what a reload's bus claims are made

@@ -584,6 +584,7 @@ pub(crate) fn armed_entry(
         out_file: spec.out_file,
         err_file: spec.err_file,
         dog: None,
+        last_exit: None,
     }
 }
 

@@ -19,7 +19,11 @@ expression: out
       "cpu_percent": 12.5,
       "memory_bytes": 50462720,
       "dog": null,
-      "lambs": null
+      "lambs": null,
+      "last_exit": {
+        "code": 1,
+        "signal": null
+      }
     },
     {
       "id": 2,
@@ -34,7 +38,11 @@ expression: out
       "cpu_percent": 12.5,
       "memory_bytes": 50462720,
       "dog": null,
-      "lambs": null
+      "lambs": null,
+      "last_exit": {
+        "code": 1,
+        "signal": null
+      }
     },
     {
       "id": 3,
@@ -49,7 +57,11 @@ expression: out
       "cpu_percent": 12.5,
       "memory_bytes": 50462720,
       "dog": null,
-      "lambs": null
+      "lambs": null,
+      "last_exit": {
+        "code": 1,
+        "signal": null
+      }
     }
   ]
 }

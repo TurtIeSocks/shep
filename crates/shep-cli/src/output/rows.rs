@@ -13,7 +13,7 @@
 use serde::Serialize;
 use shep_core::barks::{Bark, SinkOutcome};
 use shep_core::protocol::{
-    ActionOutcome, ActionReply, DogSource, Lamb, LineOutcome, LineReply, ProcessInfo,
+    ActionOutcome, ActionReply, DogSource, ExitInfo, Lamb, LineOutcome, LineReply, ProcessInfo,
     SignalOutcome, SignalReply,
 };
 use shep_core::status::ProcStatus;
@@ -40,7 +40,7 @@ pub struct FlockRows(pub Vec<ProcessInfo>);
 impl Render for FlockRows {
     fn headers() -> &'static [&'static str] {
         &[
-            "ID", "NAME", "STATUS", "PID", "RESTARTS", "CPU", "MEM", "UPTIME", "FOLD",
+            "ID", "NAME", "STATUS", "PID", "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME", "FOLD",
         ]
     }
 
@@ -56,6 +56,7 @@ impl Render for FlockRows {
                     // padded table is indistinguishable from a rendering bug.
                     p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                     p.restarts.to_string(),
+                    exit_cell(p.pid, p.last_exit),
                     // `-` for the same reason, and for the same stated
                     // reason PID uses it: a sheep that is not running, or
                     // has been up for less than one sampling window, has no
@@ -104,6 +105,7 @@ impl Render for FlockRows {
             "STATUS" => "status",
             "PID" => "pid",
             "RESTARTS" => "restarts",
+            "EXIT" => "last_exit",
             "CPU" => "cpu_percent",
             "MEM" => "memory_bytes",
             "UPTIME" => "uptime_ms",
@@ -131,15 +133,26 @@ impl Render for FlockRows {
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "STATUS", "PID",
-    // "RESTARTS", "CPU", "MEM", "UPTIME", "FOLD"]`. `flock` is the table
-    // this whole feature is drawn of, so it is the one payload type the
-    // design spec gives an explicit priority table: ID/NAME/STATUS never
-    // drop (`0`), then UPTIME, PID, MEM, RESTARTS, CPU, FOLD, in that
+    // "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME", "FOLD"]`. `flock` is the
+    // table this whole feature is drawn of, so it is the one payload type
+    // the design spec gives an explicit priority table: ID/NAME/STATUS never
+    // drop (`0`), then UPTIME, PID, MEM, RESTARTS, CPU, EXIT, FOLD, in that
     // dropping order. `flock_priorities_line_up_with_flock_headers` (below)
     // pins both the length and which three columns sit at `0`, because
     // these two arrays drift silently -- a header inserted without its
     // priority shifts every priority after it onto the wrong column.
-    const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 5, 3, 1, 6];
+    //
+    // EXIT and FOLD are the only two columns sharing the "6 and up" tier,
+    // and deliberately not tied at the same number (task 49): EXIT is
+    // exactly the column an operator needs most when a sheep is dead --
+    // Rin's own boot-loop scenario is "errored, restarts: 15, and nothing
+    // says why" -- and least when everything is healthy, where it renders
+    // `-` for every row. FOLD, an organizational label rather than a
+    // diagnostic, keeps its long-standing spot as the single most droppable
+    // column; EXIT sits one tier below it, so a narrowing terminal loses
+    // FOLD before it loses the one column that answers "why is this row
+    // even here".
+    const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 6, 5, 3, 1, 7];
 }
 
 /// One sheep's STATUS cell, per spec §2 -- the only place in this module a
@@ -176,6 +189,72 @@ fn status_cell(status: ProcStatus, presentation: Presentation, status_word: bool
         text = format!("{style}{text}{style:#}");
     }
     text
+}
+
+/// The EXIT column's cell: the last exit's code or signal name for a sheep
+/// that is not currently running, `-` otherwise — the same convention PID/
+/// CPU/MEM already use for "no honest value to show" (`Self::rows`'s own
+/// comments give each of their reasons).
+///
+/// Gated on `pid` rather than `status` directly: `pid` is `None` for exactly
+/// the statuses with no live process to report (`Stopped`, `Errored`,
+/// `WaitingRestart`), and `Some` for every status with one still on the
+/// system (`Starting`, `Online`, and `Stopping` — a reload's drainee, still
+/// alive mid-drain) — the same fact `Self::rows`'s own PID cell already
+/// reads off `pid` rather than off `status`.
+fn exit_cell(pid: Option<u32>, last_exit: Option<ExitInfo>) -> String {
+    if pid.is_some() {
+        return "-".to_string();
+    }
+    match last_exit {
+        None => "-".to_string(),
+        Some(ExitInfo {
+            code: Some(code), ..
+        }) => code.to_string(),
+        Some(ExitInfo {
+            signal: Some(signal),
+            ..
+        }) => signal_label(signal),
+        // Both `None`: the daemon recorded an exit it could not characterize
+        // (see `ExitInfo`'s own doc). Not "no honest value" in the same
+        // sense the other two arms are, but nothing legible to print either.
+        Some(ExitInfo {
+            code: None,
+            signal: None,
+        }) => "-".to_string(),
+    }
+}
+
+/// Renders a raw unix signal number as its canonical name (`SIGKILL`), or
+/// the bare number when this platform's own signal table has none for it.
+///
+/// [`shep_core::signals::OperatorSignal`] deliberately carries no such
+/// accessor — see that type's own module doc — because a raw number is not
+/// portable across platforms and shep-core has no libc to resolve one
+/// against. This function does not have that problem: `shep-client` only
+/// ever reaches a daemon over a local unix socket (its own crate doc says
+/// so), so a `ProcessInfo` this binary is rendering was always produced by
+/// a daemon running the SAME OS as this binary — the signal table to
+/// resolve against is simply this platform's own.
+///
+/// `#[cfg(unix)]`/`#[cfg(not(unix))]` rather than a `cfg` inside the
+/// function body: `nix` is a unix-only dependency of this crate (see
+/// `Cargo.toml`'s `[target.'cfg(unix)'.dependencies]`), so a Windows build
+/// never links it. The Windows arm is effectively dead code in practice —
+/// `shep-client` being unix-only means no verb ever reaches this crate's
+/// Windows leg with a real `ProcessInfo` to render — but it still has to
+/// compile there, which is what `--target x86_64-pc-windows-gnu` checks.
+#[cfg(unix)]
+fn signal_label(raw: i32) -> String {
+    nix::sys::signal::Signal::try_from(raw)
+        .map_or_else(|_| raw.to_string(), |signal| signal.as_str().to_string())
+}
+
+/// Windows counterpart to the `#[cfg(unix)]` `signal_label` above — see its
+/// doc for why this arm is unreachable in practice yet still has to exist.
+#[cfg(not(unix))]
+fn signal_label(raw: i32) -> String {
+    raw.to_string()
 }
 
 /// The dogs half of a flock listing: the `ProcessInfo`s whose `dog` marker
@@ -268,12 +347,18 @@ impl Render for DogRows {
         // Same reason `FlockRows` keeps them out of its own table: absolute
         // paths, often longer than every other column put together. They
         // ride the JSON so a programmatic consumer can still find them.
-        "out_file", "err_file",
+        "out_file",
+        "err_file",
         // Always `null` here: only `Describe` walks for lambs, and this
         // table renders `ListFlock`'s dog half. A dog is one process by
         // contract, so a lamb tree for one is not a rendering this table
         // needs to grow to cover.
         "lambs",
+        // No EXIT column here (task 49): the task that added `last_exit`
+        // scoped the new table column to `shep flock`'s own sheep table.
+        // Rides the JSON anyway, same as every other field on this wire, so
+        // a consumer switching on `ProcessInfo` shape alone still sees it.
+        "last_exit",
     ];
 
     // Parallel to `headers()` above: `["NAME", "SOURCE", "STATUS", "PID",
@@ -683,6 +768,12 @@ impl Render for FlushedRows {
         // is not `Describe`. Same shape-consistency reason as the rest of
         // this list.
         "lambs",
+        // Same lifecycle-field reasoning as `status`/`pid`/`restarts` above:
+        // `flush` neither reads nor changes why a sheep last exited, and a
+        // column for it would still push OUT_FILE/ERR_FILE off the side of
+        // a terminal. Stays in the JSON for shape consistency with every
+        // other verb answering `ProcessInfo`.
+        "last_exit",
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "OUT_FILE",
@@ -1645,6 +1736,18 @@ pub(crate) mod tests {
             // rendering it as "48.1M" is the whole point of that function.
             .cpu_percent(Some(12.5))
             .memory_bytes(Some(50_462_720))
+            // Every row here is `pid: Some(..)` -- running -- so `exit_cell`
+            // renders `-` regardless of this value (task 49's own gate: EXIT
+            // only shows for a sheep with no live pid). Populated anyway,
+            // for the same "every Option field Some" reason the rest of
+            // this fixture is: `restarts(id)` above already implies a prior
+            // exit for every row past id 0, and leaving this `None` would
+            // make it a field the drift test's JSON-key check stops
+            // exercising via this fixture.
+            .last_exit(Some(ExitInfo {
+                code: Some(1),
+                signal: None,
+            }))
             .build()
     }
 
@@ -1771,8 +1874,71 @@ pub(crate) mod tests {
     fn flock_rows_do_not_drift() {
         // UPTIME, CPU and MEM are formatted (`human_duration`/`human_bytes`),
         // not raw echoes of `uptime_ms`/`cpu_percent`/`memory_bytes` — see
-        // the doc comment on `assert_no_drift` above.
-        assert_no_drift(&sample_flock(), |j| &j[0], &["UPTIME", "CPU", "MEM"]);
+        // the doc comment on `assert_no_drift` above. EXIT joins them for a
+        // different reason: its own JSON value (`last_exit`) is a nested
+        // object, not a scalar `assert_no_drift`'s per-cell comparison knows
+        // how to stringify, and every `sample_flock` row is `pid: Some(..)`
+        // besides, so the honest cell is always `-` regardless of what
+        // `last_exit` says.
+        assert_no_drift(
+            &sample_flock(),
+            |j| &j[0],
+            &["UPTIME", "CPU", "MEM", "EXIT"],
+        );
+    }
+
+    /// fails if the EXIT column stops reading `pid` before `last_exit`, or
+    /// stops rendering a code/signal legibly. `sample_flock`'s own fixture
+    /// cannot exercise this: every row there is `pid: Some(..)`, so the
+    /// cell is always `-` regardless of what `last_exit` says (task 49's
+    /// own design: EXIT answers "why is it not running", so a sheep that IS
+    /// running has nothing for it to say).
+    #[test]
+    fn the_exit_column_shows_the_last_exit_only_for_a_sheep_that_is_not_running() {
+        let headers = FlockRows::headers();
+        let at = |cells: &[String], h: &str| {
+            cells[headers.iter().position(|x| *x == h).unwrap()].clone()
+        };
+
+        // Never exited: no pid, no `last_exit`.
+        let never_run = ProcessInfo::builder(1, "fresh", ProcStatus::Stopped).build();
+        // Exited with a code: no pid, `last_exit` carries one.
+        let crashed = ProcessInfo::builder(2, "crashed", ProcStatus::Errored)
+            .last_exit(Some(ExitInfo {
+                code: Some(1),
+                signal: None,
+            }))
+            .build();
+        // Killed by a signal: no pid, `last_exit` carries one.
+        let killed = ProcessInfo::builder(3, "killed", ProcStatus::Stopped)
+            .last_exit(Some(ExitInfo {
+                code: None,
+                signal: Some(9),
+            }))
+            .build();
+        // Running again after a past exit: `last_exit` is still `Some`
+        // (sticky across a respawn — `ProcessInfo::last_exit`'s own doc),
+        // but a live pid means there is nothing for this column to say.
+        let running_again = ProcessInfo::builder(4, "recovered", ProcStatus::Online)
+            .pid(Some(4242))
+            .last_exit(Some(ExitInfo {
+                code: Some(1),
+                signal: None,
+            }))
+            .build();
+
+        let rows = FlockRows(vec![never_run, crashed, killed, running_again]).rows();
+        assert_eq!(at(&rows[0], "EXIT"), "-");
+        assert_eq!(at(&rows[1], "EXIT"), "1");
+        #[cfg(unix)]
+        assert_eq!(at(&rows[2], "EXIT"), "SIGKILL");
+        // Windows never carries a real `ProcessInfo` to render (`shep-
+        // client` is unix-only, so no verb reaches this crate's Windows leg
+        // with real data) but this file still has to compile there — see
+        // `signal_label`'s own doc for why its Windows arm is a bare number.
+        #[cfg(not(unix))]
+        assert_eq!(at(&rows[2], "EXIT"), "9");
+        assert_eq!(at(&rows[3], "EXIT"), "-");
     }
 
     /// fails if `LambRows` grows a field that never reaches the table, or

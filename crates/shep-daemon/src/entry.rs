@@ -3,7 +3,11 @@
 use core::time::Duration;
 use std::path::PathBuf;
 
-use shep_core::{config::ResolvedApp, protocol::DogSource, status::ProcStatus};
+use shep_core::{
+    config::ResolvedApp,
+    protocol::{DogSource, ExitInfo},
+    status::ProcStatus,
+};
 
 use crate::privilege::Credentials;
 
@@ -64,6 +68,25 @@ pub struct ProcessEntry {
     /// restart budget keyed on this field is the signal that the separate
     /// registry should have been built instead.
     pub dog: Option<DogSource>,
+    /// How this instance's process most recently stopped existing.
+    ///
+    /// Set unconditionally by `Actor::handle_exited` — the one place a
+    /// process under a registered id stops existing — for every exit,
+    /// including an operator's own `stop`/`delete`: the process still
+    /// genuinely stopped, and that stays true information regardless of who
+    /// asked for it. `None` for an entry that has never exited under this
+    /// daemon (a fresh [`Self::id`] from `Actor::spawn_fresh` or
+    /// `Actor::register_at_rest` — both private to this crate, so named in
+    /// code font rather than linked).
+    ///
+    /// Survives a respawn on purpose: `Actor::respawn` mutates this same
+    /// entry in place and never touches this field, so it keeps answering
+    /// "why did this instance last stop" through the
+    /// instance's next run, not just while it is down. A reload's
+    /// replacement entry (`spawn_replacement`) copies it from the drainee it
+    /// replaces for the same reason `restarts` and `dog` do — the
+    /// replacement is the same instance continuing, not a new one.
+    pub last_exit: Option<ExitInfo>,
 }
 
 /// Restart budget and consecutive-unstable-exit tracking

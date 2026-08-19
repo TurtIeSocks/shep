@@ -30,7 +30,11 @@ expression: replies
             "cpu_percent": 12.5,
             "memory_bytes": 50331648,
             "dog": null,
-            "lambs": null
+            "lambs": null,
+            "last_exit": {
+              "code": 1,
+              "signal": null
+            }
           }
         ]
       }
@@ -97,7 +101,11 @@ expression: replies
               "kind": "adopted",
               "path": "/usr/local/bin/shep-otel"
             },
-            "lambs": null
+            "lambs": null,
+            "last_exit": {
+              "code": 1,
+              "signal": null
+            }
           }
         ]
       }
@@ -134,7 +142,11 @@ expression: replies
           "dog": {
             "kind": "built_in"
           },
-          "lambs": null
+          "lambs": null,
+          "last_exit": {
+            "code": 1,
+            "signal": null
+          }
         }
       }
     }
@@ -290,7 +302,11 @@ expression: replies
             "cpu_percent": 12.5,
             "memory_bytes": 50331648,
             "dog": null,
-            "lambs": null
+            "lambs": null,
+            "last_exit": {
+              "code": 1,
+              "signal": null
+            }
           }
         ]
       }
@@ -356,7 +372,37 @@ expression: replies
                 "pid": 4244,
                 "name": "sh"
               }
-            ]
+            ],
+            "last_exit": null
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 24,
+    "result": {
+      "Ok": {
+        "kind": "flock",
+        "data": [
+          {
+            "id": 5,
+            "name": "worker",
+            "status": "stopped",
+            "pid": null,
+            "restarts": 1,
+            "uptime_ms": 0,
+            "fold": null,
+            "out_file": null,
+            "err_file": null,
+            "cpu_percent": null,
+            "memory_bytes": null,
+            "dog": null,
+            "lambs": null,
+            "last_exit": {
+              "code": null,
+              "signal": 15
+            }
           }
         ]
       }

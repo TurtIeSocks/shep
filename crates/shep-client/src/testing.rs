@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 
 use shep_core::protocol::{
-    BusEvent, DogSource, Envelope, Hello, HelloAck, HelloReply, Lamb, PROTOCOL_VERSION,
+    BusEvent, DogSource, Envelope, ExitInfo, Hello, HelloAck, HelloReply, Lamb, PROTOCOL_VERSION,
     ProcessEventKind, ProcessInfo, Reply, Request, Response, RpcError, RpcErrorCode, codec,
     decode_frame, encode_frame,
 };
@@ -162,6 +162,14 @@ pub fn sample_info() -> ProcessInfo {
         .memory_bytes(Some(48 * 1024 * 1024))
         .dog(Some(DogSource::BuiltIn))
         .lambs(Some(vec![Lamb::new(4243, "node")]))
+        // `restarts: 3` above already says this sheep has exited before;
+        // giving it a real outcome here rather than `None` keeps that
+        // consistent, and keeps this fixture exercising `last_exit`'s own
+        // JSON shape the same way it exercises every other field's.
+        .last_exit(Some(ExitInfo {
+            code: Some(1),
+            signal: None,
+        }))
         .build()
 }
 
@@ -259,7 +267,14 @@ enum ScriptCommand {
     /// until the connection has observed and answered a `Request::Subscribe`
     /// — see [`FakeDaemon::push`] for why — then written straight to the
     /// wire for as long as the subscription stays live.
-    PushEvent(BusEvent),
+    ///
+    /// Boxed (task 49): `BusEvent::Process` carries a `ProcessInfo`, which
+    /// grew past clippy's `large_enum_variant` threshold the moment
+    /// `last_exit` landed on it. Every other variant here is a handful of
+    /// bytes, so boxing this one rather than allowing the lint keeps the
+    /// enum's stack footprint tied to its smallest common case, not its
+    /// largest.
+    PushEvent(Box<BusEvent>),
     /// Ends the script: stop serving and let the task return.
     Close,
     /// Ends the script the moment this connection has answered its next
@@ -424,7 +439,10 @@ impl FakeDaemon {
     /// so a `push` racing the connection closing simply vanishes rather
     /// than panicking.
     pub async fn push(&self, event: BusEvent) {
-        let _ = self.script.send(ScriptCommand::PushEvent(event)).await;
+        let _ = self
+            .script
+            .send(ScriptCommand::PushEvent(Box::new(event)))
+            .await;
     }
 
     /// Pushes `EVENT_CHANNEL_CAPACITY + n` [`BusEvent::LogOut`] events in
@@ -550,9 +568,9 @@ async fn serve_scripted(
                     Some(ScriptCommand::ArmOutOfOrder) => out_of_order = OutOfOrder::Armed,
                     Some(ScriptCommand::PushEvent(event)) => {
                         if subscribed {
-                            write_event(&mut frames, event).await;
+                            write_event(&mut frames, *event).await;
                         } else {
-                            pending_events.push(event);
+                            pending_events.push(*event);
                         }
                     }
                     Some(ScriptCommand::CloseAfterSubscribe) => {

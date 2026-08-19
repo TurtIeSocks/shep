@@ -174,7 +174,7 @@ impl BusEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::request::ProcessInfo;
+    use crate::protocol::request::{ExitInfo, ProcessInfo};
     use crate::status::ProcStatus;
 
     #[test]
@@ -198,6 +198,14 @@ mod tests {
                     memory_bytes: None,
                     dog: None,
                     lambs: None,
+                    // `restarts: 2` already says this is not this sheep's
+                    // first exit; `handle_exited` sets `last_exit` before it
+                    // decides what to do with the exit, so the `Exit` event
+                    // this row pins carries the very outcome it announces.
+                    last_exit: Some(ExitInfo {
+                        code: Some(1),
+                        signal: None,
+                    }),
                 },
                 manually: false,
                 at_ms: 1_700_000_000_000,
@@ -221,6 +229,14 @@ mod tests {
             .uptime_ms(500)
             .out_file(Some("/home/rin/.shep/logs/web-0-out.log".to_string()))
             .err_file(Some("/home/rin/.shep/logs/web-0-err.log".to_string()))
+            // Reused below for `Stop` and `Delete` too — the two operator-
+            // caused endings, and proof that a `shep stop`/`shep delete`
+            // still carries the exit that produced them rather than losing
+            // it because an operator asked for it.
+            .last_exit(Some(ExitInfo {
+                code: Some(1),
+                signal: None,
+            }))
             .build();
 
         let lifecycle = [
@@ -324,6 +340,7 @@ mod tests {
                     memory_bytes: None,
                     dog: None,
                     lambs: None,
+                    last_exit: None,
                 },
                 manually: true,
                 at_ms: 0,

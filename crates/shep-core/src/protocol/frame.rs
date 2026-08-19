@@ -64,6 +64,7 @@ mod tests {
                 memory_bytes: None,
                 dog: None,
                 lambs: None,
+                last_exit: None,
             },
             manually: false,
             at_ms: 1_700_000_000_000,

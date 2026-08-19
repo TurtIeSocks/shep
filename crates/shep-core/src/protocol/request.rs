@@ -306,6 +306,58 @@ impl Lamb {
     }
 }
 
+/// Why a sheep's process most recently stopped existing under this daemon.
+///
+/// Not shep-daemon's own `ExitOutcome` reused directly: that type lives
+/// behind the spawn-runner seam (`ProcessRunner::wait`, in shep-daemon's
+/// `runner` module) and is free to grow with whatever the real runner needs
+/// to observe next without dragging a breaking wire change behind it — this
+/// one only ever grows on its own say-so. The two happen to carry the same
+/// two fields today because the runner's own observation IS the honest exit
+/// outcome; shep-daemon converts one into the other at the point it records
+/// it (`Actor::handle_exited`), rather than this crate depending on
+/// shep-daemon's internals to reuse its type.
+///
+/// A struct, not two flat `Option<i32>` fields on [`ProcessInfo`] directly:
+/// with two flat fields, "this sheep has never exited under this daemon"
+/// and "it exited, killed by a signal this daemon did not name" are both
+/// all-`None`, and a reader cannot tell those apart. Nested behind
+/// [`ProcessInfo::last_exit`]'s own `Option`, that ambiguity moves up a
+/// level where it belongs: `None` there means "never exited"; `Some` means
+/// "exited, and here is what this daemon knows about it" — which itself
+/// mirrors the OS's own exited-normally/killed-by-signal split
+/// (`WIFEXITED`/`WIFSIGNALED`): ordinarily exactly one of `code`/`signal` is
+/// `Some`. A reader must not assume both can never be `None` together,
+/// though — that would still mean "this daemon recorded an exit; it could
+/// not characterize how" rather than "this sheep never exited", and this
+/// type does not forbid it.
+///
+/// No `#[non_exhaustive]`, unlike every other struct on this wire: those
+/// grow because a discriminator does (`ProcessInfo`'s own doc lists its
+/// four so far); `code`/`signal` is already the complete
+/// exited-normally/killed-by-signal split the runner exposes, this crate
+/// has no libc to derive a richer wait-status decomposition from even if it
+/// wanted one, and there is no forecast next field. Adding the attribute
+/// back later is a compatible change the day a real need appears (IR-16
+/// style); carrying it now on nothing but "might grow" is the exact
+/// speculative case IR-20 warns against.
+// wire format: changing this is a breaking change
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitInfo {
+    /// The process's own exit code, set on a normal exit (`WIFEXITED`).
+    pub code: Option<i32>,
+    /// The raw unix signal number that ended the process, set when it did
+    /// not exit on its own (`WIFSIGNALED`) — an operator's own `shep stop`
+    /// or `shep delete` included: the process still genuinely stopped by a
+    /// signal, and that stays true information even though shep, not a
+    /// crash, is what asked for it. Raw and platform-specific for the same
+    /// reason [`crate::signals::OperatorSignal`] carries no such accessor —
+    /// see that type's own module doc — so rendering this as a name
+    /// (`SIGKILL` rather than `9`) is a job for whichever OS-aware layer
+    /// reads it, never for this crate.
+    pub signal: Option<i32>,
+}
+
 /// Snapshot of one sheep for listings and events
 // wire format: changing this is a breaking change
 //
@@ -343,14 +395,18 @@ impl Lamb {
 // compares a `ProcessInfo` for total equality — `assert_eq!` needs only
 // `PartialEq`, and no listing is keyed on, hashed by, or sorted by a whole
 // row.
-/// `#[non_exhaustive]`: this struct has now grown a field in four separate
+/// `#[non_exhaustive]`: this struct has now grown a field in five separate
 /// phases (`out_file`/`err_file`, then `cpu_percent`/`memory_bytes`, then
-/// `dog`, then `lambs`) with no hand-edit sweep across the workspace for any
-/// of them — the attribute is paying for itself exactly as advertised. There
-/// is no forecast next field; `deferred.md`'s `ProcessInfo` entry explicitly
-/// warns against growing this struct speculatively, so the attribute stays
-/// for whatever the next genuine need turns out to be, not for a named one.
-/// Use [`ProcessInfo::builder`] to construct one; the fields stay `pub`, so
+/// `dog`, then `lambs`, then `last_exit`) with no hand-edit sweep across the
+/// workspace for any of them — the attribute is paying for itself exactly
+/// as advertised. Corrected from an earlier version of this comment, which
+/// overstated `deferred.md`'s own `ProcessInfo` entry as a warning against
+/// growing this struct at all: what that entry actually defers is
+/// SPLITTING it into several smaller types, and calls this attribute plus
+/// [`ProcessInfo::builder`] "deliberately the opposite of forcing the split
+/// early" — i.e. exactly what makes a field like `last_exit` cheap to add
+/// for a concrete operator need, not a reason to withhold one. Use
+/// [`ProcessInfo::builder`] to construct one; the fields stay `pub`, so
 /// reading them and assigning to them are both unchanged.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -410,6 +466,19 @@ pub struct ProcessInfo {
     /// walk and is NOT the set of processes a stop kills; any output built from
     /// it has to say so where the operator will see it.
     pub lambs: Option<Vec<Lamb>>,
+    /// How this sheep's process most recently stopped existing under this
+    /// daemon. `None` while it has never exited under this daemon — either
+    /// it has not been started yet, or it is still on its very first run —
+    /// and also when the peer daemon predates this field, the same skew
+    /// rule [`Self::out_file`] documents for itself.
+    ///
+    /// Sticky across a respawn, deliberately: this is the daemon's answer
+    /// to "why did it last stop", not "is it stopped right now" — `status`
+    /// and `pid` already answer that, and a sheep back `Online` after a
+    /// crash still has a true story to tell about the crash that restarted
+    /// it. It updates only on the next exit, never cleared by one starting
+    /// back up.
+    pub last_exit: Option<ExitInfo>,
 }
 
 impl ProcessInfo {
@@ -442,6 +511,7 @@ impl ProcessInfo {
                 memory_bytes: None,
                 dog: None,
                 lambs: None,
+                last_exit: None,
             },
         }
     }
@@ -459,7 +529,8 @@ impl ProcessInfo {
 /// has nothing to say about that field.
 ///
 /// Defaults for the skipped fields are the ones a not-yet-running sheep has:
-/// no pid, no uptime, no restarts, no resource reading, not a dog.
+/// no pid, no uptime, no restarts, no resource reading, not a dog, never
+/// exited.
 #[derive(Debug, Clone)]
 #[must_use = "a builder that is never `build`-ed produces no ProcessInfo"]
 pub struct ProcessInfoBuilder {
@@ -524,6 +595,13 @@ impl ProcessInfoBuilder {
     /// Sets the sheep's lamb list; `None` when this reply did not walk for one.
     pub fn lambs(mut self, lambs: Option<Vec<Lamb>>) -> Self {
         self.info.lambs = lambs;
+        self
+    }
+
+    /// Sets how this sheep's process most recently stopped; `None` while it
+    /// has never exited under this daemon.
+    pub fn last_exit(mut self, last_exit: Option<ExitInfo>) -> Self {
+        self.info.last_exit = last_exit;
         self
     }
 
@@ -1000,6 +1078,13 @@ mod tests {
             memory_bytes: Some(48 * 1024 * 1024),
             dog: None,
             lambs: None,
+            // `restarts: 1` above already says this sheep crashed once and
+            // came back; a code rather than `None` is the honest exit that
+            // caused it, not a fact this fixture invents.
+            last_exit: Some(ExitInfo {
+                code: Some(1),
+                signal: None,
+            }),
         }
     }
 
@@ -1024,6 +1109,7 @@ mod tests {
         assert_eq!(info.memory_bytes, None);
         assert_eq!(info.dog, None);
         assert_eq!(info.lambs, None);
+        assert_eq!(info.last_exit, None);
     }
 
     /// fails if any setter writes a field other than its own — the failure a
@@ -1043,6 +1129,10 @@ mod tests {
             .cpu_percent(Some(12.5))
             .memory_bytes(Some(48 * 1024 * 1024))
             .dog(None)
+            .last_exit(Some(ExitInfo {
+                code: Some(1),
+                signal: None,
+            }))
             .build();
 
         // `sample_info()` is still a struct literal, on purpose: it is the one
@@ -1160,6 +1250,32 @@ mod tests {
         let fixture = r#"{"id":3,"name":"web","status":"online","pid":4242,"restarts":1,"uptime_ms":60000,"fold":"backend","out_file":"/l/o.log","err_file":"/l/e.log","cpu_percent":12.5,"memory_bytes":50331648}"#;
         let info: ProcessInfo = serde_json::from_str(fixture).unwrap();
         assert_eq!(info.dog, None);
+    }
+
+    /// fails if `last_exit` stops being optional. A daemon built before this
+    /// field sends a reply with no such key and still announces protocol 1 —
+    /// the same skew rule every other field added after `Hello`/`HelloAck`
+    /// were fixed is pinned under.
+    ///
+    /// This is also the empirical proof behind task 49's own open question:
+    /// none of `ProcessInfo`'s fields carry `#[serde(default)]`, and there is
+    /// no container-level one either, yet the doc comments on `out_file` and
+    /// `cpu_percent` both claim "`None` only when the peer daemon predates
+    /// this field" as though one existed. Serde's `Deserialize` derive
+    /// special-cases a field whose type is syntactically `Option<...>`: a
+    /// missing key resolves to `None` without `#[serde(default)]` doing
+    /// anything, because the derive macro recognizes the `Option` wrapper
+    /// itself and generates that fallback for it. Those doc comments were
+    /// right; they just named the wrong mechanism, or none. This test pins
+    /// the real one for `last_exit` specifically — with `dog` and `lambs`
+    /// present but `last_exit` genuinely absent from the JSON below — rather
+    /// than leaving it as an inference from `v1_process_info_without_a_dog_
+    /// marker_still_deserializes` above.
+    #[test]
+    fn a_process_info_without_a_last_exit_key_still_deserializes() {
+        let fixture = r#"{"id":3,"name":"web","status":"online","pid":4242,"restarts":1,"uptime_ms":60000,"fold":"backend","out_file":"/l/o.log","err_file":"/l/e.log","cpu_percent":12.5,"memory_bytes":50331648,"dog":null,"lambs":null}"#;
+        let info: ProcessInfo = serde_json::from_str(fixture).unwrap();
+        assert_eq!(info.last_exit, None);
     }
 
     /// fails if a `Signal` frame stops carrying the signal name as plain text, or
@@ -1689,6 +1805,25 @@ mod tests {
                     ProcessInfo::builder(3, "web", ProcStatus::Online)
                         .pid(Some(4242))
                         .lambs(Some(vec![Lamb::new(4243, "node"), Lamb::new(4244, "sh")]))
+                        .build(),
+                ])),
+            },
+            // `sample_info()` pins `last_exit`'s "exited normally" shape
+            // (`code` set, `signal` absent) on every row above; this is the
+            // only place the other one — killed by a signal, `code` absent
+            // — is pinned. `SIGTERM`'s raw number (15) rather than a
+            // symbolic one, because [`ExitInfo::signal`]'s own doc says this
+            // crate carries no name for it; naming one is a job for
+            // whichever OS-aware layer renders this field.
+            Reply {
+                id: 24,
+                result: Ok(Response::Flock(vec![
+                    ProcessInfo::builder(5, "worker", ProcStatus::Stopped)
+                        .restarts(1)
+                        .last_exit(Some(ExitInfo {
+                            code: None,
+                            signal: Some(15),
+                        }))
                         .build(),
                 ])),
             },
