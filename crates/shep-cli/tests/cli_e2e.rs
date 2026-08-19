@@ -5119,3 +5119,92 @@ fn the_alias_binaries_exist_and_reach_their_own_verbs() {
         );
     }
 }
+
+// --- Whole-branch review item 4 -------------------------------------------
+
+/// Shared by the case below: no ANSI escape byte, and none of the
+/// box-drawing glyphs `render_boxed` (`shep-cli/src/output/table.rs`) draws
+/// -- the hard rule's own two failure shapes, named once so a second verb's
+/// assertion cannot silently drift from the first's.
+fn assert_no_box_or_escape_reached_the_pipe(stdout: &str, verb: &str) {
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "shep {verb} piped: an escape byte reached a pipe: {stdout:?}"
+    );
+    for glyph in ['┌', '┬', '┐', '├', '┼', '┤', '└', '┴', '┘', '│', '─'] {
+        assert!(
+            !stdout.contains(glyph),
+            "shep {verb} piped: a box-drawing glyph ({glyph:?}) reached a pipe:\n{stdout}"
+        );
+    }
+}
+
+/// The spec's own claim (§5): "The existing e2e suite is the pipe test...
+/// If a border or an escape reaches piped stdout, it fails. No new test
+/// needed." False as this file stood: every table-shaped assertion above is
+/// `--format json`, which `must_render_bare` forces to `Bare` on its own
+/// separate axis regardless of terminal-ness, and the only table-mode
+/// stdout assertions anywhere in this file are `.contains(...)` checks on
+/// `bleats` log lines. A box border reaching piped `shep flock` at the
+/// default style would have left all of this file green.
+///
+/// `assert_cmd`'s `.output()` captures stdout through an OS pipe, never a
+/// pty, so `std::io::stdout().is_terminal()` is `false` for every
+/// invocation in this whole suite -- exactly `must_render_bare`'s own
+/// trigger (`lib.rs`), exercised here with no `--format json` and no
+/// `--style` flag at all: the plain `shep flock | less` / `shep flock >
+/// file` an operator actually types. This is the safety net for the single
+/// most important rule on the branch, and until this case it was guarded
+/// only by a unit test of the predicate (`must_render_bare_is_true...`,
+/// `lib.rs`) plus renderer tests handed `Presentation::BARE` by hand
+/// (`table.rs`'s own snapshots) -- never the real wiring between clap
+/// parsing a piped invocation and the byte this binary actually writes to
+/// the pipe `assert_cmd` opened.
+///
+/// Two verbs, not one: `flock` and `describe` go through `emit_flock`/
+/// `emit_described` respectively, both bespoke wrappers around `table_of`
+/// rather than a plain `emit` call (`output/mod.rs`'s own module doc), so a
+/// regression scoped to just one of the two would still pass a case that
+/// only ever tried the other.
+#[test]
+fn piped_table_output_at_the_default_style_carries_no_box_or_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&script)
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+    let envelope: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert_eq!(envelope["data"][0]["status"], "online", "{envelope}");
+
+    let flock = shep(dir.path()).arg("flock").output().unwrap();
+    assert_success(&flock);
+    let flock_stdout = String::from_utf8_lossy(&flock.stdout).into_owned();
+    assert_no_box_or_escape_reached_the_pipe(&flock_stdout, "flock");
+    assert!(
+        flock_stdout.contains("online"),
+        "precondition: the piped table must still say something: {flock_stdout}"
+    );
+
+    let describe = shep(dir.path())
+        .arg("describe")
+        .arg("all")
+        .output()
+        .unwrap();
+    assert_success(&describe);
+    let describe_stdout = String::from_utf8_lossy(&describe.stdout).into_owned();
+    assert_no_box_or_escape_reached_the_pipe(&describe_stdout, "describe");
+    assert!(
+        describe_stdout.contains("online"),
+        "precondition: the piped table must still say something: {describe_stdout}"
+    );
+
+    graceful_kill(dir.path());
+}
