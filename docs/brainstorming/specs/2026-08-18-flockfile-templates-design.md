@@ -1,7 +1,7 @@
 # Flockfile templates — design
 
 **Date:** 2026-08-18
-**Status:** approved 2026-08-19; every open question answered (see §6)
+**Status:** approved 2026-08-19; expanded the same day (see §8)
 **Scope:** `shep` (the CLI crate) and one new verb. No wire change, no daemon
 change.
 
@@ -218,3 +218,77 @@ templates cannot be written without them:
    its own checkout, so the `spawn_failed` she reported on 2026-08-18 was
    entirely the relative-path resolution bug fixed in `6cf7124`. The
    interpreter gap is real and unrelated to it.
+
+
+## 8. Expansion, decided by Rin 2026-08-19 while writing lesson 1
+
+Reviewing her own first skeleton against the spec, Rin named scenarios the
+one-axis design could not express:
+
+> "Helping a user get comfortable with setting up shep/flockfiles. A quick way
+> to create a new Flockfile. A convenient way to add a new app to an existing
+> flockfile. Adding a new dog to an existing flockfile. Maybe users would want
+> to augment their existing app entries on an existing flockfile with all of
+> the options available."
+>
+> "We have quite a lot of options and sometimes all of them would be desirable
+> and sometimes not. We wouldn't want to overwhelm a brand new user who hasn't
+> used shep or pm2 with everything but a veteran user might want to add them
+> all because they aren't 100% confident of the field names."
+
+That identifies a **second axis the original design collapsed into the first**.
+Verbosity is a property of the moment, not of the template: a newcomer and a
+veteran want the SAME template at different depths. Forcing it into
+`--template` yields `node` and `node-full` and `python` and `python-full`,
+which is the combinatorial smell.
+
+### The three axes
+
+| axis | values |
+|---|---|
+| **target** | new file, add an app, add a dog, expand an existing entry |
+| **depth** | curated default, or `--all` |
+| **kind** | `--template`: minimal, node, python, binary, static, cron |
+
+### Depth: two levels, default and `--all`
+
+**A consequence that cuts against intuition and must not be forgotten: only
+`--all` is machine-checkable.** The anti-drift test in §6 compares the
+skeleton against the schemars-generated schema, which works precisely because
+`--all` is meant to contain everything. The curated default is a human
+judgement about what matters on day one; no test can tell anyone it has gone
+stale. So the fuller level is the CHEAPER one to maintain and the friendly one
+carries the ongoing cost. Reviewers of the default level are reviewing
+editorial judgement, not correctness.
+
+### Kind: all six stay
+
+Offered a cut to three on the grounds that the interpreter mapping (task #47)
+had erased the difference between `node`, `python` and `binary`, Rin kept all
+six: `shep init --template node` is discoverable and reassuring in a way
+`--template service` is not, and the redundancy buys familiarity.
+
+They must then differ in SOMETHING or the help text lies. What legitimately
+differs is the **example script path** each one shows -- `./index.js`,
+`./main.py`, `./target/release/app` -- which is the teaching content, and the
+one or two fields that shape actually implies. `static` and `cron` remain
+structurally distinct as before.
+
+Test matrix: 6 templates x 2 depths = 12 outputs, each round-tripped through
+the real parser. Cheap, and the `--all` half is additionally schema-checked.
+
+### Augment: in scope
+
+`shep init --all` pointed at an app that already exists rewrites that entry to
+carry a commented-out line for every option it has not set, preserving the
+operator's own values, comments and key order.
+
+This is the hardest piece in the feature and the only one that REWRITES rather
+than appends, so `shep_toml.rs`'s conventions bind hardest here: the lock, the
+atomic stage-and-rename, the refusal that does not clobber a file it could not
+parse, and both hard-won lessons -- no `.expect()` on a shape an operator can
+hand-write, and a refused write must not rewrite the file (assert on inode and
+mode, not on bytes).
+
+It is also the scenario that most directly serves the veteran who cannot
+remember a field name, applied to the file they already have.
