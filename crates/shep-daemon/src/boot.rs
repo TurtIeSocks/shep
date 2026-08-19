@@ -356,6 +356,18 @@ fn warn_if_socket_dir_is_loose(socket: &Path) {
 /// - [`BootError::AlreadyRunning`] — a live daemon answered on the socket.
 /// - [`BootError::Io`] — bind, probe, or unlink failed.
 pub(crate) fn bind_socket(paths: &ShepPaths, socket: &Path) -> Result<UnixListener, BootError> {
+    // Ahead of the bind, because the kernel's own refusal names neither the
+    // limit nor `$SHEP_HOME`. `sun_path` is 104 bytes on macOS and 108 on
+    // Linux, and it holds a NUL terminator, so the usable length is one less.
+    const SUN_PATH_CAPACITY: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
+    let len = socket.as_os_str().as_encoded_bytes().len();
+    if len >= SUN_PATH_CAPACITY {
+        return Err(BootError::SocketPathTooLong {
+            path: socket.to_path_buf(),
+            len,
+            limit: SUN_PATH_CAPACITY - 1,
+        });
+    }
     warn_if_socket_dir_is_loose(socket);
     match UnixListener::bind(socket) {
         Ok(listener) => Ok(listener),
@@ -1183,6 +1195,22 @@ pub enum BootError {
     },
     /// The muster roll exists but could not be read or parsed on restore
     Snapshot(SnapshotError),
+    /// `$SHEP_HOME` puts the control socket past the platform's `sun_path`
+    /// limit, so no bind could ever succeed (carries the path and the limit)
+    ///
+    /// Checked before the bind rather than translated after it: the kernel's
+    /// own `ENAMETOOLONG` names neither the limit nor the variable
+    /// responsible, and an operator reading it has no way to know that the
+    /// number is 104 here and 108 on Linux, nor that `$SHEP_HOME` is what
+    /// feeds it.
+    SocketPathTooLong {
+        /// The socket path that would not fit
+        path: PathBuf,
+        /// Its length in bytes
+        len: usize,
+        /// This platform's `sun_path` capacity in bytes
+        limit: usize,
+    },
     /// Writing the readiness line to the caller-adopted readiness pipe
     /// failed (carries the OS error)
     ///
@@ -1206,6 +1234,13 @@ impl fmt::Display for BootError {
             }
             Self::AlreadyRunning { pid: None } => write!(f, "a shep daemon is already running"),
             Self::Snapshot(err) => write!(f, "muster roll restore failed: {err}"),
+            Self::SocketPathTooLong { path, len, limit } => write!(
+                f,
+                "the control socket path is {len} bytes and this platform allows {limit}: `{}`. \
+                 A unix socket path is bounded by the kernel, not by shep, so a shorter \
+                 $SHEP_HOME is the only fix.",
+                path.display()
+            ),
             Self::ReadyWrite(err) => write!(f, "writing the readiness line failed: {err}"),
         }
     }
@@ -1216,6 +1251,9 @@ impl core::error::Error for BootError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::AlreadyRunning { .. } => None,
+            // No source: nothing failed underneath, the path was refused
+            // before any syscall was attempted.
+            Self::SocketPathTooLong { .. } => None,
             Self::Snapshot(err) => Some(err),
             Self::ReadyWrite(err) => Some(err),
         }
@@ -1344,6 +1382,41 @@ mod tests {
         assert_eq!(socket_path(&paths, None), paths.socket);
         let custom = dir.path().join("custom.sock");
         assert_eq!(socket_path(&paths, Some(&custom)), custom);
+    }
+
+    /// The kernel's own refusal is `ENAMETOOLONG` and names neither the
+    /// limit nor the variable that produced it. An operator whose
+    /// `$SHEP_HOME` is a few directories too deep has no way to guess that
+    /// the number is 104 here and 108 on Linux.
+    #[tokio::test]
+    async fn an_over_length_socket_path_names_the_limit_and_the_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+
+        // Comfortably past both platforms' capacity, without depending on
+        // which one this is.
+        let long = dir.path().join("x".repeat(200));
+
+        let err = bind_socket(&paths, &long).expect_err("a path this long cannot bind");
+        assert!(
+            matches!(err, BootError::SocketPathTooLong { .. }),
+            "refused before the syscall, not translated after it: {err:?}"
+        );
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("$SHEP_HOME"),
+            "the message names what to shorten: {rendered}"
+        );
+        assert!(
+            rendered.contains("bytes"),
+            "and the limit it is measured against: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\u{2014}') && !rendered.contains('\u{2013}'),
+            "no em or en dash in copy a user reads: {rendered}"
+        );
     }
 
     #[tokio::test]
