@@ -66,10 +66,10 @@ fn curated() -> String {
 #name = "my-first-sheep"
 # The script that shep should use to launch your app
 #script = "./index.js"
-# Restarts the process automatically when it exists unexpectedly
+# Restarts the process automatically when it exits unexpectedly
 #autorestart = true
-# shep automatically derives this but it can be overridden
-##cwd = "~/web-server"
+# Falls back to the cwd of the shep daemon if omitted
+#cwd = "/srv/web-server"
 "#
     .to_string()
 }
