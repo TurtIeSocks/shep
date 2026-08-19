@@ -2718,4 +2718,44 @@ pub(crate) mod tests {
         assert_priorities_match_headers::<KvRows>(&["KEY", "VALUE"]);
         assert_priorities_match_headers::<KvUnsetRow>(&["REMOVED"]);
     }
+
+    /// The floor-set check above cannot see two non-floor columns trading
+    /// numbers, because both stay non-zero and the lengths still agree. The
+    /// flock listing is the one table whose drop order the spec states
+    /// outright, so that order is pinned here column by column: a swap
+    /// between, say, `EXIT` and `CPU` would change what an operator loses
+    /// first on a narrowing terminal, and nothing else would notice.
+    ///
+    /// `EXIT` before `CPU` is the one placement here worth arguing about.
+    /// It reads `-` for every running sheep, so on a healthy flock it is an
+    /// empty column outranking a live number, which is why it sits where it
+    /// does. The case against: a narrow terminal is most often being read
+    /// BECAUSE something is wrong, and for a dead sheep `EXIT` is the only
+    /// column still saying anything while `CPU` has gone to `-` itself.
+    /// Left as it is rather than flipped on one person's reading; if it
+    /// moves, this test is the place that records the decision.
+    #[test]
+    fn the_flock_listing_drops_its_columns_in_the_documented_order() {
+        let mut ranked: Vec<(&str, u8)> = FlockRows::headers()
+            .iter()
+            .copied()
+            .zip(FlockRows::PRIORITIES.iter().copied())
+            .collect();
+        ranked.sort_by_key(|&(_, priority)| priority);
+
+        let order: Vec<&str> = ranked.iter().map(|&(header, _)| header).collect();
+        assert_eq!(
+            order,
+            vec![
+                // The three that identify a sheep, and so never drop.
+                "ID", "NAME", "STATUS", //
+                // Then, in the order they are given up as the terminal
+                // narrows: the ones answering "is it healthy" outlast the
+                // ones answering "which one is it".
+                "UPTIME", "PID", "MEM", "RESTARTS", "CPU", "EXIT", "FOLD",
+            ],
+            "the flock listing's drop order changed; if that is deliberate, \
+             change this test and say why in the commit"
+        );
+    }
 }
