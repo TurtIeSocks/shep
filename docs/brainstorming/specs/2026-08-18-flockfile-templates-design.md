@@ -1,7 +1,7 @@
 # Flockfile templates — design
 
 **Date:** 2026-08-18
-**Status:** draft, awaiting Rin's review — nothing implemented
+**Status:** approved 2026-08-19; every open question answered (see §6)
 **Scope:** `shep` (the CLI crate) and one new verb. No wire change, no daemon
 change.
 
@@ -175,13 +175,46 @@ away, not requirements she stated:
 6. **`--force` only replaces whole files.** There is no forced append,
    because the failure modes of append are refusals that mean something.
 
-## 6. Open questions for Rin
+## 6. Answered by Rin, 2026-08-19
 
-1. **Does `shep init` with no arguments scaffold an empty `app = []`, or
-   refuse and ask for a script?** An empty Flockfile is valid and gives
-   something to edit; refusing is more honest about needing input. Leaning
-   toward emitting the commented skeleton, since editing beats remembering.
-2. **Should `shep init` offer to write the interpreter mapping** from task
-   #47 into `shep.toml` at the same time, or stay strictly a Flockfile verb?
-3. **Is `static` in scope?** It scaffolds `shep serve` rather than a user
-   process, which is a slightly different thing wearing the same shape.
+1. **Bare `shep init` emits a skeleton, and a fuller one than proposed.** Not
+   an empty `app = []`: a Flockfile carrying a commented-out `[[app]]` AND a
+   commented-out `[dog.<name>]`, each showing its full set of options.
+
+   **This makes the scaffolded file the reference documentation**, which is
+   the point, and creates the one real risk in this feature: a hand-written
+   full-options block drifts from the parser the first time a field is added
+   or renamed, and a stale reference is worse than none because people trust
+   it. Mitigation, which the plan must carry: the skeleton is checked against
+   `crates/shep-core/assets/flockfile.schema.json` — itself generated from
+   the parser's own document type via schemars — by a test asserting that
+   every key the skeleton mentions exists in the schema, and that every
+   documented option in the schema appears in the skeleton. Adding a field to
+   the parser then fails that test until the skeleton catches up.
+
+2. **`shep init` also offers to write the interpreter mapping.** Paired with
+   the answer to the first point of §7 below: both halves of the fresh-install
+   problem get solved in the same place rather than each solving half.
+
+3. **`static` stays in scope.**
+
+## 7. The interpreter decisions this depends on (task #47)
+
+Answered at the same time, recorded here because the `node` and `python`
+templates cannot be written without them:
+
+1. **First run writes a starter mapping.** The mapping is opt-in, so without
+   this a fresh install still cannot run the `shep start server.js` that
+   `welcome.rs` and `--help` advertise in three places. shep is scaffolding
+   `~/.shep/shep.toml` anyway; the mapping is visible and editable the moment
+   it exists, which keeps it honest rather than magic.
+2. **A per-invocation `--interpreter` override exists**, for one-offs.
+3. **Precedence is `shep.toml` then Flockfile then flag, last wins.** The
+   same `file < env < flags` layering `DaemonConfig` already uses, with the
+   Flockfile between them because it is the more specific statement about a
+   particular flock.
+4. **Rin's own services did not depend on any of this.** `zeus-auth` is a
+   compiled binary started as `shep start ./target/release/zeus-auth` from
+   its own checkout, so the `spawn_failed` she reported on 2026-08-18 was
+   entirely the relative-path resolution bug fixed in `6cf7124`. The
+   interpreter gap is real and unrelated to it.
