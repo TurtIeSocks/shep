@@ -2321,6 +2321,13 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.entry.status = ProcStatus::Errored;
                 slot.entry.pid = None;
                 slot.entry.started_at = None;
+                // Cleared, because nothing exited here: the spawn itself
+                // failed, so there is no exit to report. Leaving the
+                // previous process's code in place would show a sheep that
+                // once crashed with 1 as still crashing with 1 while it is
+                // in fact failing to start at all -- and telling those two
+                // apart is the whole reason this field exists.
+                slot.entry.last_exit = None;
                 slot.ctl = None;
                 // Already `None` on every route into a respawn: all three
                 // callers reach it only for an id whose `ctl` is clear, and
@@ -7437,6 +7444,42 @@ mod tests {
                 signal: Some(15),
             }),
             "an operator's own stop must still show up as a last exit: {stopped:?}"
+        );
+    }
+
+    /// A respawn that never spawns must not keep showing the PREVIOUS
+    /// process's exit code. The two failures look identical in the status
+    /// column -- both land in `Errored` -- and `last_exit` is the only thing
+    /// that separates "your app crashed with 1" from "shep could not start
+    /// your app at all", which is the entire question this field was added
+    /// to answer.
+    ///
+    /// `ScriptedRunner` hands out `SpawnFailed` once its script list is
+    /// exhausted, so one script that exits `1` gives exactly the sequence:
+    /// a real exit that records a code, then a respawn that fails to spawn.
+    #[tokio::test(start_paused = true)]
+    async fn a_respawn_that_fails_to_spawn_clears_the_previous_exit_code() {
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::const_exit(1)]);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let app = AppConfig::minimal("svc", "./svc");
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+        // Let the exit, the restart decision and the failed respawn all land.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        let listing = handle.list().await;
+        assert_eq!(listing.len(), 1);
+        assert_eq!(
+            listing[0].status,
+            ProcStatus::Errored,
+            "a respawn that cannot spawn is still terminal: {listing:?}"
+        );
+        assert_eq!(
+            listing[0].last_exit, None,
+            "nothing exited on the failed respawn, so the earlier code must \
+             not still be showing: {listing:?}"
         );
     }
 
