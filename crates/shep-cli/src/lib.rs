@@ -329,13 +329,19 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
 /// layering for `SHEP_LOG_JSON`/`SHEP_LOG_LEVEL`/`SHEP_SOCKET`/
 /// `SHEP_MAX_CRON_SLEEP` — none of which touches `[style]` in either
 /// direction, so `None` here defends nothing and costs nothing either.
+///
+/// Parses the level through [`style::StyleLevel::parse`], the same function
+/// `resolve_style` hands `$SHEP_STYLE` to -- not `clap::ValueEnum::from_str`,
+/// which this used to call directly. The two disagreed on whitespace
+/// (`from_str` does not trim), so `SHEP_STYLE=" full "` resolved while
+/// `level = " full "` silently did not; `style_from_config_trims_the_same_way_shep_style_does`
+/// (below) pins that they now agree.
 fn style_from_config(shep_toml: Option<&str>) -> Option<style::StyleLevel> {
-    use clap::ValueEnum;
     shep_core::config::DaemonConfig::load(shep_toml, &|_| None)
         .ok()?
         .style
         .level
-        .and_then(|raw| style::StyleLevel::from_str(&raw, true).ok())
+        .and_then(|raw| style::StyleLevel::parse(&raw))
 }
 
 /// Resolves the level in force and which layer chose it: `--style`, then
@@ -1952,6 +1958,32 @@ mod tests {
             None,
             "a level this build does not recognise"
         );
+    }
+
+    /// Whole-branch review item 5: `style_from_config` and `resolve_style`'s
+    /// own `$SHEP_STYLE` handling used to go through two different parsers
+    /// for the one grammar -- `clap::ValueEnum::from_str` for the config
+    /// file, `style::StyleLevel::parse` for the env var -- and only the
+    /// latter trimmed whitespace. `SHEP_STYLE=" full "` resolved;
+    /// `level = " full "` silently did not. Both now go through
+    /// `StyleLevel::parse`, so this pins that they agree, padding and all,
+    /// rather than trusting the doc's claim of one shared parser without a
+    /// test that would catch a future regression back to two.
+    #[test]
+    fn style_from_config_trims_the_same_way_shep_style_does() {
+        for raw in ["full", " full ", "\tfull\n", "FULL", " FuLl "] {
+            assert_eq!(
+                style_from_config(Some(&format!("[style]\nlevel = {raw:?}\n"))),
+                Some(style::StyleLevel::Full),
+                "shep.toml's own level must accept {raw:?} exactly as \
+                 $SHEP_STYLE would"
+            );
+            assert_eq!(
+                style::resolve(None, Some(raw), None),
+                (style::StyleLevel::Full, style::StyleSource::Env),
+                "$SHEP_STYLE must accept {raw:?}"
+            );
+        }
     }
 
     /// fails if `resolve_style` stops honouring `--style`, ignores

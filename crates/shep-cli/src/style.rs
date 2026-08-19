@@ -13,10 +13,16 @@ use std::fmt;
 ///
 /// `clap::ValueEnum` so `--style` and this type's own [`Self::parse`] agree
 /// on spelling by construction: clap's derive and `parse` both lowercase the
-/// variant name, so `full`/`plain`/`bare` is the one grammar, read by the
-/// flag, `$SHEP_STYLE`, and `shep.toml`'s `[style] level` alike (the latter
-/// two go through [`clap::ValueEnum::from_str`], the flag through clap's own
-/// parser).
+/// variant name, so `full`/`plain`/`bare` is the one grammar -- but it is
+/// [`Self::parse`] alone that reads it for both of the two free-form text
+/// sources, `$SHEP_STYLE` (`lib.rs`'s `resolve_style`, through
+/// [`resolve`]) and `shep.toml`'s `[style] level` (`lib.rs`'s
+/// `style_from_config`). The flag goes through clap's own parser instead,
+/// because clap owns argv. `[style] level` used to go through
+/// [`clap::ValueEnum::from_str`] as well -- a second parser for the same
+/// grammar that happened to agree on case but not on whitespace, since
+/// `from_str` does not trim: `SHEP_STYLE=" full "` resolved and
+/// `level = " full "` silently did not. One grammar, one parser, now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum StyleLevel {
     /// Sheep, boxes and colour.
@@ -32,9 +38,11 @@ impl StyleLevel {
     /// Whether sheep appear at all.
     ///
     /// Read by `output::rows::FlockRows`'s own STATUS cell, which draws the
-    /// face at `Full` and nothing but the plain status word otherwise.
-    /// Milestone sheep art elsewhere (an empty flock, `shep muster`) is a
-    /// separate, later task's job and is not gated here.
+    /// face at `Full` and nothing but the plain status word otherwise, and
+    /// by the milestone sheep art elsewhere (`commands/query.rs`'s empty
+    /// flock, `commands/muster.rs`'s restored roll) -- both gate on exactly
+    /// this method, alongside `Format::Table`, before ever calling into
+    /// `flourish`.
     pub(crate) const fn sheep(self) -> bool {
         matches!(self, Self::Full)
     }
@@ -61,8 +69,17 @@ impl StyleLevel {
         matches!(self, Self::Full | Self::Plain)
     }
 
-    /// Parses one of the three level names, case-insensitively.
-    fn parse(raw: &str) -> Option<Self> {
+    /// Parses one of the three level names, case-insensitively and with
+    /// surrounding whitespace trimmed first.
+    ///
+    /// The one parser for both free-form text sources of a level:
+    /// `$SHEP_STYLE` (via [`resolve`]) and `shep.toml`'s `[style] level`
+    /// (`lib.rs`'s `style_from_config`) both read a level through this
+    /// function and nowhere else, so the two can never silently disagree
+    /// on what counts as valid input the way trimming-vs-not once let them.
+    /// `pub(crate)` rather than private for exactly that reason:
+    /// `style_from_config` lives in `lib.rs`, outside this module.
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "full" => Some(Self::Full),
             "plain" => Some(Self::Plain),

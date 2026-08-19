@@ -245,8 +245,10 @@ pub fn emit<T: Render>(
 /// whichever `presentation.level` calls for.
 ///
 /// The one branch [`emit`], [`emit_flock`] and [`emit_described`] all make on
-/// every table they render, factored out here so those four call sites stay
-/// one decision instead of reimplementing it four times. [`table::render_boxed`]
+/// every table they render, factored out here so those five call sites --
+/// `emit` once, `emit_flock` and `emit_described` twice each, one per table
+/// either renders -- stay one decision instead of reimplementing it five
+/// times. [`table::render_boxed`]
 /// needs a terminal width; `presentation.width` is [`terminal_width`] already
 /// resolved once at the seam (`lib.rs`'s `run_argv`) rather than re-measured
 /// by this function itself -- see [`crate::style::Presentation`]'s own doc
@@ -502,9 +504,9 @@ pub fn emit_error(
 /// gets its own envelope key instead of a borrowed one.
 ///
 /// Only ever constructed by [`emit_notice`], whose own doc explains the
-/// `#[cfg_attr(windows, allow(dead_code))]` this struct also carries: its
-/// one caller, `bleats.rs`, lives in `commands/`, which is
-/// `#[cfg(unix)]`-gated in `main.rs`.
+/// `#[cfg_attr(windows, allow(dead_code))]` this struct also carries: every
+/// one of its callers lives in `commands/` or in `lib.rs`'s `#[cfg(unix)]`
+/// arms, so nothing on Windows ever reaches this either.
 #[derive(Debug, Serialize)]
 #[cfg_attr(windows, allow(dead_code))]
 struct NoticeEnvelope<'a> {
@@ -520,26 +522,38 @@ struct NoticeBody<'a> {
     message: &'a str,
 }
 
-/// Renders a non-failure diagnostic to `err` in `fmt`. Same stream as
-/// [`emit_error`] (stderr — a notice is not a sheep's line, and not a
-/// command's own rendered output either) but a different envelope key, so a
+/// Renders a non-failure diagnostic to whichever stream `out` names, in
+/// `fmt`, with a different envelope key than [`emit_error`] so a
 /// `--format json` consumer can tell a diagnostic from a failure without
 /// also cross-referencing the process exit code.
+///
+/// `out` is a plain parameter rather than always `streams.err`, because a
+/// notice plays two different roles depending on the verb: `bleats.rs`'s
+/// own follow-mode notices (the daemon shutting down, a lagged read) and
+/// `commands::muster::muster`'s "the roll restored nothing" are diagnostic
+/// asides beside a *separate* primary output (a log stream, a table), and
+/// pass `streams.err` -- the stream [`emit_error`] also uses, since a
+/// notice is not a sheep's line and not that separate output either. But
+/// `Commands::Style`'s no-table report and `start_bare_shepherd`'s (both
+/// `lib.rs`) pass `streams.out`: neither verb renders anything else, so the
+/// notice IS the command's whole answer, and belongs where an operator
+/// piping this command's real output expects to find it.
 ///
 /// `code` is caller-defined, unlike `emit_error`'s `ExitCode::code_str()`:
 /// a notice's code is never part of the exit-code taxonomy — that gap is
 /// the whole reason this function exists rather than every notice call site
 /// continuing to borrow [`emit_error`].
 ///
-/// Not called outside this module's own tests on Windows: its one caller,
-/// `bleats.rs`, lives in `commands/`, which is `#[cfg(unix)]`-gated in
-/// `main.rs` — same reason [`Streams::out`] carries the same attribute.
+/// Not called outside this module's own tests on Windows: every caller
+/// above -- `bleats.rs`/`muster.rs` in `commands/`, `Commands::Style`/
+/// `start_bare_shepherd` in `lib.rs` -- is `#[cfg(unix)]`-gated, directly or
+/// through `commands/`'s own module-level gate in `main.rs`.
 ///
 /// # Errors
 /// The underlying write failed.
 #[cfg_attr(windows, allow(dead_code))]
 pub fn emit_notice(
-    err: &mut dyn io::Write,
+    out: &mut dyn io::Write,
     fmt: Format,
     code: &str,
     message: &str,
@@ -550,10 +564,10 @@ pub fn emit_notice(
                 schema_version: SCHEMA_VERSION,
                 notice: NoticeBody { code, message },
             };
-            serde_json::to_writer(&mut *err, &envelope)?;
-            writeln!(err)
+            serde_json::to_writer(&mut *out, &envelope)?;
+            writeln!(out)
         }
-        Format::Table => writeln!(err, "notice[{code}]: {message}"),
+        Format::Table => writeln!(out, "notice[{code}]: {message}"),
     }
 }
 

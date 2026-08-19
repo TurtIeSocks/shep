@@ -57,14 +57,21 @@ const STATUS_ORDER: [ProcStatus; 6] = [
     ProcStatus::Errored,
 ];
 
-/// Joins already-resolved `faces` into one row, indented four columns to
+/// Joins already-resolved `faces` into one row, indented five columns to
 /// match `welcome.rs`'s own left margin, each face separated by [`GAP`].
+///
+/// Five, not four: `welcome.rs`'s own `ART` draws its leftmost sheep's face
+/// row (`( o.o )`) five columns in -- verified by rendering the two
+/// together rather than assumed, since `ART`'s own lines are not a uniform
+/// block (they range from three to seven columns of leading whitespace
+/// across the picture) and only the face row's own margin is the one this
+/// function means to match.
 ///
 /// The shared low-level builder: [`row`] calls it for the uniform case,
 /// [`mustered`] for the mixed one, so the margin and the gap are each
 /// spelled once.
 fn faces_row(faces: &[&'static str]) -> String {
-    let mut line = String::from("    ");
+    let mut line = String::from("     ");
     for (i, face) in faces.iter().enumerate() {
         if i > 0 {
             line.push_str(GAP);

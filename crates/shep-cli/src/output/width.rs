@@ -29,11 +29,8 @@
 /// first -- but both now run, in that order, on every cell the box-drawn
 /// renderer prints.
 ///
-/// Not called outside this module's own tests yet: the caller is Task 4,
-/// the box-drawn table that pads a cell by this instead of by `len()`.
-/// `#[allow(dead_code)]` says so explicitly rather than inventing a call
-/// site nothing needs yet.
-#[allow(dead_code)]
+/// Called from non-test code by `table.rs`'s `column_widths` and
+/// `boxed_row`, which pad every cell by this instead of by `len()`.
 #[must_use]
 pub(crate) fn visible_width(s: &str) -> usize {
     let mut width = 0;
