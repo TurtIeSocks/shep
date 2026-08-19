@@ -50,83 +50,158 @@ pub(crate) enum Depth {
     All,
 }
 
+/// The preamble a scaffolded Flockfile opens with, above the first entry.
+///
+/// Hand-written and staying that way: it is not per-field content, so there
+/// is nothing for the generator to derive it from.
+const PREAMBLE: &str = "# Manage your app in a Flockfile\n\
+# Add as many apps as you would like using TOML syntax\n\n";
+
+/// The fields [`Depth::Curated`] shows, in the order it shows them.
+///
+/// An explicit ordered list rather than a `curated` flag scattered across
+/// `AppConfig`'s attributes, because membership and ORDER are one editorial
+/// decision and belong in one place a person can read at a glance. The order
+/// is a narrative: what is it, what runs, keep it alive, where it runs.
+///
+/// Generation cannot supply this. schemars emits properties into a sorted
+/// map, so a derived curated file would read `autorestart, cwd, name,
+/// script` -- alphabetical, and meaningless to someone opening it first.
+/// (Recovering the struct's own declaration order would mean enabling
+/// serde_json's `preserve_order` workspace-wide, which would also reorder
+/// every `--format json` payload shep emits: far too large a hammer.)
+///
+/// Every name here is asserted to exist in the schema, so renaming a field
+/// fails the build rather than silently dropping a row.
+const CURATED: &[&str] = &["name", "script", "autorestart", "cwd"];
+
+/// Group order for [`Depth::All`], coarsest concern first: what it is and
+/// what runs, then what it receives, then how it is kept alive, then when.
+///
+/// Fields carrying no `group` in their `init` metadata sort after all of
+/// these. That is deliberate rather than tidy -- half of `AppConfig` is
+/// currently ungrouped, so half the full scaffold is still alphabetical, and
+/// leaving those at the end makes the gap visible instead of hiding it in
+/// the middle.
+const GROUP_ORDER: &[&str] = &["process", "inputs", "control", "cron"];
+
 impl Depth {
     pub(crate) fn curated() -> String {
-        r#"# Manage your app in a Flockfile
-# Add as many apps as you would like using TOML syntax
-
-#[[app]]
-# A convenient and unique name for shep to display
-#name = "my-first-sheep"
-# The script that shep should use to launch your app
-#script = "./index.js"
-# Restarts the process automatically when it exits unexpectedly
-#autorestart = true
-# Falls back to the cwd of the shep daemon if omitted
-#cwd = "/srv/web-server"
-"#
-        .to_string()
+        format!("{PREAMBLE}{}", rows(CURATED.iter().copied()))
     }
 
     pub(crate) fn all() -> String {
-        let schema = config::flockfile_schema_json();
-        let props = schema
-            .pointer("#/$defs/AppConfig/properties")
-            .expect("app config properties must exist")
-            .as_object()
-            .expect("props must be an object");
-
-        let prop_rows = props
-            .iter()
-            .map(|(k, v)| {
-                let mut desc_row = String::new();
-                if let Some(init_vals) = v["init"].as_object()
-                    && let Some(blurb) = init_vals.get("blurb")
-                {
-                    desc_row = blurb.as_str().map(|s| format!("# {s}")).unwrap_or_default();
-                }
-
-                if desc_row.is_empty() {
-                    desc_row = v["description"]
-                        .as_str()
-                        .expect("description must be present")
-                        .split("\n")
-                        .map(|row| {
-                            if row.is_empty() {
-                                "\n".to_string()
-                            } else {
-                                format!("\n# {row}")
-                            }
-                        })
-                        .collect::<String>();
-                }
-
-                // A field's schema `default` is only a usable placeholder when
-                // it is both present and non-empty: `Option<T>` fields with no
-                // value serialize their `None` as `null`, but a *required*
-                // `String` field (`name`, `script`) still gets a `default` key
-                // from `#[serde(default)]` at the struct level, holding
-                // `String::new()`. That empty string is not a value anyone
-                // would want uncommented into a Flockfile, so it is treated the
-                // same as no default at all: both fall through to `init.example`.
-                let has_no_real_default =
-                    v["default"].is_null() || v["default"].as_str() == Some("");
-                let default_value = if has_no_real_default {
-                    v["init"]
-                        .as_object()
-                        .and_then(|init_vals| init_vals.get("example"))
-                        .map(|val| toml::Value::try_from(val).expect("must convert"))
-                        .unwrap_or(toml::Value::String(String::new()))
-                } else {
-                    toml::Value::try_from(&v["default"]).expect("must convert")
-                };
-                format!("{desc_row}\n#{k} = {default_value}")
-            })
-            .collect::<Vec<String>>()
-            .join("\n");
-
-        format!("#[[app]]{prop_rows}")
+        format!(
+            "{PREAMBLE}{}",
+            rows(grouped_order().iter().map(String::as_str))
+        )
     }
+}
+
+/// Every field name, ordered by [`GROUP_ORDER`] and alphabetically within
+/// each group, with the ungrouped remainder last.
+fn grouped_order() -> Vec<String> {
+    let schema = config::flockfile_schema_json();
+    let props = schema
+        .pointer("#/$defs/AppConfig/properties")
+        .expect("app config properties must exist")
+        .as_object()
+        .expect("props must be an object");
+
+    let rank = |name: &str| -> usize {
+        let group = props[name]["init"]["group"].as_str().unwrap_or_default();
+        GROUP_ORDER
+            .iter()
+            .position(|known| *known == group)
+            .unwrap_or(GROUP_ORDER.len())
+    };
+
+    let mut names: Vec<String> = props.keys().cloned().collect();
+    // `props` is already alphabetical (schemars emits a sorted map), and a
+    // stable sort by rank alone therefore leaves each group alphabetical.
+    names.sort_by_key(|name| rank(name));
+    names
+}
+
+/// One commented `# blurb` / `#field = value` pair per name, in the order
+/// given.
+///
+/// The single place a scaffold row is built, for both depths. Curated and
+/// full differ only in WHICH fields they ask for and in what order, never in
+/// how a row looks -- so a change to the format lands in both at once, and
+/// the curated file cannot drift out of step with the grammar the way a
+/// hand-written string could.
+fn rows<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let schema = config::flockfile_schema_json();
+    let props = schema
+        .pointer("#/$defs/AppConfig/properties")
+        .expect("app config properties must exist")
+        .as_object()
+        .expect("props must be an object");
+
+    let body = names
+        .map(|name| {
+            let v = props
+                .get(name)
+                .unwrap_or_else(|| panic!("`{name}` is not a field of AppConfig"));
+            row(name, v)
+        })
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    format!("#[[app]]{body}")
+}
+
+/// One field's comment and its commented-out line.
+///
+/// `init.blurb` is preferred over the `///` doc because the two have
+/// different readers: several of `AppConfig`'s docs cite internal types and
+/// spec sections, which mean nothing to someone editing a Flockfile.
+fn row(name: &str, v: &serde_json::Value) -> String {
+    let mut desc_row = String::new();
+    if let Some(init_vals) = v["init"].as_object()
+        && let Some(blurb) = init_vals.get("blurb")
+    {
+        desc_row = blurb
+            .as_str()
+            .map(|s| format!("\n# {s}"))
+            .unwrap_or_default();
+    }
+
+    if desc_row.is_empty() {
+        desc_row = v["description"]
+            .as_str()
+            .expect("description must be present")
+            .split('\n')
+            .map(|line| {
+                if line.is_empty() {
+                    "\n".to_string()
+                } else {
+                    format!("\n# {line}")
+                }
+            })
+            .collect::<String>();
+    }
+
+    // A field's schema `default` is only a usable placeholder when it is both
+    // present and non-empty: `Option<T>` fields with no value serialize their
+    // `None` as `null`, but a *required* `String` field (`name`, `script`)
+    // still gets a `default` key from `#[serde(default)]` at the struct
+    // level, holding `String::new()`. That empty string is not a value anyone
+    // would want uncommented into a Flockfile, so it is treated the same as
+    // no default at all: both fall through to `init.example`.
+    let has_no_real_default = v["default"].is_null() || v["default"].as_str() == Some("");
+    let value = if has_no_real_default {
+        v["init"]
+            .as_object()
+            .and_then(|init_vals| init_vals.get("example"))
+            .map(|val| toml::Value::try_from(val).expect("must convert"))
+            .unwrap_or(toml::Value::String(String::new()))
+    } else {
+        toml::Value::try_from(&v["default"]).expect("must convert")
+    };
+
+    format!("{desc_row}\n#{name} = {value}")
 }
 
 #[allow(dead_code)]
@@ -293,44 +368,37 @@ mod tests {
         );
     }
 
-    /// The two depths are one file at two verbosities, not two files. Every
-    /// field the curated level shows must also appear in the full one, or a
-    /// reader who graduates from one to the other loses something.
+    /// Every name in [`CURATED`] must be a real field.
+    ///
+    /// The subset property this replaces is now true by construction --
+    /// both depths draw from the same schema through the same builder, so
+    /// curated cannot contain a field the full scaffold lacks. What CAN
+    /// still break is a rename: `AppConfig::cwd` becoming
+    /// `AppConfig::working_dir` would leave `CURATED` naming a field that no
+    /// longer exists, and `rows` would panic at generation time instead of
+    /// here.
     #[test]
-    fn the_curated_depth_is_a_subset_of_the_full_one() {
-        let raw = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../shep-core/assets/flockfile.schema.json"
-        ));
-        let schema: serde_json::Value =
-            serde_json::from_str(raw).expect("the schema is valid JSON");
-        let properties = schema["$defs"]["AppConfig"]["properties"]
+    fn every_curated_field_is_a_real_field() {
+        let schema = shep_core::config::flockfile_schema_json();
+        let value: serde_json::Value = serde_json::to_value(&schema).expect("schema serializes");
+        let properties = value["$defs"]["AppConfig"]["properties"]
             .as_object()
             .expect("AppConfig declares properties in the schema");
 
-        let curated_text = skeleton(Depth::Curated);
-        let all_text = skeleton(Depth::All);
+        let unknown: Vec<&&str> = CURATED
+            .iter()
+            .filter(|name| !properties.contains_key(**name))
+            .collect();
 
-        let shown = |text: &str| -> Vec<String> {
-            properties
-                .keys()
-                .filter(|field| text.contains(field.as_str()))
-                .cloned()
-                .collect()
-        };
-
-        let in_curated = shown(&curated_text);
-        let in_all = shown(&all_text);
-
-        for field in &in_curated {
-            assert!(
-                in_all.contains(field),
-                "`{field}` is in the curated scaffold but not the full one"
-            );
-        }
         assert!(
-            in_curated.len() < in_all.len(),
-            "the curated scaffold must be smaller than the full one, or the              depth axis is not earning its flag"
+            unknown.is_empty(),
+            "CURATED names {} field(s) AppConfig does not have: {unknown:?}",
+            unknown.len()
+        );
+        assert!(
+            CURATED.len() < properties.len(),
+            "the curated scaffold must be smaller than the full one, or the \
+             depth axis is not earning its flag"
         );
     }
 
