@@ -363,8 +363,10 @@ mod tests {
     use std::time::Duration;
 
     use shep_client::testing::{
-        fake_client_capturing_envelopes, fake_client_with_ack, sample_ack, sample_info,
+        fake_client_capturing_envelopes, fake_client_on, fake_client_with_ack, sample_ack,
+        sample_info,
     };
+    use shep_core::protocol::DogSource;
 
     use super::*;
 
@@ -587,5 +589,131 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(json["command"], "describe");
         assert_eq!(json["data"][0]["name"], "web");
+    }
+
+    // --- Whole-branch review item 6: sheep_flourish had no test at all ----
+
+    /// A sheep, `status` and nothing else pinned -- `sheep_flourish` never
+    /// reads a field this doesn't set, and the id only has to be unique
+    /// enough to keep two sheep from looking like the same one.
+    fn sheep(id: u32, status: ProcStatus) -> ProcessInfo {
+        ProcessInfo::builder(id, format!("s{id}"), status).build()
+    }
+
+    /// A registered dog -- `sheep_flourish` must never let one answer a
+    /// question that is about the sheep half of the listing.
+    fn dog(id: u32) -> ProcessInfo {
+        ProcessInfo::builder(id, format!("d{id}"), ProcStatus::Online)
+            .dog(Some(DogSource::BuiltIn))
+            .build()
+    }
+
+    /// A listing with nothing registered gets the empty-flock flourish.
+    #[test]
+    fn sheep_flourish_fires_empty_flock_on_a_truly_empty_listing() {
+        let art = sheep_flourish(&[]).expect("an empty listing must flourish");
+        assert!(art.contains("no sheep in the flock yet"), "{art}");
+    }
+
+    /// A listing with dogs but no sheep is empty for this predicate's own
+    /// purpose -- a dog is not a sheep, so a registry holding only dogs has
+    /// exactly as much to say about the flock as one holding nothing at
+    /// all.
+    #[test]
+    fn sheep_flourish_treats_dogs_only_as_an_empty_flock() {
+        let art =
+            sheep_flourish(&[dog(1), dog(2)]).expect("dogs alone must read as an empty flock");
+        assert!(art.contains("no sheep in the flock yet"), "{art}");
+    }
+
+    /// Every sheep at rest gets the all-asleep flourish, naming the real
+    /// sheep count -- dogs excluded from that count too.
+    #[test]
+    fn sheep_flourish_fires_all_asleep_when_every_sheep_is_stopped() {
+        let listing = [
+            sheep(1, ProcStatus::Stopped),
+            sheep(2, ProcStatus::Stopped),
+            dog(3),
+        ];
+        let art = sheep_flourish(&listing).expect("an all-stopped flock must flourish");
+        assert!(art.contains("2 in the flock, all asleep"), "{art}");
+    }
+
+    /// The exact case this module's own doc calls out: a dog still running
+    /// beside an all-stopped flock must not block the "all asleep" claim --
+    /// the flourish is about the sheep, and the dogs table beneath it
+    /// already says the dog is up.
+    #[test]
+    fn a_live_dog_does_not_block_all_asleep() {
+        let listing = [sheep(1, ProcStatus::Stopped), dog(2)];
+        let art = sheep_flourish(&listing).expect("a live dog must not suppress all_asleep");
+        assert!(art.contains("1 in the flock, all asleep"), "{art}");
+    }
+
+    /// A mixed flock -- some sheep up, some not -- has plenty to look at
+    /// already, so neither flourish fires.
+    #[test]
+    fn sheep_flourish_is_silent_on_a_mixed_flock() {
+        let listing = [sheep(1, ProcStatus::Online), sheep(2, ProcStatus::Stopped)];
+        assert_eq!(
+            sheep_flourish(&listing),
+            None,
+            "a mixed flock is not a flourish moment"
+        );
+    }
+
+    /// `Stopping` -- reload's transient for the instance being replaced, not
+    /// rest -- must not read as asleep merely because nothing is `Online`.
+    /// A flourish claiming "all asleep" over a flock mid-reload would be
+    /// wrong at the exact moment an operator is watching it happen.
+    #[test]
+    fn stopping_does_not_count_as_asleep() {
+        let listing = [
+            sheep(1, ProcStatus::Stopping),
+            sheep(2, ProcStatus::Stopping),
+        ];
+        assert_eq!(
+            sheep_flourish(&listing),
+            None,
+            "Stopping is a transient, not rest"
+        );
+    }
+
+    /// The gate `flock` actually applies -- `fmt == Format::Table &&
+    /// streams.style.level.sheep()` -- pinned against a real call rather
+    /// than trusted from its own doc comment. The daemon answers an empty
+    /// flock on every one of these (`FakeDaemon`'s own default, unarmed),
+    /// which is exactly the case `sheep_flourish` always fires on, so
+    /// whether the art actually reaches `streams.out` is purely a function
+    /// of the gate.
+    #[tokio::test]
+    async fn the_flourish_only_prints_under_table_format_and_a_sheep_drawing_level() {
+        use crate::style::{Presentation, StyleLevel};
+
+        for (fmt, level, expect_art) in [
+            (Format::Table, StyleLevel::Full, true),
+            (Format::Json, StyleLevel::Full, false),
+            (Format::Table, StyleLevel::Plain, false),
+            (Format::Table, StyleLevel::Bare, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("s.sock");
+            let (client, _daemon) = fake_client_on(&path).await;
+
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: Presentation::new(level, None, None, None, 80),
+            };
+            let _ = flock(&client, &mut streams, fmt).await;
+            let printed = String::from_utf8_lossy(&out);
+            assert_eq!(
+                printed.contains("no sheep in the flock yet"),
+                expect_art,
+                "fmt={fmt:?} level={level:?}: {printed}"
+            );
+        }
     }
 }
