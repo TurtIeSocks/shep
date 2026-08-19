@@ -407,6 +407,61 @@ because the answer differs between the ad-hoc and Flockfile paths.
 Deferred only because Rin chose to finish `shep init` first; nothing about it
 is hard.
 
+### `~/` is not expanded in any path a Flockfile carries
+
+Found 2026-08-19, immediately after the cwd finding above and by the same
+route: Rin wrote `cwd = "~/web-server"` as an example in `shep init`'s
+scaffold, and it does not work.
+
+```
+[[app]] cwd = "~/web-server"
+-> error[spawn_failed]: No such file or directory (os error 2)
+```
+
+There is no tilde handling anywhere in the workspace. `assemble.rs:150` is
+`config.cwd.as_ref().map(PathBuf::from)`, so shep looks for a directory
+literally named `~`. This is correct at the layer it sits in -- `~` is a shell
+feature, expanded before a program ever sees an argument -- and a value read
+from a file has no shell between it and the parser.
+
+**Rin's decision: shep should expand it.** In her words: "it does kind of seem
+like a daemon should somewhat emulate the jobs of a shell? Since we're
+replacing the functionality for someone to use `bun run index.js --cwd
+'/srv/server'`." A process manager stands in for the interactive shell that
+would otherwise have started the process, so inheriting a narrow piece of the
+shell's job is coherent rather than sloppy.
+
+**Scope, and she named it precisely as `~/`.** That is the right line and it
+is worth keeping:
+
+- `~/...` -- the invoking user's home. Cheap, unambiguous, no lookup.
+- `~user/...` -- another user's home. Needs a passwd lookup, and under a
+  systemd unit the answer is not obviously the one anyone meant. Recommend
+  refusing rather than half-supporting.
+- `$VAR` and `${VAR}` -- NOT in scope. Once a config file starts doing
+  variable expansion it is a shell, and the question of which environment
+  (the operator's, the daemon's, the app's own `env` table) becomes real and
+  has no good answer.
+
+**The trap to avoid is expanding in one field and not the others.** Four
+fields carry paths: `script` (app.rs:77), `cwd` (81), `out_file` (153) and
+`err_file` (155). Expanding `~/` in `cwd` alone would be worse than expanding
+nowhere, because it teaches that tildes work and then fails somewhere else.
+Whatever lands must cover all four, and a test should assert that -- ideally
+one that enumerates the path-bearing fields so a fifth added later fails until
+it is handled.
+
+**Where it belongs.** `normalize()` is the natural home: it already turns an
+`AppConfig` into a `ResolvedApp` and already refuses several shapes, so
+expansion is the same kind of work at the same seam, and it happens once
+rather than at every use. Note the daemon may run as a different user than the
+CLI, which is exactly why this must resolve where the config is normalised
+rather than where it is executed.
+
+**Also fix the error.** Whatever is decided, `No such file or directory (os
+error 2)` names neither the cause nor the fix. A path that starts with `~`
+and was not expanded should say so.
+
 ### The license files are not inside the published tarballs
 
 `cargo package` does not include `LICENSE-MIT` or `LICENSE-APACHE`, so the
