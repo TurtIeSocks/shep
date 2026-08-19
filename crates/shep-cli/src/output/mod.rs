@@ -47,6 +47,16 @@ pub use rows::{
 };
 pub use table::{human_bytes, human_duration, local_timestamp, render_table};
 
+// `pub(crate)`, not part of the block above: `exit_cell` is not one of
+// `commands/`'s payload types -- it has exactly one caller outside this
+// module, `lookout::view::flock::cell`'s own EXIT column (task 49), reusing
+// the same code/signal rendering `FlockRows`'s EXIT column already uses
+// rather than a second implementation of the same rule. `#[cfg_attr(windows,
+// ...)]` for the same reason the block above carries it: `lookout` is
+// `#[cfg(unix)]` (`lib.rs`), so nothing names this import on Windows.
+#[cfg_attr(windows, allow(unused_imports))]
+pub(crate) use rows::exit_cell;
+
 use crate::cli::Format;
 use crate::style::Presentation;
 

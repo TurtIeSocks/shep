@@ -202,7 +202,14 @@ fn status_cell(status: ProcStatus, presentation: Presentation, status_word: bool
 /// system (`Starting`, `Online`, and `Stopping` — a reload's drainee, still
 /// alive mid-drain) — the same fact `Self::rows`'s own PID cell already
 /// reads off `pid` rather than off `status`.
-fn exit_cell(pid: Option<u32>, last_exit: Option<ExitInfo>) -> String {
+///
+/// `pub(crate)`, not private: `lookout::view::flock`'s own EXIT column
+/// (task 49) calls this directly rather than re-deriving the code/signal
+/// split and the nix signal-name lookup a second time -- the exact drift
+/// this project's "one vocabulary" rule exists to prevent. See
+/// `output::mod`'s own re-export for why the visibility has to travel
+/// through there too.
+pub(crate) fn exit_cell(pid: Option<u32>, last_exit: Option<ExitInfo>) -> String {
     if pid.is_some() {
         return "-".to_string();
     }
