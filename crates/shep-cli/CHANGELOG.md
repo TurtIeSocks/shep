@@ -13,7 +13,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0-alpha.1] - 2026-08-16
+### Additions
+
+- `shep flock` and `shep describe` gain an `EXIT` column: the exit code, or
+  the signal name (`SIGTERM`, not `15`), for a sheep that is not running, and
+  `-` otherwise. A boot-looping sheep previously reported only `errored` and a
+  restart count, which cannot distinguish an app crashing on its own from one
+  that never spawned. `--format json` carries the same under `last_exit`.
+- `shep bleats` prints the tail of each log before it starts following, and
+  `--lines N` says how much (default 15, counted per stream; `0` follows
+  without replaying). Following alone showed an empty screen for a sheep that
+  had already died, leaving its reason in a file the operator had no reason to
+  look in.
+
+### Fixes
+
+- `shep bleats --no-follow` is no longer fixed at 50 lines. It shares the new
+  `--lines` default of 15 and is controllable for the first time.
 
 ### Fixes
 

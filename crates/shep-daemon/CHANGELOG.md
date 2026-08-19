@@ -10,7 +10,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0-alpha.1] - 2026-08-16
+### Additions
+
+- Record every sheep's last exit outcome and carry it on `ProcessInfo`. The
+  supervisor already had it -- it decides restart policy against
+  `stop_exit_codes` -- and discarded it, so no operator surface could say why
+  a sheep died. Set on every path through `handle_exited`, which is the one
+  place a process under a registered id stops existing, and therefore covers
+  an operator stop, a delete, a reload's drainee, a crash loop and shutdown
+  alike. Cleared when a respawn fails to spawn at all, because nothing exited
+  there and a stale code would read as a fresh crash.
+
+### Fixes
+
+- `shep serve`'s connection deadline is a config field rather than a constant
+  read at the use site, so its test can wait one out on a real clock. The test
+  previously paused the clock and raced tokio's auto-advance against live
+  socket IO, failing about one run in three.
 
 ### Security and unsafe
 
