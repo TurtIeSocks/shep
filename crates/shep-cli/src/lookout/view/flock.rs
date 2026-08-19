@@ -17,7 +17,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::super::app::{App, Row};
-use crate::output::{human_bytes, human_duration};
+use crate::output::{exit_cell, human_bytes, human_duration};
 
 /// The narrowest terminal the TABLE will draw into.
 ///
@@ -68,6 +68,12 @@ pub enum Column {
     Pid,
     /// Restarts since registration.
     Restarts,
+    /// Its last exit, once it is not running -- task 49, the CLI parity gap
+    /// this variant closes. Rendered by [`crate::output::exit_cell`], the
+    /// same function `output::rows::FlockRows`'s own EXIT column calls, so
+    /// the two surfaces cannot drift on what a code or a signal name looks
+    /// like.
+    Exit,
     /// Tree CPU as a percentage of one core.
     Cpu,
     /// Tree resident set size.
@@ -80,7 +86,11 @@ pub enum Column {
 
 impl Column {
     /// The header text, matching `output::rows::FlockRows::headers` exactly
-    /// — one vocabulary across both surfaces.
+    /// — one vocabulary across both surfaces. Enforced, not just asserted:
+    /// `the_full_column_set_matches_flock_rows_headers_exactly` (below)
+    /// compares the two lists directly, which is what makes this claim
+    /// something a future column can't quietly break (task 49 found it
+    /// already had).
     #[must_use]
     pub const fn header(self) -> &'static str {
         match self {
@@ -89,6 +99,7 @@ impl Column {
             Self::Status => "STATUS",
             Self::Pid => "PID",
             Self::Restarts => "RESTARTS",
+            Self::Exit => "EXIT",
             Self::Cpu => "CPU",
             Self::Mem => "MEM",
             Self::Uptime => "UPTIME",
@@ -108,6 +119,12 @@ impl Column {
             Self::Status => 15,
             Self::Pid => 7,
             Self::Restarts => 8,
+            // 9: `SIGVTALRM`/`SIGSTKFLT`, the longest names
+            // `nix::sys::signal::Signal::as_str` returns. An exit code is at
+            // most a few digits and `-` is one character, both comfortably
+            // inside it -- like STATUS above, sized so its longest real
+            // value is never truncated.
+            Self::Exit => 9,
             Self::Cpu => 6,
             Self::Mem => 8,
             Self::Uptime => 8,
@@ -122,12 +139,24 @@ const ALL: &[Column] = &[
     Column::Status,
     Column::Pid,
     Column::Restarts,
+    Column::Exit,
     Column::Cpu,
     Column::Mem,
     Column::Uptime,
     Column::Fold,
 ];
 const NO_FOLD: &[Column] = &[
+    Column::Id,
+    Column::Name,
+    Column::Status,
+    Column::Pid,
+    Column::Restarts,
+    Column::Exit,
+    Column::Cpu,
+    Column::Mem,
+    Column::Uptime,
+];
+const NO_EXIT: &[Column] = &[
     Column::Id,
     Column::Name,
     Column::Status,
@@ -171,11 +200,27 @@ const FLOOR: &[Column] = &[Column::Id, Column::Name, Column::Status];
 /// accident of ordering: FOLD is grouping metadata rather than health;
 /// RESTARTS and PID answer follow-up questions rather than "is it up"; CPU
 /// and MEM are the last two numbers to go because they are the ones that
-/// explain WHY something is wrong. `ID NAME STATUS` is the floor because
-/// those three are the pane.
+/// explain WHY a RUNNING sheep is behaving badly. `ID NAME STATUS` is the
+/// floor because those three are the pane.
+///
+/// EXIT (task 49) sits directly below FOLD rather than beside CPU/MEM, and
+/// that placement is deliberate even though EXIT is arguably the most
+/// diagnostic column of all -- it is the only one that says anything at all
+/// once a sheep is dead. But it says nothing else: for every sheep that is
+/// still running, which is what this pane spends most of its time showing,
+/// EXIT renders `-` in every row, the same silent cell FOLD's own
+/// "grouping metadata" reasoning already earns a place near the front of
+/// the drop order for. CPU and MEM keep their spot because they answer a
+/// question EXIT cannot even ask while a sheep is up: whether a RUNNING
+/// sheep is in trouble. This matches where EXIT landed in
+/// `output::rows::FlockRows::PRIORITIES` -- the CLI table reasons through
+/// the exact same tension in its own comment and reaches the same answer --
+/// so an operator who has learned one table's drop order is not surprised
+/// by the other's.
 const TIERS: &[(u16, &[Column])] = &[
-    (90, ALL),
-    (78, NO_FOLD),
+    (101, ALL),
+    (89, NO_FOLD),
+    (78, NO_EXIT),
     (68, NO_RESTARTS),
     (59, NO_PID),
     (49, NO_MEM),
@@ -305,6 +350,9 @@ fn cell(app: &App, row: &Row, column: Column) -> String {
             .pid
             .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
         Column::Restarts => info.restarts.to_string(),
+        // `crate::output::exit_cell`, not a second implementation of the
+        // code/signal split -- see `Column::Exit`'s own doc.
+        Column::Exit => exit_cell(info.pid, info.last_exit),
         Column::Cpu => info
             .cpu_percent
             .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
@@ -339,25 +387,33 @@ pub fn scroll_offset(selected: usize, viewport: usize, total: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::super::fixtures;
     use super::*;
 
     /// fails if the drop order changes without someone re-arguing it. FOLD is
-    /// grouping metadata and goes first; CPU and MEM are the last two numbers
-    /// to go because they are the ones that explain WHY something is wrong;
-    /// ID/NAME/STATUS is the floor because those three are the pane.
+    /// grouping metadata and goes first; EXIT (task 49) goes second, right
+    /// behind it -- diagnostic only for a dead sheep, and silent (`-`) for
+    /// every row while the flock is healthy, which is the common case this
+    /// pane spends most of its time showing; RESTARTS and PID answer
+    /// follow-up questions rather than "is it up"; CPU and MEM are the last
+    /// two numbers to go because they are the ones that explain WHY a
+    /// RUNNING sheep is behaving badly; ID/NAME/STATUS is the floor because
+    /// those three are the pane.
     #[test]
     fn columns_drop_in_a_fixed_order_as_the_terminal_narrows() {
-        assert_eq!(columns_for(200).len(), 9);
-        assert_eq!(columns_for(90).len(), 9);
-        assert!(!columns_for(89).contains(&Column::Fold));
-        assert!(columns_for(89).contains(&Column::Restarts));
-        assert!(!columns_for(67).contains(&Column::Restarts));
-        assert!(!columns_for(58).contains(&Column::Pid));
-        assert!(!columns_for(48).contains(&Column::Mem));
-        assert!(!columns_for(40).contains(&Column::Cpu));
+        assert_eq!(columns_for(300).len(), 10);
+        assert_eq!(columns_for(101).len(), 10);
+        assert!(!columns_for(100).contains(&Column::Fold));
+        assert!(columns_for(100).contains(&Column::Exit));
+        assert!(!columns_for(88).contains(&Column::Exit));
+        assert!(columns_for(88).contains(&Column::Restarts));
+        assert!(!columns_for(77).contains(&Column::Restarts));
+        assert!(!columns_for(67).contains(&Column::Pid));
+        assert!(!columns_for(58).contains(&Column::Mem));
+        assert!(!columns_for(48).contains(&Column::Cpu));
         assert_eq!(columns_for(31), &[Column::Id, Column::Name, Column::Status]);
         // Every tier keeps the three that ARE the pane.
-        for width in [31u16, 40, 48, 58, 67, 89, 200] {
+        for width in [31u16, 40, 48, 58, 67, 77, 88, 100, 300] {
             let cols = columns_for(width);
             for required in [Column::Id, Column::Name, Column::Status] {
                 assert!(
@@ -366,6 +422,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// fails if lookout's own column list drifts from
+    /// `output::rows::FlockRows`'s -- `Column::header`'s own doc claims "one
+    /// vocabulary across both surfaces"; this is what makes that claim
+    /// enforceable rather than aspirational. Task 49 is the defect that let
+    /// it go stale once already: `FlockRows` grew an EXIT header and this
+    /// enum did not, and nothing here would have caught it.
+    #[test]
+    fn the_full_column_set_matches_flock_rows_headers_exactly() {
+        use crate::output::Render;
+
+        let headers: Vec<&str> = ALL.iter().map(|column| column.header()).collect();
+        assert_eq!(headers, crate::output::FlockRows::headers());
+    }
+
+    /// fails if a dead sheep's EXIT cell stops matching what `shep flock`
+    /// itself prints, or a running sheep's cell shows anything but `-`. This
+    /// pins the WIRING -- that `cell` reaches `crate::output::exit_cell` at
+    /// all -- not the rule itself: `output::rows`'s own
+    /// `the_exit_column_shows_the_last_exit_only_for_a_sheep_that_is_not_running`
+    /// already pins the code/signal split and the "no honest value" `-`.
+    #[test]
+    fn the_exit_cell_reuses_the_same_rendering_flock_rows_uses() {
+        use shep_core::protocol::{ExitInfo, ProcessInfo};
+        use shep_core::status::ProcStatus;
+
+        let crashed = ProcessInfo::builder(1, "crashed", ProcStatus::Errored)
+            .last_exit(Some(ExitInfo {
+                code: Some(1),
+                signal: None,
+            }))
+            .build();
+        let killed = ProcessInfo::builder(2, "killed", ProcStatus::Stopped)
+            .last_exit(Some(ExitInfo {
+                code: None,
+                signal: Some(9),
+            }))
+            .build();
+        let running = ProcessInfo::builder(3, "running", ProcStatus::Online)
+            .pid(Some(4_242))
+            .last_exit(Some(ExitInfo {
+                code: Some(1),
+                signal: None,
+            }))
+            .build();
+
+        let app = fixtures::app_with(vec![crashed, killed, running], fixtures::plain());
+        let rows = app.rows();
+        let cell_for = |id: u32| {
+            let row = rows.iter().find(|row| row.info.id == id).unwrap();
+            cell(&app, row, Column::Exit)
+        };
+
+        assert_eq!(cell_for(1), "1");
+        assert_eq!(cell_for(2), "SIGKILL");
+        assert_eq!(
+            cell_for(3),
+            "-",
+            "a running sheep has nothing for EXIT to say"
+        );
     }
 
     /// fails if a tier can render wider than the terminal it was chosen for.
