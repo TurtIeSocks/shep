@@ -392,6 +392,12 @@ fn resolve_style(global: &GlobalArgs) -> (style::StyleLevel, style::StyleSource)
 /// idiom below: the real call happens once, at the call site in `run`, and
 /// this stays testable without the environment mutation this crate's
 /// `#![forbid(unsafe_code)]` rules out in a test.
+///
+/// Its only real call site is inside `Commands::Style`'s set-form arm, in
+/// this file's `#[cfg(unix)]` `run` -- the same reason `output::Streams::out`
+/// and `flourish::empty_flock` each carry the same
+/// `#[cfg_attr(windows, allow(dead_code))]`.
+#[cfg_attr(windows, allow(dead_code))]
 fn style_write_is_overridden(source: style::StyleSource) -> bool {
     matches!(source, style::StyleSource::Flag | style::StyleSource::Env)
 }

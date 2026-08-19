@@ -93,6 +93,13 @@ fn row(status: ProcStatus, count: usize) -> String {
 /// Names the way out (`shep start`) because this state exists at the exact
 /// moment an operator is asking "what now" -- a face with nothing beside it
 /// would answer a question nobody asked.
+///
+/// Its only real caller, `commands::query::sheep_flourish`, lives in
+/// `commands/`, which is `#[cfg(unix)]`-gated in `main.rs` -- same reason
+/// `output::Streams::out` carries the same attribute, so
+/// `#[cfg_attr(windows, allow(dead_code))]` says so explicitly rather than
+/// leaving a Windows `cargo check` to report it unprompted.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn empty_flock() -> String {
     format!(
         "\n{}\n    no sheep in the flock yet\n    `shep start <script>` adds one\n\n",
@@ -106,6 +113,11 @@ pub(crate) fn empty_flock() -> String {
 /// `count` is the caller's own count of sheep (dogs excluded, and
 /// `Stopping` -- a shutdown in progress, not a flock at rest -- excluded
 /// too); see `commands::query::sheep_flourish` for exactly what qualifies.
+///
+/// Its only real caller lives in `commands/`, unix-only -- see
+/// [`empty_flock`]'s own doc for why this carries the same
+/// `#[cfg_attr(windows, allow(dead_code))]`.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn all_asleep(count: usize) -> String {
     format!(
         "\n{}\n    {count} in the flock, all asleep\n    `shep start <name>` wakes one\n\n",
@@ -199,7 +211,12 @@ fn mustered_caption(counts: &[(ProcStatus, usize)], total: usize) -> String {
 /// panic `output::table::render_table`'s own `#[track_caller]` doc
 /// describes for a row/header arity mismatch: better this than a
 /// nonsensical "0 restored, still at rest" caption two lines down.
+///
+/// Its only real caller, `commands::muster::muster`, lives in `commands/`,
+/// unix-only -- see [`empty_flock`]'s own doc for why this carries the same
+/// `#[cfg_attr(windows, allow(dead_code))]`.
 #[track_caller]
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn mustered(statuses: &[ProcStatus]) -> String {
     assert!(
         !statuses.is_empty(),
