@@ -105,9 +105,11 @@ force it.
 
 ### Automatic CI, and what it would cost to turn on
 
-`.github/workflows/test.yml` is `on: workflow_dispatch:` — manual only. It is
-correct and ready; the trigger is the only thing missing, and it is missing on
-purpose while the repository is private.
+**This entry was stale and is corrected here, 2026-08-19.** The workflow has
+run on `push` and `pull_request` since 2026-08-16, and the repository is
+public, so standard runners are free and the arithmetic below is history
+rather than a live decision. It is kept because the per-platform multipliers
+would matter again if the repository ever went private.
 
 The arithmetic, so the decision is about money rather than about whether the
 jobs work. GitHub bills private-repository Actions minutes with a multiplier
@@ -138,7 +140,7 @@ real CI run is the first outside check this project has ever had.
 The job count here and the one in `.github/workflows/test.yml`'s header
 comment are one fact written in two places. Change a matrix and both move.
 
-### `reuse_port` is accepted, stored, displayed — and never read
+### `reuse_port` is accepted, stored, displayed — and never read -- FIXED, Phase 17
 
 `AppConfig::reuse_port` has no production reader anywhere in the workspace.
 Reload's overlap between the old and new instance is unconditional, so the
@@ -154,7 +156,7 @@ field that says which apps may be overlapped. Until then the doc comment on
 the field says plainly that it does nothing, which is the part that was
 missing.
 
-### `bind_socket` surfaces an over-length `$SHEP_HOME` as a raw `ENAMETOOLONG`
+### `bind_socket` surfaces an over-length `$SHEP_HOME` as a raw `ENAMETOOLONG` -- FIXED, Phase 17
 
 Noticed while correcting the `sun_path` comments in the same task. `boot.rs`'s
 `bind_socket` performs no length check of its own before handing the path to
@@ -346,7 +348,7 @@ substring in `docs/migration.md`, which drifts from the code the moment
 either one is edited without the other, `grep`-checked but not
 `cargo test`-checked.
 
-### Two `# Panics` sections without `#[track_caller]`
+### Two `# Panics` sections without `#[track_caller]` -- FIXED, Phase 17
 
 `crates/shep-daemon/src/fake.rs` has seven `spawn_index` accessors that
 document a `# Panics` section and carry no `#[track_caller]`, and
@@ -361,7 +363,7 @@ feature so it never reaches docs.rs. What would force it: a panic from one of
 those accessors pointing at the accessor rather than at the caller that passed
 the bad index, which is exactly the debugging cost IR-21 exists to avoid.
 
-### A Flockfile's relative `script` resolves against the daemon's cwd
+### A Flockfile's relative `script` resolves against the daemon's cwd -- FIXED, Phase 17
 
 Found 2026-08-19 by Rin, asking what `cwd` does while writing `shep init`'s
 skeleton. Measured with three distinct directories so nothing could be
@@ -404,10 +406,13 @@ also fixes the documentation problem it caused:** `shep init`'s skeleton wants
 to say something true about `cwd`, and today the honest sentence is awkward
 because the answer differs between the ad-hoc and Flockfile paths.
 
-Deferred only because Rin chose to finish `shep init` first; nothing about it
-is hard.
+**Fixed in Phase 17.** Rin chose the second option: an app that names no
+`cwd` gets the Flockfile's own directory, absolutised, so the rule fits in
+one sentence an operator can read. Verified against a real daemon with three
+distinct directories -- shepherd in one, Flockfile in another, invocation in a
+third -- and the child now runs where its Flockfile lives.
 
-### `~/` is not expanded in any path a Flockfile carries
+### `~/` is not expanded in any path a Flockfile carries -- FIXED, Phase 17
 
 Found 2026-08-19, immediately after the cwd finding above and by the same
 route: Rin wrote `cwd = "~/web-server"` as an example in `shep init`'s

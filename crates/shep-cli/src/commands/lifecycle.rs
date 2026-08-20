@@ -301,13 +301,13 @@ pub fn resolve_target(
                     source,
                 })?;
                 Flockfile::parse(&source, format)
-                    .map(|flockfile| flockfile.apps)
+                    .map(|flockfile| default_cwd_to_flockfile_dir(flockfile.apps, path))
                     .map_err(TargetError::Flockfile)
             }
             None if path.extension().and_then(|e| e.to_str()) == Some("js") => {
                 let json = evaluate_js_flockfile(path)?;
                 Flockfile::parse(&json, FlockFormat::Json)
-                    .map(|flockfile| flockfile.apps)
+                    .map(|flockfile| default_cwd_to_flockfile_dir(flockfile.apps, path))
                     .map_err(TargetError::Flockfile)
             }
             None => Err(TargetError::UnknownFlockfileFormat {
@@ -320,7 +320,7 @@ pub fn resolve_target(
                 source,
             })?;
             Flockfile::parse(&source, format)
-                .map(|flockfile| flockfile.apps)
+                .map(|flockfile| default_cwd_to_flockfile_dir(flockfile.apps, path))
                 .map_err(TargetError::Flockfile)
         }
         // Absolutised against the CLI's cwd, which is the cwd the `exists`
@@ -592,6 +592,43 @@ fn any_restart_failed(procs: &[shep_core::protocol::ProcessInfo]) -> bool {
     procs
         .iter()
         .any(|info| info.status == shep_core::status::ProcStatus::Errored)
+}
+
+/// Gives every app that set no `cwd` the Flockfile's own directory.
+///
+/// A Flockfile is a file you commit. Before this, an app with a relative
+/// `script` and no `cwd` resolved that script against the DAEMON's working
+/// directory -- whatever directory the shepherd happened to be autostarted
+/// from -- so the same committed file worked on the machine where that was
+/// right and failed on the next one, with an error naming neither cause.
+/// Measured 2026-08-19 with three distinct directories; `deferred.md` carries
+/// the evidence. Rin's call was to default the cwd rather than resolve the
+/// script alone, because the rule then fits in one sentence an operator can
+/// read.
+///
+/// Absolute, via `canonicalize`, because the daemon resolves a relative cwd
+/// against itself and would land back where this started.
+///
+/// Silent no-op if the path cannot be canonicalised: the caller is about to
+/// fail on reading the file anyway, and inventing a directory here would
+/// bury that error under a stranger one. An app that sets its own `cwd`
+/// keeps it -- this only fills a blank.
+fn default_cwd_to_flockfile_dir(apps: Vec<AppConfig>, flockfile: &Path) -> Vec<AppConfig> {
+    let Some(dir) = std::fs::canonicalize(flockfile)
+        .ok()
+        .and_then(|abs| abs.parent().map(Path::to_path_buf))
+    else {
+        return apps;
+    };
+    let dir = dir.to_string_lossy().into_owned();
+    apps.into_iter()
+        .map(|mut app| {
+            if app.cwd.is_none() {
+                app.cwd = Some(dir.clone());
+            }
+            app
+        })
+        .collect()
 }
 
 /// The flock as it stands, for deciding whether a target names a sheep that
@@ -1175,6 +1212,54 @@ mod tests {
     /// a different one, so a relative script has to be absolutised before it
     /// crosses. Rin hit this from `~`: `shep start ./GitHub/zeus/...` where
     /// the file plainly existed, refused with `No such file or directory`
+    /// A Flockfile is a file you commit, so an app that names no `cwd` runs
+    /// where the Flockfile lives -- not where the daemon happened to be
+    /// started, which is invisible from the command line and effectively
+    /// arbitrary.
+    ///
+    /// Before this, the same committed file worked on the machine where the
+    /// shepherd was started in the right directory and failed on the next
+    /// one with `No such file or directory`, naming neither cause.
+    #[test]
+    fn a_flockfile_app_without_a_cwd_runs_where_the_flockfile_lives() {
+        let dir = tempfile::tempdir().unwrap();
+        let flockfile = dir.path().join("Flockfile.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"web\"\nscript = \"./sub/server\"\n",
+        )
+        .unwrap();
+
+        let apps = resolve_target(flockfile.to_str().unwrap(), None, &[], false)
+            .expect("the Flockfile parses");
+
+        let expected = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(
+            apps[0].cwd.as_deref(),
+            Some(expected.to_string_lossy().as_ref()),
+            "the app runs where its Flockfile lives"
+        );
+    }
+
+    /// Only a blank is filled. An app that states its own `cwd` keeps it,
+    /// because the operator said something and shep is not entitled to
+    /// overrule it.
+    #[test]
+    fn a_flockfile_app_that_sets_its_own_cwd_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let flockfile = dir.path().join("Flockfile.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"web\"\nscript = \"./server\"\ncwd = \"/srv/elsewhere\"\n",
+        )
+        .unwrap();
+
+        let apps = resolve_target(flockfile.to_str().unwrap(), None, &[], false)
+            .expect("the Flockfile parses");
+
+        assert_eq!(apps[0].cwd.as_deref(), Some("/srv/elsewhere"));
+    }
+
     /// because the shepherd's cwd was a checkout elsewhere.
     #[test]
     fn a_relative_script_is_resolved_against_the_callers_cwd() {

@@ -101,12 +101,20 @@ crate this gate deliberately excludes. Local checks give no signal on either
 macOS `cargo test` (never compiles a `target_os = "linux"` item at all). What
 DOES cover them: `.github/workflows/test.yml`'s `test` job, whose
 `ubuntu-latest`/`ubuntu-24.04-arm` legs run `cargo test --workspace --locked
---all-features` on real Linux. That workflow is `workflow_dispatch`-only
-while the repository is private (its own header comment explains the
-Actions-minutes cost), so as of this writing it has never actually run —
-these two tests are unverified on their own target platform. Don't assume
-local checks cover this crate on Linux; they don't, and nothing here does
-until that workflow runs for real.
+--all-features` on real Linux. That workflow runs on every
+push and pull request, and has since 2026-08-16, so those two tests DO get
+executed on real Linux now. This paragraph previously said the workflow was
+`workflow_dispatch`-only "while the repository is private"; both halves were
+stale, and the staleness cost real time on 2026-08-19 when a Phase 17 task
+was written to "turn CI on" that was already on. The repository is public and
+standard runners are free.
+
+Still don't assume the local gate covers Linux: it does not, and three
+separate breakages on 2026-08-19 were visible only to CI. `--all-features`
+hides a feature-matrix break, a macOS `cargo test` never compiles a
+`target_os = "windows"` arm, and the windows-gnu cross-check is `cargo check`,
+which does not run anything. Those are not gaps in the gate; they are what
+the gate is. **Read the CI result before claiming a branch is green.**
 
 **Windows.** Every plan through Phase 6 carried this one; Phases 7-9 dropped
 it without saying so, and it never reached this file, which is why nothing
