@@ -472,6 +472,51 @@ rather than where it is executed.
 error 2)` names neither the cause nor the fix. A path that starts with `~`
 and was not expanded should say so.
 
+### A dog cannot learn the name it was adopted under, and getting it wrong is silent
+
+Found 2026-08-20 while building `shep-log-rotate`, the first fully external dog.
+
+An adopted dog is spawned with **no argv at all** and **one** environment
+entry. `dogs.rs`'s `dog_app` maps `DogSource::Adopted { path }` to
+`(path.clone(), Vec::new())`, then inserts `SHEP_HOME` and nothing else. The
+comment there explains the argv decision and the reasoning is sound: "an argv
+shep invented for it is one more thing it has to agree with before it can
+start."
+
+**The name is the one thing a dog needs and cannot be given.** It is the
+`[dog.<name>]` key the dog's own configuration lives under, and the dog is
+what sends `Request::DogConfig { name }`. So the dog has to guess, and the
+guess has to match whatever the operator typed at `shep adopt`.
+
+**The failure mode is silence.** `dog_section` returns `Ok(String::new())` for
+a name with no section, which is deliberate and right on its own terms: a dog
+with no configuration is the ordinary case, not a fault. But it is
+indistinguishable from a name nobody adopted. Adopt a binary as `logrotate`
+when its author hardcoded `log-rotate`, and every setting in the operator's
+`shep.toml` is discarded, every default is used instead, and neither side
+prints anything. It looks exactly like working.
+
+**There is a workaround, and it should not have to be one.** A dog knows its
+own pid, and `ListFlock` reports a pid per entry, so the entry that is a dog
+and carries that pid is the dog itself, and its `name` is the key.
+`shep-log-rotate` does this. It works, and every dog author would have to
+reinvent it, having first discovered the problem the hard way.
+
+Three ways out, none of them large, and the choice is Rin's:
+
+1. **Pass the name after all**, as one argument or as `SHEP_DOG_NAME`. It
+   contradicts `dog_app`'s comment, but an environment variable is not an argv
+   and a dog that ignores an unknown variable still starts.
+2. **Let `DogConfig` distinguish the two cases** — a section that is absent
+   from a dog that is registered, versus a name that was never adopted. The
+   second is a genuine operator error and could be refused rather than
+   answered with the empty string.
+3. **Document the pid trick in `docs/dogs.md`** and leave the contract alone.
+   Cheapest, and it leaves every dog author to write the same twelve lines.
+
+Deferred rather than picked here because the fix is a wire or contract
+decision, and this project's job was to find it rather than to make that call.
+
 ### A third-party dog has no way to ship its own defaults
 
 Raised 2026-08-20 while designing `shep-log-rotate`, the first fully external
