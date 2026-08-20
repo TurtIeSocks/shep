@@ -32,6 +32,7 @@
 #![cfg(unix)]
 
 use std::io::Read;
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
@@ -3372,6 +3373,187 @@ fn a_js_flockfile_without_node_says_so_and_says_what_to_do() {
         !stderr.contains('\u{2014}') && !stderr.contains('\u{2013}'),
         "no em or en dash in copy a user reads: {stderr}"
     );
+}
+
+// --- shep init (lesson 3) ---------------------------------------------------
+//
+// These fail until the verb exists. `shep init` has no clap subcommand at
+// all yet, so every one of them currently dies on "unrecognized subcommand" --
+// which is exactly the point: the scaffold functions in
+// `crates/shep-cli/src/commands/init.rs` are unreachable from the command
+// line, and nothing until now has said so out loud.
+//
+// They live in the e2e tier rather than beside the functions they exercise
+// for two reasons. Writing a file is the behaviour under test, and a
+// subprocess is the only place `shep init` can actually be run; and this
+// file compiles whether or not the verb exists, so the handoff does not
+// depend on any particular shape of the implementation.
+
+/// The plain case: a directory with no Flockfile gets one.
+#[test]
+fn shep_init_writes_a_flockfile_where_there_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = shep(dir.path())
+        .current_dir(dir.path())
+        .arg("init")
+        .output()
+        .unwrap();
+    assert_success(&output);
+
+    let written = dir.path().join("Flockfile.toml");
+    assert!(written.exists(), "shep init must write Flockfile.toml");
+
+    let body = std::fs::read_to_string(&written).unwrap();
+    assert!(
+        body.contains("[[app]]"),
+        "the scaffold shows an app entry: {body}"
+    );
+    assert!(
+        body.lines().any(|l| l.trim_start().starts_with('#')),
+        "and it arrives commented out: {body}"
+    );
+}
+
+/// What it writes must be loadable, not merely present.
+///
+/// The unit tests already prove the scaffold parses; this proves the bytes
+/// that reach disk are the same ones, which is a different claim.
+#[test]
+fn what_shep_init_writes_is_a_flockfile_shep_can_read() {
+    let dir = tempfile::tempdir().unwrap();
+    shep(dir.path())
+        .current_dir(dir.path())
+        .arg("init")
+        .output()
+        .unwrap();
+
+    // Uncommenting is what makes it a live Flockfile; `shep start` against
+    // the file as written would refuse it for declaring no apps, which is
+    // its own correct behaviour and not what this test is about.
+    let body = std::fs::read_to_string(dir.path().join("Flockfile.toml")).unwrap();
+    let live: String = body
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            match trimmed.strip_prefix('#') {
+                Some(rest) if !rest.starts_with(' ') => rest.to_string(),
+                _ => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(dir.path().join("Flockfile.toml"), &live).unwrap();
+
+    let output = shep(dir.path())
+        .current_dir(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg("--flockfile")
+        .arg("Flockfile.toml")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("invalid_config"),
+        "the uncommented scaffold must be valid config: {stderr}"
+    );
+}
+
+/// Refuse rather than clobber, and prove it by metadata rather than by
+/// content.
+///
+/// This project has been bitten twice by exactly this. `shep style`'s writer
+/// shipped a refusal that still rewrote the file (`d023465`): the bytes were
+/// identical, so a content check passed, while the inode had changed and a
+/// symlinked config would have been replaced by a regular file. Compare what
+/// the filesystem says, not what the file says.
+#[test]
+fn shep_init_refuses_an_existing_flockfile_without_touching_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let existing = dir.path().join("Flockfile.toml");
+    std::fs::write(&existing, "# mine\n[[app]]\nname = \"web\"\nscript = \"./s\"\n").unwrap();
+
+    let before = std::fs::metadata(&existing).unwrap();
+
+    let output = shep(dir.path())
+        .current_dir(dir.path())
+        .arg("init")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "an existing Flockfile must not be overwritten silently"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Flockfile.toml"),
+        "the refusal names the file: {stderr}"
+    );
+
+    let after = std::fs::metadata(&existing).unwrap();
+    assert_eq!(
+        before.ino(),
+        after.ino(),
+        "a refused write must not replace the file"
+    );
+    assert_eq!(
+        before.permissions().mode(),
+        after.permissions().mode(),
+        "nor change its mode"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&existing).unwrap(),
+        "# mine\n[[app]]\nname = \"web\"\nscript = \"./s\"\n",
+        "nor its contents"
+    );
+}
+
+/// `--force` is the one destructive path, so it has to actually work.
+#[test]
+fn shep_init_force_replaces_an_existing_flockfile() {
+    let dir = tempfile::tempdir().unwrap();
+    let existing = dir.path().join("Flockfile.toml");
+    std::fs::write(&existing, "# mine\n").unwrap();
+
+    let output = shep(dir.path())
+        .current_dir(dir.path())
+        .arg("init")
+        .arg("--force")
+        .output()
+        .unwrap();
+    assert_success(&output);
+
+    let body = std::fs::read_to_string(&existing).unwrap();
+    assert!(
+        body.contains("[[app]]"),
+        "--force writes the scaffold over what was there: {body}"
+    );
+}
+
+/// The depth flag reaches the file, not just the function.
+#[test]
+fn shep_init_all_writes_the_full_scaffold() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = shep(dir.path())
+        .current_dir(dir.path())
+        .arg("init")
+        .arg("--all")
+        .output()
+        .unwrap();
+    assert_success(&output);
+
+    let body = std::fs::read_to_string(dir.path().join("Flockfile.toml")).unwrap();
+    for field in ["max_restarts", "kill_timeout", "watch_delay"] {
+        assert!(
+            body.contains(field),
+            "--all names every option, and is missing `{field}`"
+        );
+    }
 }
 
 // --- Reload ---------------------------------------------------------------
