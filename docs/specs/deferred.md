@@ -508,6 +508,55 @@ So parse-only is available cheaply and asymmetrically, if it is wanted. Not
 picked here: the grammar is Rin's, it is a wire decision, and the exercise's
 job was to find the friction rather than resolve it.
 
+### `shep adopt`'s vetting runs the candidate against the WRONG `$SHEP_HOME`
+
+Found 2026-08-20, the hard way, while building `shep-log-rotate`. It came
+within a `max_size` default of rotating the live `~/.shep` that supervises
+`zeus-auth`.
+
+`vet` proves a kernel can exec the candidate by actually execing it
+(`crates/shep-cli/src/commands/dogs.rs:384`):
+
+```rust
+match Command::new(&canonical).spawn() {
+```
+
+No `.env()`, no `.env_clear()`, no `.stdout()`/`.stderr()`. **The child
+inherits the operator's entire environment and their terminal.** On macOS
+`macos_deferred_exec_failure` then waits a short window before the kill, so
+the candidate gets real running time, not an instant teardown.
+
+**Executing is not the bug.** The doc's argument for it is sound and
+`docs/dogs.md` is honest that an adopted dog runs at the shepherd's trust
+level. The bug is narrower and worse: **`--home` does not reach this child.**
+`shep adopt --home /tmp/scratch ./my-dog` vets `my-dog` with `SHEP_HOME`
+inherited from the ambient environment, which is usually unset, so the
+candidate resolves the default `~/.shep`. A dog reads `SHEP_HOME` to find its
+socket, which is the one thing `docs/dogs.md` promises it. So the operator
+names one home on the command line and shep runs the candidate against a
+different one.
+
+For a rotator that means: connect to the live daemon, `ListFlock` the real
+flock, and rotate real logs, during a command whose entire purpose was to
+decide whether to trust this binary at all. Measured: nothing was lost only
+because `max_size` defaults to 10M and `zeus-auth-0-out.log` was 200 KB. That
+is a coincidence, not a guard.
+
+Three fixes, cheap, and they compose:
+
+1. **Pass the resolved `--home` to the child.** One `.env("SHEP_HOME", ...)`.
+   Smallest fix and it closes the reported case.
+2. **`env_clear()`, then set only what a dog is promised.** `docs/dogs.md`
+   already says `SHEP_HOME` is the one variable a dog inherits, so vetting
+   with the operator's full environment contradicts the documented contract
+   and hands an unvetted binary whatever tokens are in that shell.
+3. **Give the child null stdio.** A candidate can currently scribble on the
+   operator's terminal mid-vet, and a hostile one can imitate shep's own
+   output at the exact moment the operator is deciding whether to trust it.
+
+Deferred only because it is Rin's call how far to take it. (1) alone is a
+two-line change and fixes the case that was actually hit.
+
 ### A dog cannot learn the name it was adopted under, and getting it wrong is silent
 
 Found 2026-08-20 while building `shep-log-rotate`, the first fully external dog.
