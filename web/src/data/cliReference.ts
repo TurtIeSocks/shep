@@ -141,40 +141,49 @@ function parseVerbBlock(name: string, block: string): CliVerb {
 }
 
 function parseAliasesFromTopLevel(topLevelHelp: string, names: readonly string[]): Map<string, string[]> {
-  const commandsIndex = topLevelHelp.indexOf("\nCommands:\n");
-  const optionsIndex = topLevelHelp.indexOf("\nOptions:\n", commandsIndex);
-  if (commandsIndex === -1 || optionsIndex === -1) {
-    fail("top-level --help has no Commands:/Options: sections to read aliases from.");
+  // shep's top-level --help uses a hand-written template with grouped verb
+  // lines, not clap's generated `Commands:` block, so there is no per-verb
+  // description line carrying `[aliases: ...]` to read. The template names
+  // them on a single line instead:
+  //
+  //   Aliases          flock: list, ls   bleats: logs   stock: scale
+  //
+  // Pinned on the Rust side by `the_help_template_names_every_visible_alias`,
+  // which derives the expected content from clap itself, so this parser and
+  // the CLI cannot drift apart without that test failing first.
+  const line = topLevelHelp
+    .split("\n")
+    .find((l) => l.startsWith("Aliases"));
+  if (line === undefined) {
+    fail("top-level --help has no Aliases line to read aliases from.");
   }
-  const section = topLevelHelp.slice(commandsIndex, optionsIndex);
+
   const nameSet = new Set<string>(names);
+  const result = new Map<string, string[]>();
 
-  // Each entry starts with a line of the shape "  <verb>   <description...>"
-  // and may continue onto further indented lines with no verb name. Group
-  // continuation lines into the entry above them before checking for an
-  // alias suffix, since a wrapped description can put "[alias: x]" on its
-  // own trailing line.
-  const lines = section.split("\n").slice(1).filter((l) => l.trim().length > 0);
-  const entries: string[] = [];
-  let currentName = "";
-  for (const line of lines) {
-    const m = line.match(/^ {2}(\S+)\s+(.*)$/);
-    const firstWord = m?.[1];
-    if (firstWord && nameSet.has(firstWord)) {
-      currentName = firstWord;
-      entries.push(`${currentName} ${m![2]}`);
-    } else if (currentName) {
-      const i = entries.length - 1;
-      entries[i] = `${entries[i]} ${line.trim()}`;
+  // `verb: a, b` groups, separated by runs of whitespace. Splitting on the
+  // colon rather than on whitespace keeps multi-alias lists together.
+  const body = line.replace(/^Aliases\s*/, "");
+  const parts = body.split(/\s{2,}/).filter((p) => p.trim().length > 0);
+  for (const part of parts) {
+    const colon = part.indexOf(":");
+    if (colon === -1) {
+      continue;
     }
+    const verb = part.slice(0, colon).trim();
+    if (!nameSet.has(verb)) {
+      fail(`top-level --help names aliases for "${verb}", which is not a known verb.`);
+    }
+    const aliases = part
+      .slice(colon + 1)
+      .split(",")
+      .map((a) => a.trim())
+      .filter((a) => a.length > 0);
+    result.set(verb, aliases);
   }
 
-  const result = new Map<string, string[]>();
-  for (const entry of entries) {
-    const spaceIndex = entry.indexOf(" ");
-    const entryName = spaceIndex === -1 ? entry : entry.slice(0, spaceIndex);
-    const text = spaceIndex === -1 ? "" : entry.slice(spaceIndex + 1);
-    result.set(entryName, parseAliases(text));
+  if (result.size === 0) {
+    fail("top-level --help has an Aliases line but no verb: alias entries in it.");
   }
   return result;
 }

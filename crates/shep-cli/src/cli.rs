@@ -81,6 +81,8 @@ Foreground runs  runtime dev
 Coming from pm2  import
 Help             welcome help completions style
 
+Aliases          flock: list, ls   bleats: logs   lookout: dash   stock: scale   whisper: sendline
+
 {options}{after-help}";
 
 /// The `shep` command line.
@@ -1160,6 +1162,53 @@ mod tests {
                 *name == "help" || visible.iter().any(|v| v == name),
                 "a help group names `{name}`, which is not a visible verb"
             );
+        }
+    }
+
+    /// Every visible alias is named in `--help`, and only real ones are.
+    ///
+    /// The grouped listing replaced clap's own `Commands:` block, which used
+    /// to render `[aliases: list, ls]` beside each verb. Nothing carried that
+    /// forward, so for several phases `shep --help` did not mention a single
+    /// alias while all six kept working -- found 2026-08-19 when the docs
+    /// site's generated CLI reference could no longer find any.
+    ///
+    /// Derived from clap rather than compared against a second list, so
+    /// adding `visible_alias` to a verb fails here until the line says so.
+    #[test]
+    fn the_help_template_names_every_visible_alias() {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let mut expected: Vec<String> = command
+            .get_subcommands()
+            .filter(|s| !s.is_hide_set())
+            .filter_map(|s| {
+                let aliases: Vec<&str> = s.get_visible_aliases().collect();
+                (!aliases.is_empty()).then(|| format!("{}: {}", s.get_name(), aliases.join(", ")))
+            })
+            .collect();
+        expected.sort();
+
+        let line = HELP_TEMPLATE
+            .lines()
+            .find(|l| l.starts_with("Aliases"))
+            .expect("HELP_TEMPLATE has an Aliases line");
+
+        for entry in &expected {
+            assert!(
+                line.contains(entry.as_str()),
+                "`--help`'s Aliases line does not name `{entry}`: {line}"
+            );
+        }
+
+        // And nothing invented: every `verb: ` on the line is a real one.
+        for token in line.trim_start_matches("Aliases").split_whitespace() {
+            if let Some(verb) = token.strip_suffix(':') {
+                assert!(
+                    expected.iter().any(|e| e.starts_with(&format!("{verb}:"))),
+                    "`--help` names aliases for `{verb}`, which has none"
+                );
+            }
         }
     }
 

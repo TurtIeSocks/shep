@@ -1,74 +1,28 @@
 @@VERSION@@
 shep 0.1.0-alpha.1
 @@TOPLEVEL@@
-The `shep` command line.
-
-**`bin_name = "shep"` is load-bearing, not decoration.** Without it, clap renders every `Usage:`
-line from `argv[0]` rather than from `name` above — so `shep-runtime --help` prints `Usage:
-shep-runtime runtime ...` and `shep-dev --help` prints `Usage: shep-dev dev ...` (verified
-empirically: both alias binaries built and run with no override, Phase 15 Task 11). Pinned so every
-rendering of a verb's own usage line reads `shep <verb>` regardless of which of the three `[[bin]]`
-targets produced it — the alias binaries are convenience entrypoints for exactly that invocation,
-not commands in their own right, and their own `--help` should say so.
+A process manager for your flock
 
 Usage: shep [OPTIONS] <COMMAND>
 
-Commands:
-  start        Start a sheep from a script, a Flockfile, or stdin
-  serve        Serve a directory over plain HTTP, as a managed sheep
-  stop         Stop one or more sheep
-  restart      Restart one or more sheep
-  reload       Reload one or more sheep, one instance at a time
-  delete       Delete one or more sheep from the flock
-  stock        Set how many instances one app runs — the stocking rate [alias: scale]
-  flock        List the flock [aliases: list, ls]
-  dogs         List the dogs, and nothing else
-  enable       Turn on a registered dog: writes `[daemon] enabled_dogs` in `shep.toml`, and starts
-               it now if a shepherd is running
-  disable      Turn off a registered dog: removes it from `[daemon] enabled_dogs`, and stops it now
-               if a shepherd is running
-  adopt        Vet a binary shep has never seen and register it as a dog: writes `[daemon]
-               adopted_dogs` and `[daemon] enabled_dogs` in `shep.toml`, and starts it now if a
-               shepherd is running
-  rehome       Forget an adopted dog entirely: stops it if a shepherd is running, and removes it
-               from `[daemon] enabled_dogs`, `[daemon] adopted_dogs`, and its own `[dog.<name>]`
-               table
-  describe     Describe one sheep in detail
-  trigger      Send a named action to matched sheep and report what each app answers
-  signal       Send a unix signal to matched sheep
-  whisper      Write one line to matched sheep's stdin [alias: sendline]
-  fold         List one fold
-  bleats       Show or follow bleats (log output) for one or more sheep [alias: logs]
-  lookout      Watch the flock on a live dashboard [alias: dash]
-  whistle      Serve the MCP interface on stdin/stdout for an AI agent
-  reopen       Reopen log files after an external rotator has renamed them
-  flush        Empty the log files of one or more sheep, or the shepherd's own
-  barks        Show the alert history: `barks.jsonl`, newest last
-  set          Store a value in the shepherd's key/value store
-  get          Read one value from the store, or list the whole store with no key
-  unset        Remove one key from the store, or every key with --all
-  ping         Check whether the shepherd answers
-  kill         Shut the shepherd down
-  save         Write the muster roll now, so a reboot can bring this flock back
-  muster       Assemble the flock from the muster roll `save` wrote, starting the shepherd first if
-               none is running
-  runtime      Boot a shepherd in this process, run one Flockfile's flock in the foreground, and
-               exit once nothing is left online
-  dev          Run one Flockfile's flock in an isolated, throwaway foreground session:
-               `$SHEP_DEV_HOME` (default `~/.shep-dev`), forced `watch = true` on every app, and a
-               full stop-and-delete teardown when it ends
-  import       Write a Flockfile from a pm2 dump. Starts nothing
-  startup      Install an init unit so the shepherd starts at boot
-  unstartup    Disable and remove whichever unit `startup` installed — systemd, openrc, launchd, or
-               a BSD `rc.d` script
-  completions  Print a shell completion script
-  help         Print this message or the help of the given subcommand(s)
+Getting started
+  shep start server.js    start it and keep it alive
+  shep flock              see what's running
+  shep bleats server      follow its output
+  shep save               remember this flock across reboots
+  shep startup            bring it back after a reboot
 
-Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
+Run things       start serve stop restart reload delete stock
+See what's up    flock describe bleats lookout fold barks
+Survive reboots  save muster startup unstartup
+Talk to a sheep  trigger signal whisper
+The shepherd     ping kill reopen flush set get unset
+Dogs and agents  dogs enable disable adopt rehome whistle
+Foreground runs  runtime dev
+Coming from pm2  import
+Help             welcome help completions style
+
+Aliases          flock: list, ls   bleats: logs   lookout: dash   stock: scale   whisper: sendline
 
       --format <FORMAT>
           Output format
@@ -83,35 +37,53 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
 
   -V, --version
           Print version
+
+Run `shep help <command>` for one command, or `shep welcome` for the tour.
 @@VERB:start@@
 Start a sheep from a script, a Flockfile, or stdin
 
-Usage: shep start [OPTIONS] <TARGET>
+Usage: shep start [OPTIONS] [TARGETS]...
 
 Arguments:
-  <TARGET>
-          A script path, a Flockfile, or `-` to read Flockfile JSON from stdin
+  [TARGETS]...
+          Script paths, Flockfiles, names the flock already has, or `-` to read Flockfile JSON from
+          stdin
+          
+          Omit them to start the Flockfile in the current directory, or, when there is none, to
+          bring a shepherd up with nothing running yet.
+          
+          Several are started in turn, not atomically: if the second fails the first is already up,
+          and the exit code is the first failure. `--name` is refused with more than one, since a
+          name is unique to one sheep.
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
-      --name <NAME>
-          Name for this sheep (script form only)
-
-      --fold <FOLD>
-          Fold to place this sheep in
-
       --format <FORMAT>
           Output format
 
@@ -120,6 +92,51 @@ Options:
           - json:  A versioned JSON envelope, one object per invocation
           
           [default: table]
+
+      --name <NAME>
+          Name for this sheep (script form only)
+
+      --fold <FOLD>
+          Fold to place this sheep in
+
+  -q, --quiet
+          Suppress non-essential output
+          
+          Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
+          print regardless.
+
+      --cwd <CWD>
+          Working directory to run in (default: where you ran `shep start`)
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
+
+      --interpreter <INTERPRETER>
+          Interpreter to run the script with, overriding both shep.toml's extension mapping and a
+          Flockfile app's own interpreter field.
+          
+          The precedence, lowest to highest: shep.toml's interpreters table (matched against the
+          script's extension), then a Flockfile's own interpreter for that app, then this flag. shep
+          never guesses an interpreter on its own; every one of those three is something an operator
+          wrote down. Pass "none" to run the script directly, overriding a mapping or a Flockfile
+          that would otherwise pick one.
 
       --flockfile
           Read TARGET as a Flockfile rather than as a script path.
@@ -128,13 +145,6 @@ Options:
           running it through node, which is arbitrary code execution, so it never happens because a
           file merely has that extension. Without this flag `shep start server.js` starts
           `server.js` as a script, which is what it has always meant.
-
-  -q, --quiet
-          Suppress non-essential output
-          
-          Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
-          print regardless.
 
   -h, --help
           Print help (see a summary with '-h')
@@ -167,10 +177,14 @@ Arguments:
           Directory to serve
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
+      --format <FORMAT>
+          Output format
+
+          Possible values:
+          - table: Human-readable columns (the default)
+          - json:  A versioned JSON envelope, one object per invocation
           
-          [env: SHEP_HOME=]
+          [default: table]
 
       --port <PORT>
           Port to listen on
@@ -183,27 +197,37 @@ Options:
           
           [default: 127.0.0.1]
 
-      --format <FORMAT>
-          Output format
-
-          Possible values:
-          - table: Human-readable columns (the default)
-          - json:  A versioned JSON envelope, one object per invocation
-          
-          [default: table]
-
-      --name <NAME>
-          Name for this sheep (default: the directory's own name)
-
   -q, --quiet
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --name <NAME>
+          Name for this sheep (default: the directory's own name)
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
 
       --fold <FOLD>
           Fold to place this sheep in
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
       --spa
           Serve index.html for paths that do not exist, for a single-page app. Only for requests
@@ -240,18 +264,21 @@ Options:
 @@VERB:stop@@
 Stop one or more sheep
 
-Usage: shep stop [OPTIONS] <SELECTOR>
+Usage: shep stop [OPTIONS] <SELECTORS>...
 
 Arguments:
-  <SELECTOR>
-          name, id, `all`, `/regex/`, or `fold:<name>`
+  <SELECTORS>...
+          One or more: name, id, `all`, `zeus-*`, `/regex/`, or `fold:<name>`
+          
+          Several are applied in turn, not atomically: `shep stop a b c` where `b` matches nothing
+          still stops `a` and `c`, and the exit code is the first failure.
+          
+          A pattern carrying `*`, `?`, `[` or `{` is a glob, anchored, so `zeus-*` selects
+          `zeus-auth` and not `my-zeus-auth`. Quote it: your shell expands `zeus-*` against
+          filenames first, and zsh refuses outright when none match. A name with no such character
+          is exact, so `web.1` is the sheep called `web.1`.
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -265,8 +292,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -276,18 +322,21 @@ Options:
 @@VERB:restart@@
 Restart one or more sheep
 
-Usage: shep restart [OPTIONS] <SELECTOR>
+Usage: shep restart [OPTIONS] <SELECTORS>...
 
 Arguments:
-  <SELECTOR>
-          name, id, `all`, `/regex/`, or `fold:<name>`
+  <SELECTORS>...
+          One or more: name, id, `all`, `zeus-*`, `/regex/`, or `fold:<name>`
+          
+          Several are applied in turn, not atomically: `shep stop a b c` where `b` matches nothing
+          still stops `a` and `c`, and the exit code is the first failure.
+          
+          A pattern carrying `*`, `?`, `[` or `{` is a glob, anchored, so `zeus-*` selects
+          `zeus-auth` and not `my-zeus-auth`. Quote it: your shell expands `zeus-*` against
+          filenames first, and zsh refuses outright when none match. A name with no such character
+          is exact, so `web.1` is the sheep called `web.1`.
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -301,8 +350,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -328,18 +396,21 @@ Exits as soon as the shepherd accepts the reload, printing the flock as it stood
 clustered app takes longer to swap than any answer can wait for. The swaps themselves are reported
 on the bus, under process.reload, process.reloaded and process.reload_abandoned.
 
-Usage: shep reload [OPTIONS] <SELECTOR>
+Usage: shep reload [OPTIONS] <SELECTORS>...
 
 Arguments:
-  <SELECTOR>
-          name, id, `all`, `/regex/`, or `fold:<name>`
+  <SELECTORS>...
+          One or more: name, id, `all`, `zeus-*`, `/regex/`, or `fold:<name>`
+          
+          Several are applied in turn, not atomically: `shep stop a b c` where `b` matches nothing
+          still stops `a` and `c`, and the exit code is the first failure.
+          
+          A pattern carrying `*`, `?`, `[` or `{` is a glob, anchored, so `zeus-*` selects
+          `zeus-auth` and not `my-zeus-auth`. Quote it: your shell expands `zeus-*` against
+          filenames first, and zsh refuses outright when none match. A name with no such character
+          is exact, so `web.1` is the sheep called `web.1`.
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -353,8 +424,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -364,18 +454,21 @@ Options:
 @@VERB:delete@@
 Delete one or more sheep from the flock
 
-Usage: shep delete [OPTIONS] <SELECTOR>
+Usage: shep delete [OPTIONS] <SELECTORS>...
 
 Arguments:
-  <SELECTOR>
-          name, id, `all`, `/regex/`, or `fold:<name>`
+  <SELECTORS>...
+          One or more: name, id, `all`, `zeus-*`, `/regex/`, or `fold:<name>`
+          
+          Several are applied in turn, not atomically: `shep stop a b c` where `b` matches nothing
+          still stops `a` and `c`, and the exit code is the first failure.
+          
+          A pattern carrying `*`, `?`, `[` or `{` is a glob, anchored, so `zeus-*` selects
+          `zeus-auth` and not `my-zeus-auth`. Quote it: your shell expands `zeus-*` against
+          filenames first, and zsh refuses outright when none match. A name with no such character
+          is exact, so `web.1` is the sheep called `web.1`.
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -389,8 +482,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -423,11 +535,6 @@ Arguments:
           How many instances it runs afterwards
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -441,8 +548,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -455,11 +581,6 @@ List the flock
 Usage: shep flock [OPTIONS]
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -473,8 +594,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -487,11 +627,6 @@ List the dogs, and nothing else
 Usage: shep dogs [OPTIONS]
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -505,8 +640,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -527,11 +681,6 @@ Arguments:
           The dog's name — the `[dog.<name>]` config key
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -545,8 +694,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -567,11 +735,6 @@ Arguments:
           The dog's name — the `[dog.<name>]` config key
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -585,8 +748,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -611,11 +793,6 @@ Arguments:
           Path to the dog's binary, vetted before `shep.toml` is touched
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -629,8 +806,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -651,11 +847,6 @@ Arguments:
           The dog's name — the `[dog.<name>]` config key
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -669,8 +860,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -686,18 +896,21 @@ this list and is still killed, and a setsid() one stays in it and survives.
 
 Lamb names are executable names, never command lines.
 
-Usage: shep describe [OPTIONS] <SELECTOR>
+Usage: shep describe [OPTIONS] <SELECTORS>...
 
 Arguments:
-  <SELECTOR>
-          name, id, `all`, `/regex/`, or `fold:<name>`
+  <SELECTORS>...
+          One or more: name, id, `all`, `zeus-*`, `/regex/`, or `fold:<name>`
+          
+          Several are applied in turn, not atomically: `shep stop a b c` where `b` matches nothing
+          still stops `a` and `c`, and the exit code is the first failure.
+          
+          A pattern carrying `*`, `?`, `[` or `{` is a glob, anchored, so `zeus-*` selects
+          `zeus-auth` and not `my-zeus-auth`. Quote it: your shell expands `zeus-*` against
+          filenames first, and zsh refuses outright when none match. A name with no such character
+          is exact, so `web.1` is the sheep called `web.1`.
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -711,8 +924,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -743,11 +975,6 @@ Arguments:
           Argument text for the action, passed through to the app verbatim
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -761,8 +988,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -793,11 +1039,6 @@ Arguments:
           Signal name, e.g. `SIGHUP` or `hup`
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -811,8 +1052,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -843,11 +1103,6 @@ Arguments:
           The line, without a trailing newline — shep adds exactly one
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -861,8 +1116,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -879,11 +1153,6 @@ Arguments:
           The fold to list
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -897,8 +1166,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -917,17 +1205,6 @@ Arguments:
           [default: all]
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
-      --no-follow
-          Print the tail of each sheep's log file and exit, instead of following
-
-      --err
-          Only stderr
-
       --format <FORMAT>
           Output format
 
@@ -937,15 +1214,54 @@ Options:
           
           [default: table]
 
-      --out
-          Only stdout
+      --no-follow
+          Print the tail of each sheep's log file and exit, instead of following
+
+      --lines <N>
+          How many existing lines of each stream to print before following
+          
+          A sheep that already crashed has said everything it is going to say, so following alone
+          shows an empty screen while the reason sits in the file. This prints that much history
+          first, then follows.
+          
+          Counted per stream, so the default prints up to this many lines of stdout and up to this
+          many of stderr for each matched sheep. Narrow it with `--out` or `--err`.
+          
+          `0` prints no history at all, following only what arrives next.
+          
+          [default: 15]
 
   -q, --quiet
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --err
+          Only stderr
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
+
+      --out
+          Only stdout
 
   -h, --help
           Print help (see a summary with '-h')
@@ -980,11 +1296,6 @@ Options:
           runs as you, so anything it could do you can already do with `shep stop`. Can also be set
           with `shep set lookout.allow_control true`; this flag wins.
 
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -998,8 +1309,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1024,11 +1354,6 @@ so a flag would open nothing those don't already.
 Usage: shep whistle [OPTIONS]
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -1042,8 +1367,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1062,11 +1406,6 @@ Arguments:
           [default: all]
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -1080,8 +1419,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1101,11 +1459,6 @@ Options:
       --daemon
           Empty the shepherd's own logs instead of any sheep's
 
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -1119,8 +1472,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1137,14 +1509,6 @@ Same precedent as `shep flush --daemon`, which also works on files rather than t
 Usage: shep barks [OPTIONS]
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
-      --tail <TAIL>
-          Show only the last N barks
-
       --format <FORMAT>
           Output format
 
@@ -1154,12 +1518,34 @@ Options:
           
           [default: table]
 
+      --tail <TAIL>
+          Show only the last N barks
+
   -q, --quiet
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1186,11 +1572,6 @@ Arguments:
           The value
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -1204,8 +1585,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1222,11 +1622,6 @@ Arguments:
           The key; omit to list every key
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -1240,8 +1635,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1261,11 +1675,6 @@ Options:
       --all
           Remove every key
 
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -1279,8 +1688,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1293,11 +1721,6 @@ Check whether the shepherd answers
 Usage: shep ping [OPTIONS]
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -1311,8 +1734,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1325,11 +1767,6 @@ Shut the shepherd down
 Usage: shep kill [OPTIONS]
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -1343,8 +1780,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1357,11 +1813,6 @@ Write the muster roll now, so a reboot can bring this flock back
 Usage: shep save [OPTIONS]
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -1375,8 +1826,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1389,11 +1859,6 @@ Assemble the flock from the muster roll `save` wrote, starting the shepherd firs
 Usage: shep muster [OPTIONS]
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -1407,8 +1872,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1441,11 +1925,6 @@ Arguments:
           Flockfile to run (default: discovered in the current directory)
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -1459,8 +1938,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1487,14 +1985,6 @@ Arguments:
           Script or Flockfile to run (default: discovered in this directory)
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
-      --name <NAME>
-          Name for this sheep (script form only)
-
       --format <FORMAT>
           Output format
 
@@ -1504,12 +1994,34 @@ Options:
           
           [default: table]
 
+      --name <NAME>
+          Name for this sheep (script form only)
+
   -q, --quiet
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1528,14 +2040,6 @@ of the Flockfile, for the operator to decide.
 Usage: shep import [OPTIONS]
 
 Options:
-      --from <FROM>
-          Read this pm2 dump instead of `~/.pm2/dump.pm2`
-
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -1545,21 +2049,43 @@ Options:
           
           [default: table]
 
+      --from <FROM>
+          Read this pm2 dump instead of `~/.pm2/dump.pm2`
+
       --out <OUT>
           Write the Flockfile here instead of `./Flockfile.toml`
-
-      --dry-run
-          Print the Flockfile that would be written, and write nothing
 
   -q, --quiet
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --dry-run
+          Print the Flockfile that would be written, and write nothing
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
 
       --force
           Overwrite an existing Flockfile
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1588,14 +2114,6 @@ ever saw it, and shows the exact PATH about to go into the unit so you can check
 Usage: shep startup [OPTIONS]
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
-      --user <USER>
-          The user the unit runs the shepherd as (default: $SUDO_USER, else the invoking user)
-
       --format <FORMAT>
           Output format
 
@@ -1604,6 +2122,9 @@ Options:
           - json:  A versioned JSON envelope, one object per invocation
           
           [default: table]
+
+      --user <USER>
+          The user the unit runs the shepherd as (default: $SUDO_USER, else the invoking user)
 
       --init <INIT>
           Write a unit for this init system instead of the detected one.
@@ -1623,8 +2144,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1641,14 +2181,6 @@ that is not there is reported absent rather than failing.
 Usage: shep unstartup [OPTIONS]
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
-      --user <USER>
-          The user the unit runs the shepherd as (default: $SUDO_USER, else the invoking user)
-
       --format <FORMAT>
           Output format
 
@@ -1657,6 +2189,9 @@ Options:
           - json:  A versioned JSON envelope, one object per invocation
           
           [default: table]
+
+      --user <USER>
+          The user the unit runs the shepherd as (default: $SUDO_USER, else the invoking user)
 
       --init <INIT>
           Write a unit for this init system instead of the detected one.
@@ -1676,8 +2211,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1698,11 +2252,6 @@ Arguments:
           [possible values: bash, elvish, fish, powershell, zsh]
 
 Options:
-      --home <HOME>
-          Override $SHEP_HOME for this invocation
-          
-          [env: SHEP_HOME=]
-
       --format <FORMAT>
           Output format
 
@@ -1716,8 +2265,27 @@ Options:
           Suppress non-essential output
           
           Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
-          ...) — diagnostics distinct from a sheep's own line or a real error, both of which still
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
           print regardless.
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
 
   -h, --help
           Print help (see a summary with '-h')
