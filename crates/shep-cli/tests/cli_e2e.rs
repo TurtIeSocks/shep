@@ -3319,6 +3319,61 @@ fn restarting_a_sheep_that_cannot_spawn_reports_it_rather_than_exiting_zero() {
     graceful_kill(dir.path());
 }
 
+/// The missing-node sentence, produced for real rather than quoted.
+///
+/// `deferred.md` recorded this as untestable: producing it needs a `PATH`
+/// with no node on it, and `std::env::set_var` is `unsafe` in edition 2024
+/// inside a crate that forbids unsafe code. That is true of a UNIT test,
+/// which would have to mutate its own process. It is not true here: this
+/// tier already runs shep as a subprocess, and `Command::env` sets the
+/// CHILD's environment without touching the parent's, so there is nothing
+/// unsafe and nothing racy about it.
+///
+/// `docs/migration.md` quotes this sentence for an operator without node
+/// installed. Until now nothing re-checked that quote against the `format!`
+/// that produces it, and the two were kept in step by hand.
+#[test]
+fn a_js_flockfile_without_node_says_so_and_says_what_to_do() {
+    let dir = tempfile::tempdir().unwrap();
+    let flockfile = dir.path().join("Flockfile.js");
+    // Declares a real app, so the ONLY thing that can fail here is the
+    // missing interpreter. With node present this Flockfile is valid, which
+    // is what makes the assertion below about node rather than about shape.
+    std::fs::write(
+        &flockfile,
+        "module.exports = { app: [{ name: 'web', script: './server.js' }] };\n",
+    )
+    .unwrap();
+
+    // An empty PATH for the child only. `node` cannot be found, which is the
+    // whole condition under test, and the parent's environment is untouched.
+    let output = shep(dir.path())
+        .env("PATH", "")
+        .arg("start")
+        .arg("--flockfile")
+        .arg(&flockfile)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a Flockfile that cannot be read must not succeed: {stderr}"
+    );
+    assert!(
+        stderr.contains("node was not found on PATH"),
+        "the message names the cause: {stderr}"
+    );
+    assert!(
+        stderr.contains("install node, or convert"),
+        "and what to do about it: {stderr}"
+    );
+    assert!(
+        !stderr.contains('\u{2014}') && !stderr.contains('\u{2013}'),
+        "no em or en dash in copy a user reads: {stderr}"
+    );
+}
+
 // --- Reload ---------------------------------------------------------------
 
 /// `shep reload` reaches the reload verb, and the swap it starts really

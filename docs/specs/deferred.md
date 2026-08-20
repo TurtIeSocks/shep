@@ -336,17 +336,22 @@ evaluates a `.js` Flockfile unattended — a CI job or a provisioning script
 running `shep start` non-interactively, where nobody is watching to press
 Ctrl-C.
 
-### The missing-node error message has no test
+### The missing-node error message has no test -- FIXED, Phase 17
 
 `shep start <path>.js --flockfile` on a machine with no `node` on `PATH`
 produces a specific sentence (`crates/shep-cli/src/commands/lifecycle.rs`),
 but nothing exercises that code path under test. Producing it for real needs
 a `PATH` with no `node` on it, and mutating `PATH` for the duration of one
 test means `std::env::set_var`, which is `unsafe` in edition 2024 — in a
-crate that forbids unsafe code. The sentence is pinned instead as an exact
-substring in `docs/migration.md`, which drifts from the code the moment
-either one is edited without the other, `grep`-checked but not
-`cargo test`-checked.
+crate that forbids unsafe code. **Fixed in Phase 17**, and the reasoning above was wrong in one place worth
+naming. `set_var` is only needed by a UNIT test, which would have to mutate
+its own process. `cli_e2e` already runs shep as a subprocess, and
+`Command::env` sets the CHILD's environment: no unsafe, nothing racy, and the
+parent's `PATH` is untouched. The test runs a `.js` Flockfile with an empty
+`PATH` and asserts the sentence names both the cause and the fix.
+Mutation-checked -- restore a real `PATH` and it fails with a different error,
+which is what proves it exercises the missing-node path rather than passing
+by accident.
 
 ### Two `# Panics` sections without `#[track_caller]` -- FIXED, Phase 17
 

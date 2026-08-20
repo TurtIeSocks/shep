@@ -177,14 +177,17 @@ const JS_BRIDGE_SCRIPT: &str = "try { \
 /// interruptible; adding a bound means a reaper thread in a crate that
 /// forbids unsafe code. Recorded in `docs/specs/deferred.md`.
 ///
-/// **The `node_missing` sentence has no unit test and no automated pin**,
-/// for the same reason the stdin gap a few functions up admits its own:
-/// producing it needs a `PATH` without node, and `std::env::set_var` is
-/// `unsafe` in edition 2024 in a crate that forbids unsafe. `docs/migration.md`
-/// quotes this sentence for an operator without node installed; nothing
-/// re-checks that quote against this `format!` after the fact, so the two
-/// are kept in step by hand. If this sentence changes, update
-/// `docs/migration.md`'s quote in the same commit.
+/// The `node_missing` sentence IS pinned, as of Phase 17, by `cli_e2e`'s
+/// `a_js_flockfile_without_node_says_so_and_says_what_to_do`. This doc used
+/// to say it could not be, on the grounds that producing it needs a `PATH`
+/// without node and `std::env::set_var` is `unsafe` in edition 2024 inside a
+/// crate that forbids unsafe. That holds for a unit test, which would have to
+/// mutate its own process; the e2e tier runs shep as a subprocess, and
+/// `Command::env` sets the child's environment alone.
+///
+/// `docs/migration.md` still quotes this sentence for an operator without
+/// node installed, and that quote is still kept in step by hand, so update it
+/// in the same commit if this `format!` changes.
 ///
 /// # Errors
 ///
