@@ -467,16 +467,23 @@ rather than where it is executed.
 error 2)` names neither the cause nor the fix. A path that starts with `~`
 and was not expanded should say so.
 
-### The license files are not inside the published tarballs
+### The license files are not inside the published tarballs -- FIXED, Phase 17
 
 `cargo package` does not include `LICENSE-MIT` or `LICENSE-APACHE`, so the
 crates ship with a `license = "MIT OR Apache-2.0"` field and no license text.
 Tooling reads the field, so nothing is broken, and `docs/releasing.md` already
 records it as cosmetic.
 
-Worth knowing that tarball contents are permanent per version, so this cannot
-be corrected for `0.1.0-alpha.1` after the fact. It would be fixed by adding
-the two files to each crate's `include`, in a later version.
+**Fixed in Phase 17**, before the first publish rather than after, so no
+version ships without the text. Each crate directory carries a symlink to the
+workspace-root `LICENSE-MIT` and `LICENSE-APACHE`: cargo packages only files
+under a crate's own directory, so an `include` cannot reach the workspace
+root, and cargo dereferences the symlinks when packaging. Verified by
+extracting a built `.crate` and comparing bytes against the source -- 1060 for
+`LICENSE-MIT`, identical.
+
+The note about permanence still stands and is why this was worth doing now:
+tarball contents cannot be corrected for a version after it is published.
 
 ## Not deferred
 
