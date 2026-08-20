@@ -5,6 +5,8 @@
 
 use core::fmt;
 
+use std::path::Path;
+
 use std::collections::BTreeSet;
 
 use globset::Glob;
@@ -79,6 +81,89 @@ impl ResolvedApp {
     }
 }
 
+/// Expands a leading `~/` against `home`, and refuses `~user/`.
+///
+/// `~` is a shell feature. A shell expands it before a program ever sees the
+/// argument, so a value read out of a Flockfile has nothing between it and
+/// the parser and arrives literally: shep would look for a directory named
+/// `~`. Rin's call, 2026-08-19, was that a process manager standing in for
+/// the shell that would otherwise have started the process should inherit
+/// this narrow piece of its job.
+///
+/// Deliberately narrow. `~/` only:
+///
+/// - `~user/...` is refused. Resolving it means a passwd lookup, and under a
+///   systemd unit the answer depends on who the daemon runs as rather than
+///   on who wrote the file.
+/// - `$VAR` is NOT expanded, here or anywhere. Once a config file expands
+///   variables it has to answer WHICH environment it means -- the operator's,
+///   the daemon's, or the app's own `env` table -- and there is no good
+///   answer.
+///
+/// A path that does not start with `~` is returned untouched, so this is a
+/// no-op for every absolute and relative path anyone already has.
+///
+/// # Errors
+/// - [`NormalizeError::TildeUser`] if the path names another user's home.
+/// - [`NormalizeError::NoHomeForTilde`] if `~/` is used and `home` is `None`.
+fn expand_tilde(
+    value: &str,
+    home: Option<&Path>,
+    name: &str,
+    field: &'static str,
+) -> Result<String, NormalizeError> {
+    let Some(rest) = value.strip_prefix('~') else {
+        return Ok(value.to_string());
+    };
+    // `~` alone, or `~/...`. Anything else after the tilde names a user.
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return Err(NormalizeError::TildeUser {
+            name: name.to_string(),
+            field,
+            value: value.to_string(),
+        });
+    }
+    let Some(home) = home else {
+        return Err(NormalizeError::NoHomeForTilde {
+            name: name.to_string(),
+            field,
+        });
+    };
+    // `join` would discard `home` for a rest that still looks absolute, so
+    // the separator is trimmed and the two halves are concatenated instead.
+    let joined = home.join(rest.trim_start_matches('/'));
+    Ok(joined.to_string_lossy().into_owned())
+}
+
+/// Every field of an [`AppConfig`] that carries a filesystem path.
+///
+/// Named once, and walked by [`expand_paths`] and by its own test, so a
+/// fifth path field added later fails that test until it is handled.
+/// Expanding `~/` in some path fields and not others would be worse than
+/// expanding in none: it teaches that tildes work and then fails somewhere
+/// the operator has no reason to suspect.
+#[cfg(test)]
+const PATH_FIELDS: &[&str] = &["script", "cwd", "out_file", "err_file"];
+
+/// Expands `~/` in every path field of `app`, in place.
+///
+/// # Errors
+/// Whatever [`expand_tilde`] refuses, named with the field that carried it.
+fn expand_paths(app: &mut AppConfig, home: Option<&Path>) -> Result<(), NormalizeError> {
+    let name = app.name.clone();
+    app.script = expand_tilde(&app.script, home, &name, "script")?;
+    for (field, slot) in [
+        ("cwd", &mut app.cwd),
+        ("out_file", &mut app.out_file),
+        ("err_file", &mut app.err_file),
+    ] {
+        if let Some(value) = slot {
+            *slot = Some(expand_tilde(value, home, &name, field)?);
+        }
+    }
+    Ok(())
+}
+
 /// Validates one app config
 ///
 /// # Errors
@@ -113,6 +198,23 @@ impl ResolvedApp {
 ///   `ignore_watch` pattern globset will not compile (carries the app name,
 ///   which of the two lists, the pattern and the reason).
 pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
+    normalize_with_home(app, std::env::home_dir().as_deref())
+}
+
+/// [`normalize`], with the home directory supplied rather than read.
+///
+/// A parameter so the `~/` expansion above is testable without mutating the
+/// process environment, which is racy under a parallel `cargo test`. This is
+/// also the seam that matters for correctness rather than only for tests:
+/// the daemon may run as a different user than the CLI, so `~` has to be
+/// resolved where the config is normalised, not where it is executed.
+///
+/// # Errors
+/// The same set [`normalize`] documents.
+pub fn normalize_with_home(
+    mut app: AppConfig,
+    home: Option<&Path>,
+) -> Result<ResolvedApp, NormalizeError> {
     if app.name.is_empty() {
         return Err(NormalizeError::MissingName);
     }
@@ -122,6 +224,10 @@ pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
     if app.script.is_empty() {
         return Err(NormalizeError::MissingScript);
     }
+    // After the emptiness checks, so a missing script is reported as missing
+    // rather than as a path problem, and before every check below that reads
+    // a path.
+    expand_paths(&mut app, home)?;
     if app.instances == 0 {
         return Err(NormalizeError::ZeroInstances);
     }
@@ -404,6 +510,26 @@ pub enum NormalizeError {
         /// The sheep name, so the error names which Flockfile entry to edit.
         name: String,
     },
+    /// A path begins `~user/`, naming another user's home.
+    ///
+    /// Refused rather than resolved: answering it means a passwd lookup, and
+    /// under a systemd unit the answer is not obviously the one anyone meant.
+    /// `~/` is supported; this is not.
+    TildeUser {
+        /// The sheep name, so the error names which Flockfile entry to edit.
+        name: String,
+        /// Which field carried it.
+        field: &'static str,
+        /// The path as written.
+        value: String,
+    },
+    /// A path begins `~/` and no home directory could be determined.
+    NoHomeForTilde {
+        /// The sheep name, so the error names which Flockfile entry to edit.
+        name: String,
+        /// Which field carried it.
+        field: &'static str,
+    },
     /// `reuse_port` is set, and nothing reads it.
     ///
     /// Refused rather than ignored (Rin, 2026-08-19). The field parsed,
@@ -482,6 +608,17 @@ impl fmt::Display for NormalizeError {
                     KillSignal::ACCEPTED.join(", ")
                 )
             }
+            Self::TildeUser { name, field, value } => write!(
+                f,
+                "`{name}`: {field} is `{value}`, and shep expands only `~/` (your own home). \
+                 Another user's home needs a passwd lookup whose answer depends on who the \
+                 daemon runs as, so write the path out in full instead."
+            ),
+            Self::NoHomeForTilde { name, field } => write!(
+                f,
+                "`{name}`: {field} begins with `~/` but no home directory could be found. \
+                 Set $HOME, or write the path out in full."
+            ),
             Self::ReusePortUnimplemented { name } => {
                 write!(
                     f,
@@ -517,6 +654,114 @@ impl core::error::Error for NormalizeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// All four path fields expand `~/`, and expanding some but not others
+    /// would be worse than expanding none: it teaches that tildes work and
+    /// then fails where the operator has no reason to suspect it.
+    #[test]
+    fn every_path_field_expands_a_leading_tilde() {
+        let home = Path::new("/home/rin");
+        let mut app = AppConfig::minimal("web", "~/app/server.js");
+        app.cwd = Some("~/app".to_string());
+        app.out_file = Some("~/logs/out.log".to_string());
+        app.err_file = Some("~/logs/err.log".to_string());
+
+        let resolved = normalize_with_home(app, Some(home)).expect("all four expand");
+        let c = resolved.config();
+        assert_eq!(c.script, "/home/rin/app/server.js");
+        assert_eq!(c.cwd.as_deref(), Some("/home/rin/app"));
+        assert_eq!(c.out_file.as_deref(), Some("/home/rin/logs/out.log"));
+        assert_eq!(c.err_file.as_deref(), Some("/home/rin/logs/err.log"));
+    }
+
+    /// The anti-drift half. A fifth path field added to `AppConfig` fails
+    /// here until `expand_paths` handles it, which is the only thing keeping
+    /// the "all four or none" rule true over time.
+    #[test]
+    fn the_path_field_list_matches_what_expand_paths_walks() {
+        let home = Path::new("/home/rin");
+        let mut app = AppConfig::minimal("web", "~/s");
+        app.cwd = Some("~/c".to_string());
+        app.out_file = Some("~/o".to_string());
+        app.err_file = Some("~/e".to_string());
+
+        let resolved = normalize_with_home(app, Some(home)).expect("expands");
+        let c = resolved.config();
+        let expanded = [
+            ("script", Some(c.script.as_str())),
+            ("cwd", c.cwd.as_deref()),
+            ("out_file", c.out_file.as_deref()),
+            ("err_file", c.err_file.as_deref()),
+        ];
+        assert_eq!(
+            expanded.len(),
+            PATH_FIELDS.len(),
+            "PATH_FIELDS and this test must name the same set"
+        );
+        for (field, value) in expanded {
+            assert!(
+                PATH_FIELDS.contains(&field),
+                "`{field}` is not in PATH_FIELDS"
+            );
+            assert!(
+                value.is_some_and(|v| v.starts_with("/home/rin")),
+                "`{field}` was not expanded: {value:?}"
+            );
+        }
+    }
+
+    /// A path with no tilde is untouched, so this is a no-op for every
+    /// absolute and relative path anyone already has.
+    #[test]
+    fn a_path_without_a_tilde_is_left_exactly_as_written() {
+        let app = AppConfig::minimal("web", "./server.js");
+        let resolved =
+            normalize_with_home(app, Some(Path::new("/home/rin"))).expect("no tilde, no change");
+        assert_eq!(resolved.config().script, "./server.js");
+    }
+
+    /// `~user/` needs a passwd lookup whose answer depends on who the daemon
+    /// runs as, so it is refused rather than guessed at.
+    #[test]
+    fn another_users_home_is_refused_rather_than_resolved() {
+        let app = AppConfig::minimal("web", "~deploy/app/server.js");
+        let err = normalize_with_home(app, Some(Path::new("/home/rin")))
+            .expect_err("~user/ must not resolve");
+        assert!(
+            matches!(err, NormalizeError::TildeUser { field, .. } if field == "script"),
+            "the refusal names the field: {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("~/"),
+            "and says what IS supported: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\u{2014}') && !rendered.contains('\u{2013}'),
+            "no em or en dash in copy a user reads: {rendered}"
+        );
+    }
+
+    /// `$VAR` is not expanded, here or anywhere. A config file that expands
+    /// variables has to answer whose environment it means.
+    #[test]
+    fn a_dollar_variable_is_not_expanded() {
+        let app = AppConfig::minimal("web", "$HOME/server.js");
+        let resolved = normalize_with_home(app, Some(Path::new("/home/rin"))).expect("left alone");
+        assert_eq!(resolved.config().script, "$HOME/server.js");
+    }
+
+    /// `~/` with no home to expand against is an error naming the field
+    /// rather than a path containing a literal tilde.
+    #[test]
+    fn a_tilde_with_no_home_is_an_error_not_a_literal_path() {
+        let app = AppConfig::minimal("web", "~/server.js");
+        let err = normalize_with_home(app, None).expect_err("nothing to expand against");
+        assert!(
+            matches!(err, NormalizeError::NoHomeForTilde { .. }),
+            "{err:?}"
+        );
+    }
 
     /// Refused, not ignored. `reuse_port` parsed and stored for several
     /// phases while no production code read it, so a Flockfile could ask for
