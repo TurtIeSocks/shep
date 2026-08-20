@@ -472,6 +472,34 @@ rather than where it is executed.
 error 2)` names neither the cause nor the fix. A path that starts with `~`
 and was not expanded should say so.
 
+### A third-party dog has no way to ship its own defaults
+
+Raised 2026-08-20 while designing `shep-log-rotate`, the first fully external
+dog. `shep adopt <name> <path>` vets, registers, enables and starts in one
+command, and then the operator has an adopted dog with no `[dog.<name>]`
+section and nothing telling them what its knobs are. The README is the only
+answer today.
+
+Rin asked whether a dog's repo could ship a `Flockfile.toml` that `shep adopt`
+reads. It cannot: `RawFlockfile` is `deny_unknown_fields` over exactly
+`$schema` and `app`, so a Flockfile cannot mention a dog. That is a
+file-ownership line rather than an oversight. A Flockfile is the operator's
+file, committed in a service's repo, describing what to supervise. `shep.toml`
+is the daemon's, one per machine, holding dogs, style and interpreters. A dog's
+registration belongs to the machine.
+
+**Deferred deliberately.** The near-term answer costs shep nothing: a dog
+prints its own commented defaults (`the-dog --print-config >> shep.toml`),
+which is the same shape `shep init` gives a Flockfile, and it puts the
+documentation of a dog's options where its defaults already live.
+
+**The trust question is what any real design has to answer.** A `Dogfile.toml`
+that `adopt` reads means shep parsing a file the dog's author wrote and merging
+it into the operator's `shep.toml`. That is a larger step than "run this
+binary", and `adopt`'s existing vetting ritual exists because this boundary is
+taken seriously. Worth revisiting if a dog ecosystem appears; not worth
+pre-building for one dog.
+
 ### The license files are not inside the published tarballs -- FIXED, Phase 17
 
 `cargo package` does not include `LICENSE-MIT` or `LICENSE-APACHE`, so the
