@@ -223,6 +223,28 @@ variable an adopted dog inherits from the shepherd's environment is
 `[dog.<name>]` value ever rides along beside it, for the reason given
 above.
 
+**Knowing which name to ask for is your problem, and getting it wrong is
+silent.** A dog is given no argv and that one variable, so nothing tells it
+what the operator typed at `shep adopt`. And a `DogConfig` for a name nobody
+adopted comes back as the empty string -- exactly what a registered dog with
+no section gets, because a dog with no configuration is the ordinary case
+rather than a fault. So a one-character mismatch between the name you expect
+and the name the operator used discards their entire section for you, uses
+every default instead, and prints nothing on either side. Hardcoding a name
+and documenting it works, as long as you say so loudly. Working it out is
+better: your process knows its own pid, `ListFlock` reports a pid per entry,
+and the entry that is marked a dog and carries your pid is you -- its `name`
+is the key your section lives under. `shep-log-rotate` does the second and
+falls back to the first out loud.
+
+**Never send `Request::Flush` as part of rotating anything.** Its name reads
+like settling a buffer and it does the opposite of what a rotator wants: it
+flushes what is pending and then **truncates** the recorded paths. That is
+`shep flush`, an operator deliberately emptying logs, and reaching for it
+before a rename on the intuition that "flush" means "make sure it is written"
+deletes the lines you were about to rotate. The rename-then-`Reopen` shape
+below is the one with no such hole.
+
 There is no sandbox here, and it would be a mistake to assume one: **an
 adopted dog runs at the shepherd's own trust level, with no isolation
 beyond it.** That is the same trust an ordinary sheep in your Flockfile
