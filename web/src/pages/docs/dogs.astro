@@ -272,6 +272,28 @@ watchdog  adopted  true      stopped`}</CodeBlock>
       value rides along beside it.
     </p>
     <Callout variant="careful">
+      Knowing which name to ask for is your problem, and getting it wrong
+      is silent. Nothing tells a dog what the operator typed at{" "}
+      <code>shep adopt</code>, and a <code>DogConfig</code> for a name
+      nobody adopted comes back empty, which is exactly what a registered
+      dog with no section gets. So a one-character mismatch discards the
+      operator's whole section for you, uses every default instead, and
+      prints nothing on either side. Hardcode a name and say so loudly, or
+      work it out: your process knows its own pid, <code>ListFlock</code>{" "}
+      reports one per entry, and the entry marked as a dog carrying your
+      pid is you.
+    </Callout>
+    <Callout variant="careful">
+      Never send <code>Request::Flush</code> as part of rotating anything.
+      Its name reads like settling a buffer and it does the opposite of
+      what a rotator wants: it flushes what is pending and then{" "}
+      <strong>truncates</strong> the recorded paths. That is{" "}
+      <code>shep flush</code>, an operator deliberately emptying logs.
+      Reaching for it before a rename deletes the lines you were about to
+      rotate. Rename, then <code>Reopen</code>: that shape has no such
+      hole.
+    </Callout>
+    <Callout variant="careful">
       There is no sandbox, and it would be a mistake to assume one. An
       adopted dog runs at the shepherd's own trust level, with no isolation
       beyond it: the same trust an ordinary sheep in your Flockfile already
