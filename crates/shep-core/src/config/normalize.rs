@@ -668,10 +668,14 @@ mod tests {
 
         let resolved = normalize_with_home(app, Some(home)).expect("all four expand");
         let c = resolved.config();
-        assert_eq!(c.script, "/home/rin/app/server.js");
-        assert_eq!(c.cwd.as_deref(), Some("/home/rin/app"));
-        assert_eq!(c.out_file.as_deref(), Some("/home/rin/logs/out.log"));
-        assert_eq!(c.err_file.as_deref(), Some("/home/rin/logs/err.log"));
+        // Expectations are built with `join` rather than written as literals:
+        // the separator is `/` here and `\` on Windows, and hardcoding one
+        // turned CI's three Windows legs red when this test first landed.
+        let expect = |rest: &str| home.join(rest).to_string_lossy().into_owned();
+        assert_eq!(c.script, expect("app/server.js"));
+        assert_eq!(c.cwd.as_deref(), Some(expect("app").as_str()));
+        assert_eq!(c.out_file.as_deref(), Some(expect("logs/out.log").as_str()));
+        assert_eq!(c.err_file.as_deref(), Some(expect("logs/err.log").as_str()));
     }
 
     /// The anti-drift half. A fifth path field added to `AppConfig` fails
