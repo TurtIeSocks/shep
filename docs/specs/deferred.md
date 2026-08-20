@@ -472,6 +472,42 @@ rather than where it is executed.
 error 2)` names neither the cause nor the fix. A path that starts with `~`
 and was not expanded should say so.
 
+### `UpDuration`'s grammar tops out at hours, which only bites outside shep
+
+Found 2026-08-20 while building `shep-log-rotate`. Its `max_age` setting is a
+log-retention window, so the natural spelling is `7d`. The grammar is
+`^\d+(h|m|s)?$` (`crates/shep-core/src/values.rs`), so `7d` is refused and a
+week has to be written `168h`. A month is `720h`.
+
+**For shep itself the grammar is right and should not change on this
+argument.** Every duration shep owns is a lifecycle timer -- `min_uptime`,
+`kill_timeout`, the backoff curve -- and nobody sets a kill timeout in days.
+A day unit would be dead weight on every one of them. That is presumably why
+it is not there, and it is a good reason.
+
+What is new is that **dogs have durations shep does not**, and retention is
+the obvious one: any rotator, any archiver, any bark-history trimmer wants
+days. A dog that follows the ecosystem's spellings, as `shep-log-rotate`
+deliberately does, inherits a grammar that was scoped for a different kind of
+value. The alternative is a dog inventing its own duration parser, which is
+the thing the ecosystem rule exists to prevent.
+
+**The two halves carry different risk, and only one of them is breaking:**
+
+- **Parsing `d` is purely additive.** `"7d"` errors today, so nothing that
+  works now would change. `UpDuration` is `u64` milliseconds, so a day is
+  `86_400_000` and even `49_710d` fits without overflow.
+- **Rendering `d` is a wire-visible change.** `Display` currently walks
+  hours, then minutes, then seconds, so a `d` arm placed before the hours arm
+  would make `min_uptime = "24h"` round-trip as `"1d"`. That changes what
+  `shep describe` and `--format json` print for configs nobody edited, and
+  the type's own comment says "changing this is a breaking change (string
+  form in `AppConfig`)".
+
+So parse-only is available cheaply and asymmetrically, if it is wanted. Not
+picked here: the grammar is Rin's, it is a wire decision, and the exercise's
+job was to find the friction rather than resolve it.
+
 ### A dog cannot learn the name it was adopted under, and getting it wrong is silent
 
 Found 2026-08-20 while building `shep-log-rotate`, the first fully external dog.
