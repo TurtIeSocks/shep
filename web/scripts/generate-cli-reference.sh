@@ -17,6 +17,13 @@
 
 set -euo pipefail
 
+# Run the binary with a clean environment. clap renders an `[env: VAR=]`
+# line showing the variable's CURRENT value, so a generator run in a shell
+# that happens to have SHEP_HOME set bakes that path into the published
+# reference -- caught 2026-08-20, one regeneration away from committing
+# `[env: SHEP_HOME=/tmp/docdemo/home]` to the docs site.
+shep() { env -u SHEP_HOME -u SHEP_STYLE -u NO_COLOR "$BIN" "$@"; }
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="$REPO_ROOT/target/release/shep"
@@ -40,12 +47,12 @@ VERBS=(
 
 {
   echo "@@VERSION@@"
-  "$BIN" --version
+  shep --version
   echo "@@TOPLEVEL@@"
-  "$BIN" --help
+  shep --help
   for v in "${VERBS[@]}"; do
     echo "@@VERB:$v@@"
-    "$BIN" "$v" --help
+    shep "$v" --help
   done
 } > "$OUT"
 

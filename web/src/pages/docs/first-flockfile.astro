@@ -31,7 +31,7 @@ const fieldGroups: FieldGroup[] = [
       { name: "name", type: "string", default: "required", does: "Unique sheep name." },
       { name: "script", type: "string", default: "required", does: "Executable or script path." },
       { name: "args", type: "string[]", default: "[]", does: "Arguments passed to the script." },
-      { name: "cwd", type: "string?", default: "daemon's cwd", does: "Working directory at spawn." },
+      { name: "cwd", type: "string?", default: "the Flockfile's own directory", does: "Working directory at spawn. Unset, an app in a Flockfile runs where that Flockfile lives, so a relative script resolves the way you would read it." },
       { name: "interpreter", type: "string?", default: "none", does: "Interpreter override; \"none\" runs the script directly." },
       { name: "env", type: "map<string,string>", default: "{}", does: "Merged over the daemon's filtered environment." },
       { name: "instances", type: "integer", default: "1", does: "Fork instance count (cluster mode)." },
@@ -251,6 +251,24 @@ unknown field \`max_memory_restart\`, expected one of \`name\`, \`script\`, \`ar
       distinct error, <code>Flockfile declares no apps</code>: an empty
       file isn't a no-op, since <code>shep start</code> with nothing to
       start almost always means the path was wrong.
+    </p>
+
+    <h3>Paths</h3>
+    <p>
+      Four fields hold one: <code>script</code>, <code>cwd</code>,
+      <code>out_file</code> and <code>err_file</code>. All four expand a
+      leading <code>~/</code> to your home directory, because a Flockfile is
+      read from a file rather than typed at a shell, and nothing would
+      otherwise expand it: shep would look for a directory literally named
+      <code>~</code>.
+    </p>
+    <p class="fine">
+      Deliberately narrow. <code>~user/</code> is refused rather than
+      resolved, since answering it means a passwd lookup whose result
+      depends on which user the daemon runs as rather than on who wrote the
+      file. <code>$VAR</code> is never expanded: once a config file expands
+      variables it has to decide whose environment it means, and there is no
+      good answer to that.
     </p>
 
     <h2>The full field reference</h2>

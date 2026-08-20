@@ -8,6 +8,7 @@
 import DocsLayout from "../../layouts/DocsLayout.astro";
 import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
 ---
 
 <DocsLayout
@@ -78,6 +79,30 @@ import Callout from "../../components/docs/Callout.astro";
       <code>1.5G</code> and <code>30S</code> do not.
     </Callout>
 
+    <h3>Scripts that need an interpreter</h3>
+    <p>
+      <code>script</code> is run directly, so a compiled binary or a file
+      with a shebang and the executable bit needs nothing further. A plain
+      <code>server.js</code> has neither, and shep will not guess: guessing
+      is how a process manager ends up with opinions you did not ask for.
+    </p>
+    <p>
+      Instead you tell it once. On first run shep writes a starter mapping
+      into <code>~/.shep/shep.toml</code>, commented so you can see exactly
+      what it will do:
+    </p>
+    <CodeBlock label="~/.shep/shep.toml">{`[interpreters]
+js = "node"
+py = "python3"
+sh = "sh"`}</CodeBlock>
+    <p>
+      From then on <code>shep start server.js</code> works. Edit the table,
+      add an extension, or delete the whole thing to turn it off. An
+      individual app can override it with its own
+      <code>interpreter</code> field, and a single run can override both
+      with <code>--interpreter</code>; the last one named wins.
+    </p>
+
     <h2>3. Start the flock</h2>
     <p>
       You never launch the daemon yourself. <code>shep start</code> notices
@@ -86,15 +111,23 @@ import Callout from "../../components/docs/Callout.astro";
     <div class="terminal">
       <div><span class="prompt">$</span> shep start Flockfile.toml</div>
       <div><span class="prompt">$</span> shep ls</div>
-      <div class="muted">ID  NAME    STATUS  PID   RESTARTS  CPU    MEM    UPTIME  FOLD</div>
+      <div class="muted">ID  NAME    STATUS  PID   RESTARTS  EXIT  CPU    MEM    UPTIME  FOLD</div>
       <div>1&nbsp;&nbsp;&nbsp;web&nbsp;&nbsp;&nbsp;&nbsp;<span class="ok">online</span>&nbsp;&nbsp;1001&nbsp;&nbsp;1&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;12.5%&nbsp;&nbsp;48.1M&nbsp;&nbsp;1m&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;backend</div>
       <div>2&nbsp;&nbsp;&nbsp;worker&nbsp;<span class="ok">online</span>&nbsp;&nbsp;1002&nbsp;&nbsp;2&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;12.5%&nbsp;&nbsp;48.1M&nbsp;&nbsp;2m&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;backend</div>
       <div>3&nbsp;&nbsp;&nbsp;cron&nbsp;&nbsp;&nbsp;&nbsp;<span class="ok">online</span>&nbsp;&nbsp;1003&nbsp;&nbsp;3&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="muted">-</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;48.1M&nbsp;&nbsp;30s&nbsp;&nbsp;&nbsp;&nbsp;backend</div>
     </div>
     <p class="fine">
+      Shown plain here. At a real terminal that table is box-drawn, each
+      status is coloured and carries a sheep's face, and columns drop as the
+      window narrows; piped anywhere else it prints exactly what you see
+      above. <a href="/docs/output">Terminal output</a> covers all of it,
+      including how to turn it down.
+    </p>
+    <p class="fine">
       The CPU column prints <code>-</code> rather than <code>0.0%</code> when
       a reading is unavailable, because a confident zero is worse than an
-      obvious blank.
+      obvious blank. <code>EXIT</code> uses the same convention, and shows
+      why a stopped sheep stopped.
     </p>
 
     <h2>4. Watch what it prints</h2>

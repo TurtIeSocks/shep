@@ -51,7 +51,8 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       "cpu_percent": null,
       "memory_bytes": 1212416,
       "dog": null,
-      "lambs": null
+      "lambs": null,
+      "last_exit": null
     },
     {
       "id": 1,
@@ -66,7 +67,8 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       "cpu_percent": null,
       "memory_bytes": 1212416,
       "dog": null,
-      "lambs": null
+      "lambs": null,
+      "last_exit": null
     }
   ]
 }`}</CodeBlock>
@@ -128,6 +130,17 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
         renders the same per-sheep detail the table format's Lambs section
         shows. Check the key itself, not which command you ran, if you're
         writing something generic.
+      </li>
+      <li>
+        <code>last_exit</code> is <code>null</code> until a sheep's process
+        has stopped at least once under this daemon, and afterwards holds
+        one of two shapes: <code>{'{"code": 1, "signal": null}'}</code> for a
+        normal exit, or <code>{'{"code": null, "signal": 15}'}</code> for
+        one ended by a signal. Both are never set at once, and both being
+        <code>null</code> is not a state the daemon produces. It is the
+        field that distinguishes a process that started and crashed from one
+        that never started at all, which the <code>status</code> alone
+        cannot: both read <code>errored</code>.
       </li>
       <li>
         <code>cpu_percent</code> reads <code>null</code>, not

@@ -174,6 +174,13 @@ export const docsNav: DocsNavGroup[] = [
         spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
       },
       {
+        slug: "output",
+        label: "Terminal output",
+        built: true,
+        source: "crates/shep-cli/src/style.rs",
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
+      },
+      {
         slug: "json-output",
         label: "JSON output",
         built: true,

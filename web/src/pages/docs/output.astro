@@ -1,0 +1,195 @@
+---
+/*
+ * Terminal output (crates/shep-cli/src/style.rs — StyleLevel, Presentation,
+ * resolve; crates/shep-cli/src/output/table.rs — render_boxed;
+ * crates/shep-cli/src/vocabulary.rs — the faces and their roles;
+ * crates/shep-cli/src/output/paint.rs — roles bound to anstyle). Every
+ * command and every table below was run against target/release/shep, at the
+ * width stated, with the colour escapes stripped for print.
+ */
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
+---
+
+<DocsLayout
+  title="Terminal output"
+  description="shep draws boxes, colour and sheep at a terminal, and plain columns everywhere else. One dial changes how much, and a pipe always gets the plain version."
+  crumb="Reference / Terminal output"
+  activeSlug="output"
+>
+  <article>
+    <h1>Terminal output</h1>
+    <ReferencePills slug="output" />
+    <p class="lede">
+      At a terminal, shep draws a box-drawn table that fits your window,
+      colours each sheep's status, and shows it as a face. Piped into
+      anything else, it prints the same plain columns it always has. You do
+      not have to configure that; it is the default both ways.
+    </p>
+
+    <h2>What a terminal shows</h2>
+    <p>
+      <code>shep flock</code> in a 120-column window. The status column
+      carries a face and the word, and each row's status is the one coloured
+      cell:
+    </p>
+    <CodeBlock label="shep flock">{`┌────┬──────┬───────────────┬───────┬──────────┬──────┬──────┬──────┬────────┬─────────┐
+│ ID │ NAME │ STATUS        │ PID   │ RESTARTS │ EXIT │ CPU  │ MEM  │ UPTIME │ FOLD    │
+├────┼──────┼───────────────┼───────┼──────────┼──────┼──────┼──────┼────────┼─────────┤
+│ 1  │ api  │ (x.x) errored │ -     │ 15       │ 1    │ -    │ -    │ 0s     │ -       │
+│ 0  │ web  │ (o.o) online  │ 68630 │ 0        │ -    │ 0.0% │ 3.0M │ 18s    │ backend │
+└────┴──────┴───────────────┴───────┴──────────┴──────┴──────┴──────┴────────┴─────────┘`}</CodeBlock>
+
+    <h3>The faces</h3>
+    <p>
+      Four faces across six statuses, because some of them mean the same
+      thing to someone glancing at a table:
+    </p>
+    <div class="rows">
+      <div class="row"><span><code>(o.o)</code> grazing</span><span>online</span></div>
+      <div class="row"><span><code>(o~o)</code> waking</span><span>starting, waiting to restart</span></div>
+      <div class="row"><span><code>(-.-)</code> asleep</span><span>stopping, stopped</span></div>
+      <div class="row"><span><code>(x.x)</code> startled</span><span>errored</span></div>
+    </div>
+    <p class="fine">
+      They are ASCII rather than emoji on purpose. An emoji is double-width,
+      inconsistently so across terminals, and cannot take a foreground
+      colour, which would turn every column measurement into guesswork.
+    </p>
+
+    <h3>The EXIT column</h3>
+    <p>
+      A sheep that is not running shows why it stopped: an exit code, or a
+      signal name. A running one shows <code>-</code>, the same convention
+      <code>PID</code> and <code>CPU</code> use for a value that has no
+      honest answer yet.
+    </p>
+    <p>
+      It tells two failures apart that <code>status</code> alone cannot.
+      <code>errored</code> with fifteen restarts says only that a sheep is
+      not up. <code>EXIT 1</code> says it started and crashed; an empty EXIT
+      on that same row says it never started at all.
+    </p>
+
+    <h2>Narrow windows</h2>
+    <p>
+      The table measures your terminal and drops columns until it fits,
+      least useful first, and names what it hid. The same flock at 60
+      columns:
+    </p>
+    <CodeBlock label="shep flock, 60 columns">{`┌────┬──────┬────────┬───────┬──────────┬──────┬────────┐
+│ ID │ NAME │ STATUS │ PID   │ RESTARTS │ MEM  │ UPTIME │
+├────┼──────┼────────┼───────┼──────────┼──────┼────────┤
+│ 1  │ api  │ (x.x)  │ -     │ 15       │ -    │ 0s     │
+│ 0  │ web  │ (o.o)  │ 68630 │ 0        │ 3.0M │ 18s    │
+└────┴──────┴────────┴───────┴──────────┴──────┴────────┘
+  CPU, EXIT, FOLD hidden. Widen the window, or use --format json.`}</CodeBlock>
+    <p>
+      Two things narrowed there. The status word went before any whole
+      column did, leaving the face, which is five columns rather than
+      fifteen. Then <code>CPU</code>, <code>EXIT</code> and <code>FOLD</code>
+      dropped, and the footer says so.
+    </p>
+    <Callout kind="note">
+      Nothing is ever hidden silently, and <code>--format json</code> always
+      carries every field regardless of how wide your window is. If you are
+      scripting against shep, that is the surface to use.
+    </Callout>
+    <p class="fine">
+      <code>ID</code>, <code>NAME</code> and <code>STATUS</code> never drop.
+      Below the width those three need, the table prints wider than the
+      window rather than losing the columns that say which sheep a row is
+      about.
+    </p>
+
+    <h2>What a pipe gets</h2>
+    <p>
+      Redirect it and the boxes, colour and faces all go away. This is not a
+      setting; a non-terminal stdout forces it, and so does
+      <code>--format json</code>:
+    </p>
+    <CodeBlock label="shep flock | cat">{`ID  NAME  STATUS   PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD
+1   api   errored  -      15        1     -     -     0s      -
+0   web   online   68630  0         -     0.0%  3.0M  5m 10s  backend`}</CodeBlock>
+    <p>
+      Those are the same bytes shep printed before any of this existed, which
+      is the point: a script that parsed shep's output last year still parses
+      it today.
+    </p>
+
+    <h2>Choosing how much</h2>
+    <p>
+      Three levels, set with <code>shep style</code>:
+    </p>
+    <div class="rows">
+      <div class="row"><span><code>full</code></span><span>sheep, boxes, colour. The default.</span></div>
+      <div class="row"><span><code>plain</code></span><span>boxes and colour, no faces</span></div>
+      <div class="row"><span><code>bare</code></span><span>exactly what a pipe gets</span></div>
+    </div>
+    <CodeBlock label="shep style">{`$ shep style
+notice[style]: full (from the default)
+
+$ shep style plain
+notice[style]: wrote plain to /tmp/docdemo/home/shep.toml
+
+$ shep style
+notice[style]: plain (from shep.toml)`}</CodeBlock>
+    <p>
+      With no argument it reports the level in force <em>and where it came
+      from</em>, which is what you want when a shell profile and a config file
+      disagree. Four places can decide, and the last one wins:
+    </p>
+    <div class="rows">
+      <div class="row"><span>1. built-in default</span><span><code>full</code></span></div>
+      <div class="row"><span>2. <code>shep.toml</code></span><span><code>[style] level</code></span></div>
+      <div class="row"><span>3. <code>$SHEP_STYLE</code></span><span>per shell</span></div>
+      <div class="row"><span>4. <code>--style</code></span><span>per command</span></div>
+    </div>
+    <CodeBlock label="a higher layer says so">{`$ SHEP_STYLE=full shep style
+notice[style]: full (from $SHEP_STYLE)`}</CodeBlock>
+
+    <h3>NO_COLOR</h3>
+    <p>
+      <a href="https://no-color.org/">The <code>NO_COLOR</code> convention</a>
+      is honoured at every level, and it is a separate axis rather than a
+      fourth level. It removes colour and leaves the layout alone, so
+      <code>full</code> under <code>NO_COLOR</code> still draws boxes and
+      still shows faces:
+    </p>
+    <CodeBlock label="NO_COLOR=1 shep flock">{`│ 1  │ api  │ (x.x) errored │ -     │ 15       │ 1    │ -    │ -    │ 0s     │ -       │`}</CodeBlock>
+    <p class="fine">
+      An empty <code>NO_COLOR=</code> counts as unset, per the convention.
+    </p>
+
+    <h2>Where sheep appear</h2>
+    <p>
+      Beyond the status column, three moments get art, each one a screen with
+      nothing else on it: a flock with nothing in it yet, a flock that is
+      entirely stopped, and <code>shep muster</code>. The count is capped, so
+      mustering forty processes does not paint a field.
+    </p>
+    <Callout kind="note">
+      Never on an error, and never after <code>kill</code>,
+      <code>delete</code> or <code>stop</code>. Errors keep their colour,
+      because red is information, and lose everything else. A sheep beside a
+      failure makes it harder to read, and a cheerful one after deleting a
+      service is simply wrong.
+    </Callout>
+
+    <h2>Following logs</h2>
+    <p>
+      <code>shep bleats</code> prints the tail of each log before it starts
+      following, so a sheep that has already died still tells you why rather
+      than showing you an empty screen while the reason sits in a file you
+      had no particular reason to open.
+    </p>
+    <CodeBlock label="shep bleats api --lines 2">{`api | FATAL: port in use
+api | FATAL: port in use`}</CodeBlock>
+    <p>
+      <code>--lines</code> says how much, counted per stream, and defaults to
+      fifteen. <code>--lines 0</code> follows without replaying anything.
+    </p>
+  </article>
+</DocsLayout>
