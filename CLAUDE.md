@@ -29,9 +29,10 @@ is one class of test.
 cargo test -p shep-daemon --lib --all-features -- --skip ::slow::
 ```
 
-**~1.3s, 437 of 454 lib tests** — the exact counts drift every time a task
-adds one, so treat them as a shape, not a checksum; two briefs have now
-shipped a stale figure. The 18 tests this skips live in a nested `mod slow`
+**~1.3s, 488 of 506 lib tests as of 2026-08-19** — the exact counts drift
+every time a task adds one, so treat them as a shape, not a checksum. Three
+briefs have now shipped a stale figure, and this file carried "437 of 454"
+for long enough to be wrong by fifty. The 18 tests this skips live in a nested `mod slow`
 inside each file's `mod tests` — `extras.rs` has 9, `watch/source.rs` 7, and
 `watch/mod.rs` and `limits/sample.rs` one each — and wait on real macOS
 FSEvents or real elapsed time; they are the reason the unfiltered lib run
@@ -64,6 +65,19 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+```
+
+**If the task changed anything an operator types or sees**, the gate has a
+fifth step in `web/` -- see the docs trigger below for what counts and why:
+
+```bash
+cargo build --release
+```
+```bash
+./web/scripts/generate-cli-reference.sh
+```
+```bash
+cd web && npx astro build
 ```
 
 Each from its own command with `$?` captured directly, never through a pipe —
@@ -169,11 +183,57 @@ re-running that suite in isolation with the mutation still applied.
 
 ## Architecture
 
-Four crates, one distributed binary (`shep`): shep-core, shep-daemon,
-shep-client, shep — each crate's Cargo.toml `description` states its role.
+Five workspace members, one distributed binary (`shep`): shep-core,
+shep-daemon, shep-client, shep-cli (published as `shep`), and
+shep-cli-redirect, a placeholder holding the `shep-cli` name on crates.io.
+Each crate's Cargo.toml `description` states its role.
+
+**The docs site is `web/`** -- an Astro site, published, and part of the
+public surface. See the docs rule below; it is not optional upkeep.
 
 Daemonization = the binary re-execs itself with a hidden `daemon` subcommand.
 Module-by-module design: map.md (see above).
+
+## Docs — hard trigger
+
+**The `web/` docs site is published and is part of the public surface. A
+change to what an operator can type, see, or configure is not finished until
+`web/` says so.** That means a new or removed verb, flag, alias, `shep.toml`
+key, Flockfile field, exit code, JSON payload shape, or default value.
+
+Two halves, and only one of them is automatic:
+
+1. **Regenerate the CLI reference.** It is generated from the real binary's
+   own `--help`, so it never needs writing by hand:
+
+   ```bash
+   cargo build --release
+   ./web/scripts/generate-cli-reference.sh
+   ```
+
+   `git diff` afterwards is the check. A stale copy does not fail any build,
+   which is precisely why it drifts.
+
+2. **Read the prose pages.** `web/src/pages/docs/*.astro` are hand-written
+   and no generator touches them. Grep for the thing you changed before
+   assuming they are fine.
+
+Then build the site, because it can fail on content the Rust gate never sees:
+
+```bash
+cd web && npx astro build
+```
+
+**Why this is a hard trigger rather than a nicety.** On 2026-08-19 the
+generated reference was two days stale (919 lines of drift), and regenerating
+it surfaced a real regression nobody had noticed: the grouped verb listing
+that replaced clap's own `Commands:` block had silently dropped every
+`[aliases: ...]`, so `shep --help` named none of the six working aliases for
+several phases. The same audit found a sample Flockfile in `from-pm2.astro`
+carrying a `reuse_port = true` line that had become a parse refusal that
+morning -- copy-pasteable, and broken. **Nothing in the Rust gate can catch
+either.** `cargo test` does not read `web/`, and `web/` had no mention
+anywhere in this file until now.
 
 ## Code style — hard trigger
 
@@ -213,7 +273,7 @@ never costs clarity.
 ## Status / workflow
 
 Phases 1–10 merged: shep-core, the daemon supervision engine, log plane, the
-16-verb CLI, watch/cron/memory-limit restarts, SO_REUSEPORT reload, custom
+CLI, watch/cron/memory-limit restarts, SO_REUSEPORT reload, custom
 actions over the shepherd channel (now with a correlation id), the pm2
 cutover, the dogs subsystem with working metrics and bark dogs, and an
 audit-debt phase. Phase 11 merged too: the six remaining daemon-surface
@@ -256,8 +316,22 @@ pieces — a name filter that narrows the flock table in place, lambs in the
 sheep detail pane (fetched separately with `Request::Describe`, never on the
 two-second poll), and the three action keys (`x` stop, `R` restart, `L`
 reload) behind the `--allow-control` gate, each arming a confirm rather than
-acting on the keypress that pressed it. No wire change. The v1.0 CLI surface
-is closed except for the Windows functional tier.
+acting on the keypress that pressed it. No wire change.
+
+**After Phase 16** the CLI grew again, so "the v1.0 surface is closed" no
+longer holds and this file will not claim it. `feat/pretty-cli` merged the
+box-drawn table renderer with adaptive column dropping, colour and a sheep
+face in the STATUS column, a `full`/`plain`/`bare` style dial resolved at one
+seam, `shep style` persisting to `shep.toml`, and ASCII sheep in three
+moments. Then 2026-08-19 added `ProcessInfo::last_exit` and an EXIT column
+(a wire change), `shep bleats`' backlog and `--lines`, an opt-in
+`[interpreters]` mapping with `--interpreter`, `~/` expansion in every
+Flockfile path, a Flockfile app's `cwd` defaulting to its own directory, and
+`reuse_port` refused rather than silently ignored. `shep init` is in flight.
+
+**Verb count: 40 visible, not 16.** `./web/scripts/generate-cli-reference.sh`
+prints the current number every time it runs, which is the only figure worth
+trusting.
 
 What's built vs. deferred to v1.1+: [docs/specs/deferred.md](docs/specs/deferred.md).
 Windows is 0%, not partial — every verb prints "not yet supported" and exits.
