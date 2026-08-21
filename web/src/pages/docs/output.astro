@@ -92,7 +92,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       fifteen. Then <code>CPU</code>, <code>EXIT</code> and <code>FOLD</code>
       dropped, and the footer says so.
     </p>
-    <Callout kind="note">
+    <Callout variant="note">
       Nothing is ever hidden silently, and <code>--format json</code> always
       carries every field regardless of how wide your window is. If you are
       scripting against shep, that is the surface to use.
@@ -170,7 +170,7 @@ notice[style]: full (from $SHEP_STYLE)`}</CodeBlock>
       entirely stopped, and <code>shep muster</code>. The count is capped, so
       mustering forty processes does not paint a field.
     </p>
-    <Callout kind="note">
+    <Callout variant="note">
       Never on an error, and never after <code>kill</code>,
       <code>delete</code> or <code>stop</code>. Errors keep their colour,
       because red is information, and lose everything else. A sheep beside a
