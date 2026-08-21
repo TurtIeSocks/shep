@@ -88,11 +88,11 @@ const GROUP_ORDER: &[&str] = &["process", "inputs", "control", "cron"];
 impl Depth {
     pub(crate) fn scaffold(self) -> String {
         match self {
-            Depth::All => format!("{PREAMBLE}{}", rows(CURATED.iter().copied())),
-            Depth::Curated => format!(
+            Depth::All => format!(
                 "{PREAMBLE}{}",
                 rows(grouped_order().iter().map(String::as_str))
             ),
+            Depth::Curated => format!("{PREAMBLE}{}", rows(CURATED.iter().copied())),
         }
     }
 }
