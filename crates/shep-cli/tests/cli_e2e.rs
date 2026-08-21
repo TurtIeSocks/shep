@@ -3474,7 +3474,11 @@ fn what_shep_init_writes_is_a_flockfile_shep_can_read() {
 fn shep_init_refuses_an_existing_flockfile_without_touching_it() {
     let dir = tempfile::tempdir().unwrap();
     let existing = dir.path().join("Flockfile.toml");
-    std::fs::write(&existing, "# mine\n[[app]]\nname = \"web\"\nscript = \"./s\"\n").unwrap();
+    std::fs::write(
+        &existing,
+        "# mine\n[[app]]\nname = \"web\"\nscript = \"./s\"\n",
+    )
+    .unwrap();
 
     let before = std::fs::metadata(&existing).unwrap();
 
