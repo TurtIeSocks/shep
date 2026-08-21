@@ -86,15 +86,14 @@ const CURATED: &[&str] = &["name", "script", "autorestart", "cwd"];
 const GROUP_ORDER: &[&str] = &["process", "inputs", "control", "cron"];
 
 impl Depth {
-    pub(crate) fn curated() -> String {
-        format!("{PREAMBLE}{}", rows(CURATED.iter().copied()))
-    }
-
-    pub(crate) fn all() -> String {
-        format!(
-            "{PREAMBLE}{}",
-            rows(grouped_order().iter().map(String::as_str))
-        )
+    pub(crate) fn scaffold(self) -> String {
+        match self {
+            Depth::All => format!("{PREAMBLE}{}", rows(CURATED.iter().copied())),
+            Depth::Curated => format!(
+                "{PREAMBLE}{}",
+                rows(grouped_order().iter().map(String::as_str))
+            ),
+        }
     }
 }
 
@@ -204,14 +203,6 @@ fn row(name: &str, v: &serde_json::Value) -> String {
     format!("{desc_row}\n#{name} = {value}")
 }
 
-#[allow(dead_code)]
-pub(crate) fn skeleton(depth: Depth) -> String {
-    match depth {
-        Depth::All => Depth::all(),
-        Depth::Curated => Depth::curated(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,7 +240,7 @@ mod tests {
     #[test]
     fn the_skeleton_uncomments_into_a_working_flockfile() {
         for depth in VARIANTS {
-            let live = uncomment(&skeleton(depth));
+            let live = uncomment(&depth.scaffold());
 
             let parsed = Flockfile::parse(&live, FlockFormat::Toml).unwrap_or_else(|err| {
             panic!("the uncommented skeleton must parse as a Flockfile: {err}\n\n--- what was parsed ---\n{live}")
@@ -307,7 +298,7 @@ mod tests {
     #[test]
     fn the_skeleton_as_written_declares_no_apps() {
         for depth in VARIANTS {
-            let err = Flockfile::parse(&skeleton(depth), FlockFormat::Toml).expect_err(
+            let err = Flockfile::parse(&depth.scaffold(), FlockFormat::Toml).expect_err(
                 "shep init must not drop a live app into a fresh Flockfile; \
              everything starts commented out, so the parser must find none",
             );
@@ -326,7 +317,7 @@ mod tests {
     #[test]
     fn the_skeleton_carries_no_em_dashes() {
         for depth in VARIANTS {
-            let text = skeleton(depth);
+            let text = depth.scaffold();
             assert!(!text.contains('\u{2014}'), "em dash in the skeleton");
             assert!(!text.contains('\u{2013}'), "en dash in the skeleton");
         }
@@ -355,7 +346,7 @@ mod tests {
             .as_object()
             .expect("AppConfig declares properties in the schema");
 
-        let text = skeleton(Depth::All);
+        let text = Depth::All.scaffold();
         let missing: Vec<&String> = properties
             .keys()
             .filter(|field| !text.contains(field.as_str()))
