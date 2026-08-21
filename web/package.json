@@ -3,11 +3,11 @@
   "type": "module",
   "version": "0.0.1",
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22.18.0"
   },
   "scripts": {
     "dev": "astro dev",
-    "build": "astro build && pagefind --site dist && node scripts/verify-pagefind-index.mjs",
+    "build": "node --test scripts/verify-dogs-index.ts && astro build && pagefind --site dist && node scripts/verify-pagefind-index.mjs",
     "preview": "astro preview",
     "astro": "astro"
   },

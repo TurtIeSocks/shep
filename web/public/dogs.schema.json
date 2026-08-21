@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "shep community dog index",
+  "description": "Editor-time courtesy schema for web/public/dogs.json. web/src/data/dogs.ts's validate() is the actual gate this mirrors; if the two ever disagree, the validator wins. Point your editor at this file by path, since the data file is a top-level array and cannot carry its own \"$schema\" key.",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "name",
+      "package",
+      "adopt_as",
+      "description",
+      "repo",
+      "license",
+      "category",
+      "source"
+    ],
+    "properties": {
+      "name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "The dog's own name, unique (case-insensitively) across the index. Displayed as \"package (Name)\"."
+      },
+      "package": {
+        "type": "string",
+        "minLength": 1,
+        "description": "The crate or repository name; the real identity, also unique across the index."
+      },
+      "adopt_as": {
+        "type": "string",
+        "minLength": 1,
+        "description": "The name this dog expects to be adopted under: shep adopt <adopt_as> <path>."
+      },
+      "description": {
+        "type": "string",
+        "minLength": 1,
+        "description": "One line describing what the dog does."
+      },
+      "repo": {
+        "type": "string",
+        "format": "uri",
+        "pattern": "^https://",
+        "description": "HTTPS URL of the dog's repository, not just a domain or a profile page."
+      },
+      "license": {
+        "type": "string",
+        "minLength": 1,
+        "description": "SPDX license string."
+      },
+      "category": {
+        "type": "string",
+        "enum": ["logs", "metrics", "alerts", "health", "deploy", "other"]
+      },
+      "source": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "url"],
+            "properties": {
+              "kind": { "const": "cargo-git" },
+              "url": { "type": "string", "minLength": 1 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "module"],
+            "properties": {
+              "kind": { "const": "go-install" },
+              "module": { "type": "string", "minLength": 1 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "instructions"],
+            "properties": {
+              "kind": { "const": "manual" },
+              "instructions": { "type": "string", "minLength": 1 }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
