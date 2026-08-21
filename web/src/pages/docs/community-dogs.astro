@@ -116,10 +116,12 @@ function adoptLine(dog: Dog): string {
     <h2>Add a dog</h2>
     <p>
       Add yours by editing <code>web/public/dogs.json</code> and opening a
-      pull request. <a href="/dogs.schema.json">The published schema</a>{" "}
-      describes what an entry needs, and it's the same schema{" "}
-      <code>npm run build</code> checks every entry against before the site
-      ships.
+      pull request. Point your editor at{" "}
+      <a href="/dogs.schema.json">the published schema</a> and it will tell
+      you what an entry needs while you type it. The build runs its own
+      validator over every entry before the site ships, and a test keeps the
+      two in step, so a pull request that satisfies the schema will not
+      surprise you in CI.
     </p>
   </article>
 </DocsLayout>
