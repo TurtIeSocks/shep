@@ -107,6 +107,12 @@ export const docsNav: DocsNavGroup[] = [
         spec: { anchor: "8-dogs-plugins", label: "§8 Dogs" },
       },
       {
+        slug: "community-dogs",
+        label: "Community dogs",
+        built: true,
+        source: "docs/dogs.md",
+      },
+      {
         slug: "kv",
         label: "The KV store",
         built: true,
