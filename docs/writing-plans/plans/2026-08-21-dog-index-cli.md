@@ -4,7 +4,7 @@
 
 **Goal:** `shep dogs --available` lists the dogs an operator could adopt, read from the community index the docs site publishes, without a shepherd running and without downloading anything.
 
-**Architecture:** Three layers, each testable alone. A narrow `http` module extracted from bark's webhook client gains a bounded GET. An `index` module parses, validates and **sanitises** the fetched JSON, treating every string in it as hostile input. The verb renders through the existing `Render` trait, so the table, `--format json` and the style dial all work unchanged.
+**Architecture:** Three layers, each testable alone. A new `fetch` module takes the connect-and-TLS setup out of bark's webhook client and adds a bounded GET. An `index` module parses, validates and **sanitises** the fetched JSON, treating every string in it as hostile input. The verb renders through the existing `Render` trait, so the table, `--format json` and the style dial all work unchanged.
 
 **Tech Stack:** Rust 2024, MSRV 1.88. `tokio-rustls` and `webpki-roots`, both already workspace dependencies. No new crates.
 
@@ -30,6 +30,7 @@ Established 2026-08-21 by running them against the real host and reading the rea
 - **`Commands::Dogs` is a unit variant** (`crates/shep-cli/src/lib.rs:1125`), dispatched as `Commands::Dogs => match connect_client(...)`. A wiring test at `lib.rs:1698` asserts `matches!(..., Commands::Dogs)` and **will fail to compile** once the variant takes a field. That is expected; update it.
 - **`query::dogs`** (`crates/shep-cli/src/commands/query.rs:300`) renders via `request_and_render` with `DogRows`.
 - **The rendering trait is `Render`** (`crates/shep-cli/src/output/mod.rs:144`): `fn headers() -> &'static [&'static str]`, `fn rows(&self) -> Vec<Vec<String>>`, and an optional `fn rows_for(&self, Presentation, bool)`. `DogRows` (`output/rows.rs:278`) is the precedent to follow.
+- **`crates/shep-cli/src/http.rs` already exists**, 539 lines, and is an HTTP SERVER used by `dog::metrics`, `serve::worker` and both bark modules' tests. It already exports `HttpError`. The client goes in a NEW `fetch.rs` with a `FetchError`. I got this wrong in the first draft of this plan by checking for network dependencies and for bark's client without ever listing the source directory.
 - **bark separates transport from policy**, and this plan copies that: `sinks.rs` speaks both http and https so its tests can bind an ephemeral plain-HTTP port, while `require_secure_scheme` enforces https at config time. Do the same. The `get` function supports both schemes; the index fetch applies the https policy on top.
 
 ---
@@ -37,8 +38,14 @@ Established 2026-08-21 by running them against the real host and reading the rea
 ### Task 1: A bounded GET
 
 **Files:**
-- Create: `crates/shep-cli/src/http.rs`
+- Create: `crates/shep-cli/src/fetch.rs`
 - Modify: `crates/shep-cli/src/dog/bark/sinks.rs`, `crates/shep-cli/src/lib.rs` (or `main.rs`, wherever modules are declared)
+
+**`crates/shep-cli/src/http.rs` ALREADY EXISTS and is not yours.** It is 539 lines of HTTP *server* -- `read_request`, `write_response`, `write_head` -- with four callers: `dog::metrics`, `serve::worker`, and tests in both bark modules. **Do not add the client to it.** Its own module doc gives the reason out loud: it is deliberately TLS-free, "with no TLS to get wrong because the metrics endpoint is loopback by default". A TLS client contradicts that in the file that states it, and would push a 539-line module past 800.
+
+It also **already exports `HttpError`**, imported by `metrics/mod.rs`, `serve/worker.rs` and both bark modules. The new error type is therefore called `FetchError`, and reusing or extending `HttpError` is a defect, not a shortcut.
+
+The new module's doc comment must point at `http.rs` and say why they are separate: one serves a request, one fetches a document, and only the second needs TLS.
 
 **Interfaces:**
 - Consumes: nothing.
@@ -47,11 +54,11 @@ Established 2026-08-21 by running them against the real host and reading the rea
   - `pub fn parse_url(url: &str) -> Result<Target, HttpError>`
   - `pub fn tls_connector() -> &'static tokio_rustls::TlsConnector`
   - `pub async fn get(target: &Target, limit: usize, timeout: Duration) -> Result<Vec<u8>, HttpError>`
-  - `pub enum HttpError { Url(String), Transport(std::io::Error), Status(u16), Redirect { location: String }, Chunked, TooLarge { limit: usize }, Timeout, Truncated { expected: usize, got: usize } }`
+  - `pub enum FetchError { Url(String), Transport(std::io::Error), Status(u16), Redirect { location: String }, Chunked, TooLarge { limit: usize }, Timeout, Truncated { expected: usize, got: usize } }`
 
 - [ ] **Step 1: Move the shared pieces, changing no behaviour**
 
-Move `tls_connector`, `SinkTarget` (renamed `Target`, fields made `pub`) and `parse_sink_url` (renamed `parse_url`) from `sinks.rs` into `http.rs`. `sinks.rs` imports them. Its own error type keeps mapping through its existing variants, so bark's messages do not change.
+Move `tls_connector`, `SinkTarget` (renamed `Target`, fields made `pub`) and `parse_sink_url` (renamed `parse_url`) from `sinks.rs` into `fetch.rs`. `sinks.rs` imports them. Its own error type keeps mapping through its existing variants, so bark's messages do not change.
 
 - [ ] **Step 2: Prove bark is untouched**
 
@@ -62,7 +69,7 @@ Expected: PASS, with the same count as before the move. **Record that count befo
 
 - [ ] **Step 3: Write the failing tests for `get`**
 
-In `http.rs`. Each binds an ephemeral plain-HTTP listener and serves a canned response, the way `sinks.rs`'s own tests already do; read those first for the harness shape.
+In `fetch.rs`. Each binds an ephemeral plain-HTTP listener and serves a canned response, the way `sinks.rs`'s own tests already do; read those first for the harness shape.
 
 ```rust
 #[cfg(test)]
@@ -82,34 +89,34 @@ mod tests {
     #[tokio::test]
     async fn a_chunked_response_is_refused_rather_than_misparsed() {
         let target = serve(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n").await;
-        assert!(matches!(get(&target, 1 << 20, Duration::from_secs(5)).await, Err(HttpError::Chunked)));
+        assert!(matches!(get(&target, 1 << 20, Duration::from_secs(5)).await, Err(FetchError::Chunked)));
     }
 
     #[tokio::test]
     async fn a_redirect_is_refused_and_names_where_it_pointed() {
         let target = serve(b"HTTP/1.1 301 Moved\r\nLocation: https://elsewhere/\r\nContent-Length: 0\r\n\r\n").await;
         let err = get(&target, 1 << 20, Duration::from_secs(5)).await.expect_err("refused");
-        let HttpError::Redirect { location } = err else { panic!("wrong variant: {err:?}") };
+        let FetchError::Redirect { location } = err else { panic!("wrong variant: {err:?}") };
         assert_eq!(location, "https://elsewhere/");
     }
 
     #[tokio::test]
     async fn a_body_over_the_limit_is_refused_before_it_is_read() {
         let target = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n").await;
-        assert!(matches!(get(&target, 10, Duration::from_secs(5)).await, Err(HttpError::TooLarge { limit: 10 })));
+        assert!(matches!(get(&target, 10, Duration::from_secs(5)).await, Err(FetchError::TooLarge { limit: 10 })));
     }
 
     #[tokio::test]
     async fn a_non_2xx_carries_its_status() {
         let target = serve(b"HTTP/1.1 500 Oops\r\nContent-Length: 0\r\n\r\n").await;
-        assert!(matches!(get(&target, 1 << 20, Duration::from_secs(5)).await, Err(HttpError::Status(500))));
+        assert!(matches!(get(&target, 1 << 20, Duration::from_secs(5)).await, Err(FetchError::Status(500))));
     }
 
     #[tokio::test]
     async fn a_peer_that_closes_mid_body_is_an_error_not_a_short_read() {
         let target = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort").await;
         let err = get(&target, 1 << 20, Duration::from_secs(5)).await.expect_err("refused");
-        assert!(matches!(err, HttpError::Truncated { expected: 10, got: 5 }), "{err:?}");
+        assert!(matches!(err, FetchError::Truncated { expected: 10, got: 5 }), "{err:?}");
     }
 
     #[tokio::test]
@@ -120,8 +127,8 @@ mod tests {
 
     #[test]
     fn a_url_that_is_not_http_or_https_is_refused() {
-        assert!(matches!(parse_url("file:///etc/passwd"), Err(HttpError::Url(_))));
-        assert!(matches!(parse_url("not a url"), Err(HttpError::Url(_))));
+        assert!(matches!(parse_url("file:///etc/passwd"), Err(FetchError::Url(_))));
+        assert!(matches!(parse_url("not a url"), Err(FetchError::Url(_))));
     }
 }
 ```
@@ -131,7 +138,7 @@ The size cap is checked **against the declared `Content-Length` before reading**
 - [ ] **Step 4: Run them to watch them fail**
 
 ```bash
-cargo test -p shep --lib --all-features -- http::
+cargo test -p shep --lib --all-features -- fetch::
 ```
 Expected: FAIL, `get` not defined.
 
@@ -144,7 +151,7 @@ Refuse, in this order: a 3xx (naming `Location`), a non-2xx (carrying the code),
 - [ ] **Step 6: Run the tests, then the whole crate**
 
 ```bash
-cargo test -p shep --lib --all-features -- http::
+cargo test -p shep --lib --all-features -- fetch::
 ```
 Expected: PASS, 8 tests.
 
@@ -156,8 +163,8 @@ Expected: PASS, and bark's count matches Step 2's.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/shep-cli/src/http.rs crates/shep-cli/src/dog/bark/sinks.rs crates/shep-cli/src/lib.rs
-git commit -m "feat(cli): a bounded GET, extracted from bark's webhook client"
+git add crates/shep-cli/src/fetch.rs crates/shep-cli/src/dog/bark/sinks.rs crates/shep-cli/src/lib.rs
+git commit -m "feat(cli): a bounded GET, over bark's connect-and-TLS path"
 ```
 
 ---
@@ -169,7 +176,7 @@ git commit -m "feat(cli): a bounded GET, extracted from bark's webhook client"
 - Modify: wherever modules are declared
 
 **Interfaces:**
-- Consumes: `http::{get, parse_url, HttpError}` (Task 1).
+- Consumes: `fetch::{get, parse_url, FetchError}` (Task 1).
 - Produces:
   - `pub struct AvailableDog { pub name: String, pub package: String, pub adopt_as: String, pub description: String, pub repo: String, pub license: String, pub category: String, pub source: DogSourceKind }`
   - `pub enum DogSourceKind { CargoGit { url: String }, GoInstall { module: String }, Manual { instructions: String } }`
@@ -281,7 +288,7 @@ Expected: FAIL.
 
 `parse_index` deserialises to a permissive raw shape, then validates entry by entry. A failing entry increments `skipped` and is dropped. Sanitising every string field of a surviving entry increments `sanitised` once for the entry, not once per field.
 
-`fetch_index` applies the https policy (refusing a non-https URL, the way `require_secure_scheme` does for a sink), calls `http::get` with a **1 MiB** limit and a **10 second** timeout, then `parse_index`.
+`fetch_index` applies the https policy (refusing a non-https URL, the way `require_secure_scheme` does for a sink), calls `fetch::get` with a **1 MiB** limit and a **10 second** timeout, then `parse_index`.
 
 - [ ] **Step 4: Run them**
 
