@@ -223,6 +223,17 @@ Then build the site, because it can fail on content the Rust gate never sees:
 ```bash
 cd web && npx astro build
 ```
+```bash
+cd web && npx astro check
+```
+
+**Both, and `check` is the one that catches a wrong prop.** Astro does not
+typecheck during a build, so a page passing a component a prop it does not
+have builds clean and renders wrong. Measured 2026-08-20: `/docs/output`
+shipped two `<Callout kind="note">` against a component whose prop is
+`variant`, so `variant` was `undefined`, the rendered `div` lost its variant
+class and the label badge rendered empty. `astro build` was green the whole
+time. `astro check` reported both, at `ts(2322)`, the moment it was run.
 
 **Why this is a hard trigger rather than a nicety.** On 2026-08-19 the
 generated reference was two days stale (919 lines of drift), and regenerating
