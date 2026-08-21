@@ -1,0 +1,189 @@
+---
+/*
+ * Community dogs (web/src/data/dogs.ts, backed by web/public/dogs.json).
+ * The two built-in dogs, metrics and bark, live at /docs/dogs. This page is
+ * the third source: dogs other people wrote, adopted with `shep adopt`
+ * instead of shipped inside the binary. `dogs.ts` already validated the
+ * index at import time, so every field read below is trusted.
+ */
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
+import { dogs, CATEGORIES, type Dog, type DogCategory } from "../../data/dogs";
+
+function categoryLabel(category: DogCategory): string {
+  return category.charAt(0).toUpperCase() + category.slice(1);
+}
+
+// One section per category, in CATEGORIES order, dropping any category
+// nobody has filed an entry under rather than rendering an empty heading.
+const groups = CATEGORIES.map((category) => ({
+  category,
+  label: categoryLabel(category),
+  entries: dogs.filter((dog) => dog.category === category),
+})).filter((group) => group.entries.length > 0);
+
+function installLine(dog: Dog): string {
+  switch (dog.source.kind) {
+    case "cargo-git":
+      return `$ cargo install --git ${dog.source.url}`;
+    case "go-install":
+      return `$ go install ${dog.source.module}@latest`;
+    case "manual":
+      return dog.source.instructions;
+  }
+}
+
+function adoptLine(dog: Dog): string {
+  switch (dog.source.kind) {
+    case "cargo-git":
+      return `$ shep adopt ${dog.adopt_as} ~/.cargo/bin/${dog.package}`;
+    case "go-install":
+      return `$ shep adopt ${dog.adopt_as} $(go env GOPATH)/bin/${dog.package}`;
+    case "manual":
+      return `$ shep adopt ${dog.adopt_as} <path to the binary>`;
+  }
+}
+---
+
+<DocsLayout
+  title="Community dogs"
+  description="Dogs other people wrote and adopted with shep adopt, listed for anyone who doesn't want to write their own."
+  crumb="Concepts / Community dogs"
+  activeSlug="community-dogs"
+>
+  <article>
+    <h1>Community dogs</h1>
+    <ReferencePills slug="community-dogs" />
+    <p class="lede">
+      <code>metrics</code> and <code>bark</code> ship inside the{" "}
+      <code>shep</code> binary. Everything below is a dog someone outside
+      this project wrote and adopted the same way, with{" "}
+      <code>shep adopt &lt;name&gt; &lt;path&gt;</code>, pointed at a binary
+      you didn't have to write yourself.
+    </p>
+
+    <Callout variant="careful">
+      Being listed here means three things and nothing more: the repository
+      is real, the license is open, and the thing is genuinely a dog. Nobody
+      on this project reviewed the code, audited it, or is vouching for it.
+      Adopting one runs it at the shepherd's own trust level, the same as
+      anything else your Flockfile already starts.
+    </Callout>
+
+    <p>
+      One assumption runs through every entry below: a crate's binary
+      doesn't have to share its package name, and{" "}
+      <code>CARGO_INSTALL_ROOT</code> or <code>GOBIN</code> can move where
+      the installer puts the file, so check where it actually landed before
+      adopting it. Getting the path wrong is loud, since{" "}
+      <code>shep adopt</code> refuses a path that isn't there. Getting the
+      name wrong is silent, which is exactly why <code>adopt_as</code>{" "}
+      exists as its own field instead of reusing the package name.
+    </p>
+
+    {
+      groups.map((group) => (
+        <section class="dog-category">
+          <h2>{group.label}</h2>
+          {group.entries.map((dog) => (
+            <article class="dog-entry">
+              <h3>
+                {dog.package} ({dog.name})
+              </h3>
+              <p>{dog.description}</p>
+              <p class="meta">
+                {dog.license} ·{" "}
+                <a href={dog.repo} target="_blank" rel="noopener noreferrer">
+                  Repository
+                </a>
+              </p>
+              {dog.source.kind === "manual" ? (
+                <p>
+                  <strong>Install:</strong> {dog.source.instructions}
+                </p>
+              ) : (
+                <CodeBlock label="install">{installLine(dog)}</CodeBlock>
+              )}
+              <CodeBlock label="adopt">{adoptLine(dog)}</CodeBlock>
+            </article>
+          ))}
+        </section>
+      ))
+    }
+
+    <h2>Add a dog</h2>
+    <p>
+      Add yours by editing <code>web/public/dogs.json</code> and opening a
+      pull request. Point your editor at{" "}
+      <a href="/dogs.schema.json">the published schema</a> and it will tell
+      you what an entry needs while you type it. The build runs its own
+      validator over every entry before the site ships, and a test keeps the
+      two in step, so a pull request that satisfies the schema will not
+      surprise you in CI.
+    </p>
+  </article>
+</DocsLayout>
+
+<style>
+  h1 {
+    font-size: clamp(36px, 4.6vw, 56px);
+    line-height: 1;
+    letter-spacing: -0.04em;
+    margin: 0 0 18px;
+  }
+
+  h2 {
+    font-size: 27px;
+    letter-spacing: -0.03em;
+    margin: 44px 0 8px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  h3 {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-size: 19px;
+    letter-spacing: -0.02em;
+    margin: 0 0 8px;
+  }
+
+  .lede {
+    font-size: 19px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  .dog-category {
+    margin-bottom: 8px;
+  }
+
+  .dog-entry {
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    padding: 22px 24px 4px;
+    margin: 0 0 24px;
+    background: var(--paper-2);
+  }
+
+  .dog-entry .meta {
+    font-size: 14.5px;
+    color: var(--ink-3);
+  }
+
+  .dog-entry p {
+    color: var(--ink-2);
+  }
+</style>
