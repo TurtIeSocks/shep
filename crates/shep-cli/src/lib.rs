@@ -35,6 +35,7 @@ mod commands;
 mod completions;
 #[cfg(unix)]
 mod dog;
+mod dog_index;
 mod exit;
 mod fetch;
 mod flourish;
