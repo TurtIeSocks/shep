@@ -100,18 +100,62 @@ pub fn sanitise(field: &str) -> (String, bool) {
 /// Han, emoji and combining marks are ordinary prose in an ordinary
 /// description, and a sanitiser that eats them is a broken sanitiser.
 ///
+/// ## The second group grew, and here is the tell that it had to
+///
+/// The list below started with the characters an author thinks of first,
+/// and review found twelve survivors of exactly the same classes. The
+/// clearest was `U+061C` ARABIC LETTER MARK: a bidi control indistinguishable
+/// in kind from `U+200E`/`U+200F`, which were already stripped. An
+/// inconsistency inside one class is the tell that the class was
+/// enumerated from memory rather than from its definition, so each range
+/// below now names a *class* and takes all of it:
+///
+/// - **Invisible by design.** `U+00AD` soft hyphen, `U+034F` combining
+///   grapheme joiner, the Mongolian free variation selectors and vowel
+///   separator (`U+180B`..`U+180F`), the variation selectors
+///   (`U+FE00`..`U+FE0F` and the supplement `U+E0100`..`U+E01EF`), and the
+///   musical beam/slur/phrase marks (`U+1D173`..`U+1D17A`).
+/// - **Blank but not whitespace.** The Hangul fillers `U+115F`, `U+1160`,
+///   `U+3164` and `U+FFA0` render as nothing at all, so two entries can be
+///   made to look identical while comparing unequal.
+/// - **Tags** (`U+E0000`..`U+E007F`). `U+E0041` is an invisible `A`: the
+///   block can carry an entire hidden ASCII string through any check that
+///   reads what it can see.
+/// - **The rest of the `U+2060` block.** `U+2060`..`U+2064` and
+///   `U+2066`..`U+2069` were listed with the gap between them left in.
+///   `U+206A`..`U+206F` are the deprecated format characters (symmetric
+///   swapping, Arabic form shaping, national digit shapes) — same class,
+///   same invisibility — so the range is now the contiguous
+///   `U+2060`..`U+206F` rather than two halves and a reason to wonder about
+///   the middle.
+///
+/// One deliberate cost: stripping `U+FE0F` drops an emoji's *presentation*
+/// selector, so `❤️` prints as `❤`. The character survives, the entry
+/// survives, and a variation selector is otherwise a free channel for
+/// hiding bytes in a string a human is being asked to trust.
 fn is_unprintable(ch: char) -> bool {
     ch.is_control()
         || matches!(ch,
-            '\u{200b}'..='\u{200f}'   // zero-width space/non-joiner/joiner, LRM, RLM
+            '\u{ad}'                  // soft hyphen
+            | '\u{34f}'               // combining grapheme joiner
+            | '\u{61c}'               // arabic letter mark (bidi, as U+200E/F)
+            | '\u{115f}' | '\u{1160}' // hangul choseong/jungseong fillers
+            | '\u{180b}'..='\u{180f}' // mongolian variation selectors, vowel separator
+            | '\u{200b}'..='\u{200f}' // zero-width space/non-joiner/joiner, LRM, RLM
             | '\u{2028}' | '\u{2029}' // line and paragraph separators
             | '\u{202a}'..='\u{202e}' // bidi embeddings and overrides
-            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
-            | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{2060}'..='\u{206f}' // word joiner, invisible operators, isolates, deprecated
+            | '\u{3164}'              // hangul filler
+            | '\u{fe00}'..='\u{fe0f}' // variation selectors
             | '\u{feff}'              // byte order mark / zero-width no-break space
+            | '\u{ffa0}'             // halfwidth hangul filler
             | '\u{fff9}'..='\u{fffb}' // interlinear annotation
+            | '\u{1d173}'..='\u{1d17a}' // musical beam, slur, phrase marks
+            | '\u{e0000}'..='\u{e007f}' // tags: an invisible ascii alphabet
+            | '\u{e0100}'..='\u{e01ef}' // variation selectors supplement
         )
 }
+
 /// Whether a character [`is_unprintable`] rejected was separating words, and
 /// so should leave a space behind rather than vanish.
 fn is_line_or_space_like(ch: char) -> bool {
@@ -224,5 +268,70 @@ mod tests {
         let (clean, changed) = sanitise("line\nbreak");
         assert_eq!(clean, "line break");
         assert!(changed);
+    }
+
+    /// fails if any of the twelve survivors review found still reaches a
+    /// terminal. Each is invisible or reordering, and each is the same
+    /// *class* as something the list already stripped -- which is exactly
+    /// why they were missed: the class was enumerated from memory rather
+    /// than from its definition. `\u{61c}` is the clearest case, a bidi
+    /// control sitting beside `\u{200e}`/`\u{200f}`, which were stripped
+    /// all along.
+    #[test]
+    fn the_invisible_classes_are_taken_whole_not_as_a_remembered_subset() {
+        let hostile = [
+            ('\u{ad}', "soft hyphen"),
+            ('\u{34f}', "combining grapheme joiner"),
+            ('\u{61c}', "arabic letter mark, a bidi control"),
+            ('\u{115f}', "hangul choseong filler, renders blank"),
+            ('\u{1160}', "hangul jungseong filler, renders blank"),
+            ('\u{180e}', "mongolian vowel separator"),
+            ('\u{206b}', "deprecated: activate symmetric swapping"),
+            ('\u{3164}', "hangul filler, renders blank"),
+            ('\u{fe0f}', "variation selector 16"),
+            ('\u{ffa0}', "halfwidth hangul filler, renders blank"),
+            ('\u{1d173}', "musical symbol begin beam"),
+            ('\u{e0041}', "tag latin capital A: an invisible letter"),
+            ('\u{e0101}', "variation selector supplement"),
+        ];
+        for (ch, why) in hostile {
+            let (clean, changed) = sanitise(&format!("safe{ch}text"));
+            assert!(changed, "{why}: should have been reported as sanitised");
+            assert!(!clean.contains(ch), "{why}: survived in {clean:?}");
+        }
+    }
+
+    /// fails if the tags block can still smuggle a whole hidden string past
+    /// a reader. `U+E0000`..`U+E007F` maps one-to-one onto ASCII, so a name
+    /// can carry an invisible second name that no human sees and every
+    /// `contains` matches.
+    #[test]
+    fn a_hidden_ascii_string_written_in_tags_does_not_survive() {
+        let hidden: String = "rm -rf"
+            .chars()
+            .map(|c| char::from_u32(0xe_0000 + c as u32).unwrap())
+            .collect();
+        let (clean, changed) = sanitise(&format!("Spot{hidden}"));
+        assert!(changed);
+        assert_eq!(clean, "Spot");
+    }
+
+    /// fails if the widened list started eating prose. This is the check
+    /// that says the ranges above are ranges of *format* characters and not
+    /// of everything unfamiliar: kana, Han, accented Latin, a combining
+    /// mark and an emoji base all have to come back byte for byte.
+    #[test]
+    fn prose_in_other_scripts_still_survives_the_wider_list() {
+        for ordinary in [
+            "\u{30ed}\u{30b0}\u{3092}\u{30ed}\u{30fc}\u{30c6}\u{30fc}\u{30c8}", // rotates logs, in katakana
+            "\u{65e5}\u{8a8c}\u{306e}\u{56de}\u{8ee2}",                         // ditto, in kanji
+            "rotiert Protokolldateien",
+            "cafe\u{301}", // combining acute: a mark, not a format character
+            "\u{2764}",    // an emoji base, unaccompanied by its selector
+        ] {
+            let (clean, changed) = sanitise(ordinary);
+            assert_eq!(clean, ordinary, "prose was altered");
+            assert!(!changed, "prose was reported as sanitised");
+        }
     }
 }
