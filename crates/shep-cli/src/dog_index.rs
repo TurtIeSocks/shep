@@ -681,6 +681,45 @@ mod tests {
         assert_eq!(parse_index(document.as_bytes()).expect("parses").skipped, 1);
     }
 
+    /// fails if the CLI's category list and the docs site's drift apart.
+    ///
+    /// They are two independent six-string lists in two languages, and
+    /// nothing but this test holds them equal. Drift is silent and it cuts
+    /// both ways: a category the site accepts and shep does not means a
+    /// contributor's entry builds, publishes, and is then skipped by every
+    /// `shep dogs --available` that reads it -- counted only as an
+    /// anonymous `1 entry skipped`.
+    ///
+    /// `include_str!` rather than a runtime read, deliberately: a missing
+    /// file is then a compile error instead of a test that quietly passes
+    /// having checked nothing. It is inside `#[cfg(test)]`, so a packaged
+    /// crate without `web/` still builds.
+    ///
+    /// Only the runtime array is read here. The `DogCategory` union above
+    /// it in the same file cannot drift on its own -- the array is typed
+    /// `readonly DogCategory[]`, so TypeScript fails the site's own build
+    /// if they disagree.
+    #[test]
+    fn the_categories_match_the_docs_site_list() {
+        const DOGS_TS: &str = include_str!("../../../web/src/data/dogs.ts");
+
+        let after = DOGS_TS
+            .split_once("export const CATEGORIES")
+            .expect("web/src/data/dogs.ts declares CATEGORIES")
+            .1;
+        let literal = after
+            .split_once("];")
+            .expect("the CATEGORIES array is closed")
+            .0;
+        let site: Vec<&str> = literal.split('"').skip(1).step_by(2).collect();
+
+        assert_eq!(
+            site,
+            CATEGORIES.to_vec(),
+            "web/src/data/dogs.ts and dog_index.rs disagree about the categories"
+        );
+    }
+
     /// fails if the default index URL ever becomes plaintext. It is the one
     /// URL an operator never types, so nothing else would notice.
     #[test]
