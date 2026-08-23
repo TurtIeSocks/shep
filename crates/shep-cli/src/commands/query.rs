@@ -415,12 +415,22 @@ pub async fn available_dogs(streams: &mut Streams<'_>, fmt: Format, args: &DogsA
     code
 }
 
+/// The clause both notices below end in, because both counts are
+/// properties of the fetched document rather than of the search.
+///
+/// Without it, `shep dogs --available wombat` prints `1 entry contained
+/// control characters` beside no rows at all, and the honest reading of
+/// that — one of the entries you are looking at was hostile — is the wrong
+/// one. Saying which set the number counts is cheaper than making the
+/// number mean something else.
+const INDEX_WIDE: &str = ", across the whole index rather than this listing";
+
 /// Prints [`dog_index::Index::skipped`]/[`dog_index::Index::sanitised`] as
 /// footer notices when either is non-zero — a reader who sees one has a
 /// reason to go look at the index itself. Independent of the filter and of
 /// how many rows matched: both counts describe the fetch, not the search,
 /// so they are worth saying even alongside a detail view or a "no dog
-/// matches" line.
+/// matches" line, and [`INDEX_WIDE`] is what says so out loud.
 fn note_index_costs(streams: &mut Streams<'_>, fmt: Format, skipped: usize, sanitised: usize) {
     if skipped > 0 {
         let _ = emit_notice(
@@ -428,7 +438,7 @@ fn note_index_costs(streams: &mut Streams<'_>, fmt: Format, skipped: usize, sani
             fmt,
             "dogs_skipped",
             &format!(
-                "{skipped} entr{} skipped",
+                "{skipped} entr{} skipped{INDEX_WIDE}",
                 if skipped == 1 { "y" } else { "ies" }
             ),
         );
@@ -439,7 +449,7 @@ fn note_index_costs(streams: &mut Streams<'_>, fmt: Format, skipped: usize, sani
             fmt,
             "dogs_sanitised",
             &format!(
-                "{sanitised} entr{} contained control characters",
+                "{sanitised} entr{} contained control characters{INDEX_WIDE}",
                 if sanitised == 1 { "y" } else { "ies" }
             ),
         );
