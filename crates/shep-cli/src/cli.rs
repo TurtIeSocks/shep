@@ -279,8 +279,10 @@ pub enum Commands {
     /// List the flock.
     #[command(visible_aliases = ["list", "ls"])]
     Flock,
-    /// List the dogs, and nothing else.
-    Dogs,
+    /// List the dogs, and nothing else. `--available` lists the community
+    /// index of dogs you could adopt instead of the ones this shepherd is
+    /// running.
+    Dogs(DogsArgs),
     /// Turn on a registered dog: writes `[daemon] enabled_dogs` in
     /// `shep.toml`, and starts it now if a shepherd is running.
     ///
@@ -835,6 +837,19 @@ pub struct KvUnsetArgs {
 pub struct FoldArgs {
     /// The fold to list
     pub name: String,
+}
+
+/// `shep dogs`, and the index of dogs you could adopt.
+#[derive(Debug, clap::Args)]
+pub struct DogsArgs {
+    /// List the dogs published in the community index instead of the ones
+    /// this shepherd is running. Needs no shepherd.
+    #[arg(long)]
+    pub available: bool,
+    /// Narrow the listing to entries whose name, package or description
+    /// contains this text, case-insensitively.
+    #[arg(value_name = "FILTER")]
+    pub filter: Option<String>,
 }
 
 /// Arguments to `shep disable`/`shep rehome`, and to the hidden `shep dog`

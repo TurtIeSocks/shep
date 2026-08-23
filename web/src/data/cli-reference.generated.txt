@@ -622,11 +622,21 @@ Options:
   -V, --version
           Print version
 @@VERB:dogs@@
-List the dogs, and nothing else
+List the dogs, and nothing else. `--available` lists the community index of dogs you could adopt
+instead of the ones this shepherd is running
 
-Usage: shep dogs [OPTIONS]
+Usage: shep dogs [OPTIONS] [FILTER]
+
+Arguments:
+  [FILTER]
+          Narrow the listing to entries whose name, package or description contains this text,
+          case-insensitively
 
 Options:
+      --available
+          List the dogs published in the community index instead of the ones this shepherd is
+          running. Needs no shepherd
+
       --format <FORMAT>
           Output format
 

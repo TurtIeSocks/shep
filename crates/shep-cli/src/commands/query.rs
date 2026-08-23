@@ -21,13 +21,14 @@ use shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec};
 use shep_core::status::ProcStatus;
 use shep_daemon::snapshot::FlockSnapshot;
 
-use crate::cli::{FoldArgs, Format, SelectorArgs};
+use crate::cli::{DogsArgs, FoldArgs, Format, SelectorArgs};
 use crate::commands::selector::parse_selector;
+use crate::dog_index::{self, AvailableDog, DogSourceKind};
 use crate::exit::ExitCode;
 use crate::flourish;
 use crate::output::{
-    DogRows, Render, RolledSheep, RolledSheepRows, Streams, emit, emit_described, emit_error,
-    emit_flock, write_outcome,
+    AvailableDogRows, DogRows, Render, RolledSheep, RolledSheepRows, Streams, emit, emit_described,
+    emit_error, emit_flock, emit_notice, write_outcome,
 };
 
 /// Sends `body`, renders whatever the daemon answers through [`emit`], and
@@ -289,6 +290,12 @@ fn sheep_flourish(listing: &[ProcessInfo]) -> Option<String> {
 /// query verb here uses — `DogRows` is a [`Render`] impl like any other, so
 /// no bespoke render path is needed the way `flock`'s own split is.
 ///
+/// `args.filter`, when given, narrows further to a case-insensitive
+/// substring match against each dog's own name — the one field a running
+/// dog and a community-index entry actually share; [`available_dogs`] is
+/// where `package`/`description` join it, per [`DogsArgs::filter`]'s own
+/// doc.
+///
 /// Deliberately not [`emit_flock`]: that function's contract is a MIXED
 /// listing, sheep table first: handing it a dogs-only `Vec<ProcessInfo>`
 /// would still print the sheep table's header row for zero sheep, which is
@@ -297,7 +304,13 @@ fn sheep_flourish(listing: &[ProcessInfo]) -> Option<String> {
 /// `render_table::<DogRows>`, reached here through `emit` and from inside
 /// `emit_flock`'s own dogs section — so there is exactly one place that
 /// knows how to lay out a dogs table.
-pub async fn dogs(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> ExitCode {
+pub async fn dogs(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    fmt: Format,
+    args: &DogsArgs,
+) -> ExitCode {
+    let filter = args.filter.as_deref();
     request_and_render(
         client,
         streams,
@@ -306,12 +319,193 @@ pub async fn dogs(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> Ex
         Request::ListFlock,
         |response| match response {
             Response::Flock(procs) => Some(DogRows(
-                procs.into_iter().filter(|p| p.dog.is_some()).collect(),
+                procs
+                    .into_iter()
+                    .filter(|p| p.dog.is_some())
+                    .filter(|p| filter.is_none_or(|f| matches_filter(f, &[&p.name])))
+                    .collect(),
             )),
             _ => None,
         },
     )
     .await
+}
+
+/// Whether `filter` (already lower-cased at the one call site that needs
+/// it) matches any of `haystacks`, case-insensitively. The one substring
+/// rule backing [`DogsArgs::filter`]'s own doc comment, shared by [`dogs`]
+/// (matching on name alone) and [`available_dogs`] (name, package and
+/// description) so it lives in one place rather than two copies that could
+/// drift apart on which field counts.
+fn matches_filter(filter: &str, haystacks: &[&str]) -> bool {
+    let filter = filter.to_lowercase();
+    haystacks.iter().any(|h| h.to_lowercase().contains(&filter))
+}
+
+/// Lists the dogs published in the community index — `shep dogs
+/// --available`. Reaches no [`Client`] and no [`Request`]: nothing here
+/// touches the wire at all, which is the property `Commands::Dogs`'s own
+/// guard arm in `main`'s dispatch (`lib.rs`) exists to preserve — this must
+/// answer with no shepherd running.
+///
+/// `Format::Table` gets two affordances `--format json` does not, the same
+/// kind of split [`flock`]'s own doc draws between its roll fallback and a
+/// failed JSON request: a filter that narrows the listing to exactly one
+/// dog prints that dog's detail view (its install and adopt commands)
+/// instead of a one-row table, and a filter that matches nothing prints
+/// `no dog matches "<filter>"` and still exits [`ExitCode::Success`] — an
+/// empty search result is an answer, not a failure. `--format json` always
+/// renders the plain array through the ordinary [`emit`] path, whatever its
+/// length: every field either affordance would show is already on each row
+/// there, via [`AvailableDog`]'s own `Serialize`.
+///
+/// # Errors reaching the operator
+/// A failure to read or parse the index prints `reading the dog index from
+/// {url}: {err}` and exits [`ExitCode::Failure`] — [`dog_index::IndexError`]
+/// deliberately carries the URL on none of its variants but its own
+/// `InsecureUrl` (that type's own doc says why), so naming it here is what
+/// tells the operator which URL failed.
+pub async fn available_dogs(streams: &mut Streams<'_>, fmt: Format, args: &DogsArgs) -> ExitCode {
+    let url = dog_index::index_url();
+    let index = match dog_index::fetch_index(&url).await {
+        Ok(index) => index,
+        Err(err) => {
+            let message = format!("reading the dog index from {url}: {err}");
+            let _ = emit_error(
+                &mut *streams.err,
+                fmt,
+                ExitCode::Failure.code_str(),
+                &message,
+            );
+            return ExitCode::Failure;
+        }
+    };
+    let (skipped, sanitised) = (index.skipped, index.sanitised);
+
+    let filter = args.filter.as_deref();
+    let matched: Vec<AvailableDog> = index
+        .dogs
+        .into_iter()
+        .filter(|dog| {
+            filter.is_none_or(|f| matches_filter(f, &[&dog.name, &dog.package, &dog.description]))
+        })
+        .collect();
+
+    let code = if fmt == Format::Table
+        && matched.is_empty()
+        && let Some(filter) = filter
+    {
+        let _ = writeln!(streams.out, "no dog matches {filter:?}");
+        ExitCode::Success
+    } else if fmt == Format::Table
+        && let [only] = matched.as_slice()
+    {
+        write_outcome(render_detail(&mut *streams.out, only))
+    } else {
+        write_outcome(emit(
+            &mut *streams.out,
+            fmt,
+            "dogs",
+            AvailableDogRows(matched),
+            streams.style,
+        ))
+    };
+
+    note_index_costs(streams, fmt, skipped, sanitised);
+    code
+}
+
+/// The clause both notices below end in, because both counts are
+/// properties of the fetched document rather than of the search.
+///
+/// Without it, `shep dogs --available wombat` prints `1 entry contained
+/// control characters` beside no rows at all, and the honest reading of
+/// that — one of the entries you are looking at was hostile — is the wrong
+/// one. Saying which set the number counts is cheaper than making the
+/// number mean something else.
+const INDEX_WIDE: &str = ", across the whole index rather than this listing";
+
+/// Prints [`dog_index::Index::skipped`]/[`dog_index::Index::sanitised`] as
+/// footer notices when either is non-zero — a reader who sees one has a
+/// reason to go look at the index itself. Independent of the filter and of
+/// how many rows matched: both counts describe the fetch, not the search,
+/// so they are worth saying even alongside a detail view or a "no dog
+/// matches" line, and [`INDEX_WIDE`] is what says so out loud.
+fn note_index_costs(streams: &mut Streams<'_>, fmt: Format, skipped: usize, sanitised: usize) {
+    if skipped > 0 {
+        let _ = emit_notice(
+            &mut *streams.err,
+            fmt,
+            "dogs_skipped",
+            &format!(
+                "{skipped} entr{} skipped{INDEX_WIDE}",
+                if skipped == 1 { "y" } else { "ies" }
+            ),
+        );
+    }
+    if sanitised > 0 {
+        let _ = emit_notice(
+            &mut *streams.err,
+            fmt,
+            "dogs_sanitised",
+            &format!(
+                "{sanitised} entr{} contained control characters{INDEX_WIDE}",
+                if sanitised == 1 { "y" } else { "ies" }
+            ),
+        );
+    }
+}
+
+/// The lone-match affordance [`available_dogs`] prints for `Format::Table`:
+/// full detail on one dog, ending in the two copy-pasteable commands an
+/// operator needs to adopt it. Never reached from `--format json` — see
+/// [`available_dogs`]'s own doc for why a machine consumer needs nothing
+/// this adds.
+///
+/// # Errors
+/// The underlying write failed.
+fn render_detail(out: &mut dyn std::io::Write, dog: &AvailableDog) -> std::io::Result<()> {
+    writeln!(out, "{} . {} . {}", dog.name, dog.package, dog.category)?;
+    writeln!(out, "{}", dog.description)?;
+    writeln!(out, "{} . {}", dog.license, dog.repo)?;
+    writeln!(out)?;
+    writeln!(out, "{}", install_line(&dog.source))?;
+    writeln!(
+        out,
+        "{}",
+        adopt_line(&dog.source, &dog.adopt_as, &dog.package)
+    )
+}
+
+/// The `$ ...` line [`render_detail`] prints for how to build `source`'s
+/// binary. [`DogSourceKind::Manual`] carries free-form prose instead of a
+/// command — that variant's own doc says why — so it prints with no `$` at
+/// all, just the two-space indent the command lines share.
+fn install_line(source: &DogSourceKind) -> String {
+    match source {
+        DogSourceKind::CargoGit { url } => format!("  $ cargo install --git {url}"),
+        DogSourceKind::GoInstall { module } => format!("  $ go install {module}@latest"),
+        DogSourceKind::Manual { instructions } => format!("  {instructions}"),
+    }
+}
+
+/// The `$ shep adopt ...` line [`render_detail`] prints, built from
+/// `adopt_as` — never `name` or `package`. [`AvailableDog::adopt_as`]'s own
+/// doc is why: a dog cannot learn the name it was adopted under, so the
+/// wrong name here would ship a copy-pasteable command that silently
+/// discards its entire `[dog.<name>]` config section. [`DogSourceKind::Manual`]
+/// has no predictable install path to fill in, so its line names the
+/// placeholder literally rather than guessing one.
+fn adopt_line(source: &DogSourceKind, adopt_as: &str, package: &str) -> String {
+    match source {
+        DogSourceKind::CargoGit { .. } => {
+            format!("  $ shep adopt {adopt_as} ~/.cargo/bin/{package}")
+        }
+        DogSourceKind::GoInstall { .. } => {
+            format!("  $ shep adopt {adopt_as} $(go env GOPATH)/bin/{package}")
+        }
+        DogSourceKind::Manual { .. } => format!("  $ shep adopt {adopt_as} <path to the binary>"),
+    }
 }
 
 /// Describes the sheep matching `args.selector` in detail.

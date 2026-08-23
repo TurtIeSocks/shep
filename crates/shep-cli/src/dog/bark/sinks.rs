@@ -2,9 +2,9 @@
 //! [`deliver`] that POSTs a rendered body to it.
 //!
 //! **The transport is hand-rolled HTTP/1.1 over `tokio-rustls`, not
-//! `reqwest`.** Discord and Slack webhooks are HTTPS-only, so this is the
-//! one place in the workspace that needs TLS, and Rin's ruling
-//! (2026-08-12) was to reach for `tokio-rustls` + `webpki-roots` (+10ish
+//! `reqwest`.** Discord and Slack webhooks are HTTPS-only, so this was
+//! originally the one place in the workspace that needed TLS, and Rin's
+//! ruling (2026-08-12) was to reach for `tokio-rustls` + `webpki-roots` (+10ish
 //! crates, no C build dependency) directly rather than `reqwest` (+76 to
 //! +93 crates depending on feature set, and a C toolchain — `aws-lc-sys` —
 //! under `reqwest`'s own default `rustls` feature). `rustls` does the part
@@ -14,14 +14,22 @@
 //! way. See `crates/shep-cli/Cargo.toml` and this workspace's root
 //! `Cargo.toml` for the accounting behind the two new dependencies.
 //!
+//! **The connect-and-TLS setup — [`crate::fetch::tls_connector`],
+//! [`crate::fetch::Target`] and [`crate::fetch::parse_url`] — now lives in
+//! `crate::fetch`,** carved out unchanged when `shep dogs --available`
+//! needed the identical setup for a plain GET. This module imports it
+//! rather than owning it a second time; everything below the connection —
+//! the POST framing, the status-line read, `SinkError` itself — stays
+//! here, since none of it is `fetch`'s concern.
+//!
 //! **`http://` is accepted, not rejected**, even though Discord and Slack
 //! are always `https://`: a [`Sink::Json`] can name any operator-configured
 //! endpoint, including an internal one with no TLS in front of it, and this
 //! module's own test suite exercises exactly that scheme — the plaintext
 //! local test server below is never a real webhook, and the TLS branch
-//! ([`tls_connector`], `rustls`'s handshake, the root store built from
-//! `webpki-roots`) is consequently **not** exercised by any test in this
-//! module. That gap is real, not papered over: the request framing, the
+//! ([`crate::fetch::tls_connector`], `rustls`'s handshake, the root store
+//! built from `webpki-roots`) is consequently **not** exercised by any test
+//! in this module. That gap is real, not papered over: the request framing, the
 //! status-line read and every `SinkError` path are what this module writes
 //! itself, and they are covered; the handshake and record layer are
 //! `rustls`'s own tested surface, not bark's. Closing the remaining gap
@@ -43,7 +51,6 @@
 //! per firing, off a spawned task rather than inline in its own loop.
 
 use core::fmt;
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -51,6 +58,8 @@ use shep_core::barks::Bark;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
+
+use crate::fetch::{self, Target};
 
 /// One named entry under `[dog.bark.sinks]`.
 ///
@@ -102,8 +111,8 @@ impl Sink {
     ///
     /// Not exposed past this module — a caller reaching for a sink's URL
     /// directly is exactly the leak [`Sink`]'s own `Debug` guards against;
-    /// [`parse_sink_url`] and [`require_secure_scheme`] are the only
-    /// callers.
+    /// [`deliver`] (via [`crate::fetch::parse_url`]) and
+    /// [`require_secure_scheme`] are the only callers.
     fn url(&self) -> &str {
         match self {
             Self::Discord { url } | Self::Slack { url } | Self::Json { url, .. } => url,
@@ -172,7 +181,7 @@ impl core::error::Error for SinkConfigError {}
 /// `http://` url to either could never have worked anyway.
 /// [`Sink::Json`] is left permissive — an operator pointing bark at an
 /// internal endpoint over plain `http://` is a legitimate arrangement, and
-/// [`parse_sink_url`] still accepts it at delivery time.
+/// [`crate::fetch::parse_url`] still accepts it at delivery time.
 ///
 /// # Errors
 /// - [`SinkConfigError::InsecureScheme`] — `sink` is [`Sink::Discord`] or
@@ -349,7 +358,9 @@ fn json_escape(s: &str) -> String {
 ///   429 arrives this way and reads as one.
 pub async fn deliver(sink: &Sink, bark: &Bark, timeout: Duration) -> Result<(), SinkError> {
     let body = render_body(sink, bark)?;
-    let target = parse_sink_url(sink.url())?;
+    let target = fetch::parse_url(sink.url()).map_err(|source| SinkError::Transport {
+        source: std::io::Error::other(source),
+    })?;
     // Wraps connect, the TLS handshake (when `target.https`), the write and
     // the status-line read together, so a sink that accepts the connection
     // and then says nothing cannot wedge this past `timeout` regardless of
@@ -362,62 +373,11 @@ pub async fn deliver(sink: &Sink, bark: &Bark, timeout: Duration) -> Result<(), 
     }
 }
 
-/// A sink's webhook URL, parsed into what [`deliver`] needs to reach it.
-struct SinkTarget {
-    /// `true` for `https://`, `false` for `http://`.
-    https: bool,
-    /// The host, without a port.
-    host: String,
-    /// The port: the URL's own, or the scheme's default (443/80).
-    port: u16,
-    /// The request path, always starting with `/`.
-    path: String,
-}
-
-/// Parses `url` into a [`SinkTarget`].
-///
-/// Hand-rolled rather than pulled from a `url` crate: a sink's URL is never
-/// more than a scheme, a host, an optional port and a path, and that is
-/// narrow enough to parse directly.
-fn parse_sink_url(url: &str) -> Result<SinkTarget, SinkError> {
-    let bad_url = |reason: &'static str| SinkError::Transport {
-        source: std::io::Error::other(reason),
-    };
-    let (https, rest) = match url.strip_prefix("https://") {
-        Some(rest) => (true, rest),
-        None => match url.strip_prefix("http://") {
-            Some(rest) => (false, rest),
-            None => return Err(bad_url("sink url must start with http:// or https://")),
-        },
-    };
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (
-            h,
-            p.parse()
-                .map_err(|_err| bad_url("sink url has a non-numeric port"))?,
-        ),
-        None => (authority, if https { 443 } else { 80 }),
-    };
-    if host.is_empty() {
-        return Err(bad_url("sink url has no host"));
-    }
-    Ok(SinkTarget {
-        https,
-        host: host.to_string(),
-        port,
-        path: path.to_string(),
-    })
-}
-
 /// The request line, headers and blank line [`deliver_inner`] sends ahead
 /// of `body` — `Host` names the port only when it is off the scheme's own
 /// default (443/80), matching every sink this module tests, which binds an
 /// ephemeral one.
-fn build_request(target: &SinkTarget, body: &str) -> String {
+fn build_request(target: &Target, body: &str) -> String {
     let default_port = if target.https { 443 } else { 80 };
     let host = if target.port == default_port {
         target.host.clone()
@@ -433,7 +393,7 @@ fn build_request(target: &SinkTarget, body: &str) -> String {
 
 /// Connects to `target`, over TLS when `target.https`, and runs the
 /// write/read exchange over whichever stream results.
-async fn deliver_inner(target: &SinkTarget, body: &str) -> Result<(), SinkError> {
+async fn deliver_inner(target: &Target, body: &str) -> Result<(), SinkError> {
     let request = build_request(target, body);
     let tcp = TcpStream::connect((target.host.as_str(), target.port))
         .await
@@ -443,7 +403,7 @@ async fn deliver_inner(target: &SinkTarget, body: &str) -> Result<(), SinkError>
             ServerName::try_from(target.host.clone()).map_err(|source| SinkError::Transport {
                 source: std::io::Error::other(source),
             })?;
-        let tls = tls_connector()
+        let tls = fetch::tls_connector()
             .connect(domain, tcp)
             .await
             .map_err(|source| SinkError::Transport { source })?;
@@ -526,27 +486,6 @@ fn parse_status_code(status_line: &str) -> Result<u16, SinkError> {
         .ok_or_else(|| SinkError::Transport {
             source: std::io::Error::other("malformed http status line"),
         })
-}
-
-/// The TLS connector every `https://` delivery shares, built once on first
-/// use rather than per request: `TlsConnector` wraps an
-/// `Arc<rustls::ClientConfig>`, and building a fresh one per delivery would
-/// re-walk the root store and re-derive the cipher suite set on every bark.
-fn tls_connector() -> &'static tokio_rustls::TlsConnector {
-    static CONNECTOR: std::sync::LazyLock<tokio_rustls::TlsConnector> =
-        std::sync::LazyLock::new(|| {
-            let roots = tokio_rustls::rustls::RootCertStore::from_iter(
-                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-            );
-            let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
-            let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .expect("ring's default cipher suites cover rustls's own default protocol versions")
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-            tokio_rustls::TlsConnector::from(Arc::new(config))
-        });
-    &CONNECTOR
 }
 
 #[cfg(test)]

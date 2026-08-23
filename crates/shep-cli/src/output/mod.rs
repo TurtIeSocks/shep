@@ -40,10 +40,10 @@ use crate::exit::ExitCode;
 // narrowed to that target rather than dropped.
 #[cfg_attr(windows, allow(unused_imports))]
 pub use rows::{
-    BarkRows, DeletedIds, DogAdoptedRow, DogDisabledRow, DogEnabledRow, DogRehomedRow, DogRows,
-    EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, ImportRow, ImportRows, KillRow, KvEntry,
-    KvRows, KvUnsetRow, LambRows, RolledSheep, RolledSheepRows, SavedRollRow, SentLineRows,
-    SignalledRows, StartupStep, StartupSteps, TriggeredRows,
+    AvailableDogRows, BarkRows, DeletedIds, DogAdoptedRow, DogDisabledRow, DogEnabledRow,
+    DogRehomedRow, DogRows, EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, ImportRow,
+    ImportRows, KillRow, KvEntry, KvRows, KvUnsetRow, LambRows, RolledSheep, RolledSheepRows,
+    SavedRollRow, SentLineRows, SignalledRows, StartupStep, StartupSteps, TriggeredRows,
 };
 pub use table::{human_bytes, human_duration, local_timestamp, render_table};
 

@@ -7,8 +7,9 @@
 //! `commands/` (`#[cfg(unix)]`) could not be named by a test running on the
 //! Windows leg at all, and `commands/query.rs` (a later task) does not exist
 //! yet for a test here to depend on regardless. Every type below is built
-//! entirely from `ProcessInfo` / `u32`, and shep-core carries no `cfg` of any
-//! kind, so this really is pure tier.
+//! entirely from `ProcessInfo` / `u32` / `crate::dog_index::AvailableDog`,
+//! and none of those three carries a `cfg` of any kind, so this really is
+//! pure tier.
 
 use serde::Serialize;
 use shep_core::barks::{Bark, SinkOutcome};
@@ -18,6 +19,7 @@ use shep_core::protocol::{
 };
 use shep_core::status::ProcStatus;
 
+use crate::dog_index::AvailableDog;
 use crate::style::Presentation;
 use crate::vocabulary;
 
@@ -1666,6 +1668,75 @@ impl Render for KvRows {
     const PRIORITIES: &'static [u8] = &[0, 0];
 }
 
+/// `shep dogs --available`'s community-index listing.
+///
+/// `transparent`, matching every other `Vec<T>` payload in this file: the
+/// JSON is a plain array of [`AvailableDog`] objects, not a wrapper
+/// object. Constructed by `commands/query.rs`'s `available_dogs`, from
+/// [`crate::dog_index::fetch_index`] -- never from a `Response`: the
+/// community index never touches the daemon wire.
+///
+/// Every string [`AvailableDog`] carries is already sanitised
+/// (`dog_index`'s own module doc is the security boundary for that), so
+/// this impl clones fields straight through with no further escaping.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct AvailableDogRows(pub Vec<AvailableDog>);
+
+impl Render for AvailableDogRows {
+    fn headers() -> &'static [&'static str] {
+        &["NAME", "PACKAGE", "CATEGORY", "DESCRIPTION"]
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|dog| {
+                vec![
+                    dog.name.clone(),
+                    dog.package.clone(),
+                    dog.category.clone(),
+                    dog.description.clone(),
+                ]
+            })
+            .collect()
+    }
+
+    /// # Panics
+    /// If `header` is not one of `Self::headers()`'s own values.
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        match header {
+            "NAME" => "name",
+            "PACKAGE" => "package",
+            "CATEGORY" => "category",
+            "DESCRIPTION" => "description",
+            other => panic!("AvailableDogRows::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[
+        // The whole reason the detail view exists (`AvailableDog::adopt_as`'s
+        // own doc): the name to build an adopt line from, never a column,
+        // because a table has no room to explain why it differs from NAME.
+        "adopt_as",
+        // Long and rarely glanced at in a table row; the detail view is
+        // where an operator reads it before running the install command.
+        "repo", "license",
+        // The tagged `DogSourceKind` object -- what the detail view's
+        // install line is built from, not a column this table renders.
+        "source",
+    ];
+
+    // NAME and PACKAGE are what identify a row -- a dog's display name and
+    // its real, adoptable identity -- so both sit at the floor, the same
+    // role `DogRows`' own NAME/STATUS play. CATEGORY and DESCRIPTION are
+    // both droppable, and DESCRIPTION is the long, unbounded free-text
+    // field of the two, so it goes first -- the same "long field before
+    // short, glanceable one" rule `Render::PRIORITIES`' own doc states.
+    const PRIORITIES: &'static [u8] = &[0, 0, 6, 7];
+}
+
 /// `shep unset`'s own report: how many keys the store lost.
 ///
 /// A count rather than the removed keys themselves: `shep_core::kv::clear`
@@ -2640,6 +2711,44 @@ pub(crate) mod tests {
         assert_no_drift(&KvUnsetRow { removed: 2 }, |j| j, &[]);
     }
 
+    /// The live index's own single entry (`web/public/dogs.json`), the same
+    /// fixture `dog_index`'s own tests build from, so this module's own
+    /// coverage stays aimed at a real published shape rather than one
+    /// invented here.
+    fn sample_available_dog() -> AvailableDog {
+        AvailableDog {
+            name: "Spot".to_string(),
+            package: "shep-log-rotate".to_string(),
+            adopt_as: "log-rotate".to_string(),
+            description: "Rotates grown log files and asks the shepherd to reopen them."
+                .to_string(),
+            repo: "https://github.com/TurtIeSocks/shep-log-rotate".to_string(),
+            license: "MIT OR Apache-2.0".to_string(),
+            category: "logs".to_string(),
+            source: crate::dog_index::DogSourceKind::CargoGit {
+                url: "https://github.com/TurtIeSocks/shep-log-rotate".to_string(),
+            },
+        }
+    }
+
+    /// fails if `AvailableDogRows` grows a field that never reaches the
+    /// table, or forgets a `JSON_ONLY` reason -- the same gate every other
+    /// payload has. `adopt_as`/`repo`/`license`/`source` all serialize but
+    /// are covered by `JSON_ONLY` rather than a column (this type's own
+    /// doc says why); `assert_no_drift`'s key-set check still requires
+    /// each to carry a reason there, or this test fails on an unexplained
+    /// field. `formatted` is empty: every one of the four real columns is a
+    /// plain string, with no nested object or human-only rendering to skip
+    /// the way `DogRows`' own `SOURCE` needs.
+    #[test]
+    fn available_dog_rows_do_not_drift() {
+        assert_no_drift(
+            &AvailableDogRows(vec![sample_available_dog()]),
+            |j| &j[0],
+            &[],
+        );
+    }
+
     // --- Whole-branch review item 2: every `Render` impl gets a real
     // `PRIORITIES` --------------------------------------------------------
 
@@ -2724,6 +2833,7 @@ pub(crate) mod tests {
         assert_priorities_match_headers::<BarkRows>(&["WHEN", "RULE", "SUBJECT"]);
         assert_priorities_match_headers::<KvRows>(&["KEY", "VALUE"]);
         assert_priorities_match_headers::<KvUnsetRow>(&["REMOVED"]);
+        assert_priorities_match_headers::<AvailableDogRows>(&["NAME", "PACKAGE"]);
     }
 
     /// The floor-set check above cannot see two non-floor columns trading
