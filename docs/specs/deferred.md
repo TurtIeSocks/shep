@@ -557,6 +557,39 @@ Three fixes, cheap, and they compose:
 Deferred only because it is Rin's call how far to take it. (1) alone is a
 two-line change and fixes the case that was actually hit.
 
+### `emit_error`'s table arm prints whatever it is handed, unsanitised
+
+Found 2026-08-23 by the adversarial review of `shep dogs --available`, and
+recorded because the instance was fixed while the class was not.
+
+`emit_error`'s `Format::Table` arm is a bare `writeln!`. Nothing between an
+error's `Display` and the operator's terminal removes control characters. That
+is correct for every caller shep has today, because every one of them builds
+its message from shep's own strings.
+
+It stopped being obviously correct the moment shep grew a caller whose error
+text comes off the wire. `FetchError::Redirect` carried a hostile `Location`
+header straight through it and cleared the screen; that is fixed at the
+capture seam, and a test now pins that no `FetchError` variant's `Display` can
+carry a control character. **But the next such caller gets no warning.** The
+guarantee lives in each error type rather than at the point of printing, so
+adding an error that interpolates untrusted text reintroduces the hole
+silently.
+
+Two ways to close it, and the choice is Rin's:
+
+1. **Sanitise inside `emit_error`'s table arm.** One place, closes the class
+   for good. Costs a pass over every error message shep prints, and would
+   strip any deliberate escape a future error wanted, which today is none.
+2. **Make it unrepresentable**: a `TerminalSafe` newtype that `emit_error`
+   requires, so an error carrying raw wire text will not compile. More work,
+   and it pushes the obligation to where the string is built, which is where
+   it belongs.
+
+Deferred rather than picked, because the live hole is closed and the right
+answer depends on whether shep expects more error text to come off the wire.
+`shep install`, if it is ever built, would be exactly that.
+
 ### A dog cannot learn the name it was adopted under, and getting it wrong is silent
 
 Found 2026-08-20 while building `shep-log-rotate`, the first fully external dog.
