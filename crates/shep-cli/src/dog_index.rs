@@ -11,26 +11,25 @@
 //! entry's bytes from shep's. Without a guard, "somebody added a row to a
 //! table" becomes "somebody can drive your terminal".
 //!
-//! So this module is the security boundary of the whole feature, and every
-//! security-relevant line of it sits in this one file on purpose, so a
-//! reviewer can hold the lot in their head at once.
+//! So this module is the security boundary for everything the index says,
+//! and it holds the whole of that boundary bar one function.
 //!
 //! ## What it does about that
 //!
-//! **Every string that survives is sanitised first** ([`sanitise`]).
-//! Control characters (which is where `\u{1b}` and the single-character CSI
-//! introducer `\u{9b}` both live, both being `Cc`) and the invisible or
-//! reordering format characters — zero-width joiners, bidi overrides, the
-//! BOM — are stripped, and the whitespace their removal leaves behind is
-//! collapsed. **Non-ASCII prose is not the threat and survives untouched**:
-//! a German or Japanese description is ordinary text, and a sanitiser that
-//! strips it is a broken sanitiser.
+//! **Every string that survives is sanitised first** ([`sanitise`], which
+//! lives in [`crate::terminal_safe`] and states the rule in full). Control
+//! characters, and the invisible or reordering format characters that are
+//! not control characters, are stripped; non-ASCII prose survives
+//! untouched.
 //!
-//! Stripping rather than escaping. Rendering `^[[2J` literally is arguably
-//! more honest, but strip is simpler to get right and nothing anybody wants
-//! to read is lost. The cost is that the printable tail of a sequence
-//! survives as inert text: `\u{1b}[2J` prints as `[2J`. That is a broken
-//! sequence, not a working one.
+//! The sanitiser sits in its own module rather than in this file because
+//! the *body* of a response is not the only hostile string in a fetch. Its
+//! **headers** are too, and those are read a layer below this one, in
+//! [`crate::fetch`] — which cannot import from here without a module
+//! cycle. That asymmetry was a real hole for the length of this branch: a
+//! hostile `Location:` on a 3xx reached the terminal raw while every string
+//! beside it in the body was cleaned. [`crate::terminal_safe`]'s own doc
+//! has the history.
 //!
 //! **An entry that needed stripping still lists, and is counted**
 //! ([`Index::sanitised`]). It is reported rather than quietly repaired
@@ -63,6 +62,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::fetch::{self, FetchError};
+use crate::terminal_safe::sanitise;
 
 /// Where the index lives when nothing overrides it: the docs site serves
 /// this file verbatim, and `/dogs.json` is an exact file path that answers
@@ -414,84 +414,6 @@ fn is_https(url: &str) -> bool {
     url.starts_with("https://")
 }
 
-/// Strips everything that could drive a terminal out of `field`, returning
-/// the cleaned text and whether anything was removed.
-///
-/// The rule is: drop every character that is invisible, that moves the
-/// cursor, or that reorders what follows it — see [`is_unprintable`] for the
-/// exact set — then collapse the whitespace that dropping leaves behind, so
-/// a stripped newline does not weld two words together.
-///
-/// **A string with nothing to strip is returned byte for byte**, and reports
-/// `false`. That matters twice over: non-ASCII prose is ordinary text and
-/// must survive untouched, and the reported flag drives an operator-facing
-/// count that has to mean "this entry carried control characters" rather
-/// than "this entry had two spaces in a row".
-fn sanitise(field: &str) -> (String, bool) {
-    if !field.chars().any(is_unprintable) {
-        return (field.to_owned(), false);
-    }
-    let stripped: String = field
-        .chars()
-        .filter_map(|ch| {
-            if !is_unprintable(ch) {
-                Some(ch)
-            } else if is_line_or_space_like(ch) {
-                // A line break was separating two words; a plain deletion
-                // would join them.
-                Some(' ')
-            } else {
-                None
-            }
-        })
-        .collect();
-    let cleaned = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
-    (cleaned, true)
-}
-
-/// Whether `ch` must never reach a terminal.
-///
-/// Two groups, and it is worth naming why each is here:
-///
-/// - **`char::is_control`**, which is the Unicode `Cc` category: `U+0000`
-///   through `U+001F` and `U+007F` through `U+009F`. That covers `\u{1b}`
-///   (the escape that opens `[2J`, `]0;` and every colour sequence),
-///   `\r`, `\n`, `\t`, `\u{0}`, `\u{7}` — and `\u{9b}`, the
-///   single-character CSI introducer, which is *not* `\u{1b}` and is easy
-///   to forget precisely because it does not look like an escape.
-/// - **Invisible and reordering format characters**, which are not control
-///   characters and so survive the first test: zero-width spaces and
-///   joiners, the bidi embeddings and overrides (`U+202E` can make
-///   `exe.gnp` read as `png.exe`), the bidi isolates, the word joiner and
-///   the invisible maths operators, the BOM, and the interlinear annotation
-///   marks. `U+2028`/`U+2029` are in the list as line and paragraph
-///   separators: newlines under another name.
-///
-/// Everything else survives, and that is the point. Accented Latin, kana,
-/// Han, emoji and combining marks are ordinary prose in an ordinary
-/// description, and a sanitiser that eats them is a broken sanitiser.
-fn is_unprintable(ch: char) -> bool {
-    ch.is_control()
-        || matches!(ch,
-            '\u{200b}'..='\u{200f}'   // zero-width space/non-joiner/joiner, LRM, RLM
-            | '\u{2028}' | '\u{2029}' // line and paragraph separators
-            | '\u{202a}'..='\u{202e}' // bidi embeddings and overrides
-            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
-            | '\u{2066}'..='\u{2069}' // bidi isolates
-            | '\u{feff}'              // byte order mark / zero-width no-break space
-            | '\u{fff9}'..='\u{fffb}' // interlinear annotation
-        )
-}
-
-/// Whether a character [`is_unprintable`] rejected was separating words, and
-/// so should leave a space behind rather than vanish.
-fn is_line_or_space_like(ch: char) -> bool {
-    matches!(
-        ch,
-        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}'
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -599,49 +521,6 @@ mod tests {
     ]"#;
 
     #[test]
-    fn every_escape_class_is_stripped() {
-        // Each of these reaches a terminal if it survives. shep emits colour
-        // itself, so a reader cannot tell an entry's bytes from shep's own.
-        let hostile = [
-            ("\u{1b}[2J", "clears the screen"),
-            ("\u{1b}]0;pwned\u{7}", "rewrites the window title"),
-            ("\u{1b}[31mred", "forges shep's own colour"),
-            ("before\rafter", "overwrites the line with a bare CR"),
-            ("a\u{0}b", "a nul byte"),
-            ("tab\there", "a raw tab"),
-            ("line\nbreak", "escapes the row"),
-        ];
-        for (input, why) in hostile {
-            let (clean, changed) = sanitise(input);
-            assert!(changed, "{why}: should have been reported as sanitised");
-            assert!(
-                !clean.contains('\u{1b}'),
-                "{why}: escape survived in {clean:?}"
-            );
-            for ch in clean.chars() {
-                assert!(
-                    !ch.is_control(),
-                    "{why}: control char survived in {clean:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn ordinary_text_is_left_exactly_alone() {
-        let (clean, changed) = sanitise("Rotates grown log files. MIT OR Apache-2.0.");
-        assert_eq!(clean, "Rotates grown log files. MIT OR Apache-2.0.");
-        assert!(!changed);
-    }
-
-    #[test]
-    fn non_ascii_prose_survives_because_it_is_not_the_threat() {
-        let (clean, changed) = sanitise("rotiert Protokolldateien");
-        assert_eq!(clean, "rotiert Protokolldateien");
-        assert!(!changed);
-    }
-
-    #[test]
     fn a_sanitised_entry_still_lists_and_is_counted() {
         let index = parse_index(one_entry_with_description("clean\u{1b}[2Jhere").as_bytes())
             .expect("parses");
@@ -729,54 +608,6 @@ mod tests {
         assert_eq!(index.sanitised, 1);
     }
 
-    /// fails if a trailing escape survives. A lone `\u{1b}` at the very end
-    /// of a field opens a sequence that the NEXT thing printed completes,
-    /// which is whatever shep itself writes after the cell. It is the one
-    /// escape that does nothing on its own and everything in context.
-    #[test]
-    fn a_lone_escape_at_the_end_of_a_string_is_stripped() {
-        let (clean, changed) = sanitise("tail\u{1b}");
-        assert_eq!(clean, "tail");
-        assert!(changed);
-    }
-
-    /// fails if `\u{9b}` survives. It is the single-character CSI
-    /// introducer: `\u{9b}2J` does what `\u{1b}[2J` does, in one character
-    /// that is not `\u{1b}` and does not look like an escape. Covered here
-    /// because it lives in the C1 block, which `char::is_control` includes
-    /// and a hand-rolled `ch == '\u{1b}' || ch < ' '` check would not.
-    #[test]
-    fn the_single_character_csi_introducer_is_stripped() {
-        let (clean, changed) = sanitise("clean\u{9b}2Jhere");
-        assert!(changed);
-        assert!(!clean.contains('\u{9b}'), "C1 CSI survived in {clean:?}");
-    }
-
-    /// fails if any invisible or reordering character survives. None of
-    /// these is a control character, so `char::is_control` alone misses
-    /// every one. `\u{202e}` is the interesting one: it reverses what
-    /// follows, so a package named `shep-exe.gnp` renders as
-    /// `shep-png.exe`, and the two entries are indistinguishable in a
-    /// table.
-    #[test]
-    fn invisible_and_reordering_characters_are_stripped() {
-        let hostile = [
-            ('\u{202e}', "right-to-left override"),
-            ('\u{202d}', "left-to-right override"),
-            ('\u{2066}', "left-to-right isolate"),
-            ('\u{200d}', "zero width joiner"),
-            ('\u{200b}', "zero width space"),
-            ('\u{2060}', "word joiner"),
-            ('\u{feff}', "byte order mark"),
-            ('\u{2028}', "line separator"),
-        ];
-        for (ch, why) in hostile {
-            let (clean, changed) = sanitise(&format!("safe{ch}text"));
-            assert!(changed, "{why}: should have been reported as sanitised");
-            assert!(!clean.contains(ch), "{why}: survived in {clean:?}");
-        }
-    }
-
     /// fails if an entry whose every character is hostile becomes a blank
     /// row instead of a skipped one. A name that sanitises to nothing is
     /// not a listing.
@@ -848,16 +679,6 @@ mod tests {
         let document = serde_json::Value::Array(vec![entry]).to_string();
 
         assert_eq!(parse_index(document.as_bytes()).expect("parses").skipped, 1);
-    }
-
-    /// fails if a stripped line break welds two words together. `line` and
-    /// `break` are separate words in the source, and `linebreak` is a
-    /// different string from either.
-    #[test]
-    fn a_stripped_line_break_leaves_a_space_behind() {
-        let (clean, changed) = sanitise("line\nbreak");
-        assert_eq!(clean, "line break");
-        assert!(changed);
     }
 
     /// fails if the default index URL ever becomes plaintext. It is the one

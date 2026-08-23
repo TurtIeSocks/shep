@@ -49,6 +49,7 @@ mod serve;
 #[cfg(unix)]
 mod status;
 mod style;
+mod terminal_safe;
 mod vocabulary;
 mod welcome;
 #[cfg(unix)]

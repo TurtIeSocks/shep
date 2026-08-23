@@ -57,6 +57,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 
+use crate::terminal_safe;
+
 /// A URL, parsed into what [`get`] needs to reach it — a fetch's own
 /// version of what `dog::bark::sinks` calls a sink's target, since that is
 /// exactly what this is: the two used to be one type before this module
@@ -101,7 +103,10 @@ pub enum FetchError {
     /// The response was a 3xx naming a `Location`, refused rather than
     /// followed.
     Redirect {
-        /// The `Location` header's value, verbatim.
+        /// The `Location` header's value, [`crate::terminal_safe::sanitise`]d
+        /// at capture. It is a string the host chose and this `Display`
+        /// prints to a terminal, so it is stripped of anything that could
+        /// drive one before it is ever stored.
         location: String,
     },
     /// The response carried a `Transfer-Encoding` header. This client reads
@@ -350,7 +355,19 @@ async fn read_response<S: AsyncRead + Unpin>(
         };
         let value = value.trim();
         match name.trim().to_ascii_lowercase().as_str() {
-            "location" => location = Some(value.to_string()),
+            // Sanitised here, at the one seam where a header value becomes
+            // an owned string this module keeps, rather than at whichever
+            // print site it eventually reaches: `FetchError::Redirect`'s
+            // `Display` lands in `emit_error`'s table arm, which is a bare
+            // `writeln!`, and a print site somebody forgets is another
+            // hole. A seam is one place.
+            //
+            // Not hoisted above the `match` to cover every header at once,
+            // deliberately: `content-length` is *parsed* below, and
+            // sanitising first would silently repair `1\u{200b}2` into a
+            // `12` this client then honoured. A parser must see the raw
+            // bytes; only a string that survives to be shown gets cleaned.
+            "location" => location = Some(terminal_safe::sanitise(value).0),
             "transfer-encoding" => transfer_encoding = true,
             "content-length" => match value.parse::<u64>() {
                 Ok(parsed) => match content_length {
@@ -464,6 +481,86 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: addr.port(),
             path: "/".to_string(),
+        }
+    }
+
+    /// fails if a `Location:` header reaches an operator's terminal carrying
+    /// the bytes the host wrote. This was live on this branch and
+    /// reproduced against the release binary: the response *body* was
+    /// sanitised entry by entry and the response *headers* were not, so a
+    /// 302 naming `\u{1b}[2J\u{1b}]0;pwned\u{7}` cleared the screen and
+    /// rewrote the window title on its way through `emit_error`'s table arm,
+    /// which is a bare `writeln!`.
+    ///
+    /// Asserts the exact cleaned string, not merely the absence of an
+    /// escape: the redirect must still *name* where it pointed, or the
+    /// refusal stops being useful.
+    #[tokio::test]
+    async fn a_hostile_location_header_cannot_drive_the_terminal_it_prints_to() {
+        let target = serve(
+            b"HTTP/1.1 302 Found\r\nLocation: \x1b[2J\x1b]0;pwned\x07/gone\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let err = get(&target, 1 << 20, Duration::from_secs(5))
+            .await
+            .expect_err("refused");
+        let FetchError::Redirect { location } = &err else {
+            panic!("wrong variant: {err:?}")
+        };
+        assert_eq!(location, "[2J]0;pwned/gone", "location was not sanitised");
+        assert!(
+            !err.to_string().chars().any(char::is_control),
+            "a control character reached the message: {:?}",
+            err.to_string()
+        );
+    }
+
+    /// fails if ANY refusal can put a character the host chose in front of
+    /// an operator — the class, rather than the one `Location` case above.
+    ///
+    /// Every response here is hostile in a different place (the status line,
+    /// a header name, a header value, the header a variant actually
+    /// captures), and each drives a different refusal. A future variant that
+    /// starts carrying response-derived text and forgets the seam has to
+    /// pass this to ship.
+    #[tokio::test]
+    async fn no_refusal_hands_a_terminal_a_character_the_host_chose() {
+        let hostile: [(&'static [u8], &str); 6] = [
+            (
+                b"HTTP/1.1 302 Found\r\nLocation: \x1b[2J\x07\r\nContent-Length: 0\r\n\r\n",
+                "a redirect naming a hostile location",
+            ),
+            (
+                b"HTTP/1.1 404 \x1b[2JNot Found\r\nContent-Length: 0\r\n\r\n",
+                "a non-2xx whose reason phrase is hostile",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: \x1b[2Jchunked\r\n\r\n0\r\n\r\n",
+                "a chunked refusal whose header value is hostile",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: \x1b[2Jnope\r\n\r\n",
+                "an unparseable content-length that is hostile",
+            ),
+            (
+                b"\x1b[2J\x07 NOT HTTP AT ALL\r\n\r\n",
+                "a status line that is not HTTP and is hostile",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\n\x1b[2Jno-colon-here\r\n\r\n",
+                "a header line with no colon, hostile",
+            ),
+        ];
+        for (response, why) in hostile {
+            let target = serve(response).await;
+            let err = get(&target, 1 << 20, Duration::from_secs(5))
+                .await
+                .expect_err(why);
+            let shown = err.to_string();
+            assert!(
+                !shown.chars().any(char::is_control),
+                "{why}: a control character reached the message: {shown:?}"
+            );
         }
     }
 
