@@ -44,6 +44,15 @@
 //! read, and again as each chunk of the body arrives — so neither a lying
 //! header nor an honest one can make this read forever.
 //!
+//! **The status line and headers are capped too**, at
+//! [`MAX_HEADER_BYTES`] for the block as a whole
+//! ([`FetchError::HeadersTooLarge`]). Everything above bounds the *body*,
+//! and for a while nothing bounded what came before it: a response opening
+//! `HTTP/1.1 200 OK\r\nX-Filler: ` and then never sending another newline
+//! grew a `String` for as long as the peer kept typing — measured at
+//! 10.4 GB in three seconds on loopback, bounded only by `timeout`. A cap
+//! on the body is not a cap on the response.
+//!
 //! No `Accept-Encoding` is ever sent, so there is no `Content-Encoding` to
 //! decode: measured against the real target (a GitHub Pages site), it sends
 //! `Content-Length` and never chunks, and sends no `Content-Encoding`
@@ -58,6 +67,21 @@ use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 
 use crate::terminal_safe;
+
+/// The most this module will read before the blank line that ends a
+/// response's header block — status line included.
+///
+/// 64 KiB, which is what nginx, Apache and Go's `net/http` all settle
+/// within an order of magnitude of for the same budget, and far more than
+/// any real response needs: the live index's own answer runs about 300
+/// bytes of headers. It exists because there is no other bound at all on a
+/// peer that never sends a newline — see this module's own doc for the
+/// measurement.
+///
+/// Not the caller's `limit`. That one is a body budget an index sets from
+/// what an index plausibly weighs; this one is a protocol budget and has
+/// nothing to do with the document.
+pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 /// A URL, parsed into what [`get`] needs to reach it — a fetch's own
 /// version of what `dog::bark::sinks` calls a sink's target, since that is
@@ -118,6 +142,15 @@ pub enum FetchError {
         /// The limit the caller passed to [`get`].
         limit: usize,
     },
+    /// The status line and header block together ran past
+    /// [`MAX_HEADER_BYTES`] without reaching the blank line that ends them.
+    /// Separate from [`Self::TooLarge`] because that one is the caller's
+    /// budget for a *body* and this one is this module's own, fixed budget
+    /// for everything before it.
+    HeadersTooLarge {
+        /// [`MAX_HEADER_BYTES`], named here so the message can state it.
+        limit: usize,
+    },
     /// `timeout` elapsed before the exchange finished.
     Timeout,
     /// The peer closed the connection before `Content-Length` bytes
@@ -144,6 +177,9 @@ impl fmt::Display for FetchError {
                 )
             }
             Self::TooLarge { limit } => write!(f, "fetch response exceeded the {limit}-byte limit"),
+            Self::HeadersTooLarge { limit } => {
+                write!(f, "fetch response headers exceeded the {limit}-byte limit")
+            }
             Self::Timeout => write!(f, "fetch timed out"),
             Self::Truncated { expected, got } => {
                 write!(
@@ -164,6 +200,7 @@ impl core::error::Error for FetchError {
             | Self::Redirect { .. }
             | Self::Chunked
             | Self::TooLarge { .. }
+            | Self::HeadersTooLarge { .. }
             | Self::Timeout
             | Self::Truncated { .. } => None,
         }
@@ -315,10 +352,16 @@ async fn read_response<S: AsyncRead + Unpin>(
     stream: S,
     limit: usize,
 ) -> Result<Vec<u8>, FetchError> {
-    let mut reader = BufReader::new(stream);
+    // One budget for the status line and every header line together, spent
+    // through a `Take` rather than checked after the fact: `read_line`
+    // itself is what is unbounded, so a check afterwards is a check that
+    // runs once the `String` has already grown. When the budget runs out
+    // `read_line` reports a clean zero, exactly as EOF does, and
+    // `headers.limit()` is what tells the two apart below.
+    let mut headers = BufReader::new(stream).take(MAX_HEADER_BYTES as u64);
 
     let mut status_line = String::new();
-    reader
+    headers
         .read_line(&mut status_line)
         .await
         .map_err(FetchError::Transport)?;
@@ -336,11 +379,16 @@ async fn read_response<S: AsyncRead + Unpin>(
 
     loop {
         let mut line = String::new();
-        let read = reader
+        let read = headers
             .read_line(&mut line)
             .await
             .map_err(FetchError::Transport)?;
         if read == 0 {
+            if headers.limit() == 0 {
+                return Err(FetchError::HeadersTooLarge {
+                    limit: MAX_HEADER_BYTES,
+                });
+            }
             return Err(FetchError::Transport(std::io::Error::other(
                 "response headers ended without a blank line",
             )));
@@ -411,6 +459,12 @@ async fn read_response<S: AsyncRead + Unpin>(
     // `usize`, so `content_length` fits in one.
     let expected = content_length as usize;
 
+    // The header budget is spent; the body has its own (`limit`, checked
+    // twice above and below). Anything the `BufReader` read ahead of the
+    // blank line is still sitting in its buffer, so unwrapping the `Take`
+    // resumes exactly where the header loop stopped.
+    let mut reader = headers.into_inner();
+
     let mut body = vec![0u8; expected];
     let mut filled = 0;
     while filled < expected {
@@ -464,6 +518,13 @@ mod tests {
 
     /// Serves one canned response on an ephemeral port, then stops.
     async fn serve(response: &'static [u8]) -> Target {
+        serve_owned(response.to_vec()).await
+    }
+
+    /// [`serve`] for a response a test builds at run time rather than
+    /// writes as a literal — the header-cap cases, whose responses are tens
+    /// of kilobytes of padding.
+    async fn serve_owned(response: Vec<u8>) -> Target {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -473,8 +534,39 @@ mod tests {
             // depend on what was asked for.
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf).await;
-            let _ = stream.write_all(response).await;
+            let _ = stream.write_all(&response).await;
             let _ = stream.shutdown().await;
+        });
+        Target {
+            https: false,
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            path: "/".to_string(),
+        }
+    }
+
+    /// Serves a response that opens a header and then never ends it, for as
+    /// long as anything is still reading — the shape that swallowed 10.4 GB
+    /// in three seconds before [`MAX_HEADER_BYTES`] existed.
+    async fn serve_endless_header() -> Target {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _peer) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            if stream
+                .write_all(b"HTTP/1.1 200 OK\r\nX-Filler: ")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // Ends itself: a client that refuses closes the socket, and the
+            // next write fails. Nothing here is unbounded except the peer's
+            // patience.
+            let filler = vec![b'A'; 8 * 1024];
+            while stream.write_all(&filler).await.is_ok() {}
         });
         Target {
             https: false,
@@ -562,6 +654,46 @@ mod tests {
                 "{why}: a control character reached the message: {shown:?}"
             );
         }
+    }
+
+    /// fails if a peer that never ends a header can make this read for as
+    /// long as it cares to type. The two-second budget is the forcing
+    /// mechanism: a bounded refusal comes back in milliseconds, and the
+    /// unbounded read this replaced could only ever answer `Timeout`.
+    #[tokio::test]
+    async fn a_header_that_never_ends_is_refused_rather_than_read_forever() {
+        let target = serve_endless_header().await;
+        let err = get(&target, 1 << 20, Duration::from_secs(2))
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(
+                err,
+                FetchError::HeadersTooLarge {
+                    limit: MAX_HEADER_BYTES
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// fails if the header cap refuses a response that fits inside it. The
+    /// boundary is the point of the test: a block just under
+    /// [`MAX_HEADER_BYTES`] is large, legal, and must still be read, body
+    /// and all.
+    #[tokio::test]
+    async fn a_header_block_just_under_the_cap_is_still_read() {
+        let tail = b"\r\nContent-Length: 5\r\n\r\nhello";
+        let head = b"HTTP/1.1 200 OK\r\nX-Pad: ";
+        let pad = MAX_HEADER_BYTES - head.len() - tail.len();
+        let mut response = head.to_vec();
+        response.extend(std::iter::repeat_n(b'A', pad));
+        response.extend_from_slice(tail);
+        let target = serve_owned(response).await;
+        let body = get(&target, 1 << 20, Duration::from_secs(5))
+            .await
+            .expect("read");
+        assert_eq!(body, b"hello");
     }
 
     #[tokio::test]
