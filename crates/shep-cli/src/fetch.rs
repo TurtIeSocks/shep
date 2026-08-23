@@ -303,11 +303,36 @@ async fn get_inner(target: &Target, limit: usize) -> Result<Vec<u8>, FetchError>
         let tls = tls_connector()
             .connect(domain, tcp)
             .await
-            .map_err(FetchError::Transport)?;
+            .map_err(peer_transport_error)?;
         exchange(tls, &request, limit).await
     } else {
         exchange(tcp, &request, limit).await
     }
+}
+
+/// A transport failure the peer had a hand in wording, sanitised.
+///
+/// `TcpStream::connect` and a socket read fail with text the OS wrote, and
+/// the OS is not the threat. A TLS handshake is the exception: rustls's
+/// `CertificateError::NotValidForNameContext` prints the names the peer's
+/// certificate *presented*, which is a string somebody else chose and which
+/// [`FetchError`]'s own `Display` puts in front of an operator.
+///
+/// The channel is narrow in practice — a publicly trusted CA will not sign
+/// a name with an escape in it, and webpki parses the SANs before rustls
+/// ever formats them — but narrow is not the standard the rest of this
+/// module holds itself to, and the `Location` header this now matches
+/// looked narrow too right up until it was reproduced.
+///
+/// Keeps the [`std::io::ErrorKind`] and drops the nested source, which
+/// nothing walks: [`FetchError::Transport`]'s `Display` prints one level
+/// and [`FetchError::source`] hands back this error, not what was inside
+/// it.
+fn peer_transport_error(source: std::io::Error) -> FetchError {
+    FetchError::Transport(std::io::Error::new(
+        source.kind(),
+        terminal_safe::sanitise(&source.to_string()).0,
+    ))
 }
 
 /// The request line and headers [`get_inner`] sends: `Host` names the port
