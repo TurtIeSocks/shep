@@ -1124,8 +1124,15 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             }
             Err(_) => query::flock_from_roll(&mut streams, fmt, &paths),
         },
-        Commands::Dogs => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => query::dogs(&client, &mut streams, fmt).await,
+        // The guard arm is what makes `--available` work with no shepherd
+        // running at all: it never reaches `connect_client`, so a
+        // community-index listing does not fail on a `$SHEP_HOME` where no
+        // daemon was ever started.
+        Commands::Dogs(ref args) if args.available => {
+            query::available_dogs(&mut streams, fmt, args).await
+        }
+        Commands::Dogs(ref args) => match connect_client(&mut streams, fmt, &paths).await {
+            Ok(client) => query::dogs(&client, &mut streams, fmt, args).await,
             Err(code) => code,
         },
         // None of the four goes through `connect_client`/
@@ -1704,8 +1711,25 @@ mod tests {
         use cli::Commands;
         assert!(matches!(
             Cli::try_parse_from(["shep", "dogs"]).unwrap().command,
-            Commands::Dogs
+            Commands::Dogs(_)
         ));
+    }
+
+    /// Pins `--available` and its filter together, so the flag is not
+    /// merely present but carries the right value through to the arg
+    /// struct `main`'s dispatch reads.
+    #[test]
+    fn dogs_available_parses_with_its_filter() {
+        use clap::Parser;
+        use cli::Commands;
+        let parsed = Cli::try_parse_from(["shep", "dogs", "--available", "spot"])
+            .unwrap()
+            .command;
+        let Commands::Dogs(args) = parsed else {
+            panic!("expected dogs")
+        };
+        assert!(args.available);
+        assert_eq!(args.filter.as_deref(), Some("spot"));
     }
 
     /// fails if `Commands::Enable`/`Commands::Disable` are wired to another

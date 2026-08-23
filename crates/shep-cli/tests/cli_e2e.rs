@@ -1170,6 +1170,83 @@ fn sheep_named<'a>(data: &'a serde_json::Value, name: &str) -> &'a serde_json::V
         .unwrap_or_else(|| panic!("no sheep named {name} in the flock: {data}"))
 }
 
+// --- Dog index helpers -------------------------------------------------
+
+/// Serves `response` -- a complete raw HTTP response, status line and all
+/// -- once, on an ephemeral loopback port, on a background thread, and
+/// returns the `http://` URL to read it from. `SHEP_DOG_INDEX`'s own
+/// loopback carve-out (`dog_index::require_secure_url`'s own doc) is what
+/// makes this possible at all: this file drives the real `shep` binary as
+/// a subprocess, so there is no seam to skip the `https://` check the way
+/// `dog_index`'s own unit tests can from inside the crate.
+///
+/// Blocking `std::net`, not tokio: this file has no async runtime of its
+/// own, unlike `dog_index`'s own `serve_index` test harness, which this
+/// mirrors in every other respect -- drain the request just enough that
+/// the client's write never stalls, write the canned response, close.
+fn serve_raw_response(response: String) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+        if let Ok((mut stream, _peer)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    format!("http://127.0.0.1:{}/dogs.json", addr.port())
+}
+
+/// [`serve_raw_response`] wrapping `body` as a well-formed 200 -- the shape
+/// every case that serves a real index needs.
+fn serve_dog_index(body: &str) -> String {
+    serve_raw_response(format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    ))
+}
+
+/// A two-entry community index, shaped like the live one's own single
+/// entry (`web/public/dogs.json`, the same fixture `dog_index`'s own unit
+/// tests build from): Spot, clean; and Rex, whose description carries
+/// `\u{1b}[2J` -- a raw screen-clear escape a hostile pull request could
+/// add, and the whole reason `dog_index::sanitise` exists. Both are valid
+/// entries -- neither is dropped, so `skipped` stays zero and this fixture
+/// alone cannot exercise that count.
+fn two_entry_index_json() -> String {
+    serde_json::json!([
+        {
+            "name": "Spot",
+            "package": "shep-log-rotate",
+            "adopt_as": "log-rotate",
+            "description": "Rotates grown log files and asks the shepherd to reopen them.",
+            "repo": "https://github.com/TurtIeSocks/shep-log-rotate",
+            "license": "MIT OR Apache-2.0",
+            "category": "logs",
+            "source": {
+                "kind": "cargo-git",
+                "url": "https://github.com/TurtIeSocks/shep-log-rotate"
+            }
+        },
+        {
+            "name": "Rex",
+            "package": "shep-watchdog",
+            "adopt_as": "watchdog",
+            "description": "Barks when a sheep stops answering.\u{1b}[2J",
+            "repo": "https://github.com/example/shep-watchdog",
+            "license": "Apache-2.0",
+            "category": "health",
+            "source": {
+                "kind": "go-install",
+                "module": "github.com/example/shep-watchdog"
+            }
+        }
+    ])
+    .to_string()
+}
+
 // --- JSON fixture helpers -------------------------------------------------
 
 /// Asserts `info` (one `data[]` element of a `flock`/`describe`/`start`
@@ -4963,6 +5040,213 @@ fn whistle_starts_with_no_shepherd_and_reports_it_per_call() {
         message.contains("no shepherd is running"),
         "message: {message}"
     );
+}
+
+// --- Dogs / Available index -----------------------------------------------
+
+/// fails if `shep dogs --available` renders the raw parsed entry instead of
+/// the sanitised one -- the failure this whole feature exists to prevent
+/// (`dog_index`'s own module doc names it as the module's security
+/// boundary). Rex's description carries a raw `\u{1b}[2J` screen-clear
+/// escape; this asserts on the RAW stdout bytes, not a lossy string, so a
+/// regression cannot hide behind `String::from_utf8_lossy`'s own
+/// replacement character.
+///
+/// Also the "table lists a known index" case: both entries' NAME/PACKAGE/
+/// CATEGORY reach the table, and the one sanitised entry is named in a
+/// footer notice on stderr.
+#[test]
+fn available_dogs_lists_the_index_and_never_leaks_a_raw_escape() {
+    let home = TempDir::new().unwrap();
+    let url = serve_dog_index(&two_entry_index_json());
+
+    let output = shep(home.path())
+        .env("SHEP_DOG_INDEX", &url)
+        .arg("dogs")
+        .arg("--available")
+        .output()
+        .unwrap();
+    assert_success(&output);
+
+    assert!(
+        !output.stdout.contains(&0x1b),
+        "a raw escape reached stdout: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "NAME",
+        "PACKAGE",
+        "CATEGORY",
+        "DESCRIPTION",
+        "Spot",
+        "shep-log-rotate",
+        "logs",
+        "Rex",
+        "shep-watchdog",
+        "health",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "table is missing {expected:?}: {stdout}"
+        );
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("1 entry contained control characters"),
+        "stderr must note the sanitised entry: {stderr}"
+    );
+}
+
+/// fails if the detail view's adopt line is built from `name` or `package`
+/// instead of `adopt_as` -- `AvailableDog::adopt_as`'s own doc names this
+/// as the one thing this feature must never get wrong: a dog cannot learn
+/// the name it was adopted under, so the wrong name here ships a
+/// copy-pasteable command that silently discards the dog's whole
+/// `[dog.<name>]` config section.
+#[test]
+fn available_dogs_detail_view_uses_adopt_as_never_name() {
+    let home = TempDir::new().unwrap();
+    let url = serve_dog_index(&two_entry_index_json());
+
+    let output = shep(home.path())
+        .env("SHEP_DOG_INDEX", &url)
+        .arg("dogs")
+        .arg("--available")
+        .arg("spot")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("Spot . shep-log-rotate . logs"),
+        "detail header line: {stdout}"
+    );
+    assert!(
+        stdout.contains("$ cargo install --git https://github.com/TurtIeSocks/shep-log-rotate"),
+        "install command: {stdout}"
+    );
+    assert!(
+        stdout.contains("$ shep adopt log-rotate ~/.cargo/bin/shep-log-rotate"),
+        "adopt command must use adopt_as (log-rotate), not name (Spot): {stdout}"
+    );
+    assert!(
+        !stdout.contains("adopt Spot"),
+        "adopt command must never use the display name: {stdout}"
+    );
+}
+
+/// fails if a filter matching nothing exits non-zero — decision (task-3
+/// brief): an empty search result is an answer, not a failure.
+#[test]
+fn available_dogs_zero_matches_exits_zero_and_says_so() {
+    let home = TempDir::new().unwrap();
+    let url = serve_dog_index(&two_entry_index_json());
+
+    let output = shep(home.path())
+        .env("SHEP_DOG_INDEX", &url)
+        .arg("dogs")
+        .arg("--available")
+        .arg("wombat")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("no dog matches \"wombat\""),
+        "stdout: {stdout}"
+    );
+}
+
+/// fails if `--available` reaches `connect_client` at all — the property
+/// its guard arm in `main`'s dispatch (`lib.rs`) exists to guarantee.
+/// `$SHEP_HOME` here is a fresh tempdir where no daemon has ever run,
+/// mirroring `whistle_starts_with_no_shepherd_and_reports_it_per_call`'s
+/// own setup; beyond the exit code, this checks that neither a socket nor
+/// a pidfile exists afterwards, so a regression that autostarts a
+/// shepherd as a side effect would be caught even if it still answered
+/// successfully.
+#[test]
+fn available_dogs_needs_no_shepherd() {
+    let home = TempDir::new().unwrap();
+    let url = serve_dog_index(&two_entry_index_json());
+
+    let output = shep(home.path())
+        .env("SHEP_DOG_INDEX", &url)
+        .arg("dogs")
+        .arg("--available")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert!(
+        !home.path().join("run/shep.sock").exists(),
+        "--available must never bring up a shepherd"
+    );
+    assert!(
+        !home.path().join("pids/shepd.pid").exists(),
+        "--available must never bring up a shepherd"
+    );
+}
+
+/// fails if a non-2xx from the index host panics, hangs, or reports an
+/// error that does not name the URL — `IndexError` deliberately carries
+/// the URL on none of its variants but its own `InsecureUrl`, so the
+/// caller (`available_dogs`) is what has to tell the operator which URL
+/// failed.
+#[test]
+fn available_dogs_reports_a_server_error_naming_the_url() {
+    let home = TempDir::new().unwrap();
+    let url = serve_raw_response(
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_string(),
+    );
+
+    let output = shep(home.path())
+        .env("SHEP_DOG_INDEX", &url)
+        .arg("dogs")
+        .arg("--available")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "a 500 must not exit success: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("reading the dog index from {url}")),
+        "stderr must name the failing url: {stderr}"
+    );
+    assert!(stderr.contains("500"), "stderr: {stderr}");
+}
+
+/// fails if a connection that closes mid-body panics or hangs instead of
+/// reporting a clear, URL-naming error — the other server misbehaviour the
+/// task-3 brief calls out by name, alongside the plain 500 above.
+#[test]
+fn available_dogs_reports_a_truncated_body_naming_the_url() {
+    let home = TempDir::new().unwrap();
+    // Declares 100 bytes of body, sends 2, then the server thread closes —
+    // `fetch::get`'s own `Truncated` refusal (`fetch.rs`'s own doc).
+    let url = serve_raw_response("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n[]".to_string());
+
+    let output = shep(home.path())
+        .env("SHEP_DOG_INDEX", &url)
+        .arg("dogs")
+        .arg("--available")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "a truncated body must not exit success: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("reading the dog index from {url}")),
+        "stderr must name the failing url: {stderr}"
+    );
+    assert!(stderr.contains("truncated"), "stderr: {stderr}");
 }
 
 // --- `shep serve` --------------------------------------------------------
