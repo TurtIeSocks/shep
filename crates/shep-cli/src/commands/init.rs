@@ -10,11 +10,7 @@ use std::path::{Path, PathBuf};
 use shep_core::config::{Depth, FlockFormat, Scaffold, discover};
 
 use crate::{
-    Streams,
-    cli::{Format, InitArgs},
-    commands::runtime::get_cwd,
-    exit::ExitCode,
-    output::{emit_error, emit_notice},
+    Streams, cli::InitArgs, commands::runtime::get_cwd, exit::ExitCode, output::emit_notice,
 };
 
 /// Writes a scaffolded Flockfile.
@@ -25,13 +21,13 @@ use crate::{
 /// it rewrites the file that is there in the language that file already
 /// speaks, rather than dropping TOML into a `.yaml` and leaving something
 /// no parser will accept.
-pub async fn init(streams: &mut Streams<'_>, fmt: Format, args: &InitArgs) -> ExitCode {
-    let cwd = match get_cwd(streams, fmt) {
+pub async fn init(streams: &mut Streams<'_>, args: &InitArgs) -> ExitCode {
+    let cwd = match get_cwd(streams) {
         Ok(cwd) => cwd,
         Err(code) => return code,
     };
 
-    let (path, format) = match target(streams, fmt, &cwd, args) {
+    let (path, format) = match target(streams, &cwd, args) {
         Ok(target) => target,
         Err(code) => return code,
     };
@@ -39,13 +35,7 @@ pub async fn init(streams: &mut Streams<'_>, fmt: Format, args: &InitArgs) -> Ex
     let text = match Scaffold::new(format, depth(args)).build() {
         Ok(text) => text,
         Err(err) => {
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Usage.code_str(),
-                &err.to_string(),
-            );
-            return ExitCode::Usage;
+            return streams.fail(ExitCode::Usage, &err.to_string());
         }
     };
 
@@ -63,25 +53,12 @@ pub async fn init(streams: &mut Streams<'_>, fmt: Format, args: &InitArgs) -> Ex
 
     match written {
         Ok(()) => {
-            let _ = emit_notice(
-                &mut *streams.out,
-                fmt,
-                "init",
-                &format!("wrote {}", path.display()),
-            );
+            streams.note("init", &format!("wrote {}", path.display()));
             ExitCode::Success
         }
         // Not `Usage`: a read-only directory or a full disk is not the
         // operator getting the command wrong.
-        Err(err) => {
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Failure.code_str(),
-                &format!("{}: {err}", path.display()),
-            );
-            ExitCode::Failure
-        }
+        Err(err) => streams.fail(ExitCode::Failure, &format!("{}: {err}", path.display())),
     }
 }
 
@@ -97,7 +74,6 @@ fn depth(args: &InitArgs) -> Depth {
 /// read.
 fn target(
     streams: &mut Streams<'_>,
-    fmt: Format,
     cwd: &Path,
     args: &InitArgs,
 ) -> Result<(PathBuf, FlockFormat), ExitCode> {
@@ -106,7 +82,6 @@ fn target(
         let Some(format) = FlockFormat::from_path(&path) else {
             return Err(refuse(
                 streams,
-                fmt,
                 &format!(
                     "{} is not a Flockfile shep can read; use .toml, .yaml, \
                      .yml, .json or .json5",
@@ -117,7 +92,6 @@ fn target(
         if path.exists() && !args.force {
             return Err(refuse(
                 streams,
-                fmt,
                 &format!(
                     "{} already exists; pass --force to replace it",
                     path.display()
@@ -133,7 +107,7 @@ fn target(
         {
             let _ = emit_notice(
                 &mut *streams.err,
-                fmt,
+                streams.fmt,
                 "init_shadowed",
                 &format!(
                     "{} is already here and shep reads it first; {} will be ignored \
@@ -151,7 +125,6 @@ fn target(
             if !args.force {
                 return Err(refuse(
                     streams,
-                    fmt,
                     &format!(
                         "{} already exists; pass --force to replace it",
                         existing.display()
@@ -169,7 +142,6 @@ fn target(
     }
 }
 
-fn refuse(streams: &mut Streams<'_>, fmt: Format, message: &str) -> ExitCode {
-    let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), message);
-    ExitCode::Usage
+fn refuse(streams: &mut Streams<'_>, message: &str) -> ExitCode {
+    streams.fail(ExitCode::Usage, message)
 }

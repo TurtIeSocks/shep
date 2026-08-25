@@ -25,13 +25,12 @@ use shep_client::{Client, LOG_PLANE_DEADLINE};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{Request, Response, SelectorSpec};
 
-use crate::cli::{FlushArgs, Format, ReopenArgs};
+use crate::cli::{FlushArgs, ReopenArgs};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
 use crate::launch;
 use crate::output::{
-    EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, Render, Streams, emit, emit_error,
-    write_outcome,
+    EmptiedFile, EmptiedFiles, FlockRows, FlushedRows, Render, Streams, emit, write_outcome,
 };
 
 /// Sends `body` with `deadline` (`None` defers to the client's own default),
@@ -52,7 +51,6 @@ use crate::output::{
 async fn request_and_render<T, F>(
     client: &Client,
     streams: &mut Streams<'_>,
-    fmt: Format,
     command: &str,
     body: Request,
     deadline: Option<Duration>,
@@ -66,26 +64,19 @@ where
         Ok(response) => match extract(response) {
             Some(payload) => write_outcome(emit(
                 &mut *streams.out,
-                fmt,
+                streams.fmt,
                 command,
                 payload,
                 streams.style,
             )),
             None => {
                 let message = "the daemon answered with a response this client does not understand";
-                let _ = emit_error(
-                    &mut *streams.err,
-                    fmt,
-                    ExitCode::Internal.code_str(),
-                    message,
-                );
-                ExitCode::Internal
+                streams.fail(ExitCode::Internal, message)
             }
         },
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
@@ -117,20 +108,14 @@ where
 /// a time with no per-sheep bound, so on a slow log directory the 5s default
 /// would hand a `postrotate` stanza a `DeadlineExceeded` for a reopen that
 /// was still running.
-pub async fn reopen(
-    client: &Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    args: &ReopenArgs,
-) -> ExitCode {
-    let selector = match parse_selector(streams, fmt, &args.selector) {
+pub async fn reopen(client: &Client, streams: &mut Streams<'_>, args: &ReopenArgs) -> ExitCode {
+    let selector = match parse_selector(streams, &args.selector) {
         Ok(selector) => SelectorSpec::from(&selector),
         Err(code) => return code,
     };
     request_and_render(
         client,
         streams,
-        fmt,
         "reopen",
         Request::Reopen { selector },
         Some(LOG_PLANE_DEADLINE),
@@ -209,29 +194,20 @@ pub async fn reopen(
 /// the usage error clap itself would rather than an `expect`: a panicking
 /// convenience would abort the process over a bug in the dispatch above, and
 /// buy an operator nothing that one branch does not.
-pub async fn flush(
-    client: &Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    args: &FlushArgs,
-) -> ExitCode {
+pub async fn flush(client: &Client, streams: &mut Streams<'_>, args: &FlushArgs) -> ExitCode {
     let Some(raw) = args.selector.as_deref() else {
-        let _ = emit_error(
-            &mut *streams.err,
-            fmt,
-            ExitCode::Usage.code_str(),
+        return streams.fail(
+            ExitCode::Usage,
             "flush needs a selector, or --daemon for the shepherd's own logs",
         );
-        return ExitCode::Usage;
     };
-    let selector = match parse_selector(streams, fmt, raw) {
+    let selector = match parse_selector(streams, raw) {
         Ok(selector) => SelectorSpec::from(&selector),
         Err(code) => return code,
     };
     request_and_render(
         client,
         streams,
-        fmt,
         "flush",
         Request::Flush { selector },
         Some(LOG_PLANE_DEADLINE),
@@ -282,7 +258,7 @@ pub async fn flush(
 /// than created, so an operator can tell "emptied 4 MB" from "there was
 /// nothing here" — and a `shep flush --daemon` against a cold `$SHEP_HOME`
 /// exits 0 rather than complaining about a daemon that has never started.
-pub fn flush_daemon(streams: &mut Streams<'_>, fmt: Format, paths: &ShepPaths) -> ExitCode {
+pub fn flush_daemon(streams: &mut Streams<'_>, paths: &ShepPaths) -> ExitCode {
     let mut emptied = Vec::new();
     let mut failures = Vec::new();
 
@@ -311,17 +287,11 @@ pub fn flush_daemon(streams: &mut Streams<'_>, fmt: Format, paths: &ShepPaths) -
     }
 
     if !failures.is_empty() {
-        let _ = emit_error(
-            &mut *streams.err,
-            fmt,
-            ExitCode::Failure.code_str(),
-            &failures.join("; "),
-        );
-        return ExitCode::Failure;
+        return streams.fail(ExitCode::Failure, &failures.join("; "));
     }
     write_outcome(emit(
         &mut *streams.out,
-        fmt,
+        streams.fmt,
         "flush",
         EmptiedFiles(emptied),
         streams.style,
@@ -331,6 +301,7 @@ pub fn flush_daemon(streams: &mut Streams<'_>, fmt: Format, paths: &ShepPaths) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::Format;
     use shep_client::testing::{fake_client_capturing_envelopes, fake_client_replying_err};
     use shep_core::protocol::RpcErrorCode;
 
@@ -372,8 +343,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            let _ = reopen(&client, &mut streams, Format::Table, &args(input)).await;
+            let _ = reopen(&client, &mut streams, &args(input)).await;
             let sent = envelopes.recv().await.unwrap();
             assert_eq!(
                 sent.body,
@@ -413,9 +385,10 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
 
-        let _ = reopen(&client, &mut streams, Format::Table, &args("all")).await;
+        let _ = reopen(&client, &mut streams, &args("all")).await;
 
         let sent = envelopes.recv().await.unwrap();
         assert_eq!(
@@ -445,8 +418,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            reopen(&client, &mut streams, Format::Table, &args("/[/")).await
+            reopen(&client, &mut streams, &args("/[/")).await
         };
         assert_eq!(code, ExitCode::Usage);
         assert!(
@@ -470,8 +444,9 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
-        let code = reopen(&client, &mut streams, Format::Table, &args("ghost")).await;
+        let code = reopen(&client, &mut streams, &args("ghost")).await;
         assert_eq!(code, ExitCode::NotFound);
     }
 
@@ -505,8 +480,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            let _ = flush(&client, &mut streams, Format::Table, &flush_args(input)).await;
+            let _ = flush(&client, &mut streams, &flush_args(input)).await;
             let sent = envelopes.recv().await.unwrap();
             assert_eq!(
                 sent.body,
@@ -537,9 +513,10 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
 
-        let _ = flush(&client, &mut streams, Format::Table, &flush_args("all")).await;
+        let _ = flush(&client, &mut streams, &flush_args("all")).await;
 
         let sent = envelopes.recv().await.unwrap();
         assert_eq!(
@@ -570,8 +547,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            flush(&client, &mut streams, Format::Table, &flush_args("/[/")).await
+            flush(&client, &mut streams, &flush_args("/[/")).await
         };
         assert_eq!(code, ExitCode::Usage);
         assert!(
@@ -608,8 +586,9 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
-        let code = flush(&client, &mut streams, Format::Table, &flush_args("ghost")).await;
+        let code = flush(&client, &mut streams, &flush_args("ghost")).await;
         assert_eq!(code, ExitCode::NotFound);
     }
 
@@ -645,9 +624,10 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Json,
         };
 
-        let code = flush_daemon(&mut streams, Format::Json, &paths);
+        let code = flush_daemon(&mut streams, &paths);
 
         assert_eq!(code, ExitCode::Success);
         for name in [launch::DAEMON_STDOUT_LOG, launch::DAEMON_STDERR_LOG] {
@@ -683,9 +663,10 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Json,
         };
 
-        let code = flush_daemon(&mut streams, Format::Json, &paths);
+        let code = flush_daemon(&mut streams, &paths);
 
         assert_eq!(code, ExitCode::Success);
         let envelope: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -727,9 +708,10 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
 
-        let code = flush_daemon(&mut streams, Format::Table, &paths);
+        let code = flush_daemon(&mut streams, &paths);
 
         assert_eq!(code, ExitCode::Failure);
         assert!(

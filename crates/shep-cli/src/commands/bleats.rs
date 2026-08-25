@@ -102,24 +102,16 @@ struct BleatLine<'a> {
 async fn resolve_names(
     client: &Client,
     streams: &mut Streams<'_>,
-    fmt: Format,
 ) -> Result<HashMap<u32, ProcessInfo>, ExitCode> {
     match client.request(Request::ListFlock).await {
         Ok(Response::Flock(procs)) => Ok(procs.into_iter().map(|p| (p.id, p)).collect()),
         Ok(_unrecognised) => {
             let message = "the daemon answered with a response this client does not understand";
-            let _ = output::emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Internal.code_str(),
-                message,
-            );
-            Err(ExitCode::Internal)
+            Err(streams.fail(ExitCode::Internal, message))
         }
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = output::emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            Err(code)
+            Err(streams.fail(code, &err.to_string()))
         }
     }
 }
@@ -130,18 +122,13 @@ async fn resolve_names(
 ///
 /// # Errors
 /// Renders and returns the exit code for a subscribe request that failed.
-async fn subscribe(
-    client: &Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-) -> Result<EventStream, ExitCode> {
+async fn subscribe(client: &Client, streams: &mut Streams<'_>) -> Result<EventStream, ExitCode> {
     let topics = vec!["log.*".to_string(), "daemon.*".to_string()];
     match client.subscribe(topics).await {
         Ok(stream) => Ok(stream),
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = output::emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            Err(code)
+            Err(streams.fail(code, &err.to_string()))
         }
     }
 }
@@ -212,11 +199,11 @@ fn write_line(
 /// (`cli::GlobalArgs::quiet`, "suppress non-essential output") is exactly
 /// what a notice is — a sheep's own line and a real error both still print
 /// regardless (whole-branch review item 2).
-fn write_notice(streams: &mut Streams<'_>, fmt: Format, quiet: bool, code: &str, message: &str) {
+fn write_notice(streams: &mut Streams<'_>, quiet: bool, code: &str, message: &str) {
     if quiet {
         return;
     }
-    let _ = output::emit_notice(&mut *streams.err, fmt, code, message);
+    let _ = output::emit_notice(&mut *streams.err, streams.fmt, code, message);
 }
 
 /// The most of one log file a tail will read to find the lines it wants.
@@ -316,7 +303,6 @@ pub(crate) fn read_tail(path: &Path, limit: usize) -> io::Result<(Vec<String>, b
 /// this last case sets the final [`ExitCode::Failure`].
 fn tail_log_files(
     streams: &mut Streams<'_>,
-    fmt: Format,
     quiet: bool,
     cache: &HashMap<u32, ProcessInfo>,
     selector: &ProcessSelector,
@@ -343,7 +329,6 @@ fn tail_log_files(
             match path {
                 None => write_notice(
                     streams,
-                    fmt,
                     quiet,
                     "log_path_unknown",
                     &format!("{name}: the daemon did not report a {stream_name} log path"),
@@ -351,9 +336,14 @@ fn tail_log_files(
                 Some(path) => match read_tail(Path::new(path), args.lines) {
                     Ok((lines, _truncated)) => {
                         for line in lines {
-                            if let Err(write_err) =
-                                write_line(streams.out, fmt, info.id, name, stream_name, &line)
-                            {
+                            if let Err(write_err) = write_line(
+                                streams.out,
+                                streams.fmt,
+                                info.id,
+                                name,
+                                stream_name,
+                                &line,
+                            ) {
                                 let code = write_outcome(Err(write_err));
                                 let _ = streams.out.flush();
                                 return code;
@@ -370,7 +360,6 @@ fn tail_log_files(
                         failure = true;
                         write_notice(
                             streams,
-                            fmt,
                             quiet,
                             "log_unreadable",
                             &format!("failed to read {path}: {err}"),
@@ -399,7 +388,6 @@ fn tail_log_files(
 /// understands — so it gets its own arm rather than falling into that `_`.
 fn handle_event(
     streams: &mut Streams<'_>,
-    fmt: Format,
     quiet: bool,
     cache: &HashMap<u32, ProcessInfo>,
     selector: &ProcessSelector,
@@ -410,14 +398,14 @@ fn handle_event(
         BusEvent::LogOut { id, line } => {
             if !args.err && selector_allows(selector, cache, id) {
                 let name = resolved_name(cache, id);
-                write_line(streams.out, fmt, id, &name, "out", &line)?;
+                write_line(streams.out, streams.fmt, id, &name, "out", &line)?;
             }
             Ok(())
         }
         BusEvent::LogErr { id, line } => {
             if !args.out && selector_allows(selector, cache, id) {
                 let name = resolved_name(cache, id);
-                write_line(streams.out, fmt, id, &name, "err", &line)?;
+                write_line(streams.out, streams.fmt, id, &name, "err", &line)?;
             }
             Ok(())
         }
@@ -431,7 +419,6 @@ fn handle_event(
             // investigate.
             write_notice(
                 streams,
-                fmt,
                 quiet,
                 "dropped",
                 &format!("the daemon dropped {count} events (its own queue overflowed)"),
@@ -442,7 +429,6 @@ fn handle_event(
             // Shep's own diagnostic, not a sheep's line: `streams.err`.
             write_notice(
                 streams,
-                fmt,
                 quiet,
                 "daemon_shutdown",
                 "the daemon is shutting down",
@@ -465,14 +451,12 @@ fn handle_event(
 pub async fn bleats(
     client: &Client,
     streams: &mut Streams<'_>,
-    fmt: Format,
     quiet: bool,
     args: &BleatsArgs,
 ) -> ExitCode {
     bleats_with_signal(
         client,
         streams,
-        fmt,
         quiet,
         args,
         tokio::signal::ctrl_c().map(|_| ()),
@@ -507,12 +491,11 @@ pub async fn bleats(
 pub async fn bleats_with_signal(
     client: &Client,
     streams: &mut Streams<'_>,
-    fmt: Format,
     quiet: bool,
     args: &BleatsArgs,
     interrupt: impl std::future::Future<Output = ()> + Send,
 ) -> ExitCode {
-    let selector = match parse_selector(streams, fmt, &args.selector) {
+    let selector = match parse_selector(streams, &args.selector) {
         Ok(selector) => selector,
         Err(code) => return code,
     };
@@ -520,13 +503,13 @@ pub async fn bleats_with_signal(
     // Order matters: the id/name cache is built from ONE listing taken
     // before subscribing. Subscribing first would lose every line pushed
     // while the listing is still in flight.
-    let cache = match resolve_names(client, streams, fmt).await {
+    let cache = match resolve_names(client, streams).await {
         Ok(cache) => cache,
         Err(code) => return code,
     };
 
     if args.no_follow {
-        return tail_log_files(streams, fmt, quiet, &cache, &selector, args);
+        return tail_log_files(streams, quiet, &cache, &selector, args);
     }
 
     // The backlog first, then the stream. Following alone shows only what
@@ -545,10 +528,10 @@ pub async fn bleats_with_signal(
     // failed write to stdout will fail again in the loop below, where it is
     // handled properly.
     if args.lines > 0 {
-        let _ = tail_log_files(streams, fmt, quiet, &cache, &selector, args);
+        let _ = tail_log_files(streams, quiet, &cache, &selector, args);
     }
 
-    let mut stream = match subscribe(client, streams, fmt).await {
+    let mut stream = match subscribe(client, streams).await {
         Ok(stream) => stream,
         Err(code) => return code,
     };
@@ -562,7 +545,7 @@ pub async fn bleats_with_signal(
                 match item {
                     Some(Ok(event)) => {
                         if let Err(write_err) =
-                            handle_event(streams, fmt, quiet, &cache, &selector, args, event)
+                            handle_event(streams, quiet, &cache, &selector, args, event)
                         {
                             let code = write_outcome(Err(write_err));
                             let _ = streams.out.flush();
@@ -570,13 +553,7 @@ pub async fn bleats_with_signal(
                         }
                     }
                     Some(Err(Lagged { count })) => {
-                        write_notice(
-                            streams,
-                            fmt,
-                            quiet,
-                            "lagged",
-                            &format!("{count} events dropped locally (lagged)"),
-                        );
+                        write_notice(streams, quiet, "lagged", &format!("{count} events dropped locally (lagged)"), );
                     }
                     None => {
                         let _ = streams.out.flush();
@@ -738,16 +715,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    false,
-                    &follow_args("all"),
-                ),
+                bleats(&client, &mut streams, false, &follow_args("all")),
             )
             .await
             .expect("close_after_subscribe ends the follow deterministically, not by hanging");
@@ -798,13 +770,13 @@ mod tests {
                     out: &mut out,
                     err: &mut err,
                     style: crate::style::Presentation::BARE,
+                    fmt: Format::Table,
                 };
-                tokio::time::timeout(
-                    RUN_TIMEOUT,
-                    bleats(&client, &mut streams, Format::Table, false, &args),
-                )
-                .await
-                .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+                tokio::time::timeout(RUN_TIMEOUT, bleats(&client, &mut streams, false, &args))
+                    .await
+                    .expect(
+                        "close_after_subscribe ends the follow deterministically, not by hanging",
+                    );
             }
             let rendered = String::from_utf8(out).unwrap();
             assert!(
@@ -850,16 +822,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    false,
-                    &follow_args("web"),
-                ),
+                bleats(&client, &mut streams, false, &follow_args("web")),
             )
             .await
             .expect("close_after_subscribe ends the follow deterministically, not by hanging");
@@ -897,13 +864,13 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
 
         let args = follow_args("all");
-        let follow =
-            bleats_with_signal(&client, &mut streams, Format::Table, false, &args, async {
-                let _ = interrupt_rx.await;
-            });
+        let follow = bleats_with_signal(&client, &mut streams, false, &args, async {
+            let _ = interrupt_rx.await;
+        });
         let (_, code) = tokio::join!(
             async {
                 tokio::task::yield_now().await;
@@ -946,16 +913,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    false,
-                    &follow_args("all"),
-                ),
+                bleats(&client, &mut streams, false, &follow_args("all")),
             )
             .await
             .expect("a shutdown mid-follow must end the follow, not hang")
@@ -985,16 +947,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    false,
-                    &follow_args("all"),
-                ),
+                bleats(&client, &mut streams, false, &follow_args("all")),
             )
             .await
             .expect("the connection ending must end the follow, not hang")
@@ -1030,16 +987,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    true,
-                    &follow_args("all"),
-                ),
+                bleats(&client, &mut streams, true, &follow_args("all")),
             )
             .await
             .expect("a shutdown mid-follow must end the follow, not hang")
@@ -1082,16 +1034,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    true,
-                    &follow_args("all"),
-                ),
+                bleats(&client, &mut streams, true, &follow_args("all")),
             )
             .await
             .expect("close_after_subscribe ends the follow deterministically, not by hanging");
@@ -1147,16 +1094,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    false,
-                    &follow_args("all"),
-                ),
+                bleats(&client, &mut streams, false, &follow_args("all")),
             )
             .await
             .expect("close_after_subscribe ends the follow deterministically, not by hanging");
@@ -1203,16 +1145,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    false,
-                    &follow_args("all"),
-                ),
+                bleats(&client, &mut streams, false, &follow_args("all")),
             )
             .await
             .expect("close_after_subscribe ends the follow deterministically, not by hanging");
@@ -1262,16 +1199,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Json,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Json,
-                    false,
-                    &follow_args("all"),
-                ),
+                bleats(&client, &mut streams, false, &follow_args("all")),
             )
             .await
             .expect("close_after_subscribe ends the follow deterministically, not by hanging");
@@ -1336,16 +1268,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    false,
-                    &follow_args("all"),
-                ),
+                bleats(&client, &mut streams, false, &follow_args("all")),
             )
             .await
             .expect("close_after_subscribe ends the follow deterministically, not by hanging")
@@ -1392,16 +1319,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    false,
-                    &no_follow_args_out("all"),
-                ),
+                bleats(&client, &mut streams, false, &no_follow_args_out("all")),
             )
             .await
             .expect("--no-follow never subscribes, so it must terminate on its own")
@@ -1442,16 +1364,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             let _ = tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    false,
-                    &follow_args_out("all"),
-                ),
+                bleats(&client, &mut streams, false, &follow_args_out("all")),
             )
             .await;
         }
@@ -1482,13 +1399,13 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             let _ = tokio::time::timeout(
                 RUN_TIMEOUT,
                 bleats(
                     &client,
                     &mut streams,
-                    Format::Table,
                     false,
                     &BleatsArgs {
                         lines: 0,
@@ -1527,13 +1444,13 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
                 bleats(
                     &client,
                     &mut streams,
-                    Format::Table,
                     false,
                     &BleatsArgs {
                         lines: CAP,
@@ -1586,16 +1503,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    false,
-                    &no_follow_args_out("all"),
-                ),
+                bleats(&client, &mut streams, false, &no_follow_args_out("all")),
             )
             .await
             .expect("--no-follow never subscribes, so it must terminate on its own");
@@ -1657,13 +1569,11 @@ mod tests {
                     out: &mut out,
                     err: &mut err,
                     style: crate::style::Presentation::BARE,
+                    fmt: Format::Table,
                 };
-                tokio::time::timeout(
-                    RUN_TIMEOUT,
-                    bleats(&client, &mut streams, Format::Table, false, &args),
-                )
-                .await
-                .expect("--no-follow never subscribes, so it must terminate on its own");
+                tokio::time::timeout(RUN_TIMEOUT, bleats(&client, &mut streams, false, &args))
+                    .await
+                    .expect("--no-follow never subscribes, so it must terminate on its own");
             }
             String::from_utf8(out).unwrap()
         }
@@ -1710,16 +1620,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    false,
-                    &no_follow_args_out("all"),
-                ),
+                bleats(&client, &mut streams, false, &no_follow_args_out("all")),
             )
             .await
             .expect("--no-follow never subscribes, so it must terminate on its own");
@@ -1767,16 +1672,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    false,
-                    &no_follow_args_out("all"),
-                ),
+                bleats(&client, &mut streams, false, &no_follow_args_out("all")),
             )
             .await
             .expect("--no-follow never subscribes, so it must terminate on its own")
@@ -1818,16 +1718,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    false,
-                    &no_follow_args_out("all"),
-                ),
+                bleats(&client, &mut streams, false, &no_follow_args_out("all")),
             )
             .await
             .expect("--no-follow never subscribes, so it must terminate on its own")
@@ -1864,16 +1759,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Table,
-                    false,
-                    &no_follow_args_out("all"),
-                ),
+                bleats(&client, &mut streams, false, &no_follow_args_out("all")),
             )
             .await
             .expect("--no-follow never subscribes, so it must terminate on its own")
@@ -1911,16 +1801,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Json,
             };
             tokio::time::timeout(
                 RUN_TIMEOUT,
-                bleats(
-                    &client,
-                    &mut streams,
-                    Format::Json,
-                    false,
-                    &no_follow_args_out("all"),
-                ),
+                bleats(&client, &mut streams, false, &no_follow_args_out("all")),
             )
             .await
             .expect("--no-follow never subscribes, so it must terminate on its own");

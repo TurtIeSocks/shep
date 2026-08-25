@@ -18,38 +18,29 @@ use shep_core::status::ProcStatus;
 use crate::cli::Format;
 use crate::exit::ExitCode;
 use crate::flourish;
-use crate::output::{
-    FlockRows, SavedRollRow, Streams, emit, emit_error, emit_notice, write_outcome,
-};
+use crate::output::{FlockRows, SavedRollRow, Streams, emit, emit_notice, write_outcome};
 
 /// Asks the daemon to write the muster roll now, and reports where it
 /// landed and how many apps it recorded.
 ///
 /// `shep save` exists so an operator knows the roll is on disk before a
 /// reboot — a failed save is loud on purpose, never a silent no-op.
-pub async fn save(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> ExitCode {
+pub async fn save(client: &Client, streams: &mut Streams<'_>) -> ExitCode {
     match client.request(Request::SaveRoll).await {
         Ok(Response::RollSaved { path, apps }) => write_outcome(emit(
             &mut *streams.out,
-            fmt,
+            streams.fmt,
             "save",
             SavedRollRow { file: path, apps },
             streams.style,
         )),
         Ok(_unrecognised) => {
             let message = "the daemon answered with a response this client does not understand";
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Internal.code_str(),
-                message,
-            );
-            ExitCode::Internal
+            streams.fail(ExitCode::Internal, message)
         }
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
@@ -97,7 +88,7 @@ pub async fn save(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> Ex
 /// Gated the same way every other flourish is: `Format::Table` and
 /// `streams.style.level.sheep()` only, so `--format json` and a piped
 /// table are unchanged.
-pub async fn muster(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> ExitCode {
+pub async fn muster(client: &Client, streams: &mut Streams<'_>) -> ExitCode {
     match client
         .request_with_deadline(Request::Muster, Some(START_DEADLINE))
         .await
@@ -106,7 +97,7 @@ pub async fn muster(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> 
             if procs.is_empty() {
                 let _ = emit_notice(
                     &mut *streams.err,
-                    fmt,
+                    streams.fmt,
                     "muster_restored_nothing",
                     "the muster roll restored nothing",
                 );
@@ -119,30 +110,23 @@ pub async fn muster(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> 
             let statuses: Vec<ProcStatus> = procs.iter().map(|p| p.status).collect();
             let outcome = write_outcome(emit(
                 &mut *streams.out,
-                fmt,
+                streams.fmt,
                 "muster",
                 FlockRows(procs),
                 streams.style,
             ));
-            if fmt == Format::Table && !statuses.is_empty() && streams.style.level.sheep() {
+            if streams.fmt == Format::Table && !statuses.is_empty() && streams.style.level.sheep() {
                 let _ = write!(streams.out, "{}", flourish::mustered(&statuses));
             }
             outcome
         }
         Ok(_unrecognised) => {
             let message = "the daemon answered with a response this client does not understand";
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Internal.code_str(),
-                message,
-            );
-            ExitCode::Internal
+            streams.fail(ExitCode::Internal, message)
         }
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
@@ -179,8 +163,9 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
-        let _ = save(&client, &mut streams, Format::Table).await;
+        let _ = save(&client, &mut streams).await;
 
         let envelope = tokio::time::timeout(FAKE_REPLY_WAIT, envelopes.recv())
             .await
@@ -209,8 +194,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            save(&client, &mut streams, Format::Table).await
+            save(&client, &mut streams).await
         };
         assert_eq!(code, ExitCode::Internal);
         assert!(out.is_empty(), "a failed save prints no success table");
@@ -232,8 +218,9 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
-        let _ = muster(&client, &mut streams, Format::Table).await;
+        let _ = muster(&client, &mut streams).await;
 
         let envelope = tokio::time::timeout(FAKE_REPLY_WAIT, envelopes.recv())
             .await
@@ -280,8 +267,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            muster(&client, &mut streams, Format::Table).await
+            muster(&client, &mut streams).await
         };
         assert_eq!(code, ExitCode::Success, "an empty roll is not a failure");
         assert!(

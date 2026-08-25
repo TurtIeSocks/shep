@@ -11,12 +11,12 @@ use std::path::{Path, PathBuf};
 use shep_core::config::AppConfig;
 use shep_core::paths::ShepPaths;
 
-use crate::cli::{DevArgs, Format};
+use crate::cli::DevArgs;
 use crate::commands::foreground::{self, ForegroundOptions};
 use crate::commands::lifecycle::{resolve_target, target_exit_code};
 use crate::commands::runtime::discovered_target;
 use crate::exit::ExitCode;
-use crate::output::{Streams, emit_error, emit_notice};
+use crate::output::{Streams, emit_notice};
 
 /// Where a dev flock lives: `$SHEP_DEV_HOME`, else `~/.shep-dev`.
 ///
@@ -95,7 +95,6 @@ fn default_watch_cwd(apps: &mut [AppConfig]) {
 /// `runtime`.
 pub async fn dev(
     streams: &mut Streams<'_>,
-    fmt: Format,
     quiet: bool,
     home_given: bool,
     args: &DevArgs,
@@ -103,7 +102,7 @@ pub async fn dev(
     if home_given {
         let _ = emit_notice(
             &mut *streams.err,
-            fmt,
+            streams.fmt,
             "home_ignored",
             "shep dev ignores --home/$SHEP_HOME; isolation is the whole feature — set \
              $SHEP_DEV_HOME instead",
@@ -112,7 +111,7 @@ pub async fn dev(
 
     let target = match &args.target {
         Some(target) => target.clone(),
-        None => match discovered_target(streams, fmt) {
+        None => match discovered_target(streams) {
             Ok(target) => target,
             Err(code) => return code,
         },
@@ -122,8 +121,7 @@ pub async fn dev(
         Ok(apps) => apps,
         Err(err) => {
             let code = target_exit_code(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            return code;
+            return streams.fail(code, &err.to_string());
         }
     };
 
@@ -136,7 +134,7 @@ pub async fn dev(
         .join(", ");
     let _ = emit_notice(
         &mut *streams.err,
-        fmt,
+        streams.fmt,
         "watch_forced",
         &format!(
             "shep dev: forcing watch on {names} — each app's own `watch` setting is ignored here"
@@ -157,8 +155,7 @@ pub async fn dev(
         (None, Some(_)) => PathBuf::new(),
         (None, None) => {
             let message = "neither $SHEP_DEV_HOME nor $HOME resolves a root directory for shep dev";
-            let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), message);
-            return ExitCode::Usage;
+            return streams.fail(ExitCode::Usage, message);
         }
     };
     let paths = dev_home(&env, &home_dir);
@@ -168,7 +165,7 @@ pub async fn dev(
         apps,
         tidy_up: true,
     };
-    foreground::run(streams, fmt, quiet, options).await
+    foreground::run(streams, quiet, options).await
 }
 
 #[cfg(test)]

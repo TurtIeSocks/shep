@@ -31,20 +31,15 @@
 use shep_client::Client;
 use shep_core::protocol::{Request, Response, SelectorSpec};
 
-use crate::cli::{Format, WhisperArgs};
+use crate::cli::WhisperArgs;
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
-use crate::output::{SentLineRows, Streams, emit, emit_error, write_outcome};
+use crate::output::{SentLineRows, Streams, emit, write_outcome};
 
 /// Writes `args.line` to the stdin of the sheep matching `args.selector`,
 /// and renders one row per match.
-pub async fn whisper(
-    client: &Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    args: &WhisperArgs,
-) -> ExitCode {
-    let selector = match parse_selector(streams, fmt, &args.selector) {
+pub async fn whisper(client: &Client, streams: &mut Streams<'_>, args: &WhisperArgs) -> ExitCode {
+    let selector = match parse_selector(streams, &args.selector) {
         Ok(selector) => SelectorSpec::from(&selector),
         Err(code) => return code,
     };
@@ -53,8 +48,7 @@ pub async fn whisper(
         let message = "the line must be one line — an embedded newline or carriage return \
                         would deliver two commands where you typed one; shep adds the \
                         terminator itself";
-        let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), message);
-        return ExitCode::Usage;
+        return streams.fail(ExitCode::Usage, message);
     }
 
     let body = Request::SendLine {
@@ -65,25 +59,18 @@ pub async fn whisper(
     match client.request(body).await {
         Ok(Response::SentLine(rows)) => write_outcome(emit(
             &mut *streams.out,
-            fmt,
+            streams.fmt,
             "whisper",
             SentLineRows(rows),
             streams.style,
         )),
         Ok(_unrecognised) => {
             let message = "the daemon answered with a response this client does not understand";
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Internal.code_str(),
-                message,
-            );
-            ExitCode::Internal
+            streams.fail(ExitCode::Internal, message)
         }
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
@@ -94,6 +81,7 @@ mod tests {
     use shep_core::protocol::RpcErrorCode;
 
     use super::*;
+    use crate::cli::Format;
 
     fn args(selector: &str, line: &str) -> WhisperArgs {
         WhisperArgs {
@@ -122,8 +110,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            whisper(&client, &mut streams, Format::Table, args).await
+            whisper(&client, &mut streams, args).await
         };
         (code, out, err, envelopes)
     }
@@ -215,8 +204,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            whisper(&client, &mut streams, Format::Table, &args("ghost", "gc")).await
+            whisper(&client, &mut streams, &args("ghost", "gc")).await
         };
         assert_eq!(code, ExitCode::NotFound);
         assert!(out.is_empty());

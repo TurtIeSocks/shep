@@ -16,9 +16,9 @@ use std::path::PathBuf;
 
 use convert::ImportNote;
 
-use crate::cli::{Format, ImportArgs};
+use crate::cli::ImportArgs;
 use crate::exit::ExitCode;
-use crate::output::{ImportRow, ImportRows, Streams, emit, emit_error, emit_notice, write_outcome};
+use crate::output::{ImportRow, ImportRows, Streams, emit, emit_notice, write_outcome};
 
 /// Reads a pm2 dump into apps and writes them out as a Flockfile.
 ///
@@ -46,12 +46,11 @@ use crate::output::{ImportRow, ImportRows, Streams, emit, emit_error, emit_notic
 /// runs and both `--format table`/`--format json` (decision 13). The first
 /// line is the read summary: how many instance rows, for how many apps,
 /// from where.
-pub fn import(streams: &mut Streams<'_>, fmt: Format, args: &ImportArgs) -> ExitCode {
+pub fn import(streams: &mut Streams<'_>, args: &ImportArgs) -> ExitCode {
     let source = match resolve_source(args) {
         Ok(source) => source,
         Err(message) => {
-            let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), &message);
-            return ExitCode::Usage;
+            return streams.fail(ExitCode::Usage, &message);
         }
     };
 
@@ -66,21 +65,14 @@ pub fn import(streams: &mut Streams<'_>, fmt: Format, args: &ImportArgs) -> Exit
             } else {
                 format!("could not read {}: {err}", source.display())
             };
-            let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), &message);
-            return ExitCode::Usage;
+            return streams.fail(ExitCode::Usage, &message);
         }
     };
 
     let rows = match dump::parse(&text) {
         Ok(rows) => rows,
         Err(err) => {
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::InvalidConfig.code_str(),
-                &err.to_string(),
-            );
-            return ExitCode::InvalidConfig;
+            return streams.fail(ExitCode::InvalidConfig, &err.to_string());
         }
     };
     let instance_count = rows.len();
@@ -88,19 +80,13 @@ pub fn import(streams: &mut Streams<'_>, fmt: Format, args: &ImportArgs) -> Exit
     let imported = match convert::convert(rows) {
         Ok(imported) => imported,
         Err(err) => {
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::InvalidConfig.code_str(),
-                &err.to_string(),
-            );
-            return ExitCode::InvalidConfig;
+            return streams.fail(ExitCode::InvalidConfig, &err.to_string());
         }
     };
 
     let _ = emit_notice(
         &mut *streams.err,
-        fmt,
+        streams.fmt,
         "read",
         &format!(
             "read {instance_count} instance rows for {} apps from {}",
@@ -110,19 +96,13 @@ pub fn import(streams: &mut Streams<'_>, fmt: Format, args: &ImportArgs) -> Exit
     );
     for note in &imported.notes {
         let (code, message) = describe_note(note);
-        let _ = emit_notice(&mut *streams.err, fmt, code, &message);
+        let _ = emit_notice(&mut *streams.err, streams.fmt, code, &message);
     }
 
     let rendered = match render::flockfile(&imported.apps) {
         Ok(rendered) => rendered,
         Err(err) => {
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Failure.code_str(),
-                &err.to_string(),
-            );
-            return ExitCode::Failure;
+            return streams.fail(ExitCode::Failure, &err.to_string());
         }
     };
 
@@ -139,17 +119,10 @@ pub fn import(streams: &mut Streams<'_>, fmt: Format, args: &ImportArgs) -> Exit
             "{} already exists; pass --force to overwrite it",
             out_path.display()
         );
-        let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), &message);
-        return ExitCode::Usage;
+        return streams.fail(ExitCode::Usage, &message);
     }
     if let Err(err) = std::fs::write(&out_path, &rendered) {
-        let _ = emit_error(
-            &mut *streams.err,
-            fmt,
-            ExitCode::Failure.code_str(),
-            &err.to_string(),
-        );
-        return ExitCode::Failure;
+        return streams.fail(ExitCode::Failure, &err.to_string());
     }
 
     let rows = ImportRows(
@@ -164,7 +137,13 @@ pub fn import(streams: &mut Streams<'_>, fmt: Format, args: &ImportArgs) -> Exit
             })
             .collect(),
     );
-    write_outcome(emit(&mut *streams.out, fmt, "import", rows, streams.style))
+    write_outcome(emit(
+        &mut *streams.out,
+        streams.fmt,
+        "import",
+        rows,
+        streams.style,
+    ))
 }
 
 /// `args.from`, or `$HOME/.pm2/dump.pm2` if it names nothing.
@@ -231,6 +210,7 @@ mod tests {
     use shep_core::config::{FlockFormat, Flockfile};
 
     use super::*;
+    use crate::cli::Format;
 
     /// Mirrors `commands/trigger.rs`'s own one-line `args(..)` helper.
     fn args(dump: &Path, out: &Path, dry_run: bool, force: bool) -> ImportArgs {
@@ -260,12 +240,9 @@ mod tests {
                 out: &mut out_buf,
                 err: &mut err_buf,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            import(
-                &mut streams,
-                Format::Table,
-                &args(&dump, &out, false, false),
-            )
+            import(&mut streams, &args(&dump, &out, false, false))
         };
         assert_eq!(code, ExitCode::Usage);
         assert!(std::fs::read_to_string(&out).unwrap().contains("mine"));
@@ -288,8 +265,9 @@ mod tests {
                 out: &mut out_buf,
                 err: &mut err_buf,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            import(&mut streams, Format::Table, &args(&dump, &out, true, false))
+            import(&mut streams, &args(&dump, &out, true, false))
         };
         assert_eq!(code, ExitCode::Success);
         assert!(!out.exists(), "--dry-run writes nothing");
@@ -323,8 +301,9 @@ mod tests {
                 out: &mut out_buf,
                 err: &mut err_buf,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            let _ = import(&mut streams, Format::Table, &args(&dump, &out, true, false));
+            let _ = import(&mut streams, &args(&dump, &out, true, false));
         }
         let report = String::from_utf8(err_buf).unwrap();
         assert!(report.contains("api"), "{report}");
@@ -349,12 +328,9 @@ mod tests {
                 out: &mut out_buf,
                 err: &mut err_buf,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            import(
-                &mut streams,
-                Format::Table,
-                &args(&dump, &out, false, false),
-            )
+            import(&mut streams, &args(&dump, &out, false, false))
         };
         assert_eq!(code, ExitCode::Usage);
         let report = String::from_utf8(err_buf).unwrap();
@@ -378,12 +354,9 @@ mod tests {
                 out: &mut out_buf,
                 err: &mut err_buf,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            import(
-                &mut streams,
-                Format::Table,
-                &args(&dump, &out, false, false),
-            )
+            import(&mut streams, &args(&dump, &out, false, false))
         };
         assert_eq!(code, ExitCode::InvalidConfig);
     }

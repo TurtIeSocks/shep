@@ -65,9 +65,9 @@ use self::app::{App, Control, Effect, Msg, Sent};
 // makes that a task-gate failure.
 use self::source::Shepherd;
 use self::theme::Palette;
-use crate::cli::{Format, LookoutArgs};
+use crate::cli::LookoutArgs;
 use crate::exit::ExitCode;
-use crate::output::{self, Streams};
+use crate::output::Streams;
 
 /// How often the uptime column is re-derived.
 ///
@@ -99,24 +99,16 @@ pub const MIN_REDRAW: Duration = Duration::from_millis(33);
 ///
 /// After that it does not exit on its own at all: the ladder and the freeze
 /// take over, and the operator quits.
-pub async fn lookout(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    paths: &ShepPaths,
-    args: &LookoutArgs,
-) -> ExitCode {
+pub async fn lookout(streams: &mut Streams<'_>, paths: &ShepPaths, args: &LookoutArgs) -> ExitCode {
     // A TUI piped into a file is a usage error, not a rendering mode: the
     // alternative is writing alternate-screen escapes into somebody's log.
     // This is also what makes the refusal testable — `assert_cmd` captures
     // stdout, so the e2e case gets this path for free.
     if !std::io::stdout().is_terminal() {
-        let _ = output::emit_error(
-            &mut *streams.err,
-            fmt,
-            ExitCode::Usage.code_str(),
+        return streams.fail(
+            ExitCode::Usage,
             "lookout needs a terminal; stdout is not one",
         );
-        return ExitCode::Usage;
     }
 
     // The FIRST dial, and it happens HERE — before the palette, before the
@@ -135,8 +127,7 @@ pub async fn lookout(
         Ok(opened) => opened,
         Err(err) => {
             let code = err.exit_code();
-            let _ = output::emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            return code;
+            return streams.fail(code, &err.to_string());
         }
     };
 
@@ -168,26 +159,20 @@ pub async fn lookout(
     let out = match term::enter() {
         Ok(out) => out,
         Err(err) => {
-            let _ = output::emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Failure.code_str(),
+            return streams.fail(
+                ExitCode::Failure,
                 &format!("could not put the terminal into raw mode: {err}"),
             );
-            return ExitCode::Failure;
         }
     };
 
     let terminal = match Terminal::new(CrosstermBackend::new(out)) {
         Ok(terminal) => terminal,
         Err(err) => {
-            let _ = output::emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Failure.code_str(),
+            return streams.fail(
+                ExitCode::Failure,
                 &format!("could not open the terminal: {err}"),
             );
-            return ExitCode::Failure;
         }
     };
 

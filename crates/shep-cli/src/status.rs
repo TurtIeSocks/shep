@@ -140,11 +140,7 @@ struct PingStatus {
 /// nothing answers, because `shep ping && echo up` is a real idiom and making
 /// the verb always succeed would quietly break every script using it. What
 /// changed is what a human reads, not what a script tests.
-pub(crate) fn render_ping(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    status: &ShepherdStatus,
-) -> ExitCode {
+pub(crate) fn render_ping(streams: &mut Streams<'_>, status: &ShepherdStatus) -> ExitCode {
     let online = status.online.as_ref();
     let payload = PingStatus {
         shepherd: if online.is_some() {
@@ -158,7 +154,7 @@ pub(crate) fn render_ping(
         socket: status.socket.display().to_string(),
     };
 
-    let _ = match fmt {
+    let _ = match streams.fmt {
         Format::Table => {
             let mut lines = vec![format!("shepherd  {}", payload.shepherd)];
             if let Some(o) = online {
@@ -270,8 +266,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            render_ping(&mut streams, Format::Table, &status)
+            render_ping(&mut streams, &status)
         };
         assert_eq!(code, ExitCode::DaemonUnreachable);
         assert!(

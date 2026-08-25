@@ -28,7 +28,7 @@ use crate::exit::ExitCode;
 use crate::flourish;
 use crate::output::{
     AvailableDogRows, DogRows, Render, RolledSheep, RolledSheepRows, Streams, emit, emit_described,
-    emit_error, emit_flock, emit_notice, write_outcome,
+    emit_flock, emit_notice, write_outcome,
 };
 
 /// Sends `body`, renders whatever the daemon answers through [`emit`], and
@@ -44,7 +44,6 @@ use crate::output::{
 async fn request_and_render<T, F>(
     client: &Client,
     streams: &mut Streams<'_>,
-    fmt: Format,
     command: &str,
     body: Request,
     extract: F,
@@ -57,26 +56,19 @@ where
         Ok(response) => match extract(response) {
             Some(payload) => write_outcome(emit(
                 &mut *streams.out,
-                fmt,
+                streams.fmt,
                 command,
                 payload,
                 streams.style,
             )),
             None => {
                 let message = "the daemon answered with a response this client does not understand";
-                let _ = emit_error(
-                    &mut *streams.err,
-                    fmt,
-                    ExitCode::Internal.code_str(),
-                    message,
-                );
-                ExitCode::Internal
+                streams.fail(ExitCode::Internal, message)
             }
         },
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
@@ -95,32 +87,24 @@ where
 async fn describe_selector(
     client: &Client,
     streams: &mut Streams<'_>,
-    fmt: Format,
     command: &str,
     selector: SelectorSpec,
 ) -> ExitCode {
     match client.request(Request::Describe { selector }).await {
         Ok(Response::Described(procs)) => write_outcome(emit_described(
             &mut *streams.out,
-            fmt,
+            streams.fmt,
             command,
             procs,
             streams.style,
         )),
         Ok(_) => {
             let message = "the daemon answered with a response this client does not understand";
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Internal.code_str(),
-                message,
-            );
-            ExitCode::Internal
+            streams.fail(ExitCode::Internal, message)
         }
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
@@ -141,7 +125,7 @@ async fn describe_selector(
 ///
 /// A missing or unreadable roll is not an error either -- a machine that has
 /// never run `shep save` has nothing to show, which is itself the answer.
-pub fn flock_from_roll(streams: &mut Streams<'_>, fmt: Format, paths: &ShepPaths) -> ExitCode {
+pub fn flock_from_roll(streams: &mut Streams<'_>, paths: &ShepPaths) -> ExitCode {
     let saved = std::fs::read(&paths.snapshot)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<FlockSnapshot>(&bytes).ok());
@@ -159,7 +143,7 @@ pub fn flock_from_roll(streams: &mut Streams<'_>, fmt: Format, paths: &ShepPaths
         })
         .unwrap_or_default();
 
-    if fmt == Format::Table {
+    if streams.fmt == Format::Table {
         let _ = writeln!(
             streams.err,
             "no shepherd running. {}",
@@ -182,16 +166,16 @@ pub fn flock_from_roll(streams: &mut Streams<'_>, fmt: Format, paths: &ShepPaths
     // headers over nothing read as a glitch, and the line above already said
     // there is nothing. JSON still gets the empty array, because a script
     // parsing this wants one shape, not two.
-    if !(empty && fmt == Format::Table) {
+    if !(empty && streams.fmt == Format::Table) {
         let _ = emit(
             &mut *streams.out,
-            fmt,
+            streams.fmt,
             "flock",
             RolledSheepRows(sheep),
             streams.style,
         );
     }
-    if fmt == Format::Table && !empty {
+    if streams.fmt == Format::Table && !empty {
         let _ = writeln!(streams.err, "`shep muster` brings them back.");
     }
     ExitCode::DaemonUnreachable
@@ -218,14 +202,14 @@ pub fn flock_from_roll(streams: &mut Streams<'_>, fmt: Format, paths: &ShepPaths
 /// needs instead of widening that helper into a second renderer, keeping
 /// the same connect/request/extract/render shape every other query verb
 /// here has.
-pub async fn flock(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> ExitCode {
+pub async fn flock(client: &Client, streams: &mut Streams<'_>) -> ExitCode {
     match client.request(Request::ListFlock).await {
         Ok(Response::Flock(procs)) => {
             // Read before `procs` moves into `emit_flock`, and printed
             // ahead of the table it describes: "no sheep in the flock yet"
             // reads as the answer, with the table underneath as the
             // receipt, rather than a mascot bolted onto the end.
-            let art = (fmt == Format::Table && streams.style.level.sheep())
+            let art = (streams.fmt == Format::Table && streams.style.level.sheep())
                 .then(|| sheep_flourish(&procs))
                 .flatten();
             if let Some(art) = &art {
@@ -233,7 +217,7 @@ pub async fn flock(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> E
             }
             write_outcome(emit_flock(
                 &mut *streams.out,
-                fmt,
+                streams.fmt,
                 "flock",
                 procs,
                 streams.style,
@@ -241,18 +225,11 @@ pub async fn flock(client: &Client, streams: &mut Streams<'_>, fmt: Format) -> E
         }
         Ok(_) => {
             let message = "the daemon answered with a response this client does not understand";
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Internal.code_str(),
-                message,
-            );
-            ExitCode::Internal
+            streams.fail(ExitCode::Internal, message)
         }
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
@@ -304,17 +281,11 @@ fn sheep_flourish(listing: &[ProcessInfo]) -> Option<String> {
 /// `render_table::<DogRows>`, reached here through `emit` and from inside
 /// `emit_flock`'s own dogs section — so there is exactly one place that
 /// knows how to lay out a dogs table.
-pub async fn dogs(
-    client: &Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    args: &DogsArgs,
-) -> ExitCode {
+pub async fn dogs(client: &Client, streams: &mut Streams<'_>, args: &DogsArgs) -> ExitCode {
     let filter = args.filter.as_deref();
     request_and_render(
         client,
         streams,
-        fmt,
         "dogs",
         Request::ListFlock,
         |response| match response {
@@ -365,19 +336,13 @@ fn matches_filter(filter: &str, haystacks: &[&str]) -> bool {
 /// deliberately carries the URL on none of its variants but its own
 /// `InsecureUrl` (that type's own doc says why), so naming it here is what
 /// tells the operator which URL failed.
-pub async fn available_dogs(streams: &mut Streams<'_>, fmt: Format, args: &DogsArgs) -> ExitCode {
+pub async fn available_dogs(streams: &mut Streams<'_>, args: &DogsArgs) -> ExitCode {
     let url = dog_index::index_url();
     let index = match dog_index::fetch_index(&url).await {
         Ok(index) => index,
         Err(err) => {
             let message = format!("reading the dog index from {url}: {err}");
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Failure.code_str(),
-                &message,
-            );
-            return ExitCode::Failure;
+            return streams.fail(ExitCode::Failure, &message);
         }
     };
     let (skipped, sanitised) = (index.skipped, index.sanitised);
@@ -391,27 +356,27 @@ pub async fn available_dogs(streams: &mut Streams<'_>, fmt: Format, args: &DogsA
         })
         .collect();
 
-    let code = if fmt == Format::Table
+    let code = if streams.fmt == Format::Table
         && matched.is_empty()
         && let Some(filter) = filter
     {
         let _ = writeln!(streams.out, "no dog matches {filter:?}");
         ExitCode::Success
-    } else if fmt == Format::Table
+    } else if streams.fmt == Format::Table
         && let [only] = matched.as_slice()
     {
         write_outcome(render_detail(&mut *streams.out, only))
     } else {
         write_outcome(emit(
             &mut *streams.out,
-            fmt,
+            streams.fmt,
             "dogs",
             AvailableDogRows(matched),
             streams.style,
         ))
     };
 
-    note_index_costs(streams, fmt, skipped, sanitised);
+    note_index_costs(streams, skipped, sanitised);
     code
 }
 
@@ -431,11 +396,11 @@ const INDEX_WIDE: &str = ", across the whole index rather than this listing";
 /// how many rows matched: both counts describe the fetch, not the search,
 /// so they are worth saying even alongside a detail view or a "no dog
 /// matches" line, and [`INDEX_WIDE`] is what says so out loud.
-fn note_index_costs(streams: &mut Streams<'_>, fmt: Format, skipped: usize, sanitised: usize) {
+fn note_index_costs(streams: &mut Streams<'_>, skipped: usize, sanitised: usize) {
     if skipped > 0 {
         let _ = emit_notice(
             &mut *streams.err,
-            fmt,
+            streams.fmt,
             "dogs_skipped",
             &format!(
                 "{skipped} entr{} skipped{INDEX_WIDE}",
@@ -446,7 +411,7 @@ fn note_index_costs(streams: &mut Streams<'_>, fmt: Format, skipped: usize, sani
     if sanitised > 0 {
         let _ = emit_notice(
             &mut *streams.err,
-            fmt,
+            streams.fmt,
             "dogs_sanitised",
             &format!(
                 "{sanitised} entr{} contained control characters{INDEX_WIDE}",
@@ -509,22 +474,17 @@ fn adopt_line(source: &DogSourceKind, adopt_as: &str, package: &str) -> String {
 }
 
 /// Describes the sheep matching `args.selector` in detail.
-pub async fn describe(
-    client: &Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    args: &SelectorArgs,
-) -> ExitCode {
+pub async fn describe(client: &Client, streams: &mut Streams<'_>, args: &SelectorArgs) -> ExitCode {
     // One pass per target, each rendered as its own detail view: `describe`
     // answers with a tree per sheep (its lambs), not a row, so merging several
     // into one payload would lose the per-sheep shape the verb exists for.
     let mut failure: Option<ExitCode> = None;
     for raw in &args.selectors {
-        let selector = match parse_selector(streams, fmt, raw) {
+        let selector = match parse_selector(streams, raw) {
             Ok(selector) => SelectorSpec::from(&selector),
             Err(code) => return code,
         };
-        let code = describe_selector(client, streams, fmt, "describe", selector).await;
+        let code = describe_selector(client, streams, "describe", selector).await;
         if code != ExitCode::Success {
             failure = failure.or(Some(code));
         }
@@ -536,16 +496,10 @@ pub async fn describe(
 /// SelectorSpec::Fold(args.name) }`, delegating straight to
 /// [`describe_selector`] rather than re-implementing the request/render
 /// shape.
-pub async fn fold(
-    client: &Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    args: &FoldArgs,
-) -> ExitCode {
+pub async fn fold(client: &Client, streams: &mut Streams<'_>, args: &FoldArgs) -> ExitCode {
     describe_selector(
         client,
         streams,
-        fmt,
         "fold",
         SelectorSpec::Fold(args.name.clone()),
     )
@@ -590,8 +544,9 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
-        let _ = flock(&client, &mut streams, Format::Table).await;
+        let _ = flock(&client, &mut streams).await;
         let sent = tokio::time::timeout(RECV_TIMEOUT, envelopes.recv())
             .await
             .expect("flock must reach the wire; it hung instead of sending a request")
@@ -623,11 +578,12 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             let args = SelectorArgs {
                 selectors: vec![input.into()],
             };
-            let _ = describe(&client, &mut streams, Format::Table, &args).await;
+            let _ = describe(&client, &mut streams, &args).await;
             let sent = tokio::time::timeout(RECV_TIMEOUT, envelopes.recv())
                 .await
                 .unwrap_or_else(|_| {
@@ -658,11 +614,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             describe(
                 &client,
                 &mut streams,
-                Format::Table,
                 &SelectorArgs {
                     selectors: vec!["/[/".into()],
                 },
@@ -690,14 +646,9 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
-        let _ = fold(
-            &client,
-            &mut streams,
-            Format::Table,
-            &FoldArgs { name: "api".into() },
-        )
-        .await;
+        let _ = fold(&client, &mut streams, &FoldArgs { name: "api".into() }).await;
         let sent = tokio::time::timeout(RECV_TIMEOUT, envelopes.recv())
             .await
             .expect("fold must reach the wire; it hung instead of sending a request")
@@ -735,8 +686,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Json,
             };
-            flock(&client, &mut streams, Format::Json).await
+            flock(&client, &mut streams).await
         };
 
         assert_eq!(code, ExitCode::Success);
@@ -767,11 +719,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Json,
             };
             describe(
                 &client,
                 &mut streams,
-                Format::Json,
                 &SelectorArgs {
                     selectors: vec!["all".into()],
                 },
@@ -900,8 +852,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: Presentation::new(level, None, None, None, 80),
+                fmt,
             };
-            let _ = flock(&client, &mut streams, fmt).await;
+            let _ = flock(&client, &mut streams).await;
             let printed = String::from_utf8_lossy(&out);
             assert_eq!(
                 printed.contains("no sheep in the flock yet"),

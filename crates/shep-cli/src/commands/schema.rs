@@ -8,7 +8,6 @@
 
 use shep_core::config::flockfile_schema_string;
 
-use crate::cli::Format;
 use crate::exit::ExitCode;
 use crate::output::{Streams, write_outcome};
 
@@ -17,6 +16,6 @@ use crate::output::{Streams, write_outcome};
 /// `--format json` is deliberately ignored: the output *is* JSON, and
 /// wrapping a schema in the CLI's envelope would produce a file no editor
 /// could read.
-pub fn schema(streams: &mut Streams<'_>, _fmt: Format) -> ExitCode {
+pub fn schema(streams: &mut Streams<'_>) -> ExitCode {
     write_outcome(streams.out.write_all(flockfile_schema_string().as_bytes()))
 }

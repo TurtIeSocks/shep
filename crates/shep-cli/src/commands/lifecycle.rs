@@ -17,12 +17,10 @@ use shep_client::{Client, START_DEADLINE};
 use shep_core::config::{AppConfig, FlockFormat, Flockfile, FlockfileError};
 use shep_core::protocol::{Request, Response, SelectorSpec};
 
-use crate::cli::{Format, SelectorArgs, StartArgs, StockArgs};
+use crate::cli::{SelectorArgs, StartArgs, StockArgs};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
-use crate::output::{
-    DeletedIds, FlockRows, Render, Streams, emit, emit_error, emit_notice, write_outcome,
-};
+use crate::output::{DeletedIds, FlockRows, Render, Streams, emit, emit_notice, write_outcome};
 
 /// What [`resolve_target`] can fail with. Module-scoped per IR-18, and named
 /// for the function rather than the verb on purpose: `start`'s own
@@ -380,7 +378,6 @@ pub fn resolve_target(
 async fn request_and_render<T, F>(
     client: &Client,
     streams: &mut Streams<'_>,
-    fmt: Format,
     command: &str,
     body: Request,
     deadline: Option<Duration>,
@@ -394,26 +391,19 @@ where
         Ok(response) => match extract(response) {
             Some(payload) => write_outcome(emit(
                 &mut *streams.out,
-                fmt,
+                streams.fmt,
                 command,
                 payload,
                 streams.style,
             )),
             None => {
                 let message = "the daemon answered with a response this client does not understand";
-                let _ = emit_error(
-                    &mut *streams.err,
-                    fmt,
-                    ExitCode::Internal.code_str(),
-                    message,
-                );
-                ExitCode::Internal
+                streams.fail(ExitCode::Internal, message)
             }
         },
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
@@ -424,12 +414,11 @@ where
 /// discovered after the first two have already been acted on.
 fn parse_selectors(
     streams: &mut Streams<'_>,
-    fmt: Format,
     raw: &[String],
 ) -> Result<Vec<SelectorSpec>, ExitCode> {
     let mut parsed = Vec::with_capacity(raw.len());
     for one in raw {
-        parsed.push(SelectorSpec::from(&parse_selector(streams, fmt, one)?));
+        parsed.push(SelectorSpec::from(&parse_selector(streams, one)?));
     }
     Ok(parsed)
 }
@@ -451,7 +440,6 @@ fn parse_selectors(
 async fn request_each<I, B, F>(
     client: &Client,
     streams: &mut Streams<'_>,
-    fmt: Format,
     selectors: &[SelectorSpec],
     deadline: Option<Duration>,
     body: B,
@@ -474,19 +462,12 @@ where
                 None => {
                     let message =
                         "the daemon answered with a response this client does not understand";
-                    let _ = emit_error(
-                        &mut *streams.err,
-                        fmt,
-                        ExitCode::Internal.code_str(),
-                        message,
-                    );
-                    failure = failure.or(Some(ExitCode::Internal));
+                    failure = failure.or(Some(streams.fail(ExitCode::Internal, message)));
                 }
             },
             Err(err) => {
                 let code = ExitCode::from(&err);
-                let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-                failure = failure.or(Some(code));
+                failure = failure.or(Some(streams.fail(code, &err.to_string())));
             }
         }
     }
@@ -494,10 +475,9 @@ where
 }
 
 /// Renders `err` and returns the exit code `start` reports it as.
-fn fail_target(streams: &mut Streams<'_>, fmt: Format, err: &TargetError) -> ExitCode {
+fn fail_target(streams: &mut Streams<'_>, err: &TargetError) -> ExitCode {
     let code = target_exit_code(err);
-    let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-    code
+    streams.fail(code, &err.to_string())
 }
 
 /// Starts one or more sheep, resolved from `args.target` — see
@@ -533,7 +513,6 @@ fn fail_target(streams: &mut Streams<'_>, fmt: Format, err: &TargetError) -> Exi
 async fn resume(
     client: &Client,
     streams: &mut Streams<'_>,
-    fmt: Format,
     existing: &shep_core::protocol::ProcessInfo,
     started: &mut Vec<shep_core::protocol::ProcessInfo>,
 ) -> ExitCode {
@@ -547,13 +526,12 @@ async fn resume(
             "{} is already {}; `shep restart {}` replaces it.",
             existing.name, existing.status, existing.name
         );
-        let _ = emit_notice(&mut *streams.err, fmt, "start", &message);
+        let _ = emit_notice(&mut *streams.err, streams.fmt, "start", &message);
         return ExitCode::Success;
     }
     let (procs, failure) = request_each(
         client,
         streams,
-        fmt,
         &[SelectorSpec::Name(existing.name.clone())],
         None,
         |selector| Request::Restart { selector },
@@ -577,13 +555,7 @@ async fn resume(
             "{} could not be started; see `shep bleats {}` or its log files for why",
             existing.name, existing.name
         );
-        let _ = emit_error(
-            &mut *streams.err,
-            fmt,
-            ExitCode::SpawnFailed.code_str(),
-            &message,
-        );
-        return ExitCode::SpawnFailed;
+        return streams.fail(ExitCode::SpawnFailed, &message);
     }
     started.extend(procs);
     failure.unwrap_or(ExitCode::Success)
@@ -702,7 +674,6 @@ fn apply_interpreters(
 pub async fn start(
     client: &Client,
     streams: &mut Streams<'_>,
-    fmt: Format,
     args: &StartArgs,
     discovered: Option<&Path>,
     interpreters: &BTreeMap<String, String>,
@@ -711,15 +682,13 @@ pub async fn start(
     // one sheep, so it cannot mean anything across several targets.
     if args.name.is_some() && args.targets.len() > 1 {
         let message = "--name takes one target: a name belongs to one sheep";
-        let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), message);
-        return ExitCode::Usage;
+        return streams.fail(ExitCode::Usage, message);
     }
     if args.targets.is_empty() {
         let mut started = Vec::new();
         let code = start_one(
             client,
             streams,
-            fmt,
             args,
             None,
             discovered,
@@ -730,7 +699,7 @@ pub async fn start(
         if !started.is_empty() {
             let wrote = write_outcome(emit(
                 &mut *streams.out,
-                fmt,
+                streams.fmt,
                 "start",
                 FlockRows(started),
                 streams.style,
@@ -750,7 +719,6 @@ pub async fn start(
         let code = start_one(
             client,
             streams,
-            fmt,
             args,
             Some(target),
             discovered,
@@ -768,7 +736,7 @@ pub async fn start(
     if !started.is_empty() {
         let wrote = write_outcome(emit(
             &mut *streams.out,
-            fmt,
+            streams.fmt,
             "start",
             FlockRows(started),
             streams.style,
@@ -796,7 +764,6 @@ pub async fn start(
 async fn start_one(
     client: &Client,
     streams: &mut Streams<'_>,
-    fmt: Format,
     args: &StartArgs,
     target: Option<&str>,
     discovered: Option<&Path>,
@@ -822,7 +789,7 @@ async fn start_one(
         if !is_path_like {
             let flock = flock_now(client).await;
             if let Some(existing) = flock.iter().find(|info| info.name == name) {
-                return resume(client, streams, fmt, existing, started).await;
+                return resume(client, streams, existing, started).await;
             }
             listing = Some(flock);
         }
@@ -834,15 +801,14 @@ async fn start_one(
         (None, Some(found)) => found,
         (None, None) => {
             let message = "no target and no Flockfile in this directory";
-            let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), message);
-            return ExitCode::Usage;
+            return streams.fail(ExitCode::Usage, message);
         }
     };
 
     let stdin = if target == "-" {
         let mut buf = Vec::new();
         if let Err(source) = std::io::stdin().lock().read_to_end(&mut buf) {
-            return fail_target(streams, fmt, &TargetError::Stdin(source));
+            return fail_target(streams, &TargetError::Stdin(source));
         }
         buf
     } else {
@@ -851,7 +817,7 @@ async fn start_one(
 
     let apps = match resolve_target(target, args.name.as_deref(), &stdin, args.flockfile) {
         Ok(apps) => apps,
-        Err(err) => return fail_target(streams, fmt, &err),
+        Err(err) => return fail_target(streams, &err),
     };
     // The same rule the bare-name lookup above applies, now that the target
     // has become a set of named apps: a name the flock already has is that
@@ -873,7 +839,7 @@ async fn start_one(
         }
     }
     for existing in &resumed {
-        let code = resume(client, streams, fmt, existing, started).await;
+        let code = resume(client, streams, existing, started).await;
         if code != ExitCode::Success {
             return code;
         }
@@ -899,9 +865,7 @@ async fn start_one(
 
     let (procs, failure) = request_each(
         client,
-        streams,
-        fmt,
-        // One request either way: `Start` carries the apps, so the "selector"
+        streams, // One request either way: `Start` carries the apps, so the "selector"
         // here is a placeholder the body closure ignores. Reusing the looping
         // helper keeps the collect-then-render shape in one place.
         &[SelectorSpec::All],
@@ -918,20 +882,14 @@ async fn start_one(
 }
 
 /// Stops the sheep matching `args.selector`.
-pub async fn stop(
-    client: &Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    args: &SelectorArgs,
-) -> ExitCode {
-    let selectors = match parse_selectors(streams, fmt, &args.selectors) {
+pub async fn stop(client: &Client, streams: &mut Streams<'_>, args: &SelectorArgs) -> ExitCode {
+    let selectors = match parse_selectors(streams, &args.selectors) {
         Ok(selectors) => selectors,
         Err(code) => return code,
     };
     let (procs, failure) = request_each(
         client,
         streams,
-        fmt,
         &selectors,
         None,
         |selector| Request::Stop { selector },
@@ -944,7 +902,7 @@ pub async fn stop(
     if !procs.is_empty() {
         let wrote = write_outcome(emit(
             &mut *streams.out,
-            fmt,
+            streams.fmt,
             "stop",
             FlockRows(procs),
             streams.style,
@@ -957,20 +915,14 @@ pub async fn stop(
 }
 
 /// Restarts the sheep matching `args.selector`.
-pub async fn restart(
-    client: &Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    args: &SelectorArgs,
-) -> ExitCode {
-    let selectors = match parse_selectors(streams, fmt, &args.selectors) {
+pub async fn restart(client: &Client, streams: &mut Streams<'_>, args: &SelectorArgs) -> ExitCode {
+    let selectors = match parse_selectors(streams, &args.selectors) {
         Ok(selectors) => selectors,
         Err(code) => return code,
     };
     let (procs, failure) = request_each(
         client,
         streams,
-        fmt,
         &selectors,
         None,
         |selector| Request::Restart { selector },
@@ -1003,7 +955,7 @@ pub async fn restart(
     if !procs.is_empty() && failed.is_empty() {
         let wrote = write_outcome(emit(
             &mut *streams.out,
-            fmt,
+            streams.fmt,
             "restart",
             FlockRows(procs),
             streams.style,
@@ -1019,13 +971,7 @@ pub async fn restart(
             "{names} did not come back up; see `shep bleats {}` or its log files for why",
             failed[0]
         );
-        let _ = emit_error(
-            &mut *streams.err,
-            fmt,
-            ExitCode::SpawnFailed.code_str(),
-            &message,
-        );
-        return ExitCode::SpawnFailed;
+        return streams.fail(ExitCode::SpawnFailed, &message);
     }
 
     failure.unwrap_or(ExitCode::Success)
@@ -1041,20 +987,14 @@ pub async fn restart(
 /// — the answer is already back long before the first swap commits. The rows
 /// printed are the flock as it stood at acceptance, and the swaps report
 /// themselves on the bus.
-pub async fn reload(
-    client: &Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    args: &SelectorArgs,
-) -> ExitCode {
-    let selectors = match parse_selectors(streams, fmt, &args.selectors) {
+pub async fn reload(client: &Client, streams: &mut Streams<'_>, args: &SelectorArgs) -> ExitCode {
+    let selectors = match parse_selectors(streams, &args.selectors) {
         Ok(selectors) => selectors,
         Err(code) => return code,
     };
     let (procs, failure) = request_each(
         client,
         streams,
-        fmt,
         &selectors,
         None,
         |selector| Request::Reload { selector },
@@ -1067,7 +1007,7 @@ pub async fn reload(
     if !procs.is_empty() {
         let wrote = write_outcome(emit(
             &mut *streams.out,
-            fmt,
+            streams.fmt,
             "reload",
             FlockRows(procs),
             streams.style,
@@ -1080,20 +1020,14 @@ pub async fn reload(
 }
 
 /// Deletes (stops and deregisters) the sheep matching `args.selector`.
-pub async fn delete(
-    client: &Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    args: &SelectorArgs,
-) -> ExitCode {
-    let selectors = match parse_selectors(streams, fmt, &args.selectors) {
+pub async fn delete(client: &Client, streams: &mut Streams<'_>, args: &SelectorArgs) -> ExitCode {
+    let selectors = match parse_selectors(streams, &args.selectors) {
         Ok(selectors) => selectors,
         Err(code) => return code,
     };
     let (ids, failure) = request_each(
         client,
         streams,
-        fmt,
         &selectors,
         None,
         |selector| Request::Delete { selector },
@@ -1106,7 +1040,7 @@ pub async fn delete(
     if !ids.is_empty() {
         let wrote = write_outcome(emit(
             &mut *streams.out,
-            fmt,
+            streams.fmt,
             "delete",
             DeletedIds(ids),
             streams.style,
@@ -1127,16 +1061,10 @@ pub async fn delete(
 /// Sends `Request::Scale` with `START_DEADLINE`, not the client's default: a
 /// stock-up spawns processes, which is the same work `start` already asks
 /// for the longer budget to cover.
-pub async fn stock(
-    client: &Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    args: &StockArgs,
-) -> ExitCode {
+pub async fn stock(client: &Client, streams: &mut Streams<'_>, args: &StockArgs) -> ExitCode {
     request_and_render(
         client,
         streams,
-        fmt,
         "stock",
         Request::Scale {
             name: args.name.clone(),
@@ -1154,6 +1082,7 @@ pub async fn stock(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::Format;
     use shep_client::DEFAULT_DEADLINE;
     use shep_client::testing::{fake_client_capturing_envelopes, fake_client_replying_err};
     use shep_core::protocol::RpcErrorCode;
@@ -1189,11 +1118,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             let _ = start(
                 &client,
                 &mut streams,
-                Format::Table,
                 &args,
                 Some(flockfile.as_path()),
                 &BTreeMap::new(),
@@ -1530,11 +1459,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             start(
                 &client,
                 &mut streams,
-                Format::Table,
                 &start_args("zeus-auth"),
                 None,
                 &BTreeMap::new(),
@@ -1579,11 +1508,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             start(
                 &client,
                 &mut streams,
-                Format::Table,
                 &start_args("zeus-auth"),
                 None,
                 &BTreeMap::new(),
@@ -1612,11 +1541,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             start(
                 &client,
                 &mut streams,
-                Format::Table,
                 &start_args("./does-not-exist"),
                 None,
                 &BTreeMap::new(),
@@ -1686,6 +1615,7 @@ mod tests {
                     out: &mut out,
                     err: &mut err,
                     style: crate::style::Presentation::BARE,
+                    fmt: Format::Table,
                 };
                 let args = SelectorArgs {
                     selectors: vec![input.into()],
@@ -1697,10 +1627,10 @@ mod tests {
                     Verb::Delete => Request::Delete { selector: expected },
                 };
                 let _ = match verb {
-                    Verb::Stop => stop(&client, &mut streams, Format::Table, &args).await,
-                    Verb::Restart => restart(&client, &mut streams, Format::Table, &args).await,
-                    Verb::Reload => reload(&client, &mut streams, Format::Table, &args).await,
-                    Verb::Delete => delete(&client, &mut streams, Format::Table, &args).await,
+                    Verb::Stop => stop(&client, &mut streams, &args).await,
+                    Verb::Restart => restart(&client, &mut streams, &args).await,
+                    Verb::Reload => reload(&client, &mut streams, &args).await,
+                    Verb::Delete => delete(&client, &mut streams, &args).await,
                 };
                 let sent = envelopes.recv().await.unwrap();
                 assert_eq!(sent.body, expected_body, "verb={verb:?} input={input}");
@@ -1735,11 +1665,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             stop(
                 &client,
                 &mut streams,
-                Format::Table,
                 &SelectorArgs {
                     selectors: vec!["/[/".into()],
                 },
@@ -1765,11 +1695,11 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
         let code = stop(
             &client,
             &mut streams,
-            Format::Table,
             &SelectorArgs {
                 selectors: vec!["ghost".into()],
             },
@@ -1808,12 +1738,12 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
 
         let _ = start(
             &client,
             &mut streams,
-            Format::Table,
             &start_args(srv.to_str().unwrap()),
             None,
             &BTreeMap::new(),
@@ -1859,19 +1789,12 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
         let mut args = start_args(srv.to_str().unwrap());
         args.fold = Some("backend".to_string());
 
-        let _ = start(
-            &client,
-            &mut streams,
-            Format::Table,
-            &args,
-            None,
-            &BTreeMap::new(),
-        )
-        .await;
+        let _ = start(&client, &mut streams, &args, None, &BTreeMap::new()).await;
 
         let sent = next_start(&mut envelopes).await;
         match sent.body {
@@ -1921,6 +1844,7 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
         let mut interpreters = BTreeMap::new();
         interpreters.insert("js".to_string(), "node".to_string());
@@ -1928,7 +1852,6 @@ mod tests {
         let _ = start(
             &client,
             &mut streams,
-            Format::Table,
             &start_args(srv.to_str().unwrap()),
             None,
             &interpreters,
@@ -1968,6 +1891,7 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
         let mut interpreters = BTreeMap::new();
         interpreters.insert("js".to_string(), "node".to_string());
@@ -1975,7 +1899,6 @@ mod tests {
         let _ = start(
             &client,
             &mut streams,
-            Format::Table,
             &start_args(flockfile.to_str().unwrap()),
             None,
             &interpreters,
@@ -2012,21 +1935,14 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
         let mut args = start_args(flockfile.to_str().unwrap());
         args.interpreter = Some("deno".to_string());
         let mut interpreters = BTreeMap::new();
         interpreters.insert("js".to_string(), "node".to_string());
 
-        let _ = start(
-            &client,
-            &mut streams,
-            Format::Table,
-            &args,
-            None,
-            &interpreters,
-        )
-        .await;
+        let _ = start(&client, &mut streams, &args, None, &interpreters).await;
 
         let sent = next_start(&mut envelopes).await;
         match sent.body {
@@ -2067,11 +1983,11 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
         let _ = stock(
             &client,
             &mut streams,
-            Format::Table,
             &StockArgs {
                 name: "web".to_string(),
                 count: 4,
@@ -2109,11 +2025,11 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             stock(
                 &client,
                 &mut streams,
-                Format::Table,
                 &StockArgs {
                     name: "web".to_string(),
                     count: 1,

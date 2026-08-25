@@ -20,11 +20,9 @@ use std::path::{Path, PathBuf};
 
 use unit::UnitSpec;
 
-use crate::cli::{Format, Init, StartupArgs};
+use crate::cli::{Init, StartupArgs};
 use crate::exit::ExitCode;
-use crate::output::{
-    StartupStep, StartupSteps, Streams, emit, emit_error, emit_notice, write_outcome,
-};
+use crate::output::{StartupStep, StartupSteps, Streams, emit, emit_notice, write_outcome};
 
 /// `$SHEP_HOME`'s own directory name under a user's home, mirroring
 /// `ShepPaths::resolve`'s `home_dir.join(".shep")`. A literal there and a
@@ -140,13 +138,12 @@ struct Refusal {
 /// is root's, and a unit built from it restores nothing after a reboot.
 pub fn startup(
     streams: &mut Streams<'_>,
-    fmt: Format,
     explicit_home: Option<&Path>,
     args: &StartupArgs,
 ) -> ExitCode {
     match plan(explicit_home, args) {
-        Ok(plan) => install(streams, fmt, &plan, privilege()),
-        Err(refusal) => refuse(streams, fmt, refusal.code, &refusal.message),
+        Ok(plan) => install(streams, &plan, privilege()),
+        Err(refusal) => refuse(streams, refusal.code, &refusal.message),
     }
 }
 
@@ -155,10 +152,10 @@ pub fn startup(
 /// Resolves its plan with no explicit home: a removal is addressed by the
 /// unit's path and label, both of which come from the target user alone, and
 /// nothing here reads the `$SHEP_HOME` the unit happens to carry.
-pub fn unstartup(streams: &mut Streams<'_>, fmt: Format, args: &StartupArgs) -> ExitCode {
+pub fn unstartup(streams: &mut Streams<'_>, args: &StartupArgs) -> ExitCode {
     match plan(None, args) {
-        Ok(plan) => remove(streams, fmt, &plan, privilege()),
-        Err(refusal) => refuse(streams, fmt, refusal.code, &refusal.message),
+        Ok(plan) => remove(streams, &plan, privilege()),
+        Err(refusal) => refuse(streams, refusal.code, &refusal.message),
     }
 }
 
@@ -222,14 +219,12 @@ pub(crate) fn target_home(explicit: Option<&Path>, user_home: &Path) -> PathBuf 
 /// test points it into a temporary directory.
 pub(crate) fn install(
     streams: &mut Streams<'_>,
-    fmt: Format,
     plan: &StartupPlan,
     privilege: Privilege,
 ) -> ExitCode {
     if !plan.spec.home.is_dir() {
         return refuse(
             streams,
-            fmt,
             ExitCode::Usage,
             &format!(
                 "no directory at {}; pass --home with the $SHEP_HOME this unit should carry",
@@ -240,7 +235,6 @@ pub(crate) fn install(
     if plan.unit_path.exists() {
         return refuse(
             streams,
-            fmt,
             ExitCode::Usage,
             &format!(
                 "{} already exists; shep unstartup removes it first",
@@ -251,7 +245,6 @@ pub(crate) fn install(
     if privilege == Privilege::Unprivileged {
         return refuse(
             streams,
-            fmt,
             ExitCode::Failure,
             &format!(
                 "installing the unit needs root; run: sudo {} startup --user {} --home {}",
@@ -262,7 +255,7 @@ pub(crate) fn install(
         );
     }
     if let Some(message) = secure_path_warning(plan.sudo_user.as_deref(), &plan.spec) {
-        let _ = emit_notice(&mut *streams.err, fmt, "secure_path", &message);
+        let _ = emit_notice(&mut *streams.err, streams.fmt, "secure_path", &message);
     }
 
     let mut steps = vec![write_unit(plan)];
@@ -297,7 +290,7 @@ pub(crate) fn install(
             steps.push(run_step("rcctl", &["start", &unit_file_name(plan)]));
         }
     }
-    report(streams, fmt, "startup", steps)
+    report(streams, "startup", steps)
 }
 
 /// The notice [`install`] prints when `$SUDO_USER` was set: `None` if it
@@ -336,14 +329,12 @@ fn secure_path_warning(sudo_user: Option<&str>, spec: &UnitSpec) -> Option<Strin
 /// removal is addressed by the unit's path and label alone.
 pub(crate) fn remove(
     streams: &mut Streams<'_>,
-    fmt: Format,
     plan: &StartupPlan,
     privilege: Privilege,
 ) -> ExitCode {
     if !plan.unit_path.exists() {
         return report(
             streams,
-            fmt,
             "unstartup",
             vec![StartupStep {
                 action: "removed",
@@ -355,7 +346,6 @@ pub(crate) fn remove(
     if privilege == Privilege::Unprivileged {
         return refuse(
             streams,
-            fmt,
             ExitCode::Failure,
             &format!(
                 "removing the unit needs root; run: sudo {} unstartup --user {}",
@@ -404,7 +394,7 @@ pub(crate) fn remove(
             steps.push(remove_unit(plan));
         }
     }
-    report(streams, fmt, "unstartup", steps)
+    report(streams, "unstartup", steps)
 }
 
 /// Renders the unit and writes it at [`unit_mode`], as one step.
@@ -503,18 +493,13 @@ fn unit_file_name(plan: &StartupPlan) -> String {
 /// A step that failed fails the verb, but only after every remaining step has
 /// run: a half-installed unit is worse than a fully-attempted one, and the
 /// operator needs every row to know which half.
-fn report(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    command: &str,
-    steps: Vec<StartupStep>,
-) -> ExitCode {
+fn report(streams: &mut Streams<'_>, command: &str, steps: Vec<StartupStep>) -> ExitCode {
     let failed = steps
         .iter()
         .any(|step| step.result != OK && step.result != ABSENT);
     let written = write_outcome(emit(
         &mut *streams.out,
-        fmt,
+        streams.fmt,
         command,
         StartupSteps(steps),
         streams.style,
@@ -566,9 +551,8 @@ fn privilege() -> Privilege {
 }
 
 /// Writes one refusal to stderr and returns the code it earned.
-fn refuse(streams: &mut Streams<'_>, fmt: Format, code: ExitCode, message: &str) -> ExitCode {
-    let _ = emit_error(&mut *streams.err, fmt, code.code_str(), message);
-    code
+fn refuse(streams: &mut Streams<'_>, code: ExitCode, message: &str) -> ExitCode {
+    streams.fail(code, message)
 }
 
 /// Which init a Linux host running these two probes is on.
@@ -739,6 +723,7 @@ mod tests {
     use std::ffi::OsString;
 
     use super::*;
+    use crate::cli::Format;
 
     /// The unit path a `StartupPlan` built for a test points at, so `install`
     /// can be driven without writing into `/etc` or `/Library`. Every field
@@ -840,13 +825,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            install(
-                &mut streams,
-                Format::Table,
-                &plan_for_test(&home),
-                Privilege::Unprivileged,
-            )
+            install(&mut streams, &plan_for_test(&home), Privilege::Unprivileged)
         };
         assert_ne!(code, ExitCode::Success);
         let printed = String::from_utf8(err).unwrap();
@@ -879,8 +860,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            install(&mut streams, Format::Table, &plan, Privilege::Unprivileged);
+            install(&mut streams, &plan, Privilege::Unprivileged);
         }
         let printed = String::from_utf8(err).unwrap();
         assert!(!printed.contains("secure_path"), "{printed}");
@@ -900,16 +882,12 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
             // Root, deliberately: an unprivileged run would refuse for the
             // other reason and this case would pass without ever exercising
             // the home check.
-            install(
-                &mut streams,
-                Format::Table,
-                &plan_for_test(&missing),
-                Privilege::Root,
-            )
+            install(&mut streams, &plan_for_test(&missing), Privilege::Root)
         };
         assert_eq!(code, ExitCode::Usage);
         let printed = String::from_utf8(err).unwrap();
@@ -947,8 +925,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            install(&mut streams, Format::Table, &plan, Privilege::Root)
+            install(&mut streams, &plan, Privilege::Root)
         };
         assert_eq!(code, ExitCode::Usage);
         let printed = String::from_utf8(err).unwrap();
@@ -988,13 +967,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            remove(
-                &mut streams,
-                Format::Table,
-                &plan_for_test(&home),
-                Privilege::Unprivileged,
-            )
+            remove(&mut streams, &plan_for_test(&home), Privilege::Unprivileged)
         };
         assert_eq!(code, ExitCode::Success);
         let printed = String::from_utf8(out).unwrap();
@@ -1018,8 +993,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            remove(&mut streams, Format::Table, &plan, Privilege::Unprivileged)
+            remove(&mut streams, &plan, Privilege::Unprivileged)
         };
         assert_ne!(code, ExitCode::Success);
         let printed = String::from_utf8(err).unwrap();
@@ -1104,8 +1080,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            report(&mut streams, Format::Table, "startup", steps)
+            report(&mut streams, "startup", steps)
         };
         assert_eq!(code, ExitCode::Failure);
         let printed = String::from_utf8(out).unwrap();

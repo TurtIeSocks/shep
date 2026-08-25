@@ -763,13 +763,9 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                     out: &mut sink,
                     err: &mut err,
                     style,
-                };
-                welcome::on_first_run(
-                    &mut streams,
                     fmt,
-                    &paths.home,
-                    std::io::stderr().is_terminal(),
-                );
+                };
+                welcome::on_first_run(&mut streams, &paths.home, std::io::stderr().is_terminal());
             }
             let mut out = std::io::stdout().lock();
             let mut err = std::io::stderr().lock();
@@ -777,8 +773,9 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                 out: &mut out,
                 err: &mut err,
                 style,
+                fmt,
             };
-            return startup::startup(&mut streams, fmt, Some(paths.home.as_path()), args);
+            return startup::startup(&mut streams, Some(paths.home.as_path()), args);
         }
         Commands::Unstartup(ref args) => {
             let mut out = std::io::stdout().lock();
@@ -787,8 +784,9 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                 out: &mut out,
                 err: &mut err,
                 style,
+                fmt,
             };
-            return startup::unstartup(&mut streams, fmt, args);
+            return startup::unstartup(&mut streams, args);
         }
         // Needs no `$SHEP_HOME` at all — same reasoning as `Completions`
         // just above, and the same early spot for it.
@@ -799,8 +797,9 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                 out: &mut out,
                 err: &mut err,
                 style,
+                fmt,
             };
-            return schema::schema(&mut streams, fmt);
+            return schema::schema(&mut streams);
         }
         _ => {}
     }
@@ -821,10 +820,10 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             out: &mut out,
             err: &mut err,
             style,
+            fmt,
         };
         return dev::dev(
             &mut streams,
-            fmt,
             cli.global.quiet,
             cli.global.home.is_some(),
             args,
@@ -859,13 +858,9 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             out: &mut sink,
             err: &mut err,
             style,
-        };
-        welcome::on_first_run(
-            &mut streams,
             fmt,
-            &paths.home,
-            std::io::stderr().is_terminal(),
-        );
+        };
+        welcome::on_first_run(&mut streams, &paths.home, std::io::stderr().is_terminal());
     }
 
     // `dog` is a re-exec target like `daemon` — long-lived until signalled —
@@ -888,9 +883,10 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             out: &mut out,
             err: &mut err,
             style,
+            fmt,
         };
-        return match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => bleats::bleats(&client, &mut streams, fmt, cli.global.quiet, args).await,
+        return match connect_client(&mut streams, &paths).await {
+            Ok(client) => bleats::bleats(&client, &mut streams, cli.global.quiet, args).await,
             Err(code) => code,
         };
     }
@@ -906,8 +902,9 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             out: &mut out,
             err: &mut err,
             style,
+            fmt,
         };
-        return lookout::lookout(&mut streams, fmt, &paths, args).await;
+        return lookout::lookout(&mut streams, &paths, args).await;
     }
 
     // Not in the locked block below, for the reason `lookout`'s own comment
@@ -923,8 +920,9 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             out: &mut out,
             err: &mut err,
             style,
+            fmt,
         };
-        return serve_command(&mut streams, fmt, &paths, args).await;
+        return serve_command(&mut streams, &paths, args).await;
     }
 
     // Not in the locked block below, for the same reason as `daemon`,
@@ -940,8 +938,9 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             out: &mut out,
             err: &mut err,
             style,
+            fmt,
         };
-        return runtime::runtime(&mut streams, fmt, cli.global.quiet, paths, args).await;
+        return runtime::runtime(&mut streams, cli.global.quiet, paths, args).await;
     }
 
     // Not in the locked block below, and it takes NO `Streams` at all. This
@@ -961,6 +960,7 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
         out: &mut out,
         err: &mut err,
         style,
+        fmt,
     };
 
     match cli.command {
@@ -969,7 +969,7 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
         // the fresh machine it exists to greet.
         Commands::Welcome => {
             let shepherd = status::ShepherdStatus::probe(&paths).await;
-            let code = welcome::welcome(&mut streams, fmt, &paths.home);
+            let code = welcome::welcome(&mut streams, &paths.home);
             // After the text, not before: the welcome ends on "shep welcome
             // shows this again", and the status is the one line that changes
             // between runs.
@@ -989,7 +989,7 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             None => {
                 let (level, source) = resolve_style(&cli.global);
                 let message = format!("{level} (from {source})");
-                let _ = output::emit_notice(&mut *streams.out, fmt, "style", &message);
+                streams.note("style", &message);
                 ExitCode::Success
             }
             // A level turns this from a report into a write. Config
@@ -1014,13 +1014,7 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                             ExitCode::InvalidConfig
                         }
                     };
-                    let _ = output::emit_error(
-                        &mut *streams.err,
-                        fmt,
-                        code.code_str(),
-                        &err.to_string(),
-                    );
-                    return code;
+                    return streams.fail(code, &err.to_string());
                 }
                 // Re-resolves for the same reason the no-arg branch does:
                 // this is what tells the operator whether the value just
@@ -1039,7 +1033,7 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                 } else {
                     format!("wrote {level} to {path}")
                 };
-                let _ = output::emit_notice(&mut *streams.out, fmt, "style", &message);
+                streams.note("style", &message);
                 ExitCode::Success
             }
         },
@@ -1056,16 +1050,15 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                 None
             };
             if args.targets.is_empty() && discovered.is_none() {
-                return start_bare_shepherd(&mut streams, fmt, &paths).await;
+                return start_bare_shepherd(&mut streams, &paths).await;
             }
             let shep_toml_text = std::fs::read_to_string(&paths.daemon_config).ok();
             let interpreters = interpreters_from_config(shep_toml_text.as_deref());
-            match connect_or_spawn_client(&mut streams, fmt, &paths).await {
+            match connect_or_spawn_client(&mut streams, &paths).await {
                 Ok(client) => {
                     lifecycle::start(
                         &client,
                         &mut streams,
-                        fmt,
                         args,
                         discovered.as_deref(),
                         &interpreters,
@@ -1076,37 +1069,37 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             }
         }
         Commands::Stop(ref args) | Commands::Thatlldo(ref args) => {
-            match connect_client(&mut streams, fmt, &paths).await {
-                Ok(client) => lifecycle::stop(&client, &mut streams, fmt, args).await,
+            match connect_client(&mut streams, &paths).await {
+                Ok(client) => lifecycle::stop(&client, &mut streams, args).await,
                 Err(code) => code,
             }
         }
-        Commands::Restart(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => lifecycle::restart(&client, &mut streams, fmt, args).await,
+        Commands::Restart(ref args) => match connect_client(&mut streams, &paths).await {
+            Ok(client) => lifecycle::restart(&client, &mut streams, args).await,
             Err(code) => code,
         },
-        Commands::Reload(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => lifecycle::reload(&client, &mut streams, fmt, args).await,
+        Commands::Reload(ref args) => match connect_client(&mut streams, &paths).await {
+            Ok(client) => lifecycle::reload(&client, &mut streams, args).await,
             Err(code) => code,
         },
-        Commands::Delete(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => lifecycle::delete(&client, &mut streams, fmt, args).await,
+        Commands::Delete(ref args) => match connect_client(&mut streams, &paths).await {
+            Ok(client) => lifecycle::delete(&client, &mut streams, args).await,
             Err(code) => code,
         },
-        Commands::Stock(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => lifecycle::stock(&client, &mut streams, fmt, args).await,
+        Commands::Stock(ref args) => match connect_client(&mut streams, &paths).await {
+            Ok(client) => lifecycle::stock(&client, &mut streams, args).await,
             Err(code) => code,
         },
-        Commands::Trigger(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => trigger::trigger(&client, &mut streams, fmt, args).await,
+        Commands::Trigger(ref args) => match connect_client(&mut streams, &paths).await {
+            Ok(client) => trigger::trigger(&client, &mut streams, args).await,
             Err(code) => code,
         },
-        Commands::Signal(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => signal::signal(&client, &mut streams, fmt, args).await,
+        Commands::Signal(ref args) => match connect_client(&mut streams, &paths).await {
+            Ok(client) => signal::signal(&client, &mut streams, args).await,
             Err(code) => code,
         },
-        Commands::Whisper(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => whisper::whisper(&client, &mut streams, fmt, args).await,
+        Commands::Whisper(ref args) => match connect_client(&mut streams, &paths).await {
+            Ok(client) => whisper::whisper(&client, &mut streams, args).await,
             Err(code) => code,
         },
         // Falls back to the muster roll rather than refusing: looking at
@@ -1119,24 +1112,22 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
         // machine output should not have to tell a real listing apart from a
         // consolation prize. So JSON keeps the refusal, humans get the roll.
         Commands::Flock => match Client::connect(&paths.socket).await {
-            Ok(client) => query::flock(&client, &mut streams, fmt).await,
-            Err(_) if fmt == Format::Json => {
-                match connect_client(&mut streams, fmt, &paths).await {
-                    Ok(client) => query::flock(&client, &mut streams, fmt).await,
-                    Err(code) => code,
-                }
-            }
-            Err(_) => query::flock_from_roll(&mut streams, fmt, &paths),
+            Ok(client) => query::flock(&client, &mut streams).await,
+            Err(_) if fmt == Format::Json => match connect_client(&mut streams, &paths).await {
+                Ok(client) => query::flock(&client, &mut streams).await,
+                Err(code) => code,
+            },
+            Err(_) => query::flock_from_roll(&mut streams, &paths),
         },
         // The guard arm is what makes `--available` work with no shepherd
         // running at all: it never reaches `connect_client`, so a
         // community-index listing does not fail on a `$SHEP_HOME` where no
         // daemon was ever started.
         Commands::Dogs(ref args) if args.available => {
-            query::available_dogs(&mut streams, fmt, args).await
+            query::available_dogs(&mut streams, args).await
         }
-        Commands::Dogs(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => query::dogs(&client, &mut streams, fmt, args).await,
+        Commands::Dogs(ref args) => match connect_client(&mut streams, &paths).await {
+            Ok(client) => query::dogs(&client, &mut streams, args).await,
             Err(code) => code,
         },
         // None of the four goes through `connect_client`/
@@ -1155,7 +1146,6 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             Some(path) => {
                 dogs::adopt(
                     &mut streams,
-                    fmt,
                     &paths,
                     &AdoptArgs {
                         name: args.name.clone(),
@@ -1164,17 +1154,17 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                 )
                 .await
             }
-            None => dogs::enable(&mut streams, fmt, &paths, &args.name).await,
+            None => dogs::enable(&mut streams, &paths, &args.name).await,
         },
-        Commands::Disable(ref args) => dogs::disable(&mut streams, fmt, &paths, &args.name).await,
-        Commands::Adopt(ref args) => dogs::adopt(&mut streams, fmt, &paths, args).await,
-        Commands::Rehome(ref args) => dogs::rehome(&mut streams, fmt, &paths, &args.name).await,
-        Commands::Describe(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => query::describe(&client, &mut streams, fmt, args).await,
+        Commands::Disable(ref args) => dogs::disable(&mut streams, &paths, &args.name).await,
+        Commands::Adopt(ref args) => dogs::adopt(&mut streams, &paths, args).await,
+        Commands::Rehome(ref args) => dogs::rehome(&mut streams, &paths, &args.name).await,
+        Commands::Describe(ref args) => match connect_client(&mut streams, &paths).await {
+            Ok(client) => query::describe(&client, &mut streams, args).await,
             Err(code) => code,
         },
-        Commands::Fold(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => query::fold(&client, &mut streams, fmt, args).await,
+        Commands::Fold(ref args) => match connect_client(&mut streams, &paths).await {
+            Ok(client) => query::fold(&client, &mut streams, args).await,
             Err(code) => code,
         },
         // Not `connect_client`: a verb whose whole job is reporting whether
@@ -1183,22 +1173,22 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
         // `shep ping && echo up` still works.
         Commands::Ping => {
             let status = status::ShepherdStatus::probe(&paths).await;
-            status::render_ping(&mut streams, fmt, &status)
+            status::render_ping(&mut streams, &status)
         }
         // `connect_client`, not `connect_or_spawn_client`: saving the roll
         // of a daemon that is not running is not a thing, and autostarting
         // one to save an empty flock would overwrite a good roll with an
         // empty one.
-        Commands::Save => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => muster::save(&client, &mut streams, fmt).await,
+        Commands::Save => match connect_client(&mut streams, &paths).await {
+            Ok(client) => muster::save(&client, &mut streams).await,
             Err(code) => code,
         },
-        Commands::Muster => match connect_or_spawn_client(&mut streams, fmt, &paths).await {
-            Ok(client) => muster::muster(&client, &mut streams, fmt).await,
+        Commands::Muster => match connect_or_spawn_client(&mut streams, &paths).await {
+            Ok(client) => muster::muster(&client, &mut streams).await,
             Err(code) => code,
         },
-        Commands::Reopen(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => logs::reopen(&client, &mut streams, fmt, args).await,
+        Commands::Reopen(ref args) => match connect_client(&mut streams, &paths).await {
+            Ok(client) => logs::reopen(&client, &mut streams, args).await,
             Err(code) => code,
         },
         // The one verb with two targets, and the only arm that can finish
@@ -1208,31 +1198,31 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
         // than an optimisation — a wedged or stopped shepherd is exactly when
         // an operator reaches for this, and `connect_client` never autostarts
         // one to be told to do nothing.
-        Commands::Flush(ref args) if args.daemon => logs::flush_daemon(&mut streams, fmt, &paths),
-        Commands::Flush(ref args) => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => logs::flush(&client, &mut streams, fmt, args).await,
+        Commands::Flush(ref args) if args.daemon => logs::flush_daemon(&mut streams, &paths),
+        Commands::Flush(ref args) => match connect_client(&mut streams, &paths).await {
+            Ok(client) => logs::flush(&client, &mut streams, args).await,
             Err(code) => code,
         },
         // Reads a file and writes nothing; starts nothing, so — like
         // `--daemon`'s own arm just above — there is nothing to ask the
         // socket. The history is on disk precisely so it survives the
         // shepherd (`commands::dogs`' own module doc on this verb).
-        Commands::Barks(ref args) => dogs::barks(&mut streams, fmt, &paths, args),
+        Commands::Barks(ref args) => dogs::barks(&mut streams, &paths, args),
         // Reads and writes `kv.json` directly and never connects to the
         // shepherd — `commands::kv`'s own module doc gives the reasoning,
         // shared with `Barks` just above.
-        Commands::Set(ref args) => kv::set(&mut streams, fmt, &paths, args),
-        Commands::Get(ref args) => kv::get(&mut streams, fmt, &paths, args),
-        Commands::Unset(ref args) => kv::unset(&mut streams, fmt, &paths, args),
-        Commands::Kill => match connect_client(&mut streams, fmt, &paths).await {
-            Ok(client) => admin::kill(client, &mut streams, fmt).await,
+        Commands::Set(ref args) => kv::set(&mut streams, &paths, args),
+        Commands::Get(ref args) => kv::get(&mut streams, &paths, args),
+        Commands::Unset(ref args) => kv::unset(&mut streams, &paths, args),
+        Commands::Kill => match connect_client(&mut streams, &paths).await {
+            Ok(client) => admin::kill(client, &mut streams).await,
             Err(code) => code,
         },
-        Commands::Init(ref args) => init::init(&mut streams, fmt, args).await,
+        Commands::Init(ref args) => init::init(&mut streams, args).await,
         // Reads a file and writes a file; starts nothing, so there is
         // nothing to ask the socket. `logs::flush_daemon` is the other arm
         // that finishes without a client.
-        Commands::Import(ref args) => import::import(&mut streams, fmt, args),
+        Commands::Import(ref args) => import::import(&mut streams, args),
         Commands::Completions(_)
         | Commands::Daemon(_)
         | Commands::Startup(_)
@@ -1287,7 +1277,6 @@ fn emit_error_locked(fmt: Format, code: ExitCode, message: &str) {
 #[cfg(unix)]
 async fn connect_or_spawn_client(
     streams: &mut Streams<'_>,
-    fmt: Format,
     paths: &ShepPaths,
 ) -> Result<Client, ExitCode> {
     let launch_paths = paths.clone();
@@ -1295,8 +1284,7 @@ async fn connect_or_spawn_client(
         Ok(SpawnOutcome::Connected(client) | SpawnOutcome::Spawned(client)) => Ok(client),
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = output::emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            Err(code)
+            Err(streams.fail(code, &err.to_string()))
         }
     }
 }
@@ -1312,21 +1300,17 @@ async fn connect_or_spawn_client(
 /// Reports rather than re-boots when one is already up, because typing
 /// `shep start` twice should say what happened, not silently do nothing.
 #[cfg(unix)]
-async fn start_bare_shepherd(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    paths: &ShepPaths,
-) -> ExitCode {
+async fn start_bare_shepherd(streams: &mut Streams<'_>, paths: &ShepPaths) -> ExitCode {
     let before = status::ShepherdStatus::probe(paths).await;
     if let Some(online) = &before.online {
         let message = format!(
             "shepherd already up (pid {}). `shep start <target>` adds a sheep.",
             online.pid
         );
-        let _ = output::emit_notice(&mut *streams.out, fmt, "start", &message);
+        streams.note("start", &message);
         return ExitCode::Success;
     }
-    match connect_or_spawn_client(streams, fmt, paths).await {
+    match connect_or_spawn_client(streams, paths).await {
         Ok(client) => {
             // Asked after the boot, not before: bringing the shepherd up
             // restores the muster roll, so a flock that looked empty a
@@ -1353,7 +1337,7 @@ async fn start_bare_shepherd(
                     paths.home.display()
                 )
             };
-            let _ = output::emit_notice(&mut *streams.out, fmt, "start", &message);
+            streams.note("start", &message);
             ExitCode::Success
         }
         Err(code) => code,
@@ -1399,22 +1383,12 @@ fn unreachable_message(err: &shep_client::ConnectError) -> String {
 /// Connects to the daemon at `paths.socket`. Never autostarts — see
 /// [`run`]'s own doc for why that matters.
 #[cfg(unix)]
-async fn connect_client(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    paths: &ShepPaths,
-) -> Result<Client, ExitCode> {
+async fn connect_client(streams: &mut Streams<'_>, paths: &ShepPaths) -> Result<Client, ExitCode> {
     match Client::connect(&paths.socket).await {
         Ok(client) => Ok(client),
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = output::emit_error(
-                &mut *streams.err,
-                fmt,
-                code.code_str(),
-                &unreachable_message(&err),
-            );
-            Err(code)
+            Err(streams.fail(code, &unreachable_message(&err)))
         }
     }
 }
@@ -1479,22 +1453,13 @@ async fn run_daemon_command(fmt: Format, global: &GlobalArgs, args: &DaemonArgs)
 async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
-    // No `mut` on `streams` here (unlike the unix arm): this arm only ever
-    // reborrows through the already-`&mut` `err` field, and never takes
-    // `&mut streams` on the struct itself, so the binding needs no
-    // mutability of its own.
-    let streams = Streams {
+    let mut streams = Streams {
         out: &mut out,
         err: &mut err,
         style,
+        fmt: cli.global.format,
     };
-    let _ = output::emit_error(
-        &mut *streams.err,
-        cli.global.format,
-        ExitCode::Failure.code_str(),
-        "shep does not yet support Windows",
-    );
-    ExitCode::Failure
+    streams.fail(ExitCode::Failure, "shep does not yet support Windows")
 }
 
 #[cfg(test)]

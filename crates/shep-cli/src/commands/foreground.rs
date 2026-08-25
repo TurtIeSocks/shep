@@ -12,12 +12,12 @@ use shep_core::config::AppConfig;
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{Request, Response, SelectorSpec};
 
-use crate::cli::{BleatsArgs, DaemonArgs, Format};
+use crate::cli::{BleatsArgs, DaemonArgs};
 use crate::commands::bleats::bleats_with_signal;
 use crate::commands::daemon::{boot_supervisor, daemon_exit_code};
 use crate::commands::empty::{Sample, sample, watch_until_empty};
 use crate::exit::ExitCode;
-use crate::output::{Streams, emit_error};
+use crate::output::Streams;
 
 /// What the foreground engine should do, for the two verbs that use it.
 pub struct ForegroundOptions {
@@ -71,12 +71,7 @@ enum Ending {
 /// supervisor's own logging writes from a tokio worker thread, in this same
 /// process. `daemon`, `bleats` and `lookout` are the existing three verbs
 /// this applies to; `runtime` and `dev` make five.
-pub async fn run(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    quiet: bool,
-    options: ForegroundOptions,
-) -> ExitCode {
+pub async fn run(streams: &mut Streams<'_>, quiet: bool, options: ForegroundOptions) -> ExitCode {
     let ForegroundOptions {
         paths,
         apps,
@@ -112,8 +107,7 @@ pub async fn run(
             // while another is up, is exactly "another shepherd already
             // holds this `$SHEP_HOME`".
             let code = daemon_exit_code(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            return code;
+            return streams.fail(code, &err.to_string());
         }
     };
 
@@ -126,8 +120,7 @@ pub async fn run(
         Err(err) => {
             supervisor.abort();
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            return code;
+            return streams.fail(code, &err.to_string());
         }
     };
 
@@ -136,7 +129,7 @@ pub async fn run(
         .await
     {
         let code = ExitCode::from(&err);
-        let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
+        streams.fail(code, &err.to_string());
         let _ = client.request(Request::KillDaemon).await;
         let _ = supervisor.await;
         return code;
@@ -179,7 +172,6 @@ pub async fn run(
         bleats_with_signal(
             &client,
             streams,
-            fmt,
             quiet,
             &BleatsArgs {
                 selector: "all".to_string(),

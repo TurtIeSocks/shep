@@ -12,9 +12,8 @@ use std::time::{Duration, Instant};
 use shep_client::Client;
 use shep_core::protocol::{Request, Response};
 
-use crate::cli::Format;
 use crate::exit::ExitCode;
-use crate::output::{KillRow, Streams, emit, emit_error, write_outcome};
+use crate::output::{KillRow, Streams, emit, write_outcome};
 
 /// How long `kill` waits for the socket file to disappear after the daemon
 /// acknowledges shutdown. `RunningDaemon::run` unlinks it as its last step
@@ -40,8 +39,8 @@ const KILL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 ///
 /// Delegates to [`kill_with_wait`] with [`KILL_TEARDOWN_WAIT`]. Production's
 /// only call site; see that function's own doc for the full contract.
-pub async fn kill(client: Client, streams: &mut Streams<'_>, fmt: Format) -> ExitCode {
-    kill_with_wait(client, streams, fmt, KILL_TEARDOWN_WAIT).await
+pub async fn kill(client: Client, streams: &mut Streams<'_>) -> ExitCode {
+    kill_with_wait(client, streams, KILL_TEARDOWN_WAIT).await
 }
 
 /// As [`kill`], but with a caller-chosen teardown wait — the same
@@ -67,12 +66,7 @@ pub async fn kill(client: Client, streams: &mut Streams<'_>, fmt: Format) -> Exi
 /// deliberately undefended: nothing starts a daemon between the two
 /// statements above, and the loser of any such race exits 10, so there is
 /// nothing here for a defense to protect against.
-pub async fn kill_with_wait(
-    client: Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    wait: Duration,
-) -> ExitCode {
+pub async fn kill_with_wait(client: Client, streams: &mut Streams<'_>, wait: Duration) -> ExitCode {
     let socket = client.socket().to_path_buf();
     let pid = client.daemon().pid;
 
@@ -84,7 +78,7 @@ pub async fn kill_with_wait(
             if wait_for_socket_to_disappear(&socket, wait).await {
                 write_outcome(emit(
                     &mut *streams.out,
-                    fmt,
+                    streams.fmt,
                     "kill",
                     KillRow {
                         pid,
@@ -94,29 +88,16 @@ pub async fn kill_with_wait(
                 ))
             } else {
                 let message = "the daemon acknowledged shutdown, but teardown is still in progress";
-                let _ = emit_error(
-                    &mut *streams.err,
-                    fmt,
-                    ExitCode::DeadlineExceeded.code_str(),
-                    message,
-                );
-                ExitCode::DeadlineExceeded
+                streams.fail(ExitCode::DeadlineExceeded, message)
             }
         }
         Ok(_) => {
             let message = "the daemon answered with a response this client does not understand";
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Internal.code_str(),
-                message,
-            );
-            ExitCode::Internal
+            streams.fail(ExitCode::Internal, message)
         }
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
@@ -163,8 +144,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            kill(client, &mut streams, Format::Table).await
+            kill(client, &mut streams).await
         };
         assert_eq!(code, ExitCode::Success);
         assert!(
@@ -190,14 +172,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            kill_with_wait(
-                client,
-                &mut streams,
-                Format::Table,
-                Duration::from_millis(80),
-            )
-            .await
+            kill_with_wait(client, &mut streams, Duration::from_millis(80)).await
         };
         assert_eq!(code, ExitCode::DeadlineExceeded);
         assert!(

@@ -117,11 +117,47 @@ pub struct Streams<'a> {
     /// automatically: `Streams` holds `&mut dyn io::Write`, which is not
     /// `Default`, so every field is always named at the call site regardless.
     pub style: Presentation,
+    /// How this invocation renders: a table for a person, or JSON for a
+    /// script.
+    ///
+    /// Carried here for the reason `style` is, one field up: it reaches
+    /// every command already, and all 84 functions that took a `Streams`
+    /// also took a `Format` beside it. Nothing in production ever passed a
+    /// different one, so nothing loses an override it was using.
+    pub fmt: Format,
 }
 
 impl std::fmt::Debug for Streams<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Streams").finish_non_exhaustive()
+    }
+}
+
+impl Streams<'_> {
+    /// Prints `message` as an error, and hands back the code it printed.
+    ///
+    /// Returning the code is what lets a caller write
+    /// `return streams.fail(ExitCode::Usage, &message)` rather than naming
+    /// the code twice and risking the two drifting apart.
+    ///
+    /// The write's own failure is discarded, deliberately: a closed stderr
+    /// must not change what shep exits with. That was the decision at all
+    /// 91 call sites this replaces, and it is made once here instead.
+    pub fn fail(&mut self, code: ExitCode, message: &str) -> ExitCode {
+        let _ = emit_error(&mut *self.err, self.fmt, code.code_str(), message);
+        code
+    }
+
+    /// Prints `message` as a notice, on stdout.
+    ///
+    /// Discards its write's failure for the same reason [`Self::fail`] does.
+    /// Stdout only: a real minority of notices belong on stderr instead (a
+    /// warning beside a separate primary output, like `init`'s shadowed-file
+    /// notice), and those call [`emit_notice`] directly with `streams.err` —
+    /// see that function's own doc for the full rule. This method exists for
+    /// the majority shape, a notice that IS the command's whole answer.
+    pub fn note(&mut self, code: &str, message: &str) {
+        let _ = emit_notice(&mut *self.out, self.fmt, code, message);
     }
 }
 
@@ -892,6 +928,7 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
         assert_eq!(format!("{streams:?}"), "Streams { .. }");
     }
