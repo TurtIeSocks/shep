@@ -144,6 +144,18 @@ impl core::error::Error for BarkError {
     }
 }
 
+impl From<std::io::Error> for BarkError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Io(source)
+    }
+}
+
+impl From<serde_json::Error> for BarkError {
+    fn from(source: serde_json::Error) -> Self {
+        Self::Encode(source)
+    }
+}
+
 /// Appends `bark` to `path`, evicting oldest-first to keep the file under
 /// `max_bytes`.
 ///
@@ -168,10 +180,10 @@ pub fn append(path: &Path, bark: &Bark, max_bytes: u64) -> Result<(), BarkError>
     // Held until this function returns, so the read below and the rename
     // at the end are one transaction as far as any other writer is
     // concerned — see [`RingLock`] for why the lock is not on `path`.
-    let _lock = RingLock::acquire(path).map_err(BarkError::Io)?;
+    let _lock = RingLock::acquire(path)?;
 
     let mut lines = read_lines(path)?;
-    let new_line = serde_json::to_string(bark).map_err(BarkError::Encode)?;
+    let new_line = serde_json::to_string(bark)?;
     lines.push(new_line);
 
     // Oldest-out: drop the front line until the ring fits under the cap,
@@ -247,13 +259,13 @@ fn ring_bytes(lines: &[String]) -> u64 {
 /// reaches `write_ring` by another route.
 fn write_ring(path: &Path, lines: &[String]) -> Result<(), BarkError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = create_ring_file(parent).map_err(BarkError::Io)?;
+    let mut tmp = create_ring_file(parent)?;
 
     for line in lines {
-        tmp.write_all(line.as_bytes()).map_err(BarkError::Io)?;
-        tmp.write_all(b"\n").map_err(BarkError::Io)?;
+        tmp.write_all(line.as_bytes())?;
+        tmp.write_all(b"\n")?;
     }
-    tmp.as_file().sync_all().map_err(BarkError::Io)?;
+    tmp.as_file().sync_all()?;
 
     // `persist` is `rename(2)`. On failure the `NamedTempFile` comes back
     // inside the error and its `Drop` removes the staging file, so a

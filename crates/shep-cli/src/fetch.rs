@@ -207,6 +207,12 @@ impl core::error::Error for FetchError {
     }
 }
 
+impl From<std::io::Error> for FetchError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Transport(source)
+    }
+}
+
 /// Parses `url` into a [`Target`] naming where [`get`] should connect.
 ///
 /// Hand-rolled rather than pulled from a `url` crate, same reasoning as
@@ -294,9 +300,7 @@ pub async fn get(target: &Target, limit: usize, timeout: Duration) -> Result<Vec
 /// `sinks.rs`'s own `deliver_inner`, aimed at a GET instead of a POST.
 async fn get_inner(target: &Target, limit: usize) -> Result<Vec<u8>, FetchError> {
     let request = build_get_request(target);
-    let tcp = TcpStream::connect((target.host.as_str(), target.port))
-        .await
-        .map_err(FetchError::Transport)?;
+    let tcp = TcpStream::connect((target.host.as_str(), target.port)).await?;
     if target.https {
         let domain = ServerName::try_from(target.host.clone())
             .map_err(|source| FetchError::Transport(std::io::Error::other(source)))?;
@@ -362,11 +366,8 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     request: &str,
     limit: usize,
 ) -> Result<Vec<u8>, FetchError> {
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .map_err(FetchError::Transport)?;
-    stream.flush().await.map_err(FetchError::Transport)?;
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
     read_response(stream, limit).await
 }
 
@@ -386,10 +387,7 @@ async fn read_response<S: AsyncRead + Unpin>(
     let mut headers = BufReader::new(stream).take(MAX_HEADER_BYTES as u64);
 
     let mut status_line = String::new();
-    headers
-        .read_line(&mut status_line)
-        .await
-        .map_err(FetchError::Transport)?;
+    headers.read_line(&mut status_line).await?;
     let code = parse_status_line(&status_line)?;
 
     let mut location: Option<String> = None;
@@ -404,10 +402,7 @@ async fn read_response<S: AsyncRead + Unpin>(
 
     loop {
         let mut line = String::new();
-        let read = headers
-            .read_line(&mut line)
-            .await
-            .map_err(FetchError::Transport)?;
+        let read = headers.read_line(&mut line).await?;
         if read == 0 {
             if headers.limit() == 0 {
                 return Err(FetchError::HeadersTooLarge {
@@ -493,10 +488,7 @@ async fn read_response<S: AsyncRead + Unpin>(
     let mut body = vec![0u8; expected];
     let mut filled = 0;
     while filled < expected {
-        let read = reader
-            .read(&mut body[filled..])
-            .await
-            .map_err(FetchError::Transport)?;
+        let read = reader.read(&mut body[filled..]).await?;
         if read == 0 {
             return Err(FetchError::Truncated {
                 expected,

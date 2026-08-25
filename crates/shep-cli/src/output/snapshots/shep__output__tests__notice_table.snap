@@ -1,0 +1,5 @@
+---
+source: crates/shep-cli/src/output/mod.rs
+expression: "String::from_utf8(out).unwrap()"
+---
+notice[init]: wrote /tmp/x/Flockfile.toml

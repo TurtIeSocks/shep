@@ -27,20 +27,15 @@ use shep_client::Client;
 use shep_core::protocol::{Request, Response, SelectorSpec};
 use shep_core::signals::OperatorSignal;
 
-use crate::cli::{Format, SignalArgs};
+use crate::cli::SignalArgs;
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
-use crate::output::{SignalledRows, Streams, emit, emit_error, write_outcome};
+use crate::output::{SignalledRows, Streams, emit, write_outcome};
 
 /// Sends `args.signal` to the sheep matching `args.selector`, and renders one
 /// row per match.
-pub async fn signal(
-    client: &Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    args: &SignalArgs,
-) -> ExitCode {
-    let selector = match parse_selector(streams, fmt, &args.selector) {
+pub async fn signal(client: &Client, streams: &mut Streams<'_>, args: &SignalArgs) -> ExitCode {
+    let selector = match parse_selector(streams, &args.selector) {
         Ok(selector) => SelectorSpec::from(&selector),
         Err(code) => return code,
     };
@@ -51,8 +46,7 @@ pub async fn signal(
             args.signal,
             OperatorSignal::ACCEPTED.join(", ")
         );
-        let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), &message);
-        return ExitCode::Usage;
+        return streams.fail(ExitCode::Usage, &message);
     };
 
     let body = Request::Signal {
@@ -66,25 +60,18 @@ pub async fn signal(
     match client.request(body).await {
         Ok(Response::Signalled(replies)) => write_outcome(emit(
             &mut *streams.out,
-            fmt,
+            streams.fmt,
             "signal",
             SignalledRows(replies),
             streams.style,
         )),
         Ok(_unrecognised) => {
             let message = "the daemon answered with a response this client does not understand";
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Internal.code_str(),
-                message,
-            );
-            ExitCode::Internal
+            streams.fail(ExitCode::Internal, message)
         }
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
@@ -95,6 +82,7 @@ mod tests {
     use shep_core::protocol::RpcErrorCode;
 
     use super::*;
+    use crate::cli::Format;
 
     fn args(selector: &str, signal: &str) -> SignalArgs {
         SignalArgs {
@@ -121,8 +109,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            signal(&client, &mut streams, Format::Table, &args("/[/", "hup")).await
+            signal(&client, &mut streams, &args("/[/", "hup")).await
         };
         assert_eq!(code, ExitCode::Usage);
         assert!(
@@ -145,14 +134,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            signal(
-                &client,
-                &mut streams,
-                Format::Table,
-                &args("web", "SIGHUPP"),
-            )
-            .await
+            signal(&client, &mut streams, &args("web", "SIGHUPP")).await
         };
         assert_eq!(code, ExitCode::Usage);
         assert!(
@@ -179,14 +163,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            signal(
-                &client,
-                &mut streams,
-                Format::Table,
-                &args("nonexistent", "hup"),
-            )
-            .await
+            signal(&client, &mut streams, &args("nonexistent", "hup")).await
         };
         assert_eq!(code, ExitCode::NotFound);
         assert!(out.is_empty());
@@ -208,8 +187,9 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
-        let _ = signal(&client, &mut streams, Format::Table, &args("web", "hup")).await;
+        let _ = signal(&client, &mut streams, &args("web", "hup")).await;
 
         let envelope = envelopes.recv().await.unwrap();
         assert_eq!(
@@ -238,8 +218,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            signal(&client, &mut streams, Format::Table, &args("web", "hup")).await
+            signal(&client, &mut streams, &args("web", "hup")).await
         };
         assert_eq!(code, ExitCode::Internal);
         assert!(out.is_empty());

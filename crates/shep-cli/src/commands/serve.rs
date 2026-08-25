@@ -25,9 +25,9 @@ use shep_core::config::AppConfig;
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{Request, Response};
 
-use crate::cli::{Format, ServeArgs};
+use crate::cli::ServeArgs;
 use crate::exit::ExitCode;
-use crate::output::{FlockRows, Render, Streams, emit, emit_error, emit_notice, write_outcome};
+use crate::output::{FlockRows, Render, Streams, emit, emit_notice, write_outcome};
 use crate::serve::auth::{self, AuthError, Credentials};
 use crate::serve::worker::{self, ServeConfig};
 
@@ -88,6 +88,12 @@ impl core::error::Error for ServeRefusal {
     }
 }
 
+impl From<AuthError> for ServeRefusal {
+    fn from(source: AuthError) -> Self {
+        Self::Auth(source)
+    }
+}
+
 /// The exit code a [`ServeRefusal`] reports — decision (Step 7.3): a bad
 /// `root` is a usage error, a bad `--auth` file or a missing SPA index is a
 /// config error.
@@ -101,15 +107,9 @@ fn refusal_exit_code(refusal: &ServeRefusal) -> ExitCode {
 }
 
 /// Renders `refusal` and returns the exit code it reports.
-fn fail(streams: &mut Streams<'_>, fmt: Format, refusal: &ServeRefusal) -> ExitCode {
+fn fail(streams: &mut Streams<'_>, refusal: &ServeRefusal) -> ExitCode {
     let code = refusal_exit_code(refusal);
-    let _ = emit_error(
-        &mut *streams.err,
-        fmt,
-        code.code_str(),
-        &refusal.to_string(),
-    );
-    code
+    streams.fail(code, &refusal.to_string())
 }
 
 /// Resolves and canonicalizes `root`, refusing it if it is missing or not a
@@ -140,7 +140,7 @@ fn validate_root(root: &Path) -> Result<PathBuf, ServeRefusal> {
 /// [`ServeRefusal::Auth`] if the file cannot be loaded or, having loaded,
 /// cannot be canonicalized.
 fn validate_auth(path: &Path) -> Result<(PathBuf, Credentials), ServeRefusal> {
-    let credentials = auth::load(path).map_err(ServeRefusal::Auth)?;
+    let credentials = auth::load(path)?;
     let canonical = std::fs::canonicalize(path).map_err(|source| {
         ServeRefusal::Auth(AuthError::Io {
             path: path.to_path_buf(),
@@ -195,8 +195,8 @@ fn follow_symlinks_notice(follow_symlinks: bool) -> Option<String> {
 /// [`emit_notice`] rather than [`emit_error`] — a notice's code is not part
 /// of [`ExitCode`]'s taxonomy, and a clean run reaching `--foreground`'s
 /// worker or a green registration can still emit one on its way there.
-fn print_notice(streams: &mut Streams<'_>, fmt: Format, code: &str, message: &str) {
-    let _ = emit_notice(&mut *streams.err, fmt, code, message);
+fn print_notice(streams: &mut Streams<'_>, code: &str, message: &str) {
+    let _ = emit_notice(&mut *streams.err, streams.fmt, code, message);
 }
 
 /// The sheep's own command line, rebuilt from the flags rather than from
@@ -274,34 +274,29 @@ fn default_name(root: &Path) -> String {
 /// Does every refusal and every notice once, for both halves, so
 /// `--foreground` and the registered sheep can never disagree about what is
 /// valid — see this module's own doc.
-pub async fn serve(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    paths: &ShepPaths,
-    args: &ServeArgs,
-) -> ExitCode {
+pub async fn serve(streams: &mut Streams<'_>, paths: &ShepPaths, args: &ServeArgs) -> ExitCode {
     let root = match validate_root(&args.root) {
         Ok(root) => root,
-        Err(refusal) => return fail(streams, fmt, &refusal),
+        Err(refusal) => return fail(streams, &refusal),
     };
 
     let auth = match args.auth.as_deref() {
         Some(path) => match validate_auth(path) {
             Ok(auth) => Some(auth),
-            Err(refusal) => return fail(streams, fmt, &refusal),
+            Err(refusal) => return fail(streams, &refusal),
         },
         None => None,
     };
 
     if args.spa && !root.join("index.html").is_file() {
-        return fail(streams, fmt, &ServeRefusal::MissingSpaIndex { root });
+        return fail(streams, &ServeRefusal::MissingSpaIndex { root });
     }
 
     if let Some(notice) = exposure_notice(args.bind, auth.is_some(), &root) {
-        print_notice(streams, fmt, "exposure", &notice);
+        print_notice(streams, "exposure", &notice);
     }
     if let Some(notice) = follow_symlinks_notice(args.follow_symlinks) {
-        print_notice(streams, fmt, "follow_symlinks", &notice);
+        print_notice(streams, "follow_symlinks", &notice);
     }
 
     if args.foreground {
@@ -320,7 +315,6 @@ pub async fn serve(
 
     register(
         streams,
-        fmt,
         paths,
         &root,
         auth.as_ref().map(|(path, _)| path.as_path()),
@@ -335,7 +329,6 @@ pub async fn serve(
 /// sheep against a dead shepherd means bringing one up first.
 async fn register(
     streams: &mut Streams<'_>,
-    fmt: Format,
     paths: &ShepPaths,
     root: &Path,
     auth: Option<&Path>,
@@ -345,13 +338,7 @@ async fn register(
         Ok(exe) => exe,
         Err(source) => {
             let message = format!("could not resolve this binary's own path: {source}");
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Failure.code_str(),
-                &message,
-            );
-            return ExitCode::Failure;
+            return streams.fail(ExitCode::Failure, &message);
         }
     };
 
@@ -360,7 +347,7 @@ async fn register(
     app.args = sheep_args(root, auth, args);
     app.fold.clone_from(&args.fold);
 
-    let client = match crate::connect_or_spawn_client(streams, fmt, paths).await {
+    let client = match crate::connect_or_spawn_client(streams, paths).await {
         Ok(client) => client,
         Err(code) => return code,
     };
@@ -368,7 +355,6 @@ async fn register(
     request_and_render(
         &client,
         streams,
-        fmt,
         "serve",
         Request::Start { apps: vec![app] },
         Some(START_DEADLINE),
@@ -390,7 +376,6 @@ async fn register(
 async fn request_and_render<T, F>(
     client: &Client,
     streams: &mut Streams<'_>,
-    fmt: Format,
     command: &str,
     body: Request,
     deadline: Option<Duration>,
@@ -404,26 +389,19 @@ where
         Ok(response) => match extract(response) {
             Some(payload) => write_outcome(emit(
                 &mut *streams.out,
-                fmt,
+                streams.fmt,
                 command,
                 payload,
                 streams.style,
             )),
             None => {
                 let message = "the daemon answered with a response this client does not understand";
-                let _ = emit_error(
-                    &mut *streams.err,
-                    fmt,
-                    ExitCode::Internal.code_str(),
-                    message,
-                );
-                ExitCode::Internal
+                streams.fail(ExitCode::Internal, message)
             }
         },
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }

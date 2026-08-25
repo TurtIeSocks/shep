@@ -9,9 +9,8 @@
 
 use shep_core::selector::ProcessSelector;
 
-use crate::cli::Format;
 use crate::exit::ExitCode;
-use crate::output::{Streams, emit_error};
+use crate::output::Streams;
 
 /// Parses `raw` client-side, so a malformed selector is a fast local usage
 /// error rather than a round trip to the daemon (the daemon re-parses it
@@ -25,26 +24,18 @@ use crate::output::{Streams, emit_error};
 /// directly.
 pub(crate) fn parse_selector(
     streams: &mut Streams<'_>,
-    fmt: Format,
     raw: &str,
 ) -> Result<ProcessSelector, ExitCode> {
     match ProcessSelector::parse(raw) {
         Ok(selector) => Ok(selector),
-        Err(err) => {
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Usage.code_str(),
-                &err.to_string(),
-            );
-            Err(ExitCode::Usage)
-        }
+        Err(err) => Err(streams.fail(ExitCode::Usage, &err.to_string())),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::Format;
 
     #[test]
     fn a_well_formed_selector_parses_without_touching_streams() {
@@ -54,8 +45,9 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
-        let selector = parse_selector(&mut streams, Format::Table, "web").unwrap();
+        let selector = parse_selector(&mut streams, "web").unwrap();
         assert!(matches!(selector, ProcessSelector::Name(name) if name == "web"));
         assert!(out.is_empty());
         assert!(err.is_empty());
@@ -72,8 +64,9 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
-        let code = parse_selector(&mut streams, Format::Table, "/[/").unwrap_err();
+        let code = parse_selector(&mut streams, "/[/").unwrap_err();
         assert_eq!(code, ExitCode::Usage);
         assert!(out.is_empty(), "a usage error goes to stderr, not stdout");
         assert!(

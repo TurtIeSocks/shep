@@ -88,13 +88,8 @@ struct WelcomeData {
 /// here for the same reason [`crate::commands::daemon`]'s `ansi_enabled`
 /// takes one: a test writing into a `Vec` could not otherwise reach this
 /// branch.
-pub(crate) fn on_first_run(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    home: &Path,
-    stderr_is_terminal: bool,
-) {
-    if fmt == Format::Json || !stderr_is_terminal {
+pub(crate) fn on_first_run(streams: &mut Streams<'_>, home: &Path, stderr_is_terminal: bool) {
+    if streams.fmt == Format::Json || !stderr_is_terminal {
         return;
     }
     let _ = write!(streams.err, "{}", render(home));
@@ -106,9 +101,9 @@ pub(crate) fn on_first_run(
 /// *is* the command's output rather than a diagnostic. An explicit invocation
 /// outranks the side-effect path, so a `shep welcome` that also happens to
 /// create the home prints once, here.
-pub(crate) fn welcome(streams: &mut Streams<'_>, fmt: Format, home: &Path) -> ExitCode {
+pub(crate) fn welcome(streams: &mut Streams<'_>, home: &Path) -> ExitCode {
     let text = render(home);
-    let wrote = match fmt {
+    let wrote = match streams.fmt {
         Format::Table => write!(streams.out, "{text}"),
         Format::Json => {
             let envelope = OutputEnvelope {
@@ -194,8 +189,9 @@ Getting started
         );
     }
 
-    /// Runs `f` against buffered streams and hands back what each received.
-    fn drain(f: impl FnOnce(&mut Streams<'_>)) -> (String, String) {
+    /// Runs `f` against buffered streams rendering as `fmt`, and hands back
+    /// what each received.
+    fn drain(fmt: Format, f: impl FnOnce(&mut Streams<'_>)) -> (String, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
         {
@@ -203,6 +199,7 @@ Getting started
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt,
             };
             f(&mut streams);
         }
@@ -217,8 +214,8 @@ Getting started
     /// command the operator actually ran.
     #[test]
     fn the_first_run_welcome_goes_to_stderr() {
-        let (out, err) = drain(|s| {
-            on_first_run(s, Format::Table, Path::new("/home/rin/.shep"), true);
+        let (out, err) = drain(Format::Table, |s| {
+            on_first_run(s, Path::new("/home/rin/.shep"), true);
         });
         assert!(out.is_empty(), "stdout must stay clean: {out}");
         assert!(
@@ -231,13 +228,13 @@ Getting started
     /// input, and neither must a `--format json` consumer.
     #[test]
     fn the_first_run_welcome_is_suppressed_for_json_and_for_pipes() {
-        let (_, json) = drain(|s| {
-            on_first_run(s, Format::Json, Path::new("/x"), true);
+        let (_, json) = drain(Format::Json, |s| {
+            on_first_run(s, Path::new("/x"), true);
         });
         assert!(json.is_empty(), "--format json must suppress it: {json}");
 
-        let (_, piped) = drain(|s| {
-            on_first_run(s, Format::Table, Path::new("/x"), false);
+        let (_, piped) = drain(Format::Table, |s| {
+            on_first_run(s, Path::new("/x"), false);
         });
         assert!(
             piped.is_empty(),
@@ -249,8 +246,8 @@ Getting started
     /// goes to stdout and no terminal check applies.
     #[test]
     fn the_welcome_verb_prints_to_stdout_even_when_piped() {
-        let (out, err) = drain(|s| {
-            welcome(s, Format::Table, Path::new("/home/rin/.shep"));
+        let (out, err) = drain(Format::Table, |s| {
+            welcome(s, Path::new("/home/rin/.shep"));
         });
         assert!(
             out.contains("Getting started"),
@@ -263,8 +260,8 @@ Getting started
     /// this one, rather than printing nothing and looking broken.
     #[test]
     fn the_welcome_verb_answers_json_with_an_envelope() {
-        let (out, _) = drain(|s| {
-            welcome(s, Format::Json, Path::new("/home/rin/.shep"));
+        let (out, _) = drain(Format::Json, |s| {
+            welcome(s, Path::new("/home/rin/.shep"));
         });
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(parsed["command"], "welcome");

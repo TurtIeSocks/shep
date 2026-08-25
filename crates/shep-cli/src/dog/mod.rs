@@ -162,6 +162,18 @@ impl core::error::Error for DogRunError {
     }
 }
 
+impl From<ConnectError> for DogRunError {
+    fn from(source: ConnectError) -> Self {
+        Self::Connect(source)
+    }
+}
+
+impl From<RequestError> for DogRunError {
+    fn from(source: RequestError) -> Self {
+        Self::Request(source)
+    }
+}
+
 impl DogRuntime {
     /// Connects and fetches `name`'s section.
     ///
@@ -169,15 +181,12 @@ impl DogRuntime {
     /// - [`DogRunError::Connect`] — no shepherd answered at the socket.
     /// - [`DogRunError::Request`] — the shepherd refused the config request.
     pub async fn start(name: &str, paths: ShepPaths) -> Result<Self, DogRunError> {
-        let client = Client::connect(&paths.socket)
-            .await
-            .map_err(DogRunError::Connect)?;
+        let client = Client::connect(&paths.socket).await?;
         let response = client
             .request(Request::DogConfig {
                 name: name.to_string(),
             })
-            .await
-            .map_err(DogRunError::Request)?;
+            .await?;
         let Response::DogSection { toml } = response else {
             return Err(DogRunError::UnexpectedReply);
         };

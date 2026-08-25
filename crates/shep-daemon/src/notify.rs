@@ -104,10 +104,8 @@ pub fn notify(target: &OsStr) -> Result<(), NotifyError> {
     match target.as_bytes().strip_prefix(&[ABSTRACT_PREFIX]) {
         Some(name) => send_to_abstract(name),
         None => {
-            let socket = UnixDatagram::unbound().map_err(NotifyError::Io)?;
-            socket
-                .send_to(READY, Path::new(target))
-                .map_err(NotifyError::Io)?;
+            let socket = UnixDatagram::unbound()?;
+            socket.send_to(READY, Path::new(target))?;
             Ok(())
         }
     }
@@ -124,9 +122,9 @@ fn send_to_abstract(name: &[u8]) -> Result<(), NotifyError> {
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::SocketAddr;
 
-    let addr = SocketAddr::from_abstract_name(name).map_err(NotifyError::Io)?;
-    let socket = UnixDatagram::unbound().map_err(NotifyError::Io)?;
-    socket.send_to_addr(READY, &addr).map_err(NotifyError::Io)?;
+    let addr = SocketAddr::from_abstract_name(name)?;
+    let socket = UnixDatagram::unbound()?;
+    socket.send_to_addr(READY, &addr)?;
     Ok(())
 }
 
@@ -183,6 +181,12 @@ impl core::error::Error for NotifyError {
             Self::Unsupported => None,
             Self::Io(err) => Some(err),
         }
+    }
+}
+
+impl From<std::io::Error> for NotifyError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Io(source)
     }
 }
 

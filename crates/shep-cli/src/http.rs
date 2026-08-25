@@ -116,6 +116,12 @@ impl core::error::Error for HttpError {
     }
 }
 
+impl From<std::io::Error> for HttpError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Io(source)
+    }
+}
+
 /// Reads one request off `stream`, bounded in both size and time.
 ///
 /// Hand-rolled rather than pulled from a crate, and the reason is the whole
@@ -179,7 +185,7 @@ async fn read_request_unbounded_time<R: AsyncRead + Unpin>(
         // impossible rather than merely untried.
         reader.get_mut().set_limit(len as u64);
         let mut body = vec![0_u8; len];
-        reader.read_exact(&mut body).await.map_err(HttpError::Io)?;
+        reader.read_exact(&mut body).await?;
         body
     } else {
         Vec::new()
@@ -202,10 +208,7 @@ async fn read_head<S: AsyncRead + Unpin>(reader: &mut BufReader<S>) -> Result<Ve
     let mut head = Vec::new();
     loop {
         let mut line = Vec::new();
-        let read = reader
-            .read_until(b'\n', &mut line)
-            .await
-            .map_err(HttpError::Io)?;
+        let read = reader.read_until(b'\n', &mut line).await?;
         if read == 0 {
             // The take's budget has not been exceeded (that case returns
             // below, on this same call, before a next iteration is ever
@@ -293,11 +296,8 @@ pub async fn write_response<W: AsyncWrite + Unpin>(
         "HTTP/1.1 {status} \r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream
-        .write_all(head.as_bytes())
-        .await
-        .map_err(HttpError::Io)?;
-    stream.write_all(body).await.map_err(HttpError::Io)?;
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
     Ok(())
 }
 
@@ -363,10 +363,8 @@ pub async fn write_head<W: AsyncWrite + Unpin>(
     }
     head.push_str("Connection: close\r\n\r\n");
 
-    stream
-        .write_all(head.as_bytes())
-        .await
-        .map_err(HttpError::Io)
+    stream.write_all(head.as_bytes()).await?;
+    Ok(())
 }
 
 /// Whether `s` carries a byte outside the printable ASCII range

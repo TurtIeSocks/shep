@@ -23,10 +23,10 @@
 use shep_client::{Client, TRIGGER_DEADLINE};
 use shep_core::protocol::{Request, Response, SelectorSpec};
 
-use crate::cli::{Format, TriggerArgs};
+use crate::cli::TriggerArgs;
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
-use crate::output::{Streams, TriggeredRows, emit, emit_error, write_outcome};
+use crate::output::{Streams, TriggeredRows, emit, write_outcome};
 
 /// Sends `args.action` (and `args.params`, if any) to the sheep matching
 /// `args.selector`, and renders one row per match.
@@ -36,13 +36,8 @@ use crate::output::{Streams, TriggeredRows, emit, emit_error, write_outcome};
 /// `Request::Trigger`, which the daemon never parses either. An app that
 /// does not recognize the action name is expected to say so in its own
 /// reply.
-pub async fn trigger(
-    client: &Client,
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    args: &TriggerArgs,
-) -> ExitCode {
-    let selector = match parse_selector(streams, fmt, &args.selector) {
+pub async fn trigger(client: &Client, streams: &mut Streams<'_>, args: &TriggerArgs) -> ExitCode {
+    let selector = match parse_selector(streams, &args.selector) {
         Ok(selector) => SelectorSpec::from(&selector),
         Err(code) => return code,
     };
@@ -59,25 +54,18 @@ pub async fn trigger(
     {
         Ok(Response::Triggered(replies)) => write_outcome(emit(
             &mut *streams.out,
-            fmt,
+            streams.fmt,
             "trigger",
             TriggeredRows(replies),
             streams.style,
         )),
         Ok(_unrecognised) => {
             let message = "the daemon answered with a response this client does not understand";
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Internal.code_str(),
-                message,
-            );
-            ExitCode::Internal
+            streams.fail(ExitCode::Internal, message)
         }
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
@@ -88,6 +76,7 @@ mod tests {
     use shep_core::protocol::RpcErrorCode;
 
     use super::*;
+    use crate::cli::Format;
 
     fn args(selector: &str, action: &str, params: Option<&str>) -> TriggerArgs {
         TriggerArgs {
@@ -113,14 +102,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            trigger(
-                &client,
-                &mut streams,
-                Format::Table,
-                &args("/[/", "ping", None),
-            )
-            .await
+            trigger(&client, &mut streams, &args("/[/", "ping", None)).await
         };
         assert_eq!(code, ExitCode::Usage);
         assert!(
@@ -147,14 +131,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            trigger(
-                &client,
-                &mut streams,
-                Format::Table,
-                &args("nonexistent", "ping", None),
-            )
-            .await
+            trigger(&client, &mut streams, &args("nonexistent", "ping", None)).await
         };
         assert_eq!(code, ExitCode::NotFound);
         assert!(out.is_empty());
@@ -180,14 +159,9 @@ mod tests {
             out: &mut out,
             err: &mut err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         };
-        let _ = trigger(
-            &client,
-            &mut streams,
-            Format::Table,
-            &args("web", "gc", Some("--force")),
-        )
-        .await;
+        let _ = trigger(&client, &mut streams, &args("web", "gc", Some("--force"))).await;
 
         let envelope = envelopes.recv().await.unwrap();
         assert_eq!(
@@ -223,14 +197,9 @@ mod tests {
                 out: &mut out,
                 err: &mut err,
                 style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
             };
-            trigger(
-                &client,
-                &mut streams,
-                Format::Table,
-                &args("web", "ping", None),
-            )
-            .await
+            trigger(&client, &mut streams, &args("web", "ping", None)).await
         };
         assert_eq!(code, ExitCode::Internal);
         assert!(out.is_empty());

@@ -39,12 +39,12 @@ use shep_core::barks;
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{DogSource, Request, Response};
 
-use crate::cli::{AdoptArgs, BarksArgs, Format};
+use crate::cli::{AdoptArgs, BarksArgs};
 use crate::commands::shep_toml::{ShepToml, ShepTomlError};
 use crate::exit::ExitCode;
 use crate::output::{
     BarkRows, DogAdoptedRow, DogDisabledRow, DogEnabledRow, DogRehomedRow, Streams, emit,
-    emit_error, emit_notice, write_outcome,
+    emit_notice, write_outcome,
 };
 
 /// [`DogEnabledRow::status`] when `enable` wrote the config but no shepherd
@@ -72,13 +72,12 @@ const DISABLED_STATUS: &str = "stopped";
 /// is deliberately not `#[non_exhaustive]`, so this match must cover
 /// every variant the type has, not just the ones this file's own callers
 /// can currently produce.
-fn fail_config(streams: &mut Streams<'_>, fmt: Format, err: &ShepTomlError) -> ExitCode {
+fn fail_config(streams: &mut Streams<'_>, err: &ShepTomlError) -> ExitCode {
     let code = match err {
         ShepTomlError::Io { .. } => ExitCode::Failure,
         ShepTomlError::Parse { .. } | ShepTomlError::WrongShape { .. } => ExitCode::InvalidConfig,
     };
-    let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-    code
+    streams.fail(code, &err.to_string())
 }
 
 /// Where `name`'s binary comes from, according to `cfg`.
@@ -100,12 +99,7 @@ fn dog_source(cfg: &ShepToml, name: &str) -> DogSource {
 
 /// `shep enable <name>`: writes the config, and starts the dog if a
 /// shepherd is running.
-pub async fn enable(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    paths: &ShepPaths,
-    name: &str,
-) -> ExitCode {
+pub async fn enable(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) -> ExitCode {
     // The read and the edit are one `edit` call because they are one
     // transaction: the source below is read from the same document this
     // then writes back, under the lock that keeps a concurrent `shep
@@ -120,10 +114,10 @@ pub async fn enable(
         source
     }) {
         Ok(source) => source,
-        Err(err) => return fail_config(streams, fmt, &err),
+        Err(err) => return fail_config(streams, &err),
     };
     let client = Client::connect(&paths.socket).await.ok();
-    enable_after_config(streams, fmt, name, &source, client.as_ref()).await
+    enable_after_config(streams, name, &source, client.as_ref()).await
 }
 
 /// `enable`'s daemon half, split out from [`enable`] so a test can drive it
@@ -139,7 +133,6 @@ pub async fn enable(
 /// before starting anything must not have to.
 async fn enable_after_config(
     streams: &mut Streams<'_>,
-    fmt: Format,
     name: &str,
     source: &DogSource,
     client: Option<&Client>,
@@ -151,7 +144,13 @@ async fn enable_after_config(
             shepherd_acted: false,
             status: NO_SHEPHERD_ENABLE_STATUS.to_string(),
         };
-        return write_outcome(emit(&mut *streams.out, fmt, "enable", row, streams.style));
+        return write_outcome(emit(
+            &mut *streams.out,
+            streams.fmt,
+            "enable",
+            row,
+            streams.style,
+        ));
     };
     // An `EnableDog` reaching a name a sheep already holds comes back as
     // `RpcErrorCode::InvalidConfig` with the daemon's own message naming
@@ -170,34 +169,28 @@ async fn enable_after_config(
                 shepherd_acted: true,
                 status: info.status.to_string(),
             };
-            write_outcome(emit(&mut *streams.out, fmt, "enable", row, streams.style))
+            write_outcome(emit(
+                &mut *streams.out,
+                streams.fmt,
+                "enable",
+                row,
+                streams.style,
+            ))
         }
         Ok(_) => {
             let message = "the daemon answered with a response this client does not understand";
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Internal.code_str(),
-                message,
-            );
-            ExitCode::Internal
+            streams.fail(ExitCode::Internal, message)
         }
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
 
 /// `shep disable <name>`: removes it from the config, and stops it if a
 /// shepherd is running.
-pub async fn disable(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    paths: &ShepPaths,
-    name: &str,
-) -> ExitCode {
+pub async fn disable(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) -> ExitCode {
     let source = match ShepToml::edit(&paths.daemon_config, |cfg| {
         // `disable_dog` leaves `[daemon] adopted_dogs` alone — that is the
         // difference between `disable` and `rehome` — so this reads the
@@ -208,17 +201,16 @@ pub async fn disable(
         source
     }) {
         Ok(source) => source,
-        Err(err) => return fail_config(streams, fmt, &err),
+        Err(err) => return fail_config(streams, &err),
     };
     let client = Client::connect(&paths.socket).await.ok();
-    disable_after_config(streams, fmt, name, &source, client.as_ref()).await
+    disable_after_config(streams, name, &source, client.as_ref()).await
 }
 
 /// `disable`'s daemon half — see [`enable_after_config`]'s own doc for why
 /// this split exists and what `client: None` means.
 async fn disable_after_config(
     streams: &mut Streams<'_>,
-    fmt: Format,
     name: &str,
     source: &DogSource,
     client: Option<&Client>,
@@ -230,7 +222,13 @@ async fn disable_after_config(
             shepherd_acted: false,
             status: NO_SHEPHERD_DISABLE_STATUS.to_string(),
         };
-        return write_outcome(emit(&mut *streams.out, fmt, "disable", row, streams.style));
+        return write_outcome(emit(
+            &mut *streams.out,
+            streams.fmt,
+            "disable",
+            row,
+            streams.style,
+        ));
     };
     // `Response::Deleted`, the same reply `Delete` gives — `DisableDog`'s
     // own doc (`shep-core/src/protocol/request.rs`) says disabling
@@ -249,22 +247,21 @@ async fn disable_after_config(
                 shepherd_acted: true,
                 status: DISABLED_STATUS.to_string(),
             };
-            write_outcome(emit(&mut *streams.out, fmt, "disable", row, streams.style))
+            write_outcome(emit(
+                &mut *streams.out,
+                streams.fmt,
+                "disable",
+                row,
+                streams.style,
+            ))
         }
         Ok(_) => {
             let message = "the daemon answered with a response this client does not understand";
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Internal.code_str(),
-                message,
-            );
-            ExitCode::Internal
+            streams.fail(ExitCode::Internal, message)
         }
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
@@ -533,16 +530,10 @@ fn macos_deferred_exec_failure(_child: &mut std::process::Child) -> Option<Strin
 /// reports. [`ExitCode::InvalidConfig`] for every mode — what's wrong is
 /// the argument `adopt` was given, not shep's own state, the same category
 /// a bad Flockfile value gets.
-fn fail_adopt(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    path: &Path,
-    refusal: &AdoptRefusal,
-) -> ExitCode {
+fn fail_adopt(streams: &mut Streams<'_>, path: &Path, refusal: &AdoptRefusal) -> ExitCode {
     let code = ExitCode::InvalidConfig;
     let message = format!("{}: {refusal}", path.display());
-    let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &message);
-    code
+    streams.fail(code, &message)
 }
 
 /// [`emit_notice`] code for the group-writable warning — caller-defined,
@@ -557,45 +548,44 @@ const GROUP_WRITABLE_NOTICE: &str = "group_writable";
 /// [`emit_notice`] rather than [`emit_error`] for exactly the reason that
 /// function exists: a `--format json` consumer must be able to tell a
 /// diagnostic on a successful command from a failure.
-fn warn_group_writable(streams: &mut Streams<'_>, fmt: Format, path: &Path) {
+fn warn_group_writable(streams: &mut Streams<'_>, path: &Path) {
     let message = format!(
         "{} is writable by its group; anyone in that group can replace the binary \
          this dog runs, and it runs with the shepherd's own privileges",
         path.display()
     );
-    let _ = emit_notice(&mut *streams.err, fmt, GROUP_WRITABLE_NOTICE, &message);
+    let _ = emit_notice(
+        &mut *streams.err,
+        streams.fmt,
+        GROUP_WRITABLE_NOTICE,
+        &message,
+    );
 }
 
 /// `shep adopt <name> <path>`: vets a binary shep has never seen, records
 /// it, and starts it if a shepherd is running.
-pub async fn adopt(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    paths: &ShepPaths,
-    args: &AdoptArgs,
-) -> ExitCode {
+pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArgs) -> ExitCode {
     let vetted = match vet_binary(&args.path) {
         Ok(vetted) => vetted,
-        Err(refusal) => return fail_adopt(streams, fmt, &args.path, &refusal),
+        Err(refusal) => return fail_adopt(streams, &args.path, &refusal),
     };
     let path = vetted.path;
     for writable in &vetted.group_writable {
-        warn_group_writable(streams, fmt, writable);
+        warn_group_writable(streams, writable);
     }
     if let Err(err) = ShepToml::edit(&paths.daemon_config, |cfg| {
         cfg.adopt_dog(&args.name, &path);
     }) {
-        return fail_config(streams, fmt, &err);
+        return fail_config(streams, &err);
     }
     let client = Client::connect(&paths.socket).await.ok();
-    adopt_after_config(streams, fmt, &args.name, &path, client.as_ref()).await
+    adopt_after_config(streams, &args.name, &path, client.as_ref()).await
 }
 
 /// `adopt`'s daemon half — see [`enable_after_config`]'s own doc for why
 /// this split exists and what `client: None` means.
 async fn adopt_after_config(
     streams: &mut Streams<'_>,
-    fmt: Format,
     name: &str,
     path: &Path,
     client: Option<&Client>,
@@ -610,7 +600,13 @@ async fn adopt_after_config(
             shepherd_acted: false,
             status: NO_SHEPHERD_ENABLE_STATUS.to_string(),
         };
-        return write_outcome(emit(&mut *streams.out, fmt, "adopt", row, streams.style));
+        return write_outcome(emit(
+            &mut *streams.out,
+            streams.fmt,
+            "adopt",
+            row,
+            streams.style,
+        ));
     };
     let request = Request::EnableDog {
         name: name.to_string(),
@@ -624,33 +620,27 @@ async fn adopt_after_config(
                 shepherd_acted: true,
                 status: info.status.to_string(),
             };
-            write_outcome(emit(&mut *streams.out, fmt, "adopt", row, streams.style))
+            write_outcome(emit(
+                &mut *streams.out,
+                streams.fmt,
+                "adopt",
+                row,
+                streams.style,
+            ))
         }
         Ok(_) => {
             let message = "the daemon answered with a response this client does not understand";
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Internal.code_str(),
-                message,
-            );
-            ExitCode::Internal
+            streams.fail(ExitCode::Internal, message)
         }
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
 
 /// `shep rehome <name>`: stops an adopted dog and forgets it entirely.
-pub async fn rehome(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    paths: &ShepPaths,
-    name: &str,
-) -> ExitCode {
+pub async fn rehome(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) -> ExitCode {
     let source = match ShepToml::edit(&paths.daemon_config, |cfg| {
         // Read before `rehome_dog` erases it — the row below reports what
         // this verb forgot, and `None` (a name never adopted, or a
@@ -662,10 +652,10 @@ pub async fn rehome(
         source
     }) {
         Ok(source) => source,
-        Err(err) => return fail_config(streams, fmt, &err),
+        Err(err) => return fail_config(streams, &err),
     };
     let client = Client::connect(&paths.socket).await.ok();
-    rehome_after_config(streams, fmt, name, source, client.as_ref()).await
+    rehome_after_config(streams, name, source, client.as_ref()).await
 }
 
 /// `rehome`'s daemon half — see [`enable_after_config`]'s own doc for why
@@ -677,7 +667,6 @@ pub async fn rehome(
 /// alone.
 async fn rehome_after_config(
     streams: &mut Streams<'_>,
-    fmt: Format,
     name: &str,
     source: Option<DogSource>,
     client: Option<&Client>,
@@ -689,7 +678,13 @@ async fn rehome_after_config(
             shepherd_acted: false,
             status: NO_SHEPHERD_DISABLE_STATUS.to_string(),
         };
-        return write_outcome(emit(&mut *streams.out, fmt, "rehome", row, streams.style));
+        return write_outcome(emit(
+            &mut *streams.out,
+            streams.fmt,
+            "rehome",
+            row,
+            streams.style,
+        ));
     };
     match client
         .request(Request::DisableDog {
@@ -704,22 +699,21 @@ async fn rehome_after_config(
                 shepherd_acted: true,
                 status: DISABLED_STATUS.to_string(),
             };
-            write_outcome(emit(&mut *streams.out, fmt, "rehome", row, streams.style))
+            write_outcome(emit(
+                &mut *streams.out,
+                streams.fmt,
+                "rehome",
+                row,
+                streams.style,
+            ))
         }
         Ok(_) => {
             let message = "the daemon answered with a response this client does not understand";
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Internal.code_str(),
-                message,
-            );
-            ExitCode::Internal
+            streams.fail(ExitCode::Internal, message)
         }
         Err(err) => {
             let code = ExitCode::from(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            code
+            streams.fail(code, &err.to_string())
         }
     }
 }
@@ -737,22 +731,11 @@ async fn rehome_after_config(
 /// `--tail N` takes the LAST N records — [`BarksArgs::tail`]'s own doc, and
 /// [`barks::read`]'s: oldest first, so the tail of that `Vec` is the most
 /// recent N, in the same newest-last order the untailed read already has.
-pub fn barks(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    paths: &ShepPaths,
-    args: &BarksArgs,
-) -> ExitCode {
+pub fn barks(streams: &mut Streams<'_>, paths: &ShepPaths, args: &BarksArgs) -> ExitCode {
     let mut history = match barks::read(&paths.barks) {
         Ok(history) => history,
         Err(err) => {
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::Failure.code_str(),
-                &err.to_string(),
-            );
-            return ExitCode::Failure;
+            return streams.fail(ExitCode::Failure, &err.to_string());
         }
     };
     if let Some(tail) = args.tail {
@@ -761,7 +744,7 @@ pub fn barks(
     }
     write_outcome(emit(
         &mut *streams.out,
-        fmt,
+        streams.fmt,
         "barks",
         BarkRows(history),
         streams.style,
@@ -777,12 +760,17 @@ mod tests {
     use shep_core::protocol::RpcErrorCode;
 
     use super::*;
+    use crate::cli::Format;
 
+    /// Every test in this module drives one of the dog verbs under
+    /// `--format table` -- none of them exercises the JSON envelope -- so
+    /// `fmt` is fixed here rather than threaded through every call site.
     fn streams<'a>(out: &'a mut Vec<u8>, err: &'a mut Vec<u8>) -> Streams<'a> {
         Streams {
             out,
             err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
         }
     }
 
@@ -800,7 +788,6 @@ mod tests {
         let mut err = Vec::new();
         let _ = enable_after_config(
             &mut streams(&mut out, &mut err),
-            Format::Table,
             "metrics",
             &DogSource::BuiltIn,
             Some(&client),
@@ -846,13 +833,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = enable(
-            &mut streams(&mut out, &mut err),
-            Format::Table,
-            &paths,
-            "otel",
-        )
-        .await;
+        let code = enable(&mut streams(&mut out, &mut err), &paths, "otel").await;
 
         assert_eq!(code, ExitCode::Success);
         let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
@@ -886,13 +867,7 @@ mod tests {
         let paths = ShepPaths::resolve(&|_| None, dir.path());
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = enable(
-            &mut streams(&mut out, &mut err),
-            Format::Table,
-            &paths,
-            "metrics",
-        )
-        .await;
+        let code = enable(&mut streams(&mut out, &mut err), &paths, "metrics").await;
 
         assert_eq!(code, ExitCode::Success);
         let written = std::fs::read_to_string(&paths.daemon_config).unwrap();
@@ -925,7 +900,6 @@ mod tests {
         let mut err = Vec::new();
         let code = enable_after_config(
             &mut streams(&mut out, &mut err),
-            Format::Table,
             "bark",
             &DogSource::BuiltIn,
             Some(&client),
@@ -952,7 +926,6 @@ mod tests {
         let mut err = Vec::new();
         let _ = disable_after_config(
             &mut streams(&mut out, &mut err),
-            Format::Table,
             "bark",
             &DogSource::BuiltIn,
             Some(&client),
@@ -977,13 +950,7 @@ mod tests {
         ShepToml::edit(&paths.daemon_config, |seed| seed.enable_dog("bark")).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = disable(
-            &mut streams(&mut out, &mut err),
-            Format::Table,
-            &paths,
-            "bark",
-        )
-        .await;
+        let code = disable(&mut streams(&mut out, &mut err), &paths, "bark").await;
 
         assert_eq!(code, ExitCode::Success);
         let written = std::fs::read_to_string(&paths.daemon_config).unwrap();
@@ -1010,7 +977,6 @@ mod tests {
         let mut err = Vec::new();
         let code = disable_after_config(
             &mut streams(&mut out, &mut err),
-            Format::Table,
             "ghost",
             &DogSource::BuiltIn,
             Some(&client),
@@ -1130,13 +1096,7 @@ mod tests {
             name: "otel".to_string(),
             path: bin.clone(),
         };
-        let code = adopt(
-            &mut streams(&mut out, &mut err),
-            Format::Table,
-            &paths,
-            &args,
-        )
-        .await;
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
 
         assert_eq!(code, ExitCode::Success, "group-writable is a warning");
         let text = String::from_utf8(err).unwrap();
@@ -1163,13 +1123,7 @@ mod tests {
             name: "otel".to_string(),
             path: dir.path().join("nope"),
         };
-        let code = adopt(
-            &mut streams(&mut out, &mut err),
-            Format::Table,
-            &paths,
-            &args,
-        )
-        .await;
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
 
         assert_eq!(code, ExitCode::InvalidConfig);
         assert!(
@@ -1191,13 +1145,7 @@ mod tests {
             name: "otel".to_string(),
             path: dir.path().join("nope"),
         };
-        let code = adopt(
-            &mut streams(&mut out, &mut err),
-            Format::Table,
-            &paths,
-            &args,
-        )
-        .await;
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
 
         assert_eq!(code, ExitCode::InvalidConfig);
         let text = String::from_utf8(err).unwrap();
@@ -1220,7 +1168,6 @@ mod tests {
         let binary = PathBuf::from("/usr/local/bin/shep-otel");
         let _ = adopt_after_config(
             &mut streams(&mut out, &mut err),
-            Format::Table,
             "otel",
             &binary,
             Some(&client),
@@ -1256,13 +1203,7 @@ mod tests {
             name: "otel".to_string(),
             path: binary,
         };
-        let code = adopt(
-            &mut streams(&mut out, &mut err),
-            Format::Table,
-            &paths,
-            &args,
-        )
-        .await;
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
 
         assert_eq!(code, ExitCode::Success);
         let written = std::fs::read_to_string(&paths.daemon_config).unwrap();
@@ -1293,13 +1234,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = rehome(
-            &mut streams(&mut out, &mut err),
-            Format::Table,
-            &paths,
-            "otel",
-        )
-        .await;
+        let code = rehome(&mut streams(&mut out, &mut err), &paths, "otel").await;
 
         assert_eq!(code, ExitCode::Success);
         let written = std::fs::read_to_string(&paths.daemon_config).unwrap();
@@ -1329,7 +1264,6 @@ mod tests {
         let mut err = Vec::new();
         let _ = rehome_after_config(
             &mut streams(&mut out, &mut err),
-            Format::Table,
             "otel",
             Some(DogSource::Adopted {
                 path: "/usr/local/bin/shep-otel".to_string(),
@@ -1359,13 +1293,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = rehome(
-            &mut streams(&mut out, &mut err),
-            Format::Table,
-            &paths,
-            "otel",
-        )
-        .await;
+        let code = rehome(&mut streams(&mut out, &mut err), &paths, "otel").await;
 
         assert_eq!(code, ExitCode::Success);
         let written = std::fs::read_to_string(&paths.daemon_config).unwrap();
@@ -1417,7 +1345,6 @@ mod tests {
         let mut err = Vec::new();
         let code = barks(
             &mut streams(&mut out, &mut err),
-            Format::Table,
             &paths,
             &BarksArgs { tail: None },
         );
@@ -1456,7 +1383,6 @@ mod tests {
         let mut err = Vec::new();
         let code = barks(
             &mut streams(&mut out, &mut err),
-            Format::Table,
             &paths,
             &BarksArgs { tail: Some(2) },
         );
@@ -1485,7 +1411,6 @@ mod tests {
         let mut err = Vec::new();
         let code = barks(
             &mut streams(&mut out, &mut err),
-            Format::Table,
             &paths,
             &BarksArgs { tail: Some(50) },
         );
@@ -1509,7 +1434,6 @@ mod tests {
         let mut err = Vec::new();
         let code = barks(
             &mut streams(&mut out, &mut err),
-            Format::Table,
             &paths,
             &BarksArgs { tail: None },
         );
@@ -1547,7 +1471,6 @@ mod tests {
         let mut err = Vec::new();
         let code = barks(
             &mut streams(&mut out, &mut err),
-            Format::Table,
             &paths,
             &BarksArgs { tail: None },
         );

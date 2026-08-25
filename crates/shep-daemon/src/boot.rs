@@ -470,7 +470,8 @@ fn write_ready(mut pipe: std::fs::File, ready: &DaemonReady) -> Result<(), BootE
     let mut line = serde_json::to_string(ready).expect("DaemonReady always serializes");
     line.push('\n');
     pipe.write_all(line.as_bytes())
-        .map_err(BootError::ReadyWrite)
+        .map_err(BootError::ReadyWrite)?;
+    Ok(())
 }
 
 /// Options the CLI hands the daemon at boot.
@@ -808,10 +809,8 @@ async fn restore_flock(
     registry: &FlockRegistry,
     supervisor: &SupervisorHandle,
 ) -> Result<(), BootError> {
-    snapshot::muster(&paths.snapshot, registry, supervisor)
-        .await
-        .map(|_names| ())
-        .map_err(BootError::Snapshot)
+    snapshot::muster(&paths.snapshot, registry, supervisor).await?;
+    Ok(())
 }
 
 /// A booted daemon, not yet serving: everything [`boot`] assembled, handed
@@ -1182,6 +1181,12 @@ fn install_signals(
 #[derive(Debug)]
 pub enum BootError {
     /// A filesystem step failed (carries the path and the OS error)
+    ///
+    /// Deliberately has no `From<std::io::Error>`, and neither does any
+    /// sibling: `ReadyWrite` wraps the same type, so one would make a bare
+    /// `?` in this module pick a variant rather than report one. A caller
+    /// that cannot name the path it was working on has not finished
+    /// thinking about the error yet.
     Io {
         /// The path the failing step operated on
         path: PathBuf,
@@ -1257,6 +1262,12 @@ impl core::error::Error for BootError {
             Self::Snapshot(err) => Some(err),
             Self::ReadyWrite(err) => Some(err),
         }
+    }
+}
+
+impl From<SnapshotError> for BootError {
+    fn from(source: SnapshotError) -> Self {
+        Self::Snapshot(source)
     }
 }
 

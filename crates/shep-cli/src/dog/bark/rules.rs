@@ -184,6 +184,12 @@ impl core::error::Error for RulesError {
     }
 }
 
+impl From<SinkConfigError> for RulesError {
+    fn from(source: SinkConfigError) -> Self {
+        Self::InsecureSink(source)
+    }
+}
+
 /// Per-subject bookkeeping [`Rules`] keeps to make the bus route and the
 /// poll route agree on one firing rather than two, and to let
 /// [`Trigger::RestartRate`] measure a window without bark keeping its own
@@ -227,7 +233,7 @@ impl Rules {
     ///   footgun for the next rule that does.
     pub fn new(rules: Vec<Rule>, sinks: &BTreeMap<String, Sink>) -> Result<Self, RulesError> {
         for (name, sink) in sinks {
-            sinks::require_secure_scheme(name, sink).map_err(RulesError::InsecureSink)?;
+            sinks::require_secure_scheme(name, sink)?;
         }
         for (index, rule) in rules.iter().enumerate() {
             if rule.sinks.is_empty() {

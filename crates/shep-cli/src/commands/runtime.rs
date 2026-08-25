@@ -10,12 +10,12 @@ use std::path::PathBuf;
 use shep_core::config::discover;
 use shep_core::paths::ShepPaths;
 
-use crate::cli::{Format, RuntimeArgs};
+use crate::cli::RuntimeArgs;
 use crate::commands::foreground::{self, ForegroundOptions};
 use crate::commands::lifecycle::{resolve_target, target_exit_code};
 use crate::commands::reap;
 use crate::exit::ExitCode;
-use crate::output::{Streams, emit_error};
+use crate::output::Streams;
 
 /// The ten filenames [`discover`] looks for, in the order it looks. Named
 /// here rather than imported: `shep_core::config::flockfile::DISCOVERY_ORDER`
@@ -38,14 +38,13 @@ const DISCOVERY_NAMES: &str = "Flockfile.toml, Flockfile.yaml, Flockfile.yml, Fl
 /// engine's own `bleats` narration, same as every other verb that follows.
 pub async fn runtime(
     streams: &mut Streams<'_>,
-    fmt: Format,
     quiet: bool,
     paths: ShepPaths,
     args: &RuntimeArgs,
 ) -> ExitCode {
     let target = match &args.target {
         Some(target) => target.clone(),
-        None => match discovered_target(streams, fmt) {
+        None => match discovered_target(streams) {
             Ok(target) => target,
             Err(code) => return code,
         },
@@ -55,8 +54,7 @@ pub async fn runtime(
         Ok(apps) => apps,
         Err(err) => {
             let code = target_exit_code(&err);
-            let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-            return code;
+            return streams.fail(code, &err.to_string());
         }
     };
 
@@ -71,7 +69,7 @@ pub async fn runtime(
     // panic probe's shape in `lib.rs`'s `run_argv`. See decision 14.
     let forced = std::env::var_os("SHEP_FORCE_INIT").is_some();
     if !reap::should_split(std::process::id(), args.supervise, forced) {
-        return foreground::run(streams, fmt, quiet, options).await;
+        return foreground::run(streams, quiet, options).await;
     }
     // `Infallible` is an ordinary uninhabited enum, not the never type `!`,
     // so it does not coerce to `ExitCode` as a bare tail expression — the
@@ -85,11 +83,8 @@ pub async fn runtime(
 /// `pub(crate)`: `commands::dev` shares this rather than repeating it —
 /// `shep dev ./` and `shep runtime ./` cannot disagree about what "no
 /// target" discovers.
-pub(crate) fn discovered_target(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-) -> Result<String, ExitCode> {
-    let cwd = get_cwd(streams, fmt)?;
+pub(crate) fn discovered_target(streams: &mut Streams<'_>) -> Result<String, ExitCode> {
+    let cwd = get_cwd(streams)?;
     match discover(&cwd) {
         Some(path) => Ok(path.to_string_lossy().into_owned()),
         None => {
@@ -97,16 +92,14 @@ pub(crate) fn discovered_target(
                 "no Flockfile found in {} (looked for {DISCOVERY_NAMES})",
                 cwd.display()
             );
-            let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), &message);
-            Err(ExitCode::Usage)
+            Err(streams.fail(ExitCode::Usage, &message))
         }
     }
 }
 
-pub(crate) fn get_cwd(streams: &mut Streams<'_>, fmt: Format) -> Result<PathBuf, ExitCode> {
+pub(crate) fn get_cwd(streams: &mut Streams<'_>) -> Result<PathBuf, ExitCode> {
     std::env::current_dir().map_err(|err| {
         let message = format!("could not read the current directory: {err}");
-        let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), &message);
-        ExitCode::Usage
+        streams.fail(ExitCode::Usage, &message)
     })
 }

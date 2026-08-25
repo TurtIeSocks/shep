@@ -11,9 +11,9 @@
 use shep_core::kv::{self, KvError};
 use shep_core::paths::ShepPaths;
 
-use crate::cli::{Format, KvGetArgs, KvSetArgs, KvUnsetArgs};
+use crate::cli::{KvGetArgs, KvSetArgs, KvUnsetArgs};
 use crate::exit::ExitCode;
-use crate::output::{KvEntry, KvRows, KvUnsetRow, Streams, emit, emit_error, write_outcome};
+use crate::output::{KvEntry, KvRows, KvUnsetRow, Streams, emit, write_outcome};
 
 /// The exit code Task 13's own decision table maps each [`KvError`] to.
 ///
@@ -39,28 +39,28 @@ fn exit_code_for(err: &KvError) -> ExitCode {
 /// Renders `err` to `streams.err` and returns the code [`exit_code_for`]
 /// maps it to — the one place any of the three verbs below turns a
 /// `KvError` into a report.
-fn fail(streams: &mut Streams<'_>, fmt: Format, err: &KvError) -> ExitCode {
+fn fail(streams: &mut Streams<'_>, err: &KvError) -> ExitCode {
     let code = exit_code_for(err);
-    let _ = emit_error(&mut *streams.err, fmt, code.code_str(), &err.to_string());
-    code
+    streams.fail(code, &err.to_string())
 }
 
 /// `shep set <key> <value>`.
-pub fn set(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    paths: &ShepPaths,
-    args: &KvSetArgs,
-) -> ExitCode {
+pub fn set(streams: &mut Streams<'_>, paths: &ShepPaths, args: &KvSetArgs) -> ExitCode {
     match kv::set(&paths.kv, &args.key, &args.value) {
         Ok(()) => {
             let row = KvRows(vec![KvEntry {
                 key: args.key.clone(),
                 value: args.value.clone(),
             }]);
-            write_outcome(emit(&mut *streams.out, fmt, "set", row, streams.style))
+            write_outcome(emit(
+                &mut *streams.out,
+                streams.fmt,
+                "set",
+                row,
+                streams.style,
+            ))
         }
-        Err(err) => fail(streams, fmt, &err),
+        Err(err) => fail(streams, &err),
     }
 }
 
@@ -71,12 +71,7 @@ pub fn set(
 /// nothing to `streams.out`: this is what makes `shep get k || echo
 /// default` work in a script, the shape this store exists to serve
 /// (Task 13's own spec).
-pub fn get(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    paths: &ShepPaths,
-    args: &KvGetArgs,
-) -> ExitCode {
+pub fn get(streams: &mut Streams<'_>, paths: &ShepPaths, args: &KvGetArgs) -> ExitCode {
     let Some(key) = &args.key else {
         return match kv::all(&paths.kv) {
             Ok(entries) => {
@@ -86,9 +81,15 @@ pub fn get(
                         .map(|(key, value)| KvEntry { key, value })
                         .collect(),
                 );
-                write_outcome(emit(&mut *streams.out, fmt, "get", rows, streams.style))
+                write_outcome(emit(
+                    &mut *streams.out,
+                    streams.fmt,
+                    "get",
+                    rows,
+                    streams.style,
+                ))
             }
-            Err(err) => fail(streams, fmt, &err),
+            Err(err) => fail(streams, &err),
         };
     };
 
@@ -98,19 +99,19 @@ pub fn get(
                 key: key.clone(),
                 value,
             }]);
-            write_outcome(emit(&mut *streams.out, fmt, "get", row, streams.style))
+            write_outcome(emit(
+                &mut *streams.out,
+                streams.fmt,
+                "get",
+                row,
+                streams.style,
+            ))
         }
         Ok(None) => {
             let message = format!("`{key}` is not set");
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::NotFound.code_str(),
-                &message,
-            );
-            ExitCode::NotFound
+            streams.fail(ExitCode::NotFound, &message)
         }
-        Err(err) => fail(streams, fmt, &err),
+        Err(err) => fail(streams, &err),
     }
 }
 
@@ -120,22 +121,17 @@ pub fn get(
 /// same "did this actually do anything" honesty [`get`] gives a script,
 /// rather than exiting 0 on a no-op an operator would read as success
 /// (`shep_core::kv::unset`'s own doc makes the same point about its `bool`).
-pub fn unset(
-    streams: &mut Streams<'_>,
-    fmt: Format,
-    paths: &ShepPaths,
-    args: &KvUnsetArgs,
-) -> ExitCode {
+pub fn unset(streams: &mut Streams<'_>, paths: &ShepPaths, args: &KvUnsetArgs) -> ExitCode {
     if args.all {
         return match kv::clear(&paths.kv) {
             Ok(removed) => write_outcome(emit(
                 &mut *streams.out,
-                fmt,
+                streams.fmt,
                 "unset",
                 KvUnsetRow { removed },
                 streams.style,
             )),
-            Err(err) => fail(streams, fmt, &err),
+            Err(err) => fail(streams, &err),
         };
     }
 
@@ -149,34 +145,34 @@ pub fn unset(
     match kv::unset(&paths.kv, key) {
         Ok(true) => write_outcome(emit(
             &mut *streams.out,
-            fmt,
+            streams.fmt,
             "unset",
             KvUnsetRow { removed: 1 },
             streams.style,
         )),
         Ok(false) => {
             let message = format!("`{key}` is not set");
-            let _ = emit_error(
-                &mut *streams.err,
-                fmt,
-                ExitCode::NotFound.code_str(),
-                &message,
-            );
-            ExitCode::NotFound
+            streams.fail(ExitCode::NotFound, &message)
         }
-        Err(err) => fail(streams, fmt, &err),
+        Err(err) => fail(streams, &err),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::Format;
 
+    /// Every test in this module drives one of the three KV verbs under
+    /// `--format json` -- the script-friendly contract `kv` exists to
+    /// serve -- so `fmt` is fixed here rather than threaded through every
+    /// call site.
     fn streams<'a>(out: &'a mut Vec<u8>, err: &'a mut Vec<u8>) -> Streams<'a> {
         Streams {
             out,
             err,
             style: crate::style::Presentation::BARE,
+            fmt: Format::Json,
         }
     }
 
@@ -202,7 +198,6 @@ mod tests {
         let mut err = Vec::new();
         let code = set(
             &mut streams(&mut out, &mut err),
-            Format::Json,
             &paths,
             &KvSetArgs {
                 key: "bark.cooldown".to_string(),
@@ -214,7 +209,6 @@ mod tests {
         out.clear();
         let code = get(
             &mut streams(&mut out, &mut err),
-            Format::Json,
             &paths,
             &KvGetArgs {
                 key: Some("bark.cooldown".to_string()),
@@ -237,7 +231,6 @@ mod tests {
         let mut err = Vec::new();
         let code = get(
             &mut streams(&mut out, &mut err),
-            Format::Json,
             &paths,
             &KvGetArgs {
                 key: Some("ghost".to_string()),
@@ -257,7 +250,6 @@ mod tests {
         let mut err = Vec::new();
         set(
             &mut streams(&mut out, &mut err),
-            Format::Json,
             &paths,
             &KvSetArgs {
                 key: "a".to_string(),
@@ -266,7 +258,6 @@ mod tests {
         );
         set(
             &mut streams(&mut out, &mut err),
-            Format::Json,
             &paths,
             &KvSetArgs {
                 key: "b".to_string(),
@@ -277,7 +268,6 @@ mod tests {
         out.clear();
         let code = unset(
             &mut streams(&mut out, &mut err),
-            Format::Json,
             &paths,
             &KvUnsetArgs {
                 key: None,
@@ -302,7 +292,6 @@ mod tests {
         let mut err = Vec::new();
         let code = set(
             &mut streams(&mut out, &mut err),
-            Format::Json,
             &paths,
             &KvSetArgs {
                 key: "not valid".to_string(),
