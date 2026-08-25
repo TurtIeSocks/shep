@@ -88,6 +88,12 @@ impl core::error::Error for ServeRefusal {
     }
 }
 
+impl From<AuthError> for ServeRefusal {
+    fn from(source: AuthError) -> Self {
+        Self::Auth(source)
+    }
+}
+
 /// The exit code a [`ServeRefusal`] reports — decision (Step 7.3): a bad
 /// `root` is a usage error, a bad `--auth` file or a missing SPA index is a
 /// config error.
@@ -134,7 +140,7 @@ fn validate_root(root: &Path) -> Result<PathBuf, ServeRefusal> {
 /// [`ServeRefusal::Auth`] if the file cannot be loaded or, having loaded,
 /// cannot be canonicalized.
 fn validate_auth(path: &Path) -> Result<(PathBuf, Credentials), ServeRefusal> {
-    let credentials = auth::load(path).map_err(ServeRefusal::Auth)?;
+    let credentials = auth::load(path)?;
     let canonical = std::fs::canonicalize(path).map_err(|source| {
         ServeRefusal::Auth(AuthError::Io {
             path: path.to_path_buf(),

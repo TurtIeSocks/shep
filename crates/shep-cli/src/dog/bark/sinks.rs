@@ -252,6 +252,12 @@ impl core::error::Error for SinkError {
     }
 }
 
+impl From<std::io::Error> for SinkError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Transport { source }
+    }
+}
+
 /// The body `sink` sends for `bark` — pure, and the half worth testing
 /// exhaustively.
 ///
@@ -395,18 +401,13 @@ fn build_request(target: &Target, body: &str) -> String {
 /// write/read exchange over whichever stream results.
 async fn deliver_inner(target: &Target, body: &str) -> Result<(), SinkError> {
     let request = build_request(target, body);
-    let tcp = TcpStream::connect((target.host.as_str(), target.port))
-        .await
-        .map_err(|source| SinkError::Transport { source })?;
+    let tcp = TcpStream::connect((target.host.as_str(), target.port)).await?;
     if target.https {
         let domain =
             ServerName::try_from(target.host.clone()).map_err(|source| SinkError::Transport {
                 source: std::io::Error::other(source),
             })?;
-        let tls = fetch::tls_connector()
-            .connect(domain, tcp)
-            .await
-            .map_err(|source| SinkError::Transport { source })?;
+        let tls = fetch::tls_connector().connect(domain, tcp).await?;
         write_and_read(tls, &request).await
     } else {
         write_and_read(tcp, &request).await
@@ -426,14 +427,8 @@ async fn write_and_read<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     request: &str,
 ) -> Result<(), SinkError> {
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .map_err(|source| SinkError::Transport { source })?;
-    stream
-        .flush()
-        .await
-        .map_err(|source| SinkError::Transport { source })?;
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
     read_response(stream).await
 }
 
@@ -446,10 +441,7 @@ async fn write_and_read<S: AsyncRead + AsyncWrite + Unpin>(
 async fn read_response<S: AsyncRead + Unpin>(stream: S) -> Result<(), SinkError> {
     let mut reader = BufReader::new(stream);
     let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
-        .await
-        .map_err(|source| SinkError::Transport { source })?;
+    reader.read_line(&mut status_line).await?;
     let code = parse_status_code(&status_line)?;
     if (200..300).contains(&code) {
         return Ok(());
@@ -457,20 +449,14 @@ async fn read_response<S: AsyncRead + Unpin>(stream: S) -> Result<(), SinkError>
 
     loop {
         let mut line = String::new();
-        let read = reader
-            .read_line(&mut line)
-            .await
-            .map_err(|source| SinkError::Transport { source })?;
+        let read = reader.read_line(&mut line).await?;
         if read == 0 || line == "\r\n" || line == "\n" {
             break;
         }
     }
 
     let mut diagnostic = String::new();
-    reader
-        .read_line(&mut diagnostic)
-        .await
-        .map_err(|source| SinkError::Transport { source })?;
+    reader.read_line(&mut diagnostic).await?;
     Err(SinkError::Status {
         code,
         message: diagnostic.trim_end().to_string(),

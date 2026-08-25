@@ -108,6 +108,12 @@ impl core::error::Error for TargetError {
     }
 }
 
+impl From<FlockfileError> for TargetError {
+    fn from(source: FlockfileError) -> Self {
+        Self::Flockfile(source)
+    }
+}
+
 /// `start`'s mapping from a resolution failure to the exit code that
 /// reports it.
 ///
@@ -291,9 +297,7 @@ pub fn resolve_target(
                     "stdin is not UTF-8",
                 ))
             })?;
-            Flockfile::parse(&source, FlockFormat::Json)
-                .map(|flockfile| flockfile.apps)
-                .map_err(TargetError::Flockfile)
+            Ok(Flockfile::parse(&source, FlockFormat::Json)?.apps)
         }
         (_, format) if as_flockfile => match format {
             Some(format) => {
@@ -301,15 +305,13 @@ pub fn resolve_target(
                     path: path.to_path_buf(),
                     source,
                 })?;
-                Flockfile::parse(&source, format)
-                    .map(|flockfile| default_cwd_to_flockfile_dir(flockfile.apps, path))
-                    .map_err(TargetError::Flockfile)
+                let flockfile = Flockfile::parse(&source, format)?;
+                Ok(default_cwd_to_flockfile_dir(flockfile.apps, path))
             }
             None if path.extension().and_then(|e| e.to_str()) == Some("js") => {
                 let json = evaluate_js_flockfile(path)?;
-                Flockfile::parse(&json, FlockFormat::Json)
-                    .map(|flockfile| default_cwd_to_flockfile_dir(flockfile.apps, path))
-                    .map_err(TargetError::Flockfile)
+                let flockfile = Flockfile::parse(&json, FlockFormat::Json)?;
+                Ok(default_cwd_to_flockfile_dir(flockfile.apps, path))
             }
             None => Err(TargetError::UnknownFlockfileFormat {
                 path: path.to_path_buf(),
@@ -320,9 +322,8 @@ pub fn resolve_target(
                 path: path.to_path_buf(),
                 source,
             })?;
-            Flockfile::parse(&source, format)
-                .map(|flockfile| default_cwd_to_flockfile_dir(flockfile.apps, path))
-                .map_err(TargetError::Flockfile)
+            let flockfile = Flockfile::parse(&source, format)?;
+            Ok(default_cwd_to_flockfile_dir(flockfile.apps, path))
         }
         // Absolutised against the CLI's cwd, which is the cwd the `exists`
         // check just above was answered from. Without this the check and the

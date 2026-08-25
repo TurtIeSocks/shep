@@ -218,6 +218,12 @@ impl core::error::Error for IndexError {
     }
 }
 
+impl From<FetchError> for IndexError {
+    fn from(source: FetchError) -> Self {
+        Self::Fetch(source)
+    }
+}
+
 /// Where to read the index from: `SHEP_DOG_INDEX` when it is set, and
 /// [`DEFAULT_INDEX_URL`] when it is not.
 ///
@@ -246,11 +252,9 @@ pub fn index_url() -> String {
 /// - [`IndexError::Malformed`], [`IndexError::NotAnArray`] — as
 ///   [`parse_index`].
 pub async fn fetch_index(url: &str) -> Result<Index, IndexError> {
-    let target = fetch::parse_url(url).map_err(IndexError::Fetch)?;
+    let target = fetch::parse_url(url)?;
     require_secure_url(url, &target)?;
-    let bytes = fetch::get(&target, SIZE_LIMIT, TIMEOUT)
-        .await
-        .map_err(IndexError::Fetch)?;
+    let bytes = fetch::get(&target, SIZE_LIMIT, TIMEOUT).await?;
     parse_index(&bytes)
 }
 

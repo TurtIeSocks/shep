@@ -91,6 +91,19 @@ impl core::error::Error for DaemonRunError {
     }
 }
 
+impl From<DaemonConfigError> for DaemonRunError {
+    fn from(source: DaemonConfigError) -> Self {
+        Self::Config(source)
+    }
+}
+
+// `Self::Boot` and `Self::Run` both wrap `BootError`, so only one of them
+// could ever claim `impl From<BootError> for DaemonRunError` — and this
+// enum's own doc says they must stay distinct (a `BootError` from `run()`
+// means the supervisor came up and served, which "failed to boot" would
+// misreport). Both stay explicit `map_err` calls; see this task's own
+// report.
+
 /// Loads `paths.daemon_config`'s raw source, treating a missing file as "no
 /// file" rather than an error.
 ///
@@ -245,8 +258,7 @@ pub async fn boot_supervisor(
     let env = |key: &str| std::env::var(key).ok();
     let file_source = read_daemon_config_source(&paths)?;
     let overrides = daemon_overrides(args);
-    let config = DaemonConfig::load_layered(file_source.as_deref(), &env, &overrides)
-        .map_err(DaemonRunError::Config)?;
+    let config = DaemonConfig::load_layered(file_source.as_deref(), &env, &overrides)?;
     install_log_subscriber(&config);
     // The one read of this variable in the workspace, here beside every
     // `SHEP_*` override rather than inside shep-daemon — see
