@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-23
 **Status:** design approved by Rin, awaiting spec review
-**Scope:** `shep-cli` only. No behaviour change, no wire change, no new output.
+**Scope:** `shep-cli`, plus `shep-core` and `shep-daemon` for Move 4. No behaviour change, no wire change, no new output.
 
 ## The ask
 
@@ -148,6 +148,76 @@ straight through.
 to save nothing. The rule: convert a command when it has **two or more** early
 returns. Leave the rest.
 
+## Move 4: `From` impls for the conversions that carry nothing else
+
+Raised separately by Rin, 2026-08-23: there are a lot of `map_err` call sites,
+and would a crate like `thiserror` map them automatically.
+
+Counted across all three crates: **220 `map_err` sites.** They do two
+different jobs, and only one of them is boilerplate.
+
+| | count | can a `From` impl erase it |
+|---|---|---|
+| pure conversion, `.map_err(KvError::Io)?` | 72 | yes |
+| adds context: a path, a URL, a field name | 148 | **no, and it must not** |
+
+**Two thirds of them are not boilerplate.** `TargetError::Read { source, path }`
+exists so the error names the file it could not read, and the source
+`io::Error` does not carry that. Erasing those loses the path.
+
+That is also load-bearing rather than incidental. This project already relies
+on the absence of a blanket conversion: `shep-log-rotate`'s `Error` has no
+`From<std::io::Error>` specifically so a caller cannot `?` past the point
+where a path should be named. A `From` impl is exactly the thing that lets
+somebody do that by accident later.
+
+### Why not `thiserror`
+
+Its two halves land differently and neither fits.
+
+- **`#[error("...")]` collides with a rule already written.** IR-19 in
+  `docs/idiomatic-rust.md` specifies "manual `Display` via
+  `f.write_str(match ...)`". Adopting the derive means changing IR-19, which
+  is a separate decision about house style and not one this cleanup should
+  make on the way past.
+- **`#[from]` is the half worth having**, and all it generates is a `From`
+  impl, which is three hand-written lines. No dependency, no proc macro, no
+  compile cost, no conflict.
+
+So the crate would buy the half that is not wanted and collide with a rule
+that already exists. `anyhow` is separately ruled out by IR-18, which permits
+it only inside `shep`.
+
+### What to write
+
+**26 of shep's own error variants cover 66 of the 72 sites.** `KvError::Io`
+appears eight times, `SinkError::Transport` seven, `FetchError::Transport`
+six. Each becomes one `From` impl and the call sites become a bare `?`.
+
+The remaining six are conversions into foreign types (`std::io::Error::other`,
+`serde::de::Error::custom`). The orphan rule blocks a `From` impl for those,
+so they stay as they are.
+
+### The guard rail, which is the point of this move
+
+**Add a `From` only where the variant carries the source and nothing else.**
+
+The moment a variant has a second field, the explicit `map_err` is the
+feature, not the noise: it is what forces the next person to supply the path.
+So this move is not "convert every `map_err` it can reach", it is "convert
+exactly the ones where there was never anything else to say".
+
+Writing a `From` is also a claim about the future: it says this variant will
+never want context. Where that looks doubtful, leave the `map_err`. A missing
+`From` costs one visible line; a wrong one costs a path that quietly stops
+being reported.
+
+### Sequencing
+
+Independent of Moves 1 to 3 and of no fixed order relative to them, since it
+touches error construction rather than the streams plumbing. Its own commit,
+or one per crate if the diff reads better split.
+
 ## What must not change
 
 - **Every byte on stderr.** Same code string, same message, same format in
@@ -168,6 +238,8 @@ noise.
 2. **`fail`/`note` methods**, and the call sites moved onto them.
 3. **Inner functions**, one command at a time, only where there are two or
    more early returns.
+4. **`From` impls** for the 26 source-only variants. Independent of the other
+   three and orderable anywhere among them.
 
 ## Testing
 
@@ -195,3 +267,7 @@ useful test is a **before-and-after byte comparison**.
 6. **The 92 test constructions get the field rather than a `Streams::new`
    helper.** A constructor would hide which format a test exercises, and that
    is the thing worth reading in a test that asserts on rendered output.
+7. **No error crate.** `thiserror` collides with IR-19's manual `Display`, and
+   the half of it worth having is three lines written by hand.
+8. **`From` only for source-only variants.** The 148 context-carrying
+   `map_err` sites stay exactly as they are.
