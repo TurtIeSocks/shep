@@ -540,6 +540,29 @@ pub fn emit_error(
     code: &str,
     message: &str,
 ) -> io::Result<()> {
+    // Sanitised here rather than at each caller, because here is the only
+    // place every caller passes through. shep grew its first error text that
+    // came off the wire when `dogs --available` learned to fetch a community
+    // index, and a hostile `Location:` header cleared an operator's screen
+    // through this very `writeln!`. That instance is fixed at its source, but
+    // the NEXT error carrying somebody else's bytes would get no warning, and
+    // shep emits colour itself, so a reader cannot tell shep's escapes from
+    // an attacker's.
+    //
+    // Both arms, not just the table one. `serde_json` escapes a control byte
+    // into `\u001b` so a terminal never renders it, but a script doing
+    // `shep ... --format json | jq -r .error.message` unescapes it straight
+    // back onto a terminal.
+    //
+    // `code` is deliberately not sanitised: every one is a `&'static str`
+    // from `ExitCode::code_str` or a literal at the call site, so none of
+    // them is ever attacker-supplied.
+    //
+    // Costs one scan of a message shep is about to print anyway.
+    // `terminal_safe::sanitise` returns early when there is nothing
+    // unprintable, which is every message shep writes itself.
+    let (message, _) = crate::terminal_safe::sanitise(message);
+    let message = message.as_str();
     match fmt {
         Format::Json => {
             let envelope = ErrorEnvelope {
@@ -624,6 +647,9 @@ pub fn emit_notice(
     code: &str,
     message: &str,
 ) -> io::Result<()> {
+    // Sanitised for the reason [`emit_error`] is, one function up.
+    let (message, _) = crate::terminal_safe::sanitise(message);
+    let message = message.as_str();
     match fmt {
         Format::Json => {
             let envelope = NoticeEnvelope {
@@ -1028,6 +1054,34 @@ mod tests {
 
     /// `emit_error`'s two renderings, side by side: `error[code]: message`
     /// on the table surface, the `ErrorEnvelope` JSON object on the other.
+    #[test]
+    fn no_escape_reaches_a_stream_through_either_emitter() {
+        // The class fix. `fetch.rs` sanitises the two error texts that come
+        // off the wire today, but the guarantee has to live where every
+        // caller passes through, or the next one to carry somebody else's
+        // bytes reintroduces the hole silently.
+        let hostile = "cleared\u{1b}[2Jand\u{1b}]0;retitled\u{7}";
+        for fmt in [Format::Table, Format::Json] {
+            for (what, mut out) in [("error", Vec::new()), ("notice", Vec::new())] {
+                if what == "error" {
+                    emit_error(&mut out, fmt, "failure", hostile).unwrap();
+                } else {
+                    emit_notice(&mut out, fmt, "whatever", hostile).unwrap();
+                }
+                assert!(
+                    !out.contains(&0x1b),
+                    "{what} in {fmt:?} let an ESC through: {:?}",
+                    String::from_utf8_lossy(&out)
+                );
+                assert!(
+                    !out.contains(&0x07),
+                    "{what} in {fmt:?} let a BEL through: {:?}",
+                    String::from_utf8_lossy(&out)
+                );
+            }
+        }
+    }
+
     #[test]
     fn what_an_error_looks_like_on_the_wire() {
         for (fmt, name) in [(Format::Table, "table"), (Format::Json, "json")] {
