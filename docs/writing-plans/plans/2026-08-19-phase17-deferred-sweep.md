@@ -110,9 +110,9 @@ Seven `spawn_index` accessors documented as panicking, without the attribute tha
 
 From the teaching session. Two halves:
 
-- [ ] **Make `group` and `blurb` required**, the way `example` already is, with a test that fails the build when a field lacks them. Twenty of forty fields carry no `group` today and sort last; twenty carry no `blurb` and fall back to `///` prose written for developers (`ActionOutcome::TimedOut`, `DEFAULT_DEADLINE`, spec section numbers).
-- [ ] **Restore Rin's own prose** for `autorestart` and `cwd`, which unification replaced with the `///` text. Her wording was "Restarts the process automatically when it exits unexpectedly" and "Falls back to the cwd of the shep daemon if omitted" — the latter needs rewording anyway once Task 2 lands.
-- [ ] Once every field has a `blurb`, the em-dash sweep Rin made across `app.rs`'s doc comments can be reverted: operator prose lives in `blurb`, so `///` goes back to being for developers. **Ask before reverting it** — it is her change.
+- [x] **Make `group` and `blurb` required**, the way `example` already is, with a test that fails the build when a field lacks them. Done 2026-08-23: all forty fields carry both, and `every_field_carries_a_group_and_a_blurb` refuses a missing one, an unknown group, a dash, or a trailing full stop. The count was worse than this line said, 35 blurbs missing rather than 20.
+- [x] **Restore Rin's own prose** for `autorestart` and `cwd`, which unification replaced with the `///` text. `autorestart` is back to her wording; `cwd` already carried hers and was reworded for Task 2 as that entry anticipated. Her wording was "Restarts the process automatically when it exits unexpectedly" and "Falls back to the cwd of the shep daemon if omitted" — the latter needs rewording anyway once Task 2 lands.
+- [ ] **STILL OPEN, needs Rin.** Once every field has a `blurb`, the em-dash sweep Rin made across `app.rs`'s doc comments can be reverted: operator prose lives in `blurb`, so `///` goes back to being for developers. **Ask before reverting it** — it is her change.
 
 ---
 

@@ -615,6 +615,62 @@ mod tests {
     }
 
     #[test]
+    fn every_field_carries_a_group_and_a_blurb() {
+        // Without this the gap is invisible: a field with no `group` sorts
+        // after every grouped one and a field with no `blurb` silently falls
+        // back to its `///` doc, which is written for somebody reading the
+        // source. Several of those cite internal type names and spec section
+        // numbers, so the scaffold reads fine right up until the line that
+        // does not.
+        let schema = crate::config::flockfile_schema_json();
+        let props = properties(&schema);
+
+        let mut faults: Vec<String> = Vec::new();
+        for (name, field) in props {
+            let init = field["init"].as_object();
+            let group = init.and_then(|i| i.get("group")).and_then(|g| g.as_str());
+            let blurb = init.and_then(|i| i.get("blurb")).and_then(|b| b.as_str());
+
+            match group {
+                None => faults.push(format!("{name}: no `group`")),
+                Some(group) if !GROUP_ORDER.contains(&group) => {
+                    faults.push(format!(
+                        "{name}: unknown group {group:?}, expected one of {GROUP_ORDER:?}"
+                    ));
+                }
+                Some(_) => {}
+            }
+            match blurb {
+                None => faults.push(format!("{name}: no `blurb`")),
+                Some(blurb) if blurb.trim().is_empty() => {
+                    faults.push(format!("{name}: empty `blurb`"));
+                }
+                // The scaffold puts these in a column of comments, so they
+                // are consistent or they look broken. No dash anywhere a
+                // person reads is a project-wide rule; the missing full stop
+                // is the house style the first five set.
+                Some(blurb) if blurb.contains('\u{2014}') || blurb.contains('\u{2013}') => {
+                    faults.push(format!("{name}: `blurb` has a dash in it"));
+                }
+                Some(blurb) if blurb.trim_end().ends_with('.') => {
+                    faults.push(format!(
+                        "{name}: `blurb` ends with a full stop; the others do not"
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+
+        assert!(
+            faults.is_empty(),
+            "every AppConfig field needs `init.group` and `init.blurb`, set with \
+             #[cfg_attr(feature = \"schema\", schemars(extend(\"init\" = {{ .. }})))] \
+             in config/app.rs:\n  {}",
+            faults.join("\n  ")
+        );
+    }
+
+    #[test]
     fn every_curated_field_is_a_real_field() {
         let schema = crate::config::flockfile_schema_json();
         let props = properties(&schema);
