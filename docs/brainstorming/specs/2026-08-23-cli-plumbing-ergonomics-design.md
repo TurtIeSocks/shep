@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-23
 **Status:** design approved by Rin, awaiting spec review
-**Scope:** `shep-cli`, plus `shep-core` and `shep-daemon` for Move 4. No behaviour change, no wire change, no new output.
+**Scope:** `shep-cli`, plus `shep-core` and `shep-daemon` for Move 3. No behaviour change, no wire change, no new output.
 
 ## The ask
 
@@ -24,7 +24,6 @@ removes most of it in plain Rust.
 | `emit_error` call sites | 91 |
 | `emit_notice` call sites | 20 |
 | of which discard the result with `let _ =` | **all of them** |
-| `Err(code) =>` blocks | 38, but see Move 3: **20 are `run`'s dispatch** and stay |
 | functions taking `streams: &mut Streams` | 84 |
 | of those that ALSO take `fmt: Format` | **84** |
 | `Streams { .. }` constructions in production | 12, all in `lib.rs` |
@@ -113,58 +112,7 @@ return streams.fail(ExitCode::Usage, &message);
 `fail` returning the code it printed is what collapses the two statements into
 one. The code appears once instead of twice, so the pair cannot drift.
 
-## Move 3: the match blocks are `?` in a costume
-
-```rust
-Ok(target) => target,
-Err(code) => return code,
-```
-
-That is exactly what `?` does. It is written out because the enclosing
-function returns `ExitCode` rather than `Result<_, ExitCode>`. The fix is the
-ordinary Rust shape: a thin public wrapper over an inner function that returns
-a `Result`.
-
-```rust
-pub async fn init(streams: &mut Streams<'_>, args: &InitArgs) -> ExitCode {
-    match init_inner(streams, args).await {
-        Ok(()) => ExitCode::Success,
-        Err(code) => code,
-    }
-}
-
-async fn init_inner(streams: &mut Streams<'_>, args: &InitArgs) -> Result<(), ExitCode> {
-    let cwd = get_cwd(streams)?;
-    let (path, format) = target(streams, &cwd, args)?;
-    // ...
-}
-```
-
-**This move is the weakest of the four, and measuring it is what showed that.**
-
-Of the 38 blocks, **20 are `Err(code) => code,` inside `run`'s dispatch match**,
-one arm per verb. Those are not convertible: they ARE the wrapper this move
-would otherwise add, and they stay exactly as they are.
-
-That leaves 18 in `commands/`, and they are spread one per function almost
-everywhere. Applying the rule below, only **two** functions qualify:
-
-| function | early returns |
-|---|---|
-| `commands/bleats.rs::bleats_with_signal` | 3 |
-| `commands/init.rs::init` | 2 |
-
-Everything else (`stop`, `restart`, `reload`, `delete`, `reopen`, `flush`, and
-six singletons) has exactly one, where a wrapper would be ceremony added to
-save a line.
-
-**The rule: convert a command when it has two or more early returns.** So this
-move touches two functions and removes about five lines. It is kept because
-`bleats_with_signal` is genuinely the worst of them and because Moves 1 and 2
-make the inner-function shape cheaper to adopt later, not because the payoff
-is large. If it were the whole proposal it would not be worth doing.
-
-## Move 4: `From` impls for the conversions that carry nothing else
+## Move 3: `From` impls for the conversions that carry nothing else
 
 Raised separately by Rin, 2026-08-23: there are a lot of `map_err` call sites,
 and would a crate like `thiserror` map them automatically.
@@ -230,7 +178,7 @@ being reported.
 
 ### Sequencing
 
-Independent of Moves 1 to 3 and of no fixed order relative to them, since it
+Independent of Moves 1 and 2 and of no fixed order relative to them, since it
 touches error construction rather than the streams plumbing. Its own commit,
 or one per crate if the diff reads better split.
 
@@ -246,16 +194,21 @@ or one per crate if the diff reads better split.
 ## Sequencing, and why it is three commits
 
 Each move is independently green and independently revertable. That matters
-more than usual here because this touches 91 emit sites, 84 signatures and 38
-matches, which is exactly the diff shape where a behaviour change hides in the
-noise.
+more than usual here because Moves 1 and 2 together touch 91 emit sites and 84
+signatures, which is exactly the diff shape where a behaviour change hides in
+the noise.
 
 1. **`fmt` into `Streams`.** Largest mechanical diff, zero logic.
 2. **`fail`/`note` methods**, and the call sites moved onto them.
-3. **Inner functions**, one command at a time, only where there are two or
-   more early returns.
-4. **`From` impls** for the 26 source-only variants. Independent of the other
-   three and orderable anywhere among them.
+3. **`From` impls** for the 26 source-only variants. Independent of the other
+   two and orderable anywhere among them.
+
+**A fourth move was dropped before planning.** Converting the
+`Ok(x) => x, Err(code) => return code` blocks into `?` behind inner functions
+looked like 38 sites and turned out to be two. Twenty of the thirty-eight are
+`run`'s own dispatch match, one arm per verb, which is the wrapper such a move
+would otherwise add rather than something to convert. The rest sit one per
+function almost everywhere. Rin's call, 2026-08-23, on the measurement.
 
 ## Testing
 
@@ -278,12 +231,12 @@ useful test is a **before-and-after byte comparison**.
 3. **`fmt` moves into `Streams` rather than becoming a global**, keeping this
    crate's stated rule that presentation inputs are parameters.
 4. **`emit_error` and friends stay** as free functions.
-5. **Inner functions only where there are two or more early returns**, so the
-   refactor does not add ceremony to commands that do not need it.
-6. **The 93 test constructions get the field rather than a `Streams::new`
+5. **The 93 test constructions get the field rather than a `Streams::new`
    helper.** A constructor would hide which format a test exercises, and that
    is the thing worth reading in a test that asserts on rendered output.
-7. **No error crate.** `thiserror` collides with IR-19's manual `Display`, and
+6. **No error crate.** `thiserror` collides with IR-19's manual `Display`, and
    the half of it worth having is three lines written by hand.
-8. **`From` only for source-only variants.** The 148 context-carrying
+7. **`From` only for source-only variants.** The 148 context-carrying
    `map_err` sites stay exactly as they are.
+8. **The inner-function move is dropped**, on the measurement rather than on
+   principle. Two functions qualified.
