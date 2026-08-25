@@ -32,7 +32,7 @@
 //! and it says so in its own help text.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use shep_client::Client;
 use shep_core::barks;
@@ -352,7 +352,7 @@ impl core::error::Error for AdoptRefusal {}
 /// # Errors
 /// The refusal, which the caller renders. Nothing here is a shep fault, so
 /// none of these is an [`ExitCode::Internal`].
-pub fn vet_binary(path: &Path) -> Result<VettedBinary, AdoptRefusal> {
+pub fn vet_binary(path: &Path, home: &Path) -> Result<VettedBinary, AdoptRefusal> {
     let metadata = std::fs::metadata(path).map_err(|_| AdoptRefusal::Missing)?;
     if !metadata.is_file() {
         return Err(AdoptRefusal::NotAFile);
@@ -378,7 +378,38 @@ pub fn vet_binary(path: &Path) -> Result<VettedBinary, AdoptRefusal> {
     // ignored (a process that already exited is not a failure to vet), but
     // `wait` always runs, on every path out of this match, so no zombie
     // survives a refusal or a success.
-    match Command::new(&canonical).spawn() {
+    //
+    // `SHEP_HOME` is set to the home this invocation actually resolved, and
+    // that is a fix rather than a detail. It used to be inherited, so
+    // `shep adopt --home /tmp/scratch ./my-dog` vetted `my-dog` against
+    // whatever `SHEP_HOME` the shell had, which is usually nothing, so the
+    // candidate resolved the DEFAULT home instead. A dog reads `SHEP_HOME`
+    // to find its socket, which is the one thing `docs/dogs.md` promises it,
+    // so a rotator or anything else with a job to do connected to the live
+    // daemon and did it, during the command whose entire purpose was
+    // deciding whether to trust the binary at all. Found 2026-08-20 while
+    // building `shep-log-rotate`; nothing was lost only because that dog's
+    // default size threshold happened to be larger than the logs it found.
+    //
+    // NOT `env_clear()`, though an earlier note of mine suggested it. A real
+    // adopted dog runs with the daemon's own filtered environment merged
+    // under its `[dog.<name>]` env (`AppConfig::env`'s doc), so clearing
+    // here would vet under stricter conditions than the dog will ever run
+    // under, and a binary needing `DYLD_LIBRARY_PATH` or its like would be
+    // refused despite working perfectly once adopted. Vetting has to model
+    // the real thing, not an idealised one.
+    //
+    // Stdio goes to null. A candidate that writes on its way up would
+    // otherwise scribble over the operator's terminal mid-vet, and a hostile
+    // one could imitate shep's own output at the exact moment somebody is
+    // deciding whether to trust it.
+    match Command::new(&canonical)
+        .env("SHEP_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
         Err(err) => Err(AdoptRefusal::WillNotExec {
             reason: err.to_string(),
         }),
@@ -560,7 +591,7 @@ fn warn_group_writable(streams: &mut Streams<'_>, path: &Path) {
 /// `shep adopt <name> <path>`: vets a binary shep has never seen, records
 /// it, and starts it if a shepherd is running.
 pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArgs) -> ExitCode {
-    let vetted = match vet_binary(&args.path) {
+    let vetted = match vet_binary(&args.path, &paths.home) {
         Ok(vetted) => vetted,
         Err(refusal) => return fail_adopt(streams, &args.path, &refusal),
     };
@@ -995,20 +1026,26 @@ mod tests {
     fn a_binary_shep_has_never_seen_is_vetted_before_anything_is_written() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            vet_binary(&dir.path().join("nope")),
+            vet_binary(&dir.path().join("nope"), dir.path()),
             Err(AdoptRefusal::Missing)
         );
-        assert_eq!(vet_binary(dir.path()), Err(AdoptRefusal::NotAFile));
+        assert_eq!(
+            vet_binary(dir.path(), dir.path()),
+            Err(AdoptRefusal::NotAFile)
+        );
 
         let plain = dir.path().join("plain");
         std::fs::write(&plain, "#!/bin/sh\nexit 0\n").unwrap();
-        assert_eq!(vet_binary(&plain), Err(AdoptRefusal::NotExecutable));
+        assert_eq!(
+            vet_binary(&plain, dir.path()),
+            Err(AdoptRefusal::NotExecutable)
+        );
 
         // The same file, now executable: the ONLY thing that changed is the
         // mode bit, so a `vet_binary` that refused for some other reason
         // fails here rather than passing for the wrong one.
         chmod(&plain, 0o755);
-        let vetted = vet_binary(&plain).unwrap();
+        let vetted = vet_binary(&plain, dir.path()).unwrap();
         assert_eq!(vetted.path, plain.canonicalize().unwrap());
         assert!(
             vetted.group_writable.is_empty(),
@@ -1020,7 +1057,7 @@ mod tests {
         std::fs::write(&bogus, b"\x7fELF\x00\x00\x00 not really").unwrap();
         chmod(&bogus, 0o755);
         assert!(matches!(
-            vet_binary(&bogus),
+            vet_binary(&bogus, dir.path()),
             Err(AdoptRefusal::WillNotExec { .. })
         ));
     }
@@ -1041,7 +1078,7 @@ mod tests {
         std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
         chmod(&bin, 0o757);
         assert_eq!(
-            vet_binary(&bin),
+            vet_binary(&bin, dir.path()),
             Err(AdoptRefusal::WorldWritable {
                 path: bin.canonicalize().unwrap(),
             }),
@@ -1052,7 +1089,7 @@ mod tests {
         chmod(&bin, 0o755);
         chmod(dir.path(), 0o777);
         assert_eq!(
-            vet_binary(&bin),
+            vet_binary(&bin, dir.path()),
             Err(AdoptRefusal::WorldWritable {
                 path: bin.canonicalize().unwrap().parent().unwrap().to_path_buf(),
             }),
@@ -1078,7 +1115,7 @@ mod tests {
         chmod(&bin, 0o775);
         chmod(&deploy, 0o775);
 
-        let vetted = vet_binary(&bin).unwrap();
+        let vetted = vet_binary(&bin, dir.path()).unwrap();
         assert_eq!(
             vetted.group_writable,
             vec![bin.canonicalize().unwrap(), deploy.canonicalize().unwrap()],
