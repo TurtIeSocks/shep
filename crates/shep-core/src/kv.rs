@@ -165,6 +165,18 @@ impl core::error::Error for KvError {
     }
 }
 
+impl From<std::io::Error> for KvError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Io(source)
+    }
+}
+
+impl From<serde_json::Error> for KvError {
+    fn from(source: serde_json::Error) -> Self {
+        Self::Decode(source)
+    }
+}
+
 /// Checks one key against the grammar.
 ///
 /// # Errors
@@ -334,7 +346,7 @@ fn read_file(path: &Path) -> Result<KvFile, KvError> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(KvFile::default()),
         Err(err) => return Err(KvError::Io(err)),
     };
-    let file: KvFile = serde_json::from_str(&raw).map_err(KvError::Decode)?;
+    let file: KvFile = serde_json::from_str(&raw)?;
     if file.version > KV_VERSION {
         return Err(KvError::FutureVersion(file.version));
     }
@@ -345,12 +357,12 @@ fn read_file(path: &Path) -> Result<KvFile, KvError> {
 /// own doc for the staged-temp-file-then-rename shape.
 fn write_file(path: &Path, file: &KvFile) -> Result<(), KvError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = create_kv_file(parent).map_err(KvError::Io)?;
+    let mut tmp = create_kv_file(parent)?;
 
-    let json = serde_json::to_string_pretty(file).map_err(KvError::Decode)?;
-    tmp.write_all(json.as_bytes()).map_err(KvError::Io)?;
-    tmp.write_all(b"\n").map_err(KvError::Io)?;
-    tmp.as_file().sync_all().map_err(KvError::Io)?;
+    let json = serde_json::to_string_pretty(file)?;
+    tmp.write_all(json.as_bytes())?;
+    tmp.write_all(b"\n")?;
+    tmp.as_file().sync_all()?;
 
     // `persist` is `rename(2)`. On failure the `NamedTempFile` comes back
     // inside the error and its `Drop` removes the staging file, so a failed
@@ -374,7 +386,7 @@ pub fn all(path: &Path) -> Result<BTreeMap<String, String>, KvError> {
     // file entirely — harmless in practice, since the rename is atomic and
     // the worst case is a whole old file, but not worth reasoning about
     // twice. Do not "optimize" this away without re-deriving that.
-    let _lock = KvLock::acquire(path).map_err(KvError::Io)?;
+    let _lock = KvLock::acquire(path)?;
     Ok(read_file(path)?.entries)
 }
 
@@ -412,7 +424,7 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), KvError> {
         });
     }
 
-    let _lock = KvLock::acquire(path).map_err(KvError::Io)?;
+    let _lock = KvLock::acquire(path)?;
     let mut file = read_file(path)?;
     file.version = KV_VERSION;
     file.entries.insert(key.to_string(), value.to_string());
@@ -428,7 +440,7 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), KvError> {
 pub fn unset(path: &Path, key: &str) -> Result<bool, KvError> {
     check_key(key)?;
 
-    let _lock = KvLock::acquire(path).map_err(KvError::Io)?;
+    let _lock = KvLock::acquire(path)?;
     let mut file = read_file(path)?;
     let was_present = file.entries.remove(key).is_some();
     if was_present {
@@ -446,7 +458,7 @@ pub fn unset(path: &Path, key: &str) -> Result<bool, KvError> {
 /// store that does not exist clears to `0` rather than failing — `shep unset
 /// --all` on a fresh machine is a success that removed nothing.
 pub fn clear(path: &Path) -> Result<u32, KvError> {
-    let _lock = KvLock::acquire(path).map_err(KvError::Io)?;
+    let _lock = KvLock::acquire(path)?;
     let file = read_file(path)?;
     let count = u32::try_from(file.entries.len()).unwrap_or(u32::MAX);
     if count > 0 {
