@@ -317,12 +317,30 @@ impl core::error::Error for ConnError {
     }
 }
 
+impl From<AuthError> for ConnError {
+    fn from(source: AuthError) -> Self {
+        Self::Auth(source)
+    }
+}
+
+// `Decode` and `Encode` both wrap `WireError`, so only one of them could
+// ever claim `impl From<WireError> for ConnError` — the compiler forbids a
+// second one for the same source type, and picking one anyway would make a
+// bare `?` silently mislabel the other direction. Both stay explicit
+// `map_err` calls; see this task's own report.
+
+impl From<std::io::Error> for ConnError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Frame(source)
+    }
+}
+
 // The ordering here is load-bearing (see `handshake` and `converse` below):
 // auth before a single byte is read from the peer, the handshake before any
 // request, and the writer task joined on every exit path so a protocol-skew
 // refusal is guaranteed to reach the wire before the socket closes.
 async fn handle_conn(stream: UnixStream, ctx: RpcContext) -> Result<(), ConnError> {
-    check_peer(&stream, daemon_uid()).map_err(ConnError::Auth)?;
+    check_peer(&stream, daemon_uid())?;
     let (read_half, write_half) = stream.into_split();
     let mut frames = FramedRead::new(read_half, codec());
     let (out_tx, out_rx) = mpsc::channel::<Bytes>(CONN_QUEUE);
@@ -367,7 +385,7 @@ async fn read_loop(
     forwarder: &mut Option<JoinHandle<()>>,
 ) -> Result<(), ConnError> {
     while let Some(frame) = frames.next().await {
-        let frame = frame.map_err(ConnError::Frame)?; // oversize/short frame ends the connection
+        let frame = frame?; // oversize/short frame ends the connection
         let envelope: Envelope = decode_frame(&frame).map_err(ConnError::Decode)?;
         match dispatch(envelope, ctx).await {
             Outcome::Reply(reply) => send(out, &reply).await?,
@@ -399,8 +417,7 @@ async fn handshake(
     let frame = tokio::time::timeout(Duration::from_millis(HANDSHAKE_TIMEOUT_MS), frames.next())
         .await
         .map_err(|_| ConnError::HandshakeTimeout)?
-        .ok_or(ConnError::NoHandshake)?
-        .map_err(ConnError::Frame)?;
+        .ok_or(ConnError::NoHandshake)??;
     let hello: Hello = decode_frame(&frame).map_err(ConnError::Decode)?;
     if hello.protocol != PROTOCOL_VERSION {
         // Version skew is a typed error, not silence (spec §6).

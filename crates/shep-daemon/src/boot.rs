@@ -469,8 +469,8 @@ fn write_ready(mut pipe: std::fs::File, ready: &DaemonReady) -> Result<(), BootE
     // floats), so this can't error in practice.
     let mut line = serde_json::to_string(ready).expect("DaemonReady always serializes");
     line.push('\n');
-    pipe.write_all(line.as_bytes())
-        .map_err(BootError::ReadyWrite)
+    pipe.write_all(line.as_bytes())?;
+    Ok(())
 }
 
 /// Options the CLI hands the daemon at boot.
@@ -808,10 +808,8 @@ async fn restore_flock(
     registry: &FlockRegistry,
     supervisor: &SupervisorHandle,
 ) -> Result<(), BootError> {
-    snapshot::muster(&paths.snapshot, registry, supervisor)
-        .await
-        .map(|_names| ())
-        .map_err(BootError::Snapshot)
+    snapshot::muster(&paths.snapshot, registry, supervisor).await?;
+    Ok(())
 }
 
 /// A booted daemon, not yet serving: everything [`boot`] assembled, handed
@@ -1257,6 +1255,18 @@ impl core::error::Error for BootError {
             Self::Snapshot(err) => Some(err),
             Self::ReadyWrite(err) => Some(err),
         }
+    }
+}
+
+impl From<std::io::Error> for BootError {
+    fn from(source: std::io::Error) -> Self {
+        Self::ReadyWrite(source)
+    }
+}
+
+impl From<SnapshotError> for BootError {
+    fn from(source: SnapshotError) -> Self {
+        Self::Snapshot(source)
     }
 }
 

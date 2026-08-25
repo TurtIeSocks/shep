@@ -220,6 +220,18 @@ impl core::error::Error for SnapshotError {
     }
 }
 
+impl From<serde_json::Error> for SnapshotError {
+    fn from(source: serde_json::Error) -> Self {
+        Self::Encode(source)
+    }
+}
+
+impl From<std::io::Error> for SnapshotError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Io(source)
+    }
+}
+
 /// Writes `snapshot` to `path` atomically: a temp file in the same
 /// directory (so `rename(2)` is guaranteed atomic — it only is within one
 /// filesystem), `fsync`ed, then renamed over `path`.
@@ -239,11 +251,11 @@ pub(crate) fn write_atomic(path: &Path, snapshot: &FlockSnapshot) -> Result<(), 
     let parent = path
         .parent()
         .ok_or_else(|| SnapshotError::NoParent(path.to_path_buf()))?;
-    let json = serde_json::to_vec_pretty(snapshot).map_err(SnapshotError::Encode)?;
+    let json = serde_json::to_vec_pretty(snapshot)?;
 
-    let mut tmp = NamedTempFile::new_in(parent).map_err(SnapshotError::Io)?;
-    tmp.write_all(&json).map_err(SnapshotError::Io)?;
-    tmp.as_file().sync_all().map_err(SnapshotError::Io)?;
+    let mut tmp = NamedTempFile::new_in(parent)?;
+    tmp.write_all(&json)?;
+    tmp.as_file().sync_all()?;
     tmp.persist(path)
         .map_err(|err| SnapshotError::Io(err.error))?;
     Ok(())
@@ -261,7 +273,7 @@ pub(crate) fn write_atomic(path: &Path, snapshot: &FlockSnapshot) -> Result<(), 
 /// - [`SnapshotError::Parse`] — invalid JSON, or a schema version this
 ///   daemon does not know.
 pub fn read(path: &Path) -> Result<FlockSnapshot, SnapshotError> {
-    let bytes = std::fs::read(path).map_err(SnapshotError::Io)?;
+    let bytes = std::fs::read(path)?;
     let snapshot: FlockSnapshot =
         serde_json::from_slice(&bytes).map_err(|err| SnapshotError::Parse(err.to_string()))?;
     if snapshot.version != SNAPSHOT_VERSION {
