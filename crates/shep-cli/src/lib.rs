@@ -1307,7 +1307,7 @@ async fn start_bare_shepherd(streams: &mut Streams<'_>, paths: &ShepPaths) -> Ex
             "shepherd already up (pid {}). `shep start <target>` adds a sheep.",
             online.pid
         );
-        streams.note("start", &message);
+        streams.aside("start", &message);
         return ExitCode::Success;
     }
     match connect_or_spawn_client(streams, paths).await {
