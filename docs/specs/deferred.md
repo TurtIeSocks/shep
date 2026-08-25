@@ -243,18 +243,26 @@ complain about. What would force it: a Linux box in the regular test loop, or a
 threat model that includes an attacker with write access to a log directory's
 parent.
 
-### Reload's Linux-only assertions have no automatic execution
+### Reload's Linux-only assertions have no automatic execution -- STALE, closed 2026-08-25
 
 `daemon_e2e.rs`'s `a_reload_costs_a_draining_app_no_connections` and
 `a_reload_costs_a_defiant_app_the_work_it_will_not_finish` each carry
 `#[cfg(target_os = "linux")]` on their reload connection-count assertion
 (`grep -n 'cfg(target_os = "linux")' crates/shep-daemon/tests/daemon_e2e.rs`
-finds both), which is correct: they depend on Linux's
-accept balancing. Their only real execution to date was one manual Docker run.
-Phase 10 added the `ubuntu-24.04-arm` and `ubuntu-latest` legs that would run
-them, but the workflow stays `workflow_dispatch`-only, so they still execute
-only when someone presses the button. Recorded so the gap is known, not because
-the tests are wrong.
+finds both), which is correct: they depend on Linux's accept balancing.
+
+**This entry described a real gap once and does not anymore.** It was
+written when the workflow was still `workflow_dispatch`-only; that changed
+2026-08-16 (see "Automatic CI" above), and the entry was never revisited
+after. As of 2026-08-25: the `test` job's `ubuntu-latest` and
+`ubuntu-24.04-arm` legs run `cargo test --workspace --locked --all-features`
+on every `push` to `main` and every `pull_request`. Neither leg's `--skip`
+filter (`::slow::`, `two_concurrent_boots`) matches either test name, the
+whole `daemon_e2e.rs` file is `#![cfg(unix)]` so it compiles on both Linux
+legs, and each leg's own `target_os` is `linux`, so the `#[cfg(target_os =
+"linux")]` numeric assertions themselves are compiled in and run, not just
+the platform-neutral half of each test. No workflow change was needed; the
+gap the entry named had already closed and nobody had said so.
 
 ### The `cli_e2e` 7-test correlation
 
