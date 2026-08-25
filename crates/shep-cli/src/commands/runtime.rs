@@ -5,6 +5,8 @@
 //! at PID 1, splits into `commands::reap`'s init loop first. Read decision
 //! 14 in Phase 15's plan before touching the split itself.
 
+use std::path::PathBuf;
+
 use shep_core::config::discover;
 use shep_core::paths::ShepPaths;
 
@@ -87,11 +89,7 @@ pub(crate) fn discovered_target(
     streams: &mut Streams<'_>,
     fmt: Format,
 ) -> Result<String, ExitCode> {
-    let cwd = std::env::current_dir().map_err(|err| {
-        let message = format!("could not read the current directory: {err}");
-        let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), &message);
-        ExitCode::Usage
-    })?;
+    let cwd = get_cwd(streams, fmt)?;
     match discover(&cwd) {
         Some(path) => Ok(path.to_string_lossy().into_owned()),
         None => {
@@ -103,4 +101,12 @@ pub(crate) fn discovered_target(
             Err(ExitCode::Usage)
         }
     }
+}
+
+pub(crate) fn get_cwd(streams: &mut Streams<'_>, fmt: Format) -> Result<PathBuf, ExitCode> {
+    std::env::current_dir().map_err(|err| {
+        let message = format!("could not read the current directory: {err}");
+        let _ = emit_error(&mut *streams.err, fmt, ExitCode::Usage.code_str(), &message);
+        ExitCode::Usage
+    })
 }

@@ -115,6 +115,9 @@ use shep_client::Client;
 use shep_client::spawn::{SpawnOutcome, connect_or_spawn};
 use shep_core::paths::ShepPaths;
 
+#[cfg(unix)]
+use crate::commands::init;
+
 /// The `shep` entry point. Parses this process's arguments and runs one verb.
 ///
 /// Returns rather than exiting, so the caller's `main` owns the process exit —
@@ -1225,6 +1228,7 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             Ok(client) => admin::kill(client, &mut streams, fmt).await,
             Err(code) => code,
         },
+        Commands::Init(ref args) => init::init(&mut streams, fmt, args).await,
         // Reads a file and writes a file; starts nothing, so there is
         // nothing to ask the socket. `logs::flush_daemon` is the other arm
         // that finishes without a client.

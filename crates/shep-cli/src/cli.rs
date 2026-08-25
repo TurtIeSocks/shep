@@ -50,7 +50,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     ),
     ("Foreground runs", &["runtime", "dev"]),
     ("Coming from pm2", &["import"]),
-    ("Help", &["welcome", "help", "completions", "style"]),
+    ("Help", &["welcome", "init", "help", "completions", "style"]),
 ];
 
 /// `--help`'s shape.
@@ -79,7 +79,7 @@ The shepherd     ping kill reopen flush set get unset
 Dogs and agents  dogs enable disable adopt rehome whistle
 Foreground runs  runtime dev
 Coming from pm2  import
-Help             welcome help completions style
+Help             welcome init help completions style
 
 Aliases          flock: list, ls   bleats: logs   lookout: dash   stock: scale   whisper: sendline
 
@@ -447,6 +447,8 @@ pub enum Commands {
     // defeat the point of keeping it hidden.
     #[command(alias = "resurrect")]
     Muster,
+    /// Write a commented Flockfile to start from
+    Init(InitArgs),
     /// Boot a shepherd in this process, run one Flockfile's flock in the
     /// foreground, and exit once nothing is left online.
     ///
@@ -1085,6 +1087,21 @@ pub struct DaemonArgs {
     pub max_cron_sleep: Option<shep_core::values::UpDuration>,
 }
 
+/// Arguments to `shep init`.
+#[derive(Debug, clap::Args)]
+pub struct InitArgs {
+    /// Where to write it. The extension picks the format: toml, yaml, yml,
+    /// json or json5. Defaults to Flockfile.toml in this directory
+    #[arg(value_name = "PATH")]
+    pub path: Option<PathBuf>,
+    /// Show every option the grammar has, not just the common ones
+    #[arg(long)]
+    pub all: bool,
+    /// Overwrite the Flockfile that is already here, keeping its own format
+    #[arg(long)]
+    pub force: bool,
+}
+
 /// Arguments to `shep runtime`.
 #[derive(Debug, clap::Args)]
 pub struct RuntimeArgs {
@@ -1143,6 +1160,44 @@ mod tests {
     fn the_command_tree_parses_and_is_internally_consistent() {
         use clap::CommandFactory;
         Cli::command().debug_assert(); // clap's own structural self-check
+    }
+
+    /// fails when a visible verb is missing from the docs site's CLI
+    /// reference generator.
+    ///
+    /// The generator's `VERBS` array is hand-kept, and regenerating the
+    /// reference refreshes only what that array already names -- so a verb
+    /// left out of it is invisible in the published docs and the generator
+    /// reports success. `style` and `welcome` shipped that way, found
+    /// 2026-08-23 when `init` did the same.
+    ///
+    /// `help` is clap's own subcommand and the one deliberate omission.
+    #[test]
+    fn every_visible_verb_reaches_the_docs_site_generator() {
+        use clap::CommandFactory;
+
+        const GENERATOR: &str = include_str!("../../../web/scripts/generate-cli-reference.sh");
+        const NOT_DOCUMENTED: &[&str] = &["help"];
+
+        let (_, rest) = GENERATOR
+            .split_once("VERBS=(")
+            .expect("the generator declares a VERBS array");
+        let (block, _) = rest.split_once(')').expect("the VERBS array closes");
+        let listed: Vec<&str> = block.split_whitespace().collect();
+
+        let command = Cli::command();
+        let missing: Vec<&str> = command
+            .get_subcommands()
+            .filter(|verb| !verb.is_hide_set())
+            .map(clap::Command::get_name)
+            .filter(|name| !NOT_DOCUMENTED.contains(name) && !listed.contains(name))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these verbs would be missing from the published CLI reference: {missing:?}\n\
+             add them to VERBS in web/scripts/generate-cli-reference.sh and re-run it"
+        );
     }
 
     /// Every visible verb is filed under exactly one heading, and every name
