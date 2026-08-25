@@ -960,6 +960,67 @@ mod tests {
         assert!(text.contains("the daemon dropped 3 events"));
     }
 
+    // --- cli-plumbing-ergonomics Task 1: pin the wire bytes -------------
+    //
+    // The refactor in flight (Tasks 2-3 of that plan) touches 91
+    // `emit_error` call sites, 84 signatures and 66 `map_err`s — exactly
+    // the diff shape where a behaviour change hides in the noise. These
+    // three tests snapshot the literal bytes `emit_error`/`emit_notice`
+    // write today, in both formats, so that refactor has something byte-
+    // exact to answer to instead of "the suite is still green."
+
+    /// `emit_error`'s two renderings, side by side: `error[code]: message`
+    /// on the table surface, the `ErrorEnvelope` JSON object on the other.
+    #[test]
+    fn what_an_error_looks_like_on_the_wire() {
+        for (fmt, name) in [(Format::Table, "table"), (Format::Json, "json")] {
+            let mut out = Vec::new();
+            emit_error(
+                &mut out,
+                fmt,
+                ExitCode::Usage.code_str(),
+                "no flock at /tmp/x",
+            )
+            .unwrap();
+            insta::assert_snapshot!(format!("error_{name}"), String::from_utf8(out).unwrap());
+        }
+    }
+
+    /// `emit_notice`'s two renderings: `notice[code]: message` on the table
+    /// surface, the `NoticeEnvelope` JSON object on the other — the
+    /// `notice` key is the whole reason this function exists rather than
+    /// reusing `emit_error`, so its shape belongs in the baseline too.
+    #[test]
+    fn what_a_notice_looks_like_on_the_wire() {
+        for (fmt, name) in [(Format::Table, "table"), (Format::Json, "json")] {
+            let mut out = Vec::new();
+            emit_notice(&mut out, fmt, "init", "wrote /tmp/x/Flockfile.toml").unwrap();
+            insta::assert_snapshot!(format!("notice_{name}"), String::from_utf8(out).unwrap());
+        }
+    }
+
+    /// Quotes and a backslash render differently in the two formats (JSON
+    /// escapes them, the table surface prints them raw), so a message
+    /// carrying both is what would catch a change to either rendering path
+    /// that a plain-ASCII message would not.
+    #[test]
+    fn an_error_message_with_awkward_bytes_survives_both_formats() {
+        for (fmt, name) in [(Format::Table, "table"), (Format::Json, "json")] {
+            let mut out = Vec::new();
+            emit_error(
+                &mut out,
+                fmt,
+                ExitCode::InvalidConfig.code_str(),
+                r#"bad "quoted" \path"#,
+            )
+            .unwrap();
+            insta::assert_snapshot!(
+                format!("error_awkward_{name}"),
+                String::from_utf8(out).unwrap()
+            );
+        }
+    }
+
     // --- Task 5b: colour, and the face in the STATUS column ------------
 
     use std::ffi::OsStr;
