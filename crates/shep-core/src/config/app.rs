@@ -1,4 +1,4 @@
-//! Per-app configuration schema - one sheep's Flockfile entry
+//! Per-app configuration schema — one sheep's Flockfile entry
 
 use core::fmt;
 
@@ -54,10 +54,10 @@ fn default_failure_threshold() -> u32 {
     3
 }
 
-/// Per-app configuration - one sheep's entry in a Flockfile
+/// Per-app configuration — one sheep's entry in a Flockfile
 ///
 /// Field names are the Flockfile contract (sheep-native; pm2 spellings are
-/// rejected - the importer translates them). Unknown fields are errors so
+/// rejected — the importer translates them). Unknown fields are errors so
 /// typos fail loudly at parse time.
 ///
 /// # Example
@@ -203,14 +203,14 @@ pub struct AppConfig {
     /// How long a triggered action gets to answer on the shepherd channel
     /// before its row becomes `ActionOutcome::TimedOut`.
     ///
-    /// Defaults to 3s - comfortably under the 5s an RPC caller gets when it
+    /// Defaults to 3s — comfortably under the 5s an RPC caller gets when it
     /// sends no deadline of its own (`shep-client`'s `DEFAULT_DEADLINE`,
     /// mirrored daemon-side as `rpc`'s `DEFAULT_DEADLINE_MS`). The margin
     /// matters more than the number: push this past that budget and a caller
     /// using the plain default gives up with `DeadlineExceeded` before the
     /// daemon's own honest `TimedOut` row ever reaches it. A legitimately
     /// slow action (a cache flush, say) can still ask for longer, but its
-    /// caller has to ask for a longer deadline in step -
+    /// caller has to ask for a longer deadline in step —
     /// `Client::request_with_deadline`, the way `shep logs -f` already asks
     /// for `LOG_PLANE_DEADLINE` rather than the client's default. `normalize`
     /// refuses a value no caller could ever satisfy, however long a deadline
@@ -222,7 +222,7 @@ pub struct AppConfig {
         "blurb": "How long a triggered action has to answer before shep gives up"
     })))]
     pub action_timeout: UpDuration,
-    /// Memory ceiling - polling enforcer restarts above this
+    /// Memory ceiling — polling enforcer restarts above this
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "512M",
         "group": "control",
@@ -317,11 +317,11 @@ pub struct AppConfig {
     /// - Flipping it for the whole flock is a behaviour change to processes
     ///   nobody asked to change.
     /// - **Programs detect stdin.** A closed or null fd 0 is how a great many
-    ///   programs decide they are non-interactive - no prompt, no pager, no
+    ///   programs decide they are non-interactive — no prompt, no pager, no
     ///   readline, no colour. Handing them a pipe silently moves them to the
     ///   other branch.
     /// - It costs a descriptor and a pump task per sheep for the whole life of
-    ///   the process, against spec §14.11's single-digit-MB idle-RSS goal - the
+    ///   the process, against spec §14.11's single-digit-MB idle-RSS goal — the
     ///   same budget [`Self::channel`]'s own default is protecting.
     ///
     /// Unlike `channel`, nothing implies this: `wait_ready` and
@@ -343,7 +343,7 @@ pub struct AppConfig {
         "blurb": "Wait for the app to say it is ready on the channel"
     })))]
     pub wait_ready: bool,
-    /// Asserts that the app itself sets `SO_REUSEPORT` before it binds -
+    /// Asserts that the app itself sets `SO_REUSEPORT` before it binds —
     /// shep binds nothing, so it cannot set the option on the app's behalf.
     /// The child process owns the mechanism (Node ≥22's `reusePort`, Go's
     /// `net.ListenConfig.Control`, nginx's `reuseport`); shep's contribution
@@ -357,20 +357,20 @@ pub struct AppConfig {
     /// dropping it would silently discard a value out of an imported config.
     /// It becomes load-bearing the day shep gains a reload mode that does NOT
     /// overlap by default, which is when the permission it describes stops
-    /// being free - see `docs/specs/deferred.md`.
+    /// being free — see `docs/specs/deferred.md`.
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "group": "process",
         "blurb": "Not built yet. Setting it is refused rather than quietly ignored"
     })))]
     pub reuse_port: bool,
-    /// Readiness probe - gates reload's AwaitReady (spec §7)
+    /// Readiness probe — gates reload's AwaitReady (spec §7)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": { "kind": "http", "target": "http://127.0.0.1:8080/ready" },
         "group": "control",
         "blurb": "A health check shep waits on before it treats a reload as finished"
     })))]
     pub readiness_probe: Option<ProbeConfig>,
-    /// Liveness probe - failures feed the restart policy (spec §7)
+    /// Liveness probe — failures feed the restart policy (spec §7)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": { "kind": "http", "target": "http://127.0.0.1:8080/healthz" },
         "group": "control",
@@ -458,7 +458,7 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// A minimal config with spec defaults - the programmatic entry point
+    /// A minimal config with spec defaults — the programmatic entry point
     #[must_use]
     pub fn minimal(name: &str, script: &str) -> Self {
         Self {

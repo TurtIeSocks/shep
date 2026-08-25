@@ -347,7 +347,7 @@ fn document(syntax: &Syntax, names: &[String]) -> Vec<Line> {
             .unwrap_or_else(|| panic!("`{name}` is not a field of AppConfig"));
 
         if syntax.marker.is_some() {
-            for line in blurb(field).lines() {
+            for line in blurb(name, field).lines() {
                 lines.push(Line::Prose(line.to_owned()));
             }
         }
@@ -416,23 +416,29 @@ fn render(syntax: &Syntax, lines: &[Line]) -> String {
     out
 }
 
-/// What a field's line should explain, preferring the operator-facing blurb.
+/// What a field's line should explain.
 ///
-/// `init.blurb` is preferred over the `///` doc because the two have
-/// different readers: several of `AppConfig`'s docs cite internal types and
-/// spec sections, which mean nothing to somebody editing a Flockfile.
-fn blurb(field: &serde_json::Value) -> String {
+/// `init.blurb` and the `///` doc have different readers, and this takes the
+/// blurb. Several of `AppConfig`'s docs cite internal type names and spec
+/// section numbers, which mean nothing to somebody editing a Flockfile, and
+/// they carry em dashes because nothing an operator reads renders them.
+///
+/// # Panics
+/// If `field` has no `init.blurb`. Falling back to the `///` doc is what
+/// this used to do, and it is worse than failing: the operator gets prose
+/// written for somebody reading the source, in a file that otherwise reads
+/// as documentation, and nothing says so.
+/// `tests::every_field_carries_a_group_and_a_blurb` makes this unreachable,
+/// so a panic here means that test was removed rather than that a Flockfile
+/// was odd.
+#[track_caller]
+fn blurb(name: &str, field: &serde_json::Value) -> String {
     field["init"]
         .as_object()
         .and_then(|init| init.get("blurb"))
         .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            field["description"]
-                .as_str()
-                .expect("description must be present")
-                .to_owned()
-        })
+        .unwrap_or_else(|| panic!("`{name}` has no `init.blurb`; add one in config/app.rs"))
+        .to_owned()
 }
 
 /// A field's placeholder value, written the way `syntax` spells literals.

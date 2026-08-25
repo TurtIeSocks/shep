@@ -22,11 +22,11 @@
   "additionalProperties": false,
   "$defs": {
     "AppConfig": {
-      "description": "Per-app configuration - one sheep's entry in a Flockfile\n\nField names are the Flockfile contract (sheep-native; pm2 spellings are\nrejected - the importer translates them). Unknown fields are errors so\ntypos fail loudly at parse time.\n\n# Example\n```\nuse shep_core::config::AppConfig;\n\nlet app: AppConfig = toml::from_str(\"name = \\\"web\\\"\\nscript = \\\"./srv\\\"\").unwrap();\nassert!(app.autorestart); // spec default\n```",
+      "description": "Per-app configuration — one sheep's entry in a Flockfile\n\nField names are the Flockfile contract (sheep-native; pm2 spellings are\nrejected — the importer translates them). Unknown fields are errors so\ntypos fail loudly at parse time.\n\n# Example\n```\nuse shep_core::config::AppConfig;\n\nlet app: AppConfig = toml::from_str(\"name = \\\"web\\\"\\nscript = \\\"./srv\\\"\").unwrap();\nassert!(app.autorestart); // spec default\n```",
       "type": "object",
       "properties": {
         "action_timeout": {
-          "description": "How long a triggered action gets to answer on the shepherd channel\nbefore its row becomes `ActionOutcome::TimedOut`.\n\nDefaults to 3s - comfortably under the 5s an RPC caller gets when it\nsends no deadline of its own (`shep-client`'s `DEFAULT_DEADLINE`,\nmirrored daemon-side as `rpc`'s `DEFAULT_DEADLINE_MS`). The margin\nmatters more than the number: push this past that budget and a caller\nusing the plain default gives up with `DeadlineExceeded` before the\ndaemon's own honest `TimedOut` row ever reaches it. A legitimately\nslow action (a cache flush, say) can still ask for longer, but its\ncaller has to ask for a longer deadline in step -\n`Client::request_with_deadline`, the way `shep logs -f` already asks\nfor `LOG_PLANE_DEADLINE` rather than the client's default. `normalize`\nrefuses a value no caller could ever satisfy, however long a deadline\nit asks for; a value merely above the *default* budget is a caller's\nchoice to widen its own deadline, not a config error this crate can\nsee.",
+          "description": "How long a triggered action gets to answer on the shepherd channel\nbefore its row becomes `ActionOutcome::TimedOut`.\n\nDefaults to 3s — comfortably under the 5s an RPC caller gets when it\nsends no deadline of its own (`shep-client`'s `DEFAULT_DEADLINE`,\nmirrored daemon-side as `rpc`'s `DEFAULT_DEADLINE_MS`). The margin\nmatters more than the number: push this past that budget and a caller\nusing the plain default gives up with `DeadlineExceeded` before the\ndaemon's own honest `TimedOut` row ever reaches it. A legitimately\nslow action (a cache flush, say) can still ask for longer, but its\ncaller has to ask for a longer deadline in step —\n`Client::request_with_deadline`, the way `shep logs -f` already asks\nfor `LOG_PLANE_DEADLINE` rather than the client's default. `normalize`\nrefuses a value no caller could ever satisfy, however long a deadline\nit asks for; a value merely above the *default* budget is a caller's\nchoice to widen its own deadline, not a config error this crate can\nsee.",
           "$ref": "#/$defs/UpDuration",
           "default": "3s",
           "init": {
@@ -271,7 +271,7 @@
           }
         },
         "liveness_probe": {
-          "description": "Liveness probe - failures feed the restart policy (spec §7)",
+          "description": "Liveness probe — failures feed the restart policy (spec §7)",
           "anyOf": [
             {
               "$ref": "#/$defs/ProbeConfig"
@@ -291,7 +291,7 @@
           }
         },
         "max_memory": {
-          "description": "Memory ceiling - polling enforcer restarts above this",
+          "description": "Memory ceiling — polling enforcer restarts above this",
           "anyOf": [
             {
               "$ref": "#/$defs/MemSize"
@@ -360,7 +360,7 @@
           }
         },
         "readiness_probe": {
-          "description": "Readiness probe - gates reload's AwaitReady (spec §7)",
+          "description": "Readiness probe — gates reload's AwaitReady (spec §7)",
           "anyOf": [
             {
               "$ref": "#/$defs/ProbeConfig"
@@ -397,7 +397,7 @@
           }
         },
         "reuse_port": {
-          "description": "Asserts that the app itself sets `SO_REUSEPORT` before it binds -\nshep binds nothing, so it cannot set the option on the app's behalf.\nThe child process owns the mechanism (Node ≥22's `reusePort`, Go's\n`net.ListenConfig.Control`, nginx's `reuseport`); shep's contribution\nis permission for the old and new instance to overlap during reload,\nnot the socket option itself.\n\n**This field is inert today.** shep never reads it: reload overlap\nalready happens unconditionally, so setting it changes nothing and\nleaving it unset costs nothing. It is kept because `shep import`\nwrites it for a cluster-mode pm2 app and `shep flock` displays it, so\ndropping it would silently discard a value out of an imported config.\nIt becomes load-bearing the day shep gains a reload mode that does NOT\noverlap by default, which is when the permission it describes stops\nbeing free - see `docs/specs/deferred.md`.",
+          "description": "Asserts that the app itself sets `SO_REUSEPORT` before it binds —\nshep binds nothing, so it cannot set the option on the app's behalf.\nThe child process owns the mechanism (Node ≥22's `reusePort`, Go's\n`net.ListenConfig.Control`, nginx's `reuseport`); shep's contribution\nis permission for the old and new instance to overlap during reload,\nnot the socket option itself.\n\n**This field is inert today.** shep never reads it: reload overlap\nalready happens unconditionally, so setting it changes nothing and\nleaving it unset costs nothing. It is kept because `shep import`\nwrites it for a cluster-mode pm2 app and `shep flock` displays it, so\ndropping it would silently discard a value out of an imported config.\nIt becomes load-bearing the day shep gains a reload mode that does NOT\noverlap by default, which is when the permission it describes stops\nbeing free — see `docs/specs/deferred.md`.",
           "type": "boolean",
           "default": false,
           "init": {
@@ -425,7 +425,7 @@
           }
         },
         "stdin": {
-          "description": "Open a pipe on this sheep's stdin, so `shep whisper` can write to it.\n\nDefaults to `false`, and the default is the decision rather than a\nconvenience. Without it a sheep gets `/dev/null` on fd 0, which is what\nevery sheep has had until now, and three things argue for keeping it\nthat way unless an app asks otherwise:\n\n- Flipping it for the whole flock is a behaviour change to processes\n  nobody asked to change.\n- **Programs detect stdin.** A closed or null fd 0 is how a great many\n  programs decide they are non-interactive - no prompt, no pager, no\n  readline, no colour. Handing them a pipe silently moves them to the\n  other branch.\n- It costs a descriptor and a pump task per sheep for the whole life of\n  the process, against spec §14.11's single-digit-MB idle-RSS goal - the\n  same budget [`Self::channel`]'s own default is protecting.\n\nUnlike `channel`, nothing implies this: `wait_ready` and\n`shutdown_with_message` both need fd 3 and so turn `channel` on for you,\nwhile nothing in shep needs a sheep's stdin except an operator typing\n`shep whisper`. A sheep without it answers a `no_stdin` row and names\nthis field.\n\nThe pipe's write end lives as long as the sheep does, so the app sees\nEOF on stdin when the process is on its way out, never before.",
+          "description": "Open a pipe on this sheep's stdin, so `shep whisper` can write to it.\n\nDefaults to `false`, and the default is the decision rather than a\nconvenience. Without it a sheep gets `/dev/null` on fd 0, which is what\nevery sheep has had until now, and three things argue for keeping it\nthat way unless an app asks otherwise:\n\n- Flipping it for the whole flock is a behaviour change to processes\n  nobody asked to change.\n- **Programs detect stdin.** A closed or null fd 0 is how a great many\n  programs decide they are non-interactive — no prompt, no pager, no\n  readline, no colour. Handing them a pipe silently moves them to the\n  other branch.\n- It costs a descriptor and a pump task per sheep for the whole life of\n  the process, against spec §14.11's single-digit-MB idle-RSS goal — the\n  same budget [`Self::channel`]'s own default is protecting.\n\nUnlike `channel`, nothing implies this: `wait_ready` and\n`shutdown_with_message` both need fd 3 and so turn `channel` on for you,\nwhile nothing in shep needs a sheep's stdin except an operator typing\n`shep whisper`. A sheep without it answers a `no_stdin` row and names\nthis field.\n\nThe pipe's write end lives as long as the sheep does, so the app sees\nEOF on stdin when the process is on its way out, never before.",
           "type": "boolean",
           "default": false,
           "init": {
