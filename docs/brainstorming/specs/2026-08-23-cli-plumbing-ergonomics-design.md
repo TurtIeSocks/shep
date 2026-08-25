@@ -27,8 +27,8 @@ removes most of it in plain Rust.
 | `Ok(x) => x, Err(code) => return code` blocks | 38 |
 | functions taking `streams: &mut Streams` | 84 |
 | of those that ALSO take `fmt: Format` | **84** |
-| `Streams { .. }` constructions in production | 5 |
-| the same in test code | 92 |
+| `Streams { .. }` constructions in production | 12, all in `lib.rs` |
+| the same in test code | 93 |
 
 Two of those numbers decide the design. **Every function that takes `streams`
 also takes `fmt`**, so `fmt` is not an independent parameter; it is a
@@ -76,7 +76,7 @@ it was given. So no production call loses the ability to override, because
 none of them does.
 
 Effect: 84 signatures lose a parameter, and 91 emit sites lose an argument.
-Cost: five production constructions and 92 test constructions gain a field.
+Cost: twelve production constructions, all in `lib.rs`, and 93 test constructions gain a field.
 The test cost is real and mechanical, and it makes those tests clearer, since
 each now names the format it is exercising at the point it builds the streams.
 
@@ -264,7 +264,7 @@ useful test is a **before-and-after byte comparison**.
 4. **`emit_error` and friends stay** as free functions.
 5. **Inner functions only where there are two or more early returns**, so the
    refactor does not add ceremony to commands that do not need it.
-6. **The 92 test constructions get the field rather than a `Streams::new`
+6. **The 93 test constructions get the field rather than a `Streams::new`
    helper.** A constructor would hide which format a test exercises, and that
    is the thing worth reading in a test that asserts on rendered output.
 7. **No error crate.** `thiserror` collides with IR-19's manual `Display`, and
