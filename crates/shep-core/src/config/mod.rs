@@ -8,6 +8,8 @@ pub mod flockfile;
 pub mod kill_signal;
 pub mod normalize;
 pub mod probe;
+#[cfg(feature = "schema")]
+pub mod scaffold;
 
 pub use app::{AppConfig, ProbeConfig, ProbeKind};
 pub use cron::{CronParseError, CronSchedule, CronScheduleError};
@@ -18,3 +20,5 @@ pub use flockfile::{flockfile_schema_json, flockfile_schema_string};
 pub use kill_signal::KillSignal;
 pub use normalize::{NormalizeError, ResolvedApp, normalize, normalize_all};
 pub use probe::{ProbeTarget, ProbeTargetError};
+#[cfg(feature = "schema")]
+pub use scaffold::{CURATED, Depth, Scaffold, ScaffoldError};
