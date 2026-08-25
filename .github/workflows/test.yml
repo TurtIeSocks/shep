@@ -2,18 +2,17 @@ name: test
 # Runs automatically on pushes to main and on pull requests, by Rin's call on
 # 2026-08-16.
 #
-# This is not free while the repository is private. GitHub bills private-repo
-# Actions minutes per platform: Linux 1x, Windows 2x, macOS 10x. One run of
-# this file is 19 jobs, five of them on those two platforms (two macOS and two
-# Windows in `test`, one Windows in `features`), and the two macOS legs
-# dominate the bill. docs/specs/deferred.md carries the full arithmetic. The
-# cost goes to zero when the repository goes public.
+# The repository is public, so these runs are free regardless of job count or
+# platform. That was not always true, and docs/specs/deferred.md keeps the
+# billing arithmetic (GitHub charges private-repo Actions minutes per
+# platform: Linux 1x, Windows 2x, macOS 10x) for the day it might matter
+# again.
 #
 # The weekly `schedule: [{ cron: "0 0 * * SUN" }]` the earlier comment listed
-# is deliberately NOT enabled: a full 19-job run every week against an
+# is deliberately NOT enabled: a full matrix run every week against an
 # unchanged tree spends the most expensive part of this file to learn nothing.
-# Worth adding once the repo is public and the runs are free, where it does
-# catch dependency rot.
+# Worth adding if dependency rot against an idle tree becomes a real concern —
+# that decision is Rin's, not made here just because the runs are free.
 on:
   push:
     branches: [main]
