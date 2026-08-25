@@ -324,7 +324,7 @@ impl From<AuthError> for ConnError {
 }
 
 // `Decode` and `Encode` both wrap `WireError`, so only one of them could
-// ever claim `impl From<WireError> for ConnError` — the compiler forbids a
+// ever claim `impl From<WireError> for ConnError`: the compiler forbids a
 // second one for the same source type, and picking one anyway would make a
 // bare `?` silently mislabel the other direction. Both stay explicit
 // `map_err` calls; see this task's own report.

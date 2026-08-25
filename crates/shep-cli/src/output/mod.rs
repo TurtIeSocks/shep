@@ -153,7 +153,7 @@ impl Streams<'_> {
     /// Discards its write's failure for the same reason [`Self::fail`] does.
     /// Stdout only: a real minority of notices belong on stderr instead (a
     /// warning beside a separate primary output, like `init`'s shadowed-file
-    /// notice), and those call [`emit_notice`] directly with `streams.err` —
+    /// notice), and those call [`emit_notice`] directly with `streams.err`:
     /// see that function's own doc for the full rule. This method exists for
     /// the majority shape, a notice that IS the command's whole answer.
     pub fn note(&mut self, code: &str, message: &str) {
@@ -598,6 +598,8 @@ struct NoticeBody<'a> {
 /// # Errors
 /// The underlying write failed.
 #[cfg_attr(windows, allow(dead_code))]
+/// A caller that already holds a [`Streams`] and wants stdout can use
+/// [`Streams::note`] instead, which supplies the writer and the format.
 pub fn emit_notice(
     out: &mut dyn io::Write,
     fmt: Format,
@@ -1000,7 +1002,7 @@ mod tests {
     // --- cli-plumbing-ergonomics Task 1: pin the wire bytes -------------
     //
     // The refactor in flight (Tasks 2-3 of that plan) touches 91
-    // `emit_error` call sites, 84 signatures and 66 `map_err`s — exactly
+    // `emit_error` call sites, 84 signatures and 66 `map_err`s, exactly
     // the diff shape where a behaviour change hides in the noise. These
     // three tests snapshot the literal bytes `emit_error`/`emit_notice`
     // write today, in both formats, so that refactor has something byte-
@@ -1024,7 +1026,7 @@ mod tests {
     }
 
     /// `emit_notice`'s two renderings: `notice[code]: message` on the table
-    /// surface, the `NoticeEnvelope` JSON object on the other — the
+    /// surface, the `NoticeEnvelope` JSON object on the other. The
     /// `notice` key is the whole reason this function exists rather than
     /// reusing `emit_error`, so its shape belongs in the baseline too.
     #[test]

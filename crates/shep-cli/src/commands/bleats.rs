@@ -553,7 +553,12 @@ pub async fn bleats_with_signal(
                         }
                     }
                     Some(Err(Lagged { count })) => {
-                        write_notice(streams, quiet, "lagged", &format!("{count} events dropped locally (lagged)"), );
+                        write_notice(
+                            streams,
+                            quiet,
+                            "lagged",
+                            &format!("{count} events dropped locally (lagged)"),
+                        );
                     }
                     None => {
                         let _ = streams.out.flush();

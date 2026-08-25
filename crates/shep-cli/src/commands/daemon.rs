@@ -98,7 +98,7 @@ impl From<DaemonConfigError> for DaemonRunError {
 }
 
 // `Self::Boot` and `Self::Run` both wrap `BootError`, so only one of them
-// could ever claim `impl From<BootError> for DaemonRunError` — and this
+// could ever claim `impl From<BootError> for DaemonRunError`, and this
 // enum's own doc says they must stay distinct (a `BootError` from `run()`
 // means the supervisor came up and served, which "failed to boot" would
 // misreport). Both stay explicit `map_err` calls; see this task's own
