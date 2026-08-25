@@ -87,6 +87,10 @@ pub struct AppConfig {
     })))]
     pub script: String,
     /// Arguments passed to the script
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "inputs",
+        "blurb": "Arguments passed to the script, as a list"
+    })))]
     pub args: Vec<String>,
     /// Working directory (default: daemon's cwd at spawn registration)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
@@ -99,36 +103,64 @@ pub struct AppConfig {
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "none",
         "group": "process",
+        "blurb": "What runs the script. Set it to none to exec the file directly"
     })))]
     pub interpreter: Option<String>,
     /// Environment for the sheep (merged over the daemon's filtered env)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "{ NODE_ENV = 'production' }",
         "group": "inputs",
+        "blurb": "Environment variables for this app, layered over the daemon's own"
     })))]
     pub env: BTreeMap<String, String>,
     /// Instance count ("cluster" = N fork instances; spec §4)
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "process",
+        "blurb": "How many copies of this app to run"
+    })))]
     pub instances: u32,
     /// Restart on unexpected exit
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "control",
+        "blurb": "Restarts the process automatically when it exits unexpectedly"
+    })))]
     pub autorestart: bool,
     /// Start when the daemon starts / on `shep muster`
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "control",
+        "blurb": "Start this app when the daemon starts, and on shep muster"
+    })))]
     pub autostart: bool,
     /// Exit codes treated as clean stop (no restart)
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "control",
+        "blurb": "Exit codes that mean a clean stop, so shep will not restart"
+    })))]
     pub stop_exit_codes: Vec<i32>,
     /// Uptime below this marks an exit as unstable
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "control",
+        "blurb": "An exit sooner than this counts as unstable"
+    })))]
     pub min_uptime: UpDuration,
     /// Consecutive unstable exits before `errored`
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "control",
+        "blurb": "How many unstable exits in a row before shep gives up"
+    })))]
     pub max_restarts: u32,
     /// Fixed delay before every restart (alternative to backoff)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "3s",
         "group": "control",
+        "blurb": "A fixed wait before every restart, instead of growing backoff"
     })))]
     pub restart_delay: Option<UpDuration>,
     /// Initial backoff delay; grows ×1.5 capped at 15s (spec §4)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "5s",
         "group": "control",
+        "blurb": "Starting delay between restarts, growing each time it fails again"
     })))]
     pub exp_backoff_restart_delay: Option<UpDuration>,
     /// Stop signal, one of `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGUSR2` (the `SIG`
@@ -141,15 +173,32 @@ pub struct AppConfig {
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "SIGTERM",
         "group": "process",
+        "blurb": "Which signal shep sends first when stopping this app"
     })))]
     pub kill_signal: Option<String>,
     /// Grace period between stop signal and SIGKILL
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "control",
+        "blurb": "How long shep waits after the stop signal before SIGKILL"
+    })))]
     pub kill_timeout: UpDuration,
     /// Send `{"kind":"shutdown"}` on the shepherd channel instead of a signal
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "control",
+        "blurb": "Ask the app to stop over the channel instead of signalling it"
+    })))]
     pub shutdown_with_message: bool,
     /// Readiness fallback window when no ready signal/probe configured
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "control",
+        "blurb": "How long to wait for readiness when nothing else reports it"
+    })))]
     pub listen_timeout: UpDuration,
     /// Drain window for the old instance during reload
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "control",
+        "blurb": "How long the old instance gets to drain during a reload"
+    })))]
     pub graceful_timeout: UpDuration,
     /// How long a triggered action gets to answer on the shepherd channel
     /// before its row becomes `ActionOutcome::TimedOut`.
@@ -168,60 +217,84 @@ pub struct AppConfig {
     /// it asks for; a value merely above the *default* budget is a caller's
     /// choice to widen its own deadline, not a config error this crate can
     /// see.
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "control",
+        "blurb": "How long a triggered action has to answer before shep gives up"
+    })))]
     pub action_timeout: UpDuration,
     /// Memory ceiling - polling enforcer restarts above this
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "512M",
         "group": "control",
+        "blurb": "Restart the app if it climbs above this much memory"
     })))]
     pub max_memory: Option<MemSize>,
     /// Watch files and restart on change
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "control",
+        "blurb": "Restart when a file changes"
+    })))]
     pub watch: bool,
     /// Watch ignore globs (defaults added daemon-side: dot-entries, node_modules)
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "control",
+        "blurb": "Paths watch should skip, on top of dotfiles and node_modules"
+    })))]
     pub ignore_watch: Vec<String>,
     /// Watch debounce window (default 500ms, applied daemon-side)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "500",
         "group": "control",
+        "blurb": "How long to wait after a change before restarting"
     })))]
     pub watch_delay: Option<UpDuration>,
     /// Cron pattern for scheduled restarts (croner dialect)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "* * * * *",
-        "group": "inputs",
+        "group": "cron",
+        "blurb": "Restart on a schedule, written as a cron pattern"
     })))]
     pub cron_restart: Option<String>,
     /// Fold (group) this sheep belongs to
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "backend",
         "group": "process",
+        "blurb": "A fold to group this app with others, for commands that take one"
     })))]
     pub fold: Option<String>,
     /// Run as this user (unix)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "www-data",
         "group": "process",
+        "blurb": "Run as this user, on unix"
     })))]
     pub user: Option<String>,
     /// Run as this group (unix)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "www-data",
         "group": "process",
+        "blurb": "Run as this group, on unix"
     })))]
     pub group: Option<String>,
     /// Stdout log file (default: `$SHEP_HOME/logs/<name>-<instance>-out.log`; `merge_logs` collapses to `<name>-out.log`)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "/var/log/my-first-sheep/out.log",
         "group": "process",
+        "blurb": "Where stdout goes. Defaults to a file under $SHEP_HOME/logs"
     })))]
     pub out_file: Option<String>,
     /// Stderr log file (default: `$SHEP_HOME/logs/<name>-<instance>-err.log`; `merge_logs` collapses to `<name>-err.log`)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "/var/log/my-first-sheep/err.log",
         "group": "process",
+        "blurb": "Where stderr goes. Defaults to a file under $SHEP_HOME/logs"
     })))]
     pub err_file: Option<String>,
     /// Merge instance logs into one file pair
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "process",
+        "blurb": "Put every instance's output in one pair of files"
+    })))]
     pub merge_logs: bool,
     /// Open the shepherd channel on fd 3 for this app on its own, without
     /// needing `wait_ready` or `shutdown_with_message` to imply it.
@@ -229,6 +302,10 @@ pub struct AppConfig {
     /// Defaults to `false`: a socketpair plus two pump tasks per sheep is
     /// real cost weighed against spec §14.11's single-digit-MB idle-RSS
     /// goal, so a channel is opened only when something asks for one.
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "inputs",
+        "blurb": "Opens fd 3 so the app can talk to shep directly"
+    })))]
     pub channel: bool,
     /// Open a pipe on this sheep's stdin, so `shep whisper` can write to it.
     ///
@@ -255,8 +332,16 @@ pub struct AppConfig {
     ///
     /// The pipe's write end lives as long as the sheep does, so the app sees
     /// EOF on stdin when the process is on its way out, never before.
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "inputs",
+        "blurb": "Keeps stdin open so shep whisper can write to the process"
+    })))]
     pub stdin: bool,
     /// Expect `{"kind":"ready"}` on the shepherd channel
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "control",
+        "blurb": "Wait for the app to say it is ready on the channel"
+    })))]
     pub wait_ready: bool,
     /// Asserts that the app itself sets `SO_REUSEPORT` before it binds -
     /// shep binds nothing, so it cannot set the option on the app's behalf.
@@ -273,6 +358,10 @@ pub struct AppConfig {
     /// It becomes load-bearing the day shep gains a reload mode that does NOT
     /// overlap by default, which is when the permission it describes stops
     /// being free - see `docs/specs/deferred.md`.
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "process",
+        "blurb": "Not built yet. Setting it is refused rather than quietly ignored"
+    })))]
     pub reuse_port: bool,
     /// Readiness probe - gates reload's AwaitReady (spec §7)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
@@ -289,17 +378,23 @@ pub struct AppConfig {
     })))]
     pub liveness_probe: Option<ProbeConfig>,
     /// Watch include globs (empty = watch cwd)
+    #[cfg_attr(feature = "schema", schemars(extend("init" = {
+        "group": "control",
+        "blurb": "Which paths to watch. Empty means the working directory"
+    })))]
     pub watch_options: Vec<String>,
     /// Timezone for `cron_restart` (IANA name)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "US/Eastern",
         "group": "cron",
+        "blurb": "Which timezone cron_restart is read in, as an IANA name"
     })))]
     pub cron_timezone: Option<String>,
     /// Env var receiving the instance slot (default `SHEP_INSTANCE`)
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "INSTANCE_ID",
         "group": "inputs",
+        "blurb": "The env var each instance finds its own slot number in"
     })))]
     pub increment_var: Option<String>,
 }

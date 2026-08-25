@@ -274,8 +274,16 @@ impl Scaffold {
     }
 }
 
-/// Every field name, ordered by [`GROUP_ORDER`] and alphabetically within
-/// each group, with the ungrouped remainder last.
+/// Every field name: the curated four first, then the rest by
+/// [`GROUP_ORDER`] and alphabetically within each group.
+///
+/// The curated names lead because within a group the order is alphabetical,
+/// which buried `name` and `script` at the ninth and twelfth lines of the
+/// full scaffold. Those are the two fields `normalize` actually requires, so
+/// a reader meeting the file for the first time should not have to hunt for
+/// them. [`CURATED`] already records what matters first and in what order,
+/// and reusing it here means one editorial decision rather than two that can
+/// disagree.
 fn grouped_order() -> Vec<String> {
     let schema = crate::config::flockfile_schema_json();
     let props = properties(&schema);
@@ -288,10 +296,17 @@ fn grouped_order() -> Vec<String> {
             .unwrap_or(GROUP_ORDER.len())
     };
 
-    let mut names: Vec<String> = props.keys().cloned().collect();
     // `props` is already alphabetical (schemars emits a sorted map), and a
     // stable sort by rank alone therefore leaves each group alphabetical.
-    names.sort_by_key(|name| rank(name));
+    let mut rest: Vec<String> = props
+        .keys()
+        .filter(|name| !CURATED.contains(&name.as_str()))
+        .cloned()
+        .collect();
+    rest.sort_by_key(|name| rank(name));
+
+    let mut names: Vec<String> = CURATED.iter().map(|name| (*name).to_owned()).collect();
+    names.extend(rest);
     names
 }
 
