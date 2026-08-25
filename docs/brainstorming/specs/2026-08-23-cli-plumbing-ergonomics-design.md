@@ -24,7 +24,7 @@ removes most of it in plain Rust.
 | `emit_error` call sites | 91 |
 | `emit_notice` call sites | 20 |
 | of which discard the result with `let _ =` | **all of them** |
-| `Ok(x) => x, Err(code) => return code` blocks | 38 |
+| `Err(code) =>` blocks | 38, but see Move 3: **20 are `run`'s dispatch** and stay |
 | functions taking `streams: &mut Streams` | 84 |
 | of those that ALSO take `fmt: Format` | **84** |
 | `Streams { .. }` constructions in production | 12, all in `lib.rs` |
@@ -140,13 +140,29 @@ async fn init_inner(streams: &mut Streams<'_>, args: &InitArgs) -> Result<(), Ex
 }
 ```
 
-One match per command instead of 38 across the crate, and each body reads
-straight through.
+**This move is the weakest of the four, and measuring it is what showed that.**
 
-**Not every command wants this.** A verb whose whole body is a single
-`connect_client` match gains nothing, and converting it would add a function
-to save nothing. The rule: convert a command when it has **two or more** early
-returns. Leave the rest.
+Of the 38 blocks, **20 are `Err(code) => code,` inside `run`'s dispatch match**,
+one arm per verb. Those are not convertible: they ARE the wrapper this move
+would otherwise add, and they stay exactly as they are.
+
+That leaves 18 in `commands/`, and they are spread one per function almost
+everywhere. Applying the rule below, only **two** functions qualify:
+
+| function | early returns |
+|---|---|
+| `commands/bleats.rs::bleats_with_signal` | 3 |
+| `commands/init.rs::init` | 2 |
+
+Everything else (`stop`, `restart`, `reload`, `delete`, `reopen`, `flush`, and
+six singletons) has exactly one, where a wrapper would be ceremony added to
+save a line.
+
+**The rule: convert a command when it has two or more early returns.** So this
+move touches two functions and removes about five lines. It is kept because
+`bleats_with_signal` is genuinely the worst of them and because Moves 1 and 2
+make the inner-function shape cheaper to adopt later, not because the payoff
+is large. If it were the whole proposal it would not be worth doing.
 
 ## Move 4: `From` impls for the conversions that carry nothing else
 
