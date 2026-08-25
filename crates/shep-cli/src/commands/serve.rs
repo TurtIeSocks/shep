@@ -27,7 +27,7 @@ use shep_core::protocol::{Request, Response};
 
 use crate::cli::ServeArgs;
 use crate::exit::ExitCode;
-use crate::output::{FlockRows, Render, Streams, emit, emit_notice, write_outcome};
+use crate::output::{FlockRows, Render, Streams, emit, write_outcome};
 use crate::serve::auth::{self, AuthError, Credentials};
 use crate::serve::worker::{self, ServeConfig};
 
@@ -191,14 +191,6 @@ fn follow_symlinks_notice(follow_symlinks: bool) -> Option<String> {
     )
 }
 
-/// Writes one of this verb's own notices to `streams.err`, through
-/// [`emit_notice`] rather than [`emit_error`] — a notice's code is not part
-/// of [`ExitCode`]'s taxonomy, and a clean run reaching `--foreground`'s
-/// worker or a green registration can still emit one on its way there.
-fn print_notice(streams: &mut Streams<'_>, code: &str, message: &str) {
-    let _ = emit_notice(&mut *streams.err, streams.fmt, code, message);
-}
-
 /// The sheep's own command line, rebuilt from the flags rather than from
 /// `std::env::args`.
 ///
@@ -293,10 +285,10 @@ pub async fn serve(streams: &mut Streams<'_>, paths: &ShepPaths, args: &ServeArg
     }
 
     if let Some(notice) = exposure_notice(args.bind, auth.is_some(), &root) {
-        print_notice(streams, "exposure", &notice);
+        streams.aside("exposure", &notice);
     }
     if let Some(notice) = follow_symlinks_notice(args.follow_symlinks) {
-        print_notice(streams, "follow_symlinks", &notice);
+        streams.aside("follow_symlinks", &notice);
     }
 
     if args.foreground {

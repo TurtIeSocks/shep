@@ -18,7 +18,7 @@ use convert::ImportNote;
 
 use crate::cli::ImportArgs;
 use crate::exit::ExitCode;
-use crate::output::{ImportRow, ImportRows, Streams, emit, emit_notice, write_outcome};
+use crate::output::{ImportRow, ImportRows, Streams, emit, write_outcome};
 
 /// Reads a pm2 dump into apps and writes them out as a Flockfile.
 ///
@@ -84,9 +84,7 @@ pub fn import(streams: &mut Streams<'_>, args: &ImportArgs) -> ExitCode {
         }
     };
 
-    let _ = emit_notice(
-        &mut *streams.err,
-        streams.fmt,
+    streams.aside(
         "read",
         &format!(
             "read {instance_count} instance rows for {} apps from {}",
@@ -96,7 +94,7 @@ pub fn import(streams: &mut Streams<'_>, args: &ImportArgs) -> ExitCode {
     );
     for note in &imported.notes {
         let (code, message) = describe_note(note);
-        let _ = emit_notice(&mut *streams.err, streams.fmt, code, &message);
+        streams.aside(code, &message);
     }
 
     let rendered = match render::flockfile(&imported.apps) {

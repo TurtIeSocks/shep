@@ -20,7 +20,7 @@ use shep_core::protocol::{Request, Response, SelectorSpec};
 use crate::cli::{SelectorArgs, StartArgs, StockArgs};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
-use crate::output::{DeletedIds, FlockRows, Render, Streams, emit, emit_notice, write_outcome};
+use crate::output::{DeletedIds, FlockRows, Render, Streams, emit, write_outcome};
 
 /// What [`resolve_target`] can fail with. Module-scoped per IR-18, and named
 /// for the function rather than the verb on purpose: `start`'s own
@@ -527,7 +527,7 @@ async fn resume(
             "{} is already {}; `shep restart {}` replaces it.",
             existing.name, existing.status, existing.name
         );
-        let _ = emit_notice(&mut *streams.err, streams.fmt, "start", &message);
+        streams.aside("start", &message);
         return ExitCode::Success;
     }
     let (procs, failure) = request_each(

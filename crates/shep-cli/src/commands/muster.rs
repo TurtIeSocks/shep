@@ -18,7 +18,7 @@ use shep_core::status::ProcStatus;
 use crate::cli::Format;
 use crate::exit::ExitCode;
 use crate::flourish;
-use crate::output::{FlockRows, SavedRollRow, Streams, emit, emit_notice, write_outcome};
+use crate::output::{FlockRows, SavedRollRow, Streams, emit, write_outcome};
 
 /// Asks the daemon to write the muster roll now, and reports where it
 /// landed and how many apps it recorded.
@@ -95,9 +95,7 @@ pub async fn muster(client: &Client, streams: &mut Streams<'_>) -> ExitCode {
     {
         Ok(Response::Mustered(procs)) => {
             if procs.is_empty() {
-                let _ = emit_notice(
-                    &mut *streams.err,
-                    streams.fmt,
+                streams.aside(
                     "muster_restored_nothing",
                     "the muster roll restored nothing",
                 );

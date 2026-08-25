@@ -16,7 +16,7 @@ use crate::commands::foreground::{self, ForegroundOptions};
 use crate::commands::lifecycle::{resolve_target, target_exit_code};
 use crate::commands::runtime::discovered_target;
 use crate::exit::ExitCode;
-use crate::output::{Streams, emit_notice};
+use crate::output::Streams;
 
 /// Where a dev flock lives: `$SHEP_DEV_HOME`, else `~/.shep-dev`.
 ///
@@ -100,9 +100,7 @@ pub async fn dev(
     args: &DevArgs,
 ) -> ExitCode {
     if home_given {
-        let _ = emit_notice(
-            &mut *streams.err,
-            streams.fmt,
+        streams.aside(
             "home_ignored",
             "shep dev ignores --home/$SHEP_HOME; isolation is the whole feature — set \
              $SHEP_DEV_HOME instead",
@@ -132,9 +130,7 @@ pub async fn dev(
         .map(|app| app.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let _ = emit_notice(
-        &mut *streams.err,
-        streams.fmt,
+    streams.aside(
         "watch_forced",
         &format!(
             "shep dev: forcing watch on {names} — each app's own `watch` setting is ignored here"

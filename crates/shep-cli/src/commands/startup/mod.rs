@@ -22,7 +22,7 @@ use unit::UnitSpec;
 
 use crate::cli::{Init, StartupArgs};
 use crate::exit::ExitCode;
-use crate::output::{StartupStep, StartupSteps, Streams, emit, emit_notice, write_outcome};
+use crate::output::{StartupStep, StartupSteps, Streams, emit, write_outcome};
 
 /// `$SHEP_HOME`'s own directory name under a user's home, mirroring
 /// `ShepPaths::resolve`'s `home_dir.join(".shep")`. A literal there and a
@@ -255,7 +255,7 @@ pub(crate) fn install(
         );
     }
     if let Some(message) = secure_path_warning(plan.sudo_user.as_deref(), &plan.spec) {
-        let _ = emit_notice(&mut *streams.err, streams.fmt, "secure_path", &message);
+        streams.aside("secure_path", &message);
     }
 
     let mut steps = vec![write_unit(plan)];

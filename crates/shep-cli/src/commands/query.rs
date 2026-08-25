@@ -28,7 +28,7 @@ use crate::exit::ExitCode;
 use crate::flourish;
 use crate::output::{
     AvailableDogRows, DogRows, Render, RolledSheep, RolledSheepRows, Streams, emit, emit_described,
-    emit_flock, emit_notice, write_outcome,
+    emit_flock, write_outcome,
 };
 
 /// Sends `body`, renders whatever the daemon answers through [`emit`], and
@@ -398,9 +398,7 @@ const INDEX_WIDE: &str = ", across the whole index rather than this listing";
 /// matches" line, and [`INDEX_WIDE`] is what says so out loud.
 fn note_index_costs(streams: &mut Streams<'_>, skipped: usize, sanitised: usize) {
     if skipped > 0 {
-        let _ = emit_notice(
-            &mut *streams.err,
-            streams.fmt,
+        streams.aside(
             "dogs_skipped",
             &format!(
                 "{skipped} entr{} skipped{INDEX_WIDE}",
@@ -409,9 +407,7 @@ fn note_index_costs(streams: &mut Streams<'_>, skipped: usize, sanitised: usize)
         );
     }
     if sanitised > 0 {
-        let _ = emit_notice(
-            &mut *streams.err,
-            streams.fmt,
+        streams.aside(
             "dogs_sanitised",
             &format!(
                 "{sanitised} entr{} contained control characters{INDEX_WIDE}",

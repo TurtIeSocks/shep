@@ -44,7 +44,7 @@ use crate::commands::shep_toml::{ShepToml, ShepTomlError};
 use crate::exit::ExitCode;
 use crate::output::{
     BarkRows, DogAdoptedRow, DogDisabledRow, DogEnabledRow, DogRehomedRow, Streams, emit,
-    emit_notice, write_outcome,
+    write_outcome,
 };
 
 /// [`DogEnabledRow::status`] when `enable` wrote the config but no shepherd
@@ -554,12 +554,7 @@ fn warn_group_writable(streams: &mut Streams<'_>, path: &Path) {
          this dog runs, and it runs with the shepherd's own privileges",
         path.display()
     );
-    let _ = emit_notice(
-        &mut *streams.err,
-        streams.fmt,
-        GROUP_WRITABLE_NOTICE,
-        &message,
-    );
+    streams.aside(GROUP_WRITABLE_NOTICE, &message);
 }
 
 /// `shep adopt <name> <path>`: vets a binary shep has never seen, records

@@ -159,6 +159,24 @@ impl Streams<'_> {
     pub fn note(&mut self, code: &str, message: &str) {
         let _ = emit_notice(&mut *self.out, self.fmt, code, message);
     }
+
+    /// Prints `message` as a notice, on stderr.
+    ///
+    /// The stream is the whole difference from [`Self::note`], and it is a
+    /// decision about the reader rather than about severity. `note` carries
+    /// what the command produced: `shep init` saying which file it wrote.
+    /// This carries what somebody should know about the run without it being
+    /// the answer they asked for: a Flockfile that will be shadowed, entries
+    /// skipped, strings that had control characters stripped out of them.
+    ///
+    /// Keeping those off stdout is what lets `shep dogs --available
+    /// --format json | jq` work while the operator still sees that two
+    /// entries were skipped.
+    ///
+    /// Discards its write's failure for the same reason [`Self::fail`] does.
+    pub fn aside(&mut self, code: &str, message: &str) {
+        let _ = emit_notice(&mut *self.err, self.fmt, code, message);
+    }
 }
 
 /// Implemented once per command payload. The two methods are the ONLY place a

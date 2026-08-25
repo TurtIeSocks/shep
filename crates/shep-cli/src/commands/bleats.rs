@@ -199,11 +199,17 @@ fn write_line(
 /// (`cli::GlobalArgs::quiet`, "suppress non-essential output") is exactly
 /// what a notice is — a sheep's own line and a real error both still print
 /// regardless (whole-branch review item 2).
+/// One of `bleats`' own notices, unless `--quiet` asked for silence.
+///
+/// Kept as a wrapper rather than folded into [`Streams::aside`] because the
+/// `quiet` gate is this verb's, not every verb's: `bleats` is the one command
+/// an operator leaves running, so its own asides are the ones worth being
+/// able to switch off without losing a sheep's output.
 fn write_notice(streams: &mut Streams<'_>, quiet: bool, code: &str, message: &str) {
     if quiet {
         return;
     }
-    let _ = output::emit_notice(&mut *streams.err, streams.fmt, code, message);
+    streams.aside(code, message);
 }
 
 /// The most of one log file a tail will read to find the lines it wants.

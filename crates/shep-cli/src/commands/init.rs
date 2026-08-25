@@ -9,9 +9,7 @@ use std::path::{Path, PathBuf};
 
 use shep_core::config::{Depth, FlockFormat, Scaffold, discover};
 
-use crate::{
-    Streams, cli::InitArgs, commands::runtime::get_cwd, exit::ExitCode, output::emit_notice,
-};
+use crate::{Streams, cli::InitArgs, commands::runtime::get_cwd, exit::ExitCode};
 
 /// Writes a scaffolded Flockfile.
 ///
@@ -105,9 +103,7 @@ fn target(
         if let Some(existing) = discover(cwd)
             && existing != path
         {
-            let _ = emit_notice(
-                &mut *streams.err,
-                streams.fmt,
+            streams.aside(
                 "init_shadowed",
                 &format!(
                     "{} is already here and shep reads it first; {} will be ignored \
