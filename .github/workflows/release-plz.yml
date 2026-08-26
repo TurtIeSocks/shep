@@ -61,11 +61,31 @@ jobs:
 
   # Fires when `test.yml` finishes, not when `main` moves. That is the whole
   # point: `workflow_run` lets this job require a fact about the commit (its
-  # test result) instead of racing to find one out. The `if:` re-checks three
-  # things the `workflows:` filter above does not: that the run is `test`'s
-  # (redundant with the filter, kept for the reader), that it targeted
-  # `main` (`workflow_run` also fires for PR and manual runs of `test.yml`),
-  # and that it actually succeeded.
+  # test result) instead of racing to find one out.
+  #
+  # Every clause in the `if:` is load-bearing, and two of them are there for
+  # security rather than for ordering. A `workflow_run` job runs in the BASE
+  # repository's context: base secrets, base environments, base token. So it
+  # must establish that the run it is reacting to came from this repository
+  # and not from a fork.
+  #
+  #   event == 'push'                    `test.yml` also runs on
+  #                                      `pull_request` and `workflow_dispatch`,
+  #                                      and both of those fire this event too.
+  #   head_repository == this repository a fork's `head_branch` is the FORK's
+  #                                      branch name, so a fork branch named
+  #                                      `main` satisfies the clause below on
+  #                                      its own. Without this line, opening a
+  #                                      pull request from such a fork starts
+  #                                      this job on the fork's commit with
+  #                                      CARGO_REGISTRY_TOKEN in scope.
+  #   head_branch == 'main'              the release branch, once the two
+  #                                      clauses above have established whose
+  #                                      `main` it is.
+  #   conclusion == 'success'            the matrix passed, not merely finished.
+  #
+  # `name == 'test'` is redundant with the `workflows:` filter and kept for
+  # whoever reads the job without scrolling up.
   #
   # `checkout`'s `ref` is `workflow_run.head_sha`, not the implicit default
   # (whatever `main` points at when this job happens to start):
@@ -87,6 +107,8 @@ jobs:
     if: >-
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.name == 'test' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
