@@ -13,6 +13,319 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.1](https://github.com/TurtIeSocks/shep/releases/tag/shep-v0.1.0-alpha.1) - 2026-08-26
+
+### Added
+
+- *(cli)* shep init writes whichever Flockfile format you point it at
+- *(cli)* shep dogs --available lists the community index
+- *(cli)* parse the dog index, treating every string in it as hostile
+- *(shep)* a Flockfile app with no cwd runs where its Flockfile lives
+- *(core)* refuse reuse_port rather than accepting a knob nothing reads
+- *(shep)* shep init --all is generated from the schema, not from defaults
+- *(shep)* shep init's curated scaffold, and a depth axis for the rest
+- *(shep)* shep init's skeleton, with its tests written first
+- *(shep)* scaffold a starter interpreter mapping on first run
+- *(shep)* opt-in interpreter mapping in shep.toml, plus --interpreter
+- *(lookout)* add the EXIT column to the flock pane, matching the CLI
+- *(shep-cli)* expose exit_cell for lookout's flock pane to reuse
+- *(core,daemon,cli)* carry a sheep's last exit outcome to the operator
+- *(shep)* sheep for the moments with nothing else to look at
+- *(shep)* colour and a face reach the STATUS column
+- *(shep)* carry the style level on Streams
+- *(shep)* a box-drawn table that fits the terminal
+- *(shep)* measure a cell's visible width, not its length
+- *(shep)* one vocabulary for both flock renderings
+- *(shep)* add StyleLevel and the shep style verb
+- *(shep-core)* selectors take globs
+- *(shep)* the lifecycle verbs take several targets
+- *(shep)* `shep start <name>` acts on the sheep the flock already has
+- *(shep)* a sheep started by path runs where you ran `shep start`
+- *(shep-daemon)* a stopped sheep stays in the flock across a daemon restart
+- *(shep)* bare `shep start` runs this directory's Flockfile, or brings a shepherd up
+- *(shep)* `shep flock` falls back to the muster roll instead of refusing
+- *(shep)* show the shepherd's status on the verbs that have nothing else to say
+- *(shep)* `shep ping` reports the shepherd instead of erroring at you
+- *(shep)* teach `shep --help` instead of listing 34 verbs alphabetically
+- *(shep)* add the first-run welcome, and `shep welcome`
+- *(shep)* create the default $SHEP_HOME, refuse a named one that is missing
+- *(lookout)* the actions on screen, five frames, and the docs
+- *(lookout)* the send path's reply, upserting the shepherd's own rows
+- *(lookout)* the action keys and the confirm state machine
+- *(lookout)* the lamb line, DETAIL_ROWS 4 to 5, two frames
+- *(lookout)* Effect::RefreshSelected and the coalesced lamb fetch
+- *(lookout)* FlockSource::send, Sent, Channels, and the reply
+- *(lookout)* show the filter on screen, three frames, and the docs
+- *(lookout)* two input modes and the filter keymap
+- *(lookout)* thread one visible-rows sequence through the cursor
+- *(shep-cli)* shep dev, the isolated foreground development flock
+- *(shep-cli)* the PID-1 init split and the reaper
+- *(shep-cli)* the foreground engine and shep runtime
+- *(shep-cli)* ExitCode::FlockEmpty and the empty-flock watcher
+- *(shep-cli)* shep serve, the verb
+- *(shep-cli)* serve::worker — bind, accept, answer
+- *(shep-cli)* serve::auth — creds file, HMAC-based constant-time check
+- *(shep-cli)* serve::mime and serve::listing — content-type lookup and autoindex HTML
+- *(shep-cli)* serve::path and serve::fs — resolution, containment, refusals
+- *(shep-cli)* move http.rs to the crate root and add write_head
+- *(shep-cli)* turn shep-cli into a library with three thin binaries
+- *(lookout)* add the six remaining gallery scenes, pinned clause by clause
+- *(lookout)* add view/mod.rs's panes_for and wire the bottom stack into draw
+- *(lookout)* add view/detail.rs, the sheep detail pane
+- *(lookout)* add bleats.rs, the feed pane, and wire the heartbeat's host sample
+- *(lookout)* add view/host.rs, the host-usage strip
+- *(lookout)* add source.rs's Local trait and the host sample
+- *(lookout)* add tail.rs, the bounded log reader
+- *(lookout)* move the flock table right for a selection gutter
+- *(lookout)* add a selected sheep to the reducer
+- *(whistle)* add catalogue.rs and docs/whistle/
+- *(whistle)* add mod.rs, the verb and the shep whistle dispatch
+- *(whistle)* add control.rs, the four tools the gate can withhold
+- *(whistle)* add read.rs, the five read-only MCP tools
+- *(whistle)* add facts.rs, schema-carrying payload twins
+- *(whistle)* add shepherd.rs, one connection per tool call
+- *(whistle)* add gate.rs, the [whistle] allow_control gate
+- *(whistle)* add rmcp and schemars, measured against the plan's estimate
+- *(lookout)* add mod.rs, the verb and the UI loop that ties 12a together
+- *(lookout)* add term.rs and input.rs — raw mode, panic hook, keymap
+- *(lookout)* add source.rs and link.rs — subscribe, poll, repair, freeze
+- *(lookout)* render the frames — the point of the whole phase
+- *(lookout)* draw the flock table and the chrome lines
+- *(lookout)* add app.rs, the reducer at the dashboard's core
+- *(lookout)* map the design language's palette onto a terminal
+- *(shep-cli)* add ratatui + crossterm, measured against the plan's estimate
+- *(cli)* scale becomes stock, sendline becomes whisper
+- *(cli)* describe renders each sheep's lamb tree
+- *(daemon)* the shepherd walks a sheep's lamb tree
+- *(core)* Lamb and ProcessInfo::lambs
+- *(cli)* shep set / shep get / shep unset
+- *(core)* shep_core::kv, the file-locked key/value store
+- *(cli)* shep sendline <selector> <line>
+- *(cli)* shep scale <name> <count>
+- *(daemon,cli)* deliver a signal to one sheep, and shep signal
+- *(core)* make ProcessInfo non_exhaustive, add a builder
+- *(cli)* show the bark history
+- *(cli)* bark when the shepherd gives up
+- *(cli)* decide what is worth barking about
+- *(cli)* deliver a bark to a webhook
+- *(cli)* serve the flock's metrics
+- *(cli)* render the flock as prometheus exposition
+- *(cli)* read and write the little HTTP a dog needs
+- *(cli)* give a dog its connection and its own config
+- *(cli)* adopt and rehome a third-party dog
+- *(cli)* enable and disable a dog
+- *(cli)* print the dogs in their own table
+- *(daemon)* let the enabled dogs out at boot
+- *(core)* mark which entries are dogs
+- *(cli)* warn when sudo may have sanitized PATH before install
+- *(cli)* show each sheep's cpu and memory
+- report each sheep's cpu and memory
+- *(cli)* shep startup and unstartup
+- *(cli)* render a systemd unit and a launchd plist
+- *(daemon)* report readiness once the flock is back
+- *(cli)* shep import
+- *(cli)* import only the env an app actually declared
+- *(cli)* collapse pm2 instances into apps
+- *(cli)* read a pm2 dump
+- *(cli)* shep muster
+- *(cli)* shep save
+- *(cli)* add shep trigger
+- *(cli)* shep reload
+- *(cli)* show a flush which files it emptied
+- *(cli)* add `shep flush --daemon` for the shepherd's own logs
+- *(daemon)* make SIGUSR2 reopen every sheep's logs
+- truncate log files with shep flush
+- reopen log files so external rotation works
+- *(daemon)* wire a tracing subscriber so the daemon's diagnostics reach someone
+- *(client)* make EventStream usable without a futures-util dependency
+- *(daemon)* arm and disarm lifecycle extras across the sheep lifecycle
+- *(core)* make the cron worker's sleep bound configurable
+- *(cli)* give notices their own JSON envelope and wire up --quiet
+- *(cli)* daemon shutdown and static shell completions
+- *(core)* report each sheep's resolved log paths on ProcessInfo
+- *(cli)* bleats log following with client-side identity resolution
+- *(cli)* flock, describe, fold, and ping
+- *(cli)* start, stop, restart, and delete
+- *(cli)* foreground daemon subcommand and its detached launcher
+- *(cli)* versioned output envelope with drift-gated table and JSON renderings
+- *(cli)* clap tree, every argument struct, and the exit-code taxonomy
+
+### Fixed
+
+- *(cli)* adopt vetted the candidate against the wrong SHEP_HOME
+- *(cli)* sanitise in the emitters, so the next wire-borne error is safe too
+- *(cli)* the start notice went to two different streams
+- *(cli)* sanitise the one other peer-worded error message
+- *(cli)* say which set the dog-index footer counts count
+- *(cli)* take the invisible-character classes whole
+- *(cli)* bound the status line and header block
+- *(cli)* sanitise header-derived text at the capture seam
+- swapped init arms
+- *(packaging)* ship the license text inside every published tarball
+- *(shep)* gate the two shep style tests that cannot pass on Windows
+- *(shep)* shep restart no longer exits 0 when a sheep cannot come back
+- *(shep)* shep start <name> no longer swallows a spawn failure
+- *(shep)* the serve deadline test races a paused clock, so stop pausing it
+- *(shep)* bleats shows the log before it follows
+- *(shep)* flourish's three functions follow the crate's Windows dead-code convention
+- *(shep)* six pieces of scaffolding that were true when written
+- *(shep)* sanitise a cell's control characters before it is padded
+- *(shep)* every Render impl gets a real PRIORITIES, not the default
+- *(shep)* table_of takes an injected width, not a real-terminal read
+- *(shep)* shep muster's flourish agrees with the table above it
+- *(shep)* dogs and lambs tables never narrowed under a real terminal
+- *(shep)* status_word is a rows_for argument, not Presentation state
+- *(shep)* a refused style write must not rewrite shep.toml
+- *(shep)* set_style_level reports rather than panics on a scalar `style` key
+- *(shep)* `shep style <level>` actually sets the level
+- *(shep)* --style's help is prose, not doc-comment syntax
+- *(shep)* drop the em dash from --quiet's help text
+- *(shep)* visible_width discounts control characters, not just escapes
+- *(shep)* resolve a relative script against the caller's cwd, not the shepherd's
+- *(shep)* gate the home-refusal path to unix so Windows still compiles
+- *(shep)* stop rendering the bin_name note as --help's description
+- close the 7 real-Windows test failures found on `windows`
+- *(shep-cli)* scope the reaped-orphan test to its own grandchild
+- *(deps)* raise three dependency floors that could not build
+- *(lookout)* make the confirm-pin test able to fail
+- *(lookout)* sum the whole flock in the host strip, not the filtered view
+- *(lookout)* stop the action refusal from contradicting the reconnect banner
+- *(lookout)* reseat the cursor when an upsert renames it out of the filter
+- *(lookout)* collapse the Task 5 if-let clippy flagged at the first full gate since it landed
+- *(cli)* say no shepherd is running instead of forwarding ENOENT
+- *(shep-cli)* update the ping fixture for the 0.1.0-alpha.1 bump
+- *(shep-cli)* match the whistle catalogue generator to the renamed crate
+- *(shep-cli)* mask st_mode's file-type bits out of the auth error message
+- *(shep-dev)* make the roll durable when a signal ends the session
+- *(lookout)* three caption/title drifts in the gallery
+- *(shep-cli)* un-break the doc build (found during the phase gate)
+- *(lookout)* stop the bleats feed inventing a sheep when none is selected
+- *(lookout)* guard the bleats feed against a post-freeze read landing
+- *(whistle)* make BleatTail::truncated true for a byte-window cut too
+- *(whistle)* correct the --help claim about what the missing flag defends
+- *(whistle)* un-link mod.rs's cfg(test)-only catalogue reference
+- *(lookout)* stop advertising an x stop that always refuses in 12a
+- *(lookout)* correct two false frame captions, and pin the errored one
+- *(lookout)* reserve a gap column in the status line before the control label
+- *(cli)* lock and narrow the write path for shep.toml
+- *(cli)* stop the daemon inheriting its launcher's descriptors
+- *(dog/bark)* make substitute() a single forward pass
+- *(dog/bark)* refuse cleartext Discord/Slack webhooks at config load
+- *(cli)* enable an adopted dog as the dog it actually is
+- *(cli)* refuse to adopt a dog anyone can rewrite
+- *(daemon)* warn instead of staying silent on inert dog config
+- *(daemon)* reach every writer to a path a reload is sharing
+- close the small findings the log-plane review left open
+- *(daemon)* give the log pump the only claim on the log directory's mode
+- *(cli)* give a reopen room to finish, and let its handler prove it changes nothing
+- *(daemon)* let a reopen that failed say so, instead of acking success
+- *(cli)* stop holding the stderr lock for the daemon's whole life
+- *(workspace)* give path dependencies the versions cargo publish requires
+- *(test)* reap a case's whole flock when it panics, and signal the group
+- *(daemon)* send the graceful stop to the sheep's process group
+- *(cli)* standardise on "the daemon" in error text
+- *(cli)* shep bleats --no-follow reads log files instead of an empty bus
+- *(cli)* make Task 11's non-guarding assertions actually guard
+- *(cli)* close bleats review gaps — Dropped notice, JSON pin, broken pipe, close race
+- *(cli)* address phase3 task7 review findings
+- *(cli)* close output-layer drift gate, table panic, and Windows dead code
+- *(cli)* compiler-checked RpcErrorCode::ALL, $SHEP_HOME/alias coverage, completions without $HOME
+
+### Other
+
+- refresh the release rehearsal, and say where the dog fits
+- *(cli)* two e2e tests left a shepherd running behind them
+- *(cli)* one way to print a notice on each stream
+- the review's three findings on the plumbing refactor
+- *(cli)* From impls for the CLI's source-only error variants
+- *(cli)* fmt lives in Streams, and Streams can fail and note
+- *(cli)* pin what an error and a notice look like on the wire
+- *(cli)* pin the category list against the docs site's
+- rustfmt the shep init e2e test
+- Merge main: pick up the init arm-swap fix
+- methods on `Depth` for better oganization
+- *(shep)* five red tests for shep init, which does not exist yet
+- *(web)* the site was two days stale, and --help had lost every alias
+- *(shep)* pin the missing-node sentence by producing it
+- *(shep)* both init depths build rows through one function
+- log Rin's call that shep should expand ~/ in config paths
+- *(lookout)* the errored caption names what its EXIT column shows
+- *(lookout)* the pinned frames show a real exit, not a column of dashes
+- *(lookout)* regenerate frames.txt/frames.ansi for the EXIT column
+- changelog entries for the crates that actually changed
+- *(shep)* pin the flock listing's drop order column by column
+- *(shep)* pin sheep_flourish's own rules, and both flourish gates
+- *(shep)* add the pipe test spec §5 claimed already existed
+- *(shep)* pin every style level through the real rendering seam
+- *(shep)* a `--home` that is not there is a usage error, not an unreachable daemon
+- *(cli)* point the systemd-analyze check at a binary that exists
+- *(cli)* stop the describe fixture betting on losing a race
+- describe lookout's shipped filter, actions, and lambs, not the gaps
+- *(lookout)* fix the stale bin-only justification for frames' cfg(test)
+- *(lookout)* the Phase 16 sweep and the phase gate
+- *(shep-cli-changelog)* fix rename leftovers, permanent in the shep tarball
+- *(changelog)* head all four shipped CHANGELOGs with 0.1.0-alpha.1
+- catch three more shep-cli-as-package-name misses
+- *(shep)* rename the package from shep-cli to shep
+- *(shep-cli)* drop 40 dead_code attributes that suppress nothing
+- *(shep-cli)* update the crate-root doc for 12b's shipped panes
+- *(reap)* correct three docs claiming init calls set_child_subreaper
+- *(phase15)* close the serve/dev/runtime ledger and update the docs
+- *(shep-core)* say that the non-unix ring and kv locks hold nothing
+- Merge Phase 14: config and packaging
+- *(lookout)* document fit's char-vs-column limitation as v1.1 debt
+- *(lookout)* rewrite comments that describe shipped features as unbuilt
+- *(lookout)* make the pane-sweep test check where panes actually sit
+- *(lookout)* make the frozen-frame host-strip comment true
+- *(shep-cli)* fix the false lookout CHANGELOG entry
+- *(lookout)* reconcile the docs with what Phase 12b shipped
+- *(whistle)* stop filtering blank stdout lines out of the JSON-RPC check
+- *(whistle)* cover the malformed-shep.toml stderr notice
+- *(whistle)* drop dead_code allows that suppress nothing
+- *(whistle)* add CHANGELOG entries for the whole phase
+- *(whistle)* reconcile the ledger, README and CLAUDE.md with the shipped MCP server
+- *(whistle)* add the e2e tier over real stdio
+- *(release)* give every crate the metadata crates.io needs
+- *(lookout)* reconcile the ledger with 12a's shipped shell and flock table
+- *(lookout)* make the panic-hook restore ordering a permanent, headless test
+- *(cli)* the lamb-tree poll rides out an exec, not a sampling tick
+- *(cli)* the kv store end to end, and docs/kv.md
+- *(core,daemon)* make IR-20 true of the tree it governs
+- *(core,daemon,cli)* close the IR-20 rationale gap on six error enums
+- correct the ring claim, reuse_port, and two openat2 comments
+- record what a dog is and what it costs
+- *(dog/bark)* satisfy rustfmt on the discord-http-refused test
+- *(dog/bark)* cover GaveUp's quiet half on both routes
+- *(cli)* drop the tracing dependency that lost its last call site
+- record what a pm2 cutover actually takes
+- *(cli)* pull parse_selector into one shared copy
+- *(cli)* stop claiming a TUI, a file server and container modes ship
+- *(cli)* name the function that fills in DEFAULT_DEADLINE, not a line
+- *(cli)* reopen's failure output can name a sheep the operator did not
+- *(cli)* name the SO_REUSEPORT precondition on reload
+- *(cli)* the selector test covers four verbs, not three
+- *(cli)* name the selector test rather than linking to it
+- close the log plane's uncovered behaviours
+- unstick six enumerations the log plane falsified
+- record the log plane
+- *(cli)* prove an external copytruncate still lands at offset zero
+- correct six claims the flush verb makes about itself
+- *(cli)* correct three false claims, and honour NO_COLOR
+- *(cli)* pin the two log knobs the daemon subcommand exists to honour
+- *(cli)* pin a real RSS breach restarting a real sheep
+- *(cli)* pin a cron occurrence restarting a real sheep on a real clock
+- stop promising work this phase does not deliver
+- *(cli)* end-to-end coverage for watch, readiness and config rejection
+- *(cli)* give the e2e harness timeout headroom over SPAWN_DEADLINE
+- *(cli)* drop internal spec reference from `fold` help text
+- *(cli)* end-to-end tier with autostart, concurrency, and pinned JSON fixtures
+- *(cli)* correct two stale dead-code claims in launch.rs
+- *(cli)* close query verb coverage gaps from task 9 review
+- *(shep-cli)* close lifecycle verb coverage gaps from review
+- *(client)* fold the fakes back into shep-client behind test-support
+- SECURITY.md premises contract + per-crate changelogs (IR-42/45)
+- scaffold cargo workspace (shep-core, shep-daemon, shep-client, shep-cli)
+
 ### Additions
 
 - `shep flock` and `shep describe` gain an `EXIT` column: the exit code, or

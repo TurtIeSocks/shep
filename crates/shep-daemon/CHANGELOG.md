@@ -10,6 +10,269 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.1](https://github.com/TurtIeSocks/shep/releases/tag/shep-daemon-v0.1.0-alpha.1) - 2026-08-26
+
+### Added
+
+- *(daemon)* name the sun_path limit instead of passing ENAMETOOLONG through
+- *(core)* refuse reuse_port rather than accepting a knob nothing reads
+- *(core,daemon,cli)* carry a sheep's last exit outcome to the operator
+- *(shep-daemon)* a stopped sheep stays in the flock across a daemon restart
+- *(cli)* scale becomes stock, sendline becomes whisper
+- *(daemon)* the shepherd walks a sheep's lamb tree
+- *(core)* shep_core::kv, the file-locked key/value store
+- *(cli)* shep sendline <selector> <line>
+- *(daemon)* the supervisor writes a line to a sheep
+- *(daemon)* pipe a sheep's stdin, opt-in per app
+- *(daemon)* the supervisor scales an app
+- *(daemon,cli)* deliver a signal to one sheep, and shep signal
+- *(core,daemon)* forward shepherd-channel traffic onto the bus
+- *(core)* reject an unknown kill_signal when the config is read
+- *(core)* make ProcessInfo non_exhaustive, add a builder
+- *(daemon)* leave a trail when a dog gives up
+- *(daemon)* group a listing by name so a clustered app reads as one
+- *(daemon)* let the enabled dogs out at boot
+- *(daemon)* answer the dog contract
+- *(daemon)* start a dog through the ordinary spawn path
+- keep dogs out of what a wildcard selector sweeps
+- *(core)* mark which entries are dogs
+- report each sheep's cpu and memory
+- *(daemon)* sample every sheep, enforce only where a limit exists
+- *(daemon)* report readiness once the flock is back
+- assemble the flock from the roll on demand
+- *(daemon)* write the muster roll when an operator asks
+- *(core)* bound a custom action with its own timeout
+- *(daemon)* answer a trigger for every sheep it matched
+- *(daemon)* wait for an action's reply, or time out
+- *(core)* put trigger on the wire
+- *(daemon)* let a triggered action carry params
+- *(daemon)* keep a handle on the shepherd channel
+- *(daemon)* bound every reload swap with a deadline of the actor's own
+- *(daemon)* report a reload's progress on the bus
+- *(daemon)* answer the reload verb on the control socket
+- *(daemon)* reload an app one instance at a time
+- *(daemon)* let the stop ladder's cap be the caller's choice
+- *(daemon)* say which entry holds which half of a reload
+- *(daemon)* refuse a log ancestry a root shepherd should not write below
+- *(daemon)* refuse to follow a symlink at a log path
+- *(daemon)* make SIGUSR2 reopen every sheep's logs
+- truncate log files with shep flush
+- reopen log files so external rotation works
+- *(daemon)* give the supervisor a way to reach its log pumps
+- *(core)* let an app open the shepherd channel without a readiness flag
+- *(daemon)* wire a tracing subscriber so the daemon's diagnostics reach someone
+- *(daemon)* arm and disarm lifecycle extras across the sheep lifecycle
+- *(daemon)* watch-triggered restarts with glob filtering and re-check
+- *(daemon)* debounced filesystem watch bridged onto tokio
+- *(daemon)* gate online on readiness for apps that configure it
+- *(daemon)* HTTP, TCP and exec probes over real sockets and processes
+- *(daemon)* liveness probing with a consecutive-failure threshold
+- *(daemon)* polling memory-limit enforcement behind a mechanism-free seam
+- *(daemon)* sample resident memory across a sheep's process tree
+- *(daemon)* cron-scheduled restarts with a wall-clock seam
+- *(core)* report each sheep's resolved log paths on ProcessInfo
+- *(daemon)* daemon boot — readiness pipe, signal handlers, ordered teardown
+- *(daemon)* boot layout — 0700 dirs, pidfile, stale-socket recovery
+- *(daemon)* UDS RPC server — peer-cred auth, handshake, subscriptions
+- *(daemon)* RPC dispatch — verb routing, typed errors, per-call deadlines
+- *(daemon)* muster roll — registry, atomic writes, debounced writer, restore
+- *(daemon)* event bus — topic globs, forwarder task, drop-oldest notices
+- *(daemon)* supervisor actor with sheep-task ownership + deterministic lifecycle tests
+- *(daemon)* kill ladder — message/signal, timeout, SIGKILL tree
+- *(daemon)* tokio runner — process groups, socketpair channel, log capture
+- *(daemon)* spawn assembly — slots, env, interpreter, log paths
+- *(daemon)* restart brain — signal exits never match stop_exit_codes
+- *(daemon)* entry, budget, pinned integer backoff
+- *(daemon)* runner abstraction, shepherd channel types, scripted fake
+
+### Fixed
+
+- *(daemon)* drop the From that let ? pick the wrong BootError
+- *(packaging)* ship the license text inside every published tarball
+- *(daemon)* a respawn that never spawns must not keep the old exit code
+- *(shep-daemon)* widen the coalescing window, and pin the half load cannot break
+- *(shep-daemon)* stop asserting on which batch a write lands in
+- close the 7 real-Windows test failures found on `windows`
+- *(shep-daemon)* log the pump's ancestry-check refusal instead of swallowing it
+- *(shep-daemon)* stop treating a pre-drop straggler batch as a leak
+- *(daemon)* canonicalize the watch root here, not in the backend
+- *(shep-daemon)* silence a clippy lint in the new signalled-shutdown test
+- *(shep-dev)* make the roll durable when a signal ends the session
+- *(daemon)* a scale is refused while an earlier one is still leaving
+- *(daemon)* an abandoned stdin write is dropped, and not_written says what it means
+- *(daemon)* a full stdin queue reports no elapsed time it did not measure
+- *(daemon)* describe's lamb names stop being permanently stale
+- *(daemon)* record a partial scale in the muster roll
+- *(daemon)* stamp custom actions so a late reply cannot answer the wrong wait
+- *(protocol)* stop Response's derived Debug from leaking a dog's TOML section
+- *(daemon)* let a child block on the shepherd channel
+- *(daemon)* log the two skips that drop real work in silence
+- *(daemon)* say on the bus that a reload ended with its drainee already gone
+- *(daemon)* announce a swap only for a replacement that is still serving
+- *(daemon)* reach every writer to a path a reload is sharing
+- *(daemon)* assert the reachability claim the queue-abort rests on
+- *(daemon)* stop a reload swapping against an instance already on its way out
+- *(daemon)* stop the swap gate at the commit, and say what it made redundant
+- *(daemon)* stop an abandoned reload reporting a dying drainee as online
+- *(daemon)* hold an automatic restart off both halves of a reload's swap
+- *(daemon)* end a reload whose replacement outlives the drainee it replaced
+- *(daemon)* stop a reload deleting an app an operator only stopped
+- close the small findings the log-plane review left open
+- *(daemon)* tell a watch rescan apart from an event on the watch root
+- *(daemon)* give the log pump the only claim on the log directory's mode
+- *(daemon)* flush every writer to a path a flush is about to empty
+- *(cli)* give a reopen room to finish, and let its handler prove it changes nothing
+- *(daemon)* let a reopen that failed say so, instead of acking success
+- *(daemon)* end a log pump when its `logs` receiver goes, line or no line
+- *(daemon)* serve the log pump's control channel while it waits for room
+- *(daemon)* close the interest-cache race the log-capture harness still had
+- *(daemon)* ignore a sheep's own logs, and stop docs promising what nobody sees
+- *(daemon)* stop reporting every automatic restart as a user action
+- *(core)* reject the zero-valued knobs that turn loops into hot spins
+- *(test)* reap a case's whole flock when it panics, and signal the group
+- *(daemon)* count cron and watch restarts as automatic, not operator
+- *(daemon)* let a stop or delete override an automatic restart mid-ladder
+- *(core)* reject watch globs that will not compile at config time
+- *(daemon)* close the four ways a lifecycle extra outlives its sheep
+- *(daemon)* restart on a watch rescan, and arm the watch tests that could not fail
+- *(daemon)* make the watch source's tests actually guard what they claim
+- *(daemon)* carry `manually` through a gated app's deferred Online
+- *(daemon)* scope a readiness probe to the assembled spec's env
+- *(daemon)* carry the port in an HTTP probe's Host header
+- *(daemon)* require an HTTP status line before trusting its status code
+- *(daemon)* finish OsProber's redacting Debug non-exhaustively
+- *(daemon)* kill a timed-out exec probe's whole process group
+- *(daemon)* give an exec probe null stdio instead of the daemon's
+- *(daemon)* reject a zero probe interval, and pin the timeout wire
+- *(daemon,core)* harden cron worker per Task 3 review round
+- *(daemon)* send the graceful stop to the sheep's process group
+- *(daemon)* stop an fd-adoption test double-closing another test's descriptor
+- *(daemon)* honour a pending Delete on the duplicate-exit path
+- *(daemon)* rearm shutdown-signal listeners against a swallowed repeat SIGTERM
+- *(daemon)* restore IR-22 by design + flock the pidfile against the double-bind race
+- *(daemon)* honest SAFETY comment, deadline+credentials coverage, roll disclosure
+- *(daemon)* honour pending_delete when a Delete races a Restart
+- *(daemon)* delete-racing-shutdown deregistration; test: supervisor proptest over command/exit interleavings (IR-37)
+- *(daemon)* uid/gid spawn + seed PATH/base env so bare interpreters exec
+- *(daemon)* adopt the ready fd before boot opens anything (IO safety)
+- *(daemon)* create runtime dirs at 0700 instead of chmod-after (TOCTOU)
+- *(daemon)* abort the bus forwarder on every connection-teardown path
+- *(daemon)* resolve broken intra-doc links in server.rs's module doc
+- *(daemon)* restart budget errors at max_restarts, not max_restarts+1 (spec §4)
+- *(daemon)* correct Quick-start doctest, kill-module taxonomy, inline audit
+- *(daemon)* supervisor concurrency — shutdown orphans, kill-path deadlock, stale-timer backoff, overlapping-command reply
+- collapse nested if-let into let-chains (clippy::collapsible_if)
+- *(daemon)* CI portability + fake accessor fixes from review
+
+### Other
+
+- the review's three findings on the plumbing refactor
+- *(daemon)* From impls for the daemon's source-only error variants
+- changelog entries for the crates that actually changed
+- *(shep-daemon)* stop asserting coalescing against a shared CI runner
+- *(docs.rs)* make shep-core's schema feature visible on docs.rs
+- *(changelog)* head all four shipped CHANGELOGs with 0.1.0-alpha.1
+- *(release)* give every crate the metadata crates.io needs
+- *(core,daemon)* move shepherd channel message types to shep-core
+- *(core,daemon)* make IR-20 true of the tree it governs
+- *(core,daemon,cli)* close the IR-20 rationale gap on six error enums
+- correct the ring claim, reuse_port, and two openat2 comments
+- *(daemon)* narrow the inner-loop skip to a real slow module
+- *(daemon)* say what an answering socket actually proves
+- *(daemon)* wait out a crashed daemon's socket before rebooting
+- record what a custom action is and is not
+- *(daemon)* reconcile the changelog for Phase 7's trigger work
+- *(daemon)* ask for the channel the writer-task case needs
+- prove a trigger reaches a real child and comes back
+- *(cli)* stop claiming a TUI, a file server and container modes ship
+- *(daemon)* name ReloadState's variants for the role, not the phase
+- *(daemon)* expect over bare indexing in handle_reload
+- *(daemon)* name Reloading in track_spawned's arm list
+- graceful_timeout, not both timeouts, was the option with no reader
+- *(daemon)* the Stopping test section describes what it now guards
+- *(daemon)* pin that the muster roll never counts a reload's drainee
+- *(daemon)* reconcile the reopen entry with the reach it shipped with
+- *(daemon)* tighten the ReloadState paragraph the pid removal left behind
+- *(daemon)* call the uncommitted-swap helper instead of re-deriving it
+- *(daemon)* drop the write-only pid off ReloadState::Draining
+- record what reload does and does not promise
+- *(changelog)* say what a reload costs on each platform
+- *(daemon)* record every pid an event names, not only the ones a reply does
+- prove what a reload does to a live connection
+- *(daemon)* pin the arming order a reload depends on
+- *(daemon)* drive a drainee's liveness failure through the real probe chain
+- *(daemon)* drop task-relative phrasing from shipped comments
+- *(daemon)* stop guard 4 claiming a second rejection that never runs
+- *(daemon)* watch for the event the drainee-report bug actually emits
+- *(daemon)* scope the swap-gate release note to what it actually does
+- *(daemon)* note in the release notes which instances a reload skips
+- *(daemon)* say what holding off a cron or watch trigger actually costs
+- *(daemon)* say the swap gate keys on the phase, not the marker
+- *(daemon)* let the second-reload-refused case see the damage it names
+- *(daemon)* import AppConfig instead of naming it in full at one call site
+- *(daemon)* split the two arguments stacked on one rpc error arm
+- *(daemon)* name the shutdown-mid-reload asymmetry instead of folding it away
+- *(daemon)* make abort_reload's reachability claim a check
+- *(daemon)* give the shutdown-refuses-a-reload case something to observe
+- *(daemon)* make the stop-mid-reload case actually order-dependent
+- *(daemon)* pin the guards a reload's drainee must never pass
+- *(security)* correct the log-file claim and record the log-path posture
+- close the log plane's uncovered behaviours
+- unstick six enumerations the log plane falsified
+- correct two claims the log plane makes that are false
+- *(daemon)* pin the respawn that re-points a slot at its new log pump
+- record the log plane
+- correct six claims the flush verb makes about itself
+- *(daemon)* correct three claims the log seam makes, and cover what it hands on
+- *(cli)* correct three false claims, and honour NO_COLOR
+- *(changelog)* record the shep-daemon visibility narrowing
+- *(daemon)* narrow the crate's public surface to its real consumers
+- *(daemon)* pin the rescan producer and four watch/cron behaviours
+- *(daemon)* pin InstanceExtras' redacting Debug
+- *(daemon)* pin handle_ready_result's shutdown guard
+- *(changelog)* record the three rejections and two fixes just landed
+- *(changelog)* correct nine claims, and mark the phase 4 plan complete
+- stop promising work this phase does not deliver
+- *(daemon)* correct what a DST fall-back does to a cron occurrence
+- *(changelog)* record the Phase 4 lifecycle subsystems and config keys
+- *(daemon)* make the lifecycle-extra module headers decision guides
+- *(daemon)* pin the budget reset a restart of a stopped sheep performs
+- *(daemon)* pin the budget reset an operator's restart performs
+- *(daemon)* property and boundary coverage for the lifecycle extras
+- *(daemon)* account for the transition the disarm checklist left out
+- *(daemon)* cover the three lifecycle-extra behaviours nothing was pinning
+- *(daemon)* say where disarm is really called from, and narrow Command
+- *(daemon)* cover the lifecycle-extra behaviour nothing was pinning
+- *(daemon)* say what the rescan bypass is actually keyed on
+- *(comments)* make phase-created comments self-contained
+- *(daemon)* stop the boot race test fabricating a live "stale" socket
+- *(daemon)* unbreak the private-items doc build
+- *(daemon)* prove the shepherd channel's ready message reaches the gate
+- *(daemon)* say why readiness doesn't floor its probe interval
+- *(daemon)* correct what a cleared `ready_tx` means
+- *(daemon)* note what exit 127 stops meaning without the shell
+- *(daemon)* assert the bytes an HTTP probe puts on the wire
+- *(daemon)* accept either failure from an unroutable TCP address
+- *(daemon)* the polling enforcer is no longer a later addition
+- *(daemon)* pin four unguarded limits-loop behaviors, hoist per-tick tree index
+- *(daemon)* fix broken intra-doc links to the cfg-gated fake module
+- *(daemon)* guard tree_rss's parent-pid decision against real-OS regression
+- *(daemon)* drop task-relative phrasing from moved testing.rs comments
+- *(daemon)* move mod testing out of lib.rs into its own file
+- *(daemon)* drop task-relative phrasing from Cargo.toml comments
+- *(daemon)* make write_pidfile test-only
+- *(daemon)* correct two unsafe-surface claims left stale by Decision 1
+- correct stale unsafe-surface counts across docs and plan
+- *(daemon)* plane taxonomy, canonical security writeup, inline audit
+- *(daemon)* end-to-end tier — real socket, real children, muster round trip
+- *(daemon)* make the bare-interpreter test actually gate PATH seeding
+- *(daemon)* pin ready-fd adoption ordering; correct unsafe-surface docs
+- *(daemon)* crate mini-guide + inline audit
+- *(daemon)* fix rustdoc intra-links that reddened the docs CI job
+- *(daemon)* commit proptest regression seed for brain budget invariant
+- SECURITY.md premises contract + per-crate changelogs (IR-42/45)
+- scaffold cargo workspace (shep-core, shep-daemon, shep-client, shep-cli)
+
 ### Additions
 
 - Record every sheep's last exit outcome and carry it on `ProcessInfo`. The
