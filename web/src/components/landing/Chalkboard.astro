@@ -5,36 +5,41 @@
  * the item pills are DATA from web/src/data/chalkboard.ts, sourced from
  * docs/specs/deferred.md — see that file's header comment.
  */
-import { notBuiltYet } from "../../data/chalkboard";
+import { board } from "../../data/chalkboard";
 ---
 
 <section id="chalkboard" class="chalkboard-section">
   <div class="inner">
     <div class="frame">
       <div class="slate">
-        <div class="kicker">today on the board</div>
+        <div class="kicker">on the board</div>
         <h2>What's not built yet</h2>
         <p>
-          This board is short on purpose, and it just got shorter. Lookout's
-          last three items shipped, so the v1.0 queue is down to one thing:
-          OTLP export on the metrics dog. A handful of other features are
-          missing from shep too, but not because they're pending. They were
-          cut from v1 by decision, and they live in the deferred doc rather
-          than on this board. Windows is the biggest of those: ruled out of
-          v1 entirely rather than left half done. The workspace
-          cross-compiles for it and that check runs on every change, but no
-          test has ever executed there, only a compile.
+          Two kinds of missing. The first row is work the spec names and
+          nobody has written yet. The second is what was cut from the first
+          release on purpose. Windows is the biggest of those: ruled out
+          entirely rather than left half done. The workspace cross-compiles
+          for it and that check runs on every change, but no test has ever
+          executed there, only a compile.
         </p>
-        <div class="pills">
-          {
-            notBuiltYet.map((item) => (
-              <span class="pill">
-                <span class="x">✗</span>
-                {item}
-              </span>
-            ))
-          }
-        </div>
+        {
+          board.map((group) => (
+            <div class="group">
+              <div class="group-head">
+                <span class="group-label">{group.label}</span>
+                <span class="group-note">{group.note}</span>
+              </div>
+              <div class="pills">
+                {group.items.map((item) => (
+                  <span class="pill">
+                    <span class="x">✗</span>
+                    {item}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ))
+        }
       </div>
     </div>
   </div>
@@ -94,6 +99,32 @@ import { notBuiltYet } from "../../data/chalkboard";
     color: #cfe0d3;
     max-width: 60ch;
     margin: 0 0 28px;
+  }
+
+  .group + .group {
+    margin-top: 26px;
+  }
+
+  .group-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 10px;
+    margin-bottom: 11px;
+  }
+
+  .group-label {
+    font-family: "Space Mono", monospace;
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: #8fbfa4;
+  }
+
+  .group-note {
+    font-size: 14.5px;
+    line-height: 1.4;
+    color: #a8bfae;
   }
 
   .pills {
