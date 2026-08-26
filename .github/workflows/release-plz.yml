@@ -161,6 +161,39 @@ jobs:
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git switch --force-create main "$TESTED_SHA"
           git branch --set-upstream-to=origin/main main
+      # release-plz 0.3.160, which is what the action below actually runs,
+      # does not necessarily release the commit it was handed. When the
+      # tested commit is a MERGE commit, `should_release` looks up the
+      # associated pull request, takes that PR's last commit `P`, checks
+      # `git branch --contains P`, and on a hit returns `YesWithCommit(P)`.
+      # `release` then runs a literal `git checkout P` against this working
+      # directory, and `cargo publish` packages from that same directory.
+      # So the tarball on crates.io would be built from `P`, not from the
+      # commit test.yml passed. Anything that landed on main after the
+      # release PR's last push is tested here and absent there.
+      #
+      # A squash or rebase merge does not hit this: the merged commit is
+      # new, the branch is deleted, `git branch --contains` finds nothing,
+      # and release-plz falls back to releasing what is checked out.
+      # release-plz fixed the squash case in its #1775 and #1801; the
+      # merge-commit case looks like the one those left behind.
+      #
+      # `release_always = false` does NOT protect against this. It only
+      # governs the branch where no associated PR is found at all, so
+      # requiring a release PR routes into the exposed path rather than
+      # around it.
+      #
+      # So refuse instead of publishing something nobody tested. One parent
+      # means squash or rebase and is safe; two or more means a merge commit.
+      - name: Refuse to publish from a merge commit
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          parents="$(git rev-list --parents -n 1 "$TESTED_SHA" | wc -w)"
+          if [ "$parents" -gt 2 ]; then
+            echo "::error::$TESTED_SHA is a merge commit, and release-plz 0.3.160 would publish the release PR's head commit instead of this one. Re-merge the release pull request with squash or rebase."
+            exit 1
+          fi
       - run: rustup toolchain install stable --profile minimal
       # Same pin as the job above, for the same reason.
       - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
