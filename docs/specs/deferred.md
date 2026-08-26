@@ -1173,10 +1173,19 @@ below was laid out. Recorded so the argument does not have to be re-derived
 the next time it sounds like a nice idea.
 
 **The blocker was never XSS.** A hostile README running script on shep's own
-domain is a real risk, but it is a *solved* one: sanitise the rendered output,
-or render only a restricted Markdown subset, the same way `dog_index.rs`
-already sanitises every string that reaches a terminal out of `dogs.json`.
-That work is known and would not be the hard part.
+domain is a real risk, but it is a *solved* one in the general sense: render
+only a restricted Markdown subset, or run the HTML through an established
+sanitiser that strips `<script>`, `javascript:` hrefs, and `on*` attributes.
+
+That is not the same problem `dog_index.rs` already solves, and citing it as
+precedent here would be wrong. `terminal_safe::sanitise` strips control
+characters and invisible formatting characters for a *terminal* — it does
+nothing about a `<script>` tag, a `javascript:` href, or an `onerror`
+attribute, none of which are control characters. Terminal sanitisation and
+HTML sanitisation are different problems, and the first buys nothing for the
+second. The HTML work is still known and would not be the hard part — it is
+just work this repo has not written, not code already sitting in
+`dog_index.rs` waiting to be reused.
 
 **The actual blocker is curation, and no sanitiser touches that.** An index
 entry is reviewed exactly once, in a pull request, by a human who read the
