@@ -31,6 +31,7 @@
 //! proportion to the ask; `shep muster` is the one verb that autostarts,
 //! and it says so in its own help text.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -590,10 +591,18 @@ fn warn_group_writable(streams: &mut Streams<'_>, path: &Path) {
 
 /// `shep adopt <name> <path>`: vets a binary shep has never seen, records
 /// it, and starts it if a shepherd is running.
+///
+/// `args.path` is resolved before vetting ([`resolve_adopt_path`]): as
+/// given, with a leading `~/` expanded, or looked up on `$PATH` if it
+/// names no directory. All three funnel into the same [`vet_binary`] call,
+/// so this changes what `adopt` can FIND, never what it VETS.
 pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArgs) -> ExitCode {
-    let vetted = match vet_binary(&args.path, &paths.home) {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path_var = std::env::var_os("PATH");
+    let candidate = resolve_adopt_path(&args.path, home.as_deref(), path_var.as_deref());
+    let vetted = match vet_binary(&candidate, &paths.home) {
         Ok(vetted) => vetted,
-        Err(refusal) => return fail_adopt(streams, &args.path, &refusal),
+        Err(refusal) => return fail_adopt(streams, &candidate, &refusal),
     };
     let path = vetted.path;
     for writable in &vetted.group_writable {
@@ -606,6 +615,88 @@ pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArg
     }
     let client = Client::connect(&paths.socket).await.ok();
     adopt_after_config(streams, &args.name, &path, client.as_ref()).await
+}
+
+/// Resolves `raw` -- `shep adopt`'s own path argument -- before it reaches
+/// [`vet_binary`]: (a) as given, (b) with a leading `~/` expanded against
+/// `home`, (c) looked up on `path_var`. First hit wins; if none of the
+/// three finds anything, `raw` comes back unchanged so `vet_binary` reports
+/// the same [`AdoptRefusal::Missing`] it always has.
+///
+/// `home` and `path_var` are taken as parameters, read once by [`adopt`]
+/// from `$HOME`/`$PATH`, rather than read here -- the same reason
+/// [`resolve_paths`](crate::resolve_paths) takes an `env` closure instead
+/// of calling `std::env::var` inline: it keeps this function a pure
+/// function of its inputs, testable with a fabricated home or `$PATH`
+/// without touching the real environment (this crate forbids `unsafe`
+/// code outright, so a test cannot use `std::env::set_var` to do that
+/// either -- it is `unsafe` as of edition 2024).
+///
+/// All three routes funnel into the one [`vet_binary`] call in [`adopt`]
+/// once this returns -- existence, file-ness, the execute bit and the exec
+/// probe are exactly as strict for a `$PATH` hit or a `~/`-expanded one as
+/// for a literal path, so this changes what `adopt` can FIND, never what
+/// it VETS. `cargo install shep-log-rotate` puts the binary on `$PATH`
+/// under its own name; this is what lets `shep adopt shep-log-rotate` find
+/// it there instead of demanding the full install path.
+fn resolve_adopt_path(raw: &Path, home: Option<&Path>, path_var: Option<&OsStr>) -> PathBuf {
+    if raw.exists() {
+        return raw.to_path_buf();
+    }
+    if let Some(expanded) = raw
+        .to_str()
+        .and_then(|value| expand_tilde_candidate(value, home))
+        && expanded.exists()
+    {
+        return expanded;
+    }
+    if let Some(found) = lookup_on_path(raw, path_var) {
+        return found;
+    }
+    raw.to_path_buf()
+}
+
+/// `~/`-expands `value` against `home`, for [`resolve_adopt_path`]'s
+/// second step. `None` for anything
+/// [`shep_core::config::expand_home_tilde`] refuses (another user's home,
+/// or no home to expand against) or that does not start with `~` at all --
+/// either way [`resolve_adopt_path`] moves on to its next step rather than
+/// surfacing a tilde-specific error, since the path might never have been
+/// a tilde path to begin with.
+///
+/// The one piece of tilde-expansion logic in the workspace lives in
+/// shep-core, shared with Flockfile path fields (`normalize::expand_tilde`)
+/// -- this is not a second implementation of it.
+fn expand_tilde_candidate(value: &str, home: Option<&Path>) -> Option<PathBuf> {
+    if !value.starts_with('~') {
+        return None;
+    }
+    shep_core::config::expand_home_tilde(value, home)
+        .ok()
+        .map(PathBuf::from)
+}
+
+/// Looks `name` up on `path_var` (`$PATH`'s own syntax: `:`-separated
+/// directories), the way a shell would -- and only the way a shell would: a
+/// bare name with no directory component of its own (`shep-log-rotate`,
+/// not `./shep-log-rotate` or `/opt/bin/shep-log-rotate`), and only a hit
+/// with an execute bit set for someone, so a same-named non-executable
+/// file earlier on `$PATH` does not block the real binary further down it.
+fn lookup_on_path(name: &Path, path_var: Option<&OsStr>) -> Option<PathBuf> {
+    let is_bare = name
+        .parent()
+        .is_some_and(|parent| parent.as_os_str().is_empty());
+    if !is_bare {
+        return None;
+    }
+    let dirs = path_var?;
+    std::env::split_paths(dirs)
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::metadata(candidate)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
 }
 
 /// `adopt`'s daemon half — see [`enable_after_config`]'s own doc for why
@@ -1248,6 +1339,99 @@ mod tests {
             text.contains("next shepherd"),
             "the operator needs to know the dog is not running yet: {text}"
         );
+    }
+
+    /// fails if `resolve_adopt_path` stops trying a literal path first, or
+    /// tries the other two steps when the literal one already exists --
+    /// the base case every other `resolve_adopt_path` test builds on.
+    #[test]
+    fn resolve_adopt_path_prefers_a_literal_path_that_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("thing");
+        std::fs::write(&binary, "").unwrap();
+
+        let resolved = resolve_adopt_path(&binary, None, None);
+        assert_eq!(resolved, binary);
+    }
+
+    /// fails if `shep adopt lr '~/.cargo/bin/shep-log-rotate'` stops
+    /// working -- issue 1's second repro. `resolve_adopt_path` must expand
+    /// `~/` against the `home` it is given when the literal path (a
+    /// literal `~` directory, which does not exist) is not there.
+    ///
+    /// Mutation check: reverting the tilde-expansion step (returning
+    /// `raw` unchanged whenever the literal path is missing, skipping
+    /// straight to the `$PATH` lookup) reddens this -- `resolve_adopt_path`
+    /// would return the untouched `~/...` path, which `vet_binary` then
+    /// reports `Missing` for.
+    #[test]
+    fn resolve_adopt_path_expands_a_leading_tilde_against_the_given_home() {
+        let home = tempfile::tempdir().unwrap();
+        let binary_dir = home.path().join(".cargo/bin");
+        std::fs::create_dir_all(&binary_dir).unwrap();
+        let binary = binary_dir.join("shep-log-rotate");
+        std::fs::write(&binary, "").unwrap();
+
+        let raw = Path::new("~/.cargo/bin/shep-log-rotate");
+        let resolved = resolve_adopt_path(raw, Some(home.path()), None);
+        assert_eq!(resolved, binary);
+    }
+
+    /// fails if `shep adopt lr shep-log-rotate` stops working when the
+    /// binary is only on `$PATH` -- issue 1's first repro (`cargo install
+    /// shep-log-rotate` puts it there under its own name).
+    ///
+    /// Mutation check: reverting the `$PATH` step to return `None`
+    /// unconditionally reddens this the same way the tilde mutation above
+    /// reddens its own test.
+    #[test]
+    fn resolve_adopt_path_falls_back_to_a_path_lookup_for_a_bare_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("shep-log-rotate");
+        std::fs::write(&binary, "").unwrap();
+        let mut mode = std::fs::metadata(&binary).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        std::fs::set_permissions(&binary, mode).unwrap();
+        let path_var = std::ffi::OsString::from(dir.path());
+
+        let raw = Path::new("shep-log-rotate");
+        let resolved = resolve_adopt_path(raw, None, Some(&path_var));
+        assert_eq!(resolved, binary);
+    }
+
+    /// fails if a `$PATH` lookup fires for a name that already names a
+    /// directory of its own (`./thing`, `bin/thing`, `/opt/thing`) -- a
+    /// shell never searches `$PATH` for one of those, and neither should
+    /// this: a same-named file elsewhere on `$PATH` would silently adopt
+    /// the wrong binary.
+    #[test]
+    fn resolve_adopt_path_does_not_path_search_a_name_with_a_directory_component() {
+        let path_dir = tempfile::tempdir().unwrap();
+        // A file that WOULD match if `$PATH` were searched -- proving the
+        // guard, not just an absent or non-executable one.
+        let decoy = path_dir.path().join("thing");
+        std::fs::write(&decoy, "").unwrap();
+        let mut mode = std::fs::metadata(&decoy).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        std::fs::set_permissions(&decoy, mode).unwrap();
+        let path_var = std::ffi::OsString::from(path_dir.path());
+
+        let raw = Path::new("./thing");
+        let resolved = resolve_adopt_path(raw, None, Some(&path_var));
+        assert_eq!(
+            resolved, raw,
+            "a name with its own directory must never be searched on $PATH"
+        );
+    }
+
+    /// fails if none of the three resolution steps finding nothing stops
+    /// returning `raw` unchanged -- the funnel that keeps a plain missing
+    /// path reporting the same [`AdoptRefusal::Missing`] it always has,
+    /// rather than a resolution-specific error.
+    #[test]
+    fn resolve_adopt_path_returns_raw_unchanged_when_nothing_resolves() {
+        let raw = Path::new("/nonexistent/shep-nothing");
+        assert_eq!(resolve_adopt_path(raw, None, None), raw);
     }
 
     /// fails if `rehome` behaves as `disable` does — the whole difference

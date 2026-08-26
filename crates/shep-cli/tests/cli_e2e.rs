@@ -5877,3 +5877,68 @@ fn piped_table_output_at_the_default_style_carries_no_box_or_escape() {
 
     graceful_kill(dir.path());
 }
+
+// --- Issue 1: `shep adopt` finds a bare $PATH name and expands `~/` ------
+
+/// Issue 1's first repro, verbatim: `cargo install shep-log-rotate` puts
+/// the binary on `$PATH` under its own name, and `shep adopt` used to be
+/// unable to find it there at all.
+#[test]
+fn shep_adopt_finds_a_binary_on_path_by_bare_name() {
+    let home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    let binary = write_script(&bin_dir, "shep-log-rotate", "#!/bin/sh\nexit 0\n");
+
+    let output = Command::cargo_bin("shep")
+        .unwrap()
+        .env("PATH", bin_dir.path())
+        .arg("--home")
+        .arg(home.path())
+        .arg("adopt")
+        .arg("lr")
+        .arg("shep-log-rotate")
+        .timeout(CMD_TIMEOUT)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let written = std::fs::read_to_string(home.path().join("shep.toml")).unwrap();
+    assert!(
+        written.contains(&binary.display().to_string()),
+        "the $PATH hit must be the recorded binary: {written}"
+    );
+}
+
+/// Issue 1's second repro, verbatim: a literal `~/` path, which worked in
+/// a Flockfile (2026-08-19) but not at `shep adopt` until now.
+#[test]
+fn shep_adopt_expands_a_leading_tilde_path() {
+    let shep_home = TempDir::new().unwrap();
+    let fake_user_home = TempDir::new().unwrap();
+    let bin_dir = fake_user_home.path().join(".cargo/bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let binary = bin_dir.join("shep-log-rotate");
+    std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut mode = std::fs::metadata(&binary).unwrap().permissions();
+    mode.set_mode(0o755);
+    std::fs::set_permissions(&binary, mode).unwrap();
+
+    let output = Command::cargo_bin("shep")
+        .unwrap()
+        .env("HOME", fake_user_home.path())
+        .arg("--home")
+        .arg(shep_home.path())
+        .arg("adopt")
+        .arg("lr")
+        .arg("~/.cargo/bin/shep-log-rotate")
+        .timeout(CMD_TIMEOUT)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let written = std::fs::read_to_string(shep_home.path().join("shep.toml")).unwrap();
+    assert!(
+        written.contains(&binary.display().to_string()),
+        "the ~/-expanded binary must be the one recorded: {written}"
+    );
+}
