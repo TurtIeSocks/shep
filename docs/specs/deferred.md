@@ -348,7 +348,7 @@ one. What would force it: an app class where the sheep is a supervisor that
 does not forward signals to its own workers, which is a real shape and simply
 has not come up here yet.
 
-### `lookout`'s flock table and bleats feed measure `char`s, not display columns
+### `lookout`'s flock table and bleats feed measure `char`s, not display columns -- FIXED, 2026-08-26
 
 [`crates/shep-cli/src/lookout/view/flock.rs`](../../crates/shep-cli/src/lookout/view/flock.rs)'s
 `fit` — the function every truncated line in `shep lookout` goes through —
@@ -371,6 +371,48 @@ width (`unicode-width` or equivalent) instead of `char` count — a new
 dependency this phase's review declined to add for a cosmetic gap. What would
 force it: an operator running `shep lookout` against sheep with CJK names or
 logs, where a missing `…` is confusing rather than theoretical.
+
+**Fixed 2026-08-26, and the dependency argument had expired.** `unicode-width`
+was already in this tree twice over — `ratatui-core` pulls it for its own
+grapheme measurement, and `shep-core` reaches it through `serde-saphyr`'s
+`annotate-snippets` — so naming it directly in `crates/shep-cli/Cargo.toml`
+added **zero crates**. `Cargo.lock` resolves one `unicode-width`, before and
+after.
+
+**Three call sites, not one.** Reading the code to fix `fit` turned up the
+same fault in the other two places shep pads a cell, neither of them recorded
+here:
+
+- `output/width.rs`'s `visible_width`, which every cell of the box-drawn
+  table (`shep style full`, the default) is padded by. Its own doc called the
+  `char` count "a deliberate floor" whose alternative was "a `unicode-width`
+  dependency for a case nobody has hit" — true when written, and the same
+  sentence that stops being true the moment `lookout` needs the crate anyway.
+- `output/table.rs`'s `render_table`, the `shep style plain` renderer, which
+  measured with `chars().count()` and padded with `{cell:<width$}` — a format
+  spec that pads by character count, so measuring alone would not have fixed
+  it.
+
+Fixing one and not the others would have left the same CJK name aligned under
+`full` and crooked under `plain`, which is worse than uniformly wrong. All
+three now share one rule, `output::width::char_columns`, and the two `str`-level
+questions stay separate on purpose: `visible_width` discounts ANSI escapes
+because its callers write raw bytes to a terminal that interprets them, and
+`fit` does not, because ratatui never interprets an escape inside a `Span` —
+a log line carrying `\x1b[32m` draws a literal `32m` and occupies three
+columns. Measuring that as zero would under-count the exact cell the fix was
+for.
+
+`fit` now returns exactly `width` columns in **both** branches. A double-width
+character that will not fit the last column before the `…` is dropped and the
+column padded, because there is no half of it to draw and a short cell shifts
+every column after it on that row alone.
+
+Mutation-checked: restoring the `char` count reddens 6 tests across all three
+surfaces. Grapheme clustering is still not done and is still a deliberate
+floor — a combining mark measures zero and rides along with its base
+character, which is the case that matters, and both truncating callers stop
+on a whole `char` boundary.
 
 ### A `.js` Flockfile has no evaluation timeout
 

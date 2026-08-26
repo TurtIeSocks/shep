@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `shep bleats --no-follow` is no longer fixed at 50 lines. It shares the new
   `--lines` default of 15 and is controllable for the first time.
+- Table columns are padded by the columns a name draws in, not by its
+  character count. A CJK or emoji glyph counts as one character and draws as
+  two, so a name built from them hung over its own column and pushed every
+  column after it out of line. In `shep lookout` such a name could also lose
+  the `…` that says it was cut. The box-drawn table, the plain one and
+  `lookout` now measure the same way.
 
 ### Fixes
 

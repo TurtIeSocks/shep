@@ -1,5 +1,27 @@
 //! How wide a string looks, as opposed to how long it is.
 
+use unicode_width::UnicodeWidthChar;
+
+/// Columns one `char` occupies on a terminal.
+///
+/// The single rule both width questions in this crate are built on:
+/// [`visible_width`] below sums it over a string with ANSI escapes
+/// discounted, and `lookout::view::flock::fit` sums it over a string with
+/// nothing discounted. They differ in what they skip, never in what a
+/// character is worth, and this function is why.
+///
+/// A control character measures zero. `UnicodeWidthChar::width` returns
+/// `None` for exactly the `Cc` general category -- `U+0000..=U+001F` and
+/// `U+007F..=U+009F`, the same set `char::is_control` names -- and zero is
+/// the honest answer to "how wide is this": a newline starts a new line
+/// instead of advancing one, and a tab expands to a variable number nothing
+/// here can predict. Zero is not "safe to print"; [`sanitize_cell`] below is
+/// what makes it safe, and the two stay separate functions.
+#[must_use]
+pub(crate) fn char_columns(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
 /// Columns `s` occupies once ANSI escapes are discounted.
 ///
 /// A styled cell is `\x1b[32m(o.o)\x1b[0m`: 14 bytes, 5 columns. Padding it
@@ -8,18 +30,26 @@
 /// Three hand-drawn mockups during this feature's design made exactly this
 /// mistake.
 ///
-/// Counts characters rather than grapheme clusters or east-asian width.
-/// That is a deliberate floor, not an oversight: shep names are operator-
-/// chosen identifiers, the alternative is a `unicode-width` dependency for
-/// a case nobody has hit, and the property test in `table.rs` will catch it
-/// the moment someone does.
+/// Measures display columns, via [`char_columns`], not characters. `羊` is
+/// one `char` and two columns, so a six-character CJK name needs twice the
+/// budget of a six-character ASCII one; counting `char`s gave both six and
+/// pushed every border after the wide cell to the left. That floor was
+/// deliberate while `unicode-width` would have been a new crate for a case
+/// nobody had hit -- it is neither now, since `ratatui-core` already put it
+/// in this tree and `lookout` needs the same rule.
+///
+/// Grapheme clusters are still not what this counts, and that stays a
+/// deliberate floor: a combining mark measures zero and so rides along with
+/// its base character for free, which is the case that matters. What is not
+/// handled is a caller splitting a string *between* a base and its mark,
+/// and no caller here does -- both truncating callers stop on a whole
+/// `char` boundary and a zero-width mark never trips their budget check.
 ///
 /// Control characters (`char::is_control`, which includes `\n` and `\t`)
-/// measure as zero width. Neither occupies a column: a newline starts a new
-/// line instead of advancing one, and a tab expands to a variable number
-/// nothing here can predict. Zero is the honest answer to "how wide is
-/// this", not "safe to print" -- a control character can still split a
-/// table row in two or blow out a terminal's tab stops, which is why
+/// measure as zero width, which [`char_columns`] explains. Zero is the
+/// honest answer to "how wide is this", not "safe to print" -- a control
+/// character can still split a table row in two or blow out a terminal's
+/// tab stops, which is why
 /// [`sanitize_cell`] exists as this function's own sibling below:
 /// `table.rs`'s `render_boxed_ex` runs every cell through it before this
 /// function ever measures one, so by the time `visible_width` sees a cell,
@@ -51,8 +81,8 @@ pub(crate) fn visible_width(s: &str) -> usize {
                     }
                 }
             }
-        } else if !c.is_control() {
-            width += 1;
+        } else {
+            width += char_columns(c);
         }
     }
     width
@@ -156,10 +186,41 @@ mod tests {
 
     /// Non-ASCII names are real: a table that miscounts them misaligns for
     /// the people least able to work around it.
+    ///
+    /// The two halves are two different mistakes. `café` pins that this is
+    /// not a byte count -- 5 bytes, 4 columns. `日本` pins that it is not a
+    /// `char` count either: 2 `char`s, 6 bytes, and **4 columns**, which is
+    /// the reading a terminal actually draws. An earlier version of this
+    /// test asserted `2` here and was the thing keeping the bug pinned.
     #[test]
-    fn non_ascii_text_counts_characters() {
+    fn non_ascii_text_counts_display_columns() {
+        assert_eq!("café".len(), 5, "the raw string really is longer");
         assert_eq!(visible_width("café"), 4);
-        assert_eq!(visible_width("日本"), 2, "counted as chars, not bytes");
+        assert_eq!("日本".chars().count(), 2);
+        assert_eq!(visible_width("日本"), 4, "columns, not chars and not bytes");
+    }
+
+    /// fails if a combining mark is charged for a column of its own. `é`
+    /// spelled as `e` + `U+0301` is two `char`s and one column, and a table
+    /// that pads it by `char` count comes out one short. This is the case
+    /// [`visible_width`]'s doc gives for why grapheme clustering is not
+    /// needed on top of a per-`char` width rule.
+    #[test]
+    fn a_combining_mark_rides_along_with_its_base_character_for_free() {
+        let decomposed = "cafe\u{301}";
+        assert_eq!(decomposed.chars().count(), 5);
+        assert_eq!(visible_width(decomposed), 4);
+        assert_eq!(visible_width(decomposed), visible_width("café"));
+    }
+
+    /// fails if an escape's *parameter* bytes start being measured as the
+    /// wide characters they are not. Belt and braces on the CSI scan: the
+    /// per-`char` rule now returns something other than `1` for some
+    /// characters, so a scan that leaked `38;5;166m` would leak a width that
+    /// no longer even matches its character count.
+    #[test]
+    fn a_wide_character_beside_an_escape_is_measured_and_the_escape_is_not() {
+        assert_eq!(visible_width("\u{1b}[38;5;166m日本\u{1b}[0m"), 4);
     }
 
     /// A `\t` occupies no fixed number of columns -- expansion is a
