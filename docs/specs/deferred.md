@@ -1165,3 +1165,46 @@ the restart, and the ordering across a flock. A design that cannot point at
 something `just` plus three lines of shell does not already do should stop
 there.
 
+
+### Rendering each dog's README as its own docs-site page — rejected
+
+Rin proposed this, 2026-08-26, then agreed to drop it once the reasoning
+below was laid out. Recorded so the argument does not have to be re-derived
+the next time it sounds like a nice idea.
+
+**The blocker was never XSS.** A hostile README running script on shep's own
+domain is a real risk, but it is a *solved* one: sanitise the rendered output,
+or render only a restricted Markdown subset, the same way `dog_index.rs`
+already sanitises every string that reaches a terminal out of `dogs.json`.
+That work is known and would not be the hard part.
+
+**The actual blocker is curation, and no sanitiser touches that.** An index
+entry is reviewed exactly once, in a pull request, by a human who read the
+bytes being merged. A README is reviewed never: it lives in the dog's own
+repository, and it can change the moment after that pull request lands, to
+anything its author wants, with nobody at shep looking again. Shipping this
+would turn one reviewed `dogs.json` entry into a standing licence for
+whoever controls that repository to publish arbitrary content on shep's own
+domain, under shep's own styling, forever and unreviewed.
+
+**A disclaimer does not fix it, because the failure mode is trust, not
+confusion.** Nobody who lands on `shep.turtlesocks.dev/dogs/whatever` reads
+it as a stranger's unmoderated page; they read it as shep's docs, reviewed
+the way shep's docs are reviewed. That trust is the entire reason the feature
+would be worth building, and it is exactly what turns a compromised or
+malicious README dangerous later: the page would be believed *because* it is
+on shep's site, not despite it. A footnote saying "we did not review this"
+does not change what a reader actually does once they are on the page.
+
+**The version that would be defensible, if this ever comes back:** fetch
+each README at build time rather than at request time, and pin what was
+fetched — a Flockfile-schema-style lockfile, not a live proxy — so any
+change upstream surfaces as a diff against this repo's own pull request
+history, reviewed exactly like a `dogs.json` entry already is, instead of
+taking effect on shep's site the moment somebody else's repository changes.
+And strip HTML outright rather than trying to sanitise it: a stripped-down
+renderer has no tag left to smuggle an attack through, where a sanitiser
+only ever has to lose once. Fetching at request time gives up the curation
+property completely no matter how good the sanitiser is, because the content
+a reviewer approved and the content actually being served are free to
+diverge starting with the very next upstream commit.
