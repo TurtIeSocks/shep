@@ -1,11 +1,13 @@
 # Releasing shep
 
-Nothing has ever been published. There are no git tags, no crates.io
-presence, and no install path. This file is the checklist for changing that,
-written so the first release is a decision rather than a discovery.
+**0.1.0 published on 2026-08-26.** All five crates are on crates.io and
+`cargo install shep` works. Much of what follows was written before that and
+describes the first release specifically; it is kept because the reasoning
+about publish order and version choice still holds.
 
-Everything below was worked out and dry-run on 2026-08-15 against `main`.
-No tag was created and nothing was uploaded.
+**Releasing is now one act: merge the release pull request.** release-plz
+opens it, and merging it tags the commit, creates the GitHub release, and
+uploads. There is no tag to push by hand and no local `cargo publish`.
 
 ## Publish order
 
@@ -109,21 +111,49 @@ shep-client = { path = "crates/shep-client", version = "0.1.0" }
 
 If this drifts again on the next bump, `cargo-release` mechanises it.
 
-## Tag: one tag, `v0.1.0`
+## Tag: `v0.1.0` was manual; release-plz's default is one tag per package
 
-All five crates share a single workspace version and are released together,
-so one annotated tag on the release commit is the honest shape. Per-crate
-tags (`shep-core-v0.1.0`) are for workspaces whose members version
-independently, and adopting that scheme here would create five tags that can
-only ever hold the same number.
+`v0.1.0` was tagged by hand, in the sequence below, before release-plz owned
+any of this. The reasoning that follows describes the target shape for that
+manual tag, and it does not describe what release-plz, as configured, does.
 
-Keep the `v` prefix. It is what GitHub's release UI and most changelog tooling
-expect, and it is what the repo will be stuck with.
+`release-plz.toml` sets no `git_tag_name` or `git_tag_enable`, so each
+release-enabled package gets release-plz's own default for a multi-package
+workspace: `{{ package }}-v{{ version }}`. `shep-core`, `shep-client`,
+`shep-daemon` and `shep` share a `version_group`, so the version number
+agrees across all four, but the tags do not collapse into one:
+`shep-core-v0.1.1`, `shep-client-v0.1.1`, `shep-daemon-v0.1.1`,
+`shep-v0.1.1`. `shep-cli` carries `release = false` and gets neither a tag
+nor a release.
+
+A single shared tag is still possible: release-plz's own single-tag recipe
+disables `git_tag_enable` workspace-wide and re-enables it, named
+`v{{ version }}`, on one representative package. It is not configured here,
+so it is not what the next release does. Whether to add that configuration
+is Rin's call, not this fix's to make for her.
+
+All five crates share a single workspace version, and the four with code are
+released together. `shep-cli`, the redirect placeholder, carries
+`release = false` and is versioned along with the rest without ever being
+published by release-plz. So one annotated tag on the release commit would be
+the honest shape, if configured. Per-package tags are what a workspace whose members version
+independently would want; adopting that scheme here, as the default already
+does, produces four tags that can only ever hold the same number.
+
+Keep the `v` prefix, in either shape. It is what GitHub's release UI and most
+changelog tooling expect.
 
 ## The sequence
 
-Run it from a clean `main` with everything committed. One cargo command at a
-time: the workspace shares one target-dir build lock.
+**Every release after the first is one act: merge the release pull request.**
+release-plz opens it, and merging it tags, releases and uploads. Nothing
+below is something you run.
+
+What follows is how 0.1.0 was done by hand, kept because the checks in it are
+the ones release-plz now performs for you, and because knowing what they were
+is what lets you tell whether it did them. Run it from a clean `main` with
+everything committed, one cargo command at a time, since the workspace shares
+one target-dir build lock.
 
 ```bash
 # 1. Bump both places, per the section above, then reconcile the lockfile.
@@ -156,26 +186,35 @@ git tag -a v0.1.0 -m "shep 0.1.0"
 git push origin v0.1.0
 ```
 
-**Pushing the tag is the irreversible step, and there is no local `cargo
-publish` in the sequence any more.** `.github/workflows/release.yml` fires on
-`v*` and owns the upload: it re-checks that the tag and `[workspace.package]`
-agree, re-runs the full test suite against the tagged commit rather than
-trusting the run on the branch, rehearses all five crates with `cargo publish
---workspace --dry-run --locked`, and only then publishes. The token lives in
-that workflow's `crates-io` environment, so a laptop does not need one.
+**Merging the release pull request is the irreversible step.** There is no
+tag to push and no local `cargo publish` in the sequence.
 
-That environment is also where a human gate belongs if this ever wants one.
-Add a required reviewer to it and pushing a tag becomes a request to publish
-rather than the publish itself.
+`.github/workflows/release-plz.yml` has two jobs. `release-pr` maintains a
+pull request that bumps `[workspace.package]` from the conventional commits
+since the last release, on every push to `main`. `release` waits for
+`test.yml` to finish successfully against that same commit, then does
+nothing unless the manifest names a version that is not on crates.io, which
+is what makes the merge the act that publishes. It tags, creates the GitHub
+release, and uploads in dependency order.
 
-Two related workflows exist and neither of them publishes:
+The token lives in that workflow's `crates-io` environment, so a laptop never
+needs one. That environment is also where a required reviewer goes if this
+ever wants a human gate between merging and spending a version number.
 
-- **`release-plz.yml`** opens and maintains a release pull request, writing
-  the version bump and the changelog from the conventional commits since the
-  last release. It runs `release-pr` only. From the next release on it does
-  steps 1 and 2 above for you, which is the whole reason it is there; merging
-  its PR is what produces the commit you then tag.
-- **`test.yml`** is the branch gate, and it is what step 5 is waiting on.
+**This used to be split**, with a hand-written `release.yml` publishing behind
+a `v*` tag, and the split was wrong. `release-plz.toml` records why at length.
+The short version: merging a pull request titled "chore: release vX.Y.Z" is a
+more deliberate act than typing a `git push` of a tag, and the split's only
+visible effect was that merging the release PR did nothing and surprised the
+person who merged it.
+
+**`test.yml` is still the gate, and now it is actually wired as one.**
+`release` does not trigger on `push` at all; it triggers on `test.yml`'s
+`workflow_run` completing, checks that the run targeted `main` and
+succeeded, and checks out the exact commit `workflow_run` names. `push`
+alone would only mean "runs alongside", since both workflows would fire off
+the same event with no ordering between them -- this is what turns that into
+"waited for and required".
 
 If CI is unavailable and the publish has to happen from a laptop, the token
 goes in `CARGO_REGISTRY_TOKEN` and the command is `cargo publish --workspace`,

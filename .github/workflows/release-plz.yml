@@ -1,20 +1,31 @@
 name: release-plz
-# Opens and maintains a release pull request: version bumps and changelog
-# entries, written from the conventional commits since the last release.
+# Opens the release pull request, and publishes when it merges.
 #
-# It does NOT publish. The `release-plz-release` job from release-plz's
-# quickstart is deliberately absent, because `.github/workflows/release.yml`
-# owns the upload behind a `v*` tag. Adding it here without deleting that file
-# means two workflows racing to publish the same version. See release-plz.toml
-# for the reasoning.
+# Two jobs, gated on different events because they carry different risk.
+# `release-pr` only opens or updates a pull request, which is reversible, so
+# it runs straight off `push`/`workflow_dispatch`. `release` uploads to
+# crates.io, which is not, so it does not trigger off `push` at all: it waits
+# for `workflow_run` to report that `test.yml`'s run on that same commit
+# succeeded, then checks out the exact commit `workflow_run` names. `push`
+# and a bare `workflow_run: [test]` would have no ordering between them on
+# their own -- both firing off the same event is "alongside", not "after".
+# The `if:` on the `release` job below, plus naming the commit explicitly, is
+# what makes it "after and only if green".
+#
+# This replaced a hand-written release.yml that published behind a `v*` tag.
+# release-plz.toml records why that split was wrong.
 on:
   push:
     branches: [main]
+  workflow_run:
+    workflows: [test]
+    types: [completed]
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   release-pr:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -30,6 +41,10 @@ jobs:
           # release-plz reads the commits since the last release tag, so a
           # shallow clone would give it nothing to write a changelog from.
           fetch-depth: 0
+          # release-plz pushes commits, branches and tags over the GitHub
+          # API, not the git CLI, so the checkout's own token never needs to
+          # persist.
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
       # Pinned by commit, not by tag. This action is handed contents:write
       # and pull-requests:write, and a tag is mutable, so pinning the tag
@@ -42,4 +57,115 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
           # Read-only here: `release-pr` does not upload, but release-plz uses
           # the registry to work out which versions are already published.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Fires when `test.yml` finishes, not when `main` moves. That is the whole
+  # point: `workflow_run` lets this job require a fact about the commit (its
+  # test result) instead of racing to find one out.
+  #
+  # Every clause in the `if:` is load-bearing, and two of them are there for
+  # security rather than for ordering. A `workflow_run` job runs in the BASE
+  # repository's context: base secrets, base environments, base token. So it
+  # must establish that the run it is reacting to came from this repository
+  # and not from a fork.
+  #
+  #   event == 'push'                    `test.yml` also runs on
+  #                                      `pull_request` and `workflow_dispatch`,
+  #                                      and both of those fire this event too.
+  #   head_repository == this repository a fork's `head_branch` is the FORK's
+  #                                      branch name, so a fork branch named
+  #                                      `main` satisfies the clause below on
+  #                                      its own. Without this line, opening a
+  #                                      pull request from such a fork starts
+  #                                      this job on the fork's commit with
+  #                                      CARGO_REGISTRY_TOKEN in scope.
+  #   head_branch == 'main'              the release branch, once the two
+  #                                      clauses above have established whose
+  #                                      `main` it is.
+  #   conclusion == 'success'            the matrix passed, not merely finished.
+  #
+  # `name == 'test'` is redundant with the `workflows:` filter and kept for
+  # whoever reads the job without scrolling up.
+  #
+  # `checkout`'s `ref` is `workflow_run.head_sha`, not the implicit default
+  # (whatever `main` points at when this job happens to start):
+  # `workflow_run` always evaluates the *workflow file* off the default
+  # branch, but the commit it is reporting a result for is a fact about the
+  # past, and `main` can have moved again by the time this job runs. Naming
+  # the SHA is what makes "test.yml passed for this run" mean "test.yml
+  # passed for the commit I am about to publish", not "passed for something".
+  #
+  # Even a proven-green commit does nothing here unless the manifest names a
+  # version not yet on crates.io, and `release_always = false` in
+  # release-plz.toml narrows that further, to commits release-plz can trace
+  # to a merged release PR -- see that file for why the default (`true`) is
+  # wider than this project wants. Ordering across the five crates is
+  # release-plz's problem, not ours: it reads the dependency graph and
+  # uploads in an order that resolves, the same reason the old workflow used
+  # `cargo publish --workspace` rather than five `-p` invocations.
+  release:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.name == 'test' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    # An environment, so a required reviewer can be added here later if this
+    # ever wants a human gate between merging and spending a version number.
+    environment: crates-io
+    permissions:
+      contents: write
+      # release-plz's own quickstart grants `release` this: with
+      # `release_always = false`, it has to read pull request state to tell
+      # whether the commit it is looking at descends from a merged release
+      # PR.
+      pull-requests: read
+    concurrency:
+      group: release-plz-release-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The commit test.yml reported on, not whatever main points at
+          # right now. See the job comment above.
+          ref: ${{ github.event.workflow_run.head_sha }}
+          # As above: release-plz needs the history to know what is released.
+          fetch-depth: 0
+          persist-credentials: false
+      # Checking out a bare SHA leaves HEAD detached, and release-plz resolves
+      # `@{upstream}` to work out which branch it is releasing. On a detached
+      # HEAD that resolution fails and the job dies before it publishes
+      # anything. So put the tested commit back on a branch named `main`,
+      # tracking `origin/main`.
+      #
+      # `--force-create` rather than `switch`, because `main` may already exist
+      # locally at a different commit: the checkout above fetched every branch.
+      # Pointing it at the tested SHA is the point. If `main` has moved on since
+      # test.yml ran, this deliberately releases the commit that was tested
+      # rather than the one that happens to be newest.
+      #
+      # The SHA travels through the environment instead of being interpolated
+      # into the script. GitHub controls this value, so it is not an injection
+      # risk today, but `run:` blocks that splice `${{ }}` directly are how that
+      # class of bug starts.
+      - name: Put the tested commit back on a branch
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # Explicit rather than relying on what `fetch-depth: 0` happens to
+          # populate: `--set-upstream-to` fails outright if this ref is absent,
+          # and the repository is public, so an unauthenticated fetch is enough
+          # even with `persist-credentials: false`.
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git switch --force-create main "$TESTED_SHA"
+          git branch --set-upstream-to=origin/main main
+      - run: rustup toolchain install stable --profile minimal
+      # Same pin as the job above, for the same reason.
+      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

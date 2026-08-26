@@ -1,22 +1,39 @@
-# release-plz owns the version bump. It does NOT write the changelogs, and it
-# does NOT publish.
+# release-plz owns the version bump, the tag, the GitHub release and the
+# upload. It does NOT write the changelogs; see changelog_update below.
 #
-# The split is deliberate. `release-plz release-pr` opens a pull request that
-# bumps versions from the conventional commits since the last release, which
-# is the tedious half and the half worth automating. The upload stays in
-# `.github/workflows/release.yml`, behind a `v*` tag, a tag-versus-manifest
-# check and a `crates-io` environment.
+# ## This used to be split, and the split was wrong
 #
-# That is not distrust of release-plz. Publishing is the one action here that
-# cannot be undone, and a push to `main` is a lower bar to clear by accident
-# than pushing a tag. Keeping the two apart means a merged release PR changes
-# numbers in the repository and nothing else until somebody tags.
+# Until 2026-08-26 this file ran `release-pr` only, and a hand-written
+# .github/workflows/release.yml published behind a `v*` tag. The stated reason
+# was that "publishing cannot be undone, and a push to main is a lower bar to
+# clear by accident than pushing a tag."
 #
-# To hand release-plz the whole job later: add the `release-plz-release` job
-# from https://release-plz.dev/docs/github/quickstart and DELETE
-# `.github/workflows/release.yml`, or both will try to publish the same
-# version and the loser will fail noisily.
+# That has the risk backwards. Publishing under the standard setup requires
+# merging a pull request TITLED "chore: release vX.Y.Z". That is a reviewed,
+# named, visible artifact. Pushing a tag is a command someone types. The merge
+# is the more deliberate act, not the less.
 #
+# The cost showed up the same day. Rin merged the release PR for 0.1.1
+# reasonably expecting a release, and got silence, because the repository did
+# something non-standard and the non-standardness was invisible from outside.
+# A release process that surprises the person releasing has failed at the only
+# job it has.
+#
+# What the split was protecting turned out to be mostly covered, but not for
+# free. The tag-versus-manifest check is unnecessary once release-plz derives
+# the tag from the manifest, since they cannot then disagree. The test
+# re-run on the tag is NOT simply redundant with test.yml: the first version
+# of this move had `release` and test.yml both triggering on push to main
+# with no ordering between them, which is a race, not a proof -- `release`
+# could have published before the matrix finished, or after it failed.
+# `.github/workflows/release-plz.yml`'s `release` job is gated on a
+# `workflow_run` for test.yml's run on that same commit actually succeeding,
+# which is what closes the race; nothing publishes without a green run
+# against the commit it is about to publish.
+#
+# The `crates-io` environment survives the move, so a required reviewer can
+# still be added there if this ever wants a human gate.
+
 # ## On pre-releases, which is what this workspace is on right now
 #
 # release-plz publishes a pre-release fine and marks it as one on GitHub, via
@@ -33,6 +50,16 @@
 # pre-release tag, which `0.1.0-alpha.1` does. Without this an alpha appears
 # on the releases page looking like any other version.
 git_release_type = "auto"
+
+# release-plz's own default is true, which would have `release` try to
+# publish on every push to main whenever the manifest names an unpublished
+# version -- not only after a release PR merges. That is wider than "merging
+# the release PR is the publish" (docs/releasing.md, this file's own header
+# comment), so it is turned off explicitly instead of left at the default.
+release_always = false
+# On its own, this does not close the push-vs-test.yml race described
+# above in "This used to be split" -- it narrows *which* commits release
+# can act on, not *when* it acts relative to the test matrix.
 
 # The four real crates keep hand-written changelogs in Keep a Changelog form,
 # and those are better than anything generated from commit subjects. Left on,
