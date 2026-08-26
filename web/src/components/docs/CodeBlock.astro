@@ -195,9 +195,14 @@ const headerCopy = Boolean(label) && iconCopy;
         }
       };
 
-      button.addEventListener("click", () => {
+      button.addEventListener("click", async () => {
         const text = pre?.textContent ?? "";
-        navigator.clipboard?.writeText(text);
+        if (!navigator.clipboard) return;
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch {
+          return;
+        }
         setCopied(true);
         clearTimeout(revertTimer);
         revertTimer = setTimeout(() => setCopied(false), REVERT_DELAY_MS);
