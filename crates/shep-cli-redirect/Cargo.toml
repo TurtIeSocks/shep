@@ -9,6 +9,9 @@ license.workspace = true
 readme = "README.md"
 keywords = ["shep", "renamed", "redirect"]
 categories = ["command-line-utilities"]
+# Points at the crate that replaced this one, since that is the only thing a
+# reader who lands here needs.
+documentation = "https://docs.rs/shep"
 # No [lib] or [[bin]] TABLE here — deliberately. Cargo does still require at
 # least one target to exist (a package with truly zero targets fails
 # `no targets specified in the manifest`), so `src/lib.rs` is present and

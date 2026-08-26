@@ -175,6 +175,29 @@ the docs should describe the install rather than wait for it. Nothing to
 edit there at publish time; just confirm the badges resolve once the crates
 are up.
 
+## `shep-log-rotate` publishes after this, not alongside it
+
+`github.com/TurtIeSocks/shep-log-rotate` is the first external dog and it
+depends on `shep-client`. Until `shep-client` is on the index, that crate
+cannot be published at all, so the order across the two repositories is:
+everything here first, then the dog.
+
+Its manifest is already prepared for the swap. `shep-client` is named there
+with **both** a version and a git URL, so cargo builds it from git today while
+`cargo package` still finds the version requirement it demands. Once
+`shep-client` is up, the git and branch keys come out of that one line and
+nothing else changes.
+
+Two things worth knowing before doing that:
+
+- **Its lockfile pins a shep commit, not a version.** Whoever swaps the line
+  should rebuild and re-run the dog's own suite against the published crate
+  rather than assuming the git build proved it. The published tarball excludes
+  files a git checkout has, and that difference is exactly what a git
+  dependency cannot test.
+- **The version is `0.1.0-alpha.1`**, matching this workspace, so the number
+  does not promise more than an alpha.
+
 ## What is a blocker and what is not
 
 The point of this section is that the decision in the morning is informed. A
@@ -185,12 +208,13 @@ surface.
 ### Blockers
 
 **Nothing outstanding.** The four gates below all pass on `main` as of
-2026-08-15, and the packaging rehearsal is clean. What follows is what has to
+2026-08-25, and `cargo publish --workspace --dry-run` is clean: all five
+crates package, compile from their own tarballs, and reach the upload step. What follows is what has to
 stay true, not work left to do.
 
 - The task gate is green: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, and `cargo test --workspace
-  --all-features` at 1432 passed / 0 failed / 5 ignored.
+  --all-features` at 1711 passed / 0 failed.
 - Every crate has `description`, `readme`, `keywords` and `categories`, and
   every category is a real crates.io slug. A category the registry does not
   recognise is rejected at upload, after earlier crates in the chain have
