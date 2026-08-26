@@ -3422,6 +3422,7 @@ fn a_js_flockfile_without_node_says_so_and_says_what_to_do() {
         "module.exports = { app: [{ name: 'web', script: './server.js' }] };\n",
     )
     .unwrap();
+    let mut guard = DaemonGuard::default();
 
     // An empty PATH for the child only. `node` cannot be found, which is the
     // whole condition under test, and the parent's environment is untouched.
@@ -3432,6 +3433,10 @@ fn a_js_flockfile_without_node_says_so_and_says_what_to_do() {
         .arg(&flockfile)
         .output()
         .unwrap();
+
+    // `start` autostarts a shepherd before it ever opens the Flockfile, so
+    // this case leaves one behind even though it fails.
+    guard.adopt_home(dir.path());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -3450,6 +3455,8 @@ fn a_js_flockfile_without_node_says_so_and_says_what_to_do() {
         !stderr.contains('\u{2014}') && !stderr.contains('\u{2013}'),
         "no em or en dash in copy a user reads: {stderr}"
     );
+
+    graceful_kill(dir.path());
 }
 
 // --- shep init (lesson 3) ---------------------------------------------------
@@ -3521,6 +3528,7 @@ fn what_shep_init_writes_is_a_flockfile_shep_can_read() {
         .collect::<Vec<_>>()
         .join("\n");
     std::fs::write(dir.path().join("Flockfile.toml"), &live).unwrap();
+    let mut guard = DaemonGuard::default();
 
     let output = shep(dir.path())
         .current_dir(dir.path())
@@ -3532,11 +3540,15 @@ fn what_shep_init_writes_is_a_flockfile_shep_can_read() {
         .output()
         .unwrap();
 
+    guard.adopt_home(dir.path());
+
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains("invalid_config"),
         "the uncommented scaffold must be valid config: {stderr}"
     );
+
+    graceful_kill(dir.path());
 }
 
 /// Refuse rather than clobber, and prove it by metadata rather than by
