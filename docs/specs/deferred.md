@@ -731,6 +731,89 @@ extracting a built `.crate` and comparing bytes against the source -- 1060 for
 The note about permanence still stands and is why this was worth doing now:
 tarball contents cannot be corrected for a version after it is published.
 
+### `shep install` does not exist, and a scanner is not what would make it safe
+
+Asked by Rin on 2026-08-26, the day the first external dog published.
+
+**What shep offers today is discovery, not installation.** `shep dogs
+--available` reads the community index and prints two copy-pasteable commands
+per entry: `cargo install <package>`, then `shep adopt <name> <path>`. shep
+runs the second and vets the binary before registering it. The operator runs
+the first. Nothing in shep fetches, builds, or executes a stranger's code.
+
+**The split is deliberate, and `dog_index.rs`'s module header already says
+why.** That index is built from pull requests by strangers, and every string
+in it is printed to a terminal, so the whole module is a security boundary:
+it sanitises escapes because a `description` carrying `\u{1b}[2J` clears the
+operator's screen, and because shep emits colour of its own, a well-placed
+escape can imitate shep's own output with the reader unable to tell an
+entry's bytes from shep's. An index whose strings cannot be trusted to
+**print** is not one that should be trusted to **execute**. `shep install`
+would turn "somebody added a row to a table" into "somebody chose what builds
+and runs on this machine", which is a far larger step than the sanitiser
+guards.
+
+**The door is left open on purpose.** `DogSourceKind` is a tagged enum rather
+than a freeform string exactly so this can be added later without asking every
+past contributor to rewrite their entry: "how do I install this" and "what
+artifact would shep fetch" are two questions that look like one field. Adding
+the `cargo` kind on 2026-08-26 cost almost nothing, which is that decision
+paying out.
+
+**The obvious next move is a scanner, and it is the wrong one.** The tooling
+is real and worth knowing. `cargo-audit` and `cargo-deny` check a dependency
+tree against published advisories. `cargo-vet` and `cargo-crev` record that a
+*human* reviewed a specific version, and `cargo-vet` can import Mozilla's and
+Google's audit sets rather than starting from nothing. OpenSSF Scorecard
+grades repository practice. Socket does behavioural analysis and reached
+general availability for Rust in 2026, though its deep behavioural tier
+remains JavaScript and Python only, Cargo sits in a shallower tier, and git
+and path dependencies are unsupported.
+
+**None of that helps here, because a dog's legitimate job is the suspicious
+behaviour.** `shep-log-rotate` renames files, deletes files, writes archives,
+and holds a socket to a privileged daemon. A hostile dog does the same things.
+The capability profile of a benign dog and a malicious one is identical by
+design. Behavioural analysis earns its keep when a capability contradicts a
+stated purpose, a JSON parser that opens a network socket being the classic
+case. A process-supervisor plugin that spawns processes and writes files
+presents no contradiction to detect, so the scanner flags every real dog and
+clears a hostile one that stays inside the same envelope.
+
+**A verdict would be worse than no command at all.** `shep audit <dog>`
+printing "no issues found" manufactures confidence about a question that is
+not decidable in general, and people would install things they would
+otherwise think twice about. A green check on an unanswerable question is a
+liability, not a feature.
+
+**What would have to be true first, in rough order of signal per unit of
+work:**
+
+1. **Provenance.** Does the crate come from the repository its index entry
+   claims? crates.io supports trusted publishing and attestations, so this is
+   a fact rather than a judgement, and it closes the likeliest real attack: a
+   typosquat or a hijacked publish that has nothing to do with the repository
+   anyone reviewed.
+2. **A recorded human audit.** `cargo-vet` exists for precisely this and its
+   importable audit sets mean shep would not be starting a web of trust from
+   zero.
+3. **Confinement rather than inspection.** The one worth most. shep already
+   resolves `user`/`group` for sheep; running dogs with reduced privilege
+   bounds the damage whatever the code turns out to do. Analysis is advisory,
+   confinement is enforcement, and an hour spent on a scanner is an hour not
+   spent on the control that actually holds.
+4. **Pinned versions, and reading the diff on update.** Most real supply-chain
+   attacks arrive as an update to something already trusted, not as a first
+   install.
+
+**If a command is ever built, it reports facts and never a verdict.**
+Something nearer "14 dependencies, 3 with build scripts, published from the
+repository it claims, no human audits on record, 2 known advisories" than a
+tick or a cross, and it does not gate `shep install`, because gating on an
+undecidable question is how the false confidence gets manufactured in the
+first place.
+
+
 ## Not deferred
 
 **Dogs** (spec §8) **shipped**: the dog contract (`shep_daemon::dogs`,
