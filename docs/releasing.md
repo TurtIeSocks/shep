@@ -111,19 +111,35 @@ shep-client = { path = "crates/shep-client", version = "0.1.0" }
 
 If this drifts again on the next bump, `cargo-release` mechanises it.
 
-## Tag: one tag, `v0.1.0`
+## Tag: `v0.1.0` was manual; release-plz's default is one tag per package
 
-release-plz creates this tag now. The reasoning below is why the shape is one
-tag rather than five, and it is still the shape release-plz produces.
+`v0.1.0` was tagged by hand, in the sequence below, before release-plz owned
+any of this. The reasoning that follows describes the target shape for that
+manual tag, and it does not describe what release-plz, as configured, does.
+
+`release-plz.toml` sets no `git_tag_name` or `git_tag_enable`, so each
+release-enabled package gets release-plz's own default for a multi-package
+workspace: `{{ package }}-v{{ version }}`. `shep-core`, `shep-client`,
+`shep-daemon` and `shep` share a `version_group`, so the version number
+agrees across all four, but the tags do not collapse into one:
+`shep-core-v0.1.1`, `shep-client-v0.1.1`, `shep-daemon-v0.1.1`,
+`shep-v0.1.1`. `shep-cli` carries `release = false` and gets neither a tag
+nor a release.
+
+A single shared tag is still possible: release-plz's own single-tag recipe
+disables `git_tag_enable` workspace-wide and re-enables it, named
+`v{{ version }}`, on one representative package. It is not configured here,
+so it is not what the next release does. Whether to add that configuration
+is Rin's call, not this fix's to make for her.
 
 All five crates share a single workspace version and are released together,
-so one annotated tag on the release commit is the honest shape. Per-crate
-tags (`shep-core-v0.1.0`) are for workspaces whose members version
-independently, and adopting that scheme here would create five tags that can
-only ever hold the same number.
+so one annotated tag on the release commit would be the honest shape, if
+configured. Per-package tags are what a workspace whose members version
+independently would want; adopting that scheme here, as the default already
+does, produces four tags that can only ever hold the same number.
 
-Keep the `v` prefix. It is what GitHub's release UI and most changelog tooling
-expect, and it is what the repo will be stuck with.
+Keep the `v` prefix, in either shape. It is what GitHub's release UI and most
+changelog tooling expect.
 
 ## The sequence
 
