@@ -1,21 +1,31 @@
 name: release-plz
 # Opens the release pull request, and publishes when it merges.
 #
-# Two jobs, in the order they happen. `release-pr` maintains a pull request
-# that bumps versions from the conventional commits since the last release.
-# `release` runs after that PR merges: it tags the commit, creates the GitHub
-# release, and uploads to crates.io.
+# Two jobs, gated on different events because they carry different risk.
+# `release-pr` only opens or updates a pull request, which is reversible, so
+# it runs straight off `push`/`workflow_dispatch`. `release` uploads to
+# crates.io, which is not, so it does not trigger off `push` at all: it waits
+# for `workflow_run` to report that `test.yml`'s run on that same commit
+# succeeded, then checks out the exact commit `workflow_run` names. `push`
+# and a bare `workflow_run: [test]` would have no ordering between them on
+# their own -- both firing off the same event is "alongside", not "after".
+# The `if:` on the `release` job below, plus naming the commit explicitly, is
+# what makes it "after and only if green".
 #
 # This replaced a hand-written release.yml that published behind a `v*` tag.
 # release-plz.toml records why that split was wrong.
 on:
   push:
     branches: [main]
+  workflow_run:
+    workflows: [test]
+    types: [completed]
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   release-pr:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -45,16 +55,36 @@ jobs:
           # the registry to work out which versions are already published.
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  # Runs on every push to main, and does nothing at all unless the manifest
-  # names a version that is not yet on crates.io. That is what makes merging
-  # the release PR the act that publishes: the merge is the only thing that
-  # moves the version.
+  # Fires when `test.yml` finishes, not when `main` moves. That is the whole
+  # point: `workflow_run` lets this job require a fact about the commit (its
+  # test result) instead of racing to find one out. The `if:` re-checks three
+  # things the `workflows:` filter above does not: that the run is `test`'s
+  # (redundant with the filter, kept for the reader), that it targeted
+  # `main` (`workflow_run` also fires for PR and manual runs of `test.yml`),
+  # and that it actually succeeded.
   #
-  # Ordering across the five crates is release-plz's problem, not ours. It
-  # reads the dependency graph and uploads in an order that resolves, which
-  # is the same reason the old workflow used `cargo publish --workspace`
-  # rather than five `-p` invocations.
+  # `checkout`'s `ref` is `workflow_run.head_sha`, not the implicit default
+  # (whatever `main` points at when this job happens to start):
+  # `workflow_run` always evaluates the *workflow file* off the default
+  # branch, but the commit it is reporting a result for is a fact about the
+  # past, and `main` can have moved again by the time this job runs. Naming
+  # the SHA is what makes "test.yml passed for this run" mean "test.yml
+  # passed for the commit I am about to publish", not "passed for something".
+  #
+  # Even a proven-green commit does nothing here unless the manifest names a
+  # version not yet on crates.io, and `release_always = false` in
+  # release-plz.toml narrows that further, to commits release-plz can trace
+  # to a merged release PR -- see that file for why the default (`true`) is
+  # wider than this project wants. Ordering across the five crates is
+  # release-plz's problem, not ours: it reads the dependency graph and
+  # uploads in an order that resolves, the same reason the old workflow used
+  # `cargo publish --workspace` rather than five `-p` invocations.
   release:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.name == 'test' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     # An environment, so a required reviewer can be added here later if this
     # ever wants a human gate between merging and spending a version number.
@@ -62,11 +92,14 @@ jobs:
     permissions:
       contents: write
     concurrency:
-      group: release-plz-release-${{ github.ref }}
+      group: release-plz-release-${{ github.event.workflow_run.head_branch }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
+          # The commit test.yml reported on, not whatever main points at
+          # right now. See the job comment above.
+          ref: ${{ github.event.workflow_run.head_sha }}
           # As above: release-plz needs the history to know what is released.
           fetch-depth: 0
       - run: rustup toolchain install stable --profile minimal

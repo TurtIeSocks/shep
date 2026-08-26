@@ -19,12 +19,17 @@
 # A release process that surprises the person releasing has failed at the only
 # job it has.
 #
-# What the split was protecting turned out to be covered anyway. The
-# tag-versus-manifest check is unnecessary once release-plz derives the tag
-# from the manifest, since they cannot then disagree. The test re-run on the
-# tag is redundant with test.yml, which runs the full matrix including the
-# serial ::slow:: tier on every push to main, so the commit release-plz
-# publishes is the commit CI has already proven green.
+# What the split was protecting turned out to be mostly covered, but not for
+# free. The tag-versus-manifest check is unnecessary once release-plz derives
+# the tag from the manifest, since they cannot then disagree. The test
+# re-run on the tag is NOT simply redundant with test.yml: the first version
+# of this move had `release` and test.yml both triggering on push to main
+# with no ordering between them, which is a race, not a proof -- `release`
+# could have published before the matrix finished, or after it failed.
+# `.github/workflows/release-plz.yml`'s `release` job is gated on a
+# `workflow_run` for test.yml's run on that same commit actually succeeding,
+# which is what closes the race; nothing publishes without a green run
+# against the commit it is about to publish.
 #
 # The `crates-io` environment survives the move, so a required reviewer can
 # still be added there if this ever wants a human gate.
@@ -52,6 +57,9 @@ git_release_type = "auto"
 # the release PR is the publish" (docs/releasing.md, this file's own header
 # comment), so it is turned off explicitly instead of left at the default.
 release_always = false
+# On its own, this does not close the push-vs-test.yml race described
+# below in "This used to be split" -- it narrows *which* commits release
+# can act on, not *when* it acts relative to the test matrix.
 
 # The four real crates keep hand-written changelogs in Keep a Changelog form,
 # and those are better than anything generated from commit subjects. Left on,

@@ -173,7 +173,8 @@ tag to push and no local `cargo publish` in the sequence.
 
 `.github/workflows/release-plz.yml` has two jobs. `release-pr` maintains a
 pull request that bumps `[workspace.package]` from the conventional commits
-since the last release. `release` runs on every push to `main` and does
+since the last release, on every push to `main`. `release` waits for
+`test.yml` to finish successfully against that same commit, then does
 nothing unless the manifest names a version that is not on crates.io, which
 is what makes the merge the act that publishes. It tags, creates the GitHub
 release, and uploads in dependency order.
@@ -189,9 +190,13 @@ more deliberate act than typing a `git push` of a tag, and the split's only
 visible effect was that merging the release PR did nothing and surprised the
 person who merged it.
 
-**`test.yml` is still the gate.** It runs the full matrix, including the
-serial `::slow::` tier, on every push to `main`, so the commit release-plz
-publishes is one CI has already proven green.
+**`test.yml` is still the gate, and now it is actually wired as one.**
+`release` does not trigger on `push` at all; it triggers on `test.yml`'s
+`workflow_run` completing, checks that the run targeted `main` and
+succeeded, and checks out the exact commit `workflow_run` names. `push`
+alone would only mean "runs alongside", since both workflows would fire off
+the same event with no ordering between them -- this is what turns that into
+"waited for and required".
 
 If CI is unavailable and the publish has to happen from a laptop, the token
 goes in `CARGO_REGISTRY_TOKEN` and the command is `cargo publish --workspace`,
