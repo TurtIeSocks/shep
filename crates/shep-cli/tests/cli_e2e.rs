@@ -1717,6 +1717,19 @@ fn json_format_matches_the_committed_fixtures() {
     );
     ping_envelope["data"]["home"] = serde_json::Value::Null;
     ping_envelope["data"]["socket"] = serde_json::Value::Null;
+    // `daemon_version` belongs with `pid`, `home` and `socket`: assert it is
+    // right, then null it. A fixture that freezes the version turns every
+    // release into a red test. release-plz bumps `[workspace.package]` and
+    // knows nothing about this file, so its release PR failed on exactly this
+    // (v0.1.1, 2026-08-26) and the alpha-to-0.1.0 bump did too. Comparing
+    // against the crate's own version still catches the drift worth catching,
+    // a ping that stops reporting a version or reports the wrong one.
+    assert_eq!(
+        ping_envelope["data"]["daemon_version"].as_str().unwrap(),
+        env!("CARGO_PKG_VERSION"),
+        "ping must report this build's own version"
+    );
+    ping_envelope["data"]["daemon_version"] = serde_json::Value::Null;
     assert_eq!(
         ping_envelope,
         load_fixture("ping"),
