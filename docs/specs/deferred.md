@@ -264,15 +264,38 @@ legs, and each leg's own `target_os` is `linux`, so the `#[cfg(target_os =
 the platform-neutral half of each test. No workflow change was needed; the
 gap the entry named had already closed and nobody had said so.
 
-### The `cli_e2e` 7-test correlation
+### The `cli_e2e` 7-test correlation -- STALE, and what was really there
 
-Four of nine `cli_e2e` tests in one grouping failed under `--test-threads=1`
-where zero of six in another did — investigated twice, exonerated twice as a
-load artefact rather than a regression, and never measured again since Phase 6.
-It is a standing false-positive risk in the serial phase-gate run that CLAUDE.md
-mandates before a merge. What it needs is one fresh bounded measurement pass
-with the numbers written down, which is a measurement rather than an edit, and
-is why it is here rather than in a task.
+**This entry no longer reproduces.** Measured 2026-08-25: four serial runs of
+`cargo test -p shep --test cli_e2e --all-features -- --test-threads=1`, all
+**71 passed, 0 failed**, including one under 28 CPU burners on 14 cores with
+the load average climbing from 15 to 34. All 71 also pass individually.
+
+The harness gained `DaemonGuard`, `sweep_flock`, `graceful_kill` and a
+correctly sized `CMD_TIMEOUT` after Phase 6, which is exactly the leak class
+this entry described. It was fixed by other work and nobody came back to say
+so.
+
+**In-process shared state is absent by construction rather than by luck**, and
+that is worth recording so the next person does not re-audit it: `cli_e2e.rs`
+contains no `std::env::set_var` and no `set_current_dir` anywhere. Every
+`.env(..)` and `.current_dir(..)` is the child-scoped `Command` method, every
+invocation carries `--home <tempdir>` through `fn shep()` or `SHEP_DEV_HOME`,
+and `free_port` and `serve_raw_response` bind `127.0.0.1:0` per case.
+
+**Real shared state did turn up, just not this one.** The machine was carrying
+70 orphaned `shep daemon` processes, the oldest six days old, each holding a
+deleted temporary home. Two tests leaked one per run because they call
+`shep start --flockfile` on a file that will be refused, and `start`
+autostarts a shepherd before it ever opens the file. Fixed, and the fix is
+measured: one leak per run each before, none after, and the whole suite adds
+no new pids where it previously added two.
+
+**One product question falls out of that**, recorded rather than answered:
+`shep start --flockfile broken.js` autostarts a shepherd, then refuses the
+file. So a command that fails still leaves a daemon running. That may be the
+right trade, since the shepherd is what the next command wants anyway, but
+nothing says it out loud today.
 
 ### The windows-gnu cross-check went three phases unrun
 
