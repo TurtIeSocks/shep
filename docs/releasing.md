@@ -125,23 +125,41 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 #    exercises all five rather than stopping at the first unpublished one.
 cargo publish --workspace --dry-run
 
-# 5. Commit and tag.
+# 5. Commit the release, push it, and let CI run the gate on it.
 git add -A
 git commit -m "chore(release): 0.1.0-alpha.1"
-git tag -a v0.1.0-alpha.1 -m "shep 0.1.0-alpha.1"
-
-# 6. Publish. Ordering is cargo's problem, not yours.
-cargo publish --workspace
-
-# 7. Push the commit and the tag.
 git push origin main
+
+# 6. Once that is green, tag the pushed commit and push the tag.
+git tag -a v0.1.0-alpha.1 -m "shep 0.1.0-alpha.1"
 git push origin v0.1.0-alpha.1
 ```
 
-Step 6 is the irreversible one. Everything before it can be redone.
+**Pushing the tag is the irreversible step, and there is no local `cargo
+publish` in the sequence any more.** `.github/workflows/release.yml` fires on
+`v*` and owns the upload: it re-checks that the tag and `[workspace.package]`
+agree, re-runs the full test suite against the tagged commit rather than
+trusting the run on the branch, rehearses all five crates with `cargo publish
+--workspace --dry-run --locked`, and only then publishes. The token lives in
+that workflow's `crates-io` environment, so a laptop does not need one.
 
-If you would rather go crate by crate and watch each land, the same thing
-spelled out:
+That environment is also where a human gate belongs if this ever wants one.
+Add a required reviewer to it and pushing a tag becomes a request to publish
+rather than the publish itself.
+
+Two related workflows exist and neither of them publishes:
+
+- **`release-plz.yml`** opens and maintains a release pull request, writing
+  the version bump and the changelog from the conventional commits since the
+  last release. It runs `release-pr` only. From the next release on it does
+  steps 1 and 2 above for you, which is the whole reason it is there; merging
+  its PR is what produces the commit you then tag.
+- **`test.yml`** is the branch gate, and it is what step 5 is waiting on.
+
+If CI is unavailable and the publish has to happen from a laptop, the token
+goes in `CARGO_REGISTRY_TOKEN` and the command is `cargo publish --workspace`,
+after the same rehearsal. Ordering is cargo's problem, not yours. To go crate
+by crate and watch each land instead:
 
 ```bash
 cargo publish -p shep-cli
