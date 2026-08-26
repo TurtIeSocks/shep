@@ -91,6 +91,11 @@ jobs:
     environment: crates-io
     permissions:
       contents: write
+      # release-plz's own quickstart grants `release` this: with
+      # `release_always = false`, it has to read pull request state to tell
+      # whether the commit it is looking at descends from a merged release
+      # PR.
+      pull-requests: read
     concurrency:
       group: release-plz-release-${{ github.event.workflow_run.head_branch }}
       cancel-in-progress: false
