@@ -17,6 +17,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::super::app::{App, Row};
+use crate::output::width::char_columns;
 use crate::output::{exit_cell, human_bytes, human_duration};
 
 /// The narrowest terminal the TABLE will draw into.
@@ -248,40 +249,64 @@ pub fn name_width(width: u16, columns: &[Column]) -> u16 {
         .max(NAME_MIN)
 }
 
-/// `text` in exactly `width` characters: padded on the right, or truncated
-/// with a trailing `…`.
+/// `text` in exactly `width` display columns: padded on the right, or
+/// truncated with a trailing `…`.
 ///
-/// Counted in `char`s, never bytes — `{:<w$}` pads by character count, so a
-/// byte measurement over-pads every multi-byte name. `output::table` records
-/// having made the same choice for the same reason.
+/// Counted in terminal columns, never bytes and never `char`s. Bytes
+/// over-pad every multi-byte name. `char`s under-pad every double-width one:
+/// a CJK name or an emoji counts as one `char` and draws in two columns, so
+/// a row built by `char` count runs past its cell and shoves every column
+/// after it out of line — which for the last column means running off the
+/// end and losing the `…` that says the text was cut. That was this
+/// function's recorded limitation until [`crate::output::width::char_columns`]
+/// existed to fix it in one place; `output::table` pads by the same rule.
 ///
 /// A truncated name that looked whole would be a name an operator types into
 /// `shep stop`, so the ellipsis is not cosmetic.
 ///
-/// **Known limitation: `char`s, not display columns.** A double-width
-/// character (CJK, many emoji) counts as one `char` here but occupies two
-/// columns in the terminal, so a name or a log line built from them can run
-/// past `width` and lose its `…` truncation marker. Confirmed cosmetic, not
-/// a security issue: ratatui's own `Buffer::set_line` clips at the render
-/// area rather than bleeding into a neighbouring pane, and no ESC or CR byte
-/// ever reaches a buffer cell, so a hostile log line has no escape-injection
-/// path through this function. Fixing it means measuring display width
-/// (`unicode-width` or equivalent) instead of `char` count; not done here —
-/// see `docs/specs/deferred.md`'s "Known debt" section.
+/// **Escapes are not discounted here, deliberately** — this is the one place
+/// the two width questions in this crate part company.
+/// [`crate::output::width::visible_width`] skips an ANSI sequence because its
+/// callers write raw bytes to a terminal that will interpret one. Nothing on
+/// this path does: a `Span` hands ratatui text, ratatui draws it, and a log
+/// line carrying `\x1b[32m` puts a literal `32m` on screen occupying three
+/// columns. Measuring it as zero would under-count exactly the cell it was
+/// meant to protect.
+///
+/// The result is exactly `width` columns in **both** branches. A
+/// double-width character that will not fit the last column before the `…`
+/// is dropped and the gap is padded, so a cell never comes out short and the
+/// two-space separators between cells stay where the header put them.
 #[must_use]
 pub fn fit(text: &str, width: u16) -> String {
     let width = usize::from(width);
-    let count = text.chars().count();
-    if count <= width {
+    let columns: usize = text.chars().map(char_columns).sum();
+    if columns <= width {
         let mut out = String::from(text);
-        out.extend(core::iter::repeat_n(' ', width - count));
+        out.extend(core::iter::repeat_n(' ', width - columns));
         return out;
     }
     if width == 0 {
         return String::new();
     }
-    let mut out: String = text.chars().take(width - 1).collect();
+    // One column pays for the `…`; the rest is filled with as much of `text`
+    // as fits whole. A double-width character straddling the boundary is
+    // dropped rather than split — there is no half of it to draw — and the
+    // column it would have used is padded below so the cell still measures
+    // `width`.
+    let budget = width - 1;
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let c_width = char_columns(c);
+        if used + c_width > budget {
+            break;
+        }
+        out.push(c);
+        used += c_width;
+    }
     out.push('…');
+    out.extend(core::iter::repeat_n(' ', budget - used));
     out
 }
 
@@ -523,20 +548,96 @@ mod tests {
     /// `fit(..).chars().count() == width`, which is `width` in *both*
     /// branches under either measurement — so the byte-vs-char mutation
     /// could not redden it. The observable difference lives in the PAD
-    /// branch, where a three-character nine-byte name asks for nine columns
-    /// of padding budget it does not need and comes out short, and at the
-    /// exactly-fits boundary, where a byte count truncates a string that
-    /// already fits.
+    /// branch, where a nine-byte name asks for nine columns of padding
+    /// budget it does not need and comes out short, and at the exactly-fits
+    /// boundary, where a byte count truncates a string that already fits.
     #[test]
-    fn fit_counts_characters_not_bytes_when_it_pads_and_when_it_truncates() {
-        // Pad branch. `日本語` is 3 chars / 9 bytes: char-counted it gets 3
-        // trailing spaces, byte-counted it falls into the truncate branch.
-        assert_eq!(fit("日本語", 6), "日本語   ");
-        // Exactly fits. 7 chars / 11 bytes — a byte count cuts it to
+    fn fit_counts_columns_not_bytes_when_it_pads_and_when_it_truncates() {
+        // Pad branch. `日本語` is 9 bytes and 6 columns: measured properly
+        // it exactly fills a 6-wide cell, byte-counted it falls into the
+        // truncate branch.
+        assert_eq!(fit("日本語", 6), "日本語");
+        // Exactly fits. 7 columns / 11 bytes — a byte count cuts it to
         // `ünïcöd…`.
         assert_eq!(fit("ünïcödé", 7), "ünïcödé");
-        // Truncate branch, pinning which prefix survives.
-        assert_eq!(fit("日本語アプリ", 5), "日本語ア…");
+    }
+
+    /// fails if `fit` goes back to counting `char`s — the bug
+    /// `docs/specs/deferred.md` recorded and this change closes. A `char`
+    /// count gives `日本語` three and lets it into a 3-wide cell it draws
+    /// six columns in, and gives `日本語アプリ` a five-`char` prefix of
+    /// `日本語ア…` that draws nine.
+    ///
+    /// Every case asserts on CONTENT and on measured columns, for the same
+    /// reason the byte test above does: `chars().count()` alone is blind to
+    /// the mutation, and here so is `len()`.
+    #[test]
+    fn a_double_width_name_is_cut_to_the_columns_it_draws_in() {
+        // Truncate branch. Budget is 4 columns plus the `…`: two characters
+        // fit, the third would draw past the cell.
+        assert_eq!(fit("日本語アプリ", 5), "日本…");
+        assert_eq!(columns_of(&fit("日本語アプリ", 5)), 5);
+        // A `char` count would call this a pad — 3 chars into 3 columns —
+        // and emit `日本語`, six columns wide, with no `…` to say it was cut.
+        assert_eq!(fit("日本語", 3), "日…");
+        // The odd-width case the padding exists for: `日` fits the 2-column
+        // budget, `本` does not, and half a character is not drawable — so
+        // the leftover column is a space rather than a short cell.
+        assert_eq!(fit("日本語", 4), "日… ");
+        assert_eq!(columns_of(&fit("日本語", 4)), 4);
+        // Nothing but the marker fits, at either width.
+        assert_eq!(fit("日本語", 1), "…");
+        assert_eq!(fit("日本語", 2), "… ");
+    }
+
+    /// fails if a cell can come out narrower or wider than the width it was
+    /// asked for. Every caller concatenates cells with two-space separators
+    /// and no caller re-measures, so one short cell shifts every column
+    /// after it on that row alone — the drift is invisible in a single
+    /// cell's own test and obvious in a rendered table.
+    #[test]
+    fn every_cell_measures_exactly_the_width_it_was_given() {
+        let names = [
+            "web",
+            "payments-reconciliation-worker",
+            "日本語アプリ",
+            "café",
+            "cafe\u{301}",
+            "羊",
+            "",
+        ];
+        for name in names {
+            for width in 0..=12u16 {
+                let cell = fit(name, width);
+                assert_eq!(
+                    columns_of(&cell),
+                    usize::from(width),
+                    "fit({name:?}, {width}) == {cell:?}"
+                );
+            }
+        }
+    }
+
+    /// An ANSI escape is text here, not styling — see [`fit`]'s own doc. A
+    /// `Span` is not a terminal, so ratatui draws `\x1b[32m` as the literal
+    /// `32m` it is; measuring it as zero (which
+    /// `crate::output::width::visible_width` would, correctly, on its own
+    /// path) would let a hostile log line claim more columns than the cell
+    /// it was cut to fit.
+    #[test]
+    fn an_escape_sequence_is_measured_as_the_text_it_will_be_drawn_as() {
+        let styled = "\u{1b}[32mup";
+        // ESC is zero-width; `[32mup` is six columns.
+        assert_eq!(columns_of(styled), 6);
+        assert_eq!(columns_of(&fit(styled, 4)), 4);
+        assert!(fit(styled, 4).ends_with('…'));
+    }
+
+    /// The columns a rendered cell actually draws in, by the same rule
+    /// [`fit`] pads by. Not `chars().count()`: that is the measurement
+    /// under test.
+    fn columns_of(s: &str) -> usize {
+        s.chars().map(char_columns).sum()
     }
 
     /// fails if the selection marker stops being a plain character. Colour

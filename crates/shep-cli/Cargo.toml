@@ -64,6 +64,24 @@ sysinfo.workspace = true
 # than reached through `tokio_rustls::rustls`: rustls does not re-export
 # ring's hmac, and a crate that uses a dependency says so.
 ring = { version = "0.17", default-features = false }
+# How many terminal columns a `char` occupies, for `output::width` (which
+# every table cell is padded by) and `lookout`'s own `fit`. Both used to
+# count `char`s, so a CJK name or a log line built from double-width
+# characters overran its column and pushed every border after it -- see
+# `output/width.rs`'s own doc for the two different width questions this
+# crate asks. Adds ZERO crates to the tree: `ratatui-core` already pulls
+# this exact version in for its own grapheme measurement, and `shep-core`
+# reaches it through `serde-saphyr`'s `annotate-snippets` -- `Cargo.lock`
+# resolves one `unicode-width`, both before and after this change. Declared
+# here rather than left to feature unification with either of them, because
+# a crate that uses a dependency says so.
+#
+# `default-features = false` drops the `cjk` feature, which exists only to
+# provide `width_cjk` -- the East-Asian *Ambiguous* reading, where `▸` and
+# friends measure two columns instead of one. Plain `width` is the right
+# answer for a terminal nobody has told us is CJK-legacy, and it is the
+# reading `lookout::view::flock::mark`'s own doc already assumes.
+unicode-width = { version = "0.2", default-features = false }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "env", "wrap_help"] }
 # `default-features = false` is a no-op here — clap_complete's own default
 # feature set is empty — kept for consistency with the workspace rule.

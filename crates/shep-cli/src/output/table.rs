@@ -3,6 +3,7 @@
 //! payload type.
 
 use super::Render;
+use super::width::visible_width;
 
 /// Renders any payload as the padded table, returned rather than printed so
 /// a test can read it. [`emit`](super::emit) calls this for `Format::Table`.
@@ -46,10 +47,10 @@ pub fn render_table<T: Render>(data: &T) -> String {
         );
     }
 
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    let mut widths: Vec<usize> = headers.iter().copied().map(visible_width).collect();
     for row in &rows {
         for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.chars().count());
+            *width = (*width).max(visible_width(cell));
         }
     }
 
@@ -64,14 +65,20 @@ pub fn render_table<T: Render>(data: &T) -> String {
 /// Appends one row: every cell but the last padded to its column's width and
 /// followed by two spaces, the last cell unpadded so no line carries
 /// trailing whitespace.
+///
+/// Padded by hand rather than with `{cell:<width$}`, and the difference is
+/// the point: that format spec counts `char`s, so a CJK name gets half the
+/// spaces it needs and every column after it slides left. `boxed_row` below
+/// pads by [`visible_width`] for the same reason — this is the plain
+/// renderer catching up with the boxed one.
 fn write_row<'a>(out: &mut String, cells: impl Iterator<Item = &'a str>, widths: &[usize]) {
     let cells: Vec<&str> = cells.collect();
     let last = cells.len().saturating_sub(1);
     for (i, cell) in cells.into_iter().enumerate() {
-        if i == last {
-            out.push_str(cell);
-        } else {
-            out.push_str(&format!("{cell:<width$}", width = widths[i]));
+        out.push_str(cell);
+        if i != last {
+            let pad = widths[i].saturating_sub(visible_width(cell));
+            out.extend(core::iter::repeat_n(' ', pad));
             out.push_str("  ");
         }
     }
@@ -338,10 +345,10 @@ pub(crate) fn render_boxed_ex(
 fn column_widths(headers: &[&str], rows: &[Vec<String>], keep: &[usize]) -> Vec<usize> {
     keep.iter()
         .map(|&col| {
-            let mut w = crate::output::width::visible_width(headers[col]);
+            let mut w = visible_width(headers[col]);
             for row in rows {
                 if let Some(cell) = row.get(col) {
-                    w = w.max(crate::output::width::visible_width(cell));
+                    w = w.max(visible_width(cell));
                 }
             }
             w
@@ -356,7 +363,7 @@ fn column_widths(headers: &[&str], rows: &[Vec<String>], keep: &[usize]) -> Vec<
 fn boxed_row(cells: &[String], widths: &[usize]) -> String {
     let mut line = String::from("│");
     for (cell, w) in cells.iter().zip(widths) {
-        let pad = w.saturating_sub(crate::output::width::visible_width(cell));
+        let pad = w.saturating_sub(visible_width(cell));
         line.push(' ');
         line.push_str(cell);
         line.push_str(&" ".repeat(pad));
@@ -528,34 +535,60 @@ mod tests {
         assert_eq!(human_bytes(u64::MAX), "16.0E");
     }
 
-    /// "羊" is one character but three bytes in UTF-8. If column width were
-    /// computed with `str::len()` (bytes) instead of char count, a
-    /// six-character CJK name (18 bytes) would produce a far wider NAME
-    /// column than a six-character ASCII name (6 bytes) — even though
-    /// `{:<w$}` pads both to the same *character* width either way.
+    /// "羊" is one character, three bytes in UTF-8, and **two columns** on a
+    /// terminal. All three numbers differ, and only one of them is the width
+    /// of the column it needs.
+    ///
+    /// This test used to assert the middle one — that two names with equal
+    /// *character* counts render to equal-width rows — and that assertion was
+    /// the bug, pinned. A six-character CJK name draws twice as wide as a
+    /// six-character ASCII one, so a table that gives them the same column
+    /// hangs the CJK name over its own border and shoves every column after
+    /// it left. `docs/specs/deferred.md` recorded the same fault in
+    /// `lookout`'s `fit`; both are measured by
+    /// [`crate::output::width::char_columns`] now.
+    ///
+    /// So the property is stated in columns, and on the HEADER line as well
+    /// as the row. The two fixtures differ only in their name, so both lines
+    /// have to widen by exactly what that name draws wider — and only the
+    /// header line proves the *padding* moved, since the row's own NAME cell
+    /// is that name and would widen whatever the column did. Asserting on
+    /// one line alone would leave [`visible_width`] free to return a
+    /// constant.
+    ///
+    /// Not asserted: that a table's lines are all one width. `write_row`
+    /// leaves the last cell unpadded on purpose so no line carries trailing
+    /// whitespace, so they are not, and the boxed renderer's own
+    /// `every_line_of_a_boxed_table_has_the_same_visible_width` is where
+    /// that property belongs.
     #[test]
-    fn column_widths_count_characters_not_bytes() {
-        let ascii_name = "wwwwww".to_string(); // 6 chars, 6 bytes
-        let cjk_name = "羊".repeat(6); // 6 chars, 18 bytes
+    fn column_widths_count_display_columns_not_characters_or_bytes() {
+        let ascii_name = "wwwwww".to_string(); // 6 chars, 6 bytes, 6 columns
+        let cjk_name = "羊".repeat(6); // 6 chars, 18 bytes, 12 columns
         assert_eq!(ascii_name.chars().count(), cjk_name.chars().count());
 
-        let ascii_line = render_table(&FlockRows(vec![info_with_name(&ascii_name)]))
-            .lines()
-            .nth(1)
-            .unwrap()
-            .chars()
-            .count();
-        let cjk_line = render_table(&FlockRows(vec![info_with_name(&cjk_name)]))
-            .lines()
-            .nth(1)
-            .unwrap()
-            .chars()
-            .count();
+        let lines = |name: &str| -> (usize, usize) {
+            let table = render_table(&FlockRows(vec![info_with_name(name)]));
+            let mut lines = table.lines();
+            let header = visible_width(lines.next().expect("a header line"));
+            let row = visible_width(lines.next().expect("a row line"));
+            (header, row)
+        };
+        let (ascii_header, ascii_row) = lines(&ascii_name);
+        let (cjk_header, cjk_row) = lines(&cjk_name);
 
         assert_eq!(
-            ascii_line, cjk_line,
-            "two names with equal character counts must produce equal-width rendered rows, \
-             regardless of how many UTF-8 bytes either one takes"
+            cjk_header - ascii_header,
+            6,
+            "six `羊` draw six columns wider than six `w`, so the NAME column \
+             is padded six wider — a character count makes this 0 and a byte \
+             count makes it 12"
+        );
+        assert_eq!(
+            cjk_row - ascii_row,
+            6,
+            "and the row moves with its own header, or the two disagree about \
+             where the second column starts"
         );
     }
 
@@ -631,7 +664,7 @@ mod tests {
             let lines = table_lines(&out);
             let widths: Vec<usize> = lines
                 .iter()
-                .map(|l| crate::output::width::visible_width(l))
+                .map(|l| visible_width(l))
                 .collect();
             if let Some(&first) = widths.first() {
                 prop_assert!(
