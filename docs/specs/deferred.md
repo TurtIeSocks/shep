@@ -1089,3 +1089,79 @@ used to name:
   race, with a startup notice and, in the default mode on refusal, a
   per-request stderr line naming the path so the choice and its cost are
   never silent.
+
+## Ideas, recorded but not designed
+
+Not debt, not deferred spec surface, and not promised to anybody. Things worth
+keeping because the reasoning behind them was expensive to arrive at and cheap
+to lose.
+
+### Per-sheep build and update scripts
+
+Rin's, 2026-08-26, written down before it got lost:
+
+> I would really love to add the ability for users to add build scripts to
+> shep for each of their sheep. `shep build koji`,
+> `shep build reactmap --restart`. Maybe even update scripts or git related
+> scripts? `shep update koji` => git pull from cwd? It obviously doesn't make
+> sense to mirror all of git's capabilities but just some basics of updating
+> and building could go a loooong way in my experience. Do you know how many
+> janky updating/deploying scripts I've written over the years?
+
+**The last sentence is the evidence, and it is the strongest part.** "I keep
+rewriting this by hand" beats any amount of design argument about whether a
+feature is wanted. Anyone running a flock has written the pull-build-restart
+script, and written it slightly differently each time.
+
+**This revisits a documented non-goal, and the narrowing is the argument.**
+[shep-v1.md](shep-v1.md) §1 cuts "deployment tooling" from v1, which is
+`pm2 deploy`: host lists, revision directories, `ref` and `repo` per
+environment, remote execution over SSH. What is described here is much
+smaller. One machine, one checkout, the cwd a sheep already has, and two verbs
+that stop well short of a deploy system. Reconsidering the cut is not the same
+as reversing it, and a future design should say plainly which of pm2's deploy
+surface it is still refusing.
+
+**The sequencing is the actual feature, not the individual verbs.** `shep
+build koji` on its own is a task runner with extra steps, and `just`, `make`
+and npm scripts already exist. What replaces a janky script is pull, then
+build, then restart, with the guarantee that a failed build does not restart
+anything. Rin's own `--restart` flag already gestures at this. The
+failure semantics are the whole value, so a design that ships the verbs
+without deciding them has shipped the thin half.
+
+Questions a design would have to answer, roughly in the order they bite:
+
+- **Where do the scripts live.** The Flockfile is the natural home: per-app,
+  committed beside the code, and it already carries `cwd`. `shep.toml` is
+  daemon-scoped and would be the wrong shape for a per-sheep command.
+- **Who executes them, the CLI or the shepherd.** This is the crux and it is
+  the same trust question the `shep install` entry above works through. A
+  shepherd that runs these is a long-lived privileged daemon executing
+  arbitrary shell out of a config file. A CLI that runs them uses the
+  operator's own shell and privileges, which is far easier to reason about,
+  and costs nothing that matters while multi-host remains a non-goal.
+- **Which directory.** Mostly already decided: Phase 17 resolved a
+  Flockfile's relative `script` against the app's own directory rather than
+  the daemon's cwd, and an app's `cwd` defaults to the Flockfile's directory.
+  `shep build` should use the app's resolved `cwd` and inherit that ruling
+  rather than inventing a second one.
+- **What `shep update` actually promises.** `git pull` is where this stops
+  being simple. A dirty worktree, a detached HEAD, the wrong branch,
+  submodules, and authentication that depends on whose SSH keys are in scope
+  are all ordinary states, not edge cases. A pull that fails halfway leaves a
+  half-updated checkout that the operator then has to reason about anyway,
+  which is the exact position the janky scripts leave them in. Refusing
+  loudly on anything but a clean fast-forward is probably the honest v1 of
+  this.
+- **Whether there is a rollback.** The frightening part of a hand-rolled
+  deploy script is usually that there is not one. shep should either offer
+  something or say clearly that it does not, because an operator who assumes
+  wrong finds out at the worst moment.
+
+**If it turns out to be a thin wrapper, that is a reason not to build it.**
+The value has to come from the integration: knowing the cwd, the environment,
+the restart, and the ordering across a flock. A design that cannot point at
+something `just` plus three lines of shell does not already do should stop
+there.
+
