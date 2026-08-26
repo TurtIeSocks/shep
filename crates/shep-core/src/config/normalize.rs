@@ -103,6 +103,12 @@ impl ResolvedApp {
 /// A path that does not start with `~` is returned untouched, so this is a
 /// no-op for every absolute and relative path anyone already has.
 ///
+/// Thin wrapper over [`expand_home_tilde`], the one piece of tilde-expansion
+/// logic in the workspace: this attaches the sheep name and field
+/// [`NormalizeError`] carries, so a Flockfile refusal names the line to
+/// edit. A caller with no such context — `shep-cli`'s own `shep adopt`,
+/// resolving a bare CLI argument — calls [`expand_home_tilde`] directly.
+///
 /// # Errors
 /// - [`NormalizeError::TildeUser`] if the path names another user's home.
 /// - [`NormalizeError::NoHomeForTilde`] if `~/` is used and `home` is `None`.
@@ -112,22 +118,74 @@ fn expand_tilde(
     name: &str,
     field: &'static str,
 ) -> Result<String, NormalizeError> {
+    expand_home_tilde(value, home).map_err(|err| match err {
+        TildeError::OtherUser => NormalizeError::TildeUser {
+            name: name.to_string(),
+            field,
+            value: value.to_string(),
+        },
+        TildeError::NoHome => NormalizeError::NoHomeForTilde {
+            name: name.to_string(),
+            field,
+        },
+    })
+}
+
+/// Why [`expand_home_tilde`] refused a value — the two failure modes with
+/// no per-field context attached, for a caller that has none to give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TildeError {
+    /// The value names another user's home (`~user/...`). Refused rather
+    /// than resolved: answering it means a passwd lookup, and under a
+    /// systemd unit the answer depends on who the process runs as rather
+    /// than on who wrote the value.
+    OtherUser,
+    /// The value begins `~/` and no home directory could be determined.
+    NoHome,
+}
+
+impl fmt::Display for TildeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OtherUser => write!(
+                f,
+                "shep expands only `~/` (your own home); another user's home needs a \
+                 passwd lookup whose answer depends on who the process runs as"
+            ),
+            Self::NoHome => write!(f, "begins with `~/` but no home directory could be found"),
+        }
+    }
+}
+
+impl core::error::Error for TildeError {}
+
+/// Expands a leading `~/` in `value` against `home` — the one piece of
+/// tilde-expansion logic in the workspace, shared by `expand_tilde` above
+/// (Flockfile path fields, private to this module) and `shep-cli`'s own
+/// `shep adopt` (its `<path>` argument). Adopt's own CLI path used to run
+/// without this entirely, which is why `~/.cargo/bin/whatever` worked in
+/// a Flockfile and not at `shep adopt`.
+///
+/// Deliberately narrow, matching `expand_tilde`'s own doc: `~/` only.
+/// `~user/...` is refused (a passwd lookup, whose answer depends on who
+/// the process runs as) and `$VAR` is never expanded, here or anywhere.
+///
+/// A value that does not start with `~` is returned unchanged, so this is
+/// a no-op for every absolute and relative path anyone already has.
+///
+/// # Errors
+/// - [`TildeError::OtherUser`] if the value names another user's home.
+/// - [`TildeError::NoHome`] if `~/` is used and `home` is `None`.
+pub fn expand_home_tilde(value: &str, home: Option<&Path>) -> Result<String, TildeError> {
     let Some(rest) = value.strip_prefix('~') else {
         return Ok(value.to_string());
     };
     // `~` alone, or `~/...`. Anything else after the tilde names a user.
     if !(rest.is_empty() || rest.starts_with('/')) {
-        return Err(NormalizeError::TildeUser {
-            name: name.to_string(),
-            field,
-            value: value.to_string(),
-        });
+        return Err(TildeError::OtherUser);
     }
     let Some(home) = home else {
-        return Err(NormalizeError::NoHomeForTilde {
-            name: name.to_string(),
-            field,
-        });
+        return Err(TildeError::NoHome);
     };
     // `join` would discard `home` for a rest that still looks absolute, so
     // the separator is trimmed and the two halves are concatenated instead.
@@ -764,6 +822,34 @@ mod tests {
         assert!(
             matches!(err, NormalizeError::NoHomeForTilde { .. }),
             "{err:?}"
+        );
+    }
+
+    /// Pins [`expand_home_tilde`]'s own public contract directly, apart
+    /// from [`expand_tilde`]'s wrapping of it into a [`NormalizeError`]:
+    /// `shep-cli`'s own `shep adopt` calls this function directly (it has
+    /// no app name or field to attach), so its behavior needs its own
+    /// coverage independent of whatever `AppConfig`-shaped test drives it
+    /// above.
+    #[test]
+    fn expand_home_tilde_covers_its_four_documented_cases() {
+        let home = Path::new("/home/rin");
+        assert_eq!(
+            expand_home_tilde("~/bin/dog", Some(home)).unwrap(),
+            home.join("bin/dog").to_string_lossy()
+        );
+        assert_eq!(
+            expand_home_tilde("/opt/bin/dog", Some(home)).unwrap(),
+            "/opt/bin/dog",
+            "a value with no leading ~ is returned unchanged"
+        );
+        assert_eq!(
+            expand_home_tilde("~/bin/dog", None).unwrap_err(),
+            TildeError::NoHome
+        );
+        assert_eq!(
+            expand_home_tilde("~deploy/bin/dog", Some(home)).unwrap_err(),
+            TildeError::OtherUser
         );
     }
 

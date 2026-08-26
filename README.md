@@ -101,7 +101,7 @@ The whole vocabulary, and whether it exists yet.
 | a bark | a webhook alert | `[dog.bark.sinks]` config, `shep barks` | yes |
 | the whistle | the MCP interface agents talk to | `shep whistle` | yes |
 | the lookout | the terminal dashboard | `shep lookout` (alias `dash`) | partly |
-| adopt / rehome | register or drop a third-party dog | `shep adopt <name> <path>` | yes |
+| adopt / rehome | register or drop a third-party dog | `shep adopt <path> [--name <name>]` | yes |
 | that'll do | graceful stop, after the real herding command | `shep thatlldo` | yes |
 | stock | change how many instances of an app run (the stocking rate) | `shep stock <name> <count>` (alias `scale`) | yes |
 | signal | send a signal to one sheep's own process | `shep signal <selector> <signal>` | yes |
@@ -160,11 +160,18 @@ the exact command you should run and exits non-zero.
 **Dogs.** `shep enable metrics` turns on a Prometheus endpoint at
 `127.0.0.1:9615`; `shep enable bark` watches the flock and posts alerts to
 Discord, Slack, or a JSON endpoint you name under `[dog.bark.sinks]`. Both
-ship inside the binary. `shep adopt <name> <path>` runs anyone else's
-binary the same way — vetted once when you adopt it, and served its own
-`[dog.<name>]` config over the same socket `shep` itself talks to rather
-than through its environment, so a webhook credential never ends up in a
-process listing or a crash dump. [docs/dogs.md](docs/dogs.md) is the guide.
+ship inside the binary. `shep adopt <path>` runs anyone else's binary the
+same way — vetted once when you adopt it, found on `$PATH` or with a
+leading `~/` expanded if you don't give an absolute path, and named after
+its own file stem (`shep-` stripped) unless you pass `--name`. It's served
+its own `[dog.<name>]` config over the same socket `shep` itself talks to
+rather than through its environment, so a webhook credential never shows
+up in a process listing or gets inherited by anything the dog spawns.
+Once adopted, `shep <name>
+[args...]` runs it directly, passing your own arguments through — built-in
+verbs and their aliases always win, so a dog can't shadow either.
+[docs/dogs.md](docs/dogs.md)
+is the guide.
 
 **Coming from pm2.** `shep import` reads a real `dump.pm2` and writes a
 Flockfile. It starts nothing, names every clustered app on stderr because

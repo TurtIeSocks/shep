@@ -31,6 +31,7 @@
 //! proportion to the ask; `shep muster` is the one verb that autostarts,
 //! and it says so in its own help text.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -588,24 +589,183 @@ fn warn_group_writable(streams: &mut Streams<'_>, path: &Path) {
     streams.aside(GROUP_WRITABLE_NOTICE, &message);
 }
 
-/// `shep adopt <name> <path>`: vets a binary shep has never seen, records
-/// it, and starts it if a shepherd is running.
+/// `shep adopt <path> [--name <name>]`: vets a binary shep has never seen,
+/// records it, and starts it if a shepherd is running.
+///
+/// `args.path` is resolved before anything else ([`resolve_adopt_path`]),
+/// and `args.name` defaults to the resolved binary's file stem
+/// ([`default_dog_name`]) when omitted -- a defaulted name goes through the
+/// same [`collides_with_a_verb`] refusal an explicit `--name` would.
+///
+/// **The collision check runs before [`vet_binary`], not after.**
+/// `vet_binary` spawns the candidate to prove this kernel can exec it, so
+/// checking the name first means a refused name never gets that binary run
+/// at all -- a refusal that already ran the thing it refuses is not a
+/// refusal. `default_dog_name` needs only the resolved `candidate`, never
+/// the vetted/canonicalized path, so nothing forces the other order.
 pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArgs) -> ExitCode {
-    let vetted = match vet_binary(&args.path, &paths.home) {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path_var = std::env::var_os("PATH");
+    let candidate = resolve_adopt_path(&args.path, home.as_deref(), path_var.as_deref());
+    // Named and checked for a verb collision BEFORE vetting, deliberately:
+    // `vet_binary` below spawns the candidate to prove this kernel can exec
+    // it, and a refusal that runs after that spawn has already run the
+    // thing it refuses. `default_dog_name` only needs the resolved
+    // `candidate`, never the vetted/canonicalized path, so this reorder
+    // costs nothing -- see `a_name_collision_is_refused_before_the_candidate_is_ever_spawned`.
+    let name = match &args.name {
+        Some(name) => name.clone(),
+        None => default_dog_name(&candidate),
+    };
+    if collides_with_a_verb(&name) {
+        return fail_adopt_name_collision(streams, &name);
+    }
+    let vetted = match vet_binary(&candidate, &paths.home) {
         Ok(vetted) => vetted,
-        Err(refusal) => return fail_adopt(streams, &args.path, &refusal),
+        Err(refusal) => return fail_adopt(streams, &candidate, &refusal),
     };
     let path = vetted.path;
     for writable in &vetted.group_writable {
         warn_group_writable(streams, writable);
     }
     if let Err(err) = ShepToml::edit(&paths.daemon_config, |cfg| {
-        cfg.adopt_dog(&args.name, &path);
+        cfg.adopt_dog(&name, &path);
     }) {
         return fail_config(streams, &err);
     }
     let client = Client::connect(&paths.socket).await.ok();
-    adopt_after_config(streams, &args.name, &path, client.as_ref()).await
+    adopt_after_config(streams, &name, &path, client.as_ref()).await
+}
+
+/// Resolves `raw` -- `shep adopt`'s own path argument -- before it reaches
+/// [`vet_binary`]: (a) as given, (b) with a leading `~/` expanded against
+/// `home`, (c) looked up on `path_var`. First hit wins; if none of the
+/// three finds anything, `raw` comes back unchanged so `vet_binary` reports
+/// the same [`AdoptRefusal::Missing`] it always has.
+///
+/// `home` and `path_var` are taken as parameters, read once by [`adopt`]
+/// from `$HOME`/`$PATH`, rather than read here -- the same reason
+/// [`resolve_paths`](crate::resolve_paths) takes an `env` closure instead
+/// of calling `std::env::var` inline: it keeps this function a pure
+/// function of its inputs, testable with a fabricated home or `$PATH`
+/// without touching the real environment (this crate forbids `unsafe`
+/// code outright, so a test cannot use `std::env::set_var` to do that
+/// either -- it is `unsafe` as of edition 2024).
+///
+/// All three routes funnel into the one [`vet_binary`] call in [`adopt`]
+/// once this returns -- existence, file-ness, the execute bit and the exec
+/// probe are exactly as strict for a `$PATH` hit or a `~/`-expanded one as
+/// for a literal path, so this changes what `adopt` can FIND, never what
+/// it VETS. `cargo install shep-log-rotate` puts the binary on `$PATH`
+/// under its own name; this is what lets `shep adopt shep-log-rotate` find
+/// it there instead of demanding the full install path.
+fn resolve_adopt_path(raw: &Path, home: Option<&Path>, path_var: Option<&OsStr>) -> PathBuf {
+    if raw.exists() {
+        return raw.to_path_buf();
+    }
+    if let Some(expanded) = raw
+        .to_str()
+        .and_then(|value| expand_tilde_candidate(value, home))
+        && expanded.exists()
+    {
+        return expanded;
+    }
+    if let Some(found) = lookup_on_path(raw, path_var) {
+        return found;
+    }
+    raw.to_path_buf()
+}
+
+/// `~/`-expands `value` against `home`, for [`resolve_adopt_path`]'s
+/// second step. `None` for anything
+/// [`shep_core::config::expand_home_tilde`] refuses (another user's home,
+/// or no home to expand against) or that does not start with `~` at all --
+/// either way [`resolve_adopt_path`] moves on to its next step rather than
+/// surfacing a tilde-specific error, since the path might never have been
+/// a tilde path to begin with.
+///
+/// The one piece of tilde-expansion logic in the workspace lives in
+/// shep-core, shared with Flockfile path fields (`normalize::expand_tilde`)
+/// -- this is not a second implementation of it.
+fn expand_tilde_candidate(value: &str, home: Option<&Path>) -> Option<PathBuf> {
+    if !value.starts_with('~') {
+        return None;
+    }
+    shep_core::config::expand_home_tilde(value, home)
+        .ok()
+        .map(PathBuf::from)
+}
+
+/// Looks `name` up on `path_var` (`$PATH`'s own syntax: `:`-separated
+/// directories), the way a shell would -- and only the way a shell would: a
+/// bare name with no directory component of its own (`shep-log-rotate`,
+/// not `./shep-log-rotate` or `/opt/bin/shep-log-rotate`), and only a hit
+/// with an execute bit set for someone, so a same-named non-executable
+/// file earlier on `$PATH` does not block the real binary further down it.
+fn lookup_on_path(name: &Path, path_var: Option<&OsStr>) -> Option<PathBuf> {
+    let is_bare = name
+        .parent()
+        .is_some_and(|parent| parent.as_os_str().is_empty());
+    if !is_bare {
+        return None;
+    }
+    let dirs = path_var?;
+    std::env::split_paths(dirs)
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::metadata(candidate)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// The dog name `shep adopt` defaults to when `--name` is omitted: `path`'s
+/// file stem with one leading `shep-` stripped, the way `cargo` strips
+/// `cargo-` from its own external subcommands. `shep-log-rotate` defaults
+/// to `log-rotate`; a binary with no `shep-` prefix keeps its whole stem,
+/// and a binary literally named `shep-` (stem would strip to empty) keeps
+/// its whole stem too, rather than defaulting to an unreachable empty name.
+///
+/// Derived from `path` as resolved (pre-canonicalize), not from
+/// `vet_binary`'s canonicalized return value: a symlink's own name is what
+/// an operator typed and expects to see, not whatever file it happens to
+/// point at.
+fn default_dog_name(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_else(|| path.to_str().unwrap_or("dog"));
+    stem.strip_prefix("shep-")
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(stem)
+        .to_string()
+}
+
+/// Whether `name` already names a built-in verb or one of its visible
+/// aliases -- `shep adopt`'s own refusal, since a dog adopted under such a
+/// name could never be reached: `shep <name>` always dispatches to the
+/// built-in verb first (see `lib.rs`'s `dispatch_adopted_dog`).
+///
+/// Reads the name and every alias straight off the real `clap::Command`
+/// tree (`Cli::command()`) rather than a hand-copied list, so a verb added
+/// later is refused automatically instead of silently becoming
+/// unreachable once adopted under it.
+fn collides_with_a_verb(name: &str) -> bool {
+    use clap::CommandFactory as _;
+    crate::cli::Cli::command()
+        .get_subcommands()
+        .any(|sub| sub.get_name() == name || sub.get_all_aliases().any(|alias| alias == name))
+}
+
+/// Renders the refusal for a name `shep adopt` will not accept because it
+/// already names a built-in verb or alias.
+fn fail_adopt_name_collision(streams: &mut Streams<'_>, name: &str) -> ExitCode {
+    let code = ExitCode::InvalidConfig;
+    let message = format!(
+        "`{name}` is already a shep verb or alias, so an adopted dog by that name could never \
+         be reached -- pick another name with --name"
+    );
+    streams.fail(code, &message)
 }
 
 /// `adopt`'s daemon half — see [`enable_after_config`]'s own doc for why
@@ -830,7 +990,7 @@ mod tests {
         );
     }
 
-    /// The defect this test exists for: `shep adopt otel <path>` recorded
+    /// The defect this test exists for: `shep adopt <path> --name otel` recorded
     /// the binary, and the `shep enable otel` after it sent `BuiltIn`
     /// regardless — so the shepherd spawned `shep dog otel`, an argv branch
     /// of this binary, the operator's own binary never ran, and nothing
@@ -1125,7 +1285,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let args = AdoptArgs {
-            name: "otel".to_string(),
+            name: Some("otel".to_string()),
             path: bin.clone(),
         };
         let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
@@ -1152,7 +1312,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let args = AdoptArgs {
-            name: "otel".to_string(),
+            name: Some("otel".to_string()),
             path: dir.path().join("nope"),
         };
         let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
@@ -1174,7 +1334,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let args = AdoptArgs {
-            name: "otel".to_string(),
+            name: Some("otel".to_string()),
             path: dir.path().join("nope"),
         };
         let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
@@ -1232,7 +1392,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let args = AdoptArgs {
-            name: "otel".to_string(),
+            name: Some("otel".to_string()),
             path: binary,
         };
         let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
@@ -1247,6 +1407,259 @@ mod tests {
         assert!(
             text.contains("next shepherd"),
             "the operator needs to know the dog is not running yet: {text}"
+        );
+    }
+
+    /// fails if `adopt` stops defaulting the name when `--name` is omitted,
+    /// or defaults it from the whole file name instead of the stripped
+    /// stem: `shep-otel` must default to `otel`, the way `cargo` strips
+    /// `cargo-` from its own external subcommands.
+    ///
+    /// Mutation check: reverting `default_dog_name` to return `stem`
+    /// unstripped reddens this (`shep-otel` recorded verbatim) rather than
+    /// `otel`.
+    #[tokio::test]
+    async fn adopt_with_no_name_flag_defaults_from_the_stripped_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        let binary = dir.path().join("shep-otel");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut mode = std::fs::metadata(&binary).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        std::fs::set_permissions(&binary, mode).unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = AdoptArgs {
+            path: binary,
+            name: None,
+        };
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+
+        assert_eq!(code, ExitCode::Success);
+        let written = std::fs::read_to_string(&paths.daemon_config).unwrap();
+        let cfg = shep_core::config::DaemonConfig::load(Some(&written), &|_| None).unwrap();
+        assert!(
+            cfg.daemon.adopted_dogs.contains_key("otel"),
+            "the defaulted name must be `otel`, not `shep-otel`: {written}"
+        );
+    }
+
+    /// fails if `adopt` accepts a name that already belongs to a built-in
+    /// verb or alias -- such a dog could never be reached, since
+    /// `dispatch_adopted_dog` (`lib.rs`) only ever runs once clap has
+    /// already failed to match the name against a real subcommand.
+    ///
+    /// Mirrors [`a_refused_adopt_leaves_the_config_untouched`]'s own shape:
+    /// the refusal must happen before `shep.toml` is touched at all, same
+    /// as every other `AdoptRefusal`.
+    ///
+    /// Mutation check: reverting `collides_with_a_verb` to always return
+    /// `false` reddens this (`Success` and a written config instead of
+    /// `InvalidConfig` and an absent one).
+    #[tokio::test]
+    async fn adopt_refuses_a_name_that_collides_with_a_built_in_verb() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        let binary = dir.path().join("watchdog");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut mode = std::fs::metadata(&binary).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        std::fs::set_permissions(&binary, mode).unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        // "stop" is a real verb; "ls" is `flock`'s own visible alias. Both
+        // must be refused the same way.
+        for reserved in ["stop", "ls"] {
+            let args = AdoptArgs {
+                path: binary.clone(),
+                name: Some(reserved.to_string()),
+            };
+            let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+            assert_eq!(
+                code,
+                ExitCode::InvalidConfig,
+                "`{reserved}` must be refused"
+            );
+        }
+        assert!(
+            !paths.daemon_config.exists(),
+            "a name collision must never touch shep.toml: {}",
+            paths.daemon_config.display()
+        );
+    }
+
+    /// fails if `adopt` refuses a name collision only after already
+    /// vetting the candidate -- `vet_binary` spawns the binary as part of
+    /// vetting (to prove this kernel can exec it), so a refusal that runs
+    /// after `vet_binary` has already run the thing it refuses. The
+    /// outcome alone (`InvalidConfig`, no `shep.toml` write) is identical
+    /// whichever order runs first -- `adopt_refuses_a_name_that_collides_with_a_built_in_verb`
+    /// above cannot tell them apart -- so this test distinguishes the two
+    /// orders by which REFUSAL REASON reaches the operator instead of by a
+    /// spawn side effect: `args.path` here names nothing on disk, so
+    /// `vet_binary` fails at its very first check (`std::fs::metadata`,
+    /// `AdoptRefusal::Missing`) without ever attempting to spawn anything.
+    /// If the collision check runs first, the operator sees the collision
+    /// message; if `vet_binary` runs first, they see "no file exists at
+    /// that path" instead, for a name that was always going to be refused
+    /// either way. A process-spawn side effect (a marker file a script
+    /// writes) was tried first and dropped: `vet_binary`'s own exec probe
+    /// polls for up to 50ms before falling back to a hard kill, and that
+    /// race was not reliably observable from this test's own harness --
+    /// this path-shaped signal has no timing to race at all.
+    ///
+    /// Mutation check: moving the `collides_with_a_verb` check back to
+    /// after `vet_binary` reddens this -- the reported refusal becomes
+    /// `AdoptRefusal::Missing`'s message instead of the collision one.
+    #[tokio::test]
+    async fn a_name_collision_is_refused_before_vet_binary_ever_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = AdoptArgs {
+            path: dir.path().join("nope"),
+            name: Some("stop".to_string()),
+        };
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+
+        assert_eq!(code, ExitCode::InvalidConfig);
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            text.contains("already a shep verb or alias"),
+            "the collision must be the reported reason, not vet_binary's own refusal: {text}"
+        );
+        assert!(
+            !text.contains("no file exists at that path"),
+            "vet_binary must never run on a name that was always going to be refused: {text}"
+        );
+    }
+
+    /// fails if `resolve_adopt_path` stops trying a literal path first, or
+    /// tries the other two steps when the literal one already exists --
+    /// the base case every other `resolve_adopt_path` test builds on.
+    #[test]
+    fn resolve_adopt_path_prefers_a_literal_path_that_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("thing");
+        std::fs::write(&binary, "").unwrap();
+
+        let resolved = resolve_adopt_path(&binary, None, None);
+        assert_eq!(resolved, binary);
+    }
+
+    /// fails if `shep adopt '~/.cargo/bin/shep-log-rotate'` stops working
+    /// -- issue 1's second repro. `resolve_adopt_path` must expand `~/`
+    /// against the `home` it is given when the literal path (a literal
+    /// `~` directory, which does not exist) is not there.
+    ///
+    /// Mutation check: reverting the tilde-expansion step (returning
+    /// `raw` unchanged whenever the literal path is missing, skipping
+    /// straight to the `$PATH` lookup) reddens this -- `resolve_adopt_path`
+    /// would return the untouched `~/...` path, which `vet_binary` then
+    /// reports `Missing` for.
+    #[test]
+    fn resolve_adopt_path_expands_a_leading_tilde_against_the_given_home() {
+        let home = tempfile::tempdir().unwrap();
+        let binary_dir = home.path().join(".cargo/bin");
+        std::fs::create_dir_all(&binary_dir).unwrap();
+        let binary = binary_dir.join("shep-log-rotate");
+        std::fs::write(&binary, "").unwrap();
+
+        let raw = Path::new("~/.cargo/bin/shep-log-rotate");
+        let resolved = resolve_adopt_path(raw, Some(home.path()), None);
+        assert_eq!(resolved, binary);
+    }
+
+    /// fails if `shep adopt shep-log-rotate` stops working when the binary
+    /// is only on `$PATH` -- issue 1's first repro (`cargo install
+    /// shep-log-rotate` puts it there under its own name).
+    ///
+    /// Mutation check: reverting the `$PATH` step to return `None`
+    /// unconditionally reddens this the same way the tilde mutation above
+    /// reddens its own test.
+    #[test]
+    fn resolve_adopt_path_falls_back_to_a_path_lookup_for_a_bare_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("shep-log-rotate");
+        std::fs::write(&binary, "").unwrap();
+        let mut mode = std::fs::metadata(&binary).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        std::fs::set_permissions(&binary, mode).unwrap();
+        let path_var = std::ffi::OsString::from(dir.path());
+
+        let raw = Path::new("shep-log-rotate");
+        let resolved = resolve_adopt_path(raw, None, Some(&path_var));
+        assert_eq!(resolved, binary);
+    }
+
+    /// fails if a `$PATH` lookup fires for a name that already names a
+    /// directory of its own (`./thing`, `bin/thing`, `/opt/thing`) -- a
+    /// shell never searches `$PATH` for one of those, and neither should
+    /// this: a same-named file elsewhere on `$PATH` would silently adopt
+    /// the wrong binary.
+    #[test]
+    fn resolve_adopt_path_does_not_path_search_a_name_with_a_directory_component() {
+        let path_dir = tempfile::tempdir().unwrap();
+        // A file that WOULD match if `$PATH` were searched -- proving the
+        // guard, not just an absent or non-executable one.
+        let decoy = path_dir.path().join("thing");
+        std::fs::write(&decoy, "").unwrap();
+        let mut mode = std::fs::metadata(&decoy).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        std::fs::set_permissions(&decoy, mode).unwrap();
+        let path_var = std::ffi::OsString::from(path_dir.path());
+
+        let raw = Path::new("./thing");
+        let resolved = resolve_adopt_path(raw, None, Some(&path_var));
+        assert_eq!(
+            resolved, raw,
+            "a name with its own directory must never be searched on $PATH"
+        );
+    }
+
+    /// fails if none of the three resolution steps finding nothing stops
+    /// returning `raw` unchanged -- the funnel that keeps a plain missing
+    /// path reporting the same [`AdoptRefusal::Missing`] it always has,
+    /// rather than a resolution-specific error.
+    #[test]
+    fn resolve_adopt_path_returns_raw_unchanged_when_nothing_resolves() {
+        let raw = Path::new("/nonexistent/shep-nothing");
+        assert_eq!(resolve_adopt_path(raw, None, None), raw);
+    }
+
+    /// fails if `default_dog_name` stops stripping exactly one leading
+    /// `shep-`, keeps stripping a binary that never had the prefix, or
+    /// leaves a pathological `shep-` binary defaulting to an empty
+    /// (unreachable) name.
+    #[test]
+    fn default_dog_name_strips_one_leading_shep_prefix_and_no_further() {
+        assert_eq!(
+            default_dog_name(Path::new("/opt/bin/shep-log-rotate")),
+            "log-rotate"
+        );
+        assert_eq!(default_dog_name(Path::new("/opt/bin/otel")), "otel");
+        // Stripping the prefix here would leave "", an unreachable name --
+        // the whole stem is kept instead.
+        assert_eq!(default_dog_name(Path::new("/opt/bin/shep-")), "shep-");
+    }
+
+    /// fails if `collides_with_a_verb` misses a real subcommand name, an
+    /// alias of one, or refuses a name that names neither.
+    ///
+    /// Mutation check: reverting `collides_with_a_verb` to always return
+    /// `false` reddens the first two assertions; always `true` reddens the
+    /// third.
+    #[test]
+    fn collides_with_a_verb_covers_names_and_visible_aliases() {
+        assert!(collides_with_a_verb("stop"), "a real verb must collide");
+        assert!(collides_with_a_verb("ls"), "flock's own alias must collide");
+        assert!(
+            !collides_with_a_verb("watchdog"),
+            "an arbitrary name must not collide"
         );
     }
 

@@ -5142,11 +5142,11 @@ fn available_dogs_detail_view_uses_adopt_as_never_name() {
         "install command: {stdout}"
     );
     assert!(
-        stdout.contains("$ shep adopt log-rotate ~/.cargo/bin/shep-log-rotate"),
+        stdout.contains("$ shep adopt ~/.cargo/bin/shep-log-rotate --name log-rotate"),
         "adopt command must use adopt_as (log-rotate), not name (Spot): {stdout}"
     );
     assert!(
-        !stdout.contains("adopt Spot"),
+        !stdout.contains("--name Spot"),
         "adopt command must never use the display name: {stdout}"
     );
 }
@@ -5876,4 +5876,207 @@ fn piped_table_output_at_the_default_style_carries_no_box_or_escape() {
     );
 
     graceful_kill(dir.path());
+}
+
+// --- Issue 1/2/3: adopt ergonomics and `shep <dogname>` dispatch ---------
+
+/// Issue 1's first repro, verbatim: `cargo install shep-log-rotate` puts
+/// the binary on `$PATH` under its own name, and `shep adopt` used to be
+/// unable to find it there at all.
+#[test]
+fn shep_adopt_finds_a_binary_on_path_by_bare_name() {
+    let home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    let binary = write_script(&bin_dir, "shep-log-rotate", "#!/bin/sh\nexit 0\n");
+
+    let output = Command::cargo_bin("shep")
+        .unwrap()
+        .env("PATH", bin_dir.path())
+        .arg("--home")
+        .arg(home.path())
+        .arg("adopt")
+        .arg("shep-log-rotate")
+        .arg("--name")
+        .arg("lr")
+        .timeout(CMD_TIMEOUT)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let written = std::fs::read_to_string(home.path().join("shep.toml")).unwrap();
+    assert!(
+        written.contains(&binary.display().to_string()),
+        "the $PATH hit must be the recorded binary: {written}"
+    );
+}
+
+/// Issue 1's second repro, verbatim: a literal `~/` path, which worked in
+/// a Flockfile (2026-08-19) but not at `shep adopt` until now.
+#[test]
+fn shep_adopt_expands_a_leading_tilde_path() {
+    let shep_home = TempDir::new().unwrap();
+    let fake_user_home = TempDir::new().unwrap();
+    let bin_dir = fake_user_home.path().join(".cargo/bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let binary = bin_dir.join("shep-log-rotate");
+    std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut mode = std::fs::metadata(&binary).unwrap().permissions();
+    mode.set_mode(0o755);
+    std::fs::set_permissions(&binary, mode).unwrap();
+
+    let output = Command::cargo_bin("shep")
+        .unwrap()
+        .env("HOME", fake_user_home.path())
+        .arg("--home")
+        .arg(shep_home.path())
+        .arg("adopt")
+        .arg("~/.cargo/bin/shep-log-rotate")
+        .arg("--name")
+        .arg("lr")
+        .timeout(CMD_TIMEOUT)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let written = std::fs::read_to_string(shep_home.path().join("shep.toml")).unwrap();
+    assert!(
+        written.contains(&binary.display().to_string()),
+        "the ~/-expanded binary must be the one recorded: {written}"
+    );
+}
+/// Writes a script that records its own argv and `$SHEP_HOME` into `marker`
+/// (inside `dir`), prints a distinctive stdout line, and exits `code` --
+/// the fixture [`an_adopted_dog_runs_directly_with_its_own_argv_and_shep_home`]
+/// and [`a_built_in_verb_always_wins_over_a_same_named_adopted_dog`] both
+/// build on.
+fn write_marker_script(dir: &TempDir, marker: &Path, code: u8) -> PathBuf {
+    write_script(
+        dir,
+        "dog.sh",
+        &format!(
+            "#!/bin/sh\necho \"argv:$*\" > \"{marker}\"\necho \"home:$SHEP_HOME\" >> \"{marker}\"\necho from-the-dog\nexit {code}\n",
+            marker = marker.display(),
+        ),
+    )
+}
+
+/// `shep <dogname> [args...]` (issue 3): once a dog is adopted, invoking
+/// its name directly runs it -- with the operator's own argv passed
+/// through untouched and `$SHEP_HOME` set, the "operator-invoked" contract
+/// that is deliberately distinct from the supervised one (no argv, that
+/// same one env entry) a shepherd-started dog gets.
+///
+/// The dispatch call itself carries no `--home` flag at all -- `$SHEP_HOME`
+/// is set through the environment instead, exercising `home_before`'s
+/// fallback to the real environment alongside its `--home`-flag form,
+/// which the lib-tier `home_before_*` tests already cover directly.
+///
+/// Mutation check: reverting `lib.rs`'s `dispatch_adopted_dog` to always
+/// return `None` reddens this immediately -- clap's own "unrecognized
+/// subcommand" error and exit code 2 instead of the dog's own exit code 7.
+#[test]
+fn an_adopted_dog_runs_directly_with_its_own_argv_and_shep_home() {
+    let home = TempDir::new().unwrap();
+    let marker = home.path().join("marker.txt");
+    let script = write_marker_script(&home, &marker, 7);
+
+    let adopted = shep(home.path())
+        .arg("adopt")
+        .arg(&script)
+        .arg("--name")
+        .arg("deploy")
+        .output()
+        .unwrap();
+    assert_success(&adopted);
+
+    let ran = Command::cargo_bin("shep")
+        .unwrap()
+        .env("SHEP_HOME", home.path())
+        .arg("deploy")
+        .arg("koji")
+        .arg("--flag")
+        .timeout(CMD_TIMEOUT)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        ran.status.code(),
+        Some(7),
+        "the dog's own exit code must pass through: {ran:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&ran.stdout).contains("from-the-dog"),
+        "stdio must be inherited, not captured away: {ran:?}"
+    );
+    let recorded = std::fs::read_to_string(&marker).unwrap();
+    assert!(
+        recorded.contains("argv:koji --flag"),
+        "argv must reach the dog exactly as typed: {recorded}"
+    );
+    assert!(
+        recorded.contains(&format!("home:{}", home.path().display())),
+        "SHEP_HOME must reach the dog's own environment: {recorded}"
+    );
+}
+
+/// Built-in verbs always win, structurally (issue 3): a `[daemon]
+/// adopted_dogs` entry named `stop` -- written directly, bypassing `shep
+/// adopt`'s own refusal of the name, the way a hand-edited `shep.toml`
+/// could -- must never shadow the real `shep stop`. `dispatch_adopted_dog`
+/// only ever runs once clap has already failed to match a token against a
+/// real subcommand, so `stop` never reaches it at all.
+///
+/// `shep stop all` against a `$SHEP_HOME` with no shepherd running exits
+/// `DaemonUnreachable` (5) -- `commands::lifecycle::stop` goes through
+/// `connect_client`, which does not autostart -- so that exit code, and the
+/// marker file never appearing, are both proof the built-in ran (or at
+/// least was the one dispatch attempted) rather than the dog's script.
+#[test]
+fn a_built_in_verb_always_wins_over_a_same_named_adopted_dog() {
+    let home = TempDir::new().unwrap();
+    let marker = home.path().join("marker.txt");
+    let script = write_marker_script(&home, &marker, 0);
+    std::fs::write(
+        home.path().join("shep.toml"),
+        format!(
+            "[daemon]\nadopted_dogs = {{ stop = \"{}\" }}\nenabled_dogs = [\"stop\"]\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+
+    let output = shep(home.path()).arg("stop").arg("all").output().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "must be the built-in `stop`'s own DaemonUnreachable, not the dog's exit 0: {output:?}"
+    );
+    assert!(
+        !marker.exists(),
+        "the adopted dog's script must never have run"
+    );
+}
+
+/// An unrecognized verb with no matching adopted dog stays an ordinary
+/// unknown-verb error, suggestions included -- `dispatch_adopted_dog`
+/// finding nothing must fall all the way through to clap's own rendering,
+/// not a silent or different failure. No dog is adopted at all here, and
+/// `$SHEP_HOME` does not even exist yet.
+#[test]
+fn an_unknown_verb_with_no_matching_dog_keeps_claps_own_suggestion() {
+    let home = TempDir::new().unwrap();
+
+    let output = shep(home.path()).arg("flcok").output().unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "clap's own usage exit code");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unrecognized subcommand"),
+        "clap's own wording must survive untouched: {stderr}"
+    );
+    assert!(
+        stderr.contains("flock"),
+        "clap's own did-you-mean must still suggest the real verb: {stderr}"
+    );
 }

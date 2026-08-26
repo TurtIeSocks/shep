@@ -463,15 +463,25 @@ fn install_line(source: &DogSourceKind, package: &str) -> String {
 /// discards its entire `[dog.<name>]` config section. [`DogSourceKind::Manual`]
 /// has no predictable install path to fill in, so its line names the
 /// placeholder literally rather than guessing one.
+///
+/// Always spells `--name` explicitly, even for an entry (like this
+/// project's own `shep-log-rotate`) whose `adopt_as` happens to equal
+/// `package` with `shep-` stripped -- `shep adopt`'s own default would
+/// already get that one right, but the index is user-contributed and
+/// nothing enforces the naming convention on `package`, so a future entry
+/// whose default would NOT match `adopt_as` must not ship a silently wrong
+/// copy-pasteable command.
 fn adopt_line(source: &DogSourceKind, adopt_as: &str, package: &str) -> String {
     match source {
         DogSourceKind::Cargo { .. } | DogSourceKind::CargoGit { .. } => {
-            format!("  $ shep adopt {adopt_as} ~/.cargo/bin/{package}")
+            format!("  $ shep adopt ~/.cargo/bin/{package} --name {adopt_as}")
         }
         DogSourceKind::GoInstall { .. } => {
-            format!("  $ shep adopt {adopt_as} $(go env GOPATH)/bin/{package}")
+            format!("  $ shep adopt $(go env GOPATH)/bin/{package} --name {adopt_as}")
         }
-        DogSourceKind::Manual { .. } => format!("  $ shep adopt {adopt_as} <path to the binary>"),
+        DogSourceKind::Manual { .. } => {
+            format!("  $ shep adopt <path to the binary> --name {adopt_as}")
+        }
     }
 }
 

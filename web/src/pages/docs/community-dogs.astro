@@ -45,11 +45,11 @@ function adoptLine(dog: Dog): string {
   switch (dog.source.kind) {
     case "cargo":
     case "cargo-git":
-      return `$ shep adopt ${dog.adopt_as} ~/.cargo/bin/${dog.package}`;
+      return `$ shep adopt ~/.cargo/bin/${dog.package} --name ${dog.adopt_as}`;
     case "go-install":
-      return `$ shep adopt ${dog.adopt_as} $(go env GOPATH)/bin/${dog.package}`;
+      return `$ shep adopt $(go env GOPATH)/bin/${dog.package} --name ${dog.adopt_as}`;
     case "manual":
-      return `$ shep adopt ${dog.adopt_as} <path to the binary>`;
+      return `$ shep adopt <path to the binary> --name ${dog.adopt_as}`;
   }
 }
 ---
@@ -67,8 +67,8 @@ function adoptLine(dog: Dog): string {
       <code>metrics</code> and <code>bark</code> ship inside the{" "}
       <code>shep</code> binary. Everything below is a dog someone outside
       this project wrote and adopted the same way, with{" "}
-      <code>shep adopt &lt;name&gt; &lt;path&gt;</code>, pointed at a binary
-      you didn't have to write yourself.
+      <code>shep adopt &lt;path&gt;</code>, pointed at a binary you didn't
+      have to write yourself.
     </p>
 
     <p>
