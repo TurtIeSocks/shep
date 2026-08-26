@@ -305,8 +305,12 @@ pub enum Commands {
     /// already on `$PATH` (`cargo install` puts one there). Refuses, before
     /// touching the config at all, a path that resolves to nothing that
     /// exists, is not a file, has no execute bit set, or that this kernel
-    /// will not exec. An adopted dog runs at the shepherd's own trust
-    /// level, with no sandboxing beyond it.
+    /// will not exec — and refuses a name that already names a built-in
+    /// verb or alias, since such a dog could never be reached. An adopted
+    /// dog runs at the shepherd's own trust level, with no sandboxing
+    /// beyond it. Once adopted, `shep <name> [args...]` runs it directly,
+    /// passing `args` through untouched — a second invocation mode from
+    /// the one the shepherd itself uses to supervise it.
     Adopt(AdoptArgs),
     /// Forget an adopted dog entirely: stops it if a shepherd is running,
     /// and removes it from `[daemon] enabled_dogs`, `[daemon]

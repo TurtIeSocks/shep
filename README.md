@@ -166,8 +166,10 @@ leading `~/` expanded if you don't give an absolute path, and named after
 its own file stem (`shep-` stripped) unless you pass `--name`. It's served
 its own `[dog.<name>]` config over the same socket `shep` itself talks to
 rather than through its environment, so a webhook credential never ends up
-in a process listing or a crash dump. [docs/dogs.md](docs/dogs.md) is the
-guide.
+in a process listing or a crash dump. Once adopted, `shep <name>
+[args...]` runs it directly, passing your own arguments through — built-in
+verbs always win, so a dog can't shadow one. [docs/dogs.md](docs/dogs.md)
+is the guide.
 
 **Coming from pm2.** `shep import` reads a real `dump.pm2` and writes a
 Flockfile. It starts nothing, names every clustered app on stderr because

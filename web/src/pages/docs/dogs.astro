@@ -241,9 +241,11 @@ sinks = ["oncall"]`}</CodeBlock>
         <code>cargo-</code> from its own external subcommands. Vets the
         binary once, at adopt time: refusing a path that doesn't resolve to
         anything that exists, isn't a file, has no execute bit, or is
-        world-writable, then actually spawns it with no arguments and kills
-        it immediately, because the only honest way to know whether this
-        kernel can exec a file is to ask this kernel.
+        world-writable, and refusing a name that already belongs to a
+        built-in verb or alias, since such a dog could never be reached.
+        Passing all of that, it actually spawns the binary with no
+        arguments and kills it immediately, because the only honest way to
+        know whether this kernel can exec a file is to ask this kernel.
       </p>
     </VerbSignature>
     <VerbSignature verb="rehome" usage="shep rehome <name>">
@@ -260,6 +262,16 @@ watchdog  adopted  true      online
 $ shep rehome watchdog
 NAME      SOURCE   SHEPHERD  STATUS
 watchdog  adopted  true      stopped`}</CodeBlock>
+    <p>
+      Once adopted, <code>shep watchdog [args...]</code> runs it directly —
+      git and cargo's own precedent (<code>git foo</code> runs{" "}
+      <code>git-foo</code>), resolved against adopted dogs only, never a{" "}
+      <code>$PATH</code> scan. It's a second invocation mode, distinct from
+      the shepherd's own: a supervised dog gets no argv and one environment
+      variable; a dog you name on the command line gets whatever you typed
+      after it, plus that same <code>$SHEP_HOME</code>. A built-in verb
+      always wins over a same-named dog.
+    </p>
     <p>
       What gets recorded in <code>shep.toml</code> is the canonicalized,
       absolute path (never whatever relative path you typed) because the

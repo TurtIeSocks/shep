@@ -206,14 +206,25 @@ on `$PATH` (which is where `cargo install`/`go install` put it).
 `adopt` vets the binary once, at the moment you run it — not again at
 every later boot or every `enable`. It refuses a path that does not
 exist, is not a file, has no execute bit for anyone, or is world-writable
-(the binary itself or its containing directory), and it warns rather than
-refuses on a merely group-writable one. Passing all of that, it actually
-spawns the binary with no arguments and kills it immediately, because the
-only honest way to know whether this kernel can exec a file is to ask
-this kernel. What gets recorded in `shep.toml` is the canonicalized,
-absolute path — never whatever relative path you typed — because the
-daemon may resolve it again after a reboot from a different working
-directory than the one `adopt` ran from.
+(the binary itself or its containing directory); it also refuses a name
+that already belongs to a built-in verb or alias, since a dog by that
+name could never be reached. It warns rather than refuses on a merely
+group-writable path. Passing all of that, it actually spawns the binary
+with no arguments and kills it immediately, because the only honest way
+to know whether this kernel can exec a file is to ask this kernel. What
+gets recorded in `shep.toml` is the canonicalized, absolute path — never
+whatever relative path you typed — because the daemon may resolve it
+again after a reboot from a different working directory than the one
+`adopt` ran from.
+
+Once adopted, `shep <name> [args...]` runs the dog directly — the same
+`git foo` runs `git-foo` precedent, resolved against adopted dogs only
+(never a `$PATH` scan). It's a second invocation mode, distinct from the
+one the shepherd itself uses: a dog the shepherd starts gets no argv and
+one environment variable (`$SHEP_HOME`, below); a dog you name on the
+command line gets whatever you typed after it, passed straight through,
+plus that same `$SHEP_HOME`. A built-in verb always wins over a
+same-named dog.
 
 `rehome <name>` is `disable`'s counterpart for a third-party dog: it stops
 it if running and forgets the registration in `shep.toml` entirely, rather

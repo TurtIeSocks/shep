@@ -57,6 +57,8 @@ mod whistle;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -186,6 +188,17 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
     // all. Holding the result lets those two be answered before clap has its
     // say. Ok invocations are unaffected.
     let parsed = Cli::try_parse_from(argv.clone());
+    // Before clap ever gets to render its own "unrecognized subcommand"
+    // error, check whether the token it could not place names an adopted
+    // dog. Sync, and cheap for the overwhelming majority of invocations
+    // that parse cleanly (`Ok` short-circuits `if let Err` immediately) —
+    // see `dispatch_adopted_dog`'s own doc for the whole contract.
+    #[cfg(unix)]
+    if let Err(ref err) = parsed
+        && let Some(code) = dispatch_adopted_dog(&argv, err)
+    {
+        return code;
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -245,6 +258,143 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
         output::terminal_width(),
     );
     std::process::ExitCode::from(runtime.block_on(run(cli, style)) as u8)
+}
+
+/// Before clap's own "unrecognized subcommand" error (suggestions and
+/// all), checks whether the token it could not place names an adopted
+/// dog — `shep <dogname> [args...]` runs it directly, git/cargo's own
+/// external-subcommand precedent (`git foo` runs `git-foo`).
+///
+/// Resolved against **adopted dogs only**, never a `$PATH` scan: the
+/// operator explicitly ran `shep adopt` for these, and `commands::dogs`'
+/// own vetting already ran once, at adopt time. A `$PATH` scan would let
+/// any stray binary on the machine become a shep verb.
+///
+/// **Built-in verbs always win, structurally, not by a check here.** This
+/// only ever runs once clap has already failed to match `token` against
+/// every real subcommand and alias, so a dog named `stop` can never
+/// shadow `shep stop` — and `shep adopt` itself refuses to register a name
+/// that collides with one (`commands::dogs::collides_with_a_verb`), since
+/// such a dog could never be reached anyway.
+///
+/// `None` for every case that should still reach clap's own error: a
+/// parse failure that is not `InvalidSubcommand`, a `$SHEP_HOME` this
+/// process cannot resolve, or a name `shep.toml` has never heard of. None
+/// of those earn a special message — the token just was not an adopted
+/// dog, and clap's ordinary unknown-verb error, suggestions included, is
+/// exactly right for that.
+///
+/// The explicit `err.kind()` check below is not redundant with the
+/// `ContextKind::InvalidSubcommand` match just under it, even though
+/// nothing in this crate's own test suite can tell the two apart: clap
+/// also attaches that same context to an `ErrorKind::ArgumentConflict`
+/// (`clap_builder::error::subcommand_conflict`), but only when a command
+/// sets `args_conflicts_with_subcommands` — [`cli::Cli`] never does, so
+/// that producer is unreachable through this binary's own parse tree
+/// today. The check stays anyway, documented rather than deleted: relying
+/// on an unset builder option to keep two error shapes from colliding is
+/// exactly the kind of coupling that breaks silently the day someone
+/// upstream of this function sets it for an unrelated reason.
+#[cfg(unix)]
+fn dispatch_adopted_dog(argv: &[OsString], err: &clap::Error) -> Option<std::process::ExitCode> {
+    if err.kind() != clap::error::ErrorKind::InvalidSubcommand {
+        return None;
+    }
+    let name = match err.get(clap::error::ContextKind::InvalidSubcommand) {
+        Some(clap::error::ContextValue::String(name)) => name.as_str(),
+        _ => return None,
+    };
+    // The token's own position in the raw argv, not clap's — clap's error
+    // carries the name but not where it sat, and everything after it is
+    // this dog's own argv, passed through untouched.
+    let index = argv.iter().position(|arg| arg.to_str() == Some(name))?;
+    let global = GlobalArgs {
+        home: home_before(&argv[1..index]),
+        format: Format::Table,
+        quiet: false,
+        style: None,
+    };
+    let paths = resolve_paths(&global).ok()?;
+    let path = ShepToml::edit(&paths.daemon_config, |cfg| cfg.adopted_dog_path(name))
+        .ok()
+        .flatten()?;
+    let dog_argv = argv[index + 1..].to_vec();
+    Some(run_adopted_dog(&path, &paths.home, &dog_argv))
+}
+
+/// Scans `prefix` — the argv tokens before the one clap could not place —
+/// for `--home`, in either `--home value` or `--home=value` form. The only
+/// global flag [`resolve_paths`] reads, and the only one
+/// [`dispatch_adopted_dog`] needs reconstructed: the rest of `GlobalArgs`
+/// (`--format`, `--quiet`, `--style`) governs only how this crate renders
+/// its own output, never which binary `shep.toml` names for a dog.
+///
+/// Falls back to `$SHEP_HOME` from the environment when `prefix` names no
+/// `--home` — reproducing by hand the fallback clap's own `env =
+/// "SHEP_HOME"` attribute gives `GlobalArgs::home` on a parse that
+/// succeeds, for the one parse that did not.
+///
+/// `#[cfg(unix)]` for the same reason [`dispatch_adopted_dog`] (its only
+/// caller) is: nothing here is unix-specific, but leaving it uncompiled on
+/// Windows rather than merely unreachable keeps the Windows tier's own
+/// `cargo check` gate free of one more dead-code warning for a function
+/// with no caller there at all.
+#[cfg(unix)]
+fn home_before(prefix: &[OsString]) -> Option<PathBuf> {
+    let mut tokens = prefix.iter();
+    while let Some(arg) = tokens.next() {
+        if let Some(value) = arg.to_str().and_then(|s| s.strip_prefix("--home=")) {
+            return Some(PathBuf::from(value));
+        }
+        if arg == "--home" {
+            return tokens.next().map(PathBuf::from);
+        }
+    }
+    std::env::var_os("SHEP_HOME").map(PathBuf::from)
+}
+
+/// Runs `path` — an adopted dog's binary — the way an operator invoking it
+/// by name expects: `extra_args` passed through exactly as typed,
+/// `$SHEP_HOME` the one environment variable it needs to find the
+/// shepherd, stdio inherited so an interactive dog behaves like any other
+/// program run directly from a shell.
+///
+/// **A second invocation mode, deliberately distinct from the supervised
+/// one.** A dog the shepherd starts gets no argv and this same one env
+/// entry (`shep_daemon::dogs::dog_app`'s own doc — that contract is
+/// unchanged by this function existing); a dog an operator names on the
+/// command line gets whatever they typed after it, because passing
+/// arguments through is the entire reason to invoke it this way instead
+/// of through `shep enable`.
+///
+/// Exit code mirrors shell convention via [`dog_exit_code`]: the child's
+/// own code, or `128 + signal` if it died by one — the same reading
+/// `commands::reap::classify` gives a reaped supervisor.
+#[cfg(unix)]
+fn run_adopted_dog(path: &Path, home: &Path, extra_args: &[OsString]) -> std::process::ExitCode {
+    let status = std::process::Command::new(path)
+        .args(extra_args)
+        .env("SHEP_HOME", home)
+        .status();
+    match status {
+        Ok(status) => std::process::ExitCode::from(dog_exit_code(status)),
+        Err(err) => {
+            eprintln!("shep: could not run adopted dog {}: {err}", path.display());
+            std::process::ExitCode::from(ExitCode::Failure as u8)
+        }
+    }
+}
+
+/// `status`'s own exit code, or `128 + signal` if it died by one — the
+/// shell convention `commands::reap::classify` already reads a reaped
+/// supervisor's status by.
+#[cfg(unix)]
+fn dog_exit_code(status: std::process::ExitStatus) -> u8 {
+    use std::os::unix::process::ExitStatusExt as _;
+    match status.code() {
+        Some(code) => code as u8,
+        None => (128 + status.signal().unwrap_or(0)) as u8,
+    }
 }
 
 /// Prints the one-line shepherd status to stderr, for an invocation clap
@@ -1531,6 +1681,143 @@ mod tests {
         assert!(
             !named.exists(),
             "a refused path must be left on disk exactly as it was found"
+        );
+    }
+
+    /// fails if `home_before` stops reading `--home value` -- the common
+    /// form, and the one every existing invocation in this file's own
+    /// argv-construction tests already uses.
+    #[cfg(unix)]
+    #[test]
+    fn home_before_reads_a_separate_value_argument() {
+        let prefix = [OsString::from("--home"), OsString::from("/tmp/x")];
+        assert_eq!(home_before(&prefix), Some(PathBuf::from("/tmp/x")));
+    }
+
+    /// fails if `home_before` stops reading the `--home=value` form clap
+    /// itself also accepts.
+    #[cfg(unix)]
+    #[test]
+    fn home_before_reads_an_equals_form() {
+        let prefix = [OsString::from("--home=/tmp/y")];
+        assert_eq!(home_before(&prefix), Some(PathBuf::from("/tmp/y")));
+    }
+
+    /// fails if `home_before` only ever checks the first token instead of
+    /// scanning the whole prefix -- `--home` can follow other global flags
+    /// in a real invocation (`shep --format json --home /tmp/z mydog`).
+    #[cfg(unix)]
+    #[test]
+    fn home_before_skips_unrelated_tokens_before_finding_home() {
+        let prefix = [
+            OsString::from("--format"),
+            OsString::from("json"),
+            OsString::from("--home"),
+            OsString::from("/tmp/z"),
+        ];
+        assert_eq!(home_before(&prefix), Some(PathBuf::from("/tmp/z")));
+    }
+
+    /// fails if `dog_exit_code` stops reading a normal exit's own code.
+    #[cfg(unix)]
+    #[test]
+    fn dog_exit_code_reads_a_normal_exit_status() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = std::process::ExitStatus::from_raw(7 << 8);
+        assert_eq!(dog_exit_code(status), 7);
+    }
+
+    /// fails if `dog_exit_code` stops applying the `128 + signal` shell
+    /// convention `commands::reap::classify` already reads a reaped
+    /// supervisor's status by.
+    #[cfg(unix)]
+    #[test]
+    fn dog_exit_code_reads_128_plus_signal_for_a_signalled_status() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = std::process::ExitStatus::from_raw(9); // SIGKILL, no WIFEXITED bit
+        assert_eq!(dog_exit_code(status), 128 + 9);
+    }
+
+    /// fails if `dispatch_adopted_dog` starts trying to look up a dog for
+    /// any parse failure at all, not only an unrecognized-subcommand one --
+    /// a missing required argument (`shep adopt` with no path) must reach
+    /// clap's own usage error exactly as it always has.
+    ///
+    /// Does not, on its own, mutation-cover the explicit `err.kind()`
+    /// check inside `dispatch_adopted_dog`: a `MissingRequiredArgument`
+    /// carries no `ContextKind::InvalidSubcommand` value either, so the
+    /// context-match just below that check already returns `None` here
+    /// with or without it. That check's own doc names the narrower case
+    /// (an `ArgumentConflict` clap does not produce anywhere in this
+    /// binary's own command tree) it guards against instead.
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_adopted_dog_is_none_for_a_parse_error_that_is_not_invalid_subcommand() {
+        let argv: Vec<OsString> = ["shep", "adopt"].into_iter().map(OsString::from).collect();
+        let err = Cli::try_parse_from(&argv).unwrap_err();
+        assert_ne!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        assert!(dispatch_adopted_dog(&argv, &err).is_none());
+    }
+
+    /// fails if `dispatch_adopted_dog` invents a dog for a name
+    /// `shep.toml` has never heard of -- this must fall through to clap's
+    /// own unknown-verb error (suggestions included), not a silent,
+    /// unrelated failure.
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_adopted_dog_is_none_for_a_name_shep_toml_has_never_heard_of() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".shep");
+        std::fs::create_dir_all(&home).unwrap();
+        let argv: Vec<OsString> = ["shep", "--home"]
+            .into_iter()
+            .map(OsString::from)
+            .chain([home.into_os_string(), OsString::from("nosuchdog")])
+            .collect();
+        let err = Cli::try_parse_from(&argv).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        assert!(dispatch_adopted_dog(&argv, &err).is_none());
+    }
+
+    /// fails if `dispatch_adopted_dog` stops finding a dog `shep.toml`
+    /// really does have registered, once clap has already failed to parse
+    /// its name as a subcommand -- the fast-tier half of issue 3's
+    /// dispatch; `cli_e2e.rs`'s own case drives the real compiled binary
+    /// end to end and pins the argv/`SHEP_HOME` contract this test does
+    /// not reach (`std::process::ExitCode` carries no way to inspect the
+    /// value it wraps, so this only asserts that a real spawn-and-wait
+    /// happened, not which code it returned).
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_adopted_dog_finds_a_dog_shep_toml_really_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".shep");
+        std::fs::create_dir_all(&home).unwrap();
+        let script = dir.path().join("mydog.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut mode = std::fs::metadata(&script).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        std::fs::set_permissions(&script, mode).unwrap();
+        ShepToml::edit(&home.join("shep.toml"), |cfg| {
+            cfg.adopt_dog("mydog", &script);
+        })
+        .unwrap();
+
+        let argv: Vec<OsString> = ["shep", "--home"]
+            .into_iter()
+            .map(OsString::from)
+            .chain([
+                home.into_os_string(),
+                OsString::from("mydog"),
+                OsString::from("koji"),
+            ])
+            .collect();
+        let err = Cli::try_parse_from(&argv).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+
+        assert!(
+            dispatch_adopted_dog(&argv, &err).is_some(),
+            "an adopted dog must dispatch instead of falling through to clap's own error"
         );
     }
 

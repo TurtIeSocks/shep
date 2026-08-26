@@ -595,7 +595,8 @@ fn warn_group_writable(streams: &mut Streams<'_>, path: &Path) {
 /// `args.path` is resolved before vetting ([`resolve_adopt_path`]), and
 /// `args.name` defaults to the resolved binary's file stem
 /// ([`default_dog_name`]) when omitted. Both funnel into the same
-/// [`vet_binary`] call, so a defaulted name is exactly as vetted as a
+/// [`vet_binary`] call and the same [`collides_with_a_verb`] refusal as an
+/// explicit `--name` would, so a defaulted name is exactly as vetted as a
 /// typed one.
 pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArgs) -> ExitCode {
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -610,6 +611,9 @@ pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArg
         Some(name) => name.clone(),
         None => default_dog_name(&candidate),
     };
+    if collides_with_a_verb(&name) {
+        return fail_adopt_name_collision(streams, &name);
+    }
     for writable in &vetted.group_writable {
         warn_group_writable(streams, writable);
     }
@@ -620,28 +624,6 @@ pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArg
     }
     let client = Client::connect(&paths.socket).await.ok();
     adopt_after_config(streams, &name, &path, client.as_ref()).await
-}
-
-/// The dog name `shep adopt` defaults to when `--name` is omitted: `path`'s
-/// file stem with one leading `shep-` stripped, the way `cargo` strips
-/// `cargo-` from its own external subcommands. `shep-log-rotate` defaults
-/// to `log-rotate`; a binary with no `shep-` prefix keeps its whole stem,
-/// and a binary literally named `shep-` (stem would strip to empty) keeps
-/// its whole stem too, rather than defaulting to an unreachable empty name.
-///
-/// Derived from `path` as resolved (pre-canonicalize), not from
-/// `vet_binary`'s canonicalized return value: a symlink's own name is what
-/// an operator typed and expects to see, not whatever file it happens to
-/// point at.
-fn default_dog_name(path: &Path) -> String {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_else(|| path.to_str().unwrap_or("dog"));
-    stem.strip_prefix("shep-")
-        .filter(|rest| !rest.is_empty())
-        .unwrap_or(stem)
-        .to_string()
 }
 
 /// Resolves `raw` -- `shep adopt`'s own path argument -- before it reaches
@@ -724,6 +706,55 @@ fn lookup_on_path(name: &Path, path_var: Option<&OsStr>) -> Option<PathBuf> {
             std::fs::metadata(candidate)
                 .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         })
+}
+
+/// The dog name `shep adopt` defaults to when `--name` is omitted: `path`'s
+/// file stem with one leading `shep-` stripped, the way `cargo` strips
+/// `cargo-` from its own external subcommands. `shep-log-rotate` defaults
+/// to `log-rotate`; a binary with no `shep-` prefix keeps its whole stem,
+/// and a binary literally named `shep-` (stem would strip to empty) keeps
+/// its whole stem too, rather than defaulting to an unreachable empty name.
+///
+/// Derived from `path` as resolved (pre-canonicalize), not from
+/// `vet_binary`'s canonicalized return value: a symlink's own name is what
+/// an operator typed and expects to see, not whatever file it happens to
+/// point at.
+fn default_dog_name(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_else(|| path.to_str().unwrap_or("dog"));
+    stem.strip_prefix("shep-")
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(stem)
+        .to_string()
+}
+
+/// Whether `name` already names a built-in verb or one of its visible
+/// aliases -- `shep adopt`'s own refusal, since a dog adopted under such a
+/// name could never be reached: `shep <name>` always dispatches to the
+/// built-in verb first (see `lib.rs`'s `dispatch_adopted_dog`).
+///
+/// Reads the name and every alias straight off the real `clap::Command`
+/// tree (`Cli::command()`) rather than a hand-copied list, so a verb added
+/// later is refused automatically instead of silently becoming
+/// unreachable once adopted under it.
+fn collides_with_a_verb(name: &str) -> bool {
+    use clap::CommandFactory as _;
+    crate::cli::Cli::command()
+        .get_subcommands()
+        .any(|sub| sub.get_name() == name || sub.get_all_aliases().any(|alias| alias == name))
+}
+
+/// Renders the refusal for a name `shep adopt` will not accept because it
+/// already names a built-in verb or alias.
+fn fail_adopt_name_collision(streams: &mut Streams<'_>, name: &str) -> ExitCode {
+    let code = ExitCode::InvalidConfig;
+    let message = format!(
+        "`{name}` is already a shep verb or alias, so an adopted dog by that name could never \
+         be reached -- pick another name with --name"
+    );
+    streams.fail(code, &message)
 }
 
 /// `adopt`'s daemon half — see [`enable_after_config`]'s own doc for why
@@ -948,7 +979,7 @@ mod tests {
         );
     }
 
-    /// The defect this test exists for: `shep adopt otel <path>` recorded
+    /// The defect this test exists for: `shep adopt <path> --name otel` recorded
     /// the binary, and the `shep enable otel` after it sent `BuiltIn`
     /// regardless — so the shepherd spawned `shep dog otel`, an argv branch
     /// of this binary, the operator's own binary never ran, and nothing
@@ -1403,20 +1434,49 @@ mod tests {
         );
     }
 
-    /// fails if `default_dog_name` stops stripping exactly one leading
-    /// `shep-`, keeps stripping a binary that never had the prefix, or
-    /// leaves a pathological `shep-` binary defaulting to an empty
-    /// (unreachable) name.
-    #[test]
-    fn default_dog_name_strips_one_leading_shep_prefix_and_no_further() {
-        assert_eq!(
-            default_dog_name(Path::new("/opt/bin/shep-log-rotate")),
-            "log-rotate"
+    /// fails if `adopt` accepts a name that already belongs to a built-in
+    /// verb or alias -- such a dog could never be reached, since
+    /// `dispatch_adopted_dog` (`lib.rs`) only ever runs once clap has
+    /// already failed to match the name against a real subcommand.
+    ///
+    /// Mirrors [`a_refused_adopt_leaves_the_config_untouched`]'s own shape:
+    /// the refusal must happen before `shep.toml` is touched at all, same
+    /// as every other `AdoptRefusal`.
+    ///
+    /// Mutation check: reverting `collides_with_a_verb` to always return
+    /// `false` reddens this (`Success` and a written config instead of
+    /// `InvalidConfig` and an absent one).
+    #[tokio::test]
+    async fn adopt_refuses_a_name_that_collides_with_a_built_in_verb() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        let binary = dir.path().join("watchdog");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut mode = std::fs::metadata(&binary).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        std::fs::set_permissions(&binary, mode).unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        // "stop" is a real verb; "ls" is `flock`'s own visible alias. Both
+        // must be refused the same way.
+        for reserved in ["stop", "ls"] {
+            let args = AdoptArgs {
+                path: binary.clone(),
+                name: Some(reserved.to_string()),
+            };
+            let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+            assert_eq!(
+                code,
+                ExitCode::InvalidConfig,
+                "`{reserved}` must be refused"
+            );
+        }
+        assert!(
+            !paths.daemon_config.exists(),
+            "a name collision must never touch shep.toml: {}",
+            paths.daemon_config.display()
         );
-        assert_eq!(default_dog_name(Path::new("/opt/bin/otel")), "otel");
-        // Stripping the prefix here would leave "", an unreachable name --
-        // the whole stem is kept instead.
-        assert_eq!(default_dog_name(Path::new("/opt/bin/shep-")), "shep-");
     }
 
     /// fails if `resolve_adopt_path` stops trying a literal path first, or
@@ -1432,10 +1492,10 @@ mod tests {
         assert_eq!(resolved, binary);
     }
 
-    /// fails if `shep adopt lr '~/.cargo/bin/shep-log-rotate'` stops
-    /// working -- issue 1's second repro. `resolve_adopt_path` must expand
-    /// `~/` against the `home` it is given when the literal path (a
-    /// literal `~` directory, which does not exist) is not there.
+    /// fails if `shep adopt '~/.cargo/bin/shep-log-rotate'` stops working
+    /// -- issue 1's second repro. `resolve_adopt_path` must expand `~/`
+    /// against the `home` it is given when the literal path (a literal
+    /// `~` directory, which does not exist) is not there.
     ///
     /// Mutation check: reverting the tilde-expansion step (returning
     /// `raw` unchanged whenever the literal path is missing, skipping
@@ -1455,8 +1515,8 @@ mod tests {
         assert_eq!(resolved, binary);
     }
 
-    /// fails if `shep adopt lr shep-log-rotate` stops working when the
-    /// binary is only on `$PATH` -- issue 1's first repro (`cargo install
+    /// fails if `shep adopt shep-log-rotate` stops working when the binary
+    /// is only on `$PATH` -- issue 1's first repro (`cargo install
     /// shep-log-rotate` puts it there under its own name).
     ///
     /// Mutation check: reverting the `$PATH` step to return `None`
@@ -1510,6 +1570,38 @@ mod tests {
     fn resolve_adopt_path_returns_raw_unchanged_when_nothing_resolves() {
         let raw = Path::new("/nonexistent/shep-nothing");
         assert_eq!(resolve_adopt_path(raw, None, None), raw);
+    }
+
+    /// fails if `default_dog_name` stops stripping exactly one leading
+    /// `shep-`, keeps stripping a binary that never had the prefix, or
+    /// leaves a pathological `shep-` binary defaulting to an empty
+    /// (unreachable) name.
+    #[test]
+    fn default_dog_name_strips_one_leading_shep_prefix_and_no_further() {
+        assert_eq!(
+            default_dog_name(Path::new("/opt/bin/shep-log-rotate")),
+            "log-rotate"
+        );
+        assert_eq!(default_dog_name(Path::new("/opt/bin/otel")), "otel");
+        // Stripping the prefix here would leave "", an unreachable name --
+        // the whole stem is kept instead.
+        assert_eq!(default_dog_name(Path::new("/opt/bin/shep-")), "shep-");
+    }
+
+    /// fails if `collides_with_a_verb` misses a real subcommand name, an
+    /// alias of one, or refuses a name that names neither.
+    ///
+    /// Mutation check: reverting `collides_with_a_verb` to always return
+    /// `false` reddens the first two assertions; always `true` reddens the
+    /// third.
+    #[test]
+    fn collides_with_a_verb_covers_names_and_visible_aliases() {
+        assert!(collides_with_a_verb("stop"), "a real verb must collide");
+        assert!(collides_with_a_verb("ls"), "flock's own alias must collide");
+        assert!(
+            !collides_with_a_verb("watchdog"),
+            "an arbitrary name must not collide"
+        );
     }
 
     /// fails if `rehome` behaves as `disable` does — the whole difference
