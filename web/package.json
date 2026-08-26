@@ -7,7 +7,7 @@
   },
   "scripts": {
     "dev": "astro dev",
-    "build": "node --test scripts/verify-dogs-index.ts && astro build && pagefind --site dist && node scripts/verify-pagefind-index.mjs",
+    "build": "node scripts/check-node.mjs && node --test scripts/verify-dogs-index.ts && astro build && pagefind --site dist && node scripts/verify-pagefind-index.mjs",
     "preview": "astro preview",
     "astro": "astro"
   },
