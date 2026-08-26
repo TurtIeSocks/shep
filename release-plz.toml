@@ -46,6 +46,13 @@
 # on the releases page looking like any other version.
 git_release_type = "auto"
 
+# release-plz's own default is true, which would have `release` try to
+# publish on every push to main whenever the manifest names an unpublished
+# version -- not only after a release PR merges. That is wider than "merging
+# the release PR is the publish" (docs/releasing.md, this file's own header
+# comment), so it is turned off explicitly instead of left at the default.
+release_always = false
+
 # The four real crates keep hand-written changelogs in Keep a Changelog form,
 # and those are better than anything generated from commit subjects. Left on,
 # release-plz inserts a generated section into each existing file: the first
