@@ -188,13 +188,20 @@ through an advisory file lock, never truncated in place.
 
 ## Writing your own
 
-Third-party extension is `shep adopt <name> <path>`:
+Third-party extension is `shep adopt <path> [--name <name>]`:
 
 ```
-shep adopt watchdog ./bin/my-watchdog
+shep adopt ./bin/my-watchdog --name watchdog
 shep enable watchdog
 shep rehome watchdog
 ```
+
+`--name` is optional. Leave it off and the dog is named after its own
+file stem with a leading `shep-` stripped, the way `cargo` strips
+`cargo-` from its own external subcommands — `shep adopt
+~/.cargo/bin/shep-log-rotate` alone names itself `log-rotate`. The path
+itself can be given as-is, with a leading `~/`, or as a bare name already
+on `$PATH` (which is where `cargo install`/`go install` put it).
 
 `adopt` vets the binary once, at the moment you run it — not again at
 every later boot or every `enable`. It refuses a path that does not

@@ -5142,11 +5142,11 @@ fn available_dogs_detail_view_uses_adopt_as_never_name() {
         "install command: {stdout}"
     );
     assert!(
-        stdout.contains("$ shep adopt log-rotate ~/.cargo/bin/shep-log-rotate"),
+        stdout.contains("$ shep adopt ~/.cargo/bin/shep-log-rotate --name log-rotate"),
         "adopt command must use adopt_as (log-rotate), not name (Spot): {stdout}"
     );
     assert!(
-        !stdout.contains("adopt Spot"),
+        !stdout.contains("--name Spot"),
         "adopt command must never use the display name: {stdout}"
     );
 }
@@ -5895,8 +5895,9 @@ fn shep_adopt_finds_a_binary_on_path_by_bare_name() {
         .arg("--home")
         .arg(home.path())
         .arg("adopt")
-        .arg("lr")
         .arg("shep-log-rotate")
+        .arg("--name")
+        .arg("lr")
         .timeout(CMD_TIMEOUT)
         .output()
         .unwrap();
@@ -5929,8 +5930,9 @@ fn shep_adopt_expands_a_leading_tilde_path() {
         .arg("--home")
         .arg(shep_home.path())
         .arg("adopt")
-        .arg("lr")
         .arg("~/.cargo/bin/shep-log-rotate")
+        .arg("--name")
+        .arg("lr")
         .timeout(CMD_TIMEOUT)
         .output()
         .unwrap();

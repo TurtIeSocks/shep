@@ -563,7 +563,7 @@ impl Render for DogDisabledRow {
     const PRIORITIES: &'static [u8] = &[0, 7, 6, 0];
 }
 
-/// `shep adopt <name> <path>`: what the config edit and, if a shepherd is
+/// `shep adopt <path> [--name <name>]`: what the config edit and, if a shepherd is
 /// running, the resulting `EnableDog` RPC actually did.
 ///
 /// Constructed by `commands/dogs.rs`'s `adopt`. [`Self::source`] is always

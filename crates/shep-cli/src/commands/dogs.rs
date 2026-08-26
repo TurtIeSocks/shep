@@ -589,13 +589,14 @@ fn warn_group_writable(streams: &mut Streams<'_>, path: &Path) {
     streams.aside(GROUP_WRITABLE_NOTICE, &message);
 }
 
-/// `shep adopt <name> <path>`: vets a binary shep has never seen, records
-/// it, and starts it if a shepherd is running.
+/// `shep adopt <path> [--name <name>]`: vets a binary shep has never seen,
+/// records it, and starts it if a shepherd is running.
 ///
-/// `args.path` is resolved before vetting ([`resolve_adopt_path`]): as
-/// given, with a leading `~/` expanded, or looked up on `$PATH` if it
-/// names no directory. All three funnel into the same [`vet_binary`] call,
-/// so this changes what `adopt` can FIND, never what it VETS.
+/// `args.path` is resolved before vetting ([`resolve_adopt_path`]), and
+/// `args.name` defaults to the resolved binary's file stem
+/// ([`default_dog_name`]) when omitted. Both funnel into the same
+/// [`vet_binary`] call, so a defaulted name is exactly as vetted as a
+/// typed one.
 pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArgs) -> ExitCode {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let path_var = std::env::var_os("PATH");
@@ -605,16 +606,42 @@ pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArg
         Err(refusal) => return fail_adopt(streams, &candidate, &refusal),
     };
     let path = vetted.path;
+    let name = match &args.name {
+        Some(name) => name.clone(),
+        None => default_dog_name(&candidate),
+    };
     for writable in &vetted.group_writable {
         warn_group_writable(streams, writable);
     }
     if let Err(err) = ShepToml::edit(&paths.daemon_config, |cfg| {
-        cfg.adopt_dog(&args.name, &path);
+        cfg.adopt_dog(&name, &path);
     }) {
         return fail_config(streams, &err);
     }
     let client = Client::connect(&paths.socket).await.ok();
-    adopt_after_config(streams, &args.name, &path, client.as_ref()).await
+    adopt_after_config(streams, &name, &path, client.as_ref()).await
+}
+
+/// The dog name `shep adopt` defaults to when `--name` is omitted: `path`'s
+/// file stem with one leading `shep-` stripped, the way `cargo` strips
+/// `cargo-` from its own external subcommands. `shep-log-rotate` defaults
+/// to `log-rotate`; a binary with no `shep-` prefix keeps its whole stem,
+/// and a binary literally named `shep-` (stem would strip to empty) keeps
+/// its whole stem too, rather than defaulting to an unreachable empty name.
+///
+/// Derived from `path` as resolved (pre-canonicalize), not from
+/// `vet_binary`'s canonicalized return value: a symlink's own name is what
+/// an operator typed and expects to see, not whatever file it happens to
+/// point at.
+fn default_dog_name(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_else(|| path.to_str().unwrap_or("dog"));
+    stem.strip_prefix("shep-")
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(stem)
+        .to_string()
 }
 
 /// Resolves `raw` -- `shep adopt`'s own path argument -- before it reaches
@@ -1216,7 +1243,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let args = AdoptArgs {
-            name: "otel".to_string(),
+            name: Some("otel".to_string()),
             path: bin.clone(),
         };
         let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
@@ -1243,7 +1270,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let args = AdoptArgs {
-            name: "otel".to_string(),
+            name: Some("otel".to_string()),
             path: dir.path().join("nope"),
         };
         let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
@@ -1265,7 +1292,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let args = AdoptArgs {
-            name: "otel".to_string(),
+            name: Some("otel".to_string()),
             path: dir.path().join("nope"),
         };
         let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
@@ -1323,7 +1350,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let args = AdoptArgs {
-            name: "otel".to_string(),
+            name: Some("otel".to_string()),
             path: binary,
         };
         let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
@@ -1339,6 +1366,57 @@ mod tests {
             text.contains("next shepherd"),
             "the operator needs to know the dog is not running yet: {text}"
         );
+    }
+
+    /// fails if `adopt` stops defaulting the name when `--name` is omitted,
+    /// or defaults it from the whole file name instead of the stripped
+    /// stem: `shep-otel` must default to `otel`, the way `cargo` strips
+    /// `cargo-` from its own external subcommands.
+    ///
+    /// Mutation check: reverting `default_dog_name` to return `stem`
+    /// unstripped reddens this (`shep-otel` recorded verbatim) rather than
+    /// `otel`.
+    #[tokio::test]
+    async fn adopt_with_no_name_flag_defaults_from_the_stripped_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        let binary = dir.path().join("shep-otel");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut mode = std::fs::metadata(&binary).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        std::fs::set_permissions(&binary, mode).unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = AdoptArgs {
+            path: binary,
+            name: None,
+        };
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+
+        assert_eq!(code, ExitCode::Success);
+        let written = std::fs::read_to_string(&paths.daemon_config).unwrap();
+        let cfg = shep_core::config::DaemonConfig::load(Some(&written), &|_| None).unwrap();
+        assert!(
+            cfg.daemon.adopted_dogs.contains_key("otel"),
+            "the defaulted name must be `otel`, not `shep-otel`: {written}"
+        );
+    }
+
+    /// fails if `default_dog_name` stops stripping exactly one leading
+    /// `shep-`, keeps stripping a binary that never had the prefix, or
+    /// leaves a pathological `shep-` binary defaulting to an empty
+    /// (unreachable) name.
+    #[test]
+    fn default_dog_name_strips_one_leading_shep_prefix_and_no_further() {
+        assert_eq!(
+            default_dog_name(Path::new("/opt/bin/shep-log-rotate")),
+            "log-rotate"
+        );
+        assert_eq!(default_dog_name(Path::new("/opt/bin/otel")), "otel");
+        // Stripping the prefix here would leave "", an unreachable name --
+        // the whole stem is kept instead.
+        assert_eq!(default_dog_name(Path::new("/opt/bin/shep-")), "shep-");
     }
 
     /// fails if `resolve_adopt_path` stops trying a literal path first, or

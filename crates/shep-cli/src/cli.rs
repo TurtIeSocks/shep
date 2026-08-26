@@ -301,8 +301,10 @@ pub enum Commands {
     /// `[daemon] adopted_dogs` and `[daemon] enabled_dogs` in `shep.toml`,
     /// and starts it now if a shepherd is running.
     ///
-    /// Refuses, before touching the config at all, a path that does not
-    /// exist, is not a file, has no execute bit set, or that this kernel
+    /// The path can be given as-is, with a leading `~/`, or as a bare name
+    /// already on `$PATH` (`cargo install` puts one there). Refuses, before
+    /// touching the config at all, a path that resolves to nothing that
+    /// exists, is not a file, has no execute bit set, or that this kernel
     /// will not exec. An adopted dog runs at the shepherd's own trust
     /// level, with no sandboxing beyond it.
     Adopt(AdoptArgs),
@@ -881,13 +883,13 @@ pub struct DogArgs {
 /// built into this binary has no path to vet, so `enable` cannot carry out
 /// what `adopt` does.
 ///
-/// **Argument order is inverted from [`AdoptArgs`]'s own**, and that
-/// inversion is deliberate, not an oversight to fix: pm2's own spelling
-/// puts the path before the name (`--exec <path> <name>`), while `shep
-/// adopt` puts the name first (`adopt <name> <path>`, decision, Rin). Both
-/// arguments are strings, so a reader who assumes the two orders agree
-/// introduces a silent swap that nothing short of a test catches — see
-/// `main.rs`'s `the_hidden_pm2_spelling_reaches_adopt_with_the_arguments_the_right_way_round`.
+/// `name` here is a required positional, unlike [`AdoptArgs`]'s own
+/// (optional, defaulted from the binary's file stem) — pm2's own spelling
+/// carries no such default, and `enable --exec` exists only to keep that
+/// spelling working verbatim, not to gain `adopt`'s newer conveniences. A
+/// reader relying on the two shapes agreeing is a mistake nothing but a
+/// test catches — see `main.rs`'s
+/// `the_hidden_pm2_spelling_reaches_adopt_with_the_arguments_the_right_way_round`.
 #[derive(Debug, clap::Args)]
 pub struct EnableArgs {
     /// The dog's name — the `[dog.<name>]` config key
@@ -900,15 +902,24 @@ pub struct EnableArgs {
 
 /// Arguments to `shep adopt`.
 ///
-/// Positional, name then path (decision, Rin: no `--exec` flag on this
-/// verb) — the reverse order of [`EnableArgs`]'s hidden `--exec` alias; see
-/// that type's own doc for why the inversion is deliberate.
+/// `path` is the one positional; `--name` is optional and defaults to the
+/// binary's file stem with a leading `shep-` stripped, the way `cargo`
+/// strips `cargo-` from its own external subcommands (`shep-log-rotate`
+/// defaults to `log-rotate`). Previously both were required positionals,
+/// name first (`adopt <name> <path>`) — a breaking CLI change, decision
+/// Rin: `shep adopt <path>` alone now works for a binary whose name is
+/// already the name you want, matching `shep start <script>`'s own
+/// optional `--name`.
 #[derive(Debug, clap::Args)]
 pub struct AdoptArgs {
-    /// The dog's name — the `[dog.<name>]` config key
-    pub name: String,
-    /// Path to the dog's binary, vetted before `shep.toml` is touched
+    /// Path to the dog's binary, vetted before `shep.toml` is touched.
+    /// Resolved before vetting: as given, with a leading `~/` expanded, or
+    /// looked up on `$PATH` if it names no directory — first hit wins.
     pub path: PathBuf,
+    /// The dog's name — the `[dog.<name>]` config key. Defaults to the
+    /// binary's file stem with a leading `shep-` stripped.
+    #[arg(long)]
+    pub name: Option<String>,
 }
 
 /// The selector the verbs that take an optional one fall back to.

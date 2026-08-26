@@ -108,8 +108,8 @@ pub struct AvailableDog {
     pub package: String,
     /// The name this dog expects to be adopted under, and the whole reason
     /// the detail view exists. A dog is given no argv and cannot learn its
-    /// own adopted name, so `shep adopt <name> <path>` with the wrong
-    /// `<name>` silently discards its entire `[dog.<name>]` section. An
+    /// own adopted name, so `shep adopt <path> --name <name>` with the
+    /// wrong `<name>` silently discards its entire `[dog.<name>]` section. An
     /// adopt line must be built from this field, never from
     /// [`Self::name`] or [`Self::package`].
     pub adopt_as: String,

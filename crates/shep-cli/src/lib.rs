@@ -1140,16 +1140,18 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
         // `--exec` is the hidden pm2 spelling of `adopt` (`EnableArgs`'
         // own doc) — checked here, not inside `commands::dogs`, so that
         // module's `enable` keeps the simple `&str` signature every other
-        // verb here has, and the argument-order inversion this alias
-        // carries lives at the one seam that has to know about it.
+        // verb here has, and the field mapping this alias needs (`--exec`'s
+        // path becomes `AdoptArgs::path`, `enable`'s own positional `name`
+        // becomes `AdoptArgs::name`) lives at the one seam that has to know
+        // about it.
         Commands::Enable(ref args) => match &args.exec {
             Some(path) => {
                 dogs::adopt(
                     &mut streams,
                     &paths,
                     &AdoptArgs {
-                        name: args.name.clone(),
                         path: path.clone(),
+                        name: Some(args.name.clone()),
                     },
                 )
                 .await
@@ -1741,21 +1743,34 @@ mod tests {
 
     /// The `adopt`/`rehome` sibling of
     /// `enable_and_disable_parse_to_their_own_commands_and_require_a_name`.
-    /// `adopt` needs both positionals; `rehome` shares `DogArgs` with
-    /// `disable`, so it needs only the name.
+    /// `adopt` needs only its one positional, `path` — `name` is an
+    /// optional `--name` flag, matching `shep start <script>`'s own
+    /// optional `--name`. `rehome` shares `DogArgs` with `disable`, so it
+    /// needs only the name.
     #[test]
     fn adopt_and_rehome_parse_to_their_own_commands_and_require_their_arguments() {
         use clap::Parser;
         use cli::Commands;
 
-        let adopted = Cli::try_parse_from(["shep", "adopt", "otel", "/opt/bin/shep-otel"])
-            .unwrap()
-            .command;
+        let adopted =
+            Cli::try_parse_from(["shep", "adopt", "/opt/bin/shep-otel", "--name", "otel"])
+                .unwrap()
+                .command;
         let Commands::Adopt(args) = adopted else {
             panic!("expected adopt")
         };
-        assert_eq!(args.name, "otel");
         assert_eq!(args.path, PathBuf::from("/opt/bin/shep-otel"));
+        assert_eq!(args.name, Some("otel".to_string()));
+
+        // `--name` is optional: a bare path still parses, with no name.
+        let unnamed = Cli::try_parse_from(["shep", "adopt", "/opt/bin/shep-otel"])
+            .unwrap()
+            .command;
+        let Commands::Adopt(args) = unnamed else {
+            panic!("expected adopt")
+        };
+        assert_eq!(args.path, PathBuf::from("/opt/bin/shep-otel"));
+        assert_eq!(args.name, None);
 
         let rehomed = Cli::try_parse_from(["shep", "rehome", "otel"])
             .unwrap()
@@ -1767,11 +1782,7 @@ mod tests {
 
         assert!(
             Cli::try_parse_from(["shep", "adopt"]).is_err(),
-            "`shep adopt` with neither name nor path must be a usage error"
-        );
-        assert!(
-            Cli::try_parse_from(["shep", "adopt", "otel"]).is_err(),
-            "`shep adopt otel` with no path must be a usage error"
+            "`shep adopt` with no path must be a usage error"
         );
         assert!(
             Cli::try_parse_from(["shep", "rehome"]).is_err(),
@@ -1780,11 +1791,11 @@ mod tests {
     }
 
     /// fails if `enable --exec` routes to `enable` (which would try to run
-    /// a built-in dog named after a path), and fails if the argument order
-    /// is read as `adopt`'s. The two orders are inverted
-    /// (`EnableArgs`'/`AdoptArgs`' own docs), and a swap here is silent:
-    /// both arguments are strings, so nothing but a pinned assertion on
-    /// which field holds which value would catch one crossing the other.
+    /// a built-in dog named after a path), and fails if `--exec`'s value
+    /// and `enable`'s own positional `name` land in the wrong fields once
+    /// `main`'s dispatch turns them into an `AdoptArgs`. Both are strings,
+    /// so a swap here is silent — nothing but a pinned assertion on which
+    /// field holds which value would catch one crossing the other.
     #[test]
     fn the_hidden_pm2_spelling_reaches_adopt_with_the_arguments_the_right_way_round() {
         use clap::Parser;
