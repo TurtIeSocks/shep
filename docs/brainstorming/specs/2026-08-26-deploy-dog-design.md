@@ -374,6 +374,18 @@ Two cases the restore has to distinguish, both answered from `deploy.toml`:
   from `current`, unchanged, and say so plainly on the way out. Deleting an app
   because a deploy tool was uninstalled would be much worse than leaving it.
 
+Rin's condition for accepting that second case, and it is a requirement on the
+hook rather than on the dog: **the hook's stdout must reach the operator**, so
+the dog can say where the app actually is.
+
+```
+bpm still running from $SHEP_HOME/deploy/bpm/current
+```
+
+Without that, "left running, unchanged" is indistinguishable from "quietly
+abandoned somewhere you will not think to look", which is the failure this
+whole section exists to prevent.
+
 The deploy tree is left on disk either way. It is not the dog's to delete, and
 in the bootstrap case a running app is still pointing into it.
 
@@ -427,6 +439,21 @@ both of which came out of Rin asking what rehoming does:
    on an argument it does not recognise, exactly as `shep-log-rotate` does
    today. Failure must never block removal; an operator asking to remove
    something is entitled to have it removed.
+
+   **The hook's stdout is operator-facing and must be plumbed accordingly**,
+   which constrains it in three ways that are easy to get wrong:
+
+   - **It is third-party text on its way to a terminal, so it goes through
+     `terminal_safe::sanitise` first.** `dog_index.rs` already established this
+     boundary for the community index; a dog's parting message is the same
+     category, and an unsanitised one could clear the screen or imitate shep's
+     own output during a command the operator is watching.
+   - **Under `--format json` it belongs in the envelope as a field**, never
+     interleaved as raw text. Interleaving would corrupt the JSON of a command
+     scripts are entitled to parse.
+   - **It rides the existing notice stream** rather than inventing a fourth
+     output tier, so `--quiet` governs it the same way it governs everything
+     else, and the JSON envelope carries it regardless.
 
 ## Open questions
 
