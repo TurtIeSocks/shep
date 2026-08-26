@@ -185,15 +185,67 @@ jobs:
       #
       # So refuse instead of publishing something nobody tested. One parent
       # means squash or rebase and is safe; two or more means a merge commit.
-      - name: Refuse to publish from a merge commit
+      # release-plz does not necessarily release the commit it was handed.
+      # When the tested commit is a merge commit, `should_release` finds its
+      # pull request, takes that PR's last commit `P`, runs
+      # `git branch --contains P`, and on a hit runs a literal `git checkout P`
+      # against this working directory. `cargo publish` then packages from
+      # there. Traced in release-plz 0.3.160's source, which is the CLI this
+      # pinned action actually runs, and observed: shep 0.1.1 went out from
+      # merge commit da5e56a and all four tags landed on 5f3063d.
+      #
+      # That substitution is only DANGEROUS when the two differ. It is not the
+      # merge commit that is the problem, it is main having moved while the
+      # release pull request sat open, so that the merge carries changes the
+      # PR head does not. When the branch already contains main's tip, the two
+      # trees are byte-identical and release-plz publishes exactly what
+      # test.yml ran. That was true of 0.1.1: both trees were
+      # 712ef7567ed259ef9f069a24d44038534a6d5ac4.
+      #
+      # So compare the trees rather than banning a merge strategy. An earlier
+      # version of this step refused every merge commit, which would have
+      # failed ordinary merges this job runs on but never publishes, and made
+      # squashing a requirement nobody asked for.
+      #
+      # To keep this passing without thinking about it, turn on "Require
+      # branches to be up to date before merging" for main. Then a release
+      # pull request cannot merge while behind, and the trees cannot diverge.
+      - name: Refuse when release-plz would publish a tree nobody tested
         env:
           TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
-          parents="$(git rev-list --parents -n 1 "$TESTED_SHA" | wc -w)"
-          if [ "$parents" -gt 2 ]; then
-            echo "::error::$TESTED_SHA is a merge commit, and release-plz 0.3.160 would publish the release PR's head commit instead of this one. Re-merge the release pull request with squash or rebase."
-            exit 1
+          # One parent means squash or rebase. release-plz releases what is
+          # checked out in that case, so there is nothing to compare.
+          if [ "$(git rev-list --parents -n 1 "$TESTED_SHA" | wc -w)" -le 2 ]; then
+            echo "$TESTED_SHA has one parent; release-plz will release the commit that was tested."
+            exit 0
           fi
+          # Two calls rather than one tab-delimited line. A literal tab
+          # inside a YAML block scalar survives only until someone
+          # reformats this file, and it would fail by putting the whole
+          # line into `branch`, which the prefix test then quietly rejects.
+          pulls="repos/${GITHUB_REPOSITORY}/commits/${TESTED_SHA}/pulls"
+          branch="$(gh api "$pulls" --jq '.[0].head.ref // ""')"
+          head_sha="$(gh api "$pulls" --jq '.[0].head.sha // ""')"
+          # release-plz only substitutes for a pull request it recognises as a
+          # release PR, which it decides on this prefix.
+          case "$branch" in
+            release-plz-*) ;;
+            *)
+              echo "$TESTED_SHA is a merge commit, but its pull request branch is '${branch:-none}', which release-plz will not treat as a release PR."
+              exit 0
+              ;;
+          esac
+          git fetch --no-tags --quiet origin "$head_sha"
+          tested_tree="$(git rev-parse "${TESTED_SHA}^{tree}")"
+          head_tree="$(git rev-parse "${head_sha}^{tree}")"
+          if [ "$tested_tree" = "$head_tree" ]; then
+            echo "$TESTED_SHA and its pull request head $head_sha carry the same tree ($tested_tree), so release-plz publishes what was tested."
+            exit 0
+          fi
+          echo "::error::$TESTED_SHA was tested, but release-plz 0.3.160 will publish its pull request head $head_sha instead, and the two carry different trees ($tested_tree vs $head_tree). main moved while '$branch' was open, so the difference was never tested together. Update the branch from main and re-run, or turn on 'Require branches to be up to date before merging'."
+          exit 1
       - run: rustup toolchain install stable --profile minimal
       # Same pin as the job above, for the same reason.
       - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
