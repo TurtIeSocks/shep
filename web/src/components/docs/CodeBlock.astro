@@ -15,28 +15,90 @@
  *
  * Pass `label` for a filename header bar (like a Flockfile panel) instead
  * of a bare terminal prompt.
+ *
+ * `iconCopy` swaps the default floating text button ("copy"/"copied",
+ * bottom-right of the code body) for an icon-only button inside the label
+ * header itself, right-aligned beside the label text. Opt-in, and needs
+ * `label` to have anywhere to sit — every page on the site keeps today's
+ * floating text button unless it asks for this. community-dogs.astro's
+ * merged install+adopt block is the first user: a header-pinned icon reads
+ * as "copy this whole block" more clearly than a button floating over the
+ * second of two stacked commands.
  */
 interface Props {
   /** Optional filename/header bar, e.g. "Flockfile.toml". Omit for a bare terminal block. */
   label?: string;
+  /** Icon-only copy button in the label header instead of a text button in the body. Needs `label`. */
+  iconCopy?: boolean;
 }
 
-const { label } = Astro.props;
+const { label, iconCopy = false } = Astro.props;
+const headerCopy = Boolean(label) && iconCopy;
 ---
 
 <div class="code-block">
-  {label && <div class="code-block-label">{label}</div>}
+  {
+    label && (
+      <div class="code-block-label">
+        <span>{label}</span>
+        {headerCopy && (
+          <button
+            type="button"
+            class="code-copy-icon press"
+            data-code-copy
+            style="--shadow-offset:2px; --press-offset:1px;"
+            aria-label="Copy command"
+          >
+            <svg
+              data-copy-icon
+              viewBox="0 0 24 24"
+              width="15"
+              height="15"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <rect x="8" y="8" width="13" height="13" rx="2" />
+              <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" />
+            </svg>
+            <svg
+              data-copied-icon
+              viewBox="0 0 24 24"
+              width="15"
+              height="15"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+              style="display:none"
+            >
+              <path d="M20 6 9 17l-5-5" />
+            </svg>
+          </button>
+        )}
+      </div>
+    )
+  }
   <div class="code-block-body">
     <pre class="code-block-pre"><slot /></pre>
-    <button
-      type="button"
-      class="code-copy press"
-      data-code-copy
-      style="--shadow-offset:2px; --press-offset:1px;"
-      aria-label="Copy code"
-    >
-      <span data-copy-label>copy</span>
-    </button>
+    {
+      !headerCopy && (
+        <button
+          type="button"
+          class="code-copy press"
+          data-code-copy
+          style="--shadow-offset:2px; --press-offset:1px;"
+          aria-label="Copy code"
+        >
+          <span data-copy-label>copy</span>
+        </button>
+      )
+    }
   </div>
 </div>
 
@@ -49,8 +111,12 @@ const { label } = Astro.props;
   }
 
   .code-block-label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
     background: var(--paper-2);
-    padding: 10px 18px;
+    padding: 10px 14px 10px 18px;
     border-bottom: 2px solid var(--hair);
     font-family: "Space Mono", monospace;
     font-size: 12.5px;
@@ -89,6 +155,21 @@ const { label } = Astro.props;
     padding: 5px 10px;
     cursor: pointer;
   }
+
+  .code-copy-icon {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--paper);
+    color: var(--ink);
+    border: 2px solid var(--line);
+    border-radius: 8px;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    cursor: pointer;
+  }
 </style>
 
 <script>
@@ -98,19 +179,28 @@ const { label } = Astro.props;
     .querySelectorAll<HTMLButtonElement>("[data-code-copy]")
     .forEach((button) => {
       const label = button.querySelector<HTMLSpanElement>("[data-copy-label]");
+      const copyIcon = button.querySelector<SVGElement>("[data-copy-icon]");
+      const copiedIcon = button.querySelector<SVGElement>("[data-copied-icon]");
       const pre = button
-        .closest(".code-block-body")
+        .closest(".code-block")
         ?.querySelector<HTMLPreElement>(".code-block-pre");
       let revertTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const setCopied = (copied: boolean) => {
+        if (label) label.textContent = copied ? "copied" : "copy";
+        if (copyIcon) copyIcon.style.display = copied ? "none" : "";
+        if (copiedIcon) copiedIcon.style.display = copied ? "" : "none";
+        if (copyIcon || copiedIcon) {
+          button.setAttribute("aria-label", copied ? "Copied" : "Copy command");
+        }
+      };
 
       button.addEventListener("click", () => {
         const text = pre?.textContent ?? "";
         navigator.clipboard?.writeText(text);
-        if (label) label.textContent = "copied";
+        setCopied(true);
         clearTimeout(revertTimer);
-        revertTimer = setTimeout(() => {
-          if (label) label.textContent = "copy";
-        }, REVERT_DELAY_MS);
+        revertTimer = setTimeout(() => setCopied(false), REVERT_DELAY_MS);
       });
     });
 </script>
