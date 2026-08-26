@@ -169,7 +169,8 @@ rather than through its environment, so a webhook credential never shows
 up in a process listing or gets inherited by anything the dog spawns.
 Once adopted, `shep <name>
 [args...]` runs it directly, passing your own arguments through — built-in
-verbs always win, so a dog can't shadow one. [docs/dogs.md](docs/dogs.md)
+verbs and their aliases always win, so a dog can't shadow either.
+[docs/dogs.md](docs/dogs.md)
 is the guide.
 
 **Coming from pm2.** `shep import` reads a real `dump.pm2` and writes a

@@ -223,8 +223,8 @@ Once adopted, `shep <name> [args...]` runs the dog directly — the same
 one the shepherd itself uses: a dog the shepherd starts gets no argv and
 one environment variable (`$SHEP_HOME`, below); a dog you name on the
 command line gets whatever you typed after it, passed straight through,
-plus that same `$SHEP_HOME`. A built-in verb always wins over a
-same-named dog.
+plus that same `$SHEP_HOME`. A built-in verb or alias always wins over
+a same-named dog.
 
 `rehome <name>` is `disable`'s counterpart for a third-party dog: it stops
 it if running and forgets the registration in `shep.toml` entirely, rather
