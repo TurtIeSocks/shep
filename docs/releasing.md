@@ -132,9 +132,11 @@ disables `git_tag_enable` workspace-wide and re-enables it, named
 so it is not what the next release does. Whether to add that configuration
 is Rin's call, not this fix's to make for her.
 
-All five crates share a single workspace version and are released together,
-so one annotated tag on the release commit would be the honest shape, if
-configured. Per-package tags are what a workspace whose members version
+All five crates share a single workspace version, and the four with code are
+released together. `shep-cli`, the redirect placeholder, carries
+`release = false` and is versioned along with the rest without ever being
+published by release-plz. So one annotated tag on the release commit would be
+the honest shape, if configured. Per-package tags are what a workspace whose members version
 independently would want; adopting that scheme here, as the default already
 does, produces four tags that can only ever hold the same number.
 
