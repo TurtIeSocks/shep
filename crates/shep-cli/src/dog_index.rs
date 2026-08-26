@@ -355,6 +355,21 @@ fn require_secure_url(url: &str, target: &fetch::Target) -> Result<(), IndexErro
     }
 }
 
+/// Whether `version` spells [`SUPPORTED_INDEX_VERSION`], as either a JSON
+/// integer or a JSON float.
+///
+/// JSON itself draws no line between `1` and `1.0` -- both are the number
+/// one -- so `serde_json::Value::as_u64` alone is too narrow a check: it
+/// returns `None` for a number the parser represented as a float, which
+/// `1.0` (written with a decimal point, however the index was generated)
+/// always is. Refusing that spelling would tell an operator to "upgrade
+/// shep to read it" ([`IndexError::UnsupportedVersion`]'s own message)
+/// for an index this build already understands perfectly.
+fn version_is_supported(version: &Value) -> bool {
+    version.as_u64() == Some(SUPPORTED_INDEX_VERSION)
+        || version.as_f64() == Some(SUPPORTED_INDEX_VERSION as f64)
+}
+
 /// Parses `bytes` as a community dog index, validating and sanitising every
 /// entry.
 ///
@@ -380,8 +395,7 @@ pub fn parse_index(bytes: &[u8]) -> Result<Index, IndexError> {
     let Value::Object(document) = document else {
         return Err(IndexError::NotAnObject);
     };
-    let version = document.get("version").and_then(Value::as_u64);
-    if version != Some(SUPPORTED_INDEX_VERSION) {
+    if !document.get("version").is_some_and(version_is_supported) {
         return Err(IndexError::UnsupportedVersion {
             found: document.get("version").cloned(),
         });
@@ -725,6 +739,26 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("99"), "{message}");
         assert!(message.contains("upgrade"), "{message}");
+    }
+
+    /// fails if `"version": 1.0` (a decimal-point spelling of the same
+    /// number `SUPPORTED_INDEX_VERSION` names) is refused as unsupported.
+    /// JSON does not distinguish `1` from `1.0` -- both are the number
+    /// one -- so a hand-written or differently-serialised index spelling
+    /// it this way is not a version this build fails to understand; it is
+    /// the same version. Refusing it would send an operator to "upgrade
+    /// shep" (the exact message [`IndexError::UnsupportedVersion`]
+    /// carries) for a document this build already reads correctly.
+    ///
+    /// Mutation check: reverting `version_is_supported` to a bare
+    /// `Value::as_u64` comparison reddens this.
+    #[test]
+    fn a_version_spelled_with_a_decimal_point_is_still_supported() {
+        let as_decimal = SUPPORTED_INDEX_VERSION as f64;
+        let document = serde_json::json!({ "version": as_decimal, "dogs": [] }).to_string();
+        let index = parse_index(document.as_bytes())
+            .expect("a decimal-point spelling is the same number as SUPPORTED_INDEX_VERSION");
+        assert!(index.dogs.is_empty());
     }
 
     /// fails if a document naming a supported version but no `dogs` field
