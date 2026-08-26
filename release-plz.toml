@@ -1,10 +1,11 @@
-# release-plz owns the changelog and the version bump. It does NOT publish.
+# release-plz owns the version bump. It does NOT write the changelogs, and it
+# does NOT publish.
 #
 # The split is deliberate. `release-plz release-pr` opens a pull request that
-# bumps versions and writes changelogs from the conventional commits since the
-# last release, which is the tedious half and the half worth automating. The
-# upload stays in `.github/workflows/release.yml`, behind a `v*` tag, a
-# tag-versus-manifest check and a `crates-io` environment.
+# bumps versions from the conventional commits since the last release, which
+# is the tedious half and the half worth automating. The upload stays in
+# `.github/workflows/release.yml`, behind a `v*` tag, a tag-versus-manifest
+# check and a `crates-io` environment.
 #
 # That is not distrust of release-plz. Publishing is the one action here that
 # cannot be undone, and a push to `main` is a lower bar to clear by accident
@@ -32,6 +33,23 @@
 # pre-release tag, which `0.1.0-alpha.1` does. Without this an alpha appears
 # on the releases page looking like any other version.
 git_release_type = "auto"
+
+# The four real crates keep hand-written changelogs in Keep a Changelog form,
+# and those are better than anything generated from commit subjects. Left on,
+# release-plz inserts a generated section into each existing file: the first
+# release PR added 576 lines across shep and shep-daemon, in a second style,
+# next to entries that already covered the same work.
+#
+# It also copies commit subjects verbatim, so a typo in a commit message
+# becomes a typo in a tracked file. That is what happened on PR #1: the
+# subject of 551f3ce says "oganization", the generated changelog inherited it,
+# and the `typos` job failed on a file nobody had written by hand. A commit
+# message cannot be corrected after it is pushed, so with generation on, that
+# spelling would have had to be either committed or special-cased forever.
+#
+# So the changelogs stay hand-written, per docs/releasing.md step 2, and
+# release-plz is left with the version bump.
+changelog_update = false
 
 # Every crate here shares one version through `[workspace.package]`, and this
 # says so to release-plz rather than leaving it to infer it. Without it, two
