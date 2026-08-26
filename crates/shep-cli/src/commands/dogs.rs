@@ -592,21 +592,27 @@ fn warn_group_writable(streams: &mut Streams<'_>, path: &Path) {
 /// `shep adopt <path> [--name <name>]`: vets a binary shep has never seen,
 /// records it, and starts it if a shepherd is running.
 ///
-/// `args.path` is resolved before vetting ([`resolve_adopt_path`]), and
-/// `args.name` defaults to the resolved binary's file stem
-/// ([`default_dog_name`]) when omitted. Both funnel into the same
-/// [`vet_binary`] call and the same [`collides_with_a_verb`] refusal as an
-/// explicit `--name` would, so a defaulted name is exactly as vetted as a
-/// typed one.
+/// `args.path` is resolved before anything else ([`resolve_adopt_path`]),
+/// and `args.name` defaults to the resolved binary's file stem
+/// ([`default_dog_name`]) when omitted -- a defaulted name goes through the
+/// same [`collides_with_a_verb`] refusal an explicit `--name` would.
+///
+/// **The collision check runs before [`vet_binary`], not after.**
+/// `vet_binary` spawns the candidate to prove this kernel can exec it, so
+/// checking the name first means a refused name never gets that binary run
+/// at all -- a refusal that already ran the thing it refuses is not a
+/// refusal. `default_dog_name` needs only the resolved `candidate`, never
+/// the vetted/canonicalized path, so nothing forces the other order.
 pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArgs) -> ExitCode {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let path_var = std::env::var_os("PATH");
     let candidate = resolve_adopt_path(&args.path, home.as_deref(), path_var.as_deref());
-    let vetted = match vet_binary(&candidate, &paths.home) {
-        Ok(vetted) => vetted,
-        Err(refusal) => return fail_adopt(streams, &candidate, &refusal),
-    };
-    let path = vetted.path;
+    // Named and checked for a verb collision BEFORE vetting, deliberately:
+    // `vet_binary` below spawns the candidate to prove this kernel can exec
+    // it, and a refusal that runs after that spawn has already run the
+    // thing it refuses. `default_dog_name` only needs the resolved
+    // `candidate`, never the vetted/canonicalized path, so this reorder
+    // costs nothing -- see `a_name_collision_is_refused_before_the_candidate_is_ever_spawned`.
     let name = match &args.name {
         Some(name) => name.clone(),
         None => default_dog_name(&candidate),
@@ -614,6 +620,11 @@ pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArg
     if collides_with_a_verb(&name) {
         return fail_adopt_name_collision(streams, &name);
     }
+    let vetted = match vet_binary(&candidate, &paths.home) {
+        Ok(vetted) => vetted,
+        Err(refusal) => return fail_adopt(streams, &candidate, &refusal),
+    };
+    let path = vetted.path;
     for writable in &vetted.group_writable {
         warn_group_writable(streams, writable);
     }
@@ -1476,6 +1487,54 @@ mod tests {
             !paths.daemon_config.exists(),
             "a name collision must never touch shep.toml: {}",
             paths.daemon_config.display()
+        );
+    }
+
+    /// fails if `adopt` refuses a name collision only after already
+    /// vetting the candidate -- `vet_binary` spawns the binary as part of
+    /// vetting (to prove this kernel can exec it), so a refusal that runs
+    /// after `vet_binary` has already run the thing it refuses. The
+    /// outcome alone (`InvalidConfig`, no `shep.toml` write) is identical
+    /// whichever order runs first -- `adopt_refuses_a_name_that_collides_with_a_built_in_verb`
+    /// above cannot tell them apart -- so this test distinguishes the two
+    /// orders by which REFUSAL REASON reaches the operator instead of by a
+    /// spawn side effect: `args.path` here names nothing on disk, so
+    /// `vet_binary` fails at its very first check (`std::fs::metadata`,
+    /// `AdoptRefusal::Missing`) without ever attempting to spawn anything.
+    /// If the collision check runs first, the operator sees the collision
+    /// message; if `vet_binary` runs first, they see "no file exists at
+    /// that path" instead, for a name that was always going to be refused
+    /// either way. A process-spawn side effect (a marker file a script
+    /// writes) was tried first and dropped: `vet_binary`'s own exec probe
+    /// polls for up to 50ms before falling back to a hard kill, and that
+    /// race was not reliably observable from this test's own harness --
+    /// this path-shaped signal has no timing to race at all.
+    ///
+    /// Mutation check: moving the `collides_with_a_verb` check back to
+    /// after `vet_binary` reddens this -- the reported refusal becomes
+    /// `AdoptRefusal::Missing`'s message instead of the collision one.
+    #[tokio::test]
+    async fn a_name_collision_is_refused_before_vet_binary_ever_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = AdoptArgs {
+            path: dir.path().join("nope"),
+            name: Some("stop".to_string()),
+        };
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+
+        assert_eq!(code, ExitCode::InvalidConfig);
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            text.contains("already a shep verb or alias"),
+            "the collision must be the reported reason, not vet_binary's own refusal: {text}"
+        );
+        assert!(
+            !text.contains("no file exists at that path"),
+            "vet_binary must never run on a name that was always going to be refused: {text}"
         );
     }
 
