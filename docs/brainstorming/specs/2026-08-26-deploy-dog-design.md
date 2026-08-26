@@ -81,6 +81,17 @@ shep stores a string and paints a column. Reusable by any dog.
 Precedent for the shape: `ProcessInfo::last_exit` plus an EXIT column landed
 2026-08-19 as a wire change. This is the same move.
 
+**Smits are ephemeral and owned by the dog that published them.** Held in
+memory by the daemon, never persisted. When a dog stops for any reason, whether
+disabled, rehomed, crashed or lost to a daemon restart, its smits go with it,
+and it republishes on its next poll.
+
+This is a lifecycle decision rather than an implementation detail. The
+alternative, persisting them, means a rehomed dog leaves `shep flock` showing
+`▲ main@a1b2c3` forever, attributed to a dog that no longer exists. Making
+smits ephemeral removes that whole class of orphan instead of adding cleanup
+logic to every path that can stop a dog.
+
 **Naming.** `smit` is the real shepherding term for a paint mark identifying
 which flock a sheep belongs to, and unlike a brand it is deliberately
 temporary, which is exactly what this is. `badge` is the plain alias, per the
@@ -120,6 +131,13 @@ The sheep's `cwd` is `<root>/current`, permanently. Swapping a release is
 `rename(2)` on a symlink, which is atomic, so there is no instant where
 `current` points at nothing.
 
+**The deploy tree outlives the dog and is not its scratch space.** It sits
+under `$SHEP_HOME`, which looks like the dog's territory, but it is where the
+apps actually live: every running sheep's `cwd` points into it. Forgetting the
+dog must never remove it, and an operator tidying up `$SHEP_HOME/deploy/` after
+rehoming would take down running apps. Document this for operators rather than
+letting them find it.
+
 **Why `$SHEP_HOME` rather than the user's own directory.** The user's existing
 checkout is never restructured, moved, or written to. One uniform layout per
 app, ownership and permissions already settled by whoever owns `$SHEP_HOME`,
@@ -140,8 +158,25 @@ merged over the committed file, override wins. Because it is gitignored, the
 sharing mechanism below carries it into every release automatically, with no
 special case.
 
-**`[dog.<name>]` in `shep.toml`.** The operator's dog-level settings: poll
-interval, how many releases to keep.
+**`[dog.<name>]` in `shep.toml`.** Dog-level settings only: poll interval, how
+many releases to keep. Deliberately nothing per-target, for the reason below.
+
+**`deploy.toml`, in the deploy tree, written by the dog.** Per-target state
+lives beside the thing it describes, not in the dog's config section:
+
+```
+$SHEP_HOME/deploy/bpm/deploy.toml
+```
+
+It records the remote and branch, the last deployed sha, the verify mode, and
+the sheep's `cwd` and `script` **as they were before the dog took over**.
+
+Rin found the reason this matters by asking what happens when somebody rehomes
+the dog. Keying per-target state to the dog's *name* means renaming or
+re-adopting the dog destroys the record of every deployment it manages, and
+those are unrelated things. In the tree, the state survives rehoming, survives
+re-adoption under a different name, and makes each tree self-describing enough
+that a different deploy dog could pick it up.
 
 ### Pinning, and an honest account of what it buys
 
@@ -319,6 +354,29 @@ more once this exists.
 **Private repositories inherit the build user's git auth.** If git cannot reach
 it, the dog cannot. No credential handling of its own, deliberately.
 
+## Removal, and what it restores
+
+Rin's requirement, and the failure it prevents: an operator rehomes the dog,
+goes back to `~/ReactMap` because that is where they think their app lives,
+restarts the sheep, and cannot work out why nothing updates. That sheep's `cwd`
+was never `~/ReactMap`; it was a path under `$SHEP_HOME` they have no reason to
+know about.
+
+So **removing the dog restores the sheep to how it ran before the dog took
+over**: the `cwd` and `script` recorded in `deploy.toml` at opt-in, reapplied
+with `Start`, then a restart. The app goes back to running from the user's own
+checkout, which is the only place they will think to look.
+
+Two cases the restore has to distinguish, both answered from `deploy.toml`:
+
+- **The sheep pre-existed the dog.** Restore its recorded `cwd` and `script`.
+- **The dog bootstrapped it and there is nothing to restore.** Leave it running
+  from `current`, unchanged, and say so plainly on the way out. Deleting an app
+  because a deploy tool was uninstalled would be much worse than leaving it.
+
+The deploy tree is left on disk either way. It is not the dog's to delete, and
+in the bootstrap case a running app is still pointing into it.
+
 ## Concurrency
 
 A push landing mid-deploy aborts the in-flight deploy and starts again at the
@@ -347,6 +405,28 @@ than related work. All three are reproduced and are being fixed on
 
 Number 3 resolves a question this design would otherwise have to work around,
 since dogs cannot add CLI verbs.
+
+Two further prerequisites are changes to shep itself rather than to this dog,
+both of which came out of Rin asking what rehoming does:
+
+4. **`shep rehome` must stop deleting `[dog.<name>]`.** Today it removes the
+   dog from `enabled_dogs` and `adopted_dogs` *and* deletes the dog's config
+   table. Those settings are the operator's, not the dog's, and destroying them
+   makes re-adopting the same dog a from-scratch reconfiguration. Rehome should
+   forget the adoption and leave the settings. This changes documented,
+   shipped behaviour: the help text currently draws the `disable`/`rehome`
+   line at "forgets its configuration", and that wording has to move to
+   "forgets the adoption".
+
+5. **Dogs need an on-remove lifecycle hook.** shep must give a dog a chance to
+   act before it is forgotten, which is what makes the restore above possible
+   at all. The shape that fits what already exists: run the dog's binary with a
+   documented argv and `SHEP_HOME` set, under a timeout, and proceed regardless
+   of the outcome. That rides on the same second invocation mode prerequisite 3
+   introduces, and a dog that does not implement the hook simply exits non-zero
+   on an argument it does not recognise, exactly as `shep-log-rotate` does
+   today. Failure must never block removal; an operator asking to remove
+   something is entitled to have it removed.
 
 ## Open questions
 
