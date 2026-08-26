@@ -2,18 +2,17 @@ name: test
 # Runs automatically on pushes to main and on pull requests, by Rin's call on
 # 2026-08-16.
 #
-# This is not free while the repository is private. GitHub bills private-repo
-# Actions minutes per platform: Linux 1x, Windows 2x, macOS 10x. One run of
-# this file is 19 jobs, five of them on those two platforms (two macOS and two
-# Windows in `test`, one Windows in `features`), and the two macOS legs
-# dominate the bill. docs/specs/deferred.md carries the full arithmetic. The
-# cost goes to zero when the repository goes public.
+# The repository is public, so these runs are free regardless of job count or
+# platform. That was not always true, and docs/specs/deferred.md keeps the
+# billing arithmetic (GitHub charges private-repo Actions minutes per
+# platform: Linux 1x, Windows 2x, macOS 10x) for the day it might matter
+# again.
 #
 # The weekly `schedule: [{ cron: "0 0 * * SUN" }]` the earlier comment listed
-# is deliberately NOT enabled: a full 19-job run every week against an
+# is deliberately NOT enabled: a full matrix run every week against an
 # unchanged tree spends the most expensive part of this file to learn nothing.
-# Worth adding once the repo is public and the runs are free, where it does
-# catch dependency rot.
+# Worth adding if dependency rot against an idle tree becomes a real concern —
+# that decision is Rin's, not made here just because the runs are free.
 on:
   push:
     branches: [main]
@@ -76,6 +75,36 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: 'cargo test --workspace --locked --target x86_64-unknown-linux-musl -- --skip ::slow:: --skip two_concurrent_boots'
+  # CLAUDE.md's phase-gate cross-check
+  # (`cargo check --workspace --all-targets --all-features --target
+  # x86_64-pc-windows-gnu`) had no workflow behind it, so it only ran when a
+  # human remembered -- and it went three phases unrun that way before Phase
+  # 10 caught it (docs/specs/deferred.md, "the windows-gnu cross-check went
+  # three phases unrun"). It is `cargo check`, deliberately, not
+  # `clippy -- -D warnings`: shep-daemon's `boot`/`sys`/`server`/
+  # `tokio_runner` are `cfg(unix)`-gated, so the Windows target reports 51
+  # dead-code warnings for code that is not dead on any platform shep ships.
+  # Silencing them would mean `#[allow(dead_code)]` on live code. The
+  # question this job asks is only whether the tree still compiles for a
+  # target nobody has implemented yet.
+  #
+  # Cross-compiled from ubuntu-latest rather than run natively on
+  # windows-latest: `ring`'s build script needs a real GNU `cc` for this
+  # target regardless of host OS -- MSVC's `cl.exe` cannot produce it -- and
+  # `apt-get install mingw-w64` supplies one in seconds, the same shape the
+  # `musl` job above already uses for its own cross target. A GNU-target
+  # binary cross-compiled on Linux cannot be executed there either way, which
+  # is the other reason this stays `check` rather than `test`. The `test`
+  # job's own `windows-latest` legs already give the MSVC target full
+  # `cargo test` execution on native Windows; this job's only job is the GNU
+  # target's compile-time coverage.
+  windows-gnu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
+      - run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - run: cargo check --workspace --all-targets --all-features --locked --target x86_64-pc-windows-gnu
   features:
     strategy:
       fail-fast: false

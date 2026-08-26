@@ -118,13 +118,16 @@ per platform: Linux ×1, Windows ×2, macOS ×10. One run of this file is:
 - `test`: 4 runners × 2 toolchains = 8 jobs — 2 of them macOS (×10), 2 Windows
   (×2), 4 Linux (×1)
 - `features`: 2 jobs — 1 Windows (×2), 1 Linux
-- `lint`, `docs`, `typos`, `minimal-versions`, `musl`, `coverage`,
-  `privileged`: 7 Linux jobs
+- `lint`, `docs`, `typos`, `minimal-versions`, `musl`, `windows-gnu`,
+  `coverage`, `privileged`: 8 Linux jobs
 - `bench`: 2 Linux jobs
 
-so 19 jobs, of which the two macOS legs dominate the bill at ten times their
+so 20 jobs, of which the two macOS legs dominate the bill at ten times their
 wall-clock. A `push`+`pull_request` trigger runs the whole file on every commit
 to a branch with a PR open; a `schedule` row adds one run a week regardless.
+(`windows-gnu`, added 2026-08-25 to close the cross-check gap below, is a
+Linux job cross-compiling to the GNU target -- it costs nothing extra on the
+multiplier table even though it targets Windows.)
 
 **Superseded 2026-08-16: Rin turned it on.** `push` to `main` and
 `pull_request` now trigger the file. The weekly `schedule` row is still off,
@@ -137,8 +140,11 @@ project's history predates the first automatic run, and each was self-reported
 by the agent that wrote the code rather than independently re-run. The first
 real CI run is the first outside check this project has ever had.
 
-The job count here and the one in `.github/workflows/test.yml`'s header
-comment are one fact written in two places. Change a matrix and both move.
+The job count used to be written in two places -- here and in
+`.github/workflows/test.yml`'s own header comment -- and had to move in step.
+As of 2026-08-25 the workflow's header no longer restates the count (the
+private-repo premise it existed to cost out is gone), so this file is now the
+only place it lives. Change a matrix and update it here.
 
 ### `reuse_port` is accepted, stored, displayed — and never read -- FIXED, Phase 17
 
@@ -237,18 +243,26 @@ complain about. What would force it: a Linux box in the regular test loop, or a
 threat model that includes an attacker with write access to a log directory's
 parent.
 
-### Reload's Linux-only assertions have no automatic execution
+### Reload's Linux-only assertions have no automatic execution -- STALE, closed 2026-08-25
 
 `daemon_e2e.rs`'s `a_reload_costs_a_draining_app_no_connections` and
 `a_reload_costs_a_defiant_app_the_work_it_will_not_finish` each carry
 `#[cfg(target_os = "linux")]` on their reload connection-count assertion
 (`grep -n 'cfg(target_os = "linux")' crates/shep-daemon/tests/daemon_e2e.rs`
-finds both), which is correct: they depend on Linux's
-accept balancing. Their only real execution to date was one manual Docker run.
-Phase 10 added the `ubuntu-24.04-arm` and `ubuntu-latest` legs that would run
-them, but the workflow stays `workflow_dispatch`-only, so they still execute
-only when someone presses the button. Recorded so the gap is known, not because
-the tests are wrong.
+finds both), which is correct: they depend on Linux's accept balancing.
+
+**This entry described a real gap once and does not anymore.** It was
+written when the workflow was still `workflow_dispatch`-only; that changed
+2026-08-16 (see "Automatic CI" above), and the entry was never revisited
+after. As of 2026-08-25: the `test` job's `ubuntu-latest` and
+`ubuntu-24.04-arm` legs run `cargo test --workspace --locked --all-features`
+on every `push` to `main` and every `pull_request`. Neither leg's `--skip`
+filter (`::slow::`, `two_concurrent_boots`) matches either test name, the
+whole `daemon_e2e.rs` file is `#![cfg(unix)]` so it compiles on both Linux
+legs, and each leg's own `target_os` is `linux`, so the `#[cfg(target_os =
+"linux")]` numeric assertions themselves are compiled in and run, not just
+the platform-neutral half of each test. No workflow change was needed; the
+gap the entry named had already closed and nobody had said so.
 
 ### The `cli_e2e` 7-test correlation
 
@@ -284,6 +298,19 @@ decision rather than an oversight: shep-daemon's `boot`, `sys`, `server` and
 `tokio_runner` are `cfg(unix)`-gated, so the Windows target reports 51
 dead-code warnings for code that is not dead on any platform shep ships.
 Silencing them would mean `#[allow(dead_code)]` on live code.
+
+**Now closed the other way too, 2026-08-25.** Being in `CLAUDE.md` only ever
+meant a human had to remember to run it, which is exactly the failure mode
+that let it lapse for three phases the first time. The `windows-gnu` job in
+`.github/workflows/test.yml` runs the identical command on every push and
+pull request, cross-compiling from `ubuntu-latest` with `apt-get`'s
+`mingw-w64` rather than a native Windows runner: `ring`'s build script needs
+a real GNU `cc` regardless of host OS, and a cross-compiled Windows binary
+cannot be executed on the Linux host either way, so `check` on Linux costs
+one Linux-priced job instead of a Windows-priced one for a target the `test`
+job's native `windows-latest` legs do not otherwise cover (those exercise the
+MSVC target, not GNU). Verified locally first: `EXIT=0` with a scratch
+`CARGO_TARGET_DIR`, 2026-08-25.
 
 ### `shep signal` cannot reach a sheep's lambs, on purpose
 
