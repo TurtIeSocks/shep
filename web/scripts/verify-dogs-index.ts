@@ -14,7 +14,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { validate, dogs, CATEGORIES, REQUIRED_FIELDS } from "../src/data/dogs.ts";
+import {
+  validate,
+  unwrapIndex,
+  dogs,
+  CATEGORIES,
+  REQUIRED_FIELDS,
+  SUPPORTED_INDEX_VERSION,
+} from "../src/data/dogs.ts";
 
 /** A valid entry, cloned and broken per case. */
 function good(): Record<string, unknown> {
@@ -101,8 +108,47 @@ test("no entry carries an em dash or an en dash", () => {
 
 test("the published schema and the validator agree", async () => {
   const schema = JSON.parse(await readFile(new URL("../public/dogs.schema.json", import.meta.url), "utf8"));
-  assert.deepEqual(schema.items.properties.category.enum, [...CATEGORIES]);
-  assert.deepEqual(schema.items.required.sort(), REQUIRED_FIELDS.toSorted());
+  const entrySchema = schema.properties.dogs.items;
+  assert.deepEqual(entrySchema.properties.category.enum, [...CATEGORIES]);
+  assert.deepEqual(entrySchema.required.sort(), REQUIRED_FIELDS.toSorted());
+});
+
+test("the schema and the wrapper version agree", async () => {
+  const schema = JSON.parse(await readFile(new URL("../public/dogs.schema.json", import.meta.url), "utf8"));
+  assert.equal(schema.properties.version.const, SUPPORTED_INDEX_VERSION);
+});
+
+// --- unwrapIndex: the object wrapper around the entries array -----------
+
+test("shep 0.1.0's own bare-array shape is refused, not silently read", () => {
+  assert.throws(() => unwrapIndex([good()]), (err: Error) => {
+    assert.match(err.message, /object/);
+    return true;
+  });
+});
+
+test("a version this build does not understand is refused", () => {
+  assert.throws(
+    () => unwrapIndex({ version: 99, dogs: [good()] }),
+    (err: Error) => {
+      assert.match(err.message, /99/);
+      assert.match(err.message, new RegExp(String(SUPPORTED_INDEX_VERSION)));
+      return true;
+    },
+  );
+});
+
+test("a missing version is refused the same as an unsupported one", () => {
+  assert.throws(() => unwrapIndex({ dogs: [good()] }), /version/);
+});
+
+test("a supported version with no dogs array is refused", () => {
+  assert.throws(() => unwrapIndex({ version: SUPPORTED_INDEX_VERSION }), /dogs/);
+});
+
+test("a wrapped, supported-version document unwraps to its dogs array", () => {
+  const entries = [good()];
+  assert.deepEqual(unwrapIndex({ version: SUPPORTED_INDEX_VERSION, dogs: entries }), entries);
 });
 
 // --- Extra refusal cases, beyond the brief's list. See task-1-report.md for

@@ -48,6 +48,24 @@
 //! ([`Index::skipped`]). One bad row must not blank the listing, and the
 //! skip must not be silent either.
 //!
+//! ## The wrapper, and why the document is not just the array
+//!
+//! The document is a JSON object, `{"$schema": ..., "version": 1, "dogs":
+//! [...]}`, not a bare top-level array of entries the way `shep` 0.1.0 read
+//! it. `$schema` is what gives a contributor's editor completion when they
+//! add a row; a bare array can never carry that, or anything else beside
+//! itself. `version` is what lets a future, incompatible reshape of this
+//! wrapper announce itself instead of quietly parsing wrong: a `version`
+//! this build does not recognise is [`IndexError::UnsupportedVersion`],
+//! refused with a message that says to upgrade `shep`, not a parse error.
+//! **This is a breaking change against shep 0.1.0**, which reads the old
+//! bare-array shape and nothing else; there is no dual-format fallback,
+//! because the docs site publishes one index for every shep that asks, and
+//! 0.1.0 is hours old.
+//!
+//! Only the wrapper is new. Every entry inside `dogs` still validates
+//! exactly as it always did -- the rest of this doc, unchanged below.
+//!
 //! ## Errors and the URL
 //!
 //! None of [`IndexError`]'s variants but [`IndexError::InsecureUrl`] names
@@ -81,6 +99,13 @@ pub const INDEX_URL_ENV: &str = "SHEP_DOG_INDEX";
 /// naming anything else is skipped rather than shown, because a category
 /// shep does not know is a category shep cannot file or explain.
 const CATEGORIES: [&str; 6] = ["logs", "metrics", "alerts", "health", "deploy", "other"];
+
+/// The only `version` this build's [`parse_index`] accepts. Bump this, and
+/// the docs site's published `dogs.json`, together, the day the wrapper's
+/// own shape needs to change in a way an old `shep` could not read safely
+/// -- an entry's own shape is free to grow independently, since a bad
+/// entry is skipped and counted rather than refused.
+const SUPPORTED_INDEX_VERSION: u64 = 1;
 
 /// The response cap. A megabyte is roughly two thousand entries at the size
 /// the live index's own entries run, so this bounds a hostile or broken
@@ -201,11 +226,23 @@ pub enum IndexError {
     /// The bytes were not JSON at all. Carries the parser's complaint,
     /// never the offending bytes.
     Malformed(String),
-    /// The bytes were JSON, but the document was not a top-level array.
-    /// Distinguished from [`Self::Malformed`] because an index that parses
-    /// as, say, an object is a wrong document rather than a broken one, and
-    /// an empty listing would be the wrong answer to give for it.
-    NotAnArray,
+    /// The bytes were JSON, but the top-level document was not an object.
+    /// Distinguished from [`Self::Malformed`] because a document that
+    /// parses as, say, a bare array -- `shep` 0.1.0's own index shape --
+    /// is a wrong document rather than a broken one, and an empty listing
+    /// would be the wrong answer to give for it.
+    NotAnObject,
+    /// The document's `version` field was missing, or named a version this
+    /// build does not understand. Carries the value found, exactly as the
+    /// document had it, so the message can say what arrived and what this
+    /// build wanted instead; `None` when the key was absent entirely.
+    UnsupportedVersion {
+        /// The `version` value the document carried, if any.
+        found: Option<Value>,
+    },
+    /// The document named a `version` this build understands, but its
+    /// `dogs` field was missing or was not itself an array.
+    MissingDogsArray,
 }
 
 impl fmt::Display for IndexError {
@@ -218,7 +255,22 @@ impl fmt::Display for IndexError {
             ),
             Self::Fetch(source) => write!(f, "{source}"),
             Self::Malformed(reason) => write!(f, "the dog index was not valid json: {reason}"),
-            Self::NotAnArray => write!(f, "the dog index was not a json array"),
+            Self::NotAnObject => write!(
+                f,
+                "the dog index was not a json object -- a bare array is the shape shep 0.1.0 \
+                 read, and is no longer accepted"
+            ),
+            Self::UnsupportedVersion { found } => {
+                let found = found
+                    .as_ref()
+                    .map_or_else(|| "unspecified".to_string(), Value::to_string);
+                write!(
+                    f,
+                    "the dog index is version {found}, which this shep does not understand \
+                     (this build reads version {SUPPORTED_INDEX_VERSION}); upgrade shep to read it"
+                )
+            }
+            Self::MissingDogsArray => write!(f, "the dog index has no \"dogs\" array"),
         }
     }
 }
@@ -227,7 +279,11 @@ impl core::error::Error for IndexError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Fetch(source) => Some(source),
-            Self::InsecureUrl(_) | Self::Malformed(_) | Self::NotAnArray => None,
+            Self::InsecureUrl(_)
+            | Self::Malformed(_)
+            | Self::NotAnObject
+            | Self::UnsupportedVersion { .. }
+            | Self::MissingDogsArray => None,
         }
     }
 }
@@ -263,8 +319,9 @@ pub fn index_url() -> String {
 ///   was redirected, answered non-2xx, exceeded [`SIZE_LIMIT`], or ran past
 ///   [`TIMEOUT`]. See [`crate::fetch`]'s own module doc for the full
 ///   refusal order.
-/// - [`IndexError::Malformed`], [`IndexError::NotAnArray`] — as
-///   [`parse_index`].
+/// - [`IndexError::Malformed`], [`IndexError::NotAnObject`],
+///   [`IndexError::UnsupportedVersion`], [`IndexError::MissingDogsArray`] —
+///   as [`parse_index`].
 pub async fn fetch_index(url: &str) -> Result<Index, IndexError> {
     let target = fetch::parse_url(url)?;
     require_secure_url(url, &target)?;
@@ -298,6 +355,21 @@ fn require_secure_url(url: &str, target: &fetch::Target) -> Result<(), IndexErro
     }
 }
 
+/// Whether `version` spells [`SUPPORTED_INDEX_VERSION`], as either a JSON
+/// integer or a JSON float.
+///
+/// JSON itself draws no line between `1` and `1.0` -- both are the number
+/// one -- so `serde_json::Value::as_u64` alone is too narrow a check: it
+/// returns `None` for a number the parser represented as a float, which
+/// `1.0` (written with a decimal point, however the index was generated)
+/// always is. Refusing that spelling would tell an operator to "upgrade
+/// shep to read it" ([`IndexError::UnsupportedVersion`]'s own message)
+/// for an index this build already understands perfectly.
+fn version_is_supported(version: &Value) -> bool {
+    version.as_u64() == Some(SUPPORTED_INDEX_VERSION)
+        || version.as_f64() == Some(SUPPORTED_INDEX_VERSION as f64)
+}
+
 /// Parses `bytes` as a community dog index, validating and sanitising every
 /// entry.
 ///
@@ -308,21 +380,34 @@ fn require_secure_url(url: &str, target: &fetch::Target) -> Result<(), IndexErro
 ///
 /// # Errors
 /// - [`IndexError::Malformed`] — `bytes` are not JSON, or not UTF-8.
-/// - [`IndexError::NotAnArray`] — `bytes` are JSON, but not an array.
+/// - [`IndexError::NotAnObject`] — `bytes` are JSON, but the top level is
+///   not an object (a bare array, `shep` 0.1.0's own shape, included).
+/// - [`IndexError::UnsupportedVersion`] — `version` is missing, or is not
+///   [`SUPPORTED_INDEX_VERSION`].
+/// - [`IndexError::MissingDogsArray`] — `version` is understood, but
+///   `dogs` is missing or is not an array.
 ///
 /// Nothing an individual entry can do produces an error. A bad entry is
 /// counted in [`Index::skipped`] and dropped.
 pub fn parse_index(bytes: &[u8]) -> Result<Index, IndexError> {
     let document: Value =
         serde_json::from_slice(bytes).map_err(|err| IndexError::Malformed(err.to_string()))?;
-    let Value::Array(entries) = document else {
-        return Err(IndexError::NotAnArray);
+    let Value::Object(document) = document else {
+        return Err(IndexError::NotAnObject);
+    };
+    if !document.get("version").is_some_and(version_is_supported) {
+        return Err(IndexError::UnsupportedVersion {
+            found: document.get("version").cloned(),
+        });
+    }
+    let Some(entries) = document.get("dogs").and_then(Value::as_array) else {
+        return Err(IndexError::MissingDogsArray);
     };
 
     let mut dogs = Vec::with_capacity(entries.len());
     let mut skipped = 0;
     let mut sanitised = 0;
-    for entry in &entries {
+    for entry in entries {
         // Per entry, not per field: an entry with three hostile strings is
         // one row to go and look at, not three.
         let mut entry_sanitised = false;
@@ -444,9 +529,48 @@ fn is_https(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    /// `web/`, three directories above this file, only when it actually
+    /// exists.
+    ///
+    /// It exists inside the shep workspace checkout and nowhere else:
+    /// `crates/shep-cli` has no package `include` rule (deliberately -- see
+    /// [`read_workspace_web_file`]), so once this crate is extracted on its
+    /// own -- crates.io, a vendored copy, `cargo package`'s own
+    /// verification -- `web/` is simply absent. The three drift guards
+    /// below need to tell those two situations apart before they can read
+    /// anything, which is a question only a runtime check can answer:
+    /// `include_str!` resolves at compile time regardless of which branch
+    /// a test reaches, so it could not tell them apart, and every one of
+    /// those downstream `cargo test` runs failed to compile before this
+    /// existed.
+    fn workspace_web_dir() -> Option<PathBuf> {
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web"));
+        dir.is_dir().then(|| dir.to_path_buf())
+    }
+
+    /// Reads `web/{relative}`, or `None` outside the workspace checkout
+    /// (see [`workspace_web_dir`]).
+    ///
+    /// `web/` present but `relative` missing is not that case -- it is real
+    /// drift inside the checkout the guard exists to catch -- and panics
+    /// exactly as loudly as the `include_str!` this replaces would have.
+    ///
+    /// # Panics
+    /// Inside the workspace, if `relative` cannot be read.
+    fn read_workspace_web_file(relative: &str) -> Option<String> {
+        let dir = workspace_web_dir()?;
+        Some(
+            std::fs::read_to_string(dir.join(relative)).unwrap_or_else(|err| {
+                panic!("web/{relative} exists in the workspace but could not be read: {err}")
+            }),
+        )
+    }
 
     /// The live index's own single entry, verbatim from
     /// `web/public/dogs.json` — a shape a real contributor's pull request
@@ -473,10 +597,25 @@ mod tests {
     /// would have to escape it — serde_json refuses an unescaped control
     /// character inside a string, so a hand-formatted fixture would fail to
     /// parse for the wrong reason.
+    /// Wraps `entries` in the real document shape: `{"$schema": ...,
+    /// "version": 1, "dogs": [...]}`. Every fixture below a real index
+    /// document builds through this, never a bare
+    /// `serde_json::Value::Array` -- that shape is what
+    /// [`the_old_bare_array_format_is_refused`] proves `parse_index`
+    /// refuses now.
+    fn wrap_index(entries: Vec<Value>) -> String {
+        serde_json::json!({
+            "$schema": "https://shep.turtlesocks.dev/dogs.schema.json",
+            "version": SUPPORTED_INDEX_VERSION,
+            "dogs": entries,
+        })
+        .to_string()
+    }
+
     fn one_entry_with(field: &str, value: &str) -> String {
         let mut entry = valid_entry();
         entry[field] = serde_json::Value::String(value.to_string());
-        serde_json::Value::Array(vec![entry]).to_string()
+        wrap_index(vec![entry])
     }
 
     fn one_entry_with_description(description: &str) -> String {
@@ -516,7 +655,10 @@ mod tests {
     /// Three entries, the middle one missing `adopt_as` — the field whose
     /// absence is silent everywhere else, since a dog adopted under the
     /// wrong name loses its whole config section without saying so.
-    const THREE_ENTRIES_MIDDLE_BROKEN: &[u8] = br#"[
+    const THREE_ENTRIES_MIDDLE_BROKEN: &[u8] = br#"{
+      "$schema": "https://shep.turtlesocks.dev/dogs.schema.json",
+      "version": 1,
+      "dogs": [
       {
         "name": "Spot",
         "package": "shep-log-rotate",
@@ -546,7 +688,7 @@ mod tests {
         "category": "health",
         "source": { "kind": "go-install", "module": "github.com/example/shep-watchdog" }
       }
-    ]"#;
+    ]}"#;
 
     #[test]
     fn a_sanitised_entry_still_lists_and_is_counted() {
@@ -583,14 +725,97 @@ mod tests {
         assert_eq!(index.skipped, 1);
     }
 
+    /// fails if `shep` 0.1.0's own index shape -- a bare top-level array,
+    /// no wrapper at all -- is still silently accepted. This is the
+    /// breaking change the wrapper introduces, proven directly rather than
+    /// assumed: a published index in the new shape must not also be
+    /// readable as the old one, or a version-skew bug here would go
+    /// unnoticed until an actual 0.1.0 install hit it.
     #[test]
-    fn a_document_that_is_not_an_array_is_an_error_not_an_empty_list() {
-        assert!(parse_index(b"{}").is_err());
+    fn the_old_bare_array_format_is_refused() {
+        let bare = serde_json::Value::Array(vec![valid_entry()]).to_string();
+        assert!(
+            matches!(parse_index(bare.as_bytes()), Err(IndexError::NotAnObject)),
+            "a bare array must be refused now, not silently accepted"
+        );
+    }
+
+    /// fails if a well-formed object with no `version` field at all reads
+    /// as malformed rather than as an unsupported (in this case: entirely
+    /// unspecified) version -- the two are different refusals with
+    /// different operator actions, and conflating them would send someone
+    /// hunting for a JSON syntax error that is not there.
+    #[test]
+    fn an_object_with_no_version_is_unsupported_not_malformed() {
+        let err = parse_index(b"{}").expect_err("no version field");
+        assert!(
+            matches!(err, IndexError::UnsupportedVersion { found: None }),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("unspecified"),
+            "the message must say no version was given: {err}"
+        );
+    }
+
+    /// fails if a `version` this build does not recognise reaches the
+    /// operator as a parse error instead of a named refusal that says to
+    /// upgrade -- the entire reason the field exists rather than being
+    /// decoration. `99` is never going to be a real version this file
+    /// assigns.
+    ///
+    /// Mutation check: hardcoding `parse_index`'s version check to `true`
+    /// (accepting anything) reddens this -- `dogs: []` would otherwise
+    /// parse to an empty, successful index instead of refusing.
+    #[test]
+    fn a_version_this_build_does_not_understand_is_refused_with_an_upgrade_message() {
+        let document = serde_json::json!({ "version": 99, "dogs": [] }).to_string();
+        let err = parse_index(document.as_bytes()).expect_err("unsupported version");
+        let IndexError::UnsupportedVersion { found } = &err else {
+            panic!("wrong variant: {err:?}");
+        };
+        assert_eq!(found.as_ref().and_then(serde_json::Value::as_u64), Some(99));
+        let message = err.to_string();
+        assert!(message.contains("99"), "{message}");
+        assert!(message.contains("upgrade"), "{message}");
+    }
+
+    /// fails if `"version": 1.0` (a decimal-point spelling of the same
+    /// number `SUPPORTED_INDEX_VERSION` names) is refused as unsupported.
+    /// JSON does not distinguish `1` from `1.0` -- both are the number
+    /// one -- so a hand-written or differently-serialised index spelling
+    /// it this way is not a version this build fails to understand; it is
+    /// the same version. Refusing it would send an operator to "upgrade
+    /// shep" (the exact message [`IndexError::UnsupportedVersion`]
+    /// carries) for a document this build already reads correctly.
+    ///
+    /// Mutation check: reverting `version_is_supported` to a bare
+    /// `Value::as_u64` comparison reddens this.
+    #[test]
+    fn a_version_spelled_with_a_decimal_point_is_still_supported() {
+        let as_decimal = SUPPORTED_INDEX_VERSION as f64;
+        let document = serde_json::json!({ "version": as_decimal, "dogs": [] }).to_string();
+        let index = parse_index(document.as_bytes())
+            .expect("a decimal-point spelling is the same number as SUPPORTED_INDEX_VERSION");
+        assert!(index.dogs.is_empty());
+    }
+
+    /// fails if a document naming a supported version but no `dogs` field
+    /// at all is read as an empty index instead of refused -- an operator
+    /// whose self-hosted index dropped the field entirely by accident
+    /// needs to hear about it, not see a silently empty listing.
+    #[test]
+    fn a_supported_version_with_no_dogs_field_is_refused() {
+        let document = serde_json::json!({ "version": SUPPORTED_INDEX_VERSION }).to_string();
+        assert!(matches!(
+            parse_index(document.as_bytes()),
+            Err(IndexError::MissingDogsArray)
+        ));
     }
 
     #[test]
-    fn an_empty_array_is_a_valid_empty_index() {
-        let index = parse_index(b"[]").expect("parses");
+    fn an_empty_dogs_array_is_a_valid_empty_index() {
+        let index = parse_index(wrap_index(vec![]).as_bytes()).expect("parses");
         assert!(index.dogs.is_empty());
         assert_eq!(index.skipped, 0);
     }
@@ -611,7 +836,7 @@ mod tests {
         let mut entry = valid_entry();
         entry["name"] = serde_json::Value::String("Spot\u{1b}".to_string());
         entry["description"] = serde_json::Value::String("[2J and the screen is gone".to_string());
-        let document = serde_json::Value::Array(vec![entry]).to_string();
+        let document = wrap_index(vec![entry]);
 
         let index = parse_index(document.as_bytes()).expect("parses");
         assert_eq!(index.dogs.len(), 1);
@@ -656,7 +881,7 @@ mod tests {
         let mut entry = valid_entry();
         entry["description"] = serde_json::Value::String("hostile\u{1b}[2J".to_string());
         entry["category"] = serde_json::Value::String("logz".to_string());
-        let document = serde_json::Value::Array(vec![entry]).to_string();
+        let document = wrap_index(vec![entry]);
 
         let index = parse_index(document.as_bytes()).expect("parses");
         assert_eq!(index.skipped, 1);
@@ -674,7 +899,7 @@ mod tests {
         broken["name"] = serde_json::json!(42);
         let mut other = valid_entry();
         other["package"] = serde_json::Value::String("shep-watchdog".to_string());
-        let document = serde_json::Value::Array(vec![broken, other]).to_string();
+        let document = wrap_index(vec![broken, other]);
 
         let index = parse_index(document.as_bytes()).expect("parses");
         assert_eq!(index.dogs.len(), 1);
@@ -689,7 +914,7 @@ mod tests {
     fn a_cargo_source_parses_and_carries_no_fields_of_its_own() {
         let mut entry = valid_entry();
         entry["source"] = serde_json::json!({ "kind": "cargo" });
-        let document = serde_json::Value::Array(vec![entry]).to_string();
+        let document = wrap_index(vec![entry]);
 
         let index = parse_index(document.as_bytes()).expect("parses");
         assert_eq!(index.skipped, 0);
@@ -704,7 +929,7 @@ mod tests {
     fn a_non_https_cargo_git_source_url_is_skipped() {
         let mut entry = valid_entry();
         entry["source"] = serde_json::json!({ "kind": "cargo-git", "url": "http://example.com/x" });
-        let document = serde_json::Value::Array(vec![entry]).to_string();
+        let document = wrap_index(vec![entry]);
 
         let index = parse_index(document.as_bytes()).expect("parses");
         assert_eq!(index.dogs.len(), 0);
@@ -719,7 +944,7 @@ mod tests {
         let mut entry = valid_entry();
         entry["source"] =
             serde_json::json!({ "kind": "curl-bash", "url": "https://example.com/x" });
-        let document = serde_json::Value::Array(vec![entry]).to_string();
+        let document = wrap_index(vec![entry]);
 
         assert_eq!(parse_index(document.as_bytes()).expect("parses").skipped, 1);
     }
@@ -753,7 +978,7 @@ mod tests {
     fn a_cargo_source_keeps_the_version_it_names() {
         let mut entry = valid_entry();
         entry["source"] = serde_json::json!({ "kind": "cargo", "version": "0.1.0-alpha.1" });
-        let document = serde_json::Value::Array(vec![entry]).to_string();
+        let document = wrap_index(vec![entry]);
 
         let index = parse_index(document.as_bytes()).expect("parses");
         assert_eq!(
@@ -772,7 +997,7 @@ mod tests {
     fn a_cargo_source_with_an_empty_version_is_skipped() {
         let mut entry = valid_entry();
         entry["source"] = serde_json::json!({ "kind": "cargo", "version": "" });
-        let document = serde_json::Value::Array(vec![entry]).to_string();
+        let document = wrap_index(vec![entry]);
 
         let index = parse_index(document.as_bytes()).expect("parses");
         assert_eq!(index.dogs.len(), 0);
@@ -792,7 +1017,7 @@ mod tests {
         for (kind, source) in SOURCE_KINDS {
             let mut entry = valid_entry();
             entry["source"] = serde_json::from_str(source).expect("fixture is JSON");
-            let document = serde_json::Value::Array(vec![entry]).to_string();
+            let document = wrap_index(vec![entry]);
 
             let index = parse_index(document.as_bytes()).expect("parses");
             assert_eq!(
@@ -809,16 +1034,21 @@ mod tests {
     /// breaks. `cargo` was missing here for the whole of the index's first
     /// life, so every published dog would have been advertised with a git
     /// install; that gap is what this pins shut.
+    ///
+    /// Skips outside the workspace checkout -- see
+    /// [`read_workspace_web_file`].
     #[test]
     fn the_source_kinds_match_the_docs_site_list() {
-        const DOGS_TS: &str = include_str!("../../../web/src/data/dogs.ts");
+        let Some(dogs_ts) = read_workspace_web_file("src/data/dogs.ts") else {
+            return;
+        };
 
         // Past the `=` before splitting on quotes: the declaration reads
         // `const SOURCE_KINDS: readonly DogSource["kind"][] = [...]`, and
         // that `"kind"` in the type sits before the array. The category
         // test needs no such step because its declaration carries no
         // quotes ahead of its own `=`.
-        let after = DOGS_TS
+        let after = dogs_ts
             .split_once("const SOURCE_KINDS")
             .expect("web/src/data/dogs.ts declares SOURCE_KINDS")
             .1
@@ -847,10 +1077,9 @@ mod tests {
     /// `shep dogs --available` that reads it -- counted only as an
     /// anonymous `1 entry skipped`.
     ///
-    /// `include_str!` rather than a runtime read, deliberately: a missing
-    /// file is then a compile error instead of a test that quietly passes
-    /// having checked nothing. It is inside `#[cfg(test)]`, so a packaged
-    /// crate without `web/` still builds.
+    /// Reads `web/src/data/dogs.ts` at runtime rather than with
+    /// `include_str!`, and skips outside the workspace checkout -- see
+    /// [`read_workspace_web_file`].
     ///
     /// Only the runtime array is read here. The `DogCategory` union above
     /// it in the same file cannot drift on its own -- the array is typed
@@ -858,9 +1087,11 @@ mod tests {
     /// if they disagree.
     #[test]
     fn the_categories_match_the_docs_site_list() {
-        const DOGS_TS: &str = include_str!("../../../web/src/data/dogs.ts");
+        let Some(dogs_ts) = read_workspace_web_file("src/data/dogs.ts") else {
+            return;
+        };
 
-        let after = DOGS_TS
+        let after = dogs_ts
             .split_once("export const CATEGORIES")
             .expect("web/src/data/dogs.ts declares CATEGORIES")
             .1;
@@ -874,6 +1105,59 @@ mod tests {
             site,
             CATEGORIES.to_vec(),
             "web/src/data/dogs.ts and dog_index.rs disagree about the categories"
+        );
+    }
+
+    /// fails if the checked-in editor schema (`web/public/dogs.schema.json`)
+    /// drifts from either list this file itself enforces -- the docs
+    /// trigger's own "$schema pointing at a 404 is worse than none" applies
+    /// just as much to "$schema pointing at a schema that lies". This is
+    /// the same drift-guard shape as the two tests above, aimed at the
+    /// schema instead of the docs site's `dogs.ts`, and reading real JSON
+    /// with `serde_json` rather than splitting text, since the schema (and
+    /// only the schema, of these three files) actually is JSON.
+    ///
+    /// Mutation check: deleting the `"cargo"` variant from the schema's
+    /// `source.oneOf` (its real, once-shipped bug -- caught by hand while
+    /// writing this test, not by the test itself, which is exactly the
+    /// gap this closes) reddens the source-kinds half of this assertion.
+    ///
+    /// Skips outside the workspace checkout -- see
+    /// [`read_workspace_web_file`].
+    #[test]
+    fn the_schema_agrees_with_the_categories_and_source_kinds() {
+        let Some(schema) = read_workspace_web_file("public/dogs.schema.json") else {
+            return;
+        };
+        let schema: Value = serde_json::from_str(&schema).expect("dogs.schema.json is valid json");
+        let entry_schema = &schema["properties"]["dogs"]["items"];
+
+        let schema_categories: Vec<&str> = entry_schema["properties"]["category"]["enum"]
+            .as_array()
+            .expect("category.enum is an array")
+            .iter()
+            .map(|v| v.as_str().expect("each category is a string"))
+            .collect();
+        assert_eq!(
+            schema_categories,
+            CATEGORIES.to_vec(),
+            "dogs.schema.json and dog_index.rs disagree about the categories"
+        );
+
+        let schema_kinds: Vec<&str> = entry_schema["properties"]["source"]["oneOf"]
+            .as_array()
+            .expect("source.oneOf is an array")
+            .iter()
+            .map(|variant| {
+                variant["properties"]["kind"]["const"]
+                    .as_str()
+                    .expect("each source variant names a const kind")
+            })
+            .collect();
+        let ours: Vec<&str> = SOURCE_KINDS.iter().map(|(kind, _)| *kind).collect();
+        assert_eq!(
+            schema_kinds, ours,
+            "dogs.schema.json and dog_index.rs disagree about the source kinds"
         );
     }
 

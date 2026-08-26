@@ -115,13 +115,19 @@ function adoptLine(dog: Dog): string {
                 </a>
               </p>
               {dog.source.kind === "manual" ? (
-                <p>
-                  <strong>Install:</strong> {dog.source.instructions}
-                </p>
+                <>
+                  <p>
+                    <strong>Install:</strong> {dog.source.instructions}
+                  </p>
+                  <CodeBlock label="adopt" iconCopy>
+                    {adoptLine(dog)}
+                  </CodeBlock>
+                </>
               ) : (
-                <CodeBlock label="install">{installLine(dog)}</CodeBlock>
+                <CodeBlock label="install & adopt" iconCopy>
+                  {`${installLine(dog)}\n${adoptLine(dog)}`}
+                </CodeBlock>
               )}
-              <CodeBlock label="adopt">{adoptLine(dog)}</CodeBlock>
             </article>
           ))}
         </section>

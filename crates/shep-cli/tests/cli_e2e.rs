@@ -1215,35 +1215,45 @@ fn serve_dog_index(body: &str) -> String {
 /// add, and the whole reason `dog_index::sanitise` exists. Both are valid
 /// entries -- neither is dropped, so `skipped` stays zero and this fixture
 /// alone cannot exercise that count.
+///
+/// Wrapped in the `{"$schema": ..., "version": 1, "dogs": [...]}` object
+/// the real `dogs.json` carries -- a bare array here is exactly the shape
+/// `the_old_bare_array_format_is_refused` (`dog_index.rs`'s own unit
+/// tests) proves `parse_index` now refuses, and this fixture has to stay
+/// on the accepted side of that line to test anything else.
 fn two_entry_index_json() -> String {
-    serde_json::json!([
-        {
-            "name": "Spot",
-            "package": "shep-log-rotate",
-            "adopt_as": "log-rotate",
-            "description": "Rotates grown log files and asks the shepherd to reopen them.",
-            "repo": "https://github.com/TurtIeSocks/shep-log-rotate",
-            "license": "MIT OR Apache-2.0",
-            "category": "logs",
-            "source": {
-                "kind": "cargo-git",
-                "url": "https://github.com/TurtIeSocks/shep-log-rotate"
+    serde_json::json!({
+        "$schema": "https://shep.turtlesocks.dev/dogs.schema.json",
+        "version": 1,
+        "dogs": [
+            {
+                "name": "Spot",
+                "package": "shep-log-rotate",
+                "adopt_as": "log-rotate",
+                "description": "Rotates grown log files and asks the shepherd to reopen them.",
+                "repo": "https://github.com/TurtIeSocks/shep-log-rotate",
+                "license": "MIT OR Apache-2.0",
+                "category": "logs",
+                "source": {
+                    "kind": "cargo-git",
+                    "url": "https://github.com/TurtIeSocks/shep-log-rotate"
+                }
+            },
+            {
+                "name": "Rex",
+                "package": "shep-watchdog",
+                "adopt_as": "watchdog",
+                "description": "Barks when a sheep stops answering.\u{1b}[2J",
+                "repo": "https://github.com/example/shep-watchdog",
+                "license": "Apache-2.0",
+                "category": "health",
+                "source": {
+                    "kind": "go-install",
+                    "module": "github.com/example/shep-watchdog"
+                }
             }
-        },
-        {
-            "name": "Rex",
-            "package": "shep-watchdog",
-            "adopt_as": "watchdog",
-            "description": "Barks when a sheep stops answering.\u{1b}[2J",
-            "repo": "https://github.com/example/shep-watchdog",
-            "license": "Apache-2.0",
-            "category": "health",
-            "source": {
-                "kind": "go-install",
-                "module": "github.com/example/shep-watchdog"
-            }
-        }
-    ])
+        ]
+    })
     .to_string()
 }
 
