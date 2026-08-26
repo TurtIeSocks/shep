@@ -58,7 +58,7 @@ git_release_type = "auto"
 # comment), so it is turned off explicitly instead of left at the default.
 release_always = false
 # On its own, this does not close the push-vs-test.yml race described
-# below in "This used to be split" -- it narrows *which* commits release
+# above in "This used to be split" -- it narrows *which* commits release
 # can act on, not *when* it acts relative to the test matrix.
 
 # The four real crates keep hand-written changelogs in Keep a Changelog form,
