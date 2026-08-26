@@ -31,32 +31,52 @@ inter-member dependencies against the local workspace instead of demanding
 they already be on the index. That is the one-command form, and it is what
 the sequence below uses.
 
-## Version: publish `0.1.0-alpha.1`, not `0.1.0`
+## Version: `0.1.0`, and what the alpha train was for
 
 A crates.io version is permanent. Yanking hides a version from resolution but
-never frees the number, so `0.1.0` can be spent exactly once and never
-corrected. That matters more than usual here for two reasons.
+never frees the number, so a version can be spent exactly once and never
+corrected. That is why the first publish went out as `0.1.0` rather
+than `0.1.0`.
 
-The first is that shep is genuinely pre-release, and the README already says
-so. Windows is zero rather than partial, and OTLP export on the metrics dog
-is still unbuilt. A
-`0.1.0` on crates.io is a normal release under semver, and cargo
-resolves it for anyone who writes `shep-core = "0.1"`. A pre-release version
-is excluded from that matching by the semver spec, so `0.1.0-alpha.1` cannot
-be picked up by accident. Nobody ends up depending on this by writing a
-version requirement that looks ordinary.
+That reasoning was half right, and it is worth keeping the half that held. A
+workspace's first publish is where packaging faults surface: a readme path
+that does not resolve, a docs.rs build that fails on a unix-only dependency,
+an inter-crate version requirement that does not match what actually went up.
+Those are unfixable in place. On an alpha train the fix is `-alpha.2` and
+costs nothing; on `0.1.0` it is `0.1.1` plus a yank, on four crates, in
+public. Treating the first publish as a rehearsal is sound and it is what
+this project did.
 
-The second is that a workspace's first publish is where packaging faults
-surface: a readme path that does not resolve, a docs.rs build that fails on a
-unix-only dependency, an inter-crate version requirement that does not match
-what actually went up. Those are unfixable in place. On an alpha train the fix
-is `0.1.0-alpha.2` and costs nothing. On `0.1.0` the fix is `0.1.1` plus a
-yank, on four crates, in public.
+The other half did not hold. The argument was that a pre-release cannot be
+picked up by accident, since semver excludes it from ordinary matching. True,
+and close to worthless here, because `0.x` already carries that meaning: the
+semver spec says major version zero is for initial development and anything
+may change at any time. The suffix stacked a second instability signal on a
+version that already said it.
 
-The cost is one line of friction: `cargo install shep` does not select a
-pre-release, so the install command carries an explicit version until the
-first non-alpha release. That is a fair price for keeping `0.1.0` in reserve
-for the release that is actually complete.
+What it charged for that, measured on 2026-08-26 rather than guessed:
+
+```
+$ cargo install shep
+error: could not find `shep` in registry `crates-io` with version `*`
+```
+
+`cargo install` resolves `*` when given no version, and `*` never matches a
+pre-release. Note the asymmetry, because it decides how much this matters:
+`cargo add shep-client` copes fine, writing the exact `"0.1.0"`
+requirement itself. Only `install` breaks. For a library that would be a
+footnote. shep is a CLI whose primary distribution channel is
+`cargo install`, so it was the headline command in the README, in
+getting-started, and on the landing page, each needing a version flag and a
+paragraph explaining cargo's resolution rules.
+
+So `0.1.0` it is, and the alpha stays on the registry unyanked. It works when
+named explicitly, and yanking is for releases that are broken or unsafe
+rather than superseded. Publishing `0.1.0` needs no yank in any case:
+`0.1.0` sorts above `0.1.0`, so it is an ordinary forward bump.
+
+Keep the rehearsal habit for future risky publishes. Drop the assumption that
+a pre-release suffix is free, because on a binary crate it is not.
 
 ### The version bump touches two places
 
@@ -68,31 +88,32 @@ path at publish time and substitutes that literal, and there is no
 have to be edited together.
 
 Getting this wrong is a silent failure with a loud symptom. If the package
-version becomes `0.1.0-alpha.1` while the dependency literals stay `"0.1.0"`,
-then the published `shep-client` asks for a `shep-core` matching `^0.1.0`,
-which by semver excludes every `0.1.0-alpha.*`. `shep-core` publishes fine and
-`shep-client` fails to resolve, at the point where three of four crates are
-already permanent.
+version and the dependency literals disagree, the published `shep-client`
+asks for a `shep-core` that the version actually uploaded does not satisfy.
+The pre-release train made this especially easy to hit, since `^0.1.0`
+excludes every `0.1.0-alpha.*` by semver, but any mismatch does it.
+`shep-core` publishes fine and `shep-client` fails to resolve, at the point
+where three of four crates are already permanent.
 
 The five lines to change in the root `Cargo.toml`:
 
 ```toml
 [workspace.package]
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 
 [workspace.dependencies]
-shep-core = { path = "crates/shep-core", version = "0.1.0-alpha.1" }
-shep-daemon = { path = "crates/shep-daemon", version = "0.1.0-alpha.1" }
-shep-client = { path = "crates/shep-client", version = "0.1.0-alpha.1" }
+shep-core = { path = "crates/shep-core", version = "0.1.0" }
+shep-daemon = { path = "crates/shep-daemon", version = "0.1.0" }
+shep-client = { path = "crates/shep-client", version = "0.1.0" }
 ```
 
 If this drifts again on the next bump, `cargo-release` mechanises it.
 
-## Tag: one tag, `v0.1.0-alpha.1`
+## Tag: one tag, `v0.1.0`
 
 All five crates share a single workspace version and are released together,
 so one annotated tag on the release commit is the honest shape. Per-crate
-tags (`shep-core-v0.1.0-alpha.1`) are for workspaces whose members version
+tags (`shep-core-v0.1.0`) are for workspaces whose members version
 independently, and adopting that scheme here would create five tags that can
 only ever hold the same number.
 
@@ -109,7 +130,7 @@ time: the workspace shares one target-dir build lock.
 $EDITOR Cargo.toml
 cargo check --workspace --all-features
 
-# 2. Move each crate's [Unreleased] section to [0.1.0-alpha.1] with today's
+# 2. Move each crate's [Unreleased] section to [0.1.0] with today's
 #    date, in all four real crates' CHANGELOG.md files. shep-cli (the
 #    redirect) ships no code and keeps no CHANGELOG — nothing to log.
 $EDITOR crates/*/CHANGELOG.md
@@ -127,12 +148,12 @@ cargo publish --workspace --dry-run
 
 # 5. Commit the release, push it, and let CI run the gate on it.
 git add -A
-git commit -m "chore(release): 0.1.0-alpha.1"
+git commit -m "chore(release): 0.1.0"
 git push origin main
 
 # 6. Once that is green, tag the pushed commit and push the tag.
-git tag -a v0.1.0-alpha.1 -m "shep 0.1.0-alpha.1"
-git push origin v0.1.0-alpha.1
+git tag -a v0.1.0 -m "shep 0.1.0"
+git push origin v0.1.0
 ```
 
 **Pushing the tag is the irreversible step, and there is no local `cargo
@@ -179,7 +200,7 @@ up, wait a minute and rerun the one that failed.
 Afterwards, the install line becomes:
 
 ```bash
-cargo install shep --version 0.1.0-alpha.1
+cargo install shep --version 0.1.0
 ```
 
 `shep` carries three `[[bin]]` targets since Phase 15's library
@@ -213,26 +234,26 @@ Two things worth knowing before doing that:
   rather than assuming the git build proved it. The published tarball excludes
   files a git checkout has, and that difference is exactly what a git
   dependency cannot test.
-- **The version is `0.1.0-alpha.1`**, matching this workspace, so the number
+- **The version is `0.1.0`**, matching this workspace, so the number
   does not promise more than an alpha.
 
 ## What is a blocker and what is not
 
 The point of this section is that the decision in the morning is informed. A
-`0.1.0-alpha.1` promises a working thing on macOS and Linux that is not
+`0.1.0` promises a working thing on macOS and Linux that is not
 finished. It does not promise a stable API, Windows, or a complete v1.0
 surface.
 
 ### Blockers
 
-**Nothing outstanding.** The four gates below all pass on `main` as of
-2026-08-25, and `cargo publish --workspace --dry-run` is clean: all five
-crates package, compile from their own tarballs, and reach the upload step. What follows is what has to
-stay true, not work left to do.
+**Nothing outstanding, and this is no longer a prediction.** `0.1.0-alpha.1`
+published on 2026-08-26: all five crates went up, in cargo's own order,
+within four seconds. The list below is what held, not what somebody hoped
+would hold.
 
 - The task gate is green: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, and `cargo test --workspace
-  --all-features` at 1711 passed / 0 failed.
+  --all-features` at 1716 passed / 0 failed.
 - Every crate has `description`, `readme`, `keywords` and `categories`, and
   every category is a real crates.io slug. A category the registry does not
   recognise is rejected at upload, after earlier crates in the chain have
@@ -247,7 +268,9 @@ stay true, not work left to do.
 
 **CI runs automatically now.** `push` to `main` and `pull_request` trigger the
 full workflow as of 2026-08-16; before that it was `workflow_dispatch` only,
-kept off while the repository is private and Actions bills macOS at 10x. The
+kept off while the repository was private and Actions billed macOS at 10x.
+The repository is public and standard runners are free, so that arithmetic is
+history rather than a live constraint. The
 weekly `schedule` row stays off for the same billing reason, since a full
 19-job run against an unchanged tree spends the expensive part of the file to
 learn nothing. The gates it runs are the same ones that run locally, and they

@@ -3,7 +3,7 @@
   "command": "ping",
   "data": {
     "shepherd": "online",
-    "daemon_version": "0.1.0-alpha.1",
+    "daemon_version": "0.1.0",
     "pid": null,
     "home": null,
     "socket": null

@@ -23,25 +23,20 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
     <p class="lede">
       shep is one binary. Running it starts a daemon called the shepherd,
       which keeps a flock of your long-running processes alive. This page
-      takes you from a clone to a running flock.
+      takes you from an install to a running flock.
     </p>
 
     <Callout variant="careful">
-      shep is a pre-release alpha, and only macOS and Linux work. On Windows
-      every command prints <code>shep does not yet support Windows</code>
-      and exits 1.
+      shep is pre-1.0, so anything here can still change, and only macOS
+      and Linux work. On Windows every command prints
+      <code>shep does not yet support Windows</code> and exits 1.
     </Callout>
 
     <h2>1. Install it</h2>
     <div class="terminal">
-      <div><span class="prompt">$</span> cargo install shep --version 0.1.0-alpha.1</div>
+      <div><span class="prompt">$</span> cargo install shep</div>
       <div><span class="prompt">$</span> shep --help</div>
     </div>
-    <Callout variant="note">
-      This is a prerelease, and cargo ignores prereleases by default. The
-      exact <code>--version 0.1.0-alpha.1</code> is required; a bare
-      <code>cargo install shep</code> will not find it.
-    </Callout>
     <p>Prefer to build it yourself, or want to hack on it?</p>
     <div class="terminal">
       <div><span class="prompt">$</span> git clone https://github.com/TurtIeSocks/shep.git</div>

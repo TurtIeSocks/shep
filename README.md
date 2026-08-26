@@ -17,17 +17,15 @@ to keep straight, and sheep are a better mnemonic than "target group" or
 called `kill`, error messages are written in plain technical English, and
 every themed verb has a straight alias that works forever.
 
-> **Status: pre-release alpha, `0.1.0-alpha.1`.** It runs on macOS and Linux.
-> On Windows every command prints `shep does not yet support Windows` and
-> exits 1, which is a real answer but not a useful one. Cargo ignores
-> prereleases by default, so install with `cargo install shep --version
-> 0.1.0-alpha.1`, not a bare `cargo install shep`. The
-> [roadmap](#whats-not-built-yet) below says what is missing.
+> **Status: `0.1.0`, and pre-1.0 means anything can still change.** It runs
+> on macOS and Linux. On Windows every command prints `shep does not yet
+> support Windows` and exits 1, which is a real answer but not a useful one.
+> The [roadmap](#whats-not-built-yet) below says what is missing.
 
 ## Try it
 
 ```bash
-cargo install shep --version 0.1.0-alpha.1
+cargo install shep
 shep --help
 ```
 

@@ -2,9 +2,11 @@
 /*
  * Scene 5, pre-release, honestly. Copy originally verbatim from
  * docs/shep-design/README.md, "Screens > 1. Landing page > Scene copy" #5;
- * updated 2026-08-16 ahead of the 0.1.0-alpha.1 publish to carry the
+ * updated 2026-08-16 ahead of the first publish to carry the
  * `cargo install` command instead of "not on crates.io", matching
- * README.md's own status block. docs/shep-design/README.md is left as the
+ * README.md's own status block. The version is deliberately not repeated
+ * here: it would be one more place to bump, and the install command no
+ * longer needs to name one. docs/shep-design/README.md is left as the
  * original design handoff record and was not edited to match.
  */
 import SceneSection from "../SceneSection.astro";
@@ -17,9 +19,8 @@ import SceneSection from "../SceneSection.astro";
       <span class="kicker-label">and honest about it</span>
     </div>
     <p>
-      Pre-release alpha, <code>0.1.0-alpha.1</code>. Install with
-      <code>cargo install shep --version 0.1.0-alpha.1</code> and it runs on
-      macOS and Linux. On Windows every command prints
+      Early days, and pre-1.0 means anything can still change. Install
+      with <code>cargo install shep</code> and it runs on macOS and Linux. On Windows every command prints
       <code>shep does not yet support Windows</code> and exits 1. That's a
       real answer, but not a useful one.
     </p>

@@ -8,8 +8,7 @@
     "license": "MIT OR Apache-2.0",
     "category": "logs",
     "source": {
-      "kind": "cargo",
-      "version": "0.1.0-alpha.1"
+      "kind": "cargo"
     }
   }
 ]
