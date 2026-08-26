@@ -134,6 +134,33 @@ jobs:
           # As above: release-plz needs the history to know what is released.
           fetch-depth: 0
           persist-credentials: false
+      # Checking out a bare SHA leaves HEAD detached, and release-plz resolves
+      # `@{upstream}` to work out which branch it is releasing. On a detached
+      # HEAD that resolution fails and the job dies before it publishes
+      # anything. So put the tested commit back on a branch named `main`,
+      # tracking `origin/main`.
+      #
+      # `--force-create` rather than `switch`, because `main` may already exist
+      # locally at a different commit: the checkout above fetched every branch.
+      # Pointing it at the tested SHA is the point. If `main` has moved on since
+      # test.yml ran, this deliberately releases the commit that was tested
+      # rather than the one that happens to be newest.
+      #
+      # The SHA travels through the environment instead of being interpolated
+      # into the script. GitHub controls this value, so it is not an injection
+      # risk today, but `run:` blocks that splice `${{ }}` directly are how that
+      # class of bug starts.
+      - name: Put the tested commit back on a branch
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # Explicit rather than relying on what `fetch-depth: 0` happens to
+          # populate: `--set-upstream-to` fails outright if this ref is absent,
+          # and the repository is public, so an unauthenticated fetch is enough
+          # even with `persist-credentials: false`.
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git switch --force-create main "$TESTED_SHA"
+          git branch --set-upstream-to=origin/main main
       - run: rustup toolchain install stable --profile minimal
       # Same pin as the job above, for the same reason.
       - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
