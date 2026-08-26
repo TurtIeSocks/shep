@@ -315,7 +315,12 @@ fn dispatch_adopted_dog(argv: &[OsString], err: &clap::Error) -> Option<std::pro
         style: None,
     };
     let paths = resolve_paths(&global).ok()?;
-    let path = ShepToml::edit(&paths.daemon_config, |cfg| cfg.adopted_dog_path(name))
+    // `_readonly`, not `ShepToml::edit`: this runs on every unrecognized
+    // verb, most of which are typos rather than dog names, and `edit`
+    // saves unconditionally even when its closure only reads -- a lookup
+    // that finds nothing would still create `$SHEP_HOME` and write a
+    // `shep.toml` as a side effect of failing.
+    let path = ShepToml::adopted_dog_path_readonly(&paths.daemon_config, name)
         .ok()
         .flatten()?;
     let dog_argv = argv[index + 1..].to_vec();
@@ -1777,6 +1782,47 @@ mod tests {
         let err = Cli::try_parse_from(&argv).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
         assert!(dispatch_adopted_dog(&argv, &err).is_none());
+    }
+
+    /// fails if `dispatch_adopted_dog`'s lookup creates anything on a
+    /// plain "no such dog" answer. CodeRabbit's finding on PR #4, verified
+    /// against the real code before fixing: `ShepToml::edit` calls
+    /// `open_locked`, which calls `create_home_dir` unconditionally, and
+    /// `edit` itself calls `doc.save()` unconditionally even when its
+    /// closure only read. Routing this lookup through `edit` meant a
+    /// plain typo like `shep flcok`, on a machine with no `$SHEP_HOME`
+    /// yet, created the directory and wrote an empty `shep.toml` as a
+    /// side effect of failing to find a dog. A read that fails should
+    /// leave the filesystem exactly as it found it.
+    ///
+    /// `home` here is never pre-created, unlike this file's other two
+    /// `dispatch_adopted_dog` tests just above and below -- the point of
+    /// this one is exactly that absence.
+    ///
+    /// Mutation check: routing the lookup in `dispatch_adopted_dog` back
+    /// through `ShepToml::edit` reddens this -- both `home` and
+    /// `home.join("shep.toml")` come to exist.
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_adopted_dog_creates_nothing_for_a_missing_shep_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".shep");
+        assert!(!home.exists(), "test setup must start with no $SHEP_HOME");
+
+        let argv: Vec<OsString> = ["shep", "--home"]
+            .into_iter()
+            .map(OsString::from)
+            .chain([home.clone().into_os_string(), OsString::from("nosuchdog")])
+            .collect();
+        let err = Cli::try_parse_from(&argv).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+
+        assert!(dispatch_adopted_dog(&argv, &err).is_none());
+        assert!(
+            !home.exists(),
+            "a failed dog lookup must never create $SHEP_HOME: {}",
+            home.display()
+        );
     }
 
     /// fails if `dispatch_adopted_dog` stops finding a dog `shep.toml`

@@ -223,8 +223,10 @@ impl ShepToml {
 
     /// Reads `path`, treating a missing file as an empty document.
     ///
-    /// Private, and reached only from [`Self::edit`] with the document's
-    /// lock already held — see that method's own doc.
+    /// Private. Reached two ways: from [`Self::edit`]/[`Self::try_edit`]
+    /// with the document's lock already held for a write, and from
+    /// [`Self::adopted_dog_path_readonly`] with no lock at all, for a
+    /// caller that only ever reads.
     ///
     /// # Errors
     /// - [`ShepTomlError::Io`] — the file exists and could not be read.
@@ -320,6 +322,29 @@ impl ShepToml {
             .get(name)?
             .as_str()
             .map(PathBuf::from)
+    }
+
+    /// [`Self::adopted_dog_path`] without [`Self::edit`]'s write side --
+    /// for a caller that only wants the answer, such as `lib.rs`'s
+    /// `dispatch_adopted_dog`, which runs on every unrecognized verb, most
+    /// of which are typos rather than dog names.
+    ///
+    /// Creates nothing: a missing `$SHEP_HOME` or a missing `path` is an
+    /// ordinary "no such dog" answer ([`Self::open`] already treats a
+    /// missing file as an empty document), never a reason to create
+    /// either. Takes no lock, unlike [`Self::edit`] -- `Self::save`'s
+    /// rename onto `path` is atomic, so a concurrent writer can only ever
+    /// make this read observe the document just before or just after that
+    /// write, never a torn one.
+    ///
+    /// # Errors
+    /// [`ShepTomlError::Io`] if `path` exists and could not be read.
+    /// [`ShepTomlError::Parse`] if `path` exists and is not valid TOML.
+    pub fn adopted_dog_path_readonly(
+        path: &Path,
+        name: &str,
+    ) -> Result<Option<PathBuf>, ShepTomlError> {
+        Ok(Self::open(path)?.adopted_dog_path(name))
     }
 
     /// Forgets `name` entirely: out of `enabled_dogs`, out of
