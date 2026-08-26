@@ -15,6 +15,30 @@ how many janky updating/deploying scripts I've written over the years?" Anyone
 running a flock has written the pull-build-restart script, and written it
 slightly differently each time.
 
+## Where this lives
+
+The dog is its own repository and its own crate, not part of shep:
+[github.com/TurtIeSocks/shep-deploy](https://github.com/TurtIeSocks/shep-deploy),
+scaffolded 2026-08-26. It publishes to crates.io the way `shep-log-rotate`
+does, and it consumes `shep-core` and `shep-client` as an ordinary dependent.
+
+**Adopted, it is named `deploy`.** Prerequisite 2 below strips a leading
+`shep-` from the default name, the way cargo strips `cargo-`, so
+`cargo install shep-deploy` followed by `shep adopt` gives a dog called
+`deploy`. With prerequisite 3, that makes the operator's command read as plain
+English:
+
+```
+shep deploy koji
+```
+
+Rin's observation, and worth recording because it is why the three
+prerequisites are prerequisites rather than nice-to-haves: the ergonomics only
+land if all three do.
+
+The name "Fred" appears throughout the brainstorming conversation as a
+placeholder and is not the product name.
+
 ## Why this exists as a design rather than a feature request
 
 Two things make it more than a wrapper around `git pull && npm run build`.
@@ -75,7 +99,8 @@ are being watched. Making the whole feature internal would buy that, at the
 price of shep's core learning what a deployment is.
 
 Instead, a general mechanism: **a dog may attach a short string to a sheep, and
-`shep flock` renders it without understanding it.** Fred sets `▲ main@a1b2c3`;
+`shep flock` renders it without understanding it.** The dog sets
+`▲ main@a1b2c3`;
 shep stores a string and paints a column. Reusable by any dog.
 
 Precedent for the shape: `ProcessInfo::last_exit` plus an EXIT column landed
