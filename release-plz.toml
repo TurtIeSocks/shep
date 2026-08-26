@@ -1,0 +1,63 @@
+# release-plz owns the changelog and the version bump. It does NOT publish.
+#
+# The split is deliberate. `release-plz release-pr` opens a pull request that
+# bumps versions and writes changelogs from the conventional commits since the
+# last release, which is the tedious half and the half worth automating. The
+# upload stays in `.github/workflows/release.yml`, behind a `v*` tag, a
+# tag-versus-manifest check and a `crates-io` environment.
+#
+# That is not distrust of release-plz. Publishing is the one action here that
+# cannot be undone, and a push to `main` is a lower bar to clear by accident
+# than pushing a tag. Keeping the two apart means a merged release PR changes
+# numbers in the repository and nothing else until somebody tags.
+#
+# To hand release-plz the whole job later: add the `release-plz-release` job
+# from https://release-plz.dev/docs/github/quickstart and DELETE
+# `.github/workflows/release.yml`, or both will try to publish the same
+# version and the loser will fail noisily.
+#
+# ## On pre-releases, which is what this workspace is on right now
+#
+# release-plz publishes a pre-release fine and marks it as one on GitHub, via
+# `git_release_type = "auto"` below. What it does not do is manage the
+# progression: there is no automated path from `-alpha.1` to `-alpha.2` to
+# `-beta.0` to a stable version. The maintainer said so directly in
+# discussion #2443, where somebody asked this exact question, and
+# `release-plz set-version` has open issues besides. So while this workspace
+# is on an alpha, the version in `[workspace.package]` is set by hand and the
+# release PR is a changelog PR.
+
+[workspace]
+# Marks a GitHub release as a pre-release when the version carries a SemVer
+# pre-release tag, which `0.1.0-alpha.1` does. Without this an alpha appears
+# on the releases page looking like any other version.
+git_release_type = "auto"
+
+# Every crate here shares one version through `[workspace.package]`, and this
+# says so to release-plz rather than leaving it to infer it. Without it, two
+# crates whose commits imply different bumps would be assigned different
+# versions, and the inheritance would then fight it.
+[[package]]
+name = "shep-core"
+version_group = "shep"
+
+[[package]]
+name = "shep-client"
+version_group = "shep"
+
+[[package]]
+name = "shep-daemon"
+version_group = "shep"
+
+[[package]]
+name = "shep"
+version_group = "shep"
+
+# The placeholder holding the `shep-cli` name on crates.io. It has no code, so
+# no commit will ever imply a version bump for it, and a changelog entry for
+# an empty crate is noise. Left out of release-plz entirely; if it ever needs
+# republishing, that is a deliberate act rather than a consequence of merging
+# a release PR.
+[[package]]
+name = "shep-cli"
+release = false
