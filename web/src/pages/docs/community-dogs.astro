@@ -27,7 +27,11 @@ const groups = CATEGORIES.map((category) => ({
 function installLine(dog: Dog): string {
   switch (dog.source.kind) {
     case "cargo":
-      return `$ cargo install ${dog.package}`;
+      // The version is part of the command for a pre-release: cargo
+      // resolves `*` otherwise, and `*` never matches one.
+      return dog.source.version
+        ? `$ cargo install ${dog.package} --version ${dog.source.version}`
+        : `$ cargo install ${dog.package}`;
     case "cargo-git":
       return `$ cargo install --git ${dog.source.url}`;
     case "go-install":

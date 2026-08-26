@@ -137,7 +137,15 @@ pub enum DogSourceKind {
     /// package name is [`AvailableDog::package`] rather than a field here:
     /// it is the same fact, and an entry that could spell it two ways would
     /// eventually spell it two ways.
-    Cargo,
+    Cargo {
+        /// The exact version to name, for a dog that needs one. cargo
+        /// resolves `*` by default and `*` never matches a pre-release, so
+        /// an alpha that leaves this out ships a command that cannot find
+        /// it: `could not find <crate> in registry `crates-io` with version
+        /// `*``. Absent for a dog on a normal release, where a bare install
+        /// is the right command.
+        version: Option<String>,
+    },
     /// Installable with `cargo install --git <url>`, for a dog that is not
     /// on crates.io.
     CargoGit {
@@ -382,7 +390,16 @@ fn validate_entry(entry: &Value, sanitised: &mut bool) -> Option<AvailableDog> {
 fn validate_source(source: &Value, sanitised: &mut bool) -> Option<DogSourceKind> {
     let source = source.as_object()?;
     match source.get("kind")?.as_str()? {
-        "cargo" => Some(DogSourceKind::Cargo),
+        "cargo" => {
+            // Optional, but not lax: absent is a normal release, while
+            // present-and-unusable takes the entry with it, the same as
+            // every other malformed field in this file.
+            let version = match source.get("version") {
+                None => None,
+                Some(_) => Some(field(source, "version", sanitised)?),
+            };
+            Some(DogSourceKind::Cargo { version })
+        }
         "cargo-git" => {
             let url = field(source, "url", sanitised)?;
             if !is_https(&url) {
@@ -677,7 +694,7 @@ mod tests {
         let index = parse_index(document.as_bytes()).expect("parses");
         assert_eq!(index.skipped, 0);
         assert_eq!(index.dogs.len(), 1);
-        assert_eq!(index.dogs[0].source, DogSourceKind::Cargo);
+        assert_eq!(index.dogs[0].source, DogSourceKind::Cargo { version: None });
     }
 
     /// fails if a plaintext install URL is printed as a command to run.
@@ -714,10 +731,53 @@ mod tests {
     /// AND equal to the validator, which are different failures.
     const SOURCE_KINDS: [(&str, &str); 4] = [
         ("cargo", r#"{"kind":"cargo"}"#),
-        ("cargo-git", r#"{"kind":"cargo-git","url":"https://example.com/x"}"#),
-        ("go-install", r#"{"kind":"go-install","module":"example.com/x"}"#),
+        (
+            "cargo-git",
+            r#"{"kind":"cargo-git","url":"https://example.com/x"}"#,
+        ),
+        (
+            "go-install",
+            r#"{"kind":"go-install","module":"example.com/x"}"#,
+        ),
         ("manual", r#"{"kind":"manual","instructions":"build it"}"#),
     ];
+
+    /// fails if a pre-release dog's version is dropped on the way through.
+    ///
+    /// Measured, not assumed: `cargo install shep-log-rotate` with no
+    /// version answers `could not find shep-log-rotate in registry
+    /// `crates-io` with version `*``, because `*` never matches a
+    /// pre-release. Every dog published before 1.0 needs the version
+    /// carried, so losing it here ships a command that cannot work.
+    #[test]
+    fn a_cargo_source_keeps_the_version_it_names() {
+        let mut entry = valid_entry();
+        entry["source"] = serde_json::json!({ "kind": "cargo", "version": "0.1.0-alpha.1" });
+        let document = serde_json::Value::Array(vec![entry]).to_string();
+
+        let index = parse_index(document.as_bytes()).expect("parses");
+        assert_eq!(
+            index.dogs[0].source,
+            DogSourceKind::Cargo {
+                version: Some("0.1.0-alpha.1".to_string())
+            }
+        );
+    }
+
+    /// fails if a `version` that is present but unusable is quietly
+    /// ignored, leaving a bare install command beside a half-parsed entry.
+    /// Absent is fine; present-and-broken takes the entry, like every other
+    /// malformed field here.
+    #[test]
+    fn a_cargo_source_with_an_empty_version_is_skipped() {
+        let mut entry = valid_entry();
+        entry["source"] = serde_json::json!({ "kind": "cargo", "version": "" });
+        let document = serde_json::Value::Array(vec![entry]).to_string();
+
+        let index = parse_index(document.as_bytes()).expect("parses");
+        assert_eq!(index.dogs.len(), 0);
+        assert_eq!(index.skipped, 1);
+    }
 
     /// fails if a kind this file claims to support is skipped in practice.
     ///

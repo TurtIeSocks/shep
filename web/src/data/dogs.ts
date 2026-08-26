@@ -37,6 +37,12 @@ export const CATEGORIES: readonly DogCategory[] = [
  */
 export interface CargoSource {
   kind: "cargo";
+  /**
+   * The exact version to name, for a dog that needs one. cargo resolves `*`
+   * by default and `*` never matches a pre-release, so an alpha that omits
+   * this ships a command that cannot resolve it. Omit for a normal release.
+   */
+  version?: string;
 }
 
 /** Installable with `cargo install --git <url>`, for a dog not on crates.io. */
@@ -193,8 +199,18 @@ function validateSource(source: unknown, label: string): DogSource {
   }
 
   switch (kind) {
-    case "cargo":
-      return { kind };
+    case "cargo": {
+      // Optional, but not lax: absent means a normal release, while present
+      // and unusable is a malformed entry like any other here.
+      const version = source.version;
+      if (version === undefined) {
+        return { kind };
+      }
+      if (typeof version !== "string" || version.trim() === "") {
+        fail(label, `a "cargo" source with a "version" needs it non-empty`);
+      }
+      return { kind, version };
+    }
     case "cargo-git": {
       const url = source.url;
       if (typeof url !== "string" || url.trim() === "") {

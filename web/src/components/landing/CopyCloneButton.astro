@@ -1,14 +1,19 @@
 ---
 /*
  * Hero copy-to-clipboard button (docs/shep-design/README.md,
- * "Interactions > Copy button"). Writes the clone command, flips its label
+ * "Interactions > Copy button"). Writes the install command, flips its label
  * copy -> copied, and reverts after 1800ms.
  */
-const CLONE_COMMAND = "git clone https://github.com/TurtIeSocks/shep.git";
+// The version is part of the command, not noise. shep is a pre-release,
+// cargo resolves `*` unless told otherwise, and `*` never matches a
+// pre-release: a bare `cargo install shep` answers "could not find shep in
+// registry `crates-io` with version `*`". docs/getting-started says the same
+// thing in prose. Drop the flag when shep reaches a normal release.
+const INSTALL_COMMAND = "cargo install shep --version 0.1.0-alpha.1";
 ---
 
-<button type="button" class="copy-clone press" style="--shadow-offset:6px; --press-offset:3px;" data-copy-clone data-clone-command={CLONE_COMMAND}>
-  <span class="prompt">$</span> git clone github.com/TurtIeSocks/shep
+<button type="button" class="copy-clone press" style="--shadow-offset:6px; --press-offset:3px;" data-copy-clone data-clone-command={INSTALL_COMMAND}>
+  <span class="prompt">$</span> cargo install shep --version 0.1.0-alpha.1
   <span class="label" data-copy-label>copy</span>
 </button>
 
