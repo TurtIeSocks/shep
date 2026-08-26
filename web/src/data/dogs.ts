@@ -29,7 +29,17 @@ export const CATEGORIES: readonly DogCategory[] = [
   "other",
 ];
 
-/** Installable with `cargo install --git <url>`. */
+/**
+ * Installable with `cargo install <package>` from crates.io. Carries no
+ * fields of its own: the package name is already the entry's `package`, and
+ * a source that could spell it a second way would eventually spell it
+ * differently.
+ */
+export interface CargoSource {
+  kind: "cargo";
+}
+
+/** Installable with `cargo install --git <url>`, for a dog not on crates.io. */
 export interface CargoGitSource {
   kind: "cargo-git";
   url: string;
@@ -54,7 +64,7 @@ export interface ManualSource {
  * stays machine-readable if `shep install` ever exists without asking every
  * past contributor to redo their entry.
  */
-export type DogSource = CargoGitSource | GoInstallSource | ManualSource;
+export type DogSource = CargoSource | CargoGitSource | GoInstallSource | ManualSource;
 
 /** One listing in the community dog index. Every field is required. */
 export interface Dog {
@@ -92,7 +102,7 @@ export const REQUIRED_FIELDS: readonly string[] = [
   "source",
 ];
 
-const SOURCE_KINDS: readonly DogSource["kind"][] = ["cargo-git", "go-install", "manual"];
+const SOURCE_KINDS: readonly DogSource["kind"][] = ["cargo", "cargo-git", "go-install", "manual"];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -104,6 +114,23 @@ function isDogCategory(value: string): value is DogCategory {
 
 function isSourceKind(value: string): value is DogSource["kind"] {
   return (SOURCE_KINDS as readonly string[]).includes(value);
+}
+
+/**
+ * The `#fragment` an entry is linked by, so a link can read
+ * `/docs/community-dogs#bella` rather than naming the crate. Derived from
+ * `name` and not stored, because a hand-written id is one more field to get
+ * out of step with the name beside it.
+ *
+ * Slugging is lossy, so `validate` below keys its duplicate-name check on
+ * this rather than on the name itself: "Bella" and "Bella!" are two names
+ * and one anchor, and the second would silently scroll to the first.
+ */
+export function anchorOf(dog: Pick<Dog, "name">): string {
+  return dog.name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 /**
@@ -166,6 +193,8 @@ function validateSource(source: unknown, label: string): DogSource {
   }
 
   switch (kind) {
+    case "cargo":
+      return { kind };
     case "cargo-git": {
       const url = source.url;
       if (typeof url !== "string" || url.trim() === "") {
@@ -240,7 +269,10 @@ export function validate(raw: unknown): Dog[] {
 
     const source = validateSource(entry.source, label);
 
-    const nameKey = name.toLowerCase();
+    const nameKey = anchorOf({ name });
+    if (nameKey === "") {
+      fail(label, `"name" "${name}" has no letters or digits, so it has no anchor to link it by`);
+    }
     const priorNameLabel = namesSeen.get(nameKey);
     if (priorNameLabel !== undefined) {
       fail(label, `duplicate "name" "${name}" (already used by ${priorNameLabel})`);

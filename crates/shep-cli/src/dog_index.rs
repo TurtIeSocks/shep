@@ -133,7 +133,13 @@ pub struct AvailableDog {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum DogSourceKind {
-    /// Installable with `cargo install --git <url>`.
+    /// Installable with `cargo install <package>` from crates.io. The
+    /// package name is [`AvailableDog::package`] rather than a field here:
+    /// it is the same fact, and an entry that could spell it two ways would
+    /// eventually spell it two ways.
+    Cargo,
+    /// Installable with `cargo install --git <url>`, for a dog that is not
+    /// on crates.io.
     CargoGit {
         /// The repository to install from, always `https://`.
         url: String,
@@ -376,6 +382,7 @@ fn validate_entry(entry: &Value, sanitised: &mut bool) -> Option<AvailableDog> {
 fn validate_source(source: &Value, sanitised: &mut bool) -> Option<DogSourceKind> {
     let source = source.as_object()?;
     match source.get("kind")?.as_str()? {
+        "cargo" => Some(DogSourceKind::Cargo),
         "cargo-git" => {
             let url = field(source, "url", sanitised)?;
             if !is_https(&url) {
@@ -658,6 +665,21 @@ mod tests {
         assert_eq!(index.dogs[0].package, "shep-watchdog");
     }
 
+    /// fails if a crates.io dog stops parsing, which is the common case:
+    /// most dogs are published, and `cargo` carries no fields precisely
+    /// because the package name is already `package`.
+    #[test]
+    fn a_cargo_source_parses_and_carries_no_fields_of_its_own() {
+        let mut entry = valid_entry();
+        entry["source"] = serde_json::json!({ "kind": "cargo" });
+        let document = serde_json::Value::Array(vec![entry]).to_string();
+
+        let index = parse_index(document.as_bytes()).expect("parses");
+        assert_eq!(index.skipped, 0);
+        assert_eq!(index.dogs.len(), 1);
+        assert_eq!(index.dogs[0].source, DogSourceKind::Cargo);
+    }
+
     /// fails if a plaintext install URL is printed as a command to run.
     /// `repo` is a link; a `cargo-git` `url` is pasted into a shell, so it
     /// gets the same https check and not a weaker one.
@@ -683,6 +705,77 @@ mod tests {
         let document = serde_json::Value::Array(vec![entry]).to_string();
 
         assert_eq!(parse_index(document.as_bytes()).expect("parses").skipped, 1);
+    }
+
+    /// Every `source.kind` this file accepts, and a minimal source that
+    /// should parse as it. Only the tests read this: `validate_source`
+    /// matches string literals directly, since a match on a const is not a
+    /// match. The two tests below hold this list equal to the docs site's
+    /// AND equal to the validator, which are different failures.
+    const SOURCE_KINDS: [(&str, &str); 4] = [
+        ("cargo", r#"{"kind":"cargo"}"#),
+        ("cargo-git", r#"{"kind":"cargo-git","url":"https://example.com/x"}"#),
+        ("go-install", r#"{"kind":"go-install","module":"example.com/x"}"#),
+        ("manual", r#"{"kind":"manual","instructions":"build it"}"#),
+    ];
+
+    /// fails if a kind this file claims to support is skipped in practice.
+    ///
+    /// This is the dangerous direction, and the same one the category test
+    /// describes: a kind the docs site accepts and shep does not means a
+    /// contributor's entry publishes and is then dropped by every
+    /// `shep dogs --available`, counted as an anonymous `1 entry skipped`.
+    /// Adding a kind to the list and to dogs.ts without adding it to
+    /// `validate_source` would otherwise pass every other test here.
+    #[test]
+    fn every_listed_source_kind_actually_parses() {
+        for (kind, source) in SOURCE_KINDS {
+            let mut entry = valid_entry();
+            entry["source"] = serde_json::from_str(source).expect("fixture is JSON");
+            let document = serde_json::Value::Array(vec![entry]).to_string();
+
+            let index = parse_index(document.as_bytes()).expect("parses");
+            assert_eq!(
+                index.dogs.len(),
+                1,
+                "source.kind {kind:?} is listed as supported but its entry was skipped"
+            );
+        }
+    }
+
+    /// fails if the CLI's source kinds and the docs site's drift apart.
+    ///
+    /// Same shape as the category test below, and the same silence when it
+    /// breaks. `cargo` was missing here for the whole of the index's first
+    /// life, so every published dog would have been advertised with a git
+    /// install; that gap is what this pins shut.
+    #[test]
+    fn the_source_kinds_match_the_docs_site_list() {
+        const DOGS_TS: &str = include_str!("../../../web/src/data/dogs.ts");
+
+        // Past the `=` before splitting on quotes: the declaration reads
+        // `const SOURCE_KINDS: readonly DogSource["kind"][] = [...]`, and
+        // that `"kind"` in the type sits before the array. The category
+        // test needs no such step because its declaration carries no
+        // quotes ahead of its own `=`.
+        let after = DOGS_TS
+            .split_once("const SOURCE_KINDS")
+            .expect("web/src/data/dogs.ts declares SOURCE_KINDS")
+            .1
+            .split_once('=')
+            .expect("the SOURCE_KINDS declaration has an initialiser")
+            .1;
+        let literal = after
+            .split_once("];")
+            .expect("the SOURCE_KINDS array is closed")
+            .0;
+        let site: Vec<&str> = literal.split('"').skip(1).step_by(2).collect();
+
+        let ours: Vec<&str> = SOURCE_KINDS.iter().map(|(kind, _)| *kind).collect();
+        assert_eq!(
+            site, ours,
+            "web/src/data/dogs.ts and dog_index.rs disagree about the source kinds"
+        );
     }
 
     /// fails if the CLI's category list and the docs site's drift apart.

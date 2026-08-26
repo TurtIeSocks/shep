@@ -430,7 +430,7 @@ fn render_detail(out: &mut dyn std::io::Write, dog: &AvailableDog) -> std::io::R
     writeln!(out, "{}", dog.description)?;
     writeln!(out, "{} . {}", dog.license, dog.repo)?;
     writeln!(out)?;
-    writeln!(out, "{}", install_line(&dog.source))?;
+    writeln!(out, "{}", install_line(&dog.source, &dog.package))?;
     writeln!(
         out,
         "{}",
@@ -442,8 +442,9 @@ fn render_detail(out: &mut dyn std::io::Write, dog: &AvailableDog) -> std::io::R
 /// binary. [`DogSourceKind::Manual`] carries free-form prose instead of a
 /// command — that variant's own doc says why — so it prints with no `$` at
 /// all, just the two-space indent the command lines share.
-fn install_line(source: &DogSourceKind) -> String {
+fn install_line(source: &DogSourceKind, package: &str) -> String {
     match source {
+        DogSourceKind::Cargo => format!("  $ cargo install {package}"),
         DogSourceKind::CargoGit { url } => format!("  $ cargo install --git {url}"),
         DogSourceKind::GoInstall { module } => format!("  $ go install {module}@latest"),
         DogSourceKind::Manual { instructions } => format!("  {instructions}"),
@@ -459,7 +460,7 @@ fn install_line(source: &DogSourceKind) -> String {
 /// placeholder literally rather than guessing one.
 fn adopt_line(source: &DogSourceKind, adopt_as: &str, package: &str) -> String {
     match source {
-        DogSourceKind::CargoGit { .. } => {
+        DogSourceKind::Cargo | DogSourceKind::CargoGit { .. } => {
             format!("  $ shep adopt {adopt_as} ~/.cargo/bin/{package}")
         }
         DogSourceKind::GoInstall { .. } => {

@@ -10,7 +10,7 @@ import DocsLayout from "../../layouts/DocsLayout.astro";
 import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
-import { dogs, CATEGORIES, type Dog, type DogCategory } from "../../data/dogs";
+import { dogs, anchorOf, CATEGORIES, type Dog, type DogCategory } from "../../data/dogs";
 
 function categoryLabel(category: DogCategory): string {
   return category.charAt(0).toUpperCase() + category.slice(1);
@@ -26,6 +26,8 @@ const groups = CATEGORIES.map((category) => ({
 
 function installLine(dog: Dog): string {
   switch (dog.source.kind) {
+    case "cargo":
+      return `$ cargo install ${dog.package}`;
     case "cargo-git":
       return `$ cargo install --git ${dog.source.url}`;
     case "go-install":
@@ -37,6 +39,7 @@ function installLine(dog: Dog): string {
 
 function adoptLine(dog: Dog): string {
   switch (dog.source.kind) {
+    case "cargo":
     case "cargo-git":
       return `$ shep adopt ${dog.adopt_as} ~/.cargo/bin/${dog.package}`;
     case "go-install":
@@ -94,9 +97,11 @@ function adoptLine(dog: Dog): string {
         <section class="dog-category">
           <h2>{group.label}</h2>
           {group.entries.map((dog) => (
-            <article class="dog-entry">
+            <article class="dog-entry" id={anchorOf(dog)}>
               <h3>
-                {dog.package} ({dog.name})
+                <a href={`#${anchorOf(dog)}`}>
+                  {dog.package} ({dog.name})
+                </a>
               </h3>
               <p>{dog.description}</p>
               <p class="meta">
