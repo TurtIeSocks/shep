@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-26
+
 ### Additions
 
 - Record every sheep's last exit outcome and carry it on `ProcessInfo`. The
@@ -20,54 +22,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an operator stop, a delete, a reload's drainee, a crash loop and shutdown
   alike. Cleared when a respawn fails to spawn at all, because nothing exited
   there and a stale code would read as a fresh crash.
-
-### Fixes
-
-- `shep serve`'s connection deadline is a config field rather than a constant
-  read at the use site, so its test can wait one out on a real clock. The test
-  previously paused the clock and raced tokio's auto-advance against live
-  socket IO, failing about one run in three.
-
-### Security and unsafe
-
-- Refuse, under a shepherd running as root, to open a log file whose ancestry
-  another local user could redirect — and warn about it, once per path, under
-  any other. An ancestor is loose when it is owned by neither the daemon's own
-  uid nor root, or when it is a world-writable directory. Ownership is the
-  load-bearing half: it catches an intermediate component swapped for a
-  symlink, which `O_NOFOLLOW` on the final component structurally cannot see,
-  and it catches an ordinary `0755` directory owned by an app's own
-  dropped-privilege `user`, which a write-bit test alone waves through. The
-  split by uid is deliberate — a loose ancestry is an escalation only for a
-  privileged daemon, and a developer logging to `/tmp` as themselves has
-  handed nobody anything they could not already do, so refusing there would
-  break a legitimate setup to no one's benefit. The sticky bit does not change
-  the answer: it restricts unlinking and renaming entries you do not own, not
-  creating new ones, and the attack plants a NEW entry at a path shep has not
-  created yet. A TOCTOU window remains between the check and the open, and
-  there is no portable way to close it while macOS is tier-1. The check costs
-  one `lstat(2)` per path component (7.8 µs for a nine-component path,
-  measured).
-- Open every log file with `O_NOFOLLOW`, in both halves of the log plane:
-  the pump's appending handle and the truncating one `shep flush` opens. An
-  app's `out_file`/`err_file` are free-form config, so a log path can name a
-  pre-existing directory shep neither created nor tightens — and there
-  another local user could plant a symlink where the log file was going to
-  be, have a root shepherd append the sheep's stdout through it, and have
-  `shep flush` empty its target. Dropping privileges with `user`/`group`
-  never helped, because log I/O never leaves the daemon, and the peer-cred
-  check was never in the path, because the attacker never touches the socket.
-  Both opens now fail instead, leaving the symlink and its target alone. The
-  guard covers only the FINAL path component: a symlinked parent directory
-  still resolves, and closing that needs `openat2(RESOLVE_NO_SYMLINKS)`,
-  which is Linux-only and so out of scope while macOS is tier-1. `O_APPEND`
-  rides alongside the new flag rather than being replaced by it — losing it
-  brings back the sparse hole after every rotation. An operator whose log
-  path legitimately IS a symlink is told so in those words, on the failure
-  path each verb already has: `ELOOP`'s own wording ("too many levels of
-  symbolic links") describes a loop they do not have.
-
-### Additions
 
 - `MemorySampler::identify` (defaulted) and `StatsState::lambs_of` — a
   sheep's parent-pid descendants, walked on demand and carried by `Describe`
@@ -706,6 +660,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixes
 
+- `shep serve`'s connection deadline is a config field rather than a constant
+  read at the use site, so its test can wait one out on a real clock. The test
+  previously paused the clock and raced tokio's auto-advance against live
+  socket IO, failing about one run in three.
+
 - A reply to a live trigger is no longer swallowed as a previous trigger's
   timeout debt when the app echoes the dispatch `id`.
 - The stop ladder no longer clamps an unrecognized `kill_signal` to SIGTERM —
@@ -785,6 +744,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   displaces either. What a restart *does* is unchanged either way — an
   automatic one resets the restart budget exactly as `shep restart` does,
   whichever of the four raised it.
+
+### Security and unsafe
+
+- Refuse, under a shepherd running as root, to open a log file whose ancestry
+  another local user could redirect — and warn about it, once per path, under
+  any other. An ancestor is loose when it is owned by neither the daemon's own
+  uid nor root, or when it is a world-writable directory. Ownership is the
+  load-bearing half: it catches an intermediate component swapped for a
+  symlink, which `O_NOFOLLOW` on the final component structurally cannot see,
+  and it catches an ordinary `0755` directory owned by an app's own
+  dropped-privilege `user`, which a write-bit test alone waves through. The
+  split by uid is deliberate — a loose ancestry is an escalation only for a
+  privileged daemon, and a developer logging to `/tmp` as themselves has
+  handed nobody anything they could not already do, so refusing there would
+  break a legitimate setup to no one's benefit. The sticky bit does not change
+  the answer: it restricts unlinking and renaming entries you do not own, not
+  creating new ones, and the attack plants a NEW entry at a path shep has not
+  created yet. A TOCTOU window remains between the check and the open, and
+  there is no portable way to close it while macOS is tier-1. The check costs
+  one `lstat(2)` per path component (7.8 µs for a nine-component path,
+  measured).
+- Open every log file with `O_NOFOLLOW`, in both halves of the log plane:
+  the pump's appending handle and the truncating one `shep flush` opens. An
+  app's `out_file`/`err_file` are free-form config, so a log path can name a
+  pre-existing directory shep neither created nor tightens — and there
+  another local user could plant a symlink where the log file was going to
+  be, have a root shepherd append the sheep's stdout through it, and have
+  `shep flush` empty its target. Dropping privileges with `user`/`group`
+  never helped, because log I/O never leaves the daemon, and the peer-cred
+  check was never in the path, because the attacker never touches the socket.
+  Both opens now fail instead, leaving the symlink and its target alone. The
+  guard covers only the FINAL path component: a symlinked parent directory
+  still resolves, and closing that needs `openat2(RESOLVE_NO_SYMLINKS)`,
+  which is Linux-only and so out of scope while macOS is tier-1. `O_APPEND`
+  rides alongside the new flag rather than being replaced by it — losing it
+  brings back the sparse hole after every rotation. An operator whose log
+  path legitimately IS a symlink is told so in those words, on the failure
+  path each verb already has: `ELOOP`'s own wording ("too many levels of
+  symbolic links") describes a loop they do not have.
 
 ### Changes
 

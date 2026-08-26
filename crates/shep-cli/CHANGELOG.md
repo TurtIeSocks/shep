@@ -13,6 +13,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixes
+
+- Table columns are padded by the columns a name draws in, not by its
+  character count. A CJK or emoji glyph counts as one character and draws as
+  two, so a name built from them hung over its own column and pushed every
+  column after it out of line. In `shep lookout` such a name could also lose
+  the `…` that says it was cut. The box-drawn table, the plain one and
+  `lookout` now measure the same way.
+
+## [0.1.1] - 2026-08-26
+
+### Additions
+
+- Add `shep <name> [args...]`, which runs an adopted dog directly and passes
+  every remaining argument straight through, the precedent git's `git foo`
+  (running `git-foo`) and cargo's `cargo foo` (running `cargo-foo`) already
+  set. The lookup reads only `[daemon] adopted_dogs` in `shep.toml`, never a
+  `$PATH` scan: `shep adopt` already vetted the binary once, at adopt time, and
+  a `$PATH` scan here would let any stray binary on the machine answer to a
+  shep verb. A built-in verb always wins, since the dispatch only runs once
+  clap has already failed to match the token against a real subcommand or
+  alias, and `shep adopt` itself now refuses to register a name that collides
+  with one. A name matching neither a verb nor an adopted dog is still the
+  ordinary unrecognized subcommand error, suggestion included. `$SHEP_HOME`
+  reaches the dog's environment the same way it does for one the shepherd
+  starts; everything typed after the name is the dog's own argv, which is the
+  reason to invoke it this way instead of through `shep enable`.
+
+### Fixes
+
+- `shep adopt` resolves a bare binary name against `$PATH` and a leading `~/`
+  against `$HOME` before refusing it as missing. `cargo install
+  shep-log-rotate` puts the binary on `$PATH`, and neither `shep adopt
+  shep-log-rotate` nor `shep adopt '~/.cargo/bin/shep-log-rotate'` worked
+  before this fix: only a plain absolute or CWD-relative path did. A bare name
+  is looked up only when it has no directory component, and only against an
+  entry with its execute bit set, so a same-named non-executable file earlier
+  on `$PATH` cannot shadow the real binary. A path that resolves through
+  neither still reaches the same missing-binary refusal it always has; nothing
+  about what `adopt` vets once a path is resolved has changed.
+- `shep adopt` checks a name collision with a built-in verb before it vets the
+  candidate binary, not after. `shep adopt ./mydog --name stop` used to run
+  `./mydog` to prove the kernel could exec it, and only then refuse the name: a
+  refusal that has already run the thing it refuses is not a refusal. The
+  candidate is never executed now when its name collides with an existing verb
+  or alias.
+- An unrecognized command that names no adopted dog no longer creates
+  `$SHEP_HOME`. Looking one up went through the same path a config edit does,
+  which unconditionally creates the runtime directory and writes an empty
+  `shep.toml` even though the lookup only reads. On a fresh machine, a typo
+  like `shep flcok` therefore left `$SHEP_HOME` and a `shep.toml` behind as a
+  side effect of a lookup that found nothing. A missing `$SHEP_HOME`, or a
+  `shep.toml` that has never heard of the name, is now an ordinary no-such-dog
+  answer, and the filesystem is left exactly as the lookup found it.
+- `shep dogs --available` accepts a dog index whose `"version"` field is
+  written `1.0` rather than the bare integer `1`. JSON draws no line between
+  the two, but the parser checked only the integer reading, so a hand-written
+  or differently serialized index spelling the version with a decimal point was
+  refused with a message telling the operator to upgrade shep, which was false:
+  no newer shep would have read it either. Both readings are checked now, and
+  the index parses.
+
+### Changes
+
+- `shep adopt` takes one positional argument, the path, with the dog's name
+  given by an optional `--name` flag; it no longer takes `<name> <path>` as two
+  required positionals. This breaks any existing script or muscle memory typing
+  the old two-positional form, deliberately: there is no way to parse both
+  shapes unambiguously, so a silent compatibility shim would sometimes read the
+  arguments backwards, which is worse than a change that fails loudly. Sheep
+  already work this way (`shep start <script>` with an optional `--name`), and
+  adopt now matches. Omitting `--name` defaults the dog's name to the binary's
+  file stem with one leading `shep-` stripped, matching how cargo names its own
+  external subcommands: `shep-log-rotate` defaults to `log-rotate`, and a
+  binary with no `shep-` prefix keeps its whole stem. `shep enable --exec
+  <path> <name>`, pm2's own hidden spelling, is unchanged.
+- `web/public/dogs.json`, the community dog index `shep dogs --available`
+  reads, is now an object carrying `$schema`, `version` and a `dogs` array,
+  rather than a bare top-level array of entries. A shep 0.1.0 binary pointed at
+  the live index, or a self-hosted one, now gets a refusal instead of an empty
+  or wrong listing: the parser requires the new shape and names the old one
+  explicitly in its error. The entries inside `dogs` are unchanged: same
+  fields, same validation, same sanitizing. The `version` field is
+  load-bearing, not decoration; a version this build does not recognize is its
+  own named refusal with a message pointing at an upgrade, so the next
+  incompatible reshape of the wrapper can announce itself the same way instead
+  of repeating this break silently.
+
+## [0.1.0] - 2026-08-26
+
 ### Additions
 
 - `shep flock` and `shep describe` gain an `EXIT` column: the exit code, or
@@ -25,34 +115,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without replaying). Following alone showed an empty screen for a sheep that
   had already died, leaving its reason in a file the operator had no reason to
   look in.
-
-### Fixes
-
-- `shep bleats --no-follow` is no longer fixed at 50 lines. It shares the new
-  `--lines` default of 15 and is controllable for the first time.
-- Table columns are padded by the columns a name draws in, not by its
-  character count. A CJK or emoji glyph counts as one character and draws as
-  two, so a name built from them hung over its own column and pushed every
-  column after it out of line. In `shep lookout` such a name could also lose
-  the `…` that says it was cut. The box-drawn table, the plain one and
-  `lookout` now measure the same way.
-
-### Fixes
-
-- A read-only verb run where no shepherd has ever started now says so, instead
-  of forwarding the raw `connect(2)` failure. `shep flock` on a fresh machine
-  used to print ``could not connect to `/root/.shep/run/shep.sock`: No such
-  file or directory (os error 2)``, which is accurate and reads like a broken
-  install, about a path the operator did not choose. It now prints `no shepherd
-  is running (no socket at <path>); start one with `shep start <target>``.
-  Only the absent-socket case changes: a permission failure or a refused
-  connection keeps the OS detail, because those mean something specific and a
-  refusal in particular is a stale socket file rather than a missing shepherd,
-  which `shep start` would not fix. `shep-client`'s own wording is unchanged,
-  since it is published for embedders and a library should not tell its caller
-  to run a shell command.
-
-### Additions
 
 - Add `--flockfile` to `shep start`. With it, `shep start <path> --flockfile`
   reads `<path>` as a Flockfile by extension — including `.js`, evaluated by
@@ -902,32 +964,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never touches a production flock's state. `shep-dev` is the `[[bin]]`
   alias that supplies the `dev` verb.
 
-### Changes
-
-- **The CLI binary crate is renamed from `shep-cli` to `shep`.** The
-  package name now matches the `[[bin]]` it has always produced, so
-  `cargo install shep` installs it — the mismatch where the package was
-  `shep-cli` but the binary was `shep`, forcing `cargo install shep-cli`,
-  is gone. Nothing was ever published under either name before this
-  release, so there is no migration for an existing install: this is the
-  name the crate ships under from its first `cargo publish`. `shep-cli`
-  itself is not freed up for someone else to squat — it is published
-  separately, once, as an empty placeholder with no `[[bin]]` (so
-  `cargo install shep-cli` fails outright) whose README and doc comment
-  point at `shep`. See that crate's own listing for the full reasoning.
-
-- **A Linux host with no `/run/systemd/system` is now refused instead of
-  being written a systemd unit.** `shep startup` used to write and enable a
-  `Type=notify` unit unconditionally on any Linux target, including a
-  container with no init to ever read it. It now probes at runtime —
-  `/run/systemd/system` a directory means systemd, `/run/openrc/softlevel` or
-  `/run/openrc` a directory means openrc, neither means refuse, naming both
-  paths — because systemd and openrc share one compile target and cannot be
-  told apart any other way. This is the phase's one user-visible regression:
-  a container that got a (useless) unit before now gets a refusal. `--init
-  systemd` restores the old behaviour where that is actually wanted.
-
 ### Fixes
+
+- `shep bleats --no-follow` is no longer fixed at 50 lines. It shares the new
+  `--lines` default of 15 and is controllable for the first time.
+
+- A read-only verb run where no shepherd has ever started now says so, instead
+  of forwarding the raw `connect(2)` failure. `shep flock` on a fresh machine
+  used to print ``could not connect to `/root/.shep/run/shep.sock`: No such
+  file or directory (os error 2)``, which is accurate and reads like a broken
+  install, about a path the operator did not choose. It now prints `no shepherd
+  is running (no socket at <path>); start one with `shep start <target>``.
+  Only the absent-socket case changes: a permission failure or a refused
+  connection keeps the OS detail, because those mean something specific and a
+  refusal in particular is a stale socket file rather than a missing shepherd,
+  which `shep start` would not fix. `shep-client`'s own wording is unchanged,
+  since it is published for embedders and a library should not tell its caller
+  to run a shell command.
 
 - `shep enable <name>` sends the source `shep.toml` actually records, not a
   hardcoded `built-in`. A name in `[daemon] adopted_dogs` is an adopted dog
@@ -986,3 +1039,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   there was no dogs infrastructure yet to read either one. That warning is
   gone now that there is: a daemon starting two dogs while warning that it
   has no dogs infrastructure would be worse than saying nothing at all.
+
+### Changes
+
+- **The CLI binary crate is renamed from `shep-cli` to `shep`.** The
+  package name now matches the `[[bin]]` it has always produced, so
+  `cargo install shep` installs it — the mismatch where the package was
+  `shep-cli` but the binary was `shep`, forcing `cargo install shep-cli`,
+  is gone. Nothing was ever published under either name before this
+  release, so there is no migration for an existing install: this is the
+  name the crate ships under from its first `cargo publish`. `shep-cli`
+  itself is not freed up for someone else to squat — it is published
+  separately, once, as an empty placeholder with no `[[bin]]` (so
+  `cargo install shep-cli` fails outright) whose README and doc comment
+  point at `shep`. See that crate's own listing for the full reasoning.
+
+- **A Linux host with no `/run/systemd/system` is now refused instead of
+  being written a systemd unit.** `shep startup` used to write and enable a
+  `Type=notify` unit unconditionally on any Linux target, including a
+  container with no init to ever read it. It now probes at runtime —
+  `/run/systemd/system` a directory means systemd, `/run/openrc/softlevel` or
+  `/run/openrc` a directory means openrc, neither means refuse, naming both
+  paths — because systemd and openrc share one compile target and cannot be
+  told apart any other way. This is the phase's one user-visible regression:
+  a container that got a (useless) unit before now gets a refusal. `--init
+  systemd` restores the old behaviour where that is actually wanted.
