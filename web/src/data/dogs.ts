@@ -4,9 +4,20 @@
  * `web/public/dogs.json` is the single source. It lives in `public/`, not
  * here in `src/data/`, because it has a second consumer this module cannot
  * satisfy: the published site serves it verbatim at `/dogs.json`, a stable
- * URL a future `shep` command could read. Every other data file on this site
- * is a TypeScript module because only the site itself reads it; this one
- * has to be plain JSON so something outside the Astro build can too.
+ * URL `shep dogs --available` reads (`crates/shep-cli/src/dog_index.rs`).
+ * Every other data file on this site is a TypeScript module because only
+ * the site itself reads it; this one has to be plain JSON so something
+ * outside the Astro build can too.
+ *
+ * The file is an object, `{ "$schema": ..., "version": 1, "dogs": [...] }`,
+ * not a bare top-level array of entries -- `unwrapIndex()` below is what
+ * peels that open before `validate()` ever sees an entry, and it is a
+ * breaking change against `shep` 0.1.0, which read the old bare-array shape
+ * and nothing else. `$schema` gives a contributor's editor completion when
+ * they add a row; a bare array could never carry that, or `version` beside
+ * it. `version` is what lets a future, incompatible reshape of the wrapper
+ * announce itself instead of silently parsing wrong -- `dog_index.rs`'s own
+ * module doc has the fuller reasoning, shared by both readers of this file.
  *
  * This module is the gate: it validates that JSON at import time and throws
  * on the first bad entry, which fails `astro build` with the thrown message
@@ -16,6 +27,16 @@
  * type; `validate()` here is the one that actually decides.
  */
 import raw from "../../public/dogs.json" with { type: "json" };
+
+/**
+ * The only wrapper `version` this build's `unwrapIndex()` accepts. Kept in
+ * sync with `crates/shep-cli/src/dog_index.rs`'s own
+ * `SUPPORTED_INDEX_VERSION` by hand -- `the schema and the wrapper version
+ * agree` in `scripts/verify-dogs-index.ts` pins the two together the same
+ * way this file's own category and source-kind lists are pinned against
+ * that crate.
+ */
+export const SUPPORTED_INDEX_VERSION = 1;
 
 /** The six categories a dog can be filed under, in the order the page groups them. */
 export type DogCategory = "logs" | "metrics" | "alerts" | "health" | "deploy" | "other";
@@ -316,5 +337,34 @@ export function validate(raw: unknown): Dog[] {
   return result;
 }
 
+/**
+ * Peels the `{ "$schema": ..., "version": 1, "dogs": [...] }` wrapper open
+ * and hands `validate()` the bare array it has always taken. Kept separate
+ * from `validate()` itself so every existing entry-level test keeps calling
+ * `validate()` with a plain array, unaffected by the wrapper -- the entries
+ * inside `dogs` did not change, so the tests that check them should not
+ * have to.
+ *
+ * @throws {Error} if `raw` is not an object, names an unsupported
+ * `version`, or has no `dogs` array.
+ */
+export function unwrapIndex(raw: unknown): unknown[] {
+  if (!isRecord(raw)) {
+    throw new Error(
+      `dogs.json must be a top-level object with a "dogs" array, not ${Array.isArray(raw) ? "an array" : typeof raw}. ` +
+        `shep 0.1.0's own index was a bare array; that shape is no longer accepted.`,
+    );
+  }
+  if (raw.version !== SUPPORTED_INDEX_VERSION) {
+    throw new Error(
+      `dogs.json is version ${JSON.stringify(raw.version) ?? "unspecified"}, but this build only understands version ${SUPPORTED_INDEX_VERSION}.`,
+    );
+  }
+  if (!Array.isArray(raw.dogs)) {
+    throw new Error(`dogs.json's "dogs" field must be an array, not ${typeof raw.dogs}.`);
+  }
+  return raw.dogs;
+}
+
 /** The validated real index. Throws at import time if `dogs.json` is bad. */
-export const dogs: Dog[] = validate(raw);
+export const dogs: Dog[] = validate(unwrapIndex(raw));
