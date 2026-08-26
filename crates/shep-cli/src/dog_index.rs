@@ -529,9 +529,48 @@ fn is_https(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    /// `web/`, three directories above this file, only when it actually
+    /// exists.
+    ///
+    /// It exists inside the shep workspace checkout and nowhere else:
+    /// `crates/shep-cli` has no package `include` rule (deliberately -- see
+    /// [`read_workspace_web_file`]), so once this crate is extracted on its
+    /// own -- crates.io, a vendored copy, `cargo package`'s own
+    /// verification -- `web/` is simply absent. The three drift guards
+    /// below need to tell those two situations apart before they can read
+    /// anything, which is a question only a runtime check can answer:
+    /// `include_str!` resolves at compile time regardless of which branch
+    /// a test reaches, so it could not tell them apart, and every one of
+    /// those downstream `cargo test` runs failed to compile before this
+    /// existed.
+    fn workspace_web_dir() -> Option<PathBuf> {
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web"));
+        dir.is_dir().then(|| dir.to_path_buf())
+    }
+
+    /// Reads `web/{relative}`, or `None` outside the workspace checkout
+    /// (see [`workspace_web_dir`]).
+    ///
+    /// `web/` present but `relative` missing is not that case -- it is real
+    /// drift inside the checkout the guard exists to catch -- and panics
+    /// exactly as loudly as the `include_str!` this replaces would have.
+    ///
+    /// # Panics
+    /// Inside the workspace, if `relative` cannot be read.
+    fn read_workspace_web_file(relative: &str) -> Option<String> {
+        let dir = workspace_web_dir()?;
+        Some(
+            std::fs::read_to_string(dir.join(relative)).unwrap_or_else(|err| {
+                panic!("web/{relative} exists in the workspace but could not be read: {err}")
+            }),
+        )
+    }
 
     /// The live index's own single entry, verbatim from
     /// `web/public/dogs.json` — a shape a real contributor's pull request
@@ -995,16 +1034,21 @@ mod tests {
     /// breaks. `cargo` was missing here for the whole of the index's first
     /// life, so every published dog would have been advertised with a git
     /// install; that gap is what this pins shut.
+    ///
+    /// Skips outside the workspace checkout -- see
+    /// [`read_workspace_web_file`].
     #[test]
     fn the_source_kinds_match_the_docs_site_list() {
-        const DOGS_TS: &str = include_str!("../../../web/src/data/dogs.ts");
+        let Some(dogs_ts) = read_workspace_web_file("src/data/dogs.ts") else {
+            return;
+        };
 
         // Past the `=` before splitting on quotes: the declaration reads
         // `const SOURCE_KINDS: readonly DogSource["kind"][] = [...]`, and
         // that `"kind"` in the type sits before the array. The category
         // test needs no such step because its declaration carries no
         // quotes ahead of its own `=`.
-        let after = DOGS_TS
+        let after = dogs_ts
             .split_once("const SOURCE_KINDS")
             .expect("web/src/data/dogs.ts declares SOURCE_KINDS")
             .1
@@ -1033,10 +1077,9 @@ mod tests {
     /// `shep dogs --available` that reads it -- counted only as an
     /// anonymous `1 entry skipped`.
     ///
-    /// `include_str!` rather than a runtime read, deliberately: a missing
-    /// file is then a compile error instead of a test that quietly passes
-    /// having checked nothing. It is inside `#[cfg(test)]`, so a packaged
-    /// crate without `web/` still builds.
+    /// Reads `web/src/data/dogs.ts` at runtime rather than with
+    /// `include_str!`, and skips outside the workspace checkout -- see
+    /// [`read_workspace_web_file`].
     ///
     /// Only the runtime array is read here. The `DogCategory` union above
     /// it in the same file cannot drift on its own -- the array is typed
@@ -1044,9 +1087,11 @@ mod tests {
     /// if they disagree.
     #[test]
     fn the_categories_match_the_docs_site_list() {
-        const DOGS_TS: &str = include_str!("../../../web/src/data/dogs.ts");
+        let Some(dogs_ts) = read_workspace_web_file("src/data/dogs.ts") else {
+            return;
+        };
 
-        let after = DOGS_TS
+        let after = dogs_ts
             .split_once("export const CATEGORIES")
             .expect("web/src/data/dogs.ts declares CATEGORIES")
             .1;
@@ -1076,10 +1121,15 @@ mod tests {
     /// `source.oneOf` (its real, once-shipped bug -- caught by hand while
     /// writing this test, not by the test itself, which is exactly the
     /// gap this closes) reddens the source-kinds half of this assertion.
+    ///
+    /// Skips outside the workspace checkout -- see
+    /// [`read_workspace_web_file`].
     #[test]
     fn the_schema_agrees_with_the_categories_and_source_kinds() {
-        const SCHEMA: &str = include_str!("../../../web/public/dogs.schema.json");
-        let schema: Value = serde_json::from_str(SCHEMA).expect("dogs.schema.json is valid json");
+        let Some(schema) = read_workspace_web_file("public/dogs.schema.json") else {
+            return;
+        };
+        let schema: Value = serde_json::from_str(&schema).expect("dogs.schema.json is valid json");
         let entry_schema = &schema["properties"]["dogs"]["items"];
 
         let schema_categories: Vec<&str> = entry_schema["properties"]["category"]["enum"]

@@ -1154,7 +1154,39 @@ fn duration_flag(value: &str) -> Result<shep_core::values::UpDuration, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::*;
+
+    /// `web/`, three directories above this file, only when it actually
+    /// exists.
+    ///
+    /// Same helper, and the same reasoning, as
+    /// `dog_index::tests::workspace_web_dir` -- see that one for why this
+    /// has to be a runtime check rather than `include_str!`. Duplicated
+    /// rather than shared: two call sites and six lines each did not earn a
+    /// crate-wide test-support module.
+    fn workspace_web_dir() -> Option<PathBuf> {
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web"));
+        dir.is_dir().then(|| dir.to_path_buf())
+    }
+
+    /// Reads `web/{relative}`, or `None` outside the workspace checkout
+    /// (see [`workspace_web_dir`]).
+    ///
+    /// `web/` present but `relative` missing is real drift inside the
+    /// checkout, not a published-crate build, and panics accordingly.
+    ///
+    /// # Panics
+    /// Inside the workspace, if `relative` cannot be read.
+    fn read_workspace_web_file(relative: &str) -> Option<String> {
+        let dir = workspace_web_dir()?;
+        Some(
+            std::fs::read_to_string(dir.join(relative)).unwrap_or_else(|err| {
+                panic!("web/{relative} exists in the workspace but could not be read: {err}")
+            }),
+        )
+    }
 
     #[test]
     fn the_command_tree_parses_and_is_internally_consistent() {
@@ -1172,14 +1204,19 @@ mod tests {
     /// 2026-08-23 when `init` did the same.
     ///
     /// `help` is clap's own subcommand and the one deliberate omission.
+    ///
+    /// Skips outside the workspace checkout -- see
+    /// [`read_workspace_web_file`].
     #[test]
     fn every_visible_verb_reaches_the_docs_site_generator() {
         use clap::CommandFactory;
 
-        const GENERATOR: &str = include_str!("../../../web/scripts/generate-cli-reference.sh");
+        let Some(generator) = read_workspace_web_file("scripts/generate-cli-reference.sh") else {
+            return;
+        };
         const NOT_DOCUMENTED: &[&str] = &["help"];
 
-        let (_, rest) = GENERATOR
+        let (_, rest) = generator
             .split_once("VERBS=(")
             .expect("the generator declares a VERBS array");
         let (block, _) = rest.split_once(')').expect("the VERBS array closes");
