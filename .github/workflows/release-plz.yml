@@ -31,7 +31,11 @@ jobs:
           # shallow clone would give it nothing to write a changelog from.
           fetch-depth: 0
       - run: rustup toolchain install stable --profile minimal
-      - uses: release-plz/action@v0
+      # Pinned by commit, not by tag. This action is handed contents:write
+      # and pull-requests:write, and a tag is mutable, so pinning the tag
+      # would mean trusting whatever it points at later. `v0` does not exist
+      # anyway: this repository publishes only exact versions.
+      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release-pr
         env:
