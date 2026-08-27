@@ -1035,14 +1035,38 @@ impl SupervisorHandle {
     /// - [`SupervisorError::NotFound`] — no app of that name is registered.
     /// - [`SupervisorError::InvalidScale`] — a count of `0`, or a target that
     ///   is a dog.
-    /// - [`SupervisorError::CannotStart`] — the app's `user`/`group` could
-    ///   not be resolved, so no instance could be assembled. Nothing was
-    ///   spawned, nothing was removed, and the stored instance count is
-    ///   unchanged: the flock is exactly as it was. Only reachable for an app
-    ///   that has never resolved its identity, which today means one
-    ///   registered at rest from the muster roll rather than started.
+    /// - [`SupervisorError::CannotStart`] — a scale-UP whose app has a
+    ///   `user`/`group` that will not resolve, so no new instance could be
+    ///   assembled. Nothing was spawned, nothing was removed, and the stored
+    ///   instance count is unchanged: the flock is exactly as it was. The
+    ///   reachable set is narrow, and worth stating rather than guessing at:
     /// - [`SupervisorError::ReloadInFlight`] — the app is mid-reload.
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    ///
+    /// `CannotStart` needs all three of `count > current`, an app whose
+    /// identity has never been resolved, and a resolution that then fails.
+    /// Only the growing arm resolves anything, so scaling DOWN and scaling to
+    /// the count an app already has never ask the passwd database and never
+    /// reach this variant, however unresolvable the app's `user` is. And only
+    /// two things carry an unresolved identity, both of them registered
+    /// without ever spawning:
+    ///
+    /// - a sheep the muster roll restored because it was saved while stopped;
+    /// - a row left `Errored` by a `Start` under [`BatchPolicy::PerApp`] whose
+    ///   credentials failed. Its `user` is already known not to resolve —
+    ///   that is why the row is there — so scaling it up meets the same
+    ///   refusal the start did, worded the same way.
+    ///
+    /// Both register `instance: 0` and nothing else, so their `current` is 1
+    /// and any `count` of 2 or more is the scale-up that reaches the lookup.
+    /// A count of 0 is refused as `InvalidScale` before any of this, which is
+    /// what leaves scaling down unreachable for them rather than merely
+    /// harmless.
+    ///
+    /// A scale-up that resolves successfully settles the identity for good,
+    /// including for the instance that was already registered: the lookup
+    /// runs once and is stored, so the app's next restart reuses it rather
+    /// than asking again.
     ///
     /// A scale-up that ran out of instances part-way is NOT an error here: it
     /// answers `Ok` with [`Scaled::shortfall`] set, the achieved count on
@@ -3540,38 +3564,6 @@ impl<R: ProcessRunner> Actor<R> {
         };
 
         let current = u32::try_from(slots.len()).unwrap_or(u32::MAX);
-        // Off an instance that already exists, so for a RUNNING app this is
-        // the identity that instance is already under and the resolve inside
-        // never happens. It is reached through the one seam anyway, and the
-        // failure arm is not dead code: an app registered at rest from the
-        // muster roll has never resolved anything, and scaling one up is a
-        // real route to a passwd lookup that can fail.
-        //
-        // `CannotStart`, not `SpawnFailed`, and not `InvalidScale`. Nothing
-        // has been spawned, nothing removed, and the config write-back is
-        // still ahead, so the flock this returns on is untouched -- which is
-        // exactly the promise `CannotStart` documents and the one an
-        // operator needs. `SpawnFailed` would name a spawn that never
-        // happened, and `InvalidScale` maps to `InvalidConfig` and means "ask
-        // for a different count", which is not something the caller can do
-        // about a `user` that will not resolve.
-        //
-        // Measured, because the obvious claim for this change is wrong: both
-        // `CannotStart` and `SpawnFailed` map to `RpcErrorCode::SpawnFailed`,
-        // and the CLI frames a reply by its CODE, so `shep stock` prints
-        // "error[spawn_failed]: the daemon reported SpawnFailed: <message>"
-        // either way. The operator's sentence does not change at all. What
-        // changes is what a caller matching `SupervisorError` sees, and what
-        // this daemon's own log says through the variant's `Display`, which
-        // is "start refused" rather than a spawn that never happened.
-        let credentials = match self.credentials_for_spawn(slots[0].1) {
-            Ok(credentials) => credentials,
-            Err(err) => {
-                let _ = reply.send(Err(SupervisorError::CannotStart(format!("{name}: {err}"))));
-                return;
-            }
-        };
-
         // The spawn/remove pass runs FIRST and the config write-back second,
         // which is the opposite of the obvious order and is the whole of this
         // function's care about a partial scale. Writing `rescaled` onto every
@@ -3593,6 +3585,49 @@ impl<R: ProcessRunner> Actor<R> {
         let survivors: Vec<u32> = match count.cmp(&current) {
             Ordering::Equal => slots.iter().map(|(_, id)| *id).collect(),
             Ordering::Greater => {
+                // INSIDE this arm, not above the match, because this is the
+                // only arm that spawns. `Equal` is a genuine no-op and `Less`
+                // only removes, so neither needs an identity -- and resolving
+                // one anyway meant a lookup that could REFUSE the call. `shep
+                // stock <name> 1` on an app restored from the muster roll was
+                // exactly that: `register_without_spawning` registers
+                // `instance: 0` whatever `instances` says, so `current` is 1,
+                // `count == 0` is refused earlier, and `Equal` is the only
+                // arm such a call can reach. It failed with `CannotStart`
+                // over credentials it was never going to use.
+                //
+                // Read off an instance that already exists, so for a RUNNING
+                // app this is the identity that instance is already under and
+                // the resolve inside never happens. The failure arm is not
+                // dead code all the same: an entry that has never spawned has
+                // never resolved anything, and scaling one up is a real route
+                // to a passwd lookup that can fail.
+                //
+                // `CannotStart`, not `SpawnFailed`, and not `InvalidScale`.
+                // Nothing has been spawned, nothing removed, and the config
+                // write-back is still ahead, so the flock this returns on is
+                // untouched -- exactly the promise `CannotStart` documents.
+                // `SpawnFailed` would name a spawn that never happened, and
+                // `InvalidScale` maps to `InvalidConfig` and means "ask for a
+                // different count", which is not something the caller can do
+                // about a `user` that will not resolve.
+                //
+                // Measured, because the obvious claim for that choice is
+                // wrong: both `CannotStart` and `SpawnFailed` map to
+                // `RpcErrorCode::SpawnFailed`, and the CLI frames a reply by
+                // its CODE, so `shep stock` prints "error[spawn_failed]: the
+                // daemon reported SpawnFailed: <message>" either way. The
+                // operator's sentence does not change at all. What changes is
+                // what a caller matching `SupervisorError` sees, and what this
+                // daemon's own log says through the variant's `Display`.
+                let credentials = match self.credentials_for_spawn(slots[0].1) {
+                    Ok(credentials) => credentials,
+                    Err(err) => {
+                        let _ =
+                            reply.send(Err(SupervisorError::CannotStart(format!("{name}: {err}"))));
+                        return;
+                    }
+                };
                 let existing: Vec<u32> = slots.iter().map(|(instance, _)| *instance).collect();
                 let mut ids: Vec<u32> = slots.iter().map(|(_, id)| *id).collect();
                 for instance in instance_slots(&existing, count - current) {
@@ -14554,6 +14589,112 @@ mod tests {
             actor.sheep[&registered.id].entry.credentials,
             SpawnIdentity::Unresolved,
             "a failed resolution settles nothing: the next attempt must ask again"
+        );
+    }
+
+    // fails if the `Errored` row a refused start leaves behind can be scaled
+    // up into running processes. It is the second of the two things that
+    // carry an unresolved identity, and the one `scale`'s own `# Errors`
+    // names without anything else covering it: its `user` is already known
+    // not to resolve, which is why the row is there at all, so the scale must
+    // meet the same refusal the start did.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn scaling_up_the_row_a_refused_start_left_meets_the_same_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits(); 4]);
+        let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+
+        // The row, made the way an unattended boot makes it.
+        actor
+            .do_start(vec![app], None, BatchPolicy::PerApp)
+            .expect_err("an unresolvable user must refuse the start");
+        let id = actor
+            .sheep
+            .values()
+            .next()
+            .expect("the refused start leaves a row")
+            .entry
+            .id;
+        assert_eq!(actor.sheep[&id].entry.status, ProcStatus::Errored);
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_scale("web", 3, reply);
+        let err = answer
+            .await
+            .expect("handle_scale answers every call")
+            .expect_err("the row's user still will not resolve");
+
+        assert!(
+            matches!(err, SupervisorError::CannotStart(_)),
+            "expected CannotStart, got {err:?}"
+        );
+        assert_eq!(actor.runner.spawn_count(), 0);
+        assert_eq!(
+            actor.sheep.len(),
+            1,
+            "no instance may be registered by a scale that could not resolve an identity"
+        );
+    }
+
+    // fails if a scale that needs no spawn asks the passwd database anything.
+    // A resolvable user, so the question WOULD be answered if it were asked:
+    // what this reads is that the entry's identity is still unresolved
+    // afterwards, which it could not be if a lookup had run and stored its
+    // answer. `count == current` spawns nothing, so there is nothing for an
+    // identity to be resolved FOR.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_no_op_scale_asks_no_passwd_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits(); 2]);
+        let app = app_with("web", |app| app.user = Some(own_user_name()));
+        let registered = actor.register_at_rest(&app);
+
+        // `register_at_rest` always registers `instance: 0` whatever
+        // `instances` says, so a restored app's `current` is 1 and this is the
+        // `Ordering::Equal` arm.
+        let (reply, answer) = oneshot::channel();
+        actor.handle_scale("web", 1, reply);
+        answer
+            .await
+            .expect("handle_scale answers every call")
+            .expect("scaling to the count an app already has is a no-op");
+
+        assert_eq!(
+            actor.sheep[&registered.id].entry.credentials,
+            SpawnIdentity::Unresolved,
+            "a scale that spawns nothing must not resolve an identity: nothing would use it, \
+             and asking is what lets the answer refuse the call"
+        );
+        assert_eq!(actor.runner.spawn_count(), 0);
+    }
+
+    // fails if a genuine no-op is refused over credentials it never needed.
+    // The user here cannot be resolved, so a scale that asks is a scale that
+    // fails -- and `shep stock <name> 1` on a restored app is exactly the
+    // call an operator re-running a provisioning script makes.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_no_op_scale_survives_a_user_that_will_not_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits(); 2]);
+        let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+        let registered = actor.register_at_rest(&app);
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_scale("web", 1, reply);
+        let scaled = answer
+            .await
+            .expect("handle_scale answers every call")
+            .expect("a no-op scale must not be refused over an identity it never needed");
+
+        assert_eq!(scaled.instances.len(), 1);
+        assert_eq!(actor.runner.spawn_count(), 0);
+        assert_eq!(
+            actor.sheep[&registered.id].entry.status,
+            ProcStatus::Stopped,
+            "a no-op must leave the sheep exactly as it found it"
         );
     }
 

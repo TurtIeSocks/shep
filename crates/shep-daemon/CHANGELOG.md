@@ -155,7 +155,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `SupervisorError::CannotStart`, a command refused before it registered
   or spawned anything: a `Start` batch whose checking pass rejected an app, or
-  a `shep stock` on an app whose `user` will not resolve. Separate from `SpawnFailed` because nothing was spawned,
+  a `shep stock` scale-UP of an app whose `user` will not resolve. A scale
+  that removes instances, or that asks for the count an app already has,
+  resolves nothing and cannot reach it. Separate from `SpawnFailed` because nothing was spawned,
   and an operator told "spawn failed" about a spawn that never happened is
   being pointed at the wrong place; the two also differ in what they leave
   behind, which is the part that matters operationally. It maps to the
